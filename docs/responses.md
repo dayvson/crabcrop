@@ -81,7 +81,7 @@ Operational failures carry these codes:
 | `pdf_render_failed` | `502` | The configured PDF renderer failed. |
 | `processing_timeout` | `504` | Processing ran past the process deadline. An SVG still rendering, or an AVIF still decoding, is killed with its worker process. |
 | `processing_failed` | `500` | The processing job itself failed. |
-| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate, the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), or the source host lookup slots (16 at once, see [Source images](url-grammar.md#source-images)) waited past its timeout; the response carries `Retry-After`. |
+| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate, the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), or the source host lookup slots (128 at once, see [Source images](url-grammar.md#source-images)) waited past its timeout; the response carries `Retry-After`. |
 | `provenance_unavailable` | `503` | Signing the output failed because the C2PA timestamp authority (`CRABCROP_C2PA_TSA_URL`) did not answer within its bounds, refused the connection, or answered with something that is not a timestamp. The response carries `Retry-After: 30`. Any other signing failure is `encode_failed`. |
 | `invalid_purge_group` | `400` | A purge-group name is empty or contains a slash. |
 | `uploads_not_configured` | `404` | A `PUT` to `/upload/...` on a server with no upload destination configured, whatever its signature. |

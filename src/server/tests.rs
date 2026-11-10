@@ -16893,13 +16893,23 @@ async fn answers_for(
     all
 }
 
-/// A served state whose loader is `loader`, with `fallback`.
+/// A served state whose loader is `loader`, with `fallback`,
+/// and `/metrics` open to the bearer `metrics-token`.
 async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     let mut state = tier_test_state(None, "http://127.0.0.1:9");
     state.shared_store = None;
     state.loader = loader;
     state.fallback = fallback;
+    state.metrics_token = Some("metrics-token".to_string());
     serve_state(&state).await
+}
+
+/// The value of the unlabeled series `name` in `exposition`.
+fn metric_value(exposition: &str, name: &str) -> Option<String> {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .map(str::to_string)
 }
 
 /// A host name that resolves to a non-public address and one
@@ -17017,18 +17027,29 @@ async fn file_paths_outside_the_root_answer_alike_whatever_exists_there() {
 
 /// A load shed because every host lookup slot stayed taken
 /// answers the gates' `503 server_busy` with `Retry-After`,
-/// on the image route and the explain route, and never falls
-/// back: it is overload, and the fallback could need a lookup
-/// too.
+/// on the image route, the explain route and for a
+/// watermark, and never falls back: it is overload, and the
+/// fallback could need a lookup too. Nor is it counted as a
+/// load failure. `/metrics` shows the slots in use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lookup_shed_answers_busy_and_never_falls_back() {
+    let dir = crate::test_support::scratch_dir("lookup-shed");
+    std::fs::write(dir.join("ok.png"), test_png()).unwrap();
+    let root = std::fs::canonicalize(&*dir).unwrap();
     let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let started = Arc::new(AtomicUsize::new(0));
     let held = Arc::clone(&gate);
+    let counter = Arc::clone(&started);
     let loader = Loader::with_defaults()
         .unwrap()
         .with_policy(crate::loader::SourcePolicy::new(vec![], true))
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        })
         .with_host_lookup(
             move |_host| {
+                counter.fetch_add(1, Ordering::SeqCst);
                 let (released, wake) = &*held;
                 let mut released = released.lock().unwrap();
                 let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -17047,28 +17068,70 @@ async fn a_lookup_shed_answers_busy_and_never_falls_back() {
     let first = "64x64/http://first.test/x.png".to_string();
     let url = format!("{base}/{}/{first}", sign(&first));
     let holder = tokio::spawn(async move { client().get(url).send().await.unwrap().status() });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    for route in ["", "explain/"] {
-        let remainder = "64x64/http://second.test/x.png";
+    // Wait until the held request's lookup has the one slot.
+    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "the lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let shed = [
+        "64x64/http://second.test/x.png".to_string(),
+        "explain/64x64/http://second.test/x.png".to_string(),
+        "64x64/filters:watermark(http%3A%2F%2Fsecond.test%2Fw.png,0,0,50)/file:///ok.png"
+            .to_string(),
+    ];
+    for path in &shed {
+        let remainder = path.strip_prefix("explain/").unwrap_or(path);
+        let route = if path.starts_with("explain/") {
+            "explain/"
+        } else {
+            ""
+        };
         let resp = client()
             .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{route}");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert_eq!(
             resp.headers()
                 .get(header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()),
             Some("5"),
-            "{route}"
+            "{path}"
         );
-        assert!(resp.headers().get("x-crabcrop-fallback").is_none());
+        assert!(
+            resp.headers().get("x-crabcrop-fallback").is_none(),
+            "{path}"
+        );
         assert_eq!(
             resp.text().await.unwrap(),
-            "server busy: too many source host lookups waiting"
+            "server busy: too many source host lookups waiting",
+            "{path}"
         );
     }
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "a shed load started a lookup"
+    );
+    let exposition = scrape(&base, "metrics-token").await;
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_loader_errors_total").as_deref(),
+        Some("0"),
+        "a shed counted as a load failure"
+    );
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_in_flight").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_capacity").as_deref(),
+        Some("1")
+    );
     {
         let (released, wake) = &*gate;
         *released.lock().unwrap() = true;
@@ -17076,4 +17139,10 @@ async fn a_lookup_shed_answers_busy_and_never_falls_back() {
     }
     // The held request's lookup failed: the fallback stands in.
     assert_eq!(holder.await.unwrap(), StatusCode::OK);
+    let exposition = scrape(&base, "metrics-token").await;
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_in_flight").as_deref(),
+        Some("0")
+    );
+    drop(dir);
 }

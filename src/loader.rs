@@ -39,13 +39,14 @@
 //! refused: the loader never presents Basic credentials to an
 //! origin (audit L-2).
 //!
-//! The private-address check's host lookups run on slots of
-//! their own (see [`LOOKUP_SLOTS`]), and a host name that
-//! resolves to a non-public address fails the way a name that
-//! does not resolve fails, so the answer never says which names
-//! resolve inside the server's network.
+//! Every lookup of a source host name, the private-address
+//! check's and the HTTP client's own for a fetch the check does
+//! not pin, runs on slots of their own (see [`LOOKUP_SLOTS`]).
+//! A host name that resolves to a non-public address fails the
+//! way a name that does not resolve fails, so the answer never
+//! says which names resolve inside the server's network.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -626,7 +627,15 @@ impl SourcePolicy {
 /// Fetches source image bytes over HTTP(S).
 #[derive(Debug, Clone)]
 pub struct Loader {
+    /// The client for HTTP and HTTPS sources the policy does
+    /// not pin. It resolves host names on the lookup slots
+    /// (see [`SlotResolver`]).
     client: Client,
+    /// The client for object store requests. Their host names
+    /// come from configuration (the store endpoints), not from
+    /// the request, so they resolve apart from the lookup
+    /// slots and stay reachable while the slots are full.
+    store_client: Client,
     timeout: Duration,
     max_bytes: u64,
     policy: SourcePolicy,
@@ -662,24 +671,30 @@ pub struct Loader {
     /// still compete for that room. Rebuilt with
     /// the budget; shared by loader clones.
     read_ahead_pool: std::sync::Arc<tokio::sync::Semaphore>,
-    /// The source policy's host lookups and their slots (see
-    /// [`HostLookups`]); shared by loader clones.
+    /// The source host lookups and their slots (see
+    /// [`HostLookups`]); shared by loader clones and by the
+    /// HTTP clients' resolver.
     lookups: HostLookups,
 }
 
-/// How many source policy host lookups run at once, per
-/// loader. A lookup is a blocking `getaddrinfo` call on the
-/// runtime's blocking pool, the pool every render, file
+/// How many source host lookups run at once, per loader. A
+/// lookup is a blocking `getaddrinfo` call on the runtime's
+/// blocking pool (512 threads), the pool every render, file
 /// read and disk cache read also needs a thread from, and
 /// nothing can interrupt it before the system resolver
 /// gives up: a resolver that never answers holds the
 /// thread for its full timeout and retries, well past the
 /// request's own source timeout. A fixed number of slots
-/// keeps lookups to a small share of that pool, however
-/// many requests name hosts whose DNS does not answer.
-/// Lookups normally take milliseconds, so 16 at once serve
-/// hundreds of fresh host names a second.
-pub const LOOKUP_SLOTS: usize = 16;
+/// keeps lookups to a quarter of that pool, however many
+/// requests name hosts whose DNS does not answer. The
+/// bound has a cost: with a resolver that gives up after
+/// about 10 seconds, requests naming such hosts at about
+/// 13 a second keep every slot taken, and other lookups
+/// wait and then shed while they do. An allowlist avoids
+/// it, since a host off the list is refused before any
+/// lookup. Lookups normally take milliseconds, so 128 at
+/// once serve thousands of fresh host names a second.
+pub const LOOKUP_SLOTS: usize = 128;
 
 /// How long a load waits for a host lookup slot before it
 /// sheds with [`LoadError::LookupBusy`]: the stills gate's
@@ -692,8 +707,8 @@ pub const LOOKUP_WAIT: Duration = Duration::from_secs(5);
 /// stand-in in tests.
 type LookupFn = dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync;
 
-/// The source policy's host lookups, on slots of their own
-/// (see [`LOOKUP_SLOTS`]). A load waits at most its
+/// The source host lookups, on slots of their own (see
+/// [`LOOKUP_SLOTS`]). A load waits at most its
 /// [`LOOKUP_WAIT`] for a slot. While it waits it holds
 /// nothing: a load that gives up then, at that wait or at
 /// its own source timeout, leaves the queue, and its lookup
@@ -704,6 +719,7 @@ type LookupFn = dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync;
 #[derive(Clone)]
 struct HostLookups {
     slots: std::sync::Arc<tokio::sync::Semaphore>,
+    capacity: usize,
     wait: Duration,
     lookup: std::sync::Arc<LookupFn>,
 }
@@ -712,6 +728,7 @@ impl std::fmt::Debug for HostLookups {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostLookups")
             .field("free_slots", &self.slots.available_permits())
+            .field("capacity", &self.capacity)
             .field("wait", &self.wait)
             .finish_non_exhaustive()
     }
@@ -731,9 +748,16 @@ impl HostLookups {
     fn new(lookup: std::sync::Arc<LookupFn>, slots: usize, wait: Duration) -> Self {
         Self {
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
+            capacity: slots,
             wait,
             lookup,
         }
+    }
+
+    /// How many slots are taken right now: lookups running,
+    /// including ones whose loads have given up.
+    fn in_use(&self) -> usize {
+        self.capacity - self.slots.available_permits()
     }
 
     /// The addresses `host` resolves to. A lookup failure is
@@ -763,6 +787,46 @@ impl HostLookups {
 fn system_lookup(host: &str) -> std::io::Result<Vec<IpAddr>> {
     use std::net::ToSocketAddrs;
     Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
+}
+
+/// The HTTP clients' resolver for source hosts: the same
+/// [`HostLookups`] the private-address check uses. A fetch the
+/// check does not pin (an allowlisted host, or any host with
+/// the check switched off) leaves the name to the client, and
+/// the client's default resolver would run `getaddrinfo` on
+/// the blocking pool with no bound. A shed comes back to the
+/// load as [`LoadError::LookupBusy`] (see [`map_request_error`]).
+struct SlotResolver(HostLookups);
+
+impl reqwest::dns::Resolve for SlotResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let lookups = self.0.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let ips = lookups.resolve(&host).await?;
+            // Port 0: the client puts in the URL's port.
+            let addrs: reqwest::dns::Addrs = Box::new(
+                ips.into_iter()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            Ok(addrs)
+        })
+    }
+}
+
+/// The client for HTTP and HTTPS sources the policy does not
+/// pin: the loader's timeout, no redirects (the loader follows
+/// them itself, re-checking the policy on every hop), and
+/// host names resolved on `lookups`.
+fn source_client(timeout: Duration, lookups: &HostLookups) -> Result<Client, LoadError> {
+    Client::builder()
+        .timeout(timeout)
+        .redirect(redirect::Policy::none())
+        .dns_resolver(SlotResolver(lookups.clone()))
+        .build()
+        .map_err(|e| LoadError::Network(e.to_string()))
 }
 
 /// Cap on the pinned-client cache (issue #369).
@@ -874,15 +938,17 @@ enum LoadBody {
 impl Loader {
     /// Build a loader with an explicit byte limit and total timeout.
     pub fn new(max_bytes: u64, timeout: Duration) -> Result<Self, LoadError> {
-        let client = Client::builder()
+        let lookups = HostLookups::system();
+        let client = source_client(timeout, &lookups)?;
+        let store_client = Client::builder()
             .timeout(timeout)
-            // Redirects are followed manually in `load` so the
-            // source policy is re-checked on every hop.
+            // A store's 3xx surfaces as its status.
             .redirect(redirect::Policy::none())
             .build()
             .map_err(|e| LoadError::Network(e.to_string()))?;
         Ok(Self {
             client,
+            store_client,
             timeout,
             max_bytes,
             policy: SourcePolicy::default(),
@@ -892,7 +958,7 @@ impl Loader {
             )),
             source_budget: SourceBudget::unlimited(),
             read_ahead_pool: read_ahead_pool(tokio::sync::Semaphore::MAX_PERMITS, max_bytes),
-            lookups: HostLookups::system(),
+            lookups,
         })
     }
 
@@ -907,6 +973,8 @@ impl Loader {
         wait: Duration,
     ) -> Self {
         self.lookups = HostLookups::new(std::sync::Arc::new(lookup), slots, wait);
+        self.client = source_client(self.timeout, &self.lookups).expect("source client");
+        self.pinned_clients.lock().unwrap().clear();
         self
     }
 
@@ -939,6 +1007,12 @@ impl Loader {
     /// charge against.
     pub fn source_budget(&self) -> &SourceBudget {
         &self.source_budget
+    }
+
+    /// The source host lookup slots (see [`LOOKUP_SLOTS`]):
+    /// how many are taken right now, and how many there are.
+    pub fn lookup_slots(&self) -> (usize, usize) {
+        (self.lookups.in_use(), self.lookups.capacity)
     }
 
     /// Fetch `url` and return the body bytes, dispatching on
@@ -1343,7 +1417,7 @@ impl Loader {
         };
         let url = Url::parse(&url_string)
             .map_err(|e| LoadError::Network(format!("invalid store url: {e}")))?;
-        let mut request = self.client.get(url.clone());
+        let mut request = self.store_client.get(url.clone());
         if let Some(creds) = creds {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1424,7 +1498,13 @@ impl Loader {
                 "invalid file source path".to_string(),
             ));
         }
-        let relative = file_source_relative_path(&decoded).ok_or(LoadError::NotFound)?;
+        let relative = decoded.trim_start_matches('/');
+        if !file_source_path_stays_in_root(relative) {
+            return Err(LoadError::NotFound);
+        }
+        // The path text itself is resolved, not a normal form
+        // of it, so a trailing slash still asks for a
+        // directory, as the filesystem reads it.
         let canonical = tokio::fs::canonicalize(root.join(relative))
             .await
             .map_err(|_| LoadError::NotFound)?;
@@ -1522,6 +1602,10 @@ impl Loader {
             .redirect(redirect::Policy::none())
             .no_proxy()
             .resolve(&pin.host, pin.addr)
+            // Only the pinned host is fetched with this client,
+            // and the override answers for it; any other name
+            // would still resolve on the slots.
+            .dns_resolver(SlotResolver(self.lookups.clone()))
             .build()
             .map_err(|e| LoadError::Network(e.to_string()))?;
         let mut cache = self.pinned_clients.lock().unwrap();
@@ -1720,22 +1804,16 @@ fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
         || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64, discard-only
 }
 
-/// The decoded path of a `file://` source as a path relative
-/// to the file root, judged on the text alone: `None` when a
-/// component would leave the root (a `..` segment, or a root
-/// or drive prefix that would replace it). `.` components and
-/// repeated separators drop out.
-fn file_source_relative_path(decoded: &str) -> Option<PathBuf> {
+/// Whether the decoded path of a `file://` source, relative to
+/// the file root, stays under the root on its text alone: no
+/// component would leave it (a `..` segment, or a root or
+/// drive prefix that would replace it). `.` components and
+/// repeated separators are not escapes.
+fn file_source_path_stays_in_root(relative: &str) -> bool {
     use std::path::{Component, Path};
-    let mut relative = PathBuf::new();
-    for component in Path::new(decoded.trim_start_matches('/')).components() {
-        match component {
-            Component::Normal(part) => relative.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(relative)
+    Path::new(relative)
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 /// Whether any `/`-separated component of `path` is a dot
@@ -1836,10 +1914,18 @@ fn percent_decode(path: &str) -> String {
 
 fn map_request_error(e: reqwest::Error) -> LoadError {
     if e.is_timeout() {
-        LoadError::Timeout
-    } else {
-        LoadError::Network(e.to_string())
+        return LoadError::Timeout;
     }
+    // A lookup shed inside the client's resolver (see
+    // [`SlotResolver`]) is overload, not a fetch failure.
+    let mut cause = std::error::Error::source(&e);
+    while let Some(inner) = cause {
+        if inner.downcast_ref::<LoadError>() == Some(&LoadError::LookupBusy) {
+            return LoadError::LookupBusy;
+        }
+        cause = inner.source();
+    }
+    LoadError::Network(e.to_string())
 }
 
 /// Map a failure to open or read a file source whose
@@ -3035,17 +3121,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[tokio::test]
+    async fn a_file_named_with_a_trailing_slash_answers_not_found() {
+        // A trailing slash asks for a directory, so a regular
+        // file named with one does not resolve: the uniform
+        // not-found answer, never the file.
+        let (base, root) = make_file_tree();
+        let loader = file_loader(&root, 1024);
+        for url in [
+            "file:///pic.jpg/",
+            "file:///pic.jpg%2f",
+            "file:///sub/inner.jpg/",
+            "file:///sub%2finner.jpg%2f",
+        ] {
+            assert_eq!(loader.load(url).await, Err(LoadError::NotFound), "{url}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_directory_inside_the_root_keeps_its_read_failure() {
+        // Only a path that cannot be resolved inside the root
+        // is the uniform not-found answer. A directory inside
+        // the root resolves; reading it fails, and that read
+        // failure keeps its own answer.
+        let (base, root) = make_file_tree();
+        let loader = file_loader(&root, 1024);
+        for url in ["file:///sub", "file:///sub/", "file:///"] {
+            let err = loader.load(url).await.unwrap_err();
+            assert!(matches!(err, LoadError::Network(_)), "{url}: {err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn file_source_paths_are_judged_on_their_text() {
-        let rel = |path: &str| file_source_relative_path(path);
-        assert_eq!(rel("/a/b.jpg"), Some(PathBuf::from("a/b.jpg")));
-        assert_eq!(rel("//a/./b.jpg"), Some(PathBuf::from("a/b.jpg")));
-        assert_eq!(rel("/"), Some(PathBuf::new()));
-        assert_eq!(rel("/a/../b.jpg"), None);
-        assert_eq!(rel("/../b.jpg"), None);
-        assert_eq!(rel("/a/.."), None);
+        let stays = |path: &str| file_source_path_stays_in_root(path);
+        assert!(stays("a/b.jpg"));
+        assert!(stays("a//./b.jpg"));
+        assert!(stays("a/b.jpg/"));
+        assert!(stays(""));
+        assert!(!stays("a/../b.jpg"));
+        assert!(!stays("../b.jpg"));
+        assert!(!stays("a/.."));
+        assert!(!stays("/a/b.jpg"));
         // Dots inside a name are a name.
-        assert_eq!(rel("/a..b/...jpg"), Some(PathBuf::from("a..b/...jpg")));
+        assert!(stays("a..b/...jpg"));
     }
 
     /// A stand-in resolver for the host lookup tests: every
@@ -3214,7 +3335,7 @@ mod tests {
                 ..Default::default()
             });
         let read = runtime.block_on(async {
-            let flood: Vec<_> = (0..64)
+            let flood: Vec<_> = (0..LOOKUP_SLOTS + 48)
                 .map(|i| {
                     let loader = loader.clone();
                     tokio::spawn(
@@ -3240,6 +3361,104 @@ mod tests {
         assert_eq!(running, LOOKUP_SLOTS, "lookups running at once");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_burst_of_stuck_lookups_leaves_slots_for_other_names() {
+        // Lookups the resolver never answers keep their slots
+        // for the resolver's whole timeout. A burst of them,
+        // 96 here, must still leave slots for other names.
+        let stuck = StuckResolver::default();
+        let stuck_lookup = stuck.lookup();
+        let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(20))
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec![], true))
+            .with_host_lookup(
+                move |host| {
+                    if host.ends_with(".stuck.test") {
+                        stuck_lookup(host)
+                    } else {
+                        Ok(vec!["93.184.216.34".parse().unwrap()])
+                    }
+                },
+                LOOKUP_SLOTS,
+                LOOKUP_WAIT,
+            );
+        let burst: Vec<_> = (0..96)
+            .map(|i| {
+                let loader = loader.clone();
+                tokio::spawn(
+                    async move { loader.load(&format!("http://h{i}.stuck.test/x.png")).await },
+                )
+            })
+            .collect();
+        eventually("all 96 stuck lookups running", || stuck.running() == 96).await;
+        let url = Url::parse("http://origin.test/x.png").unwrap();
+        let pin = tokio::time::timeout(Duration::from_secs(1), loader.check_policy(&url)).await;
+        let addr = pin
+            .expect("the lookup waited for a slot")
+            .expect("the lookup failed")
+            .expect("no pin")
+            .addr;
+        assert_eq!(addr, "93.184.216.34:80".parse().unwrap());
+        assert_eq!(loader.lookup_slots(), (96, LOOKUP_SLOTS));
+        stuck.release();
+        for load in burst {
+            let _ = load.await;
+        }
+        eventually("the slots to come free", || loader.lookup_slots().0 == 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetches_the_policy_does_not_pin_resolve_on_the_lookup_slots() {
+        // An allowlisted host, or any host with the
+        // private-address check off, is not looked up by the
+        // policy: the HTTP client resolves the name when it
+        // connects. That lookup runs on the same slots, and a
+        // shed there is the same overload answer.
+        for policy in [
+            SourcePolicy::new(vec![], false),
+            SourcePolicy::new(vec!["test".to_string()], true),
+        ] {
+            let base = spawn_server(Respond::Bytes(ok_image_response())).await;
+            let port = Url::parse(&base).unwrap().port().unwrap();
+            let stuck = StuckResolver::default();
+            let stuck_lookup = stuck.lookup();
+            let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(20))
+                .unwrap()
+                .with_policy(policy.clone())
+                .with_host_lookup(
+                    move |host| {
+                        if host == "origin.test" {
+                            Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+                        } else {
+                            stuck_lookup(host)
+                        }
+                    },
+                    1,
+                    Duration::from_millis(200),
+                );
+            // `origin.test` is a name only the stand-in knows.
+            let body = loader
+                .load(&format!("http://origin.test:{port}/x.png"))
+                .await;
+            assert!(body.is_ok(), "{policy:?}: {body:?}");
+            let held = {
+                let loader = loader.clone();
+                tokio::spawn(async move { loader.load("http://a.stuck.test/x.png").await })
+            };
+            eventually("the stuck lookup to start", || stuck.running() == 1).await;
+            assert_eq!(loader.lookup_slots(), (1, 1));
+            assert_eq!(
+                loader.load("http://b.stuck.test/x.png").await,
+                Err(LoadError::LookupBusy),
+                "{policy:?}"
+            );
+            assert_eq!(stuck.started(), 1, "the shed load started a lookup");
+            stuck.release();
+            let err = held.await.unwrap().unwrap_err();
+            assert!(matches!(err, LoadError::Network(_)), "{policy:?}: {err:?}");
+        }
+    }
+
     /// A stand-in resolver: `internal.test` and `loopback.test`
     /// resolve inward, `mixed.test` to one public and one
     /// non-public address, `empty.test` to nothing, and every
@@ -3248,7 +3467,7 @@ mod tests {
         let addrs: &[&str] = match host {
             "internal.test" => &["10.96.0.12"],
             "loopback.test" => &["127.0.0.1"],
-            "mixed.test" => &["93.184.216.34", "169.254.169.254"],
+            "mixed.test" => &["93.184.216.34", "192.168.7.20"],
             "empty.test" => &[],
             _ => {
                 return Err(std::io::Error::new(

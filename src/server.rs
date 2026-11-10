@@ -533,10 +533,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             state.metrics.render(),
             lane_metrics(&state),
             source_buffer_metrics(&state),
+            source_lookup_metrics(&state),
             tier_metrics(&state)
         ),
     )
@@ -590,6 +591,24 @@ fn source_buffer_metrics(state: &AppState) -> String {
          crabcrop_source_buffer_capacity_bytes {}\n",
         budget.in_use(),
         budget.capacity()
+    )
+}
+
+/// Source host lookup slot occupancy for `/metrics`: the
+/// lookups running right now against the slots (see
+/// [`crate::loader::LOOKUP_SLOTS`]), read live at scrape time.
+/// In flight sitting at capacity while requests shed with
+/// `server_busy` means the resolver is not answering for the
+/// host names requests carry.
+fn source_lookup_metrics(state: &AppState) -> String {
+    let (in_flight, capacity) = state.loader.lookup_slots();
+    format!(
+        "# HELP crabcrop_source_lookups_in_flight Source host lookups running now.\n\
+         # TYPE crabcrop_source_lookups_in_flight gauge\n\
+         crabcrop_source_lookups_in_flight {in_flight}\n\
+         # HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.\n\
+         # TYPE crabcrop_source_lookups_capacity gauge\n\
+         crabcrop_source_lookups_capacity {capacity}\n"
     )
 }
 
