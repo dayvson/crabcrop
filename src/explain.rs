@@ -140,7 +140,10 @@ pub struct ReportInput {
     pub presets: Vec<PresetEntry>,
     /// The canonical remainder (the cache key's path form;
     /// the fingerprint suffix the key carries is operator
-    /// state and is never reported).
+    /// state and is never reported). A form longer than
+    /// [`crate::cache::MAX_KEY_BASE_BYTES`] is reported in
+    /// full, though the key carries it as its digest
+    /// ([`crate::cache::bounded_key_base`]).
     pub canonical: String,
     pub cache_group: Option<String>,
     /// The image request path exactly as presented, for
