@@ -40,6 +40,21 @@
 //!   renderer draws the media box, which a page may
 //!   declare far larger than its crop box.
 //!
+//! The raster clamp bounds the surface the renderer draws,
+//! not the images a page draws on it: Poppler decodes an
+//! embedded JPEG 2000 image at its full declared size, four
+//! bytes a sample, before scaling it onto the page. So a
+//! document that stores a JPEG 2000 image past the decode
+//! budget is refused before any tool runs (see
+//! `oversized_jpx`), and on Linux both tools run under a
+//! 2 GiB address-space cap (`RENDERER_MAX_ADDRESS_SPACE`),
+//! sized to the largest page within the raster budget with
+//! an image within the decode budget on it, which bounds
+//! every other decode a document can ask for. An image
+//! whose decode passes the cap fails in the renderer, and
+//! the renderer leaves it out of the page, as it leaves out
+//! any image it cannot decode.
+//!
 //! The rendered PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
 //! dimensions and allocation, output pixels) applies to
@@ -114,6 +129,23 @@ const MIN_RENDER_DPI: f64 = 1.0;
 /// report is a few hundred bytes; this is generous
 /// headroom for chatty builds.
 const PROBE_REPORT_CAP: usize = 1024 * 1024;
+
+/// The PDF tools' address-space cap on Linux, 2 GiB. The
+/// heaviest renders within the budgets measured about 1.1
+/// GiB with Poppler 24.02: a page holding an 8192x8192
+/// JPEG 2000 image (the decode budget, which Poppler holds
+/// at four bytes a sample while it draws it) at the 64
+/// megapixel raster, and a 64 megapixel page drawing a
+/// 12000x12000 JPEG. The cap leaves room over those for a
+/// transparency group or two at the full raster, and turns
+/// a decode past it into a failure in the tool within about
+/// a second.
+const RENDERER_MAX_ADDRESS_SPACE: u64 = 2 << 30;
+
+/// The two markers that open every JPEG 2000 codestream:
+/// SOC (start of codestream) and SIZ (image and tile size),
+/// which the format requires to follow it at once.
+const JPX_SOC_SIZ: [u8; 4] = [0xFF, 0x4F, 0xFF, 0x51];
 
 /// Whether bytes can be a PDF at all: the format's
 /// header, `%PDF-`, appears within the first 1024 bytes
@@ -324,13 +356,29 @@ impl PdfRenderer {
         }
     }
 
-    /// Render the selected page as PNG bytes. Probes
-    /// first: the page count cap and the page range are
-    /// enforced against the probe before the renderer
-    /// runs, and the render scale is computed from the
-    /// probed page size, the crop box the renderer then
-    /// draws.
+    /// Render the selected page as PNG bytes. A document
+    /// that stores a JPEG 2000 image past the decode budget
+    /// is refused before any tool runs. Then the probe: the
+    /// page count cap and the page range are enforced
+    /// against the probe before the renderer runs, and the
+    /// render scale is computed from the probed page size,
+    /// the crop box the renderer then draws.
     pub fn render_page(&self, pdf: &[u8], page: u32) -> Result<RenderedPage, PdfError> {
+        if let Some(image) = oversized_jpx(pdf) {
+            return Err(PdfError::NotPdf(format!(
+                "the document embeds a {}x{} JPEG 2000 image with {} {}, past the {} byte \
+                 decode allocation budget",
+                image.width,
+                image.height,
+                image.components,
+                if image.components == 1 {
+                    "component"
+                } else {
+                    "components"
+                },
+                crate::engine::MAX_DECODE_ALLOC
+            )));
+        }
         // One deadline for the probe and the render
         // together (issue #362).
         let deadline = Instant::now() + self.timeout;
@@ -446,6 +494,7 @@ impl PdfRenderer {
             max_stderr: PROBE_REPORT_CAP,
             deadline,
             cpu_limit: tool_cpu_limit(self.timeout),
+            max_address_space: RENDERER_MAX_ADDRESS_SPACE,
         })
         .map_err(|e| {
             PdfError::Failed(match e {
@@ -604,6 +653,103 @@ fn parse_page_size(line: &str, page: u32) -> Option<(f64, f64)> {
         return None;
     }
     Some((width, height))
+}
+
+/// A JPEG 2000 image's size, as its codestream declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JpxSize {
+    /// The image's width in pixels (its reference grid
+    /// less the image offset).
+    width: u64,
+    /// The image's height in pixels.
+    height: u64,
+    /// How many components each pixel has.
+    components: u16,
+    /// The samples the decoded image holds, summed over its
+    /// components, each at its own subsampling.
+    samples: u64,
+}
+
+impl JpxSize {
+    /// Whether the decoded image passes the engine's decode
+    /// allocation budget, counted the way the engine counts
+    /// its own decodes, four bytes a pixel, or one byte a
+    /// sample where an image has more than four components.
+    fn past_the_budget(&self) -> bool {
+        let pixels = self.width.saturating_mul(self.height);
+        pixels.saturating_mul(4).max(self.samples) > crate::engine::MAX_DECODE_ALLOC
+    }
+}
+
+/// The first JPEG 2000 image the document stores as is
+/// whose decoded size passes the decode budget (see
+/// [`JpxSize`]), or `None`. A `JPXDecode` stream holds the
+/// codestream itself, so its SOC and SIZ markers sit in the
+/// document's bytes, and the SIZ segment declares the size
+/// the renderer's decoder allocates for. The scan reads
+/// every SOC and SIZ pair whose segment is well formed
+/// (its length matches its component count, and the image
+/// is not empty); the odds that compressed bytes elsewhere
+/// form one are negligible. A codestream behind a further
+/// filter or encryption is out of its sight, and the
+/// renderer's address-space cap bounds that one instead.
+fn oversized_jpx(pdf: &[u8]) -> Option<JpxSize> {
+    let mut at = 0;
+    while let Some(found) = pdf[at..].iter().position(|&b| b == JPX_SOC_SIZ[0]) {
+        let start = at + found;
+        if pdf[start..].starts_with(&JPX_SOC_SIZ)
+            && let Some(size) = parse_jpx_siz(&pdf[start + JPX_SOC_SIZ.len()..])
+            && size.past_the_budget()
+        {
+            return Some(size);
+        }
+        at = start + 1;
+    }
+    None
+}
+
+/// Parse a JPEG 2000 SIZ marker segment, from its length
+/// field on: `Lsiz Rsiz Xsiz Ysiz XOsiz YOsiz XTsiz YTsiz
+/// XTOsiz YTOsiz Csiz`, then `Ssiz XRsiz YRsiz` per
+/// component, big-endian. `None` for a segment that is cut
+/// short or not well formed.
+fn parse_jpx_siz(segment: &[u8]) -> Option<JpxSize> {
+    let u16_at = |at: usize| -> Option<u16> {
+        Some(u16::from_be_bytes(
+            segment.get(at..at + 2)?.try_into().ok()?,
+        ))
+    };
+    let u32_at = |at: usize| -> Option<u64> {
+        Some(u64::from(u32::from_be_bytes(
+            segment.get(at..at + 4)?.try_into().ok()?,
+        )))
+    };
+    let length = usize::from(u16_at(0)?);
+    let (x, y) = (u32_at(4)?, u32_at(8)?);
+    let (x0, y0) = (u32_at(12)?, u32_at(16)?);
+    let components = u16_at(36)?;
+    let count = usize::from(components);
+    if count == 0 || count > 16384 || length != 38 + 3 * count || x <= x0 || y <= y0 {
+        return None;
+    }
+    let table = segment.get(38..38 + 3 * count)?;
+    let mut samples: u64 = 0;
+    for component in 0..count {
+        let dx = u64::from(table[3 * component + 1]);
+        let dy = u64::from(table[3 * component + 2]);
+        if dx == 0 || dy == 0 {
+            return None;
+        }
+        let width = x.div_ceil(dx) - x0.div_ceil(dx);
+        let height = y.div_ceil(dy) - y0.div_ceil(dy);
+        samples = samples.saturating_add(width.saturating_mul(height));
+    }
+    Some(JpxSize {
+        width: x - x0,
+        height: y - y0,
+        components,
+        samples,
+    })
 }
 
 /// The not-a-PDF refusal: bytes the probe cannot read
@@ -1504,5 +1650,276 @@ exit 0\n";
                 );
             }
         }
+    }
+
+    /// A JPEG 2000 SOC and SIZ pair declaring an image of
+    /// `x` by `y` on the reference grid, from `(x0, y0)`,
+    /// with one `(XRsiz, YRsiz)` subsampling per component.
+    fn jpx_siz(x: u32, y: u32, x0: u32, y0: u32, components: &[(u8, u8)]) -> Vec<u8> {
+        let mut out = JPX_SOC_SIZ.to_vec();
+        let count = u16::try_from(components.len()).unwrap();
+        out.extend_from_slice(&(38 + 3 * count).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        for value in [x, y, x0, y0, x, y, 0, 0] {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out.extend_from_slice(&count.to_be_bytes());
+        for &(dx, dy) in components {
+            out.extend_from_slice(&[7, dx, dy]);
+        }
+        out
+    }
+
+    const RGB: &[(u8, u8)] = &[(1, 1), (1, 1), (1, 1)];
+
+    #[test]
+    fn the_scan_reads_each_jpeg_2000_image_size_against_the_decode_budget() {
+        // The budget is the engine's: 256 MiB at four bytes a
+        // pixel (8192x8192 fits exactly), or one byte a
+        // sample past four components.
+        let at = |bytes: Vec<u8>| oversized_jpx(&bytes);
+        assert_eq!(at(jpx_siz(8192, 8192, 0, 0, RGB)), None);
+        let over = at(jpx_siz(16000, 16000, 0, 0, RGB)).expect("16000x16000 is over");
+        assert_eq!(
+            (over.width, over.height, over.components),
+            (16000, 16000, 3)
+        );
+        assert_eq!(over.samples, 3 * 16000 * 16000);
+        assert!(at(jpx_siz(8193, 8192, 0, 0, RGB)).is_some());
+        // The image is the grid less its offset.
+        assert_eq!(at(jpx_siz(16000, 8192, 8000, 0, RGB)), None);
+        assert!(at(jpx_siz(16000, 8192, 7000, 0, RGB)).is_some());
+        // Past four components, the samples count: sixteen
+        // at 4096x4096 fit, seventeen do not.
+        assert_eq!(at(jpx_siz(4096, 4096, 0, 0, &[(1, 1); 16])), None);
+        assert!(at(jpx_siz(4096, 4096, 0, 0, &[(1, 1); 17])).is_some());
+        // A subsampled component holds fewer samples, but the
+        // pixels alone can pass the budget.
+        let half = at(jpx_siz(9000, 9000, 0, 0, &[(1, 1), (2, 2), (2, 2)])).unwrap();
+        assert_eq!(half.samples, 81_000_000 + 2 * 4500 * 4500);
+        // The image may sit anywhere in the document, after
+        // stray marker bytes, and a later one counts too.
+        let mut document = b"%PDF-1.7 \xff\xff\x4f\xff junk".to_vec();
+        document.extend_from_slice(&jpx_siz(64, 64, 0, 0, RGB));
+        document.extend_from_slice(b" more ");
+        document.extend_from_slice(&jpx_siz(20000, 20000, 0, 0, &[(1, 1)]));
+        assert_eq!(oversized_jpx(&document).map(|s| s.width), Some(20000));
+    }
+
+    #[test]
+    fn the_scan_ignores_marker_bytes_that_are_not_a_size_segment() {
+        let big = jpx_siz(16000, 16000, 0, 0, RGB);
+        // The length must match the component count.
+        let mut wrong_length = big.clone();
+        wrong_length[5] += 1;
+        assert_eq!(oversized_jpx(&wrong_length), None);
+        // No components, or a zero subsampling.
+        assert_eq!(oversized_jpx(&jpx_siz(16000, 16000, 0, 0, &[])), None);
+        assert_eq!(
+            oversized_jpx(&jpx_siz(16000, 16000, 0, 0, &[(1, 1), (0, 1)])),
+            None
+        );
+        // An empty image (no extent past its offset).
+        assert_eq!(oversized_jpx(&jpx_siz(16000, 16000, 16000, 0, RGB)), None);
+        // Cut short anywhere.
+        for end in 0..big.len() {
+            assert_eq!(oversized_jpx(&big[..end]), None, "cut at {end}");
+        }
+        assert!(oversized_jpx(&big).is_some());
+    }
+
+    /// The JPEG 2000 file (a JP2 box sequence around its
+    /// codestream) FFmpeg's OpenJPEG encoder writes for one
+    /// 16000x16000 gray RGB frame.
+    const JPX_16000: &str = "0000000c6a5020200d0a870a00000014667479706a703220000000006a703220\
+0000002d6a703268000000166968647200003e8000003e800003070700000000000f636f6c720100000000\
+0010000000a76a703263ff4fff51002f000000003e8000003e80000000000000000000003e8000003e8000\
+000000000000000003070101070101070101ff52000c00000001000504040001ff5c001340404848504848\
+50484850484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e\
+20322e352e30ff90000a0000000000200001ff93808080808080808080808080808080808080ffd9";
+
+    fn jpx_16000() -> Vec<u8> {
+        (0..JPX_16000.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&JPX_16000[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A one-page 200x200 pt document that draws `image`, a
+    /// 16000x16000 RGB image XObject through `filter`.
+    fn image_pdf(filter: &str, image: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"%PDF-1.5\n");
+        let content = b"q 200 0 0 200 0 0 cm /Im0 Do Q";
+        let mut objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+        ];
+        let mut stream = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream.extend_from_slice(content);
+        stream.extend_from_slice(b"\nendstream");
+        objects.push(stream);
+        let mut xobject = format!(
+            "<< /Type /XObject /Subtype /Image /Width 16000 /Height 16000 \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter {filter} /Length {} >>\nstream\n",
+            image.len()
+        )
+        .into_bytes();
+        xobject.extend_from_slice(image);
+        xobject.extend_from_slice(b"\nendstream");
+        objects.push(xobject);
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(object);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn a_document_with_a_jpeg_2000_image_past_the_decode_budget_is_refused_before_any_tool_runs() {
+        // Both fake tools mark that they ran; neither may.
+        let dir = temp_dir("jpx-budget");
+        let marker = dir.join("ran");
+        let mark = |body: &str| {
+            format!(
+                "#!/bin/sh\ncat > /dev/null\ntouch \"{}\"\n{body}",
+                marker.display()
+            )
+        };
+        write_tool(
+            &dir,
+            "pdfinfo",
+            &mark(
+                "printf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  200 x 200 pts'\nexit 0\n",
+            ),
+        );
+        let program = write_tool(
+            &dir,
+            "pdftocairo",
+            &mark("printf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n"),
+        );
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer
+            .render_page(&image_pdf("/JPXDecode", &jpx_16000()), 1)
+            .unwrap_err();
+        assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("16000x16000 JPEG 2000 image with 3 components"),
+            "{err}"
+        );
+        assert!(!marker.exists(), "no tool may run");
+        // A document whose images fit runs as before.
+        let small = image_pdf("/JPXDecode", &jpx_siz(640, 480, 0, 0, RGB));
+        renderer.render_page(&small, 1).unwrap();
+        assert!(marker.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_pdf_tools_run_under_the_renderer_address_space_cap() {
+        // Each fake tool records its own address-space cap
+        // and OOM score: the renderer's cap, sized to the
+        // raster and decode budgets, and the highest score.
+        let dir = temp_dir("pdf-limits");
+        let record = dir.join("limits.log");
+        let report = format!(
+            "sleep 0.3\n\
+             grep '^Max address space' /proc/$$/limits | awk '{{print $4}}' >> \"{0}\"\n\
+             cat /proc/$$/oom_score_adj >> \"{0}\"\n",
+            record.display()
+        );
+        write_tool(
+            &dir,
+            "pdfinfo",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\n{report}printf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  200 x 200 pts'\nexit 0\n"
+            ),
+        );
+        let program = write_tool(
+            &dir,
+            "pdftocairo",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\n{report}printf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n"
+            ),
+        );
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        renderer.render_page(b"%PDF- fake", 1).unwrap();
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let cap = RENDERER_MAX_ADDRESS_SPACE.to_string();
+        assert_eq!(cap, (2u64 << 30).to_string());
+        let expected: Vec<&str> = [cap.as_str(), "1000"].repeat(2);
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            expected,
+            "probe then renderer: {recorded}"
+        );
+    }
+
+    #[test]
+    fn real_tools_refuse_a_document_with_a_jpeg_2000_image_past_the_decode_budget() {
+        // A document whose JPEG 2000 image declares
+        // 16000x16000 RGB is refused before any tool runs.
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(60)).unwrap();
+        let bytes = image_pdf("/JPXDecode", &jpx_16000());
+        assert_eq!(bytes.len(), 923);
+        let started = Instant::now();
+        let err = renderer.render_page(&bytes, 1).unwrap_err();
+        assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+        assert!(
+            err.to_string().contains("decode allocation budget"),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The same image behind an ASCIIHex filter, where the
+    /// scan cannot see its size: the renderer's address-space
+    /// cap stops the decode, about a gigabyte in, and the
+    /// renderer leaves the image out of the page, which
+    /// stays white instead of the image's gray. Ignored by
+    /// default for that gigabyte. Under a cap that holds the
+    /// whole decode, the page comes back gray.
+    #[test]
+    #[ignore = "allocates about 1 GiB in the renderer before its cap stops it"]
+    fn real_renderer_leaves_out_an_image_whose_decode_passes_its_cap() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(60)).unwrap();
+        let mut hex: Vec<u8> = jpx_16000()
+            .iter()
+            .flat_map(|b| format!("{b:02x}").into_bytes())
+            .collect();
+        hex.push(b'>');
+        let bytes = image_pdf("[/ASCIIHexDecode /JPXDecode]", &hex);
+        assert_eq!(oversized_jpx(&bytes), None, "the scan cannot see it");
+        let page = renderer.render_page(&bytes, 1).unwrap();
+        let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
+        assert_eq!((img.width(), img.height()), (400, 400));
+        let p = img.get_pixel(200, 200);
+        assert_eq!((p[0], p[1], p[2]), (255, 255, 255), "the image was drawn");
     }
 }

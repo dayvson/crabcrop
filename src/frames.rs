@@ -22,20 +22,23 @@
 //! and built entirely here:
 //!
 //! - Probe: `-nostdin -v info -protocol_whitelist fd
-//!   -format_whitelist <containers> -dump_separator <token>
-//!   -i fd:`. No output target is named, so the tool
-//!   prints its input report (duration, stream list) to
-//!   stderr and exits nonzero; the probe reads its facts
-//!   from that report and treats the exit status as
-//!   meaningless. The report also prints the source's own
-//!   metadata, so the token, random per probe, marks the
-//!   real stream lines (see [`parse_probe`]). A source with
-//!   no video stream in the report (a non-video, an
-//!   audio-only file, a corrupt container) is
+//!   -format_whitelist <containers> -threads 2
+//!   -max_pixels <pixels> -codec_whitelist <decoders>
+//!   -dump_separator <token> -i fd:`. No output target is
+//!   named, so the tool prints its input report (duration,
+//!   stream list) to stderr and exits nonzero; the probe
+//!   reads its facts from that report and treats the exit
+//!   status as meaningless. The report also prints the
+//!   source's own metadata, so the token, random per probe,
+//!   marks the real stream lines (see [`parse_probe`]). A
+//!   source with no video stream in the report (a
+//!   non-video, an audio-only file, a corrupt container) is
 //!   [`FrameError::NotVideo`].
 //! - Extract: `-nostdin -v info -protocol_whitelist fd
-//!   -format_whitelist <containers> -i fd: -ss <t>
-//!   -frames:v 1 -f image2pipe -vcodec png pipe:1`. The
+//!   -format_whitelist <containers> -filter_threads 2
+//!   -threads 2 -max_pixels <pixels> -codec_whitelist
+//!   <decoders> -i fd: -ss <t> -frames:v 1 -an -sn -dn
+//!   -threads 2 -f image2pipe -vcodec png pipe:1`. The
 //!   seek is output-side, which is the accurate form:
 //!   the tool decodes forward and returns the first frame
 //!   at or after `t`, and nothing when `t` is past the
@@ -52,6 +55,18 @@
 //! already holds, and refuses a descriptor named in a URL),
 //! so container indirection (a manifest naming a `file://`
 //! or network target) has nowhere to go.
+//!
+//! The decoder bounds hold the tool to the decode budget
+//! the extracted PNG has to pass anyway (issue #605 for the
+//! decoder list): a probed frame size past it is refused
+//! before any extraction runs, `-max_pixels` makes the
+//! decoder refuse a larger frame wherever it appears (a
+//! stream can change size after the frames the probe
+//! reads), the thread caps keep the frames a decoder holds
+//! in flight from scaling with the host's cores, and
+//! `-codec_whitelist` lets the tool open only the decoders
+//! of the video codecs it names. On Linux the kernel caps
+//! the tool's address space at 3 GiB behind all of that.
 //!
 //! The extracted PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -81,6 +96,52 @@ pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
 /// the byte stream the loader already validated, which is
 /// also why the protocol whitelist names only `fd`.
 const FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,flv,asf,ogg";
+
+/// The decoders the tool may open (issue #605), by FFmpeg
+/// decoder name: H.264 (`h264`, or `libopenh264` in builds
+/// without the native decoder), HEVC, VP8 and VP9 (native or
+/// libvpx), AV1 (dav1d, libaom, or the native decoder),
+/// MPEG-4 Part 2, MPEG-1 and MPEG-2 video, Theora, and
+/// Motion JPEG: the video codecs a web, broadcast, or camera
+/// file in the accepted containers carries. A stream in any
+/// other codec has no decoder the tool may open, so it
+/// yields no frame. Audio and subtitle decoders are absent
+/// too: the extraction maps no such stream (`-an -sn -dn`),
+/// and the probe only logs that it cannot open them.
+const CODEC_WHITELIST: &str = "h264,libopenh264,hevc,vp8,libvpx,vp9,libvpx-vp9,av1,libdav1d,\
+libaom-av1,mpeg4,mpeg1video,mpeg2video,theora,mjpeg";
+
+/// The most pixels a video frame may hold: the engine's
+/// decode allocation budget at four bytes a pixel
+/// ([`crate::engine::MAX_DECODE_ALLOC`], 64 Mi pixels), the
+/// budget the extracted PNG has to pass anyway. The tool's
+/// decoders get it as `-max_pixels`, and a probed frame size
+/// past it, or past [`crate::engine::MAX_DECODE_DIMENSION`]
+/// on a side, is refused before any extraction runs.
+const MAX_FRAME_PIXELS: u64 = crate::engine::MAX_DECODE_ALLOC / 4;
+
+/// The threads the tool's decoder, filters, and PNG encoder
+/// each get. A decoder holds about one frame in flight per
+/// thread, so FFmpeg's default of one thread per core made
+/// a run's memory grow with the host. Two threads measured
+/// as fast as the default or faster for H.264 extractions
+/// up to the frame budget on a 4-core host.
+const TOOL_THREADS: &str = "2";
+
+/// The tool's address-space cap on Linux, 3 GiB. An
+/// extraction at the frame budget needs about 1.7 GiB of
+/// address space (an 8192x8192 H.264 frame), and an 8K
+/// 10-bit HEVC frame, the heaviest common source, about
+/// 2.4 GiB, most of it decoder frames and the reservations
+/// of the tool's threads; the cap leaves headroom over that
+/// and turns any larger allocation into a tool error.
+const DECODER_MAX_ADDRESS_SPACE: u64 = 3 << 30;
+
+/// What FFmpeg logs when a decoder refuses a frame past
+/// `-max_pixels`. A run whose report says so and that
+/// produced no frame met the frame budget, which makes the
+/// source a bad one, not the tool a broken one.
+const PIXEL_BOUND_REPORT: &str = "exceeds specified max pixel count";
 
 /// How much of a tool's stderr report the probe keeps.
 /// The input report sits at the head of the output, and a
@@ -212,6 +273,7 @@ impl VideoFrameExtractor {
     /// invocation (issue #362).
     fn probe_until(&self, input: &File, deadline: Instant) -> Result<VideoProbe, FrameError> {
         let separator = probe_separator();
+        let max_pixels = MAX_FRAME_PIXELS.to_string();
         let run = self.run(
             &[
                 "-nostdin",
@@ -221,6 +283,12 @@ impl VideoFrameExtractor {
                 "fd",
                 "-format_whitelist",
                 FORMAT_WHITELIST,
+                "-threads",
+                TOOL_THREADS,
+                "-max_pixels",
+                &max_pixels,
+                "-codec_whitelist",
+                CODEC_WHITELIST,
                 "-dump_separator",
                 &separator,
                 "-i",
@@ -245,6 +313,11 @@ impl VideoFrameExtractor {
                      (frame extraction needs FFmpeg 6.0 or newer): {}",
                     run.stderr_excerpt()
                 ));
+            }
+            if met_the_pixel_bound(&run) {
+                // The decoder refused the stream's frame size,
+                // so the report may carry no size to check.
+                return frame_past_the_budget();
             }
             FrameError::NotVideo(
                 "the source has no video stream the decoder can read \
@@ -275,6 +348,10 @@ impl VideoFrameExtractor {
         let deadline = Instant::now() + self.timeout;
         let input = stage_input(video)?;
         let probe = self.probe_until(&input, deadline)?;
+        // A frame the decode budget refuses is refused here,
+        // before the extraction decodes it (the probe's own
+        // decoder is bounded the same way).
+        check_frame_size(probe.width, probe.height)?;
         let mut timestamp = resolve_timestamp(selection, &probe)?;
         let step = frame_interval(probe.fps);
         for attempt in 0..=3 {
@@ -311,8 +388,12 @@ impl VideoFrameExtractor {
     /// One extraction run at an already-resolved
     /// timestamp. An empty `Ok` means the tool ran fine
     /// and there is no frame at that time (the caller
-    /// decides whether to step back); any other failure
-    /// is `Failed`.
+    /// decides whether to step back). No frame from a run
+    /// whose decoder refused a frame past the budget is
+    /// `NotVideo`, whatever the exit status: an earlier
+    /// timestamp would only answer with a different frame
+    /// than the one asked for. Any other failure is
+    /// `Failed`.
     fn extract_at(
         &self,
         input: &File,
@@ -320,6 +401,7 @@ impl VideoFrameExtractor {
         deadline: Instant,
     ) -> Result<Vec<u8>, FrameError> {
         let seek = format_seconds(timestamp);
+        let max_pixels = MAX_FRAME_PIXELS.to_string();
         let run = self.run(
             &[
                 "-nostdin",
@@ -329,12 +411,25 @@ impl VideoFrameExtractor {
                 "fd",
                 "-format_whitelist",
                 FORMAT_WHITELIST,
+                "-filter_threads",
+                TOOL_THREADS,
+                "-threads",
+                TOOL_THREADS,
+                "-max_pixels",
+                &max_pixels,
+                "-codec_whitelist",
+                CODEC_WHITELIST,
                 "-i",
                 "fd:",
                 "-ss",
                 &seek,
                 "-frames:v",
                 "1",
+                "-an",
+                "-sn",
+                "-dn",
+                "-threads",
+                TOOL_THREADS,
                 "-f",
                 "image2pipe",
                 "-vcodec",
@@ -345,6 +440,9 @@ impl VideoFrameExtractor {
             MAX_FRAME_PNG_BYTES,
             deadline,
         )?;
+        if run.stdout.is_empty() && met_the_pixel_bound(&run) {
+            return Err(frame_past_the_budget());
+        }
         if !run.status.success() {
             return Err(FrameError::Failed(format!(
                 "video decoder exited with {}: {}",
@@ -380,6 +478,7 @@ impl VideoFrameExtractor {
             max_stderr: PROBE_REPORT_CAP,
             deadline,
             cpu_limit: tool_cpu_limit(self.timeout),
+            max_address_space: DECODER_MAX_ADDRESS_SPACE,
         })
         .map_err(|e| {
             FrameError::Failed(match e {
@@ -398,6 +497,35 @@ impl VideoFrameExtractor {
             })
         })
     }
+}
+
+/// Refuse a frame size past the decode budget (see
+/// [`MAX_FRAME_PIXELS`]), as a bad source: the PNG of such a
+/// frame could never pass the engine's decode limits.
+fn check_frame_size(width: u32, height: u32) -> Result<(), FrameError> {
+    let side = crate::engine::MAX_DECODE_DIMENSION;
+    if width > side || height > side || u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS {
+        return Err(FrameError::NotVideo(format!(
+            "the video's frames are {width}x{height}, past the decode budget \
+             ({side} px a side, {MAX_FRAME_PIXELS} pixels)"
+        )));
+    }
+    Ok(())
+}
+
+/// The refusal for a frame the decoder refused for its
+/// size, which the run does not name.
+fn frame_past_the_budget() -> FrameError {
+    FrameError::NotVideo(format!(
+        "a frame of the video is past the decode budget ({MAX_FRAME_PIXELS} pixels), \
+         and the decoder refused it"
+    ))
+}
+
+/// Whether a run's report says the decoder refused a frame
+/// past `-max_pixels` (see [`PIXEL_BOUND_REPORT`]).
+fn met_the_pixel_bound(run: &ToolRun) -> bool {
+    run.stderr.contains(PIXEL_BOUND_REPORT) || run.stderr_excerpt().contains(PIXEL_BOUND_REPORT)
 }
 
 /// Stage the source bytes for the tool's stdin (issue
