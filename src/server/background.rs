@@ -6,8 +6,8 @@
 //! render has started (it finishes and is stored even when
 //! its client goes away), and a purge's background walk
 //! all outlive the request that started them. Each one is
-//! spawned through [`Background`], so
-//! none is a bare `tokio::spawn`: every one is tracked.
+//! spawned through [`Background`], so none is a bare
+//! `tokio::spawn`: every one is tracked.
 //! The write-throughs are bounded here too, since every
 //! miss starts one and nothing else limits them; purges
 //! are signed, and their walks wait for a turn (issue
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 
 /// How many shared-tier writes a process keeps in flight
 /// (issue #463). Each one holds a whole rendered entry
@@ -40,18 +41,28 @@ pub const SHARED_PUTS_AT_ONCE: usize = 64;
 /// on its own deadline rather than on the platform's.
 pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 8;
 
-/// The detached work of one server: write-throughs, purges
-/// and disk-hit follow-ups that a shutdown waits for, and
-/// background purge walks that it does not. Clones share
-/// everything.
+/// The detached work of one server: write-throughs, purges,
+/// disk-hit follow-ups and image misses that a shutdown
+/// waits for, and background purge walks that it does not.
+/// Clones share everything.
 #[derive(Clone, Debug)]
 pub struct Background {
     /// Detached work a shutdown drain waits for, up to its
     /// deadline: shared-tier write-throughs, purge fan-outs
-    /// whose request may have gone, a disk hit's follow-up
-    /// writes, and cache misses whose client may have gone
-    /// after their render started.
+    /// whose request may have gone, and a disk hit's
+    /// follow-up writes.
     writes: TaskTracker,
+    /// Image misses, each on a task of its own so that a
+    /// render that has started outlives a client that goes
+    /// away (see `finish_started_miss`). A shutdown drain
+    /// waits for them before the writes, which they start.
+    /// While its client is there, a miss is part of a
+    /// request in flight, not background work.
+    misses: TaskTracker,
+    /// The misses whose client has gone after their render
+    /// started, each counted by a token it holds until it
+    /// ends: the background work among `misses`.
+    misses_left: TaskTracker,
     /// Background purge walks (issue #462). A drain never
     /// waits for them: a walk cut short leaves its purge's
     /// bucket tombstone unended, which keeps the purge in
@@ -81,6 +92,11 @@ impl Default for Background {
 pub struct Drained {
     /// Tracked writes that had not finished: abandoned.
     pub writes: usize,
+    /// Renders whose client had gone that had not finished:
+    /// abandoned, so they are not stored. A miss whose
+    /// client is still there is a request in flight and is
+    /// not counted here.
+    pub renders: usize,
     /// Background purge walks, never waited for: stopped.
     pub walks: usize,
 }
@@ -90,6 +106,8 @@ impl Background {
     pub fn new(put_capacity: usize) -> Self {
         Self {
             writes: TaskTracker::new(),
+            misses: TaskTracker::new(),
+            misses_left: TaskTracker::new(),
             walks: TaskTracker::new(),
             put_slots: Arc::new(Semaphore::new(put_capacity)),
             put_capacity,
@@ -107,6 +125,25 @@ impl Background {
         F::Output: Send + 'static,
     {
         self.writes.spawn(task)
+    }
+
+    /// Run an image miss on a task of its own, which a
+    /// shutdown drain waits for. Its request awaits the
+    /// handle; once its client has gone, the miss counts as
+    /// background work for as long as it holds the token of
+    /// [`Background::client_left`].
+    pub(crate) fn spawn_miss<F>(&self, task: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.misses.spawn(task)
+    }
+
+    /// Count a miss whose client has gone (see
+    /// [`Background::spawn_miss`]) until the token drops.
+    pub(crate) fn client_left(&self) -> TaskTrackerToken {
+        self.misses_left.token()
     }
 
     /// Run a background purge walk: tracked, but never
@@ -162,24 +199,33 @@ impl Background {
         self.puts_skipped.load(Ordering::Relaxed)
     }
 
-    /// Wait until the tracked writes have finished, or until
-    /// `deadline`, whichever comes first, and report what is
-    /// still running. Work spawned while the drain waits
-    /// (by requests that are still finishing) is waited for
-    /// too. Background purge walks are not: a walk cut
-    /// short leaves its purge in force (issue #461), so
-    /// they are only counted.
+    /// Wait until the tracked misses and writes have
+    /// finished, or until `deadline`, whichever comes first,
+    /// and report what is still running. The misses go
+    /// first, since a miss that finishes starts its writes.
+    /// Work spawned while the drain waits (by requests that
+    /// are still finishing) is waited for too. Background
+    /// purge walks are not: a walk cut short leaves its
+    /// purge in force (issue #461), so they are only
+    /// counted.
     pub async fn drain(&self, deadline: tokio::time::Instant) -> Drained {
+        self.misses.close();
         self.writes.close();
-        let _ = tokio::time::timeout_at(deadline, self.writes.wait()).await;
+        let _ = tokio::time::timeout_at(deadline, async {
+            self.misses.wait().await;
+            self.writes.wait().await;
+        })
+        .await;
         self.running()
     }
 
-    /// The tracked writes and background purge walks
-    /// running right now.
+    /// The tracked writes, the renders whose client has
+    /// gone, and the background purge walks running right
+    /// now.
     pub fn running(&self) -> Drained {
         Drained {
             writes: self.writes.len(),
+            renders: self.misses_left.len(),
             walks: self.walks.len(),
         }
     }

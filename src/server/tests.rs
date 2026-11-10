@@ -9526,7 +9526,7 @@ fn provenance_job(
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        render_started: Default::default(),
+        progress: Default::default(),
     }
 }
 
@@ -10218,7 +10218,7 @@ async fn processing_gate_bounds_concurrency() {
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
-        render_started: Default::default(),
+        progress: Default::default(),
     };
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let png = test_png();
@@ -10351,7 +10351,7 @@ async fn timed_out_encode_releases_the_process_gate() {
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
             jxl_speed: state.jxl_speed,
-            render_started: Default::default(),
+            progress: Default::default(),
         }
     };
     let stuck_job = job(
@@ -11096,7 +11096,7 @@ fn lane_test_job(
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        render_started: Default::default(),
+        progress: Default::default(),
     }
 }
 
@@ -11537,7 +11537,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
-        render_started: Default::default(),
+        progress: Default::default(),
     };
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let png = test_png();
@@ -13444,6 +13444,334 @@ async fn a_request_dropped_before_its_render_starts_starts_none() {
         2,
         "the dropped request kept its AI permit"
     );
+}
+
+#[tokio::test]
+async fn a_waiter_past_the_wait_cap_finishes_a_render_its_client_left() {
+    // A request whose flights keep ending without an
+    // answer for it stops waiting once its cap is spent
+    // and runs the miss path itself (issue #375). That
+    // miss is finished like a leader's: once its render
+    // has started, the render is stored even though the
+    // client leaves, and the replay is a hit.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(1);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    // The request's key, read from the flight of a first
+    // request that waits for the only lane and is dropped
+    // there, before any render.
+    let lane = state.process_gate.clone().acquire_owned().await.unwrap();
+    let first = start_request(&state, &remainder, None);
+    wait_until("the first request leads a flight", || {
+        state.inflight.image_flights().len() == 1
+    })
+    .await;
+    let key = state.inflight.image_flights().remove(0).0;
+    disconnect(first).await;
+    drop(lane);
+    wait_until("its flight ended", || {
+        state.inflight.image_flights().is_empty()
+    })
+    .await;
+    // The test leads the key's flights from here: each
+    // ends with no answer for the request, and the next
+    // begins in the same step, so the request follows
+    // each in turn until its cap is spent.
+    let lead = || match state.inflight.lead(&key) {
+        Flight::Leader(guard, _) => guard,
+        Flight::Follower(..) => panic!("the key already had a flight"),
+    };
+    let mut flight = lead();
+    let request = start_request(&state, &remainder, None);
+    for _ in 0..MAX_FLIGHT_WAITS {
+        wait_until("the request waits on the flight", || {
+            state.inflight.image_flights() == [(key.clone(), 1)]
+        })
+        .await;
+        drop(flight);
+        flight = lead();
+    }
+    wait_until("the request's own render started", || {
+        calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    disconnect(request).await;
+    drop(flight);
+    open_release(&release);
+    // The request's own miss runs outside any flight, so a
+    // replay would not wait for it: wait for the entry it
+    // stores. A miss dropped with its client stores none.
+    wait_until("the render is stored", || state.cache.get(&key).is_some()).await;
+    assert_eq!(state.process_gate.in_use(), 0);
+    let replay = start_request(&state, &remainder, None).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay.headers()["cache-status"],
+        "crabcrop; hit",
+        "the replay rendered again"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the first request's fetch and the request's own"
+    );
+}
+
+/// A source server that counts its hits and answers each
+/// one only once the returned sender is set to `true`.
+async fn spawn_held_server(
+    body: Vec<u8>,
+) -> (String, Arc<AtomicUsize>, tokio::sync::watch::Sender<bool>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (open, opened) = tokio::sync::watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counted = hits.clone();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut opened = opened.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let _ = opened.wait_for(|open| *open).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+    (format!("http://{addr}/fallback.png"), hits, open)
+}
+
+#[tokio::test]
+async fn a_source_that_did_not_decode_gets_no_fallback_once_its_client_left() {
+    // A source that loads but does not decode is rendered
+    // again on the configured fallback. A fallback is never
+    // stored, so for a client that has gone that run would
+    // answer nobody: a miss finished for a client that left
+    // during its render neither fetches the fallback nor
+    // starts a second render. The fake decoder holds the
+    // render until the test lets it fail.
+    let dir = crate::test_support::scratch_dir("server-fallback-left");
+    let started = dir.join("started");
+    let release = dir.join("release");
+    let script = format!(
+        "#!/bin/sh\ncat > /dev/null\n: > \"{}\"\nwhile [ ! -e \"{}\" ]; do sleep 0.02; done\nexit 1\n",
+        started.display(),
+        release.display()
+    );
+    let decoder = dir.join("decoder.sh");
+    crate::test_support::write_script(&decoder, &script);
+    let (src, _) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+    let (fallback, fallback_hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), 1, 1);
+    state.frame_extractor = Some(Arc::new(
+        crate::frames::VideoFrameExtractor::new(decoder, std::time::Duration::from_secs(30))
+            .unwrap(),
+    ));
+    state.fallback = Some(Fallback::Url(fallback));
+    let remainder = format!("frame:1.5/40x30/{src}");
+    let request = start_request(&state, &remainder, None);
+    wait_until("the render started", || started.exists()).await;
+    disconnect(request).await;
+    std::fs::write(&release, b"").unwrap();
+    wait_until("the miss ended", || {
+        state.inflight.image_flights().is_empty()
+    })
+    .await;
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "the fallback was fetched for a client that had gone"
+    );
+    assert_eq!(state.slow_gate.in_use(), 0);
+}
+
+#[tokio::test]
+async fn a_fallback_whose_client_left_while_it_loaded_starts_no_render() {
+    // The same rule when the client leaves later, while the
+    // fallback loads: the load ends, and the fallback render
+    // does not start when its lane comes free.
+    let (garbage, _) = spawn_counting_server(200, "image/png", b"not an image".to_vec()).await;
+    let (fallback, fallback_hits, open_fallback) = spawn_held_server(test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(1);
+    // Renders are not held here: the double only counts
+    // them.
+    open_release(&release);
+    state.fallback = Some(Fallback::Url(fallback));
+    let remainder = format!("filters:upscale(2)/{garbage}");
+    let request = start_request(&state, &remainder, None);
+    wait_until("the fallback is loading", || {
+        fallback_hits.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    disconnect(request).await;
+    open_fallback.send_replace(true);
+    wait_until("the miss ended", || {
+        state.inflight.image_flights().is_empty()
+    })
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a fallback render started for a client that had gone"
+    );
+    assert_eq!(state.process_gate.in_use(), 0);
+    assert_eq!(state.ai_gate.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn followers_of_a_leader_that_forwent_its_fallback_get_the_fallback() {
+    // A leader that forwent its fallback run ends with the
+    // decode failure, which is not the answer its request
+    // would have had. A follower with the same request must
+    // not take it from the flight: it makes its own attempt
+    // and gets the fallback, as a request on its own does.
+    let (garbage, garbage_hits) =
+        spawn_counting_server(200, "image/png", b"not an image".to_vec()).await;
+    let (fallback, fallback_hits, open_fallback) = spawn_held_server(test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(2);
+    open_release(&release);
+    state.fallback = Some(Fallback::Url(fallback));
+    let remainder = format!("filters:upscale(2)/{garbage}");
+    let leader = start_request(&state, &remainder, None);
+    wait_until("the leader's fallback is loading", || {
+        fallback_hits.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let follower = start_request(&state, &remainder, None);
+    wait_until("the follower waits on the flight", || {
+        state
+            .inflight
+            .image_flights()
+            .first()
+            .is_some_and(|(_, waiting)| *waiting == 1)
+    })
+    .await;
+    disconnect(leader).await;
+    open_fallback.send_replace(true);
+    let answer = follower.await.unwrap();
+    assert_eq!(answer.status(), StatusCode::OK);
+    assert_eq!(answer.headers()["x-crabcrop-fallback"], "1");
+    let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let image = image::load_from_memory(&body).unwrap();
+    assert_eq!((image.width(), image.height()), (200, 120));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the follower's fallback rendered"
+    );
+    assert_eq!(garbage_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_counts_a_miss_once_its_client_has_left() {
+    // Every image miss runs on a task of its own. While its
+    // client is there it is part of a request in flight, so
+    // the drain does not count it as background work (a
+    // request cut off at the grace used to be reported as
+    // a dropped background write). Once its client has
+    // gone after the render started, the drain waits for
+    // it and, cut off, reports it as a render.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(1);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    let request = start_request(&state, &remainder, None);
+    wait_until("the render started", || calls.load(Ordering::SeqCst) == 1).await;
+    let nothing = Drained {
+        writes: 0,
+        renders: 0,
+        walks: 0,
+    };
+    assert_eq!(
+        state.background.running(),
+        nothing,
+        "a connected request's miss counted as background work"
+    );
+    disconnect(request).await;
+    wait_until("the miss counts as a render whose client left", || {
+        state.background.running().renders == 1
+    })
+    .await;
+    let left = state.background.drain(tokio::time::Instant::now()).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            renders: 1,
+            walks: 0
+        }
+    );
+    // With time to spare, the drain returns once the render
+    // is stored.
+    open_release(&release);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(deadline).await, nothing);
+    let replay = start_request(&state, &remainder, None).await.unwrap();
+    assert_eq!(replay.headers()["cache-status"], "crabcrop; hit");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_waits_for_the_write_a_left_render_starts() {
+    // A render whose client has gone starts its shared-tier
+    // write when it finishes, after the drain has begun.
+    // The drain waits for the misses before the writes, so
+    // that write is waited for too.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let mut state = tier_test_state(None, &fake.endpoint);
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.upscale = Some(Arc::new(HeldUpscale {
+        release: release.clone(),
+        calls: calls.clone(),
+    }));
+    let _open = OpenOnDrop(release.clone());
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let request = start_request(&state, &format!("filters:upscale(2)/{src}"), None);
+    wait_until("the render started", || calls.load(Ordering::SeqCst) == 1).await;
+    disconnect(request).await;
+    wait_until("the miss counts as a render whose client left", || {
+        state.background.running().renders == 1
+    })
+    .await;
+    let background = state.background.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let drain = tokio::spawn(async move { background.drain(deadline).await });
+    open_release(&release);
+    wait_until("the render's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(
+        !drain.is_finished(),
+        "the drain ended before the write the render started"
+    );
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    assert_eq!(
+        drain.await.unwrap(),
+        Drained {
+            writes: 0,
+            renders: 0,
+            walks: 0
+        }
+    );
+    assert_eq!(entry_objects(&fake), 1);
 }
 
 /// Fire `n` concurrent meta requests for one URL and
@@ -16634,6 +16962,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
         left,
         Drained {
             writes: 0,
+            renders: 0,
             walks: 0
         }
     );
@@ -16691,6 +17020,7 @@ async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
         left,
         Drained {
             writes: 1,
+            renders: 0,
             walks: 0
         }
     );
@@ -16704,6 +17034,7 @@ async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
         left,
         Drained {
             writes: 0,
+            renders: 0,
             walks: 0
         }
     );
@@ -16746,6 +17077,7 @@ async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
         left,
         Drained {
             writes: 0,
+            renders: 0,
             walks: 1
         }
     );
