@@ -566,10 +566,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             state.metrics.render(),
             lane_metrics(&state),
             source_buffer_metrics(&state),
+            source_lookup_metrics(&state),
             tier_metrics(&state)
         ),
     )
@@ -623,6 +624,24 @@ fn source_buffer_metrics(state: &AppState) -> String {
          crabcrop_source_buffer_capacity_bytes {}\n",
         budget.in_use(),
         budget.capacity()
+    )
+}
+
+/// Source host lookup slot occupancy for `/metrics`: the
+/// lookups running right now against the slots (see
+/// [`crate::loader::LOOKUP_SLOTS`]), read live at scrape time.
+/// In flight sitting at capacity while requests shed with
+/// `server_busy` means the resolver is not answering for the
+/// host names requests carry.
+fn source_lookup_metrics(state: &AppState) -> String {
+    let (in_flight, capacity) = state.loader.lookup_slots();
+    format!(
+        "# HELP crabcrop_source_lookups_in_flight Source host lookups running now.\n\
+         # TYPE crabcrop_source_lookups_in_flight gauge\n\
+         crabcrop_source_lookups_in_flight {in_flight}\n\
+         # HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.\n\
+         # TYPE crabcrop_source_lookups_capacity gauge\n\
+         crabcrop_source_lookups_capacity {capacity}\n"
     )
 }
 
@@ -1134,6 +1153,9 @@ async fn explain_handle(
 /// operator's facts, not the caller's (issue #196,
 /// requirement 3).
 fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
+    if let Some(busy) = load_busy_response(&e, accept) {
+        return busy;
+    }
     eprintln!("explain load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
@@ -4075,16 +4097,16 @@ async fn load_source(
             record.load = load_start.elapsed();
             // A policy refusal (Forbidden) is a decision, not a
             // failure: it never falls back. Neither does an
-            // exhausted budget (issue #403): that is overload,
-            // and the fallback would need budget too. Nor does
-            // source text that does not parse (issue #467): a
-            // 400 stays honest, like a grammar failure. Any
-            // other load failure degrades to the configured
-            // fallback when there is one.
-            let fb = if matches!(
-                e,
-                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
-            ) {
+            // exhausted source budget or lookup slots (issue
+            // #403): that is overload, and the fallback would
+            // need budget too. Nor does source text that does
+            // not parse (issue #467): a 400 stays honest, like
+            // a grammar failure. Any other load failure
+            // degrades to the configured fallback when there
+            // is one.
+            let fb = if e.is_busy()
+                || matches!(e, LoadError::Forbidden(_) | LoadError::InvalidSource(_))
+            {
                 None
             } else {
                 fallback_source_bytes(state, charge).await
@@ -4094,7 +4116,7 @@ async fn load_source(
                 None => {
                     // A budget shed is overload, like a full
                     // gate, not a loader error (issue #403).
-                    if e != LoadError::Busy {
+                    if !e.is_busy() {
                         record.fail = FailStage::Load;
                     }
                     return Err(Box::new(load_error_response(e, accept)));
@@ -4138,7 +4160,7 @@ async fn load_watermarks(
         {
             Ok(b) => b,
             Err(e) => {
-                if e != LoadError::Busy {
+                if !e.is_busy() {
                     record.fail = FailStage::Load;
                 }
                 return Err(Box::new(load_error_response(e, accept)));
@@ -4637,6 +4659,21 @@ fn source_budget_busy(accept: Option<&str>) -> Response {
 
 const SOURCE_BUDGET_BUSY: &str = "server busy: too many source images held in memory";
 
+const SOURCE_LOOKUP_BUSY: &str = "server busy: too many source host lookups waiting";
+
+/// The 503 for a load shed as overload, when `e` is one: the
+/// source buffer budget's, or the host lookup slots' (see
+/// [`crate::loader::LOOKUP_SLOTS`]), which carries the gates'
+/// Retry-After, since a slot that stayed taken for the whole
+/// wait is held by a lookup the resolver is not answering.
+fn load_busy_response(e: &LoadError, accept: Option<&str>) -> Option<Response> {
+    match e {
+        LoadError::Busy => Some(source_budget_busy(accept)),
+        LoadError::LookupBusy => Some(busy_response(SOURCE_LOOKUP_BUSY, 5, accept)),
+        _ => None,
+    }
+}
+
 /// A 503 for a saturated gate. Retry-After tells clients
 /// and CDNs when a retry has a chance, instead of letting
 /// them retry straight into the same full queue; the value
@@ -4683,8 +4720,10 @@ fn sealed_or(sealed: bool, resp: Response) -> Response {
 /// generic message (PL-6). A policy refusal is
 /// genericized the same way the explain path does it
 /// (issue #196, requirement 3): the reason can name a
-/// resolved address or a bucket, which are the operator's
-/// facts, not the caller's.
+/// bucket, which is the operator's fact, not the caller's.
+/// A host name that resolves to a non-public address is a
+/// [`LoadError::Network`] cause, so it answers exactly as a
+/// name that does not resolve.
 fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
     match e {
         LoadError::Forbidden(_) => (
@@ -4739,12 +4778,17 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
             "server_busy",
             SOURCE_BUDGET_BUSY.to_string(),
         ),
+        LoadError::LookupBusy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_busy",
+            SOURCE_LOOKUP_BUSY.to_string(),
+        ),
     }
 }
 
 fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
-    if e == LoadError::Busy {
-        return source_budget_busy(accept);
+    if let Some(busy) = load_busy_response(&e, accept) {
+        return busy;
     }
     eprintln!("load error: {e}");
     let (status, code, message) = load_error_parts(e);

@@ -2499,6 +2499,12 @@ async fn assert_error_modes(
 fn load_error_cases() -> Vec<(LoadError, StatusCode, &'static str, String)> {
     vec![
         (
+            LoadError::LookupBusy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_busy",
+            "server busy: too many source host lookups waiting".to_string(),
+        ),
+        (
             LoadError::Forbidden("a policy reason".to_string()),
             StatusCode::FORBIDDEN,
             "source_forbidden",
@@ -7152,13 +7158,13 @@ fn oversized_source_is_a_bad_gateway() {
 }
 
 #[tokio::test]
-async fn policy_refusal_body_names_no_resolution() {
-    // The refusal reason can carry a server-side DNS
-    // resolution; the image path answers with the same
-    // generic body as the explain path (issue #196,
-    // requirement 3), and the reason stays in the log.
+async fn policy_refusal_body_names_no_reason() {
+    // The refusal reason can name operator configuration;
+    // the image path answers with the same generic body as
+    // the explain path (issue #196, requirement 3), and the
+    // reason stays in the log.
     let resp = load_error_response(
-        LoadError::Forbidden("host localhost resolves to a non-public address (::1)".to_string()),
+        LoadError::Forbidden("bucket private-media is not an allowed source".to_string()),
         None,
     );
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -17618,4 +17624,297 @@ async fn concurrent_slow_svg_http_explains_leave_health_responsive() {
         })
         .collect();
     health_stays_responsive_during_slow_explains(urls, &base).await;
+}
+
+/// One answer, as a client can see it: the status, the
+/// headers that do not vary per request, and the body.
+async fn visible_answer(resp: reqwest::Response) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+    let status = resp.status();
+    let mut headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "date" | "x-request-id"))
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
+        .collect();
+    headers.sort();
+    (status, headers, resp.bytes().await.unwrap().to_vec())
+}
+
+/// The answers to the signed `remainders`, on the image route
+/// and the explain route, plain and with a JSON `Accept`.
+async fn answers_for(
+    base: &str,
+    remainders: &[String],
+) -> Vec<Vec<(StatusCode, Vec<(String, String)>, Vec<u8>)>> {
+    let mut all = Vec::new();
+    for route in ["", "explain/"] {
+        for accept in ["*/*", "application/json"] {
+            let mut answers = Vec::new();
+            for remainder in remainders {
+                let resp = client()
+                    .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+                    .header(header::ACCEPT, accept)
+                    .send()
+                    .await
+                    .unwrap();
+                answers.push(visible_answer(resp).await);
+            }
+            all.push(answers);
+        }
+    }
+    all
+}
+
+/// A served state whose loader is `loader`, with `fallback`,
+/// and `/metrics` open to the bearer `metrics-token`.
+async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
+    let mut state = tier_test_state(None, "http://127.0.0.1:9");
+    state.shared_store = None;
+    state.loader = loader;
+    state.fallback = fallback;
+    state.metrics_token = Some("metrics-token".to_string());
+    serve_state(&state).await
+}
+
+/// The value of the unlabeled series `name` in `exposition`.
+fn metric_value(exposition: &str, name: &str) -> Option<String> {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .map(str::to_string)
+}
+
+/// A host name that resolves to a non-public address and one
+/// that does not resolve get the same answer, on the image
+/// and explain routes, with and without a fallback image: the
+/// caller sent only the name, so the answer must not tell it
+/// which names resolve inside the server's network.
+#[tokio::test]
+async fn a_name_resolving_inward_answers_like_a_name_that_does_not_resolve() {
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_policy(crate::loader::SourcePolicy::new(vec![], true))
+        .with_host_lookup(
+            |host| match host {
+                "internal.test" => Ok(vec!["10.96.0.12".parse().unwrap()]),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                )),
+            },
+            crate::loader::LOOKUP_SLOTS,
+            crate::loader::LOOKUP_WAIT,
+        );
+    let remainders = [
+        "64x64/http://internal.test/x.png".to_string(),
+        "64x64/http://missing.test/x.png".to_string(),
+    ];
+    for fallback in [None, Some(Fallback::Bytes(Arc::new(test_png())))] {
+        let with_fallback = fallback.is_some();
+        let base = serve_loader(loader.clone(), fallback).await;
+        for answers in answers_for(&base, &remainders).await {
+            assert_eq!(
+                answers[0], answers[1],
+                "fallback {with_fallback}: inward and missing names differ"
+            );
+        }
+        // The answer is the fetch failure (or the fallback in
+        // its place on the image route), never the refusal.
+        let resp = client()
+            .get(format!("{base}/{}/{}", sign(&remainders[0]), remainders[0]))
+            .send()
+            .await
+            .unwrap();
+        if with_fallback {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers()["x-crabcrop-fallback"], "1");
+        } else {
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(resp.text().await.unwrap(), "source fetch failed");
+        }
+    }
+}
+
+/// File paths that leave the root answer exactly like a
+/// missing file whatever is at them, on the image and explain
+/// routes, through a source and through a watermark.
+#[tokio::test]
+async fn file_paths_outside_the_root_answer_alike_whatever_exists_there() {
+    let dir = crate::test_support::scratch_dir("file-outside-root");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("ok.png"), test_png()).unwrap();
+    std::fs::write(dir.join("outside.png"), test_png()).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        });
+    let base = serve_loader(loader, None).await;
+    let remainders = [
+        "64x64/file:///..%2foutside.png%2fx".to_string(),
+        "64x64/file:///..%2fmissing.png%2fx".to_string(),
+        "64x64/file:///..%2foutside.png".to_string(),
+        "64x64/file:///missing.png".to_string(),
+    ];
+    for answers in answers_for(&base, &remainders).await {
+        for answer in &answers[1..] {
+            assert_eq!(&answers[0], answer, "file answers differ");
+        }
+    }
+    let resp = client()
+        .get(format!("{base}/{}/{}", sign(&remainders[0]), remainders[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // A watermark loads through the same loader.
+    let watermarks: Vec<String> = ["..%252foutside.png%252fx", "..%252fmissing.png%252fx"]
+        .iter()
+        .map(|path| format!("filters:watermark(file%3A%2F%2F%2F{path},0,0,50)/file:///ok.png"))
+        .collect();
+    let mut seen = Vec::new();
+    for remainder in &watermarks {
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(remainder)))
+            .send()
+            .await
+            .unwrap();
+        seen.push(visible_answer(resp).await);
+    }
+    assert_eq!(seen[0], seen[1], "watermark answers differ");
+    assert_eq!(seen[0].0, StatusCode::NOT_FOUND);
+    // Inside the root still loads.
+    let remainder = "64x64/file:///ok.png";
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", sign(remainder)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    drop(dir);
+}
+
+/// A load shed because every host lookup slot stayed taken
+/// answers the gates' `503 server_busy` with `Retry-After`,
+/// on the image route, the explain route and for a
+/// watermark, and never falls back: it is overload, and the
+/// fallback could need a lookup too. Nor is it counted as a
+/// load failure. `/metrics` shows the slots in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_shed_answers_busy_and_never_falls_back() {
+    let dir = crate::test_support::scratch_dir("lookup-shed");
+    std::fs::write(dir.join("ok.png"), test_png()).unwrap();
+    let root = std::fs::canonicalize(&*dir).unwrap();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let started = Arc::new(AtomicUsize::new(0));
+    let held = Arc::clone(&gate);
+    let counter = Arc::clone(&started);
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_policy(crate::loader::SourcePolicy::new(vec![], true))
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        })
+        .with_host_lookup(
+            move |_host| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (released, wake) = &*held;
+                let mut released = released.lock().unwrap();
+                let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !*released && std::time::Instant::now() < give_up {
+                    released = wake
+                        .wait_timeout(released, std::time::Duration::from_millis(50))
+                        .unwrap()
+                        .0;
+                }
+                Err(std::io::Error::other("resolver did not answer"))
+            },
+            1,
+            std::time::Duration::from_millis(100),
+        );
+    let base = serve_loader(loader, Some(Fallback::Bytes(Arc::new(test_png())))).await;
+    let first = "64x64/http://first.test/x.png".to_string();
+    let url = format!("{base}/{}/{first}", sign(&first));
+    let holder = tokio::spawn(async move { client().get(url).send().await.unwrap().status() });
+    // Wait until the held request's lookup has the one slot.
+    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "the lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let shed = [
+        "64x64/http://second.test/x.png".to_string(),
+        "explain/64x64/http://second.test/x.png".to_string(),
+        "64x64/filters:watermark(http%3A%2F%2Fsecond.test%2Fw.png,0,0,50)/file:///ok.png"
+            .to_string(),
+    ];
+    for path in &shed {
+        let remainder = path.strip_prefix("explain/").unwrap_or(path);
+        let route = if path.starts_with("explain/") {
+            "explain/"
+        } else {
+            ""
+        };
+        let resp = client()
+            .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "{path}"
+        );
+        assert!(
+            resp.headers().get("x-crabcrop-fallback").is_none(),
+            "{path}"
+        );
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "server busy: too many source host lookups waiting",
+            "{path}"
+        );
+    }
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "a shed load started a lookup"
+    );
+    let exposition = scrape(&base, "metrics-token").await;
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_loader_errors_total").as_deref(),
+        Some("0"),
+        "a shed counted as a load failure"
+    );
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_in_flight").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_capacity").as_deref(),
+        Some("1")
+    );
+    {
+        let (released, wake) = &*gate;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    // The held request's lookup failed: the fallback stands in.
+    assert_eq!(holder.await.unwrap(), StatusCode::OK);
+    let exposition = scrape(&base, "metrics-token").await;
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_in_flight").as_deref(),
+        Some("0")
+    );
+    drop(dir);
 }
