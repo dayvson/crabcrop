@@ -416,18 +416,20 @@ fn an_svg_draws_no_file_its_hrefs_name_whatever_the_working_directory_holds() {
     // usvg reads an image href that is not a data URL as a
     // file path, relative to the working directory the worker
     // inherits from the server. Start the server from a
-    // directory that holds a `data:` directory and a file
-    // named like a fragment reference, with a red PNG outside
-    // the file root: neither href may draw it.
+    // directory that holds a `data:` directory, a file named
+    // like a fragment reference, and one under a directory
+    // named like one, with a red PNG outside the file root:
+    // none of these hrefs may draw a file.
     let work = common::scratch_dir("svg-isolation-href");
     let (root, cwd, outside) = (work.join("root"), work.join("cwd"), work.join("outside"));
-    for dir in [&root, &cwd, &outside, &cwd.join("data:")] {
+    for dir in [&root, &cwd, &outside, &cwd.join("data:"), &cwd.join("#d")] {
         std::fs::create_dir(dir).unwrap();
     }
     let red = solid_png([255, 0, 0, 255]);
     let secret = outside.join("secret.png");
     std::fs::write(&secret, &red).unwrap();
     std::fs::write(cwd.join("#red.png"), &red).unwrap();
+    std::fs::write(cwd.join("#d").join("red.png"), &red).unwrap();
     // `cwd/data:/..` is `cwd`; enough further `..` reach `/`.
     let ups = "../".repeat(cwd.components().count() + 2);
     let through_data = format!(
@@ -435,7 +437,7 @@ fn an_svg_draws_no_file_its_hrefs_name_whatever_the_working_directory_holds() {
         secret.to_str().unwrap().trim_start_matches('/')
     );
     let svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><rect width=\"100\" height=\"100\" fill=\"#00ff00\"/><image href=\"{through_data}\" width=\"50\" height=\"100\"/><image href=\"#red.png\" x=\"50\" width=\"50\" height=\"100\"/><filter id=\"f\"><feImage href=\"{through_data}\"/></filter><rect y=\"80\" width=\"100\" height=\"20\" filter=\"url(#f)\"/></svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><rect width=\"100\" height=\"100\" fill=\"#00ff00\"/><image href=\"{through_data}\" width=\"50\" height=\"100\"/><image href=\"#red.png\" x=\"50\" width=\"50\" height=\"100\"/><image href=\"#d/red.png\" x=\"25\" width=\"50\" height=\"50\"/><filter id=\"f\"><feImage href=\"{through_data}\"/></filter><rect y=\"80\" width=\"100\" height=\"20\" filter=\"url(#f)\"/></svg>"
     );
     std::fs::write(root.join("href.svg"), svg).unwrap();
     let (mut server, port) = boot_in(&root, Some(&cwd), &[]);
@@ -450,5 +452,6 @@ fn an_svg_draws_no_file_its_hrefs_name_whatever_the_working_directory_holds() {
     assert_eq!(red_pixels, 0, "an href drew a file from disk");
     assert_eq!(out.get_pixel(25, 40), &image::Rgba([0, 255, 0, 255]));
     assert_eq!(out.get_pixel(75, 40), &image::Rgba([0, 255, 0, 255]));
+    assert_eq!(out.get_pixel(50, 20), &image::Rgba([0, 255, 0, 255]));
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
 }

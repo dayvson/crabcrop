@@ -195,16 +195,17 @@ fn has_external_url_ref(value: &str) -> bool {
 }
 
 /// Whether an `href` value points inside the document: a
-/// fragment reference to an element ID (`#id`, which holds no
-/// path separator), or a `data:` URL with the comma every data
-/// URL has between its media type and its payload. usvg reads
-/// anything else as a file path, so a value that only starts
-/// like one of these (`#/x`, `data:x.png`) is dropped here, and
-/// the renderer's own loader refuses it as well (see
-/// [`image_href_resolver`]).
+/// fragment reference to an element ID (`#id`, whatever
+/// characters the ID holds, `/` included), or a `data:` URL
+/// with the comma every data URL has between its media type
+/// and its payload. A value that only starts like a data URL
+/// (`data:x.png`) is dropped here. An image href that names no
+/// element (`#x.png`) is kept and draws nothing: usvg hands it
+/// to the renderer's own loader, which resolves nothing but
+/// data URLs (see [`image_href_resolver`]).
 fn is_document_href(value: &str) -> bool {
     if let Some(id) = value.strip_prefix('#') {
-        return !id.is_empty() && !id.contains(['/', '\\']);
+        return !id.is_empty();
     }
     starts_with_ci(value, "data:") && value.contains(',')
 }
@@ -1385,6 +1386,9 @@ mod tests {
         for kept in [
             "#g",
             "#a.b-c_d",
+            "#icons/arrow",
+            "#a\\b",
+            "#/../x.png",
             "data:image/png;base64,iVBORw0KGgo=",
             "DATA:image/svg+xml,%3Csvg/%3E",
             "data:,",
@@ -1393,9 +1397,6 @@ mod tests {
         }
         for dropped in [
             "#",
-            "#/../x.png",
-            "#a/b",
-            "#a\\b",
             "data:x.png",
             "data:/../../etc/x.png",
             "/etc/x.png",
@@ -1404,11 +1405,29 @@ mod tests {
         ] {
             assert!(!is_document_href(dropped), "{dropped}");
         }
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><image href="data:x.png" width="10" height="10"/><image href="#/../x.png" width="10" height="10"/><use href="#r"/><rect id="r" width="1" height="1"/></svg>"##;
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><image href="data:x.png" width="10" height="10"/><image href="x.png" width="10" height="10"/><use href="#r"/><rect id="r" width="1" height="1"/></svg>"##;
         let clean = sanitize(svg).unwrap();
         assert!(!clean.contains("data:x.png"), "{clean}");
-        assert!(!clean.contains("#/../"), "{clean}");
+        assert!(!clean.contains("\"x.png\""), "{clean}");
         assert!(clean.contains("href=\"#r\""), "{clean}");
+    }
+
+    #[test]
+    fn references_to_ids_with_path_characters_still_draw() {
+        // An element ID may hold `/` or `\`, as sprite sheets'
+        // `icons/arrow` do. A reference to one names an element,
+        // not a file, and draws that element.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="40" height="20"><defs><rect id="icons/arrow" width="20" height="20" fill="#ff0000"/><rect id="a\b" width="20" height="20" fill="#0000ff"/></defs><use xlink:href="#icons/arrow"/><use href="#a\b" x="20"/></svg>"##;
+        let clean = sanitize(svg).unwrap();
+        assert!(clean.contains("#icons/arrow"), "{clean}");
+        assert!(clean.contains("#a\\b"), "{clean}");
+        let img = prepare(svg.as_bytes())
+            .unwrap()
+            .render(40, 20)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(img.get_pixel(10, 10), &image::Rgba([255, 0, 0, 255]));
+        assert_eq!(img.get_pixel(30, 10), &image::Rgba([0, 0, 255, 255]));
     }
 
     #[test]

@@ -4873,10 +4873,24 @@ fn jpeg_xl_decodes_to_the_pixels_the_image_hook_decodes() {
             "gray16",
             jixel::encode_image_gray_16bit(&ramp16(1), w, h, &config),
         ),
+        (
+            "gray-alpha16",
+            jixel::encode_image_gray_alpha_16bit(&ramp16(2), w, h, &config),
+        ),
         ("rgbf32", jixel::encode_image_f32(&rampf(3), w, h, &config)),
         (
             "rgbaf32",
             jixel::encode_image_with_alpha_f32(&rampf(4), w, h, &config),
+        ),
+        // A float grayscale image decodes as RGB, as the hook
+        // decodes it: its float output is colour only.
+        (
+            "grayf32",
+            jixel::encode_image_gray_f32(&rampf(1), w, h, &config),
+        ),
+        (
+            "grayf16",
+            jixel::encode_image_gray_f16(&rampf(1), w, h, &config),
         ),
     ];
     for (name, bytes) in files {
