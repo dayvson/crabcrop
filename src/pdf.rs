@@ -138,9 +138,8 @@ const PROBE_REPORT_CAP: usize = 1024 * 1024;
 /// three render the same bytes as without the cap. Work past
 /// the cap fails in the tool: an image whose decode needs
 /// more is left out of the page, and a page whose surfaces
-/// need more (deeper groups at the full raster) fails to
-/// render. A decode that fails near the cap can take several
-/// seconds to get there.
+/// need more fails to render. A decode that fails near the
+/// cap can take several seconds to get there.
 const RENDERER_MAX_ADDRESS_SPACE: u64 = 3 << 30;
 
 /// The two markers that open every JPEG 2000 codestream:
@@ -718,9 +717,8 @@ impl JpxSize {
 /// empty); the odds that compressed bytes elsewhere form
 /// one are negligible. It reads at most
 /// [`JPX_SCAN_COMPONENTS`] component entries in all and
-/// stops there. A codestream it does not read (behind a
-/// further filter, in an encrypted document, or past that
-/// budget) is bounded by the cap instead.
+/// stops there. A codestream it does not read is bounded by
+/// the cap instead.
 fn oversized_jpx(pdf: &[u8]) -> Option<JpxSize> {
     let mut components_left = JPX_SCAN_COMPONENTS;
     let mut at = 0;
@@ -1808,7 +1806,8 @@ exit 0\n";
         );
         // An image before them is still found; past the
         // budget the scan stops, and the renderer's cap bounds
-        // the rest, as it bounds an image behind a filter.
+        // the rest, as it bounds every image the scan does not
+        // read.
         let big = jpx_siz(16000, 16000, 0, 0, RGB);
         let mut before = big.clone();
         before.extend_from_slice(&packed);
@@ -2144,14 +2143,13 @@ exit 0\n";
         assert_eq!((img.width(), img.height()), (8000, 8000));
     }
 
-    /// The same image behind an ASCIIHex filter, where the
-    /// scan cannot see its size: the renderer's address-space
-    /// cap stops the decode (with Poppler 24.02, about nine
-    /// seconds and 3 GB in), and the renderer leaves the
-    /// image out of the page, which stays white instead of
-    /// the image's gray. Ignored by default for those
-    /// gigabytes. Under a cap that holds the whole decode,
-    /// the page comes back gray.
+    /// The same image in a stream the scan does not read: the
+    /// renderer's address-space cap stops the decode (with
+    /// Poppler 24.02, about nine seconds and 3 GB in), and the
+    /// renderer leaves the image out of the page, which stays
+    /// white instead of the image's gray. Ignored by default
+    /// for those gigabytes. Under a cap that holds the whole
+    /// decode, the page comes back gray.
     #[test]
     #[ignore = "allocates about 3 GiB in the renderer before its cap stops it"]
     fn real_renderer_leaves_out_an_image_whose_decode_passes_its_cap() {
