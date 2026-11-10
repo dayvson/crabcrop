@@ -1446,6 +1446,120 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+/// The negotiation of a plain request: no hints, no
+/// Accept, no meta.
+fn plain_negotiation(ops: &[crate::url::Operation]) -> Negotiated {
+    Negotiated {
+        directives: crate::url::RequestDirectives::analyze(ops),
+        preferred: None,
+        effective_dpr: 1.0,
+        hinted_width: None,
+        save_data_applies: false,
+        meta: false,
+        debug: false,
+        placeholders: false,
+    }
+}
+
+#[test]
+fn an_ordinary_url_keeps_its_cache_key() {
+    let remainder = "300x200/filters:grayscale/http://x/heroes/cat.jpg";
+    let (ops, source, _, _) = parse_operations_with_expiry(remainder).unwrap();
+    let key = cache_key_for("test", &ops, source, &plain_negotiation(&ops));
+    assert_eq!(
+        key,
+        format!(
+            "{}#cfgtest#source",
+            crate::url::canonical_form(&ops, source)
+        )
+    );
+}
+
+#[test]
+fn a_padded_source_is_keyed_by_a_bounded_digest() {
+    // Empty path segments survive into the source, so a
+    // padded source used to put its whole length into the
+    // key: a 58 KB key for a 70-byte entry.
+    let source = format!("http://origin{}t.png", "/".repeat(58_000));
+    let remainder = format!("filters:format(png)/{source}");
+    let (ops, parsed, _, _) = parse_operations_with_expiry(&remainder).unwrap();
+    assert_eq!(parsed, source);
+    let key = cache_key_for("test", &ops, parsed, &plain_negotiation(&ops));
+    assert!(
+        key.len() <= crate::cache::MAX_KEY_BASE_BYTES + "#cfgtest".len(),
+        "a {}-byte key",
+        key.len()
+    );
+    // Another padding is another entry.
+    let longer = format!("http://origin{}t.png", "/".repeat(58_001));
+    let other = cache_key_for("test", &ops, &longer, &plain_negotiation(&ops));
+    assert_ne!(key, other);
+}
+
+/// A source server that reads each whole request head before
+/// it answers, however long the request line, and counts the
+/// requests.
+async fn spawn_reading_counting_server(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counted = hits.clone();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            tokio::spawn(async move {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                reply_and_close(&mut socket, head.as_bytes(), &body).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn an_over_long_url_caches_and_purges_under_its_bounded_key() {
+    // The serve path and the purge path bound the key the
+    // same way, so a URL past the key bound still caches,
+    // and its purge still finds the entry.
+    let (origin, hits) = spawn_reading_counting_server(test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("300x200/{origin}{}src.png", "/".repeat(6_000));
+    assert!(remainder.len() > crate::cache::MAX_KEY_BASE_BYTES);
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
+    for _ in 0..2 {
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the second request is a hit"
+    );
+    let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+    let resp = client()
+        .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.text().await.unwrap().contains("purged 1"));
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the purge evicted the entry"
+    );
+}
+
 #[tokio::test]
 async fn purge_evicts_expiry_variants() {
     // Audit P-2: entries are keyed without their exp:

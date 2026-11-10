@@ -14,7 +14,9 @@
 //! fails to parse is a miss, is deleted, and is overwritten
 //! by the next store. The byte budget evicts least recently
 //! used entries, with recency tracked in memory and re-seeded
-//! from file times at open.
+//! from file times at open. Each entry is charged its file
+//! and the record the in-memory index keeps for it, so the
+//! budget bounds the index's memory as well as the files.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,16 +30,50 @@ use crate::url::ImageFormat;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// An index record: the entry's file stem, its charge (see
+/// [`entry_charge`]), and its cache groups.
+type Record = (String, usize, Vec<String>);
+
+/// The allocator's bookkeeping charged for each separate heap
+/// allocation an index record makes: its header and size
+/// rounding.
+const ALLOCATION_OVERHEAD: usize = 16;
+
+/// The length of an entry's file stem: a hex SHA-256.
+const STEM_LEN: usize = 64;
+
+/// What an index record costs besides its strings: its slot in
+/// each of the two maps, doubled for the spare slots a hash map
+/// keeps as it grows, and the allocations behind its two key
+/// copies and its file stem.
+const RECORD_OVERHEAD: usize =
+    2 * (size_of::<(String, Record)>() + size_of::<(String, u64)>()) + 3 * ALLOCATION_OVERHEAD;
+
+/// What one entry is charged against the store's budget: its
+/// file of `file_bytes`, plus the record the index keeps for
+/// it in memory (the key twice, as it keys both maps, the file
+/// stem, and each group name). Charging the file alone let
+/// entries with tiny bodies under long keys hold about twice
+/// the budget in index memory.
+fn entry_charge(key: &str, file_bytes: usize, groups: &[String]) -> usize {
+    let groups: usize = groups
+        .iter()
+        .map(|group| group.len() + size_of::<String>() + ALLOCATION_OVERHEAD)
+        .sum();
+    file_bytes + 2 * key.len() + STEM_LEN + groups + RECORD_OVERHEAD
+}
+
 #[derive(Debug, Default)]
 struct Inner {
-    /// Cache key -> (file stem, total file size, cache groups).
-    entries: HashMap<String, (String, usize, Vec<String>)>,
+    /// Cache key -> its index record.
+    entries: HashMap<String, Record>,
     /// Last-access stamp per key (monotonic clock). Eviction
     /// removes the smallest stamp, the least recently used
     /// entry: the same order the VecDeque kept, at O(1) per
     /// access instead of a linear scan per hit.
     stamps: HashMap<String, u64>,
     clock: u64,
+    /// The sum of the indexed entries' charges.
     total_bytes: usize,
 }
 
@@ -394,11 +430,12 @@ impl DiskStore {
         found.sort_by_key(|(mtime, _, _, _, _)| *mtime);
         let mut inner = self.inner.lock().unwrap();
         for (_, key, stem, size, groups) in found {
-            inner.total_bytes += size;
+            let charge = entry_charge(&key, size, &groups);
+            inner.total_bytes += charge;
             inner.clock += 1;
             let stamp = inner.clock;
             inner.stamps.insert(key.clone(), stamp);
-            inner.entries.insert(key, (stem, size, groups));
+            inner.entries.insert(key, (stem, charge, groups));
         }
         Ok(())
     }
@@ -461,13 +498,14 @@ impl DiskStore {
     }
 
     /// Store `image` under `key`, evicting least recently used
-    /// entries until the new file fits the budget.
+    /// entries until the new entry's charge fits the budget.
     pub fn put(&self, key: &str, image: &CachedImage) {
         if self.max_bytes == 0 {
             return;
         }
         let data = serialize_entry(key, image, &self.entry_key);
-        if data.len() > self.max_bytes {
+        let charge = entry_charge(key, data.len(), &image.groups);
+        if charge > self.max_bytes {
             return;
         }
         let stem = key_stem(key);
@@ -488,7 +526,7 @@ impl DiskStore {
                 inner.total_bytes -= old_size;
                 inner.stamps.remove(key);
             }
-            while inner.total_bytes + data.len() > self.max_bytes {
+            while inner.total_bytes + charge > self.max_bytes {
                 let oldest = inner
                     .stamps
                     .iter()
@@ -501,13 +539,13 @@ impl DiskStore {
                 }
                 inner.stamps.remove(&oldest);
             }
-            inner.total_bytes += data.len();
+            inner.total_bytes += charge;
             inner.clock += 1;
             let stamp = inner.clock;
             inner.stamps.insert(key.to_string(), stamp);
             inner
                 .entries
-                .insert(key.to_string(), (stem, data.len(), image.groups.clone()));
+                .insert(key.to_string(), (stem, charge, image.groups.clone()));
         }
         for old_stem in evicted {
             let _ = std::fs::remove_file(self.file_for(&old_stem));
@@ -629,7 +667,7 @@ impl DiskStore {
         stems.len()
     }
 
-    /// (entries, total bytes) currently indexed, for the boot
+    /// (entries, total charge) currently indexed, for the boot
     /// log line.
     pub fn stats(&self) -> (usize, usize) {
         let inner = self.inner.lock().unwrap();
@@ -1472,17 +1510,50 @@ mod tests {
     #[test]
     fn eviction_respects_the_byte_budget() {
         let dir = temp_dir("evict");
-        let store = DiskStore::open(&dir, 300, test_entry_key()).unwrap();
         let payload = vec![7u8; 100];
+        let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
+        let one = entry_charge("a", file, &[]);
+        let budget = 2 * one + one / 2;
+        let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
         store.put("a", &image(&payload));
         store.put("b", &image(&payload));
         store.put("c", &image(&payload));
-        // Each entry is ~125 bytes on disk; 300 fits two, so
-        // the third store evicted the least recently used.
+        // The budget fits two entries, so the third store
+        // evicted the least recently used.
         assert!(store.get("c").is_some());
         let (_, total) = store.stats();
-        assert!(total <= 300, "total {total}");
+        assert!(total <= budget, "total {total}");
         assert!(store.get("a").is_none(), "the LRU entry went first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_index_record_of_each_entry_counts_against_the_budget() {
+        // Tiny files under 4 KiB keys: the index holds each key
+        // twice in memory. Charging only the files let the index
+        // grow to about twice the budget beside them.
+        let dir = temp_dir("index-charge");
+        let budget = 64 * 1024;
+        let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+        for i in 0..100 {
+            let key = format!("{i:04}/{}", "k".repeat(4091));
+            store.put(&key, &image(&[7u8; 70]));
+        }
+        let (entries, total) = store.stats();
+        assert!(total <= budget, "total {total}");
+        let on_disk: usize = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len() as usize)
+            .sum();
+        let index_keys = entries * 2 * 4096;
+        assert!(
+            on_disk + index_keys <= budget,
+            "{entries} entries: {on_disk} bytes on disk and {index_keys} bytes of index keys under a {budget}-byte budget"
+        );
+        // A reopened store charges the scanned entries the same.
+        drop(store);
+        let reopened = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+        assert_eq!(reopened.stats(), (entries, total));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

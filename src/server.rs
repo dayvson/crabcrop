@@ -1399,17 +1399,15 @@ async fn purge_handle(
     // Entries are keyed post-merge (issue #145): with
     // defaults configured, the purge target's key form is
     // the canonical form of the merged operations, or the
-    // purge silently removes nothing.
-    let key_form = if state.default_ops.is_empty() {
-        crate::url::canonical_key_form(target)
-    } else {
-        match parse_operations_with_expiry(target) {
-            Ok((ops, source, _, _)) => {
-                let merged = crate::url::merge_default_ops(&state.default_ops, ops);
-                crate::url::canonical_form(&merged, source)
-            }
-            Err(_) => crate::url::canonical_key_form(target),
+    // purge silently removes nothing. The form is bounded
+    // the way `cache_key_for` bounds it, so an over-long
+    // URL's purge names its digest-form key.
+    let key_form = match parse_operations_with_expiry(target) {
+        Ok((ops, source, _, _)) => {
+            let merged = crate::url::merge_default_ops(&state.default_ops, ops);
+            crate::cache::bounded_key_base(crate::url::canonical_form(&merged, source), source)
         }
+        Err(_) => crate::cache::bounded_key_base(target.to_string(), ""),
     };
     // The fan-out runs in a spawned task once the
     // signature has verified (issue #347): a purge that
@@ -2764,14 +2762,20 @@ fn negotiate(
 /// parsed operations re-serialized in their one
 /// spelling, so equivalent requests share an entry.
 /// Expiry and the cache lifetime are not operations,
-/// so neither ever enters it.
+/// so neither ever enters it. A form past
+/// [`crate::cache::MAX_KEY_BASE_BYTES`] is carried as its
+/// digest ([`crate::cache::bounded_key_base`]), so a padded
+/// source cannot make one entry's key, which every tier
+/// stores and the cache maps hold twice, tens of kilobytes
+/// long.
 fn cache_key_for(
     config_fingerprint: &str,
     ops: &[crate::url::Operation],
     source_url: &str,
     negotiated: &Negotiated,
 ) -> String {
-    let key_base = crate::url::canonical_form(ops, source_url);
+    let key_base =
+        crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
     // The key also carries the configuration fingerprint
     // (audit R2-08): entries in the persistent tiers are
     // keyed under the configuration that produced them, so
