@@ -832,6 +832,10 @@ fn sigterm_cuts_off_a_hung_request_at_the_grace() {
         stderr.contains("shutdown: requests still in flight at the deadline are cut off"),
         "{stderr}"
     );
+    // The request's miss belongs to the request: it is not
+    // reported again as background work left behind.
+    assert!(!stderr.contains("background writes"), "{stderr}");
+    assert!(!stderr.contains("renders whose client left"), "{stderr}");
     wait_for_line(&lines, "shutdown: done");
 }
 

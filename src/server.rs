@@ -61,7 +61,7 @@ pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PU
 mod process;
 pub(in crate::server) use process::{
     AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
-    PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
+    MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
     SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process, wants_animation_gate,
     wants_slow_lane,
 };
@@ -2565,6 +2565,7 @@ async fn serve(
         cache_key,
         max_age: resolved.max_age,
         sealed,
+        progress: MissProgress::default(),
     };
     let (mut response, record) = run_flight(state, path, work, if_none_match, record).await;
     if hint_shaped {
@@ -3073,11 +3074,16 @@ async fn run_flight(
     // the raw header, so browsers that phrase the same
     // request differently still share one flight. The
     // conditional header is left out: each waiter applies
-    // its own. A waiter that cannot take the response
-    // (another spelling of the key, a body past the share
-    // cap, a leader whose request was dropped, a run a
-    // purge of the key overtook) leads or follows the next
-    // flight. Waits are capped: a waiter whose flights
+    // its own. A leader whose client goes away after its
+    // render has started still finishes the flight (see
+    // `finish_started_miss`). A waiter that cannot take
+    // the response (another spelling of the key, a body
+    // past the share cap, a leader whose request was
+    // dropped before its render started, a leader that
+    // forwent its fallback run because its client had
+    // gone, a run a purge of the key overtook) leads or
+    // follows the next flight.
+    // Waits are capped: a waiter whose flights
     // keep ending without an answer for it stops queueing
     // and runs the miss path itself (issue #375), so it
     // ends with the origin's real answer instead of a busy
@@ -3136,18 +3142,35 @@ async fn run_flight(
         match state.inflight.lead(&cache_key) {
             Flight::Leader(guard, slot) => {
                 let snapshot = state.purge_guard.snapshot();
-                let (response, record, render_etag) = serve_miss(state, work, record).await;
-                let (mut response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
-                if let Some(shared) = shared {
-                    *slot.shared.lock().unwrap() = Some(SharedFlight {
-                        request: flight_request,
-                        snapshot,
-                        response: shared,
-                        etag: render_etag.clone(),
-                        fallback: record.fallback,
-                    });
-                }
-                drop(guard);
+                let progress = work.progress.clone();
+                let task_progress = progress.clone();
+                let task_state = state.clone();
+                // The leader's whole part runs as one miss
+                // (see `finish_started_miss`): a render it
+                // starts is stored and answers the
+                // followers even when this request is gone,
+                // and the guard is held until it has. A
+                // miss that forwent a render for a client
+                // that had gone ends without its request's
+                // answer, so it shares nothing.
+                let lead = async move {
+                    let (response, record, render_etag) =
+                        serve_miss(&task_state, work, record).await;
+                    let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+                    if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
+                        *slot.shared.lock().unwrap() = Some(SharedFlight {
+                            request: flight_request,
+                            snapshot,
+                            response: shared,
+                            etag: render_etag.clone(),
+                            fallback: record.fallback,
+                        });
+                    }
+                    drop(guard);
+                    (response, record, render_etag)
+                };
+                let (mut response, record, render_etag) =
+                    finish_started_miss(state, progress, lead).await;
                 if let Some(etag) = &render_etag {
                     finalize_validators(&mut response, etag, if_none_match);
                 }
@@ -3165,7 +3188,11 @@ async fn run_flight(
                     // to stop queueing behind failing leaders
                     // forever, not to refuse a request that
                     // has not had its own attempt.
-                    let (mut response, record, render_etag) = serve_miss(state, work, record).await;
+                    let progress = work.progress.clone();
+                    let task_state = state.clone();
+                    let miss = async move { serve_miss(&task_state, work, record).await };
+                    let (mut response, record, render_etag) =
+                        finish_started_miss(state, progress, miss).await;
                     if let Some(etag) = &render_etag {
                         finalize_validators(&mut response, etag, if_none_match);
                     }
@@ -3181,6 +3208,90 @@ async fn run_flight(
                 followed = Some(slot);
             }
         }
+    }
+}
+
+/// Run one image miss (`miss`: the miss path for a key,
+/// with whatever its flight does around it) on a task of
+/// its own, tracked for the shutdown drain, and wait for
+/// its answer.
+///
+/// The task is what lets a render outlive its client
+/// usefully. When the client goes away, the server drops
+/// this future, and with it the sender of the `gone`
+/// channel. If the miss has not started a render by then
+/// (`progress`, see [`MissProgress`]), the task drops the
+/// miss too, which stops it where it was, as before: a
+/// source load or a gate wait ends, its budget share and
+/// permits come back, and it starts no render. If a render
+/// has started, it runs to its end on its blocking thread
+/// anyway, so the task finishes the miss: the render is
+/// stored in the tiers (the guarded writes of
+/// [`populate_tiers`], unchanged) and the flight's
+/// followers receive it, through the tiers or the flight's
+/// slot. A replay of the request is then a hit, or a
+/// follower of the render still running, instead of a
+/// fresh render each time. Finishing starts no further
+/// render: a source that did not decode gets no fallback
+/// run once the client has gone, and the flight's
+/// followers then make their own attempt. The permits a
+/// render holds still come back when that render ends
+/// (issue #357), whether or not its client is still there;
+/// what runs after it (the tier writes, the slot) holds
+/// none. Only image misses run here: meta documents and
+/// debug views are never stored, so a render made for one
+/// has nothing to keep once its client is gone.
+///
+/// A miss whose client is still there is part of a
+/// request in flight, which the shutdown drain counts as
+/// such; one whose client has gone is counted as a render
+/// left running (see [`Background::spawn_miss`]).
+async fn finish_started_miss<F>(
+    state: &AppState,
+    progress: MissProgress,
+    miss: F,
+) -> (Response, RequestRecord, Option<String>)
+where
+    F: std::future::Future<Output = (Response, RequestRecord, Option<String>)> + Send + 'static,
+{
+    // Never sent on: dropping the sender, with this
+    // future, is the signal.
+    let (_waiting, gone) = tokio::sync::oneshot::channel::<std::convert::Infallible>();
+    let background = state.background.clone();
+    let task = state.background.spawn_miss(async move {
+        let mut miss = std::pin::pin!(miss);
+        tokio::select! {
+            // The client's departure is checked first on
+            // every wake, so a miss whose client has gone
+            // never takes a lane permit that frees up in
+            // the same instant and starts a render.
+            biased;
+            _ = gone => {
+                if progress.render_started() {
+                    progress.mark_client_gone();
+                    let _left = background.client_left();
+                    Some(miss.await)
+                } else {
+                    None
+                }
+            }
+            answer = &mut miss => Some(answer),
+        }
+    });
+    match task.await {
+        Ok(Some(answer)) => answer,
+        // A panic on the miss path stays the panic of
+        // this request, as when the path ran inline.
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // The task gives up only once this future is gone,
+        // and is cancelled only by a runtime that is
+        // shutting down, which drops this request too: no
+        // client receives this answer.
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            RequestRecord::default(),
+            None,
+        ),
     }
 }
 
@@ -3711,6 +3822,9 @@ struct MissWork {
     /// render still reports in full, and a plain hit on an
     /// entry first served sealed still names its groups.
     sealed: bool,
+    /// How far this miss has got (see [`MissProgress`]);
+    /// its render jobs carry clones.
+    progress: MissProgress,
 }
 
 /// Whether a request runs inference and so takes an AI
@@ -4241,6 +4355,7 @@ fn build_job(
         brand_color: state.brand_color,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
+        progress: work.progress.clone(),
     }
 }
 
@@ -4267,7 +4382,10 @@ async fn render_with_fallback(
         .map_err(|busy| Box::new(busy.response(accept)))?;
     let processed = match run_process(state, job, source, plan.lane, deadline, permits).await {
         Ok(p) => p,
-        Err(ProcessFailure::Busy) => {
+        // A first run never finds its client gone (see
+        // `ProcessFailure::ClientGone`); were it to, nobody
+        // would receive the busy answer.
+        Err(ProcessFailure::Busy | ProcessFailure::ClientGone) => {
             return Err(Box::new(match plan.lane {
                 Lane::Slow => busy_response(
                     "server busy: long-running processing lane is full",
@@ -4332,13 +4450,21 @@ async fn render_with_fallback(
 /// decode: the same job on the configured fallback's bytes,
 /// under the same deadline. `None` leaves the original
 /// engine error standing: no fallback, no budget for it, a
-/// full gate, or a failed run.
+/// full gate, a failed run, or a client that has gone (see
+/// [`MissProgress`]), before the run or by the time its
+/// lane comes free.
 async fn retry_on_fallback(
     state: &AppState,
     job: &ProcessJob,
     plan: RunPlan,
     deadline: Instant,
 ) -> Option<crate::engine::ProcessedImage> {
+    // A fallback is never stored, so for a client that has
+    // gone it would be work nobody receives: it is not
+    // fetched or charged, and it waits for no gate.
+    if state.fallback.is_none() || !job.progress.may_start_render() {
+        return None;
+    }
     // The first run's source share drained with its job, so
     // the fallback is charged afresh (issue #403), with a
     // wait of its own like each gate below; the watermarks
