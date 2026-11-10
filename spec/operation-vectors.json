@@ -424,6 +424,18 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "crop:100x100:objects(%EF%BB%BFperson%EF%BB%BF)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_crop",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(%C2%85person%C2%85)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "crop:100x100:objects(person):1/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "crop:300x0/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_crop",
@@ -2113,6 +2125,18 @@
    "remainder": "filters:blurclass()/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%EF%BB%BFperson%EF%BB%BF)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%C2%85person%C2%85)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:blurclass(person)/https://example.com/a.jpg",
    "source": "https://example.com/a.jpg"
   },
   {
@@ -4634,6 +4658,31 @@
    "canonical": "crop:100x100:objects(person):1"
   },
   {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
+     "﻿person﻿"
+    ]
+   ],
+   "throws": true,
+   "segment": "crop:100x100:objects(%EF%BB%BFperson%EF%BB%BF):1",
+   "error": "invalid_crop"
+  },
+  {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
+     "person"
+    ]
+   ],
+   "segment": "crop:100x100:objects(person):1",
+   "canonical": "crop:100x100:objects(person):1"
+  },
+  {
    "call": "ops.cropRect",
    "args": [
     0,
@@ -5447,6 +5496,23 @@
    "call": "filter.blurClass",
    "args": [
     " person "
+   ],
+   "segment": "blurclass(person)",
+   "canonical": "blurclass(person)"
+  },
+  {
+   "call": "filter.blurClass",
+   "args": [
+    "﻿person﻿"
+   ],
+   "throws": true,
+   "segment": "blurclass(%EF%BB%BFperson%EF%BB%BF)",
+   "error": "invalid_filters"
+  },
+  {
+   "call": "filter.blurClass",
+   "args": [
+    "person"
    ],
    "segment": "blurclass(person)",
    "canonical": "blurclass(person)"

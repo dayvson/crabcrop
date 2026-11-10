@@ -235,6 +235,26 @@ export function isOneOf<T extends string | number>(list: readonly T[], value: un
 export const MAX_OBJECTS_CLASSES = 32;
 
 /**
+ * Trim like the server's Rust `str::trim`: exactly the
+ * Unicode White_Space set, from both ends. JavaScript's
+ * `String.prototype.trim` disagrees on two characters:
+ * it also strips U+FEFF, which the server keeps (so a
+ * class name wrapped in it is no class name), and it
+ * keeps U+0085, which the server strips (issue #537).
+ * Every place this package mirrors a server-side trim
+ * uses this instead of the built-in.
+ */
+const SERVER_WHITESPACE =
+  "\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000";
+const SERVER_TRIM = new RegExp(
+  `^[${SERVER_WHITESPACE}]+|[${SERVER_WHITESPACE}]+$`,
+  "g",
+);
+export function trimLikeServer(text: string): string {
+  return text.replace(SERVER_TRIM, "");
+}
+
+/**
  * A detection class name as the server's parse_class_name
  * takes it, already trimmed: 1 to 64 UTF-8 bytes (bytes, not
  * UTF-16 code units, as on the server) of letters, digits,
@@ -565,7 +585,7 @@ function validateFilter(name: string, args: string | null): string | null {
     case "pixelateclass": {
       if (args === null) return bad;
       const decoded = percentDecodable(args);
-      return decoded !== null && isClassName(decoded.trim()) ? null : bad;
+      return decoded !== null && isClassName(trimLikeServer(decoded)) ? null : bad;
     }
     case "recolorclass": {
       if (args === null) return bad;
@@ -573,7 +593,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (cut < 0) return bad;
       if (!/^[0-9a-fA-F]{6}$/.test(args.slice(cut + 1))) return bad;
       const decoded = percentDecodable(args.slice(0, cut));
-      return decoded !== null && isClassName(decoded.trim()) ? null : bad;
+      return decoded !== null && isClassName(trimLikeServer(decoded)) ? null : bad;
     }
     case "blur_region":
     case "pixelate_region":
@@ -709,7 +729,7 @@ function parseObjectsAlign(align: string): { classes: string[]; scale: number } 
   for (const part of parts) {
     const decoded = percentDecodable(part);
     if (decoded === null) return null;
-    const name = decoded.trim();
+    const name = trimLikeServer(decoded);
     if (!isClassName(name)) return null;
     const key = classFoldKey(name);
     if (!seen.has(key)) {
@@ -1014,7 +1034,7 @@ export function explainUrl(
   // %2e%2e) that the server treats as literal path bytes
   // (audit P-3). A query or fragment is not part of the
   // signed path, on either side.
-  let path = input.trim();
+  let path = trimLikeServer(input);
   const scheme = path.indexOf("://");
   if (scheme > 0 && /^[a-zA-Z][a-zA-Z0-9+.-]*$/.test(path.slice(0, scheme))) {
     const afterAuthority = path.slice(scheme + 3);
