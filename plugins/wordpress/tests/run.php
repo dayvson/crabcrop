@@ -116,9 +116,43 @@ if ($GROUP === 'vectors') {
     check(is_array($vectors) && count($vectors) > 0, 'spec vectors load');
     $signed = 0;
     $refused = 0;
+    $reserved = 0;
+    $reserved_message = 'remainder begins with the reserved segment "crabcrop": '
+        . 'it is kept for key derivation, and no image URL may begin with it';
     foreach ($vectors as $vector) {
         if (!empty($vector['sealed'])) {
             continue; // Sealing is out of scope for a URL builder.
+        }
+        if (!empty($vector['reserved'])) {
+            // A remainder under the reserved segment: every derived
+            // subkey is the signature of one, so neither sign nor
+            // build computes it, signed, keyed or unsafe.
+            check(CrabcropUrl::is_reserved_remainder($vector['remainder']), 'reserved: ' . $vector['description']);
+            $calls = array(
+                function () use ($vector) {
+                    return CrabcropUrl::sign('s3cr3t', $vector['remainder']);
+                },
+                function () use ($vector) {
+                    return CrabcropUrl::build('https://images.example.com', 's3cr3t', $vector['operations'], $vector['source']);
+                },
+                function () use ($vector) {
+                    return CrabcropUrl::build('https://images.example.com', null, $vector['operations'], $vector['source']);
+                },
+                function () use ($vector) {
+                    return CrabcropUrl::build('https://images.example.com', 's3cr3t', $vector['operations'], $vector['source'], null, 'k2');
+                },
+            );
+            foreach ($calls as $call) {
+                $message = null;
+                try {
+                    $call();
+                } catch (InvalidArgumentException $e) {
+                    $message = $e->getMessage();
+                }
+                eq($reserved_message, $message, 'vector: ' . $vector['description']);
+            }
+            $reserved++;
+            continue;
         }
         if (isset($vector['refuses'])) {
             // Builder refusals (issue #472): signed and unsafe
@@ -158,6 +192,24 @@ if ($GROUP === 'vectors') {
     }
     check($signed >= 20, "signature vectors covered ($signed)");
     check($refused >= 17, "refusal vectors covered ($refused)");
+    check($reserved >= 9, "reserved vectors covered ($reserved)");
+    // A key label's signature would be its subkey: refused, and a
+    // source that only names a label further in still signs.
+    foreach (array('crabcrop/purge-key', 'crabcrop/upload-key', 'crabcrop/seal-key') as $label) {
+        $message = null;
+        try {
+            CrabcropUrl::build('https://images.example.com', 'label-test-secret-0123456789', '', $label);
+        } catch (InvalidArgumentException $e) {
+            $message = $e->getMessage();
+        }
+        eq($reserved_message, $message, 'build refuses ' . $label);
+    }
+    $named = 'https://example.com/crabcrop/purge-key.jpg';
+    eq(
+        'https://images.example.com/' . hash_hmac('sha256', $named, 'k') . '/' . $named,
+        CrabcropUrl::build('https://images.example.com', 'k', '', $named),
+        'build: a source that names a label further in signs'
+    );
 
     eq(
         'https://images.example.com/3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6'

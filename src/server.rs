@@ -861,6 +861,12 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
+    // The reserved segment is refused before verification,
+    // as on the image path.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        let (status, code, message) = reserved_remainder_parts();
+        return error_response(status, code, message, accept.as_deref());
+    }
     if !state
         .keyring
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
@@ -1001,10 +1007,13 @@ async fn explain_handle(
     // The canonical form is the cache key's path form, of
     // the merged list as the image path keys it. The key's
     // config fingerprint suffix is operator state and stays
-    // unreported. For a root source the form is built from
-    // the source as written: the key itself is keyed on the
-    // expansion, but printing that here would publish the
-    // root's base URL into the report.
+    // unreported. A form past the key-length bound is shown
+    // in full, though the key carries its digest
+    // (`cache::bounded_key_base`). For a root source the
+    // form is built from the source as written: the key
+    // itself is keyed on the expansion, but printing that
+    // here would publish the root's base URL into the
+    // report.
     let canonical = crate::url::canonical_form(&merged, source_url);
     let report = crate::explain::Report::new(crate::explain::ReportInput {
         signed: !matches!(signature, crate::url::Signature::Unsafe),
@@ -1297,8 +1306,9 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
 /// (issue #351). The signature is an HMAC over the
 /// path under a purge subkey derived from the secret (see
 /// [`crate::url::purge_key`]), so only the secret holder can
-/// purge and an image signature can never be replayed here; a
-/// bad signature is a 403 and purges nothing. Idempotent:
+/// purge and an image signature does not verify here (no
+/// signer signs the subkey's label); a bad signature is a
+/// 403 and purges nothing. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<AppState>,
@@ -1399,17 +1409,15 @@ async fn purge_handle(
     // Entries are keyed post-merge (issue #145): with
     // defaults configured, the purge target's key form is
     // the canonical form of the merged operations, or the
-    // purge silently removes nothing.
-    let key_form = if state.default_ops.is_empty() {
-        crate::url::canonical_key_form(target)
-    } else {
-        match parse_operations_with_expiry(target) {
-            Ok((ops, source, _, _)) => {
-                let merged = crate::url::merge_default_ops(&state.default_ops, ops);
-                crate::url::canonical_form(&merged, source)
-            }
-            Err(_) => crate::url::canonical_key_form(target),
+    // purge silently removes nothing. The form is bounded
+    // the way `cache_key_for` bounds it, so an over-long
+    // URL's purge names its digest-form key.
+    let key_form = match parse_operations_with_expiry(target) {
+        Ok((ops, source, _, _)) => {
+            let merged = crate::url::merge_default_ops(&state.default_ops, ops);
+            crate::cache::bounded_key_base(crate::url::canonical_form(&merged, source), source)
         }
+        Err(_) => crate::cache::bounded_key_base(target.to_string(), ""),
     };
     // The fan-out runs in a spawned task once the
     // signature has verified (issue #347): a purge that
@@ -1475,10 +1483,11 @@ async fn purge_handle(
 /// as in the per-URL purge (issue #351). The signature is
 /// verified under the purge-group
 /// subkey, its own domain beside the purge subkey, over the
-/// group name, so neither an image signature nor a per-URL
-/// purge signature can be replayed here (audit R2-14). A
-/// bad signature is a 403 and removes nothing; an unknown
-/// group answers 200 with a count of 0.
+/// group name, so a per-URL purge signature does not verify
+/// here, and neither does an image signature (no signer
+/// signs the subkey's label). A bad signature is a 403 and
+/// removes nothing; an unknown group answers 200 with a
+/// count of 0.
 async fn purge_group_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -2510,6 +2519,13 @@ fn authenticate<'a>(
     // rejection and an empty one.
     let (signature, key_id, rest) =
         parse_signature(full).map_err(|e| Refusal::AsIs(parse_failure_parts(&e)))?;
+    // A remainder that begins with the reserved segment is
+    // refused before its signature is checked, so the answer
+    // is the same whatever the signature: no response depends
+    // on an HMAC over a key derivation label.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::AsIs(reserved_remainder_parts()));
+    }
     let verify_start = Instant::now();
     let verified = state
         .keyring
@@ -2566,6 +2582,13 @@ fn resolve_request(
             "reserved_segment",
             "an image URL may not begin with a purge or upload segment".to_string(),
         )));
+    }
+    // A plain remainder that begins with the key derivation
+    // segment never gets this far (`authenticate` refuses it
+    // before verification); an opened token's can, and its
+    // answer is the uniform refusal like any payload failure.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::Payload(reserved_remainder_parts()));
     }
     // The cache groups (RFC 9875) are the presets the signed
     // remainder references, read before expansion rewrites it.
@@ -2765,14 +2788,20 @@ fn negotiate(
 /// parsed operations re-serialized in their one
 /// spelling, so equivalent requests share an entry.
 /// Expiry and the cache lifetime are not operations,
-/// so neither ever enters it.
+/// so neither ever enters it. A form past
+/// [`crate::cache::MAX_KEY_BASE_BYTES`] is carried as its
+/// digest ([`crate::cache::bounded_key_base`]), so a padded
+/// source cannot make one entry's key, which every tier
+/// stores and the cache maps hold twice, tens of kilobytes
+/// long.
 fn cache_key_for(
     config_fingerprint: &str,
     ops: &[crate::url::Operation],
     source_url: &str,
     negotiated: &Negotiated,
 ) -> String {
-    let key_base = crate::url::canonical_form(ops, source_url);
+    let key_base =
+        crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
     // The key also carries the configuration fingerprint
     // (audit R2-08): entries in the persistent tiers are
     // keyed under the configuration that produced them, so
@@ -4741,6 +4770,23 @@ fn truncate_echo(message: &str) -> String {
 /// them leaves the answer to the one place that knows how
 /// the request may be answered (see [`Refusal::answer`]).
 type ErrorParts = (StatusCode, &'static str, String);
+
+/// The refusal for an image remainder that begins with
+/// [`crabcrop_url::RESERVED_SEGMENT`]. Every derived subkey
+/// (purge, purge-group, upload, seal, cache entry) is the
+/// HMAC of a label under that segment, so no image URL may
+/// begin with it, and no source can: it names no scheme the
+/// loader fetches.
+fn reserved_remainder_parts() -> ErrorParts {
+    (
+        StatusCode::BAD_REQUEST,
+        "reserved_segment",
+        format!(
+            "an image URL may not begin with the reserved segment {}",
+            crabcrop_url::RESERVED_SEGMENT
+        ),
+    )
+}
 
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.
