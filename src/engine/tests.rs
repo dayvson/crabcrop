@@ -6242,6 +6242,10 @@ fn the_video_argv_is_the_pipe_contract_for_each_format() {
         "mp4",
     ];
     let webm = [
+        // Bitexact muxing (issue #567): two renders of the
+        // same frames come out byte-identical.
+        "-fflags",
+        "+bitexact",
         "-c:v",
         "libvpx-vp9",
         "-b:v",

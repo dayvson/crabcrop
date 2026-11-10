@@ -500,7 +500,15 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// measures, instead of its media box; and a PDF page too
 /// large to fit the raster limits at 1 dpi refused instead
 /// of rendered past them).
-const RENDERING_VERSION: u32 = 4;
+///
+/// 5: the first release after 0.10.1, which changes output
+/// for existing URLs (WebM output written with bitexact
+/// muxing: the Matroska muxer writes a fixed track UID and
+/// the generic `Lavf` and `Lavc` tags instead of a random
+/// track UID and the encoder build's own tags, so WebM
+/// bytes change once and then repeat render for render
+/// #567).
+const RENDERING_VERSION: u32 = 5;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
