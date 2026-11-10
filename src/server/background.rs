@@ -2,9 +2,11 @@
 //! (issue #463), and the shutdown drain that waits for it.
 //!
 //! A shared-tier write-through, a purge whose caller has
-//! gone, a disk hit's follow-up writes, and a purge's
-//! background walk all outlive the request that started
-//! them. Each one is spawned through [`Background`], so
+//! gone, a disk hit's follow-up writes, a cache miss whose
+//! render has started (it finishes and is stored even when
+//! its client goes away), and a purge's background walk
+//! all outlive the request that started them. Each one is
+//! spawned through [`Background`], so
 //! none is a bare `tokio::spawn`: every one is tracked.
 //! The write-throughs are bounded here too, since every
 //! miss starts one and nothing else limits them; purges
@@ -46,8 +48,9 @@ pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 8;
 pub struct Background {
     /// Detached work a shutdown drain waits for, up to its
     /// deadline: shared-tier write-throughs, purge fan-outs
-    /// whose request may have gone, and a disk hit's
-    /// follow-up writes.
+    /// whose request may have gone, a disk hit's follow-up
+    /// writes, and cache misses whose client may have gone
+    /// after their render started.
     writes: TaskTracker,
     /// Background purge walks (issue #462). A drain never
     /// waits for them: a walk cut short leaves its purge's

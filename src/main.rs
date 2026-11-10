@@ -154,7 +154,8 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // listener closes, idle connections close, and requests
     // in flight finish; then the background writes they and
     // earlier requests left (shared-tier write-throughs,
-    // purges whose caller left) finish. One deadline, the
+    // purges whose caller left, renders whose client left
+    // after they started) finish. One deadline, the
     // grace from the signal on, bounds both waits, and the
     // process exits at it with whatever is still running.
     // A second signal ends the drain at once.

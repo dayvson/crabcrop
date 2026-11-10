@@ -320,6 +320,38 @@ pub(in crate::server) struct ProcessJob {
     pub(in crate::server) brand_color: Option<[u8; 3]>,
     pub(in crate::server) avif_speed: u8,
     pub(in crate::server) jxl_speed: jixel::Speed,
+    /// Marked by [`run_process`] when the job's render
+    /// starts, so the miss that built the job can tell
+    /// whether it has a render to finish when its client
+    /// goes away (see [`RenderStarted`]).
+    pub(in crate::server) render_started: RenderStarted,
+}
+
+/// Whether a miss has started a render: marked by
+/// [`run_process`] once the run holds its lane permit,
+/// in the same step that hands the job to its blocking
+/// thread, and never cleared. Clones share the mark. A
+/// render that has started runs to its end on that
+/// thread whatever happens to the request (a blocking
+/// job cannot be cancelled), so the request path reads
+/// the mark to decide what a client that goes away
+/// stops: before the mark, the miss stops where it is
+/// (a source load, a gate wait) and nothing it holds
+/// outlives it; after it, the miss finishes, so the
+/// render is stored and reaches the requests waiting on
+/// it instead of being thrown away.
+#[derive(Clone, Debug, Default)]
+pub(in crate::server) struct RenderStarted(Arc<std::sync::atomic::AtomicBool>);
+
+impl RenderStarted {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a render has started.
+    pub(in crate::server) fn is_marked(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// A request's watermark images, with their share of the
@@ -563,6 +595,9 @@ pub(in crate::server) async fn run_process(
         Ok(Ok(permit)) => permit,
         _ => return Err(ProcessFailure::Busy),
     };
+    // No await between here and the spawn below: the
+    // render is marked started exactly when it is.
+    job.render_started.mark();
     let job = job.clone();
     let engine = state.engine;
     // The processing deadline (issue #260) is the

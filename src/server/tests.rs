@@ -9526,6 +9526,7 @@ fn provenance_job(
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+        render_started: Default::default(),
     }
 }
 
@@ -10217,6 +10218,7 @@ async fn processing_gate_bounds_concurrency() {
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
+        render_started: Default::default(),
     };
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let png = test_png();
@@ -10349,6 +10351,7 @@ async fn timed_out_encode_releases_the_process_gate() {
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
             jxl_speed: state.jxl_speed,
+            render_started: Default::default(),
         }
     };
     let stuck_job = job(
@@ -11093,6 +11096,7 @@ fn lane_test_job(
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+        render_started: Default::default(),
     }
 }
 
@@ -11533,6 +11537,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
+        render_started: Default::default(),
     };
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let png = test_png();
@@ -13229,6 +13234,216 @@ async fn flight_waiters_do_not_take_a_render_a_purge_overtook() {
         "the request after the purge got the render the purge overtook"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+/// The release a held render waits behind (see
+/// `open_release` and `wait_for_open`).
+type Release = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// An upscale double for the disconnect tests: counts the
+/// renders that reach it and holds each one until the test
+/// opens its release, then doubles the image.
+#[derive(Debug)]
+struct HeldUpscale {
+    release: Release,
+    calls: Arc<AtomicUsize>,
+}
+
+impl crate::ai::UpscaleProvider for HeldUpscale {
+    fn factor(&self) -> u32 {
+        2
+    }
+
+    fn upscale(
+        &self,
+        img: &image::DynamicImage,
+    ) -> Result<image::DynamicImage, crate::ai::AiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        wait_for_open(&self.release);
+        Ok(image::DynamicImage::ImageRgba8(image::imageops::resize(
+            &img.to_rgba8(),
+            img.width() * 2,
+            img.height() * 2,
+            image::imageops::FilterType::Nearest,
+        )))
+    }
+}
+
+/// Opens a held render's release when dropped, so a test
+/// that fails before it opens the release does not leave
+/// the render parked on its blocking thread.
+struct OpenOnDrop(Release);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        open_release(&self.0);
+    }
+}
+
+/// A lane test state whose upscale provider holds every
+/// render until the release opens, with the provider's
+/// call count.
+fn held_upscale_state(process_permits: usize) -> (AppState, Release, Arc<AtomicUsize>) {
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), process_permits, 1);
+    state.upscale = Some(Arc::new(HeldUpscale {
+        release: release.clone(),
+        calls: calls.clone(),
+    }));
+    (state, release, calls)
+}
+
+/// Start one signed image request for `remainder` on a
+/// task of its own, the way a connection drives the
+/// handler: aborting the task drops the request where it
+/// is, as a client that disconnects does.
+fn start_request(
+    state: &AppState,
+    remainder: &str,
+    width_hint: Option<u32>,
+) -> tokio::task::JoinHandle<Response> {
+    let uri: axum::http::Uri = format!("/{}/{remainder}", sign(remainder)).parse().unwrap();
+    let mut headers = HeaderMap::new();
+    if let Some(width) = width_hint {
+        headers.insert("sec-ch-width", width.into());
+    }
+    tokio::spawn(handle(State(state.clone()), uri, headers))
+}
+
+/// Drop a started request, as its client disconnecting
+/// does, and wait until it is gone.
+async fn disconnect(request: tokio::task::JoinHandle<Response>) {
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn a_render_whose_client_left_is_stored_and_its_replay_is_a_hit() {
+    // A client that disconnects drops its request while
+    // the render runs. The render runs to its end on its
+    // blocking thread anyway, and it used to be thrown
+    // away there: nothing was stored, so each replay of
+    // the URL, under each width hint, rendered it again.
+    // Now the finished render is stored: each hint
+    // variant renders once, and its replay is a hit. The
+    // lane and AI permits still come back when the render
+    // itself ends.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(2);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    for (rendering, width) in [(1, 150), (2, 250)] {
+        let request = start_request(&state, &remainder, Some(width));
+        wait_until("the render started", || {
+            calls.load(Ordering::SeqCst) == rendering
+        })
+        .await;
+        disconnect(request).await;
+    }
+    assert_eq!(
+        state.process_gate.in_use(),
+        2,
+        "each render holds its lane permit while it runs"
+    );
+    open_release(&release);
+    wait_until("the renders ended and their permits came back", || {
+        state.process_gate.in_use() == 0 && state.ai_gate.available_permits() == 2
+    })
+    .await;
+    for width in [150, 250] {
+        let replay = start_request(&state, &remainder, Some(width))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK, "width {width}");
+        assert_eq!(
+            replay.headers()["cache-status"],
+            "crabcrop; hit",
+            "the replay at width {width} rendered again"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one render per variant");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one fetch per variant");
+}
+
+#[tokio::test]
+async fn followers_of_a_leader_whose_client_left_receive_its_render() {
+    // With every cache tier off nothing stores a render,
+    // so a flight's followers take the leader's response
+    // from the flight (issue #407). A leader whose client
+    // disconnected used to end the flight with its
+    // request: the followers woke to nothing, and one of
+    // them rendered the key a second time while the first
+    // render was still running. Now the flight lasts until
+    // the render it started has finished: a follower that
+    // disconnects too costs nothing, and the one still
+    // connected receives the first render.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(2);
+    state.cache = Arc::new(Cache::new(0));
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    let leader = start_request(&state, &remainder, None);
+    wait_until("the leader's render started", || {
+        calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let leaving = start_request(&state, &remainder, None);
+    let staying = start_request(&state, &remainder, None);
+    // Time for both to find the flight and wait on it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    disconnect(leaving).await;
+    disconnect(leader).await;
+    open_release(&release);
+    let answer = staying.await.unwrap();
+    assert_eq!(answer.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let image = image::load_from_memory(&body).unwrap();
+    assert_eq!((image.width(), image.height()), (200, 120));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the key rendered again after its leader's client left"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_request_dropped_before_its_render_starts_starts_none() {
+    // The other half of the rule: a request whose client
+    // leaves while it still waits, here for the only lane
+    // permit, stops there, as it always has, and gives
+    // back what it holds. Only a render already running is
+    // finished for a client that has gone; one that has
+    // not started is never started.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(1);
+    let _open = OpenOnDrop(release);
+    let held = state.process_gate.clone().acquire_owned().await.unwrap();
+    let remainder = format!("filters:upscale(2)/{src}");
+    let request = start_request(&state, &remainder, None);
+    wait_until(
+        "the request holds its AI permit and waits for a lane",
+        || hits.load(Ordering::SeqCst) == 1 && state.ai_gate.available_permits() == 1,
+    )
+    .await;
+    disconnect(request).await;
+    // The lane frees up right after the client has gone.
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a render started for a request that was gone"
+    );
+    assert_eq!(state.process_gate.in_use(), 0);
+    assert_eq!(
+        state.ai_gate.available_permits(),
+        2,
+        "the dropped request kept its AI permit"
+    );
 }
 
 /// Fire `n` concurrent meta requests for one URL and
