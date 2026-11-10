@@ -447,6 +447,20 @@ impl Quality {
             }
         }
     }
+
+    /// Whether this directive settles a quality for every
+    /// output format: a plain value or `auto` does; a
+    /// per-format list does only when it carries a bare
+    /// fallback entry. A list without one leaves the formats
+    /// it does not name as if no quality were named, so the
+    /// Save-Data step-down still applies to those formats
+    /// (issue #569).
+    pub fn covers_all_formats(&self) -> bool {
+        match self {
+            Quality::Value(_) | Quality::Auto => true,
+            Quality::PerFormat(entries) => entries.iter().any(|(key, _)| key.is_none()),
+        }
+    }
 }
 
 /// Chroma subsampling as spelled in `format(...)` options
@@ -2638,6 +2652,12 @@ pub struct RequestDirectives {
     pub keep_profile: bool,
     /// Any `quality(...)` directive, fixed or auto.
     pub quality_directive: bool,
+    /// The `quality(...)` directive in force settles a
+    /// quality for every output format (issue #569): a
+    /// plain value, `auto`, or a per-format list with a
+    /// bare fallback. The last `quality(...)` filter wins,
+    /// as it does in the engine's options.
+    pub quality_covers_all_formats: bool,
     /// Any `text` filter.
     pub text: bool,
     /// The request requires the face model: a face-aligned
@@ -2693,6 +2713,7 @@ impl RequestDirectives {
             has_size_operation: false,
             keep_profile: false,
             quality_directive: false,
+            quality_covers_all_formats: false,
             text: false,
             needs_face_model: false,
             classes: Vec::new(),
@@ -2748,7 +2769,10 @@ impl RequestDirectives {
                         Filter::Upscale(_) => d.upscale = true,
                         Filter::Dpr(factor) => d.dpr = Some(*factor),
                         Filter::KeepProfile => d.keep_profile = true,
-                        Filter::Quality(_) => d.quality_directive = true,
+                        Filter::Quality(q) => {
+                            d.quality_directive = true;
+                            d.quality_covers_all_formats = q.covers_all_formats();
+                        }
                         Filter::Text { .. } => d.text = true,
                         Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
                         Filter::BlurClass(name)

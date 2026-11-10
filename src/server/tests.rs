@@ -7237,6 +7237,100 @@ async fn save_data_steps_quality_and_separates_the_cache() {
 }
 
 #[tokio::test]
+async fn save_data_steps_a_quality_list_that_misses_the_format() {
+    // Issue #569: a per-format list with no entry for the
+    // output format and no bare fallback behaves as if no
+    // quality was named, so the engine steps the Save-Data
+    // render; the cache key must separate the two entries
+    // the way it does when no quality is named at all.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:format(webp):quality(jpeg:90)/{src}");
+    // Plain first: the default encode, nothing reported.
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    let plain = resp.bytes().await.unwrap();
+    // Save-Data: the step to 70 is reported and the bytes
+    // are a different encode.
+    let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "70");
+    let stepped = resp.bytes().await.unwrap();
+    assert_ne!(plain, stepped);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // A repeat of each is a hit on its own entry.
+    let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(resp.bytes().await.unwrap(), stepped);
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    assert_eq!(resp.bytes().await.unwrap(), plain);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn save_data_first_does_not_poison_the_plain_entry() {
+    // Issue #569, the reverse order: the stepped render
+    // lands first, and the plain request afterwards must
+    // not be served it.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:format(webp):quality(jpeg:90)/{src}");
+    let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "70");
+    let stepped = resp.bytes().await.unwrap();
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    let plain = resp.bytes().await.unwrap();
+    assert_ne!(plain, stepped);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // The plain repeat is the plain entry.
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(resp.bytes().await.unwrap(), plain);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn save_data_reports_nothing_when_the_list_covers_the_format() {
+    // Issue #569: a list whose bare fallback covers every
+    // format is a quality directive in force, so Save-Data
+    // does not step and reports nothing, and the two
+    // requests share one entry: their bytes cannot differ.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:format(webp):quality(80,jpeg:90)/{src}");
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    let plain = resp.bytes().await.unwrap();
+    let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    assert_eq!(resp.bytes().await.unwrap(), plain);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn save_data_separates_a_list_that_covers_only_this_format() {
+    // Issue #569: a list that covers this format but not
+    // every format (quality(webp:75) served as WebP) does
+    // not meet the key's rule either, so the Save-Data
+    // request stores a second entry with the same bytes,
+    // the way PNG and GIF outputs already behaved: they
+    // carry the separation and are never stepped.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:format(webp):quality(webp:75)/{src}");
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    let plain = resp.bytes().await.unwrap();
+    let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+    assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+    assert_eq!(resp.bytes().await.unwrap(), plain);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn cli_verbs_work_against_a_live_server() {
     let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     let src = spawn_image_server().await;

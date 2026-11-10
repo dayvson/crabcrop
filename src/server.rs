@@ -2688,9 +2688,13 @@ fn negotiate(
         width_hint.map(|w| quantize_width(w, state.width_step))
     };
     // Save-Data changes the bytes exactly when the engine
-    // steps (hint present, no quality directive in the URL);
-    // the key separates those entries under the same rule.
-    let save_data_applies = save_data && !directives.quality_directive;
+    // steps: the hint is present and the quality directive
+    // in force does not settle a quality for every format.
+    // A per-format list that names other formats only
+    // leaves this format to the default the step-down acts
+    // on, so it separates entries like no directive at all;
+    // the key is built with the engine's rule (issue #569).
+    let save_data_applies = save_data && !directives.quality_covers_all_formats;
 
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);

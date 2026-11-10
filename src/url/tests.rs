@@ -1783,6 +1783,39 @@ fn per_format_quality_resolves_for_the_negotiated_format() {
         Quality::Auto.resolved_for(ImageFormat::Gif),
         Some(ResolvedQuality::Auto)
     );
+    // Coverage (issue #569): a list with a bare fallback
+    // covers every format; a list without one does not.
+    assert!(
+        Quality::PerFormat(vec![
+            (None, QualityValue::Value(70)),
+            (Some(ImageFormat::Jpeg), QualityValue::Value(90)),
+        ])
+        .covers_all_formats()
+    );
+    assert!(
+        !Quality::PerFormat(vec![(Some(ImageFormat::Jpeg), QualityValue::Value(90))])
+            .covers_all_formats()
+    );
+    assert!(Quality::Value(55).covers_all_formats());
+    assert!(Quality::Auto.covers_all_formats());
+}
+
+#[test]
+fn directives_record_whether_quality_covers_every_format() {
+    // Issue #569: the Save-Data cache key follows the
+    // quality directive in force, and the last quality
+    // filter is the one in force, as in the engine.
+    let covered = |ops: &str| {
+        let (ops, _) = parse_operations(&format!("{ops}/example.com/i.jpg")).unwrap();
+        RequestDirectives::analyze(&ops).quality_covers_all_formats
+    };
+    assert!(covered("filters:quality(80)"));
+    assert!(covered("filters:quality(auto)"));
+    assert!(covered("filters:quality(80,jpeg:90)"));
+    assert!(!covered("filters:quality(jpeg:90)"));
+    assert!(!covered("300x200"));
+    assert!(covered("filters:quality(jpeg:90):quality(80)"));
+    assert!(!covered("filters:quality(80):quality(jpeg:90)"));
 }
 
 #[test]
