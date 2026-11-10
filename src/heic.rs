@@ -79,8 +79,9 @@ fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
 /// at all. So this walks every item the decode can reach (the
 /// primary's derivation tree with its alpha and depth
 /// auxiliaries, the gain map item, and the primary's `altr`
-/// alternatives, which the decoder falls back to when the
-/// primary itself fails) and checks each one three times:
+/// alternatives with their own gain maps, which the decoder
+/// falls back to when the primary itself fails) and checks each
+/// one three times:
 ///
 /// - its codec: a coded item (or a tiled item's tiles) must be
 ///   HEVC, through [`check_hevc_coded`] (issue #466), so the
@@ -111,10 +112,16 @@ fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
     if let Ok(meta) = file.meta() {
         for group in meta.groups_containing(primary.id, b"altr") {
             for &alt in &group.entity_ids {
-                if alt != primary.id
-                    && let Ok(node) = oxideav_heif::build_graph(&file, alt)
-                {
+                if alt == primary.id {
+                    continue;
+                }
+                if let Ok(node) = oxideav_heif::build_graph(&file, alt) {
                     validate_node(&file, &node, &mut seen)?;
+                }
+                // The decode of an alternative decodes its gain
+                // map too, as it does the primary's.
+                if let Some(gain) = gain_map_node(&file, alt) {
+                    validate_node(&file, &gain, &mut seen)?;
                 }
             }
         }
@@ -665,19 +672,20 @@ impl GraphCost {
     }
 }
 
-/// The gain map image of a primary that is not itself a `tmap`
-/// (a `tmap` primary's gain map is its second input, already in
-/// its graph): the second derivation input of the `tmap` item
-/// whose first input is the primary, mirroring the decoder's
-/// own lookup in `find_gain_map`.
+/// The gain map image of an item the decode may output (the
+/// primary, or one of its `altr` alternatives) that is not
+/// itself a `tmap` (a `tmap` item's gain map is its second
+/// input, already in its graph): the second derivation input of
+/// the `tmap` item whose first input is that item, mirroring the
+/// decoder's own lookup in `find_gain_map`.
 fn gain_map_node<D: AsRef<[u8]>>(
     file: &oxideav_heif::HeifFile<D>,
-    primary_id: u32,
+    item_id: u32,
 ) -> Option<oxideav_heif::ImageNode> {
     let meta = file.meta().ok()?;
     let tmap = meta.items.iter().find(|item| {
         item.item_type == oxideav_heif::meta::ITEM_TYPE_TMAP
-            && meta.derivation_inputs(item.id).first() == Some(&primary_id)
+            && meta.derivation_inputs(item.id).first() == Some(&item_id)
     })?;
     let inputs = meta.derivation_inputs(tmap.id);
     oxideav_heif::build_graph(file, *inputs.get(1)?).ok()
@@ -1455,6 +1463,64 @@ mod tests {
             None
         );
         assert_eq!(cap_metadata(None, crate::color::MAX_META_BYTES), None);
+    }
+
+    #[test]
+    fn an_alternative_s_gain_map_is_held_to_the_decode_limits() {
+        // Should the primary (item 1) fail to decode, the decoder
+        // falls back to its `altr` alternative (item 2) and
+        // decodes that item's gain map (item 3, the second input
+        // of the `tmap` item 4) along with it. The gain map
+        // announces a size past the decode limit, so validation
+        // must refuse the file, though the gain map belongs to no
+        // graph the primary's or the alternative's walk reaches.
+        let infe = |id: u16, kind: &[u8; 4]| {
+            let mut body = id.to_be_bytes().to_vec();
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(kind);
+            body.push(0);
+            full_box(b"infe", 2, &body)
+        };
+        let ispe = |width: u32, height: u32| {
+            let mut body = width.to_be_bytes().to_vec();
+            body.extend_from_slice(&height.to_be_bytes());
+            full_box(b"ispe", 0, &body)
+        };
+        let mut meta = full_box(b"hdlr", 0, b"\0\0\0\0pict\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        meta.extend(full_box(b"pitm", 0, &1u16.to_be_bytes()));
+        let mut iinf = 4u16.to_be_bytes().to_vec();
+        for (id, kind) in [(1, b"hvc1"), (2, b"hvc1"), (3, b"hvc1"), (4, b"tmap")] {
+            iinf.extend(infe(id, kind));
+        }
+        meta.extend(full_box(b"iinf", 0, &iinf));
+        // The `tmap` item 4 derives from item 2 and gain map 3.
+        let dimg = [4u16, 2, 2, 3].map(u16::to_be_bytes).concat();
+        meta.extend(full_box(b"iref", 0, &bmff_box(b"dimg", &dimg)));
+        let mut iprp = bmff_box(b"ipco", &[ispe(64, 64), ispe(20_000, 48)].concat());
+        let mut ipma = 4u32.to_be_bytes().to_vec();
+        for (id, property) in [(1u16, 1u8), (2, 1), (3, 2), (4, 1)] {
+            ipma.extend_from_slice(&id.to_be_bytes());
+            ipma.extend_from_slice(&[1, property]);
+        }
+        iprp.extend(full_box(b"ipma", 0, &ipma));
+        meta.extend(bmff_box(b"iprp", &iprp));
+        // One `altr` group: group 100, items 1 and 2.
+        let altr = [100u32, 2, 1, 2].map(u32::to_be_bytes).concat();
+        meta.extend(bmff_box(b"grpl", &full_box(b"altr", 0, &altr)));
+        let mut bytes = bmff_box(b"ftyp", b"heic\0\0\0\0mif1heic");
+        bytes.extend(full_box(b"meta", 0, &meta));
+
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        let meta = file.meta().unwrap();
+        assert_eq!(meta.groups_containing(1, b"altr").len(), 1);
+        assert!(gain_map_node(&file, 1).is_none());
+        assert_eq!(gain_map_node(&file, 2).map(|node| node.item.id), Some(3));
+        match validate_decode_budget(&bytes) {
+            Err(EngineError::Decode(msg)) => {
+                assert!(msg.contains("item 3 announces 20000x48"), "{msg}")
+            }
+            other => panic!("expected the gain map refusal, got {other:?}"),
+        }
     }
 
     /// One ISO-BMFF box.
