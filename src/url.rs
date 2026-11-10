@@ -3069,9 +3069,12 @@ pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsaf
 ///
 /// Purge signatures live in their own domain (security audit
 /// P-1): they are HMACs under this derived key, never under the
-/// secret itself, so a signature minted for an image URL can
-/// never be replayed against the purge endpoint, even when the
-/// image remainder begins with `purge/`. Signing the literal
+/// secret itself, so a signature minted for an image URL does
+/// not verify at the purge endpoint, even when the image
+/// remainder begins with `purge/`. The key is the HMAC of the
+/// label `crabcrop/purge-key` under the secret, so this rests
+/// on no signer signing that label (see
+/// [`crabcrop_url::RESERVED_SEGMENT`]). Signing the literal
 /// `purge/<target>` with the secret itself would be exactly an
 /// image signature over a remainder of that shape.
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
@@ -3146,7 +3149,9 @@ pub fn verify_purge_group(secret: &[u8], signature: &Signature, group: &str) -> 
 /// (issue #168). Upload signatures live in their own
 /// domain beside the purge domain, under this derived
 /// key, so neither an image signature nor a purge
-/// signature can be replayed against the upload endpoint.
+/// signature verifies at the upload endpoint. As with
+/// [`purge_key`], that rests on no signer signing the key's
+/// label (see [`crabcrop_url::RESERVED_SEGMENT`]).
 pub fn upload_key(secret: &[u8]) -> Vec<u8> {
     crabcrop_url::upload_key(secret)
 }

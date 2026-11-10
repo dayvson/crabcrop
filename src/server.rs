@@ -861,6 +861,12 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
+    // The reserved segment is refused before verification,
+    // as on the image path.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        let (status, code, message) = reserved_remainder_parts();
+        return error_response(status, code, message, accept.as_deref());
+    }
     if !state
         .keyring
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
@@ -1300,8 +1306,9 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
 /// (issue #351). The signature is an HMAC over the
 /// path under a purge subkey derived from the secret (see
 /// [`crate::url::purge_key`]), so only the secret holder can
-/// purge and an image signature can never be replayed here; a
-/// bad signature is a 403 and purges nothing. Idempotent:
+/// purge and an image signature does not verify here (no
+/// signer signs the subkey's label); a bad signature is a
+/// 403 and purges nothing. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<AppState>,
@@ -1476,10 +1483,11 @@ async fn purge_handle(
 /// as in the per-URL purge (issue #351). The signature is
 /// verified under the purge-group
 /// subkey, its own domain beside the purge subkey, over the
-/// group name, so neither an image signature nor a per-URL
-/// purge signature can be replayed here (audit R2-14). A
-/// bad signature is a 403 and removes nothing; an unknown
-/// group answers 200 with a count of 0.
+/// group name, so a per-URL purge signature does not verify
+/// here, and neither does an image signature (no signer
+/// signs the subkey's label). A bad signature is a 403 and
+/// removes nothing; an unknown group answers 200 with a
+/// count of 0.
 async fn purge_group_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -2510,6 +2518,13 @@ fn authenticate<'a>(
     // rejection and an empty one.
     let (signature, key_id, rest) =
         parse_signature(full).map_err(|e| Refusal::AsIs(parse_failure_parts(&e)))?;
+    // A remainder that begins with the reserved segment is
+    // refused before its signature is checked, so the answer
+    // is the same whatever the signature: no response depends
+    // on an HMAC over a key derivation label.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::AsIs(reserved_remainder_parts()));
+    }
     let verify_start = Instant::now();
     let verified = state
         .keyring
@@ -2566,6 +2581,13 @@ fn resolve_request(
             "reserved_segment",
             "an image URL may not begin with a purge or upload segment".to_string(),
         )));
+    }
+    // A plain remainder that begins with the key derivation
+    // segment never gets this far (`authenticate` refuses it
+    // before verification); an opened token's can, and its
+    // answer is the uniform refusal like any payload failure.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::Payload(reserved_remainder_parts()));
     }
     // The cache groups (RFC 9875) are the presets the signed
     // remainder references, read before expansion rewrites it.
@@ -4622,6 +4644,23 @@ fn truncate_echo(message: &str) -> String {
 /// them leaves the answer to the one place that knows how
 /// the request may be answered (see [`Refusal::answer`]).
 type ErrorParts = (StatusCode, &'static str, String);
+
+/// The refusal for an image remainder that begins with
+/// [`crabcrop_url::RESERVED_SEGMENT`]. Every derived subkey
+/// (purge, purge-group, upload, seal, cache entry) is the
+/// HMAC of a label under that segment, so no image URL may
+/// begin with it, and no source can: it names no scheme the
+/// loader fetches.
+fn reserved_remainder_parts() -> ErrorParts {
+    (
+        StatusCode::BAD_REQUEST,
+        "reserved_segment",
+        format!(
+            "an image URL may not begin with the reserved segment {}",
+            crabcrop_url::RESERVED_SEGMENT
+        ),
+    )
+}
 
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.
