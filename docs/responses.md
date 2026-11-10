@@ -71,7 +71,7 @@ Operational failures carry these codes:
 | `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |
 | `meta_disabled` | `403` | Meta mode is off on this server, which is the default (`CRABCROP_META_MODE` unset or `0`). |
 | `not_found` | `404` | A `PUT` on the image route, or a request to a path no route matches, such as `/`. |
-| `method_not_allowed` | `405` | The path matches a route, but not for this method. The answer carries an `Allow` header listing the methods the route does serve. |
+| `method_not_allowed` | `405` | The path matches a route, but not for this method. The answer carries an `Allow` header listing the methods the route does serve. An image path's `Allow` also names `PUT`, which answers `404 not_found` there. |
 | `metrics_disabled` | `403` | `GET /metrics` when no `CRABCROP_METRICS_TOKEN` is configured. |
 | `metrics_unauthorized` | `401` | `GET /metrics` with a missing or wrong bearer token. |
 | `invalid_source` | `400` | The source URL is not one the server can fetch: it does not parse, names a scheme other than `http`, `https`, `s3`, `gs`, or `file`, or is a malformed bucket or file locator (`s3://` with no bucket or key, a file path carrying a NUL). A redirect to such a URL is the origin's answer and stays `source_fetch_failed`. |
@@ -116,7 +116,7 @@ The statuses you can get:
 | `401` | `GET /metrics` with a missing or wrong `CRABCROP_METRICS_TOKEN` bearer. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy from the URL itself (a host not in `CRABCROP_ALLOWED_SOURCES`, an IP address in a non-public range refused under `CRABCROP_BLOCK_PRIVATE_SOURCES`, or credentials in the URL). A host name that resolves to a non-public address answers `502` instead, like a name that does not resolve. |
 | `404` | The source was not found: a file missing under a source root, a file path with a `..` segment, one that leads outside the root or cannot be resolved inside it (whatever exists at it: a file, a directory, a symlink loop, or nothing), or an origin (an object store included) that answered 404. All of these answer with the same `source not found` body, so the response does not reveal what exists. Also a `PUT` to `/upload/...` when uploads are not configured (`uploads_not_configured`), a `PUT` on the image route, or a path no route matches, such as `/` (`not_found`). |
-| `405` | The path matches a route but the method does not: a `POST` or `DELETE` to an image path, a `GET` on `/upload/...`, a `PUT` on `/health`. The answer carries an `Allow` header listing the methods the route serves. |
+| `405` | The path matches a route but the method does not: a `POST` or `DELETE` to an image path, a `GET` on `/upload/...`, a `PUT` on `/health`. The answer carries an `Allow` header listing the methods the route serves. An image path's `Allow` also names `PUT`, which answers `404 not_found` there. |
 | `409` | An upload to a name that already exists, while `CRABCROP_UPLOAD_ALLOW_OVERWRITE` is off. |
 | `413` | An upload body larger than the `CRABCROP_UPLOAD_MAX_MB` cap. |
 | `415` | An upload body that does not decode as an image, or whose media kind does not match the name's extension. |

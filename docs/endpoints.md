@@ -12,7 +12,7 @@
 | `GET /explain/<signature>/...` | A report on the URL instead of the image. See [Self-explaining URLs](#self-explaining-urls). |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
-A request to one of these routes with any other method answers `405`, with an `Allow` header naming the methods the route serves.
+A request to one of these routes with any other method answers `405`, with an `Allow` header naming the methods the route serves. The exception is a `PUT` on an image path, which answers `404` (`not_found`). An image path's `Allow` also names `PUT`.
 
 ### Purge a cached result
 

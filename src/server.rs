@@ -439,10 +439,11 @@ pub fn app(state: AppState) -> Router {
         // from a mistyped path.
         .route("/upload/{*path}", axum::routing::put(upload_handle))
         .route("/{*path}", get(handle))
-        // A PUT that matched no upload route is a 404, not
-        // the 405 the GET catch-all would otherwise produce
-        // for it: the upload route is this server's only
-        // PUT surface (issue #168).
+        // A PUT on an image path is a 404, not the 405 the
+        // GET catch-all would otherwise produce for it:
+        // uploads go to the upload route only (issue #168).
+        // A PUT to a named route other than the upload
+        // route is the 405 below.
         .route("/{*path}", axum::routing::put(put_not_found))
         // A path no route matches (the catch-all's wildcard
         // cannot match `/` itself) answers the documented
@@ -465,9 +466,9 @@ fn accept_of(headers: &HeaderMap) -> Option<String> {
 }
 
 /// The image catch-all's PUT handler: a PUT there is
-/// simply not found. PUTs to the named routes are a
-/// different answer: the router's method-not-allowed
-/// fallback below (issue #563).
+/// simply not found. A PUT to a named route other than
+/// `/upload` is a different answer: the router's
+/// method-not-allowed fallback below (issue #563).
 async fn put_not_found(headers: HeaderMap) -> Response {
     error_response(
         StatusCode::NOT_FOUND,
