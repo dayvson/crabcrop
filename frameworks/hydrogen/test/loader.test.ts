@@ -79,3 +79,17 @@ test("the shared rule applies after scale: the URL carries the scaled pixel coun
     /crabcrop loader: width 20000 exceeds the maximum dimension/,
   );
 });
+
+test("a source under the reserved segment is refused, never signed", () => {
+  // With no dimensions there are no operations, so src is the
+  // whole remainder; every derived subkey is the signature of
+  // a label such as crabcrop/upload-key.
+  const loader = createCrabcropLoader({ base: "https://images.example.com", secret: "test-secret" });
+  const unsigned = createCrabcropLoader({ base: "https://images.example.com" });
+  for (const src of ["crabcrop/upload-key", "crabcrop/purge-group-key", "crabcrop"]) {
+    assert.throws(() => loader({ src }), /reserved segment "crabcrop"/);
+    assert.throws(() => unsigned({ src }), /reserved segment "crabcrop"/);
+  }
+  const named = "https://cdn.example.com/crabcrop/upload-key.jpg";
+  assert.equal(loader({ src: named }), `https://images.example.com/${sig(named)}/${named}`);
+});

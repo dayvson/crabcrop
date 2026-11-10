@@ -22,3 +22,14 @@ test("server-side calls sign (the spec vector secret agrees)", () => {
     `https://images.example.com/${sig(remainder)}/${remainder}`,
   );
 });
+
+test("a source under the reserved segment is refused, never signed", () => {
+  // A width the loader drops leaves no operations, so src is
+  // the whole remainder; every derived subkey is the signature
+  // of a label such as crabcrop/upload-key.
+  for (const src of ["crabcrop/upload-key", "crabcrop/seal-key", "crabcrop"]) {
+    assert.throws(() => loader({ src, width: 0 }), /reserved segment "crabcrop"/);
+  }
+  const named = "https://cdn.example.com/crabcrop/upload-key.jpg";
+  assert.equal(loader({ src: named, width: 0 }), `https://images.example.com/${sig(named)}/${named}`);
+});

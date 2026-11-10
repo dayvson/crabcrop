@@ -122,7 +122,7 @@ fn get(port: u16, path: &str, accept: Option<&str>) -> Option<Reply> {
 fn signed(remainder: &str) -> String {
     format!(
         "/{}/{remainder}",
-        crabcrop_url::sign(SECRET.as_bytes(), remainder)
+        crabcrop_url::sign(SECRET.as_bytes(), remainder).unwrap()
     )
 }
 

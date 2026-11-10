@@ -14,8 +14,36 @@ import { explainUrl } from "./sdk/explain.js";
 
 const encoder = new TextEncoder();
 
-/** Lowercase hex HMAC-SHA256 of `remainder` under `secret`. */
+/**
+ * The first remainder segment reserved for key derivation, as
+ * in the SDK: every derived subkey (purge, purge-group, upload,
+ * seal, cache entry) is the HMAC of a label such as
+ * `crabcrop/upload-key` under the secret, which is the image
+ * signature of that label. The server refuses an image URL
+ * that begins with this segment, and no signer signs one.
+ */
+export const RESERVED_SEGMENT = "crabcrop";
+
+/** Whether `remainder` is the reserved segment or starts with `crabcrop/`. */
+export function isReservedRemainder(remainder) {
+  return remainder === RESERVED_SEGMENT || remainder.startsWith(`${RESERVED_SEGMENT}/`);
+}
+
+function assertNotReserved(remainder) {
+  if (isReservedRemainder(remainder)) {
+    throw new Error(
+      `remainder begins with the reserved segment "${RESERVED_SEGMENT}": it is kept for key derivation, and no image URL may begin with it`,
+    );
+  }
+}
+
+/**
+ * Lowercase hex HMAC-SHA256 of `remainder` under `secret`. A
+ * remainder that begins with the reserved segment throws: its
+ * signature could be a derived subkey.
+ */
 export async function sign(secret, remainder) {
+  assertNotReserved(remainder);
   // WebCrypto refuses a zero-length HMAC key. By the HMAC
   // definition, a key shorter than the 64-byte block size is
   // padded with zeros to the block size, so an empty key is
@@ -61,6 +89,9 @@ export async function buildPlaygroundUrl({ base, secret, operations, source, exp
     remainder += `${operations}/`;
   }
   remainder += source;
+  // Refused with or without a secret, as the SDK refuses it:
+  // the server refuses the URL whatever its signature.
+  assertNotReserved(remainder);
   const signature =
     secret === null || secret === undefined ? "unsafe" : await sign(secret, remainder);
   return `${trimmedBase}/${signature}/${remainder}`;
@@ -125,6 +156,11 @@ export async function verifyUrlSignature(secret, input) {
   const { signature, remainder } = explainUrl(input);
   if (!signature || signature.kind !== "hmac") {
     return null;
+  }
+  // No signature over a reserved remainder is ever valid, and
+  // this check must not confirm a derived subkey either.
+  if (isReservedRemainder(remainder)) {
+    return false;
   }
   const expected = await sign(secret, remainder);
   // No case-folding: the explainer already classifies a
