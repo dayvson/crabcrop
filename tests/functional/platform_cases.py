@@ -1170,9 +1170,10 @@ def parity_cases():
     ]
     vectors = json.load(open(os.path.join(REPO, "spec", "test-vectors.json")))
     for i, v in enumerate(vectors):
-        if "refuses" in v:
-            # Builder refusals (issue #472) have no output to
-            # compare; each SDK's own vector suite runs them.
+        if "refuses" in v or v.get("reserved"):
+            # Builder refusals (issue #472) and reserved
+            # remainders have no output to compare; each SDK's
+            # own vector suite runs them.
             continue
         if v.get("sealed"):
             cases.append({"id": f"vec-seal-{i}", "kind": "seal",

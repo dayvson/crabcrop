@@ -119,20 +119,22 @@ Every open failure (wrong secret, tampered token, malformed segment) is the same
 
 ## Verification and primitives
 
-If you assemble or check URLs yourself, `sign` and `verify` are the raw HMAC-SHA256 pair. Verification compares in constant time, and a malformed signature segment fails cleanly instead of panicking.
+If you assemble or check URLs yourself, `sign` and `verify` are the HMAC-SHA256 pair. Verification compares in constant time, and a malformed signature segment fails cleanly instead of panicking.
 
 ```rust
 use crabcrop_url::{sign, verify};
 
-let signature = sign(b"your-secret", "300x200/https://example.com/photo.jpg");
+let signature = sign(b"your-secret", "300x200/https://example.com/photo.jpg").unwrap();
 assert!(verify(b"your-secret", &signature, "300x200/https://example.com/photo.jpg"));
 ```
+
+`sign`, and every builder, refuses a remainder that begins with the reserved segment `crabcrop` (`is_reserved_remainder`) with `BuildError::ReservedRemainder`: the derived subkeys below are the HMAC of labels such as `crabcrop/purge-key` under the secret, so a signature over one of them would be that subkey. No image URL may begin with that segment, and the server refuses one whatever its signature. See [Reserved remainders](https://github.com/dayvson/crabcrop/blob/main/spec/url-signing.md#reserved-remainders).
 
 Builders always emit the canonical lowercase hex tag, and the server accepts only that spelling: an uppercase tag is well-formed hex but not a valid signature segment there, so hand-assembled URLs should reuse builder output rather than re-casing a tag.
 
 ## Purge signatures
 
-Cache purge endpoints take their own signatures, domain-separated under a derived subkey, so a signature minted for an image URL can never be replayed against a purge endpoint (or the other way around). The helpers sign the right strings, so callers never assemble them by hand.
+Cache purge endpoints take their own signatures, domain-separated under a derived subkey, so a signature minted for an image URL does not verify at a purge endpoint (or the other way around). The helpers sign the right strings, so callers never assemble them by hand.
 
 ```rust
 use crabcrop_url::{purge_group_signature, purge_signature};

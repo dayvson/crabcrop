@@ -33,6 +33,8 @@ Use that hex string as the first path segment. Anyone can verify the scheme agai
 
 A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`, `yes`, `on`). Keep it off in production. Purges are the exception that never bends: `/purge` and `/purge-group` always require an HMAC signature made with the secret, even in unsafe mode.
 
+The first segment `crabcrop` is reserved. The keys the server derives from the secret (for purges, uploads, sealed URLs, and its stored cache entries) are HMACs of labels such as `crabcrop/purge-key`, so a signature over one of those labels would be that key. No signer signs a remainder that is `crabcrop` or begins with `crabcrop/`, and the server answers one with `400` (`reserved_segment`) before it looks at the signature. It names no source the server could fetch, so no working URL is affected. If you write your own signer, refuse it too: [Reserved remainders](../spec/url-signing.md#reserved-remainders) has the rule and the test vectors.
+
 ### Sealed URLs
 
 Signing proves a URL was minted by someone holding the secret, but it hides nothing: the operations and the source sit in the path for anyone to read. That readability is the design (`The URL is the API` cuts both ways, and it is what makes crabcrop URLs debuggable), and for most deployments it is the right default. When it is not, the same remainder can be **sealed**: encrypted into an opaque token that sits in the signature slot.
