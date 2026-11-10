@@ -33,7 +33,10 @@ srcset = build_srcset(
     [400, 800, 1200],
 )
 
-# The raw signature for a remainder, if you assemble URLs yourself.
+# The signature for a remainder, if you assemble URLs yourself. It
+# raises ValueError for a remainder that begins with the reserved
+# segment "crabcrop" (is_reserved_remainder), as every builder does:
+# the derived subkeys are signatures of labels under that segment.
 signature = sign("your-secret", "300x200/https://example.com/photo.jpg")
 
 # Verify a signature in constant time (malformed tags return False).

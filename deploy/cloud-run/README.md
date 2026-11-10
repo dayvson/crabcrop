@@ -22,7 +22,7 @@ the wiring.
 Release images are published to GHCR as
 `ghcr.io/dayvson/crabcrop`, tagged with the release
 version. Replace the `REPLACE_ME` image in `service.yaml`
-with `ghcr.io/dayvson/crabcrop:0.10.1`, or with your own
+with `ghcr.io/dayvson/crabcrop:0.11.0`, or with your own
 build of the repo Dockerfile pushed to Artifact Registry.
 
 ## Prerequisites

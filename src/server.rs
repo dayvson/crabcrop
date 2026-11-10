@@ -61,7 +61,7 @@ pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PU
 mod process;
 pub(in crate::server) use process::{
     AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
-    PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
+    MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
     SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process, wants_animation_gate,
     wants_slow_lane,
 };
@@ -230,6 +230,11 @@ pub struct AppState {
     /// Quantization step for width client hints
     /// (`CRABCROP_WIDTH_STEP`).
     pub width_step: u32,
+    /// Whether the image path reads the client hint headers
+    /// (`CRABCROP_CLIENT_HINTS`, on by default). Off, every
+    /// hint header is ignored, image answers vary on
+    /// `Accept` alone, and no `Accept-CH` is advertised.
+    pub client_hints: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -301,11 +306,11 @@ pub struct AppState {
     /// keeps it from holding stills permits while it runs.
     pub anim_gate: Arc<tokio::sync::Semaphore>,
     /// Bounds concurrent heavy `/explain` probes (an SVG's
-    /// parse in the worker, an AVIF's decode), which run on
-    /// blocking threads (see `explain_probe`): a burst of
-    /// them waits here, or sheds with a 503, instead of
-    /// occupying the async runtime or starting a worker
-    /// process per request.
+    /// parse in the worker, an AVIF's decode, a HEIC's item
+    /// graph walk), which run on blocking threads (see
+    /// `explain_probe`): a burst of them waits here, or
+    /// sheds with a 503, instead of occupying the async
+    /// runtime or starting a worker process per request.
     pub probe_gate: Arc<tokio::sync::Semaphore>,
     /// In-flight miss coalescing (audit R2-09): concurrent
     /// misses for one cache key share one fetch and one
@@ -394,6 +399,7 @@ impl std::fmt::Debug for AppState {
             avif_speed,
             jxl_speed,
             width_step,
+            client_hints,
             preserve_metadata,
             brand_color,
             presets,
@@ -458,24 +464,51 @@ async fn put_not_found(headers: HeaderMap) -> Response {
 }
 
 /// Headers applied to every response (audit PL-5, PL-6):
-/// `nosniff` everywhere, and `no-store` on the system
+/// `nosniff` everywhere, `no-store` on the system
 /// endpoints, whose contents are operational data, not
-/// cacheable content.
+/// cacheable content, and `no-store` on every error answer
+/// that does not already carry it.
+///
+/// An error describes one request at one moment (a source
+/// not there yet, a gate that was full, a header that asked
+/// for something this URL cannot serve), never what the URL
+/// is. Without cache headers a shared cache applies its own
+/// default to an error, and some store one for seconds to
+/// an hour under a key that leaves out the request headers
+/// the answer depended on, so every viewer of the URL would
+/// get it. Setting it here covers every route and the
+/// router's own answers (an unrouted method's `405`) in one
+/// place, so an error builder added later cannot miss it.
 async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let system = matches!(req.uri().path(), "/health" | "/metrics");
     let mut response = next.run(req).await;
+    let error = response.status().is_client_error() || response.status().is_server_error();
     let headers = response.headers_mut();
     headers.insert(
         "x-content-type-options",
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    if system {
+    let stored_nowhere = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| has_directive(v, "no-store"));
+    if system || (error && !stored_nowhere) {
         headers.insert(
             header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
     }
     response
+}
+
+/// Whether a `Cache-Control` value carries `directive`
+/// (compared without case, ignoring any argument).
+fn has_directive(cache_control: &str, directive: &str) -> bool {
+    cache_control.split(',').any(|d| {
+        d.split('=')
+            .next()
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(directive))
+    })
 }
 
 async fn health() -> &'static str {
@@ -533,10 +566,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             state.metrics.render(),
             lane_metrics(&state),
             source_buffer_metrics(&state),
+            source_lookup_metrics(&state),
             tier_metrics(&state)
         ),
     )
@@ -593,6 +627,24 @@ fn source_buffer_metrics(state: &AppState) -> String {
     )
 }
 
+/// Source host lookup slot occupancy for `/metrics`: the
+/// lookups running right now against the slots (see
+/// [`crate::loader::LOOKUP_SLOTS`]), read live at scrape time.
+/// In flight sitting at capacity while requests shed with
+/// `server_busy` means the resolver is not answering for the
+/// host names requests carry.
+fn source_lookup_metrics(state: &AppState) -> String {
+    let (in_flight, capacity) = state.loader.lookup_slots();
+    format!(
+        "# HELP crabcrop_source_lookups_in_flight Source host lookups running now.\n\
+         # TYPE crabcrop_source_lookups_in_flight gauge\n\
+         crabcrop_source_lookups_in_flight {in_flight}\n\
+         # HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.\n\
+         # TYPE crabcrop_source_lookups_capacity gauge\n\
+         crabcrop_source_lookups_capacity {capacity}\n"
+    )
+}
+
 /// Cache tier failures for `/metrics` (issue #367): the
 /// stores count their own failures as they log them; the
 /// exposition reads the counters live at scrape time,
@@ -635,6 +687,45 @@ fn tier_metrics(state: &AppState) -> String {
     out
 }
 
+/// The DPR hint headers [`dpr_hint`] reads, the
+/// structured one first.
+const DPR_HINT_HEADERS: [&str; 2] = ["Sec-CH-DPR", "DPR"];
+
+/// The width hint headers [`width_hint`] reads, in the
+/// order it prefers them.
+const WIDTH_HINT_HEADERS: [&str; 4] = [
+    "Sec-CH-Width",
+    "Width",
+    "Sec-CH-Viewport-Width",
+    "Viewport-Width",
+];
+
+/// The header [`save_data_hint`] reads.
+const SAVE_DATA_HEADER: &str = "Save-Data";
+
+/// The `Vary` of every image-route answer while the server
+/// reads client hints: `Accept` and every header the hint
+/// readers above read, since each can change the bytes.
+const VARY_WITH_HINTS: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
+
+/// The `Vary` of every image-route answer with client hints
+/// off (`CRABCROP_CLIENT_HINTS=0`): no hint header is read,
+/// so only `Accept` can change an answer.
+const VARY_WITHOUT_HINTS: &str = "Accept";
+
+/// The `Vary` an image-route answer carries, success or
+/// error: an error's body follows `Accept` (plain text or
+/// the JSON envelope) and can follow a hint (a hinted size
+/// that runs past a limit or the deadline), just as an
+/// image does.
+fn image_vary(client_hints: bool) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_static(if client_hints {
+        VARY_WITH_HINTS
+    } else {
+        VARY_WITHOUT_HINTS
+    })
+}
+
 /// The `DPR` client hint, when it names one of the settled
 /// factors. Anything else (absent, unparsable, out of set) is
 /// no hint: hints are advisory, never an error. A factor
@@ -642,9 +733,10 @@ fn tier_metrics(state: &AppState) -> String {
 /// in the engine rather than failing the request (issue
 /// #529).
 fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
+    let [first, legacy] = DPR_HINT_HEADERS;
     let raw = headers
-        .get("Sec-CH-DPR")
-        .or_else(|| headers.get("DPR"))
+        .get(first)
+        .or_else(|| headers.get(legacy))
         .and_then(|v| v.to_str().ok())?;
     raw.trim()
         .parse::<f32>()
@@ -659,12 +751,7 @@ fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
 /// unparsable, or out-of-range value is no hint, never an
 /// error.
 fn width_hint(headers: &HeaderMap) -> Option<u32> {
-    for name in [
-        "Sec-CH-Width",
-        "Width",
-        "Sec-CH-Viewport-Width",
-        "Viewport-Width",
-    ] {
+    for name in WIDTH_HINT_HEADERS {
         let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
         };
@@ -706,7 +793,7 @@ fn quantize_width(width: u32, step: u32) -> u32 {
 /// Whether the client sent `Save-Data: on`.
 fn save_data_hint(headers: &HeaderMap) -> bool {
     headers
-        .get("Save-Data")
+        .get(SAVE_DATA_HEADER)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("on"))
 }
@@ -756,9 +843,10 @@ async fn fallback_source_bytes(
 /// The load asks this after every chunk, on the async
 /// runtime, so it never sizes a kind whose probe is heavy
 /// ([`crate::engine::probe_is_heavy`]): an SVG's size needs
-/// the whole document anyway, and an AVIF's a decode. Those
-/// read on to the end of the body (or the head cap), and
-/// [`explain_probe`] sizes them once, off the runtime.
+/// the whole document anyway, an AVIF's a decode, and a
+/// HEIC's a walk of its item graph. Those read on to the end
+/// of the body (or the head cap), and [`explain_probe`]
+/// sizes them once, off the runtime.
 fn probe_settled(head: &[u8]) -> bool {
     let kind = crate::engine::probe_kind(head);
     match kind {
@@ -776,13 +864,13 @@ const PROBE_GATE_WAIT: std::time::Duration = PROCESS_GATE_WAIT;
 
 /// The explain report's source probe. A heavy probe (an
 /// SVG's parse in the worker, which may take the probe's
-/// whole 5 s, or an AVIF's decode) runs on a blocking
-/// thread under the probe gate, so the async runtime, and
-/// every route it serves, never waits on one; the permit
-/// moves into the job, so a probe whose request went away
-/// still counts until it ends. Every other kind's probe
-/// reads headers alone and runs inline. `None` means the
-/// gate stayed full past its wait.
+/// whole 5 s, an AVIF's decode, or a HEIC's item graph
+/// walk) runs on a blocking thread under the probe gate,
+/// so the async runtime, and every route it serves, never
+/// waits on one; the permit moves into the job, so a probe
+/// whose request went away still counts until it ends.
+/// Every other kind's probe reads headers alone and runs
+/// inline. `None` means the gate stayed full past its wait.
 async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine::SourceProbe> {
     let kind = crate::engine::probe_kind(&head);
     if !crate::engine::probe_is_heavy(kind) {
@@ -816,10 +904,11 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// source touched, once, through the loader with all of
 /// its guards, and the facts come from header probing
 /// (`crate::engine::probe_source`): no decode, no
-/// detection, no process, AI, or video gate (an SVG or AVIF
-/// probe takes the probe gate, see [`explain_probe`]), and
-/// nothing written to any cache tier. A bad signature, an over-cap
-/// operation list, or an expired URL therefore costs zero
+/// detection, no process, AI, or video gate (an SVG, AVIF,
+/// or HEIC probe takes the probe gate, see
+/// [`explain_probe`]), and nothing written to any cache
+/// tier. A bad signature, an over-cap operation list, or an
+/// expired URL therefore costs zero
 /// source fetches, and answers with the image path's own
 /// status and body.
 async fn explain_handle(
@@ -861,6 +950,12 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
+    // The reserved segment is refused before verification,
+    // as on the image path.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        let (status, code, message) = reserved_remainder_parts();
+        return error_response(status, code, message, accept.as_deref());
+    }
     if !state
         .keyring
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
@@ -1001,10 +1096,13 @@ async fn explain_handle(
     // The canonical form is the cache key's path form, of
     // the merged list as the image path keys it. The key's
     // config fingerprint suffix is operator state and stays
-    // unreported. For a root source the form is built from
-    // the source as written: the key itself is keyed on the
-    // expansion, but printing that here would publish the
-    // root's base URL into the report.
+    // unreported. A form past the key-length bound is shown
+    // in full, though the key carries its digest
+    // (`cache::bounded_key_base`). For a root source the
+    // form is built from the source as written: the key
+    // itself is keyed on the expansion, but printing that
+    // here would publish the root's base URL into the
+    // report.
     let canonical = crate::url::canonical_form(&merged, source_url);
     let report = crate::explain::Report::new(crate::explain::ReportInput {
         signed: !matches!(signature, crate::url::Signature::Unsafe),
@@ -1016,8 +1114,9 @@ async fn explain_handle(
         probe,
         // The DPR hint is read as the image path reads it, so
         // the forecast steps a hinted factor down as the image
-        // request does (issue #529).
-        dpr_hint: dpr_hint(&headers),
+        // request does (issue #529), and not at all with
+        // client hints off.
+        dpr_hint: dpr_hint(&headers).filter(|_| state.client_hints),
         source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
         merged_ops: merged,
@@ -1054,6 +1153,9 @@ async fn explain_handle(
 /// operator's facts, not the caller's (issue #196,
 /// requirement 3).
 fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
+    if let Some(busy) = load_busy_response(&e, accept) {
+        return busy;
+    }
     eprintln!("explain load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
@@ -1297,8 +1399,9 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
 /// (issue #351). The signature is an HMAC over the
 /// path under a purge subkey derived from the secret (see
 /// [`crate::url::purge_key`]), so only the secret holder can
-/// purge and an image signature can never be replayed here; a
-/// bad signature is a 403 and purges nothing. Idempotent:
+/// purge and an image signature does not verify here (no
+/// signer signs the subkey's label); a bad signature is a
+/// 403 and purges nothing. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<AppState>,
@@ -1399,17 +1502,15 @@ async fn purge_handle(
     // Entries are keyed post-merge (issue #145): with
     // defaults configured, the purge target's key form is
     // the canonical form of the merged operations, or the
-    // purge silently removes nothing.
-    let key_form = if state.default_ops.is_empty() {
-        crate::url::canonical_key_form(target)
-    } else {
-        match parse_operations_with_expiry(target) {
-            Ok((ops, source, _, _)) => {
-                let merged = crate::url::merge_default_ops(&state.default_ops, ops);
-                crate::url::canonical_form(&merged, source)
-            }
-            Err(_) => crate::url::canonical_key_form(target),
+    // purge silently removes nothing. The form is bounded
+    // the way `cache_key_for` bounds it, so an over-long
+    // URL's purge names its digest-form key.
+    let key_form = match parse_operations_with_expiry(target) {
+        Ok((ops, source, _, _)) => {
+            let merged = crate::url::merge_default_ops(&state.default_ops, ops);
+            crate::cache::bounded_key_base(crate::url::canonical_form(&merged, source), source)
         }
+        Err(_) => crate::cache::bounded_key_base(target.to_string(), ""),
     };
     // The fan-out runs in a spawned task once the
     // signature has verified (issue #347): a purge that
@@ -1475,10 +1576,11 @@ async fn purge_handle(
 /// as in the per-URL purge (issue #351). The signature is
 /// verified under the purge-group
 /// subkey, its own domain beside the purge subkey, over the
-/// group name, so neither an image signature nor a per-URL
-/// purge signature can be replayed here (audit R2-14). A
-/// bad signature is a 403 and removes nothing; an unknown
-/// group answers 200 with a count of 0.
+/// group name, so a per-URL purge signature does not verify
+/// here, and neither does an image signature (no signer
+/// signs the subkey's label). A bad signature is a 403 and
+/// removes nothing; an unknown group answers 200 with a
+/// count of 0.
 async fn purge_group_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -2261,18 +2363,15 @@ fn generate_request_id() -> String {
     hex::encode(&digest[..8])
 }
 
-fn request_id_from(inbound: Option<&str>) -> String {
-    if let Some(value) = inbound {
-        let value = value.trim();
-        if (1..=128).contains(&value.len())
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return value.to_string();
-        }
-    }
-    generate_request_id()
+/// The request ID a client chose with `X-Request-Id`, when
+/// it is 1 to 128 letters, digits, `-` or `_`.
+fn client_request_id(inbound: Option<&str>) -> Option<String> {
+    let value = inbound?.trim();
+    ((1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then(|| value.to_string())
 }
 
 async fn handle(
@@ -2294,14 +2393,19 @@ async fn handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let request_id = request_id_from(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
+    let chosen_id = client_request_id(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
+    let request_id = chosen_id.clone().unwrap_or_else(generate_request_id);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let dpr = dpr_hint(&headers);
-    let width = width_hint(&headers);
-    let save_data = save_data_hint(&headers);
+    // With client hints off, no hint header is read at all:
+    // every request for a URL gets the same bytes, the one
+    // answer a cache that keys on the URL alone can hold.
+    let hints = state.client_hints;
+    let dpr = dpr_hint(&headers).filter(|_| hints);
+    let width = width_hint(&headers).filter(|_| hints);
+    let save_data = hints && save_data_hint(&headers);
     let (mut response, mut record) = serve(
         &state,
         path,
@@ -2315,10 +2419,27 @@ async fn handle(
     record.request_id = request_id.clone();
     record.status = response.status().as_u16();
     record.total = started.elapsed();
-    response.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-request-id"),
-        request_id.parse().unwrap(),
-    );
+    // Every answer on this route, errors and meta included,
+    // names the request headers it may depend on.
+    response
+        .headers_mut()
+        .insert(header::VARY, image_vary(state.client_hints));
+    // An answer a shared cache may store reaches every later
+    // viewer of the URL with the headers it was stored with,
+    // so it never carries an ID the client chose: that
+    // client already has it, and the log line records it.
+    // An ID the server generated is still sent.
+    let shared = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| has_directive(v, "public"));
+    if chosen_id.is_none() || !shared {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-request-id"),
+            request_id.parse().unwrap(),
+        );
+    }
     state.metrics.record(&record);
     println!("{}", record.to_json());
     response
@@ -2406,6 +2527,7 @@ async fn serve(
         Ok(admitted) => admitted,
         Err(refusal) => return (refusal.answer(sealed, accept), record),
     };
+    let hint_shaped = negotiated.hint_shaped();
     let cache_key = cache_key_for(
         &state.config_fingerprint,
         &resolved.ops,
@@ -2434,14 +2556,53 @@ async fn serve(
         placeholders: negotiated.placeholders,
         hinted_width: negotiated.hinted_width,
         dpr_hint,
-        save_data,
+        // The engine steps on the same decision the key and
+        // the private marking take, never on the raw header:
+        // a render the header stepped where the key does not
+        // separate it would be stored, and served publicly,
+        // as the URL's plain answer.
+        save_data: negotiated.save_data_applies,
         accept: accept.map(str::to_string),
         groups: resolved.groups,
         cache_key,
         max_age: resolved.max_age,
         sealed,
+        progress: MissProgress::default(),
     };
-    run_flight(state, path, work, if_none_match, record).await
+    let (mut response, record) = run_flight(state, path, work, if_none_match, record).await;
+    if hint_shaped {
+        keep_from_shared_caches(&mut response);
+    }
+    (response, record)
+}
+
+/// Make a public answer private, keeping its lifetime: an
+/// answer a client hint gives its own cache entry (see
+/// [`Negotiated::hint_shaped`]).
+///
+/// The hint headers are request headers any client sets,
+/// and many shared caches (CDNs among them) key on the URL
+/// and not on `Vary`, so a hint-shaped answer stored there
+/// would be the answer every later viewer of the URL gets,
+/// whatever their own headers say. A private answer is
+/// still kept by the browser that asked, for its whole
+/// lifetime, and the URL's hint-free answer stays public:
+/// it is the answer a cache that keys on the URL alone
+/// should hold. Answers that are not public (meta, errors,
+/// the fallback, the debug view) are left as they are.
+fn keep_from_shared_caches(response: &mut Response) {
+    let Some(rest) = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("public"))
+    else {
+        return;
+    };
+    let private = format!("private{rest}");
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, private.parse().unwrap());
 }
 
 /// A remainder the request may run.
@@ -2509,6 +2670,13 @@ fn authenticate<'a>(
     // rejection and an empty one.
     let (signature, key_id, rest) =
         parse_signature(full).map_err(|e| Refusal::AsIs(parse_failure_parts(&e)))?;
+    // A remainder that begins with the reserved segment is
+    // refused before its signature is checked, so the answer
+    // is the same whatever the signature: no response depends
+    // on an HMAC over a key derivation label.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::AsIs(reserved_remainder_parts()));
+    }
     let verify_start = Instant::now();
     let verified = state
         .keyring
@@ -2565,6 +2733,13 @@ fn resolve_request(
             "reserved_segment",
             "an image URL may not begin with a purge or upload segment".to_string(),
         )));
+    }
+    // A plain remainder that begins with the key derivation
+    // segment never gets this far (`authenticate` refuses it
+    // before verification); an opened token's can, and its
+    // answer is the uniform refusal like any payload failure.
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::Payload(reserved_remainder_parts()));
     }
     // The cache groups (RFC 9875) are the presets the signed
     // remainder references, read before expansion rewrites it.
@@ -2646,11 +2821,32 @@ struct Negotiated {
     effective_dpr: f32,
     /// The quantized width a width hint resolves to.
     hinted_width: Option<u32>,
-    /// Whether `Save-Data` changes the bytes.
+    /// Whether `Save-Data` applies: the engine steps the
+    /// quality of a format that carries one, and the key
+    /// separates the entry.
     save_data_applies: bool,
     meta: bool,
     debug: bool,
     placeholders: bool,
+}
+
+impl Negotiated {
+    /// Whether a client hint gives the answer its own cache
+    /// entry: a width hint sizes it, a DPR hint (not the
+    /// URL's own `dpr`) scales it, or `Save-Data` applies.
+    /// This is exactly when [`cache_key_for`] gives the key
+    /// a hint's suffix, so the answer is set apart from the
+    /// URL's hint-free answer by the same rule its cache
+    /// entry is. It can still match that answer byte for
+    /// byte (a width hint at or past the source width, a DPR
+    /// hint on a URL that sizes nothing, `Save-Data` on PNG
+    /// output), and is set apart all the same: whether the
+    /// bytes differ is only known after the render.
+    fn hint_shaped(&self) -> bool {
+        self.hinted_width.is_some()
+            || self.save_data_applies
+            || (self.directives.dpr.is_none() && self.effective_dpr != 1.0)
+    }
 }
 
 /// The third stage of [`serve`]: settle the directives,
@@ -2687,9 +2883,13 @@ fn negotiate(
     } else {
         width_hint.map(|w| quantize_width(w, state.width_step))
     };
-    // Save-Data changes the bytes exactly when the engine
-    // steps (hint present, no quality directive in the URL);
-    // the key separates those entries under the same rule.
+    // Save-Data applies when the hint is present and the URL
+    // names no quality directive. This one decision drives
+    // the engine's step (`MissWork::save_data`), the key's
+    // separate entry, and the private marking, so the three
+    // cannot disagree: a per-format list that names no value
+    // for the output format still counts as a directive, and
+    // the engine does not step it either.
     let save_data_applies = save_data && !directives.quality_directive;
 
     let preferred = negotiate_format(accept);
@@ -2764,14 +2964,20 @@ fn negotiate(
 /// parsed operations re-serialized in their one
 /// spelling, so equivalent requests share an entry.
 /// Expiry and the cache lifetime are not operations,
-/// so neither ever enters it.
+/// so neither ever enters it. A form past
+/// [`crate::cache::MAX_KEY_BASE_BYTES`] is carried as its
+/// digest ([`crate::cache::bounded_key_base`]), so a padded
+/// source cannot make one entry's key, which every tier
+/// stores and the cache maps hold twice, tens of kilobytes
+/// long.
 fn cache_key_for(
     config_fingerprint: &str,
     ops: &[crate::url::Operation],
     source_url: &str,
     negotiated: &Negotiated,
 ) -> String {
-    let key_base = crate::url::canonical_form(ops, source_url);
+    let key_base =
+        crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
     // The key also carries the configuration fingerprint
     // (audit R2-08): entries in the persistent tiers are
     // keyed under the configuration that produced them, so
@@ -2865,15 +3071,21 @@ async fn run_flight(
     // cache lifetime all come from it) and the same header
     // inputs as the miss path sees them: the negotiated
     // format, not the raw Accept (on this path errors are
-    // plain text whatever it says), and the quantized
-    // width, not the raw hint, so browsers that phrase the
-    // same request differently still share one flight. The
+    // plain text whatever it says), the quantized width,
+    // not the raw hint, and whether Save-Data applies, not
+    // the raw header, so browsers that phrase the same
+    // request differently still share one flight. The
     // conditional header is left out: each waiter applies
-    // its own. A waiter that cannot take the response
-    // (another spelling of the key, a body past the share
-    // cap, a leader whose request was dropped, a run a
-    // purge of the key overtook) leads or follows the next
-    // flight. Waits are capped: a waiter whose flights
+    // its own. A leader whose client goes away after its
+    // render has started still finishes the flight (see
+    // `finish_started_miss`). A waiter that cannot take
+    // the response (another spelling of the key, a body
+    // past the share cap, a leader whose request was
+    // dropped before its render started, a leader that
+    // forwent its fallback run because its client had
+    // gone, a run a purge of the key overtook) leads or
+    // follows the next flight.
+    // Waits are capped: a waiter whose flights
     // keep ending without an answer for it stops queueing
     // and runs the miss path itself (issue #375), so it
     // ends with the origin's real answer instead of a busy
@@ -2894,7 +3106,13 @@ async fn run_flight(
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
             let etag = hit.etag.clone();
-            let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
+            let mut response = respond(
+                hit.format,
+                hit.quality,
+                hit.bytes,
+                max_age,
+                state.client_hints,
+            );
             attach_cache_headers(&mut response, cache_status, &groups, sealed);
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
@@ -2926,18 +3144,35 @@ async fn run_flight(
         match state.inflight.lead(&cache_key) {
             Flight::Leader(guard, slot) => {
                 let snapshot = state.purge_guard.snapshot();
-                let (response, record, render_etag) = serve_miss(state, work, record).await;
-                let (mut response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
-                if let Some(shared) = shared {
-                    *slot.shared.lock().unwrap() = Some(SharedFlight {
-                        request: flight_request,
-                        snapshot,
-                        response: shared,
-                        etag: render_etag.clone(),
-                        fallback: record.fallback,
-                    });
-                }
-                drop(guard);
+                let progress = work.progress.clone();
+                let task_progress = progress.clone();
+                let task_state = state.clone();
+                // The leader's whole part runs as one miss
+                // (see `finish_started_miss`): a render it
+                // starts is stored and answers the
+                // followers even when this request is gone,
+                // and the guard is held until it has. A
+                // miss that forwent a render for a client
+                // that had gone ends without its request's
+                // answer, so it shares nothing.
+                let lead = async move {
+                    let (response, record, render_etag) =
+                        serve_miss(&task_state, work, record).await;
+                    let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+                    if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
+                        *slot.shared.lock().unwrap() = Some(SharedFlight {
+                            request: flight_request,
+                            snapshot,
+                            response: shared,
+                            etag: render_etag.clone(),
+                            fallback: record.fallback,
+                        });
+                    }
+                    drop(guard);
+                    (response, record, render_etag)
+                };
+                let (mut response, record, render_etag) =
+                    finish_started_miss(state, progress, lead).await;
                 if let Some(etag) = &render_etag {
                     finalize_validators(&mut response, etag, if_none_match);
                 }
@@ -2955,7 +3190,11 @@ async fn run_flight(
                     // to stop queueing behind failing leaders
                     // forever, not to refuse a request that
                     // has not had its own attempt.
-                    let (mut response, record, render_etag) = serve_miss(state, work, record).await;
+                    let progress = work.progress.clone();
+                    let task_state = state.clone();
+                    let miss = async move { serve_miss(&task_state, work, record).await };
+                    let (mut response, record, render_etag) =
+                        finish_started_miss(state, progress, miss).await;
                     if let Some(etag) = &render_etag {
                         finalize_validators(&mut response, etag, if_none_match);
                     }
@@ -2971,6 +3210,90 @@ async fn run_flight(
                 followed = Some(slot);
             }
         }
+    }
+}
+
+/// Run one image miss (`miss`: the miss path for a key,
+/// with whatever its flight does around it) on a task of
+/// its own, tracked for the shutdown drain, and wait for
+/// its answer.
+///
+/// The task is what lets a render outlive its client
+/// usefully. When the client goes away, the server drops
+/// this future, and with it the sender of the `gone`
+/// channel. If the miss has not started a render by then
+/// (`progress`, see [`MissProgress`]), the task drops the
+/// miss too, which stops it where it was, as before: a
+/// source load or a gate wait ends, its budget share and
+/// permits come back, and it starts no render. If a render
+/// has started, it runs to its end on its blocking thread
+/// anyway, so the task finishes the miss: the render is
+/// stored in the tiers (the guarded writes of
+/// [`populate_tiers`], unchanged) and the flight's
+/// followers receive it, through the tiers or the flight's
+/// slot. A replay of the request is then a hit, or a
+/// follower of the render still running, instead of a
+/// fresh render each time. Finishing starts no further
+/// render: a source that did not decode gets no fallback
+/// run once the client has gone, and the flight's
+/// followers then make their own attempt. The permits a
+/// render holds still come back when that render ends
+/// (issue #357), whether or not its client is still there;
+/// what runs after it (the tier writes, the slot) holds
+/// none. Only image misses run here: meta documents and
+/// debug views are never stored, so a render made for one
+/// has nothing to keep once its client is gone.
+///
+/// A miss whose client is still there is part of a
+/// request in flight, which the shutdown drain counts as
+/// such; one whose client has gone is counted as a render
+/// left running (see [`Background::spawn_miss`]).
+async fn finish_started_miss<F>(
+    state: &AppState,
+    progress: MissProgress,
+    miss: F,
+) -> (Response, RequestRecord, Option<String>)
+where
+    F: std::future::Future<Output = (Response, RequestRecord, Option<String>)> + Send + 'static,
+{
+    // Never sent on: dropping the sender, with this
+    // future, is the signal.
+    let (_waiting, gone) = tokio::sync::oneshot::channel::<std::convert::Infallible>();
+    let background = state.background.clone();
+    let task = state.background.spawn_miss(async move {
+        let mut miss = std::pin::pin!(miss);
+        tokio::select! {
+            // The client's departure is checked first on
+            // every wake, so a miss whose client has gone
+            // never takes a lane permit that frees up in
+            // the same instant and starts a render.
+            biased;
+            _ = gone => {
+                if progress.render_started() {
+                    progress.mark_client_gone();
+                    let _left = background.client_left();
+                    Some(miss.await)
+                } else {
+                    None
+                }
+            }
+            answer = &mut miss => Some(answer),
+        }
+    });
+    match task.await {
+        Ok(Some(answer)) => answer,
+        // A panic on the miss path stays the panic of
+        // this request, as when the path ran inline.
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // The task gives up only once this future is gone,
+        // and is cancelled only by a runtime that is
+        // shutting down, which drops this request too: no
+        // client receives this answer.
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            RequestRecord::default(),
+            None,
+        ),
     }
 }
 
@@ -3483,6 +3806,10 @@ struct MissWork {
     placeholders: bool,
     hinted_width: Option<u32>,
     dpr_hint: Option<f32>,
+    /// Whether Save-Data steps this render's quality:
+    /// [`Negotiated::save_data_applies`], the rule the cache
+    /// key and the private marking follow, not the raw
+    /// header.
     save_data: bool,
     accept: Option<String>,
     groups: Vec<String>,
@@ -3497,6 +3824,9 @@ struct MissWork {
     /// render still reports in full, and a plain hit on an
     /// entry first served sealed still names its groups.
     sealed: bool,
+    /// How far this miss has got (see [`MissProgress`]);
+    /// its render jobs carry clones.
+    progress: MissProgress,
 }
 
 /// Whether a request runs inference and so takes an AI
@@ -3736,6 +4066,7 @@ async fn serve_miss(
             processed.quality,
             bytes::Bytes::from(processed.bytes),
             max_age,
+            state.client_hints,
         )
     };
     if !meta {
@@ -3880,16 +4211,16 @@ async fn load_source(
             record.load = load_start.elapsed();
             // A policy refusal (Forbidden) is a decision, not a
             // failure: it never falls back. Neither does an
-            // exhausted budget (issue #403): that is overload,
-            // and the fallback would need budget too. Nor does
-            // source text that does not parse (issue #467): a
-            // 400 stays honest, like a grammar failure. Any
-            // other load failure degrades to the configured
-            // fallback when there is one.
-            let fb = if matches!(
-                e,
-                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
-            ) {
+            // exhausted source budget or lookup slots (issue
+            // #403): that is overload, and the fallback would
+            // need budget too. Nor does source text that does
+            // not parse (issue #467): a 400 stays honest, like
+            // a grammar failure. Any other load failure
+            // degrades to the configured fallback when there
+            // is one.
+            let fb = if e.is_busy()
+                || matches!(e, LoadError::Forbidden(_) | LoadError::InvalidSource(_))
+            {
                 None
             } else {
                 fallback_source_bytes(state, charge).await
@@ -3899,7 +4230,7 @@ async fn load_source(
                 None => {
                     // A budget shed is overload, like a full
                     // gate, not a loader error (issue #403).
-                    if e != LoadError::Busy {
+                    if !e.is_busy() {
                         record.fail = FailStage::Load;
                     }
                     return Err(Box::new(load_error_response(e, accept)));
@@ -3943,7 +4274,7 @@ async fn load_watermarks(
         {
             Ok(b) => b,
             Err(e) => {
-                if e != LoadError::Busy {
+                if !e.is_busy() {
                     record.fail = FailStage::Load;
                 }
                 return Err(Box::new(load_error_response(e, accept)));
@@ -4026,6 +4357,7 @@ fn build_job(
         brand_color: state.brand_color,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
+        progress: work.progress.clone(),
     }
 }
 
@@ -4052,7 +4384,10 @@ async fn render_with_fallback(
         .map_err(|busy| Box::new(busy.response(accept)))?;
     let processed = match run_process(state, job, source, plan.lane, deadline, permits).await {
         Ok(p) => p,
-        Err(ProcessFailure::Busy) => {
+        // A first run never finds its client gone (see
+        // `ProcessFailure::ClientGone`); were it to, nobody
+        // would receive the busy answer.
+        Err(ProcessFailure::Busy | ProcessFailure::ClientGone) => {
             return Err(Box::new(match plan.lane {
                 Lane::Slow => busy_response(
                     "server busy: long-running processing lane is full",
@@ -4117,13 +4452,21 @@ async fn render_with_fallback(
 /// decode: the same job on the configured fallback's bytes,
 /// under the same deadline. `None` leaves the original
 /// engine error standing: no fallback, no budget for it, a
-/// full gate, or a failed run.
+/// full gate, a failed run, or a client that has gone (see
+/// [`MissProgress`]), before the run or by the time its
+/// lane comes free.
 async fn retry_on_fallback(
     state: &AppState,
     job: &ProcessJob,
     plan: RunPlan,
     deadline: Instant,
 ) -> Option<crate::engine::ProcessedImage> {
+    // A fallback is never stored, so for a client that has
+    // gone it would be work nobody receives: it is not
+    // fetched or charged, and it waits for no gate.
+    if state.fallback.is_none() || !job.progress.may_start_render() {
+        return None;
+    }
     // The first run's source share drained with its job, so
     // the fallback is charged afresh (issue #403), with a
     // wait of its own like each gate below; the watermarks
@@ -4357,6 +4700,7 @@ fn respond(
     quality: Option<u8>,
     bytes: bytes::Bytes,
     max_age: Option<u32>,
+    client_hints: bool,
 ) -> Response {
     let content_type = match format {
         ImageFormat::Jpeg => "image/jpeg",
@@ -4379,21 +4723,18 @@ fn respond(
         axum::http::HeaderValue::from_static(content_type),
     );
     headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
-    // The format may have been negotiated from the request's Accept.
-    headers.insert(
-        header::VARY,
-        axum::http::HeaderValue::from_static(
-            "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data",
-        ),
-    );
-    // Advertise the client hints the server reads, so
-    // browsers send them on later requests; without the
-    // advertisement only proxies and clients that set the
-    // hints manually ever benefit from them.
-    headers.insert(
-        axum::http::HeaderName::from_static("accept-ch"),
-        axum::http::HeaderValue::from_static("Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"),
-    );
+    // `Vary` is set by `handle`, on every answer of the
+    // image route alike. Advertise the client hints the
+    // server reads, so browsers send them on later requests;
+    // without the advertisement only proxies and clients
+    // that set the hints manually ever benefit from them.
+    // With hints off there is nothing to advertise.
+    if client_hints {
+        headers.insert(
+            axum::http::HeaderName::from_static("accept-ch"),
+            axum::http::HeaderValue::from_static("Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"),
+        );
+    }
     if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
@@ -4444,6 +4785,21 @@ fn source_budget_busy(accept: Option<&str>) -> Response {
 
 const SOURCE_BUDGET_BUSY: &str = "server busy: too many source images held in memory";
 
+const SOURCE_LOOKUP_BUSY: &str = "server busy: too many source host lookups waiting";
+
+/// The 503 for a load shed as overload, when `e` is one: the
+/// source buffer budget's, or the host lookup slots' (see
+/// [`crate::loader::LOOKUP_SLOTS`]), which carries the gates'
+/// Retry-After, since a slot that stayed taken for the whole
+/// wait is held by a lookup the resolver is not answering.
+fn load_busy_response(e: &LoadError, accept: Option<&str>) -> Option<Response> {
+    match e {
+        LoadError::Busy => Some(source_budget_busy(accept)),
+        LoadError::LookupBusy => Some(busy_response(SOURCE_LOOKUP_BUSY, 5, accept)),
+        _ => None,
+    }
+}
+
 /// A 503 for a saturated gate. Retry-After tells clients
 /// and CDNs when a retry has a chance, instead of letting
 /// them retry straight into the same full queue; the value
@@ -4490,8 +4846,10 @@ fn sealed_or(sealed: bool, resp: Response) -> Response {
 /// generic message (PL-6). A policy refusal is
 /// genericized the same way the explain path does it
 /// (issue #196, requirement 3): the reason can name a
-/// resolved address or a bucket, which are the operator's
-/// facts, not the caller's.
+/// bucket, which is the operator's fact, not the caller's.
+/// A host name that resolves to a non-public address is a
+/// [`LoadError::Network`] cause, so it answers exactly as a
+/// name that does not resolve.
 fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
     match e {
         LoadError::Forbidden(_) => (
@@ -4546,12 +4904,17 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
             "server_busy",
             SOURCE_BUDGET_BUSY.to_string(),
         ),
+        LoadError::LookupBusy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_busy",
+            SOURCE_LOOKUP_BUSY.to_string(),
+        ),
     }
 }
 
 fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
-    if e == LoadError::Busy {
-        return source_budget_busy(accept);
+    if let Some(busy) = load_busy_response(&e, accept) {
+        return busy;
     }
     eprintln!("load error: {e}");
     let (status, code, message) = load_error_parts(e);
@@ -4572,7 +4935,10 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
 /// answers the uniform refusal instead: the image path's
 /// [`Refusal::answer`] skips this builder, and the miss
 /// path's [`sealed_or`] drops the answer its failure
-/// built.
+/// built. Every error answer leaves with `Cache-Control:
+/// no-store`, which the router's response-header layer
+/// adds on every route, and on the image route with the
+/// same `Vary` as an image ([`image_vary`]).
 fn error_response(
     status: StatusCode,
     code: &str,
@@ -4615,6 +4981,23 @@ fn truncate_echo(message: &str) -> String {
 /// them leaves the answer to the one place that knows how
 /// the request may be answered (see [`Refusal::answer`]).
 type ErrorParts = (StatusCode, &'static str, String);
+
+/// The refusal for an image remainder that begins with
+/// [`crabcrop_url::RESERVED_SEGMENT`]. Every derived subkey
+/// (purge, purge-group, upload, seal, cache entry) is the
+/// HMAC of a label under that segment, so no image URL may
+/// begin with it, and no source can: it names no scheme the
+/// loader fetches.
+fn reserved_remainder_parts() -> ErrorParts {
+    (
+        StatusCode::BAD_REQUEST,
+        "reserved_segment",
+        format!(
+            "an image URL may not begin with the reserved segment {}",
+            crabcrop_url::RESERVED_SEGMENT
+        ),
+    )
+}
 
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.

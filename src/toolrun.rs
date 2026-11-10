@@ -15,11 +15,16 @@
 //! timeouts kill the process group, but the children also
 //! run under kernel resource limits, so a tool that
 //! allocates without bound or spins on CPU meets a hard
-//! stop in the kernel as well: address space is capped,
-//! and CPU time is capped just past the most the
-//! wall-clock budget allows on this host's cores (the wall
-//! clock stays the precise mechanism; the CPU limit is the
-//! backstop).
+//! stop in the kernel as well: address space is capped at
+//! what the calling module sizes for its tool's work (the
+//! `max_address_space` of each `ToolCommand`), CPU time
+//! is capped just past the most the wall-clock budget
+//! allows on this host's cores (the wall clock stays the
+//! precise mechanism; the CPU limit is the backstop), and
+//! core files are off. The child's OOM score is raised to
+//! the maximum as well, as the SVG worker raises its own,
+//! so a host that runs short of memory anyway has the
+//! kernel end the tool before the server.
 //!
 //! The limits are applied with `prlimit` right after the
 //! spawn: the crate forbids unsafe code, so the
@@ -28,10 +33,10 @@
 //! before the parent sets the limits; it cannot do
 //! meaningful work of its own in that window, and the
 //! wall-clock group kill covers the whole lifetime
-//! regardless. `prlimit` is a Linux syscall, so the
-//! kernel limits exist only there; on other platforms
-//! the wall clock and the group kill are the bounds, as
-//! they were before this module.
+//! regardless. `prlimit` is a Linux syscall, and the OOM
+//! score a Linux file, so the kernel limits exist only
+//! there; on other platforms the wall clock and the group
+//! kill are the bounds, as they were before this module.
 //!
 //! A child that is this binary (the SVG worker, issue
 //! #447) caps itself instead, with `limit_self` as it
@@ -92,6 +97,11 @@ pub(crate) struct ToolCommand<'a> {
     /// The kernel's CPU-time backstop for the child:
     /// [`tool_cpu_limit`] of the tool's timeout.
     pub(crate) cpu_limit: Duration,
+    /// The kernel's address-space cap for the child, in
+    /// bytes. Each tool module sizes it to the most its tool
+    /// needs for work within crabcrop's budgets, so an
+    /// allocation past that work fails in the tool.
+    pub(crate) max_address_space: u64,
 }
 
 /// A run that finished inside its deadline and its stdout
@@ -237,6 +247,7 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         max_stderr,
         deadline,
         cpu_limit,
+        max_address_space,
     } = command;
     let (stdin, feed): (Stdio, Option<Feed>) = match input {
         ToolInput::File(file) => (Stdio::from(file), None),
@@ -269,7 +280,7 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().map_err(ToolError::Spawn)?;
-    limit_child(child.id(), cpu_limit, TOOL_MAX_ADDRESS_SPACE);
+    limit_child(child.id(), cpu_limit, max_address_space);
 
     let writer = feed.map(|feed| {
         let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
@@ -425,14 +436,6 @@ fn kill_tool(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// The address-space ceiling for a tool child: generous
-/// headroom over the largest legitimate workload (the
-/// tools render or encode at most the shared pixel and
-/// decode budgets, a few hundred megabytes of buffers)
-/// while still turning a runaway allocation into a tool
-/// error instead of a host-level failure.
-pub(crate) const TOOL_MAX_ADDRESS_SPACE: u64 = 8 * 1024 * 1024 * 1024;
-
 /// How far past the most CPU time a run can spend inside
 /// its wall-clock budget the CPU limit sits (see
 /// [`tool_cpu_limit`]).
@@ -465,7 +468,13 @@ pub(crate) fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
     timeout.saturating_mul(cores).saturating_add(TOOL_CPU_GRACE)
 }
 
-/// Apply the resource limits to a spawned tool child.
+/// Apply the resource limits to a spawned tool child: the
+/// CPU time and address-space caps, no core files (a tool
+/// that aborts leaves no core behind per request, as the
+/// SVG worker leaves none), and the highest OOM score, so
+/// the kernel ends the tool before the server when the
+/// host runs short of memory. Raising another process's
+/// score needs no privilege when it runs as the same user.
 /// Best effort: a limit the platform refuses is skipped
 /// (the wall-clock timeout and the process-group kill
 /// remain the primary bounds). Linux only: `prlimit` is
@@ -498,6 +507,15 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
                 maximum: Some(max_address_space),
             },
         );
+        let _ = rustix::process::prlimit(
+            Some(pid),
+            rustix::process::Resource::Core,
+            rustix::process::Rlimit {
+                current: Some(0),
+                maximum: Some(0),
+            },
+        );
+        let _ = std::fs::write(format!("/proc/{raw}/oom_score_adj"), "1000");
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
@@ -565,6 +583,9 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    /// An address-space cap no test tool comes near.
+    const GENEROUS_ADDRESS_SPACE: u64 = 8 << 30;
+
     // The kernel limits exist only where prlimit does;
     // elsewhere limit_child is a no-op and this child
     // would spin until the watchdog kills it.
@@ -577,7 +598,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        limit_child(child.id(), Duration::from_secs(1), TOOL_MAX_ADDRESS_SPACE);
+        limit_child(child.id(), Duration::from_secs(1), GENEROUS_ADDRESS_SPACE);
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -664,7 +685,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        limit_child(child.id(), tool_cpu_limit(timeout), TOOL_MAX_ADDRESS_SPACE);
+        limit_child(child.id(), tool_cpu_limit(timeout), GENEROUS_ADDRESS_SPACE);
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -802,6 +823,44 @@ mod tests {
         assert!(!out.status.success(), "{}", out.status);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_tool_runs_under_its_own_cap_with_no_core_files_and_the_highest_oom_score() {
+        // The tool reads its own limits and OOM score once
+        // the runner has set them (the pause covers the
+        // spawn-to-limit window): the address-space cap its
+        // command names, not a shared one, core files off,
+        // and the highest OOM score, so a host short of
+        // memory has the kernel end the tool before the
+        // server.
+        let argv = [
+            "-c",
+            "sleep 0.3; cat /proc/$$/oom_score_adj; \
+             grep -E '^Max (address space|core file size)' /proc/$$/limits",
+        ];
+        let mut command = shell(&argv, ToolInput::Bytes(b""));
+        command.max_address_space = 3 << 30;
+        let run = run_tool(command).unwrap();
+        assert!(run.status.success(), "{}: {}", run.status, run.stderr);
+        let report = String::from_utf8(run.stdout).unwrap();
+        let limit = |name: &str| {
+            let line = report
+                .lines()
+                .find(|line| line.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} line: {report}"));
+            let fields: Vec<&str> = line[name.len()..].split_whitespace().collect();
+            (fields[0].to_string(), fields[1].to_string())
+        };
+        assert_eq!(report.lines().next(), Some("1000"), "{report}");
+        let cap = (3u64 << 30).to_string();
+        assert_eq!(limit("Max address space"), (cap.clone(), cap), "{report}");
+        assert_eq!(
+            limit("Max core file size"),
+            ("0".to_string(), "0".to_string()),
+            "{report}"
+        );
+    }
+
     /// A shell one-liner as a tool run, under generous
     /// bounds.
     fn shell<'a>(script: &'a [&'a str; 2], input: ToolInput<'a>) -> ToolCommand<'a> {
@@ -813,6 +872,7 @@ mod tests {
             max_stderr: 64 * 1024,
             deadline: std::time::Instant::now() + Duration::from_secs(20),
             cpu_limit: Duration::from_secs(20),
+            max_address_space: GENEROUS_ADDRESS_SPACE,
         }
     }
 
