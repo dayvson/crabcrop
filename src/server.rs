@@ -1001,10 +1001,13 @@ async fn explain_handle(
     // The canonical form is the cache key's path form, of
     // the merged list as the image path keys it. The key's
     // config fingerprint suffix is operator state and stays
-    // unreported. For a root source the form is built from
-    // the source as written: the key itself is keyed on the
-    // expansion, but printing that here would publish the
-    // root's base URL into the report.
+    // unreported. A form past the key-length bound is shown
+    // in full, though the key carries its digest
+    // (`cache::bounded_key_base`). For a root source the
+    // form is built from the source as written: the key
+    // itself is keyed on the expansion, but printing that
+    // here would publish the root's base URL into the
+    // report.
     let canonical = crate::url::canonical_form(&merged, source_url);
     let report = crate::explain::Report::new(crate::explain::ReportInput {
         signed: !matches!(signature, crate::url::Signature::Unsafe),
