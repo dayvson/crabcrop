@@ -7,8 +7,12 @@
 //! entry therefore carries the strong ETag of its own bytes,
 //! computed at render time, so conditional requests validate
 //! against what was actually rendered. The cache is bounded
-//! by total bytes with least-recently-used eviction. Only
-//! successful responses are stored; errors are never cached.
+//! by total bytes with least-recently-used eviction, and an
+//! entry is charged everything it keeps resident (its key,
+//! its ETag and group names, and its bookkeeping, not only
+//! its payload), so the budget bounds the memory the tier
+//! holds. Only successful responses are stored; errors are
+//! never cached.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,6 +220,48 @@ pub(crate) fn key_belongs_to_source(key: &str, source: &str) -> bool {
     let base = key.split('#').next().unwrap_or(key);
     base.strip_suffix(source)
         .is_some_and(|head| head.is_empty() || head.ends_with('/'))
+}
+
+/// The longest cache key base (the canonical form, ahead of
+/// the `#` suffixes) a key carries as written. Real request
+/// paths sit far below it. A longer base, which only a
+/// padded source or an extreme operation chain produces, is
+/// carried in digest form instead (see [`bounded_key_base`]),
+/// so one entry's key, which every tier holds and the memory
+/// tiers hold twice, stays small next to the budgets.
+pub(crate) const MAX_KEY_BASE_BYTES: usize = 4096;
+
+/// What opens a digest-form key base. It holds a space, which
+/// a request target cannot carry, so no base a request spells
+/// out can begin with it and the two forms never meet.
+const DIGEST_BASE_MARK: &str = "sha256 ";
+
+/// The cache key base for `base`, the canonical form of a
+/// request whose source is `source`. A base within
+/// [`MAX_KEY_BASE_BYTES`] is returned unchanged, so the keys of
+/// ordinary URLs never change. A longer one becomes the
+/// SHA-256 of the whole base, followed by `/` and the source
+/// when the source is the base's tail and the result still
+/// fits: keeping the source keeps the key under the
+/// per-source purge an upload overwrite runs
+/// ([`key_belongs_to_source`]). The serve path and the purge
+/// path both derive the base through here, so a purge by URL
+/// still finds an entry keyed in digest form.
+pub(crate) fn bounded_key_base(base: String, source: &str) -> String {
+    if base.len() <= MAX_KEY_BASE_BYTES {
+        return base;
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(base.as_bytes());
+    let mut bounded = format!("{DIGEST_BASE_MARK}{}", hex::encode(digest));
+    let keeps_source = !source.is_empty()
+        && base.ends_with(source)
+        && bounded.len() + 1 + source.len() <= MAX_KEY_BASE_BYTES;
+    if keeps_source {
+        bounded.push('/');
+        bounded.push_str(source);
+    }
+    bounded
 }
 
 /// Whether `key` is the base cache key `base` or one of its
@@ -674,19 +720,58 @@ fn trim_tombstones(map: &mut HashMap<String, u64>) {
     }
 }
 
+/// One stored entry and what it is charged against the
+/// budget. The charge is recorded with the entry, so every
+/// removal takes back exactly what the store added, even
+/// after a group merge has grown the entry.
+#[derive(Debug)]
+struct Entry {
+    image: CachedImage,
+    cost: usize,
+}
+
+/// The allocator's bookkeeping charged for each separate heap
+/// allocation an entry makes: its header and size rounding.
+const ALLOCATION_OVERHEAD: usize = 16;
+
+/// What an entry costs besides its strings and its payload:
+/// its slot in each of the two maps, doubled for the spare
+/// slots a hash map keeps as it grows, and the allocations
+/// behind its two key copies, its ETag, and its payload.
+const ENTRY_OVERHEAD: usize =
+    2 * (size_of::<(String, Entry)>() + size_of::<(String, u64)>()) + 4 * ALLOCATION_OVERHEAD;
+
+/// What one entry keeps resident, charged against the budget:
+/// the payload, the key twice (it keys both the entry map and
+/// the recency map), the ETag, every group name with its own
+/// string and allocation, and [`ENTRY_OVERHEAD`]. Charging only
+/// the payload let entries with tiny bodies under long keys
+/// hold many times the budget without ever being evicted.
+fn entry_cost(key: &str, image: &CachedImage) -> usize {
+    let groups: usize = image
+        .groups
+        .iter()
+        .map(|group| group.len() + size_of::<String>() + ALLOCATION_OVERHEAD)
+        .sum();
+    image.bytes.len() + 2 * key.len() + image.etag.len() + groups + ENTRY_OVERHEAD
+}
+
 #[derive(Debug, Default)]
 struct Inner {
-    entries: HashMap<String, CachedImage>,
+    entries: HashMap<String, Entry>,
     /// Last-access stamp per key (monotonic clock). Eviction
     /// removes the smallest stamp, which is the least recently
     /// used entry: the same order the VecDeque kept, at O(1)
     /// per access instead of a linear scan per hit.
     stamps: HashMap<String, u64>,
     clock: u64,
+    /// The sum of the stored entries' charges.
     total_bytes: usize,
 }
 
-/// A byte-bounded LRU cache. A `max_bytes` of 0 disables it.
+/// A byte-bounded LRU cache: the entries' charges (see
+/// [`entry_cost`]) stay within `max_bytes`. A `max_bytes` of 0
+/// disables it.
 #[derive(Debug)]
 pub struct Cache {
     max_bytes: usize,
@@ -707,7 +792,7 @@ impl Cache {
             return None;
         }
         let mut inner = self.inner.lock().unwrap();
-        let image = inner.entries.get(key)?.clone();
+        let image = inner.entries.get(key)?.image.clone();
         touch(&mut inner, key);
         Some(image)
     }
@@ -725,7 +810,7 @@ impl Cache {
             .entries
             .extract_if(|k, _| k.as_str() == base || k.starts_with(&prefix))
         {
-            inner.total_bytes -= old.bytes.len();
+            inner.total_bytes -= old.cost;
             inner.stamps.remove(&key);
             removed += 1;
         }
@@ -739,7 +824,7 @@ impl Cache {
         let Some(old) = inner.entries.remove(key) else {
             return false;
         };
-        inner.total_bytes -= old.bytes.len();
+        inner.total_bytes -= old.cost;
         inner.stamps.remove(key);
         true
     }
@@ -753,9 +838,9 @@ impl Cache {
         let mut removed = 0;
         for (key, old) in inner
             .entries
-            .extract_if(|_, image| image.groups.iter().any(|g| g == group))
+            .extract_if(|_, entry| entry.image.groups.iter().any(|g| g == group))
         {
-            inner.total_bytes -= old.bytes.len();
+            inner.total_bytes -= old.cost;
             inner.stamps.remove(&key);
             removed += 1;
         }
@@ -767,16 +852,25 @@ impl Cache {
     /// hit, so an entry first stored by a group-free
     /// spelling is still found by a later group purge.
     /// Returns whether the stored entry changed.
+    ///
+    /// The entry is charged again for its grown group set, and
+    /// least recently used entries make room if that takes the
+    /// cache over its budget.
     pub fn merge_groups(&self, key: &str, groups: &[String]) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(image) = inner.entries.get_mut(key) else {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let Some(entry) = inner.entries.get_mut(key) else {
             return false;
         };
-        let merged = union_groups(&image.groups, groups);
-        if merged == image.groups {
+        let merged = union_groups(&entry.image.groups, groups);
+        if merged == entry.image.groups {
             return false;
         }
-        image.groups = merged;
+        entry.image.groups = merged;
+        let cost = entry_cost(key, &entry.image);
+        let old = std::mem::replace(&mut entry.cost, cost);
+        inner.total_bytes = inner.total_bytes - old + cost;
+        evict_to_fit(inner, self.max_bytes, 0);
         true
     }
 
@@ -795,7 +889,7 @@ impl Cache {
             let base = k.split('#').next().unwrap_or(k);
             base == source || base.ends_with(&suffix)
         }) {
-            inner.total_bytes -= old.bytes.len();
+            inner.total_bytes -= old.cost;
             inner.stamps.remove(&key);
             removed += 1;
         }
@@ -803,34 +897,47 @@ impl Cache {
     }
 
     /// Store `image` under `key`, evicting least recently used
-    /// entries until it fits. Entries larger than the whole budget
-    /// are not stored.
+    /// entries until its charge fits. Entries whose charge is
+    /// larger than the whole budget are not stored.
     pub fn put(&self, key: String, image: CachedImage) {
-        if self.max_bytes == 0 || image.bytes.len() > self.max_bytes {
+        let cost = entry_cost(&key, &image);
+        if self.max_bytes == 0 || cost > self.max_bytes {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
         if let Some(old) = inner.entries.remove(&key) {
-            inner.total_bytes -= old.bytes.len();
+            inner.total_bytes -= old.cost;
             inner.stamps.remove(&key);
         }
-        while inner.total_bytes + image.bytes.len() > self.max_bytes {
-            let oldest = inner
-                .stamps
-                .iter()
-                .min_by_key(|(_, stamp)| *stamp)
-                .map(|(k, _)| k.clone());
-            let Some(oldest) = oldest else { break };
-            if let Some(evicted) = inner.entries.remove(&oldest) {
-                inner.total_bytes -= evicted.bytes.len();
-            }
-            inner.stamps.remove(&oldest);
-        }
-        inner.total_bytes += image.bytes.len();
+        evict_to_fit(&mut inner, self.max_bytes, cost);
+        inner.total_bytes += cost;
         inner.clock += 1;
         let stamp = inner.clock;
         inner.stamps.insert(key.clone(), stamp);
-        inner.entries.insert(key, image);
+        inner.entries.insert(key, Entry { image, cost });
+    }
+
+    /// The stored entries' total charge.
+    #[cfg(test)]
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.inner.lock().unwrap().total_bytes
+    }
+}
+
+/// Evict least recently used entries until `incoming` more
+/// bytes of charge fit within `max_bytes`.
+fn evict_to_fit(inner: &mut Inner, max_bytes: usize, incoming: usize) {
+    while inner.total_bytes + incoming > max_bytes {
+        let oldest = inner
+            .stamps
+            .iter()
+            .min_by_key(|(_, stamp)| *stamp)
+            .map(|(k, _)| k.clone());
+        let Some(oldest) = oldest else { break };
+        if let Some(evicted) = inner.entries.remove(&oldest) {
+            inner.total_bytes -= evicted.cost;
+        }
+        inner.stamps.remove(&oldest);
     }
 }
 
@@ -865,6 +972,14 @@ mod tests {
         }
     }
 
+    /// What `img(n)` stored under `key` is charged.
+    fn cost(key: &str, n: usize) -> usize {
+        entry_cost(key, &img(n))
+    }
+
+    /// A budget roomy enough that the tests using it never evict.
+    const ROOMY: usize = 64 * 1024;
+
     #[test]
     fn etag_for_bytes_is_a_stable_quoted_digest_of_the_bytes() {
         let etag = etag_for_bytes(b"some rendered bytes");
@@ -876,7 +991,7 @@ mod tests {
 
     #[test]
     fn put_then_get_round_trips() {
-        let cache = Cache::new(1024);
+        let cache = Cache::new(ROOMY);
         cache.put("a".to_string(), img(10));
         assert_eq!(cache.get("a"), Some(img(10)));
         assert_eq!(cache.get("missing"), None);
@@ -884,7 +999,7 @@ mod tests {
 
     #[test]
     fn eviction_drops_the_oldest_when_over_budget() {
-        let cache = Cache::new(100);
+        let cache = Cache::new(cost("a", 60) + cost("b", 60) - 1);
         cache.put("a".to_string(), img(60));
         cache.put("b".to_string(), img(60));
         assert_eq!(cache.get("a"), None);
@@ -893,7 +1008,7 @@ mod tests {
 
     #[test]
     fn get_refreshes_recency() {
-        let cache = Cache::new(100);
+        let cache = Cache::new(cost("a", 60) + cost("b", 30) + cost("c", 30) - 1);
         cache.put("a".to_string(), img(60));
         cache.put("b".to_string(), img(30));
         assert!(cache.get("a").is_some());
@@ -920,7 +1035,7 @@ mod tests {
 
     #[test]
     fn purge_group_removes_only_members() {
-        let cache = Cache::new(1024);
+        let cache = Cache::new(ROOMY);
         cache.put("a".to_string(), grouped(10, &["thumb"]));
         cache.put("b".to_string(), grouped(10, &["thumb", "hero"]));
         cache.put("c".to_string(), grouped(10, &["hero"]));
@@ -936,7 +1051,7 @@ mod tests {
 
     #[test]
     fn merge_groups_accumulates_provenance() {
-        let cache = Cache::new(1024);
+        let cache = Cache::new(ROOMY);
         cache.put("a".to_string(), grouped(10, &["thumb"]));
         // A later spelling of the same entry brings its
         // own group: the stored set is the union, so a
@@ -950,7 +1065,7 @@ mod tests {
 
     #[test]
     fn purge_source_removes_every_derivative_of_the_source() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(ROOMY);
         cache.put("300x200/file:///heroes/cat.jpg".to_string(), img(10));
         cache.put(
             "300x200/file:///heroes/cat.jpg#cfgab12#avif".to_string(),
@@ -968,7 +1083,7 @@ mod tests {
 
     #[test]
     fn replacing_a_key_does_not_double_count() {
-        let cache = Cache::new(60);
+        let cache = Cache::new(cost("other", 50));
         cache.put("k".to_string(), img(50));
         cache.put("k".to_string(), img(50));
         assert_eq!(cache.get("k"), Some(img(50)));
@@ -980,7 +1095,7 @@ mod tests {
 
     #[test]
     fn remove_drops_exactly_one_entry() {
-        let cache = Cache::new(1024);
+        let cache = Cache::new(ROOMY);
         cache.put("a".to_string(), img(10));
         cache.put("a#avif".to_string(), img(10));
         assert!(cache.remove("a"));
@@ -989,6 +1104,149 @@ mod tests {
         assert!(cache.get("a#avif").is_some());
         assert!(!cache.remove("a"));
         assert!(!cache.remove("missing"));
+    }
+
+    #[test]
+    fn long_keys_with_tiny_bodies_are_evicted_by_their_full_charge() {
+        // A 70-byte body under a 4 KiB key keeps the key
+        // resident twice. Charging only the body let a 64 KiB
+        // budget hold every one of these entries, about
+        // twelve times the budget in keys, and never evict.
+        let budget = 64 * 1024;
+        let cache = Cache::new(budget);
+        let keys: Vec<String> = (0..100)
+            .map(|i| format!("{i:04}/{}", "k".repeat(4091)))
+            .collect();
+        for key in &keys {
+            cache.put(key.clone(), img(70));
+        }
+        assert!(cache.charged_bytes() <= budget);
+        let kept: Vec<&String> = keys.iter().filter(|k| cache.get(k).is_some()).collect();
+        let resident: usize = kept.iter().map(|k| 2 * k.len() + 70).sum();
+        assert!(
+            resident <= budget,
+            "{} entries hold {resident} bytes of keys and bodies under a {budget}-byte budget",
+            kept.len()
+        );
+        assert!(
+            cache.get(&keys[0]).is_none(),
+            "the oldest entry was evicted"
+        );
+        assert!(cache.get(&keys[99]).is_some(), "the newest entry is kept");
+    }
+
+    #[test]
+    fn an_entry_whose_charge_exceeds_the_budget_is_not_stored() {
+        // The body alone fits; with its key it does not.
+        let key = "k".repeat(4096);
+        let cache = Cache::new(4096);
+        cache.put(key.clone(), img(10));
+        assert_eq!(cache.get(&key), None);
+        assert_eq!(cache.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn a_merge_that_grows_an_entry_is_charged_and_keeps_the_budget() {
+        let cache = Cache::new(cost("a", 10) + cost("b", 10));
+        cache.put("a".to_string(), img(10));
+        cache.put("b".to_string(), img(10));
+        let group = "g".repeat(64);
+        assert!(cache.merge_groups("b", std::slice::from_ref(&group)));
+        assert_eq!(
+            cache.charged_bytes(),
+            entry_cost("b", &grouped(10, &[group.as_str()])),
+            "b is charged for its new group; a made room"
+        );
+        assert_eq!(
+            cache.get("a"),
+            None,
+            "the least recently used entry made room"
+        );
+        assert_eq!(cache.get("b").unwrap().groups, [group]);
+    }
+
+    #[test]
+    fn every_removal_takes_back_what_the_store_charged() {
+        let cache = Cache::new(ROOMY);
+        let source = "file:///heroes/cat.jpg";
+        let keys = [
+            format!("300x200/{source}"),
+            format!("300x200/{source}#cfg1#avif"),
+            format!("600x400/{source}"),
+            "a/b.png".to_string(),
+            "c/d.png".to_string(),
+        ];
+        for key in &keys {
+            cache.put(key.clone(), grouped(10, &["thumb"]));
+        }
+        let charged: usize = keys
+            .iter()
+            .map(|k| entry_cost(k, &grouped(10, &["thumb"])))
+            .sum();
+        assert_eq!(cache.charged_bytes(), charged);
+        // A merge grows two entries' charges before they go.
+        assert!(cache.merge_groups(&keys[0], &["hero".to_string()]));
+        assert!(cache.merge_groups(&keys[3], &["hero".to_string()]));
+        assert_eq!(cache.purge_source(source), 3);
+        assert_eq!(cache.purge_matching("a/b.png"), 1);
+        assert!(cache.remove("c/d.png"));
+        assert_eq!(cache.charged_bytes(), 0);
+        cache.put("e".to_string(), grouped(10, &["thumb"]));
+        assert_eq!(cache.purge_group("thumb"), 1);
+        assert_eq!(cache.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn key_bases_within_the_bound_are_kept_as_written() {
+        for base in [
+            "300x200/http://x/cat.jpg".to_string(),
+            "x".repeat(MAX_KEY_BASE_BYTES),
+        ] {
+            assert_eq!(bounded_key_base(base.clone(), "http://x/cat.jpg"), base);
+        }
+    }
+
+    #[test]
+    fn an_over_long_key_base_is_carried_as_a_digest_with_its_source() {
+        let source = "file:///heroes/cat.jpg";
+        let long_ops = format!("filters:{}", ["blur(1)"; 800].join(":"));
+        let base = format!("{long_ops}/{source}");
+        assert!(base.len() > MAX_KEY_BASE_BYTES);
+        let bounded = bounded_key_base(base.clone(), source);
+        assert!(bounded.len() <= MAX_KEY_BASE_BYTES, "{}", bounded.len());
+        assert!(bounded.starts_with(DIGEST_BASE_MARK));
+        // The digest covers the whole base: another chain on
+        // the same source is a different key.
+        let other = bounded_key_base(format!("{long_ops}:blur(2)/{source}"), source);
+        assert_ne!(bounded, other);
+        assert_eq!(bounded_key_base(base, source), bounded, "deterministic");
+        // The per-source purge and the per-URL purge still
+        // find the entry and its variants.
+        let key = format!("{bounded}#cfgab12#avif");
+        assert!(key_belongs_to_source(&key, source));
+        assert!(!key_belongs_to_source(&key, "file:///heroes/dog.jpg"));
+        assert!(key_has_base(&key, &bounded));
+        assert!(!key_has_base(&key, &other));
+    }
+
+    #[test]
+    fn an_over_long_source_is_carried_in_the_digest_alone() {
+        // A source padded with empty path segments, the shape
+        // that grew keys to tens of kilobytes.
+        let source = format!("http://origin{}t.png", "/".repeat(58_000));
+        let base = format!("filters:format(png)/{source}");
+        let bounded = bounded_key_base(base, &source);
+        assert_eq!(bounded.len(), DIGEST_BASE_MARK.len() + 64);
+        // A request target holds no space, so no base a
+        // request spells out collides with a digest form.
+        assert!(bounded.contains(' '));
+        // Without a source tail (a purge target that does not
+        // parse), the digest stands alone too.
+        let unparsed = "u".repeat(MAX_KEY_BASE_BYTES + 1);
+        assert_eq!(
+            bounded_key_base(unparsed, "").len(),
+            DIGEST_BASE_MARK.len() + 64
+        );
     }
 
     #[test]
