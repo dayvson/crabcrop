@@ -170,6 +170,25 @@ export function isOneOf(list, value) {
  */
 export const MAX_OBJECTS_CLASSES = 32;
 /**
+ * Whether a UTF-16 code unit is in the Unicode White_Space
+ * set, the set Rust's `str::trim` strips. Every member is in
+ * the Basic Multilingual Plane, so one code unit is one
+ * character here, and a surrogate is never white space.
+ */
+function isServerWhiteSpace(unit) {
+    return ((unit >= 0x0009 && unit <= 0x000d) ||
+        unit === 0x0020 ||
+        unit === 0x0085 ||
+        unit === 0x00a0 ||
+        unit === 0x1680 ||
+        (unit >= 0x2000 && unit <= 0x200a) ||
+        unit === 0x2028 ||
+        unit === 0x2029 ||
+        unit === 0x202f ||
+        unit === 0x205f ||
+        unit === 0x3000);
+}
+/**
  * Trim like the server's Rust `str::trim`: exactly the
  * Unicode White_Space set, from both ends. JavaScript's
  * `String.prototype.trim` disagrees on two characters:
@@ -177,12 +196,18 @@ export const MAX_OBJECTS_CLASSES = 32;
  * class name wrapped in it is no class name), and it
  * keeps U+0085, which the server strips (issue #537).
  * Every place this package mirrors a server-side trim
- * uses this instead of the built-in.
+ * uses this instead of the built-in. It walks in from
+ * each end, so it takes time linear in the input, however
+ * long a run of white space is.
  */
-const SERVER_WHITESPACE = "\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000";
-const SERVER_TRIM = new RegExp(`^[${SERVER_WHITESPACE}]+|[${SERVER_WHITESPACE}]+$`, "g");
 export function trimLikeServer(text) {
-    return text.replace(SERVER_TRIM, "");
+    let start = 0;
+    let end = text.length;
+    while (start < end && isServerWhiteSpace(text.charCodeAt(start)))
+        start++;
+    while (end > start && isServerWhiteSpace(text.charCodeAt(end - 1)))
+        end--;
+    return text.slice(start, end);
 }
 /**
  * A detection class name as the server's parse_class_name
