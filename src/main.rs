@@ -513,7 +513,47 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// measures, instead of its media box; and a PDF page too
 /// large to fit the raster limits at 1 dpi refused instead
 /// of rendered past them).
-const RENDERING_VERSION: u32 = 4;
+///
+/// 5: the first release after 0.10.1, which changes output
+/// for existing URLs (a signed output records every image
+/// source as its parent ingredient, a container JPEG XL, a
+/// HEIF whose major brand is not `heic` or `heix`, and an
+/// SVG, TIFF, BMP or ICO source included, instead of
+/// starting a fresh chain #564, PR #581, and no longer
+/// carries the source's C2PA manifest store, its parent
+/// ingredient naming only the source's format and the
+/// status codes its store validated with #610, PR #621; a
+/// `Save-Data` request for a URL whose per-format
+/// `quality(...)` list names no value for the output
+/// format, such as `format(webp):quality(jpeg:90)`, encoded
+/// at the format's default quality instead of the stepped
+/// 70, which the release before could also store as the
+/// URL's plain entry #569, PR #618; a `file://` source path
+/// with a `..` segment answered `404` even where it stays
+/// inside the file root, PR #620; an SVG source draws
+/// nothing for an image reference that points outside the
+/// document, PR #623; `frame:` refused with `502` on a
+/// video stream in a codec off the decoder list (WMV and
+/// VC-1, Sorenson H.263 and VP6 in FLV, Microsoft MPEG-4,
+/// lossless, raw and screen-capture codecs) #605, on a
+/// video with any stream past the decode budget, displayed
+/// or coded, and where the decode needs more than the
+/// extractor's 3 GiB address-space cap, 8 GiB before; a PDF
+/// page drawn without an embedded image whose decode needs
+/// more than the PDF tools' 3 GiB cap, a page whose own
+/// surfaces need more refused with `502`, and every page of
+/// a document that stores a JPEG 2000 image past that cap
+/// refused with `502`, PR #624; and an animated GIF whose
+/// frames pass the 100 million pixel budget once each
+/// counts at its declared size where that is larger than
+/// the canvas, a HEIC/HEIF source whose item graph takes
+/// too much work to walk or would hold more than 128 MiB,
+/// or whose `altr` alternative's gain map fails the checks
+/// run before a decode, and a JPEG XL source with a frame
+/// holding more pixels than the decode budget allows a
+/// whole image, all of which rendered before and are now
+/// refused with `502`, PR #623).
+const RENDERING_VERSION: u32 = 5;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
