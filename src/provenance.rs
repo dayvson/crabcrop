@@ -276,6 +276,52 @@ pub struct ProvenanceFacts {
     pub signing_configured: bool,
 }
 
+/// The HTTP resolver every store read runs with: it answers
+/// each request with an error and opens no connection.
+/// Reading a store can otherwise reach the network on the
+/// store's say: a CAWG identity assertion names its issuer
+/// as a `did:web` host whose document the SDK fetches, and
+/// the SDK's default resolver sets no timeout. A read runs
+/// inside a render's job, which holds a render permit until
+/// it returns, so what bounds the read must be local work
+/// only.
+struct NoNetwork;
+
+impl c2pa::http::SyncHttpResolver for NoNetwork {
+    fn http_resolve(
+        &self,
+        request: c2pa::http::http::Request<Vec<u8>>,
+    ) -> Result<c2pa::http::http::Response<Box<dyn std::io::Read>>, c2pa::http::HttpResolverError>
+    {
+        Err(c2pa::http::HttpResolverError::Io(std::io::Error::other(
+            format!(
+                "no network request is made while reading a manifest store ({})",
+                request.uri()
+            ),
+        )))
+    }
+}
+
+/// The context every read of a manifest store runs under:
+/// no network ([`NoNetwork`]) and no decoding of CAWG
+/// identity assertions. Decoding one evaluates the
+/// identity's own credential against its issuer, which is
+/// where the network fetches come from; with no network an
+/// issuer that publishes its key on the web could only read
+/// as unavailable, a failure of the reader's making that
+/// the SDK counts against the manifest. Undecoded, an
+/// identity assertion is still an assertion the claim
+/// hashes, so its bytes are checked like any other, and a
+/// manifest's state is its own signature and hashes, which
+/// is what meta reports and an output records about its
+/// parent. Like [`Context::new`], it loads no trust
+/// anchors.
+fn reading_context() -> Context {
+    let mut context = Context::new().with_resolver(NoNetwork);
+    context.settings_mut().core.decode_identity_assertions = false;
+    context
+}
+
 /// Read and validate the manifest store embedded in an
 /// asset. `None` when the asset carries no manifest (or no
 /// parseable one); a present-but-failing manifest reads
@@ -287,10 +333,11 @@ pub struct ProvenanceFacts {
 /// lists: its context loads no trust anchors (the SDK's
 /// defaults carry none outside its own tests), so an
 /// intact manifest reads `valid` whoever issued its
-/// certificate.
+/// certificate. It makes no network request
+/// ([`reading_context`]).
 pub fn read_manifest(bytes: &[u8], format: &str) -> Option<ManifestSummary> {
     let mut cursor = Cursor::new(bytes);
-    let reader = Reader::from_context(Context::new())
+    let reader = Reader::from_context(reading_context())
         .with_stream(format, &mut cursor)
         .ok()?;
     Some(summarize(&reader))
@@ -324,10 +371,10 @@ fn summarize(reader: &Reader) -> ManifestSummary {
 /// (issue #610): 1 MiB, room for a chain of several edits,
 /// each with a full-size claim thumbnail. Reading a store
 /// means parsing and validating it, which holds several
-/// times its size in memory, so a larger store is not read
-/// at all: its ingredient names the source's format and
-/// records no validation status, like a source with no
-/// store.
+/// times its size in memory, so a larger store is not
+/// parsed or validated: its ingredient names the source's
+/// format and records no validation status, like a source
+/// with no store.
 const MAX_SOURCE_STORE_BYTES: usize = 1024 * 1024;
 
 /// How many distinct status codes an output records per
@@ -346,18 +393,24 @@ const MAX_STATUS_CODE_LEN: usize = 64;
 /// them. `None` when the source carries no embedded store,
 /// when its store is over [`MAX_SOURCE_STORE_BYTES`], or
 /// when the store does not parse; the ingredient then names
-/// the source's format only. The store's size is read
-/// first, by copying its bytes out of the container without
-/// parsing them, so an oversized store is never parsed, and
-/// the reader runs only on a source that embeds a store.
+/// the source's format only. The store's bytes are copied
+/// out of the container first, without parsing them, so an
+/// oversized store is never parsed or validated, and the
+/// reader runs only on a source that embeds a store. What
+/// it validates is exactly the store that was measured,
+/// against the source read as `format`: the reader is
+/// handed those bytes rather than finding the store again,
+/// since its own container detection can pick a different
+/// handler than the hint (a text SVG whose first bytes also
+/// look like another container). The read makes no network
+/// request ([`reading_context`]).
 fn source_status(source: &[u8], format: &str) -> Option<serde_json::Value> {
     let store = c2pa::jumbf_io::load_jumbf_from_stream(format, &mut Cursor::new(source)).ok()?;
     if store.len() > MAX_SOURCE_STORE_BYTES {
         return None;
     }
-    drop(store);
-    let reader = Reader::from_context(Context::new())
-        .with_stream(format, Cursor::new(source))
+    let reader = Reader::from_context(reading_context())
+        .with_manifest_data_and_stream(&store, format, Cursor::new(source))
         .ok()?;
     let results = serde_json::to_value(reader.validation_results()?).ok()?;
     Some(status_codes(&results))
@@ -682,18 +735,18 @@ impl ProvenanceSigner {
     /// source carries a manifest store, the status codes its
     /// validation produced ([`source_status`]), and nothing
     /// else. The source's store does not ride along, under
-    /// either metadata policy. Carrying it copied the
-    /// source's claim thumbnail (a picture of the whole
-    /// source frame, so of everything a crop or a redaction
-    /// removed) and every assertion it held (EXIF location,
-    /// authorship, identity) into each output, made a
-    /// thumbnail-sized output as large as the source's store
-    /// whatever the request asked for (issue #610), and
-    /// could not follow `CRABCROP_METADATA`: a parent claim's
-    /// title, generator and certificate are signed, so no
-    /// redaction removes them. No instance ID is copied
-    /// either: the SDK would take the source's XMP
-    /// `InstanceID`, which identifies the original file.
+    /// either metadata policy. The store is the source's
+    /// metadata, not the output's: its claim thumbnails
+    /// depict the source as it was, and its assertions
+    /// (EXIF, authorship, identity) describe the source, so
+    /// carrying it could not follow `CRABCROP_METADATA` (a
+    /// parent claim's title, generator and certificate are
+    /// signed, so no SDK redaction removes them), and it made
+    /// a thumbnail-sized output as large as the source's
+    /// store whatever the request asked for (issue #610). No
+    /// instance ID is copied either: the SDK would take the
+    /// source's XMP `InstanceID`, which identifies the
+    /// original file.
     pub fn sign(
         &self,
         output: &[u8],
@@ -1210,6 +1263,278 @@ mod tests {
             .ingredients()[0];
         assert_eq!(parent.format(), Some("image/jpeg"));
         assert!(parent.validation_results().is_none());
+    }
+
+    /// A tagged COSE_Sign1 whose protected header names
+    /// EdDSA and the `application/vc` content type, carrying
+    /// `payload` and a placeholder signature: the envelope an
+    /// identity-claims-aggregation credential travels in.
+    fn cose_sign1(payload: &[u8]) -> Vec<u8> {
+        fn byte_string(out: &mut Vec<u8>, bytes: &[u8]) {
+            match bytes.len() {
+                len if len < 24 => out.push(0x40 | len as u8),
+                len if len < 256 => out.extend_from_slice(&[0x58, len as u8]),
+                len => {
+                    out.push(0x59);
+                    let len = u16::try_from(len).expect("the payload fits two length bytes");
+                    out.extend_from_slice(&len.to_be_bytes());
+                }
+            }
+            out.extend_from_slice(bytes);
+        }
+        // { 1 (alg): -8 (EdDSA), 3 (content type): "application/vc" }
+        let mut protected = vec![0xA2, 0x01, 0x27, 0x03, 0x6E];
+        protected.extend_from_slice(b"application/vc");
+        // Tag 18 (COSE_Sign1), an array of four.
+        let mut out = vec![0xD2, 0x84];
+        byte_string(&mut out, &protected);
+        out.push(0xA0);
+        byte_string(&mut out, payload);
+        byte_string(&mut out, &[0; 64]);
+        out
+    }
+
+    /// A credential holder claiming an identity whose
+    /// credential was issued by the `did:web` DID it holds.
+    /// Validating such an identity means resolving the
+    /// issuer's DID document from the issuer's host.
+    struct WebIssuedIdentity(String);
+
+    impl c2pa::identity::builder::CredentialHolder for WebIssuedIdentity {
+        fn sig_type(&self) -> &'static str {
+            "cawg.identity_claims_aggregation"
+        }
+
+        fn reserve_size(&self) -> usize {
+            4096
+        }
+
+        fn sign(
+            &self,
+            payload: &c2pa::identity::SignerPayload,
+        ) -> Result<Vec<u8>, c2pa::identity::builder::IdentityBuilderError> {
+            let credential = serde_json::json!({
+                "@context": [
+                    "https://www.w3.org/ns/credentials/v2",
+                    "https://cawg.io/identity/1.1/ica/context/",
+                ],
+                "type": ["VerifiableCredential", "IdentityClaimsAggregationCredential"],
+                "credentialSubject": {
+                    "verifiedIdentities": [{
+                        "type": "cawg.document_verification",
+                        "name": "Test Identity",
+                        "verifiedAt": "2026-01-01T00:00:00Z",
+                        "provider": { "id": "https://identity.example", "name": "Test Provider" },
+                    }],
+                    "c2paAsset": payload,
+                },
+                "issuer": self.0,
+                "validFrom": "2026-01-01T00:00:00Z",
+            })
+            .to_string();
+            Ok(cose_sign1(credential.as_bytes()))
+        }
+    }
+
+    /// The test identity, adding a [`WebIssuedIdentity`]
+    /// identity assertion to every manifest it signs.
+    struct SignerWithIdentity {
+        inner: c2pa::BoxedSigner,
+        issuer: String,
+    }
+
+    impl Signer for SignerWithIdentity {
+        fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
+            self.inner.sign(data)
+        }
+
+        fn alg(&self) -> SigningAlg {
+            self.inner.alg()
+        }
+
+        fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
+            self.inner.certs()
+        }
+
+        fn reserve_size(&self) -> usize {
+            self.inner.reserve_size()
+        }
+
+        fn dynamic_assertions(&self) -> Vec<Box<dyn c2pa::dynamic_assertion::DynamicAssertion>> {
+            vec![Box::new(
+                c2pa::identity::builder::IdentityAssertionBuilder::for_credential_holder(
+                    WebIssuedIdentity(self.issuer.clone()),
+                ),
+            )]
+        }
+    }
+
+    /// A JPEG whose manifest store, signed with the test
+    /// identity, carries a CAWG identity assertion issued by
+    /// `issuer`.
+    fn test_source_with_a_web_identity(issuer: &str) -> Vec<u8> {
+        let signer = SignerWithIdentity {
+            inner: c2pa::create_signer::from_keys(
+                TEST_CHAIN.as_bytes(),
+                TEST_KEY.as_bytes(),
+                SigningAlg::Es256,
+                None,
+            )
+            .expect("the test identity loads"),
+            issuer: issuer.to_string(),
+        };
+        let definition = serde_json::json!({
+            "title": "identity test source",
+            "claim_generator_info": [{ "name": "test editor", "version": "1.0" }],
+            "assertions": [{ "label": "c2pa.actions", "data": { "actions": [{
+                "action": "c2pa.created",
+                "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture",
+            }]}}],
+        })
+        .to_string();
+        let mut signed = Cursor::new(Vec::new());
+        Builder::from_context(reading_context())
+            .with_definition(definition)
+            .expect("the definition loads")
+            .sign(
+                &signer,
+                "image/jpeg",
+                &mut Cursor::new(crop_output()),
+                &mut signed,
+            )
+            .expect("the source signs");
+        signed.into_inner()
+    }
+
+    #[test]
+    fn a_source_identity_assertion_is_not_validated_while_signing() {
+        // The issuer's host is one the SDK refuses to fetch
+        // from before any request is made, so this test opens
+        // no connection whichever way signing reads the
+        // source. Validating the identity would still record
+        // CAWG status codes for the parent; reading the
+        // source's store without decoding identities records
+        // none, and needs nothing but local work.
+        let source = test_source_with_a_web_identity("did:web:localhost%3A9:test-issuer");
+        assert!(contains(&source, b"cawg.identity"));
+        assert!(contains(&source, b"did:web:localhost%3A9:test-issuer"));
+        let signed = sign_from(&test_signer(), &crop_output(), "image/jpeg", &source);
+        assert_eq!(
+            reader(&signed, "image/jpeg").validation_state(),
+            ValidationState::Valid
+        );
+        let mut recorded = Vec::new();
+        for category in ["success", "informational", "failure"] {
+            recorded.extend(parent_codes(&signed, "image/jpeg", category));
+        }
+        assert!(
+            recorded.iter().any(|c| c == "claimSignature.validated"),
+            "the source's store was read: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().all(|c| !c.starts_with("cawg.")),
+            "no identity was validated: {recorded:?}"
+        );
+        // Meta's summary of the source is its manifest's own
+        // signature and hashes, which validate, whether or not
+        // the identity's issuer could be reached.
+        let summary = read_manifest(&source, "image/jpeg").expect("the source has a manifest");
+        assert_eq!(summary.state, "valid");
+        assert_eq!(summary.signer.as_deref(), Some("crabcrop test signer"));
+        assert_eq!(summary.manifests, 1);
+    }
+
+    /// A local listener that accepts and drops connections,
+    /// counting them. Send on the sender to stop it; the join
+    /// handle yields the count.
+    fn connection_counter() -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<usize>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let counter = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut accepted = 0;
+            while std::time::Instant::now() < deadline
+                && stopped.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty)
+            {
+                match listener.accept() {
+                    Ok(_) => accepted += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            while listener.accept().is_ok() {
+                accepted += 1;
+            }
+            accepted
+        });
+        (addr, stop, counter)
+    }
+
+    #[test]
+    fn reading_a_manifest_store_opens_no_connection() {
+        // Every store read (the parent's status, meta's
+        // summaries) runs under this context: a request the
+        // store's contents lead the SDK to make is answered
+        // with an error on the spot, with no connection, and
+        // identity assertions are not decoded at all.
+        let context = reading_context();
+        let (addr, stop, counter) = connection_counter();
+        let request = c2pa::http::http::Request::get(format!("http://{addr}/did.json"))
+            .body(Vec::new())
+            .unwrap();
+        let started = std::time::Instant::now();
+        let response = context.resolver().http_resolve(request);
+        assert!(response.is_err(), "the request is refused");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        stop.send(()).unwrap();
+        assert_eq!(counter.join().unwrap(), 0, "no connection was opened");
+        assert!(!context.settings().core.decode_identity_assertions);
+    }
+
+    #[test]
+    fn the_store_validated_is_the_store_measured() {
+        // A text SVG whose leading comment puts `ftyp` at
+        // bytes 4 to 7, where an ISO BMFF file names its
+        // first box. The engine's sniff and the store's
+        // measurement read it as SVG; the reader is handed
+        // that measured store, so it validates it against
+        // the SVG, instead of finding a store again through
+        // its own container detection.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"><rect width="100" height="60" fill="#00ff00"/></svg>"##;
+        let signer = test_signer();
+        let mut source = b"<!--ftyp-->".to_vec();
+        source.extend(
+            signer
+                .sign(svg, "image/svg+xml", &plain())
+                .expect("the SVG signs"),
+        );
+        assert_eq!(&source[4..8], b"ftyp");
+        assert_eq!(sniff_format(&source), "image/svg+xml");
+        let signed = sign_from(&signer, &crop_output(), "image/jpeg", &source);
+        let reader = reader(&signed, "image/jpeg");
+        let parent = &reader
+            .active_manifest()
+            .expect("an active manifest")
+            .ingredients()[0];
+        assert_eq!(parent.format(), Some("image/svg+xml"));
+        assert!(
+            parent.validation_results().is_some(),
+            "the measured store's status is recorded"
+        );
+        assert!(
+            parent_codes(&signed, "image/jpeg", "success")
+                .iter()
+                .any(|c| c == "claimSignature.validated"),
+            "the store's own signature validated"
+        );
     }
 
     #[test]
