@@ -23,7 +23,7 @@ By default Cloudflare only caches a fixed list of file extensions, and a crabcro
 - Edge TTL: **Respect origin**
 - Browser TTL: **Respect origin**
 
-**Never use an Edge TTL override on the crabcrop hostname.** An override that ignores origin cache headers caches even `no-store` responses, so crabcrop's meta JSON (`private, no-store`) and its error responses would be pinned at the edge. Respect origin also preserves the per-URL `maxage:` directive, which an override would flatten to a single value.
+**Never use an Edge TTL override on the crabcrop hostname.** An override that ignores origin cache headers caches even `no-store` responses, so crabcrop's meta JSON (`private, no-store`) and its error responses (`no-store`) would be pinned at the edge. Respect origin also preserves the per-URL `maxage:` directive, which an override would flatten to a single value.
 
 ## 2. Turn Polish off for this hostname
 
@@ -35,13 +35,13 @@ Image Transformations need no opt-out: they only run on `/cdn-cgi/image/` URLs o
 
 ## 3. Format negotiation: pin it, or split the cache
 
-Without an explicit `filters:format(...)`, crabcrop negotiates the output format from the request's `Accept` header (AVIF, then JPEG XL, then WebP) and can vary dimensions by client hints (DPR), all under one URL. Cloudflare's default cache key does not include `Accept`, so the first variant cached is the variant every later visitor gets, whatever their browser sent. Three ways to handle it, in order:
+Without an explicit `filters:format(...)`, crabcrop negotiates the output format from the request's `Accept` header (AVIF, then JPEG XL, then WebP), all under one URL. Cloudflare's default cache key does not include `Accept`, so the first variant cached is the variant every later visitor gets, whatever their browser sent. Three ways to handle it, in order:
 
 1. **Pin the format in the URL** (`filters:format(avif)`). Each format becomes a different signed URL and its own cache entry. Works on every plan, no edge features involved. This is the recommended default behind any CDN, not just Cloudflare.
 2. **Vary for Images** (Pro plans and up), Cloudflare's mechanism for origin-negotiated variants. It keys off a configured extension list (avif, webp, jpg, png, gif, and a few more), so it covers AVIF and WebP negotiation, but not JPEG XL, and not DPR variants. It is configured through the API, not a Cache Rule, and it is incompatible with Cache Reserve (step 6).
 3. **A custom cache key including `Accept` values** (Enterprise only) splits entries by negotiated format without URL changes, at Enterprise prices.
 
-DPR variants share an entry under options 2 and 3 as well: build width variants as distinct operations (the SDKs' `build_srcset` does exactly this) instead of relying on client hints behind a CDN.
+**Client hints: turn them off on the origin.** Cloudflare passes the request's headers to the origin, and none of the three options above puts the client hint headers (`DPR`, `Sec-CH-DPR`, `Sec-CH-Width`, `Width`, `Sec-CH-Viewport-Width`, `Viewport-Width`, `Save-Data`) in the cache key. Those headers can change a URL's size or quality, so set `CRABCROP_CLIENT_HINTS=0` on the crabcrop origin: crabcrop then ignores them, every request for a URL gets the same bytes, which is the one entry the edge keeps, and image responses vary on `Accept` alone. Build width variants as distinct operations instead (the SDKs' `build_srcset` does exactly this). If hints stay on, crabcrop serves every response a hint shaped as `private`, so Cloudflare does not store it and sends each such request to the origin.
 
 ## 4. Expiring URLs: the edge does not read them
 
@@ -88,6 +88,8 @@ Run against your zone after setup:
 3. Purge one URL in both layers, then request it: `cf-cache-status: MISS`, then HIT again on the next request.
 4. If you use the tag bridge: request a `preset:` URL, purge by its tag, and request it again. A MISS proves the tag landed.
 5. If you left formats unpinned, request one URL with an AVIF `Accept` header and then with a JPEG-only one. Identical bytes mean your variant split from step 3 is not in effect.
+6. Request a new signed image URL with a `DPR: 3` header, then without it. Identical bytes, and a `Vary` of `Accept` alone, prove client hints are off on the origin (step 3).
+7. Request a signed URL whose source does not exist, twice. Both answers are crabcrop's `404` with `Cache-Control: no-store`, and the second is not a HIT: errors are never stored at the edge.
 
 ## Teardown
 

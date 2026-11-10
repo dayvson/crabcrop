@@ -161,7 +161,31 @@ async fn spawn_app(allow_unsafe: bool) -> String {
 }
 
 async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String>) -> String {
-    let state = AppState {
+    spawn_state(base_test_state(allow_unsafe, metrics_token)).await
+}
+
+/// [`spawn_app`]'s server with `CRABCROP_CLIENT_HINTS` set
+/// to `client_hints`.
+async fn spawn_app_with_client_hints(client_hints: bool) -> String {
+    let mut state = base_test_state(false, Some(TEST_METRICS_TOKEN.to_string()));
+    state.client_hints = client_hints;
+    spawn_state(state).await
+}
+
+/// Serve `state` on a free local port, returning its base
+/// URL.
+async fn spawn_state(state: AppState) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The state [`spawn_app`] serves.
+fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
+    AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
         allow_unsafe,
         loader: Loader::with_defaults().unwrap(),
@@ -196,6 +220,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -214,13 +239,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app(state)).await.unwrap();
-    });
-    format!("http://{addr}")
+    }
 }
 
 /// Two-frame animated GIF bytes for the video tests.
@@ -340,6 +359,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -403,6 +423,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -466,6 +487,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -539,6 +561,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -622,6 +645,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -906,6 +930,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1265,6 +1290,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -1335,6 +1361,7 @@ async fn spawn_app_rotating() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1408,6 +1435,7 @@ async fn spawn_app_with_fallback() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -3259,6 +3287,7 @@ async fn spawn_app_with_presets_and_roots(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -4496,6 +4525,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -4678,6 +4708,7 @@ async fn spawn_app_with_moderation(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5012,6 +5043,7 @@ async fn spawn_app_with_ocr_timeout(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5435,6 +5467,7 @@ async fn spawn_app_with_embeddings(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6181,6 +6214,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6246,6 +6280,7 @@ async fn spawn_app_with_studio() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: Some([0xf5, 0xf0, 0xe8]),
         presets: std::collections::HashMap::new(),
@@ -6311,6 +6346,7 @@ async fn spawn_app_with_inpaint() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6408,6 +6444,7 @@ async fn spawn_app_with_segment() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6901,6 +6938,7 @@ async fn spawn_app_with_providers(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6980,6 +7018,7 @@ async fn spawn_app_full(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -7168,6 +7207,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        true,
     );
     finalize_validators(&mut resp, &etag, None);
     assert_eq!(resp.status(), StatusCode::OK);
@@ -7179,6 +7219,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        true,
     );
     finalize_validators(&mut resp, &etag, Some(etag.as_str()));
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
@@ -7194,6 +7235,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        true,
     );
     finalize_validators(&mut resp, &etag, Some("\"other\""));
     assert_eq!(resp.status(), StatusCode::OK);
@@ -7208,14 +7250,26 @@ fn validators_skip_meta_and_error_responses() {
     let etag = etag_for_bytes(b"rendered bytes");
     // Meta responses are private, no-store: no ETag is
     // attached and a matching conditional never 304s them.
-    let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);
+    let mut resp = respond(
+        ImageFormat::Png,
+        None,
+        bytes::Bytes::from(vec![1]),
+        None,
+        true,
+    );
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     finalize_validators(&mut resp, &etag, Some(etag.as_str()));
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers().get(header::ETAG).is_none());
     // An error status is left alone too, public or not.
-    let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);
+    let mut resp = respond(
+        ImageFormat::Png,
+        None,
+        bytes::Bytes::from(vec![1]),
+        None,
+        true,
+    );
     *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     finalize_validators(&mut resp, &etag, Some(etag.as_str()));
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -7407,6 +7461,503 @@ async fn save_data_steps_quality_and_separates_the_cache() {
     let remainder = format!("filters:format(jpeg):quality(90)/{src}");
     let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
     assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+}
+
+#[tokio::test]
+async fn a_save_data_answer_is_stepped_only_where_its_entry_and_privacy_follow() {
+    // One decision settles whether Save-Data steps a
+    // render, gives it its own cache entry, and keeps it
+    // from shared caches. A per-format quality list that
+    // names no value for the output format is where the
+    // engine and the key could part: a stepped encode
+    // stored under the URL's plain entry, served public,
+    // and then returned to plain requests. Whatever the
+    // rule says for such a URL, a stepped answer is private
+    // and the plain answer is never the stepped encode.
+    let detailed = DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 200, |x, y| {
+        image::Rgb([
+            (x * 255 / 320) as u8,
+            (y * 255 / 200) as u8,
+            ((x + y) * 7) as u8,
+        ])
+    }));
+    let mut png = Vec::new();
+    detailed
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let (src, _) = spawn_counting_server(200, "image/png", png).await;
+    for remainder in [
+        format!("filters:format(webp):quality(jpeg:90)/{src}"),
+        format!("200x0/filters:format(jpeg):quality(webp:60)/{src}"),
+    ] {
+        // The URL's plain answer, rendered by a server that
+        // has seen no Save-Data request.
+        let reference = spawn_app(false).await;
+        let resp = get_with_headers(&reference, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{remainder}");
+        let plain = resp.bytes().await.unwrap();
+        // Save-Data first, on a fresh server.
+        let base = spawn_app(false).await;
+        let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{remainder}");
+        let stepped = header(&resp, "x-crabcrop-quality") == "70";
+        let cache_control = header(&resp, "cache-control");
+        let body = resp.bytes().await.unwrap();
+        if stepped {
+            assert_eq!(cache_control, YEAR_PRIVATE, "stepped: {remainder}");
+        } else {
+            assert_eq!(cache_control, YEAR_PUBLIC, "{remainder}");
+            assert_eq!(body, plain, "a public Save-Data answer: {remainder}");
+        }
+        // The plain request after it gets the plain answer.
+        let resp = get_with_headers(&base, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{remainder}");
+        assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC, "{remainder}");
+        assert_eq!(resp.bytes().await.unwrap(), plain, "{remainder}");
+    }
+}
+
+/// The `Vary` every image-route answer carries while client
+/// hints are on, the published value.
+const HINTED_VARY: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
+
+const YEAR_PUBLIC: &str = "public, max-age=31536000, immutable";
+const YEAR_PRIVATE: &str = "private, max-age=31536000, immutable";
+const JSON: Pairs = &[("Accept", "application/json")];
+
+/// Request headers, as name and value pairs.
+type Pairs<'a> = &'a [(&'a str, &'a str)];
+
+/// GET `path` (already signed or sealed) with `pairs` as
+/// request headers.
+async fn get_path(base: &str, path: &str, pairs: &[(&str, &str)]) -> reqwest::Response {
+    let mut req = client().get(format!("{base}{path}"));
+    for (name, value) in pairs {
+        req = req.header(*name, *value);
+    }
+    req.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn image_route_errors_are_no_store_and_vary_like_the_image() {
+    // An error is one request's answer at one moment, never
+    // what the URL is: a cache must not hand it to the next
+    // viewer, so every class leaves with no-store, and with
+    // the image's Vary, since its body follows Accept and a
+    // hint can lead to it.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (missing, _) = spawn_counting_server(404, "text/plain", b"gone".to_vec()).await;
+    let (broken, _) = spawn_counting_server(500, "text/plain", b"boom".to_vec()).await;
+    let base = spawn_app(false).await;
+    let image = format!("20x15/{src}");
+    let resp = get_with_headers(&base, &image, &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC);
+    assert_eq!(header(&resp, "vary"), HINTED_VARY);
+    let unparsable = format!("filters:bogus(1)/{src}");
+    let not_found = format!("20x15/{missing}");
+    let bad_gateway = format!("20x15/{broken}");
+    let debug = format!("debug:focal/crop:50x50:smart/{src}");
+    let signed = |remainder: &str| format!("/{}/{remainder}", sign(remainder));
+    let sealed = |remainder: &str| format!("/{}", sealed_path(remainder, None));
+    let cases: Vec<(&str, String, Pairs, u16)> = vec![
+        ("parse error", signed(&unparsable), &[], 400),
+        ("parse error, envelope", signed(&unparsable), JSON, 400),
+        ("bad signature", format!("/deadbeef/{image}"), &[], 403),
+        ("source not found", signed(&not_found), &[], 404),
+        // Meta mode is on here: the meta path's own failure.
+        ("meta, source not found", signed(&not_found), JSON, 404),
+        ("origin failure", signed(&bad_gateway), &[], 502),
+        ("meta of a debug view", signed(&debug), JSON, 400),
+        ("sealed, source not found", sealed(&not_found), &[], 403),
+        ("sealed meta of a debug view", sealed(&debug), JSON, 403),
+        (
+            "sealed, unopened",
+            "/s1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            &[],
+            403,
+        ),
+    ];
+    for (label, path, pairs, status) in cases {
+        let resp = get_path(&base, &path, pairs).await;
+        assert_eq!(resp.status().as_u16(), status, "{label}");
+        assert_eq!(header(&resp, "cache-control"), "no-store", "{label}");
+        assert_eq!(header(&resp, "vary"), HINTED_VARY, "{label}");
+    }
+    // The meta refusal keeps the meta document's own header.
+    let base = spawn_app_with_meta_enabled(false).await;
+    let resp = get_path(&base, &signed(&image), JSON).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "cache-control"), "private, no-store");
+    assert_eq!(header(&resp, "vary"), HINTED_VARY);
+}
+
+#[tokio::test]
+async fn errors_on_the_other_routes_are_no_store() {
+    let base = spawn_app(false).await;
+    let cases = [
+        (
+            "unrouted method",
+            client().delete(format!("{base}/anything")),
+        ),
+        (
+            "PUT fallback",
+            client().put(format!("{base}/anything")).body("x"),
+        ),
+        (
+            "explain, bad signature",
+            client().get(format!(
+                "{base}/explain/deadbeef/20x15/http://127.0.0.1:9/a.png"
+            )),
+        ),
+        (
+            "purge, bad signature",
+            client().post(format!(
+                "{base}/purge/deadbeef/20x15/http://127.0.0.1:9/a.png"
+            )),
+        ),
+    ];
+    for (label, req) in cases {
+        let resp = req.send().await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "{label}: {}",
+            resp.status()
+        );
+        assert_eq!(header(&resp, "cache-control"), "no-store", "{label}");
+    }
+}
+
+#[tokio::test]
+async fn every_error_status_leaves_with_no_store() {
+    // The middleware is the one place: whatever builder made
+    // an error, and whatever its status, it leaves no-store.
+    // A no-store answer keeps its own value, and a success
+    // with no cache header of its own is left alone.
+    let router = Router::new()
+        .route(
+            "/status/{code}",
+            get(
+                |axum::extract::Path(code): axum::extract::Path<u16>| async move {
+                    let status = StatusCode::from_u16(code).unwrap();
+                    if status == StatusCode::SERVICE_UNAVAILABLE {
+                        busy_response("server busy", 1, None)
+                    } else {
+                        error_response(status, "some_code", "message".to_string(), None)
+                    }
+                },
+            ),
+        )
+        .route(
+            "/meta-refusal",
+            get(|| async {
+                meta_cache_headers(error_response(
+                    StatusCode::FORBIDDEN,
+                    "meta_disabled",
+                    "off".to_string(),
+                    Some("application/json"),
+                ))
+            }),
+        )
+        .route("/ok", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(security_headers));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}");
+    for code in [
+        400, 401, 403, 404, 405, 409, 413, 415, 500, 501, 502, 503, 504,
+    ] {
+        let resp = client()
+            .get(format!("{base}/status/{code}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), code);
+        assert_eq!(header(&resp, "cache-control"), "no-store", "{code}");
+        if code == 503 {
+            assert_eq!(header(&resp, "retry-after"), "1");
+        }
+    }
+    let resp = client()
+        .get(format!("{base}/meta-refusal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(header(&resp, "cache-control"), "private, no-store");
+    let resp = client().get(format!("{base}/ok")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+}
+
+#[test]
+fn directives_are_matched_by_name() {
+    assert!(has_directive("private, no-store", "no-store"));
+    assert!(has_directive("No-Store", "no-store"));
+    assert!(has_directive("public, max-age=60", "public"));
+    assert!(has_directive("public , max-age=60", "max-age"));
+    assert!(!has_directive("private, max-age=60", "public"));
+    assert!(!has_directive("no-store-ish", "no-store"));
+    assert!(!has_directive("", "public"));
+}
+
+#[tokio::test]
+async fn an_answer_a_client_hint_shaped_is_kept_from_shared_caches() {
+    // A hint header is the requester's own: an answer it
+    // shaped is private, so a cache that keys on the URL
+    // alone never hands it to the next viewer. An answer the
+    // hints left as the URL's own stays public.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app(false).await;
+    let unsized_url = format!("filters:format(jpeg)/{src}");
+    let sized = format!("300x0/filters:format(jpeg)/{src}");
+    let own_dpr = format!("300x0/filters:format(jpeg):dpr(2)/{src}");
+    let own_quality = format!("300x0/filters:format(jpeg):quality(80)/{src}");
+    let short = format!("maxage:60/300x0/filters:format(jpeg)/{src}");
+    let cases: [(&str, &str, Pairs, &str); 16] = [
+        ("bare, unsized", &unsized_url, &[], YEAR_PUBLIC),
+        (
+            "Sec-CH-Width",
+            &unsized_url,
+            &[("Sec-CH-Width", "250")],
+            YEAR_PRIVATE,
+        ),
+        ("Width", &unsized_url, &[("Width", "250")], YEAR_PRIVATE),
+        (
+            "Sec-CH-Viewport-Width",
+            &unsized_url,
+            &[("Sec-CH-Viewport-Width", "250")],
+            YEAR_PRIVATE,
+        ),
+        (
+            "Viewport-Width",
+            &unsized_url,
+            &[("Viewport-Width", "250")],
+            YEAR_PRIVATE,
+        ),
+        ("bare, sized", &sized, &[], YEAR_PUBLIC),
+        (
+            "width hint on a sized URL",
+            &sized,
+            &[("Width", "250")],
+            YEAR_PUBLIC,
+        ),
+        ("DPR", &sized, &[("DPR", "2")], YEAR_PRIVATE),
+        ("Sec-CH-DPR", &sized, &[("Sec-CH-DPR", "1.5")], YEAR_PRIVATE),
+        ("DPR 1", &sized, &[("DPR", "1")], YEAR_PUBLIC),
+        ("DPR out of set", &sized, &[("DPR", "7")], YEAR_PUBLIC),
+        (
+            "DPR under the URL's own dpr",
+            &own_dpr,
+            &[("DPR", "3")],
+            YEAR_PUBLIC,
+        ),
+        ("Save-Data", &sized, &[("Save-Data", "on")], YEAR_PRIVATE),
+        (
+            "Save-Data under the URL's own quality",
+            &own_quality,
+            &[("Save-Data", "on")],
+            YEAR_PUBLIC,
+        ),
+        (
+            "maxage with DPR",
+            &short,
+            &[("DPR", "2")],
+            "private, max-age=60, immutable",
+        ),
+        ("maxage bare", &short, &[], "public, max-age=60, immutable"),
+    ];
+    for (label, remainder, pairs, expected) in cases {
+        // The render, then its cache hit: both paths agree.
+        for pass in ["miss", "hit"] {
+            let resp = get_with_headers(&base, remainder, pairs).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{label} ({pass})");
+            assert_eq!(header(&resp, "cache-control"), expected, "{label} ({pass})");
+            assert_eq!(header(&resp, "vary"), HINTED_VARY, "{label} ({pass})");
+            // The browser that asked still revalidates its
+            // copy: the validator stays on a private answer.
+            assert!(!header(&resp, "etag").is_empty(), "{label} ({pass})");
+        }
+    }
+    // A conditional request answers 304 with the same
+    // privacy as the answer it stands for.
+    let resp = get_with_headers(&base, &sized, &[("DPR", "2")]).await;
+    let etag = header(&resp, "etag");
+    let resp = get_with_headers(&base, &sized, &[("DPR", "2"), ("If-None-Match", &etag)]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(header(&resp, "cache-control"), YEAR_PRIVATE);
+    let resp = get_with_headers(&base, &sized, &[]).await;
+    let etag = header(&resp, "etag");
+    let resp = get_with_headers(&base, &sized, &[("If-None-Match", &etag)]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC);
+}
+
+/// Every hint header the server reads, each with a value
+/// that changes the answer of a URL it applies to.
+const HINT_REQUESTS: [(&str, &str); 7] = [
+    ("DPR", "2"),
+    ("Sec-CH-DPR", "2"),
+    ("Sec-CH-Width", "250"),
+    ("Width", "250"),
+    ("Sec-CH-Viewport-Width", "250"),
+    ("Viewport-Width", "250"),
+    ("Save-Data", "on"),
+];
+
+#[test]
+fn the_hinted_vary_names_accept_and_exactly_the_headers_the_hints_read() {
+    let named: std::collections::BTreeSet<&str> = VARY_WITH_HINTS.split(", ").collect();
+    let read: std::collections::BTreeSet<&str> = DPR_HINT_HEADERS
+        .into_iter()
+        .chain(WIDTH_HINT_HEADERS)
+        .chain([SAVE_DATA_HEADER, "Accept"])
+        .collect();
+    assert_eq!(named, read);
+    assert_eq!(VARY_WITH_HINTS, HINTED_VARY);
+    assert_eq!(VARY_WITHOUT_HINTS, "Accept");
+    // The published row the CDN recipes are checked against
+    // (tests/deploy_recipes.rs) is the header sent.
+    let responses = include_str!("../../docs/responses.md");
+    let row = responses
+        .lines()
+        .find(|l| l.starts_with("| `Vary` |"))
+        .unwrap();
+    assert!(
+        row.starts_with(&format!("| `Vary` | `{VARY_WITH_HINTS}`")),
+        "{row}"
+    );
+    let requested: std::collections::BTreeSet<&str> = HINT_REQUESTS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["Accept"])
+        .collect();
+    assert_eq!(requested, read);
+}
+
+#[tokio::test]
+async fn every_hint_header_in_vary_can_change_the_bytes() {
+    // With hints on, each header the Vary names changes the
+    // bytes of a URL it applies to: Vary leaves none out
+    // that matters, and lists none that cannot.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app(false).await;
+    let unsized_url = format!("filters:format(jpeg)/{src}");
+    let sized = format!("300x0/filters:format(jpeg)/{src}");
+    for (name, value) in HINT_REQUESTS {
+        let remainder = if name.ends_with("Width") {
+            &unsized_url
+        } else {
+            &sized
+        };
+        let bare = get_with_headers(&base, remainder, &[])
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let resp = get_with_headers(&base, remainder, &[(name, value)]).await;
+        assert!(
+            header(&resp, "vary").split(", ").any(|h| h == name),
+            "{name}"
+        );
+        assert_ne!(resp.bytes().await.unwrap(), bare, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn with_client_hints_off_no_hint_header_changes_an_answer() {
+    // CRABCROP_CLIENT_HINTS=0: every request for a URL gets
+    // the same bytes, ETag and headers, whatever hint
+    // headers it sends, alone or together, plain, sized or
+    // sealed; the answers vary on Accept alone, and nothing
+    // asks the browser for hints.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app_with_client_hints(false).await;
+    let unsized_url = format!("filters:format(jpeg)/{src}");
+    let sized = format!("300x0/filters:format(jpeg)/{src}");
+    let paths = [
+        format!("/{}/{unsized_url}", sign(&unsized_url)),
+        format!("/{}/{sized}", sign(&sized)),
+        format!("/{}", sealed_path(&sized, None)),
+    ];
+    let mut requests: Vec<Vec<(&str, &str)>> = HINT_REQUESTS.iter().map(|h| vec![*h]).collect();
+    requests.push(HINT_REQUESTS.to_vec());
+    for path in &paths {
+        let resp = get_path(&base, path, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let etag = header(&resp, "etag");
+        let bare = resp.bytes().await.unwrap();
+        for pairs in &requests {
+            let resp = get_path(&base, path, pairs).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path} {pairs:?}");
+            assert_eq!(
+                header(&resp, "cache-control"),
+                YEAR_PUBLIC,
+                "{path} {pairs:?}"
+            );
+            assert_eq!(header(&resp, "vary"), "Accept", "{path} {pairs:?}");
+            assert_eq!(header(&resp, "accept-ch"), "", "{path} {pairs:?}");
+            assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{path} {pairs:?}");
+            assert_eq!(header(&resp, "etag"), etag, "{path} {pairs:?}");
+            assert_eq!(resp.bytes().await.unwrap(), bare, "{path} {pairs:?}");
+        }
+    }
+    // An error varies on Accept alone too.
+    let resp = get_path(&base, &format!("/deadbeef/{sized}"), &[]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "vary"), "Accept");
+    // /explain forecasts what the image request does: no
+    // hinted factor.
+    let resp = get_path(
+        &base,
+        &format!("/explain/{}/{sized}", sign(&sized)),
+        &[("Accept", "application/json"), ("DPR", "3")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let report: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert!(report["forecast"]["dpr_hint"].is_null(), "{report}");
+    assert_eq!(report["forecast"]["dpr"], 1.0);
+}
+
+#[tokio::test]
+async fn a_client_chosen_request_id_stays_off_answers_shared_caches_keep() {
+    // A shared cache stores an answer with its headers and
+    // hands both to every later viewer of the URL, so a
+    // public answer never carries an ID a client chose. The
+    // server's own ID still goes out, and answers no shared
+    // cache keeps echo the client's.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let (missing, _) = spawn_counting_server(404, "text/plain", b"gone".to_vec()).await;
+    let base = spawn_app(false).await;
+    let image = format!("300x0/filters:format(jpeg)/{src}");
+    let chosen = ("X-Request-Id", "chosen-by-client");
+    for pass in ["miss", "hit"] {
+        let resp = get_with_headers(&base, &image, &[chosen]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{pass}");
+        assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC, "{pass}");
+        assert!(resp.headers().get("x-request-id").is_none(), "{pass}");
+    }
+    let resp = get_with_headers(&base, &image, &[]).await;
+    let etag = header(&resp, "etag");
+    let generated = header(&resp, "x-request-id");
+    assert_eq!(generated.len(), 16, "{generated}");
+    assert!(
+        generated.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{generated}"
+    );
+    let resp = get_with_headers(&base, &image, &[chosen, ("If-None-Match", &etag)]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert!(resp.headers().get("x-request-id").is_none());
+    // A hint-shaped answer is private: the ID comes back.
+    let resp = get_with_headers(&base, &image, &[chosen, ("DPR", "2")]).await;
+    assert_eq!(header(&resp, "cache-control"), YEAR_PRIVATE);
+    assert_eq!(header(&resp, "x-request-id"), "chosen-by-client");
+    // So does an error, which is no-store.
+    let not_found = format!("20x15/{missing}");
+    let resp = get_with_headers(&base, &not_found, &[chosen]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(header(&resp, "x-request-id"), "chosen-by-client");
 }
 
 #[tokio::test]
@@ -8498,6 +9049,7 @@ async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -8585,6 +9137,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -9938,6 +10491,7 @@ async fn spawn_app_with_provenance_signer(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -10345,6 +10899,7 @@ async fn processing_gate_bounds_concurrency() {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -10476,6 +11031,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11214,6 +11770,7 @@ fn lane_test_state(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11501,6 +12058,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11658,6 +12216,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -12608,6 +13167,7 @@ async fn spawn_app_with_upload_gate(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -15368,6 +15928,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -16725,6 +17286,7 @@ async fn spawn_explain_app_with_roots(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,

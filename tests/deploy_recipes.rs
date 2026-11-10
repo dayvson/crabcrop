@@ -333,3 +333,136 @@ fn the_helm_chart_gives_the_pod_more_than_the_server_drain() {
         "deployment.yaml: the guard checks the merged env before it is listed"
     );
 }
+
+/// The client hint headers, read from the `Vary` row of
+/// docs/responses.md (which a server unit test ties to the
+/// header the server sends): every header named there but
+/// `Accept`.
+fn hint_headers() -> Vec<String> {
+    let responses = read("docs/responses.md");
+    let row = responses
+        .lines()
+        .find(|l| l.starts_with("| `Vary` |"))
+        .expect("docs/responses.md: a Vary row");
+    let value = row.split('`').nth(3).expect("the Vary row's first value");
+    let names: Vec<String> = value
+        .split(", ")
+        .filter(|n| *n != "Accept")
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names.len(), 7, "{value}");
+    names
+}
+
+/// The CDN recipes whose edge keys on neither `Vary` nor
+/// the client hint headers.
+const UNKEYED_HINT_RECIPES: [&str; 4] = [
+    "deploy/cloudflare/README.md",
+    "deploy/cloudfront/README.md",
+    "deploy/bunnycdn/README.md",
+    "deploy/akamai/README.md",
+];
+
+#[test]
+fn recipes_whose_edge_cannot_key_on_hints_turn_them_off() {
+    // A hint header changes a URL's bytes, and these edges
+    // store one copy per key: with hints read at the
+    // origin, whichever request filled the edge would pick
+    // the copy every later viewer gets. Each recipe turns
+    // hints off on the origin.
+    for rel in UNKEYED_HINT_RECIPES {
+        assert!(
+            read(rel).contains("`CRABCROP_CLIENT_HINTS=0`"),
+            "{rel}: sets CRABCROP_CLIENT_HINTS=0 on the origin"
+        );
+    }
+}
+
+#[test]
+fn the_cloudfront_origin_request_policy_forwards_no_hint() {
+    let recipe = read("deploy/cloudfront/README.md");
+    let forwarded = recipe
+        .lines()
+        .find(|l| l.starts_with("- Headers:"))
+        .expect("cloudfront: the origin request policy's headers");
+    assert!(forwarded.contains("`Accept`"), "{forwarded}");
+    for hint in hint_headers() {
+        assert!(
+            !forwarded.contains(&format!("`{hint}`")),
+            "cloudfront: forwards {hint}, which no key carries: {forwarded}"
+        );
+    }
+}
+
+#[test]
+fn the_akamai_cache_key_carries_every_hint_header_or_none() {
+    // Remove Vary Header leaves the key as the only thing
+    // that tells variants apart: a hint the key leaves out
+    // would share one object between the bytes it changes.
+    let rules: serde_json::Value =
+        serde_json::from_str(&read("deploy/akamai/property-rules.json")).unwrap();
+    let cache_id = rules["rules"]["behaviors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "cacheId")
+        .expect("akamai: a cacheId behavior");
+    let keyed: Vec<&str> = cache_id["options"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(keyed.contains(&"Accept"), "{keyed:?}");
+    let hints = hint_headers();
+    let keyed_hints = hints.iter().filter(|h| keyed.contains(&h.as_str())).count();
+    assert!(
+        keyed_hints == 0 || keyed_hints == hints.len(),
+        "akamai: keys {keyed_hints} of the {} hint headers: {keyed:?}",
+        hints.len()
+    );
+}
+
+#[test]
+fn the_cloudfront_recipe_keeps_errors_out_of_its_error_cache() {
+    // CloudFront caches an error on its own for the error
+    // caching minimum TTL, whatever the origin's headers:
+    // every error status the image route answers gets a
+    // custom error response with that TTL at 0.
+    let recipe = read("deploy/cloudfront/README.md");
+    let setting = recipe
+        .lines()
+        .find(|l| l.contains("**Error caching minimum TTL: 0**"))
+        .expect("cloudfront: custom error responses with an error caching TTL of 0");
+    for status in [400, 403, 404, 405, 500, 501, 502, 503, 504] {
+        assert!(
+            setting.contains(&format!("`{status}`")),
+            "{status}: {setting}"
+        );
+    }
+}
+
+#[test]
+fn cdn_recipes_name_the_error_header_the_server_sends() {
+    // Errors leave with `Cache-Control: no-store` (a server
+    // test pins it); a recipe that tells operators anything
+    // else about them is wrong about what reaches the edge.
+    for rel in [
+        "deploy/cloudflare/README.md",
+        "deploy/cloudfront/README.md",
+        "deploy/fastly/README.md",
+        "deploy/bunnycdn/README.md",
+        "deploy/akamai/README.md",
+    ] {
+        let recipe = read(rel);
+        assert!(
+            recipe.contains("error responses (`no-store`)")
+                || recipe.contains("error responses `no-store`"),
+            "{rel}: names the error responses' no-store"
+        );
+        assert!(
+            !recipe.contains("error responses `private, no-store`"),
+            "{rel}: error responses are no-store, not private, no-store"
+        );
+    }
+}
