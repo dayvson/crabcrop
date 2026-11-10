@@ -510,10 +510,9 @@ test("purge_result gives up on a hung endpoint", { timeout: 60000 }, async () =>
 
 test("sign_url refuses a remainder that begins with the reserved segment", { timeout: 60000 }, async () => {
   // Every derived subkey is HMAC(secret, "crabcrop/<x>-key"),
-  // the image signature of that label: a sign_url call with
-  // empty operations and a label as the source used to return
-  // the subkey in the URL. The SDK's builder refuses it, so
-  // the tool answers an error that carries no signature.
+  // the same function as an image signature, so the SDK's
+  // builder refuses a remainder under the reserved segment,
+  // and the tool answers an error that carries no signature.
   const secret = "mcp-test-secret-0123456";
   const client = await startMcp({ ...process.env, CRABCROP_BASE: "http://127.0.0.1:9", CRABCROP_SECRET: secret });
   try {

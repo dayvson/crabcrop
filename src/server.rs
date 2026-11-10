@@ -1303,8 +1303,9 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
 /// (issue #351). The signature is an HMAC over the
 /// path under a purge subkey derived from the secret (see
 /// [`crate::url::purge_key`]), so only the secret holder can
-/// purge and an image signature can never be replayed here; a
-/// bad signature is a 403 and purges nothing. Idempotent:
+/// purge and an image signature does not verify here (no
+/// signer signs the subkey's label); a bad signature is a
+/// 403 and purges nothing. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<AppState>,
@@ -1481,10 +1482,11 @@ async fn purge_handle(
 /// as in the per-URL purge (issue #351). The signature is
 /// verified under the purge-group
 /// subkey, its own domain beside the purge subkey, over the
-/// group name, so neither an image signature nor a per-URL
-/// purge signature can be replayed here (audit R2-14). A
-/// bad signature is a 403 and removes nothing; an unknown
-/// group answers 200 with a count of 0.
+/// group name, so a per-URL purge signature does not verify
+/// here, and neither does an image signature (no signer
+/// signs the subkey's label). A bad signature is a 403 and
+/// removes nothing; an unknown group answers 200 with a
+/// count of 0.
 async fn purge_group_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -2517,9 +2519,8 @@ fn authenticate<'a>(
         parse_signature(full).map_err(|e| Refusal::AsIs(parse_failure_parts(&e)))?;
     // A remainder that begins with the reserved segment is
     // refused before its signature is checked, so the answer
-    // is the same whatever the signature: the server never
-    // tells a caller whether a signature over a key label,
-    // which would be that label's subkey, is the right one.
+    // is the same whatever the signature: no response depends
+    // on an HMAC over a key derivation label.
     if crabcrop_url::is_reserved_remainder(rest) {
         return Err(Refusal::AsIs(reserved_remainder_parts()));
     }

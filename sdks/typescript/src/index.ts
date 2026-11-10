@@ -73,9 +73,10 @@ function subkey(secret: string, label: string): Uint8Array {
  * remainder without its signature): HMAC-SHA256 of the
  * path under a subkey derived from the secret (the raw
  * HMAC of the secret over the label `crabcrop/purge-key`),
- * so an image signature can never be replayed as a purge
- * signature. This is the signature segment for
- * `POST /purge/<signature>/<path>`.
+ * so an image signature does not verify as a purge
+ * signature: no signer signs a label (see
+ * {@link RESERVED_SEGMENT}). This is the signature segment
+ * for `POST /purge/<signature>/<path>`.
  */
 export function purgeSignature(secret: string, target: string): string {
   return toHex(hmacSha256(subkey(secret, "crabcrop/purge-key"), target));
@@ -100,9 +101,11 @@ export function purgeGroupSignature(secret: string, group: string): string {
  * The upload signature for an object name: HMAC-SHA256 of
  * the name under a subkey derived from the secret (the raw
  * HMAC of the secret over the label `crabcrop/upload-key`),
- * so neither an image signature nor a purge signature can
- * ever be replayed as an upload signature. This is the
- * signature segment for `PUT /upload/<signature>/<name>`.
+ * so neither an image signature nor a purge signature
+ * verifies as an upload signature: a purge signature is
+ * under another subkey, and no signer signs a label (see
+ * {@link RESERVED_SEGMENT}). This is the signature segment
+ * for `PUT /upload/<signature>/<name>`.
  *
  * With `expires` (unix seconds), the signature covers
  * `exp:<expires>/<name>` instead, and the request path is
@@ -294,9 +297,6 @@ export function buildSealedURL(
   source: string,
   options: SealOptions = {},
 ): string {
-  if (secret === null || secret === undefined) {
-    throw new Error("sealing requires a secret: there is no unsafe token");
-  }
   if (options.expires !== undefined) {
     assertExpires(options.expires);
   }
@@ -312,6 +312,12 @@ export function buildSealedURL(
   }
   remainder += source;
   assertNotReserved(remainder);
+  // The inputs are checked before the secret, as in the Rust
+  // and Python builders, so a refused input gets the same
+  // error with or without a secret.
+  if (secret === null || secret === undefined) {
+    throw new Error("sealing requires a secret: there is no unsafe token");
+  }
   const segment = seal(secret, remainder, options.keyId);
   return options.name ? `${trimmedBase}/${segment}/${options.name}` : `${trimmedBase}/${segment}`;
 }

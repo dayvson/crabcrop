@@ -305,8 +305,9 @@ test("encoder options and per-format quality explain (issue #319)", () => {
 });
 
 test("the playground never signs a key label, and a subkey never verifies", async () => {
-  // Every derived subkey is HMAC(secret, "crabcrop/<x>-key"):
-  // the playground's signer printed it for a bare label.
+  // Every derived subkey is HMAC(secret, "crabcrop/<x>-key"),
+  // the same function as the playground's signer, so the
+  // signer refuses every label.
   const secret = "label-test-secret-0123456789";
   const base = "https://img.example.com";
   for (const label of ["crabcrop/purge-key", "crabcrop/upload-key", "crabcrop/seal-key"]) {

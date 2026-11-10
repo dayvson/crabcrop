@@ -38,15 +38,15 @@ remainder = everything after the signature segment, exactly as it appears
 
 ## Reserved remainders
 
-The first remainder segment `crabcrop` is reserved for key derivation. Every derived subkey (the purge, purge-group, upload and seal subkeys below, and the key the server authenticates its stored cache entries with) is `HMAC_SHA256(secret, label)` for a label that begins with `crabcrop/`, and that is exactly the image signature of the label read as a remainder. A signer that signed the remainder `crabcrop/upload-key` would print the upload subkey as the signature.
+The first remainder segment `crabcrop` is reserved for key derivation. Every derived subkey (the purge, purge-group, upload and seal subkeys below, and the key the server authenticates its stored cache entries with) is `HMAC_SHA256(secret, label)` for a label that begins with `crabcrop/`, the same function as an image signature over a remainder. The rule below keeps the two message spaces apart, so that no image signature equals a derived subkey.
 
-So the rule, for the server and for every signer:
+The rule, for the server and for every signer:
 
 - A remainder is reserved when it is `crabcrop` or begins with `crabcrop/`. The test is on the bytes as written, as the HMAC is: `exp:1893456000/crabcrop/x`, `CRABCROP/x`, `crabcrop-assets/x.jpg` and `300x200/https://example.com/crabcrop/x.jpg` are ordinary remainders.
 - A signer never computes `HMAC_SHA256(secret, remainder)` for a reserved remainder. `sign` refuses one, and every builder refuses to assemble one, whether the operations, the source, or both hold the reserved text, with or without a secret, with or without a key ID, plain or sealed. Sealing itself computes no HMAC under the secret, so the sealing primitive is not where the rule is enforced; the sealed builders enforce it like a refused character.
 - The server answers an image or `/explain` request whose remainder is reserved with `400` (`reserved_segment`) before it checks the signature, so the answer is the same whatever the signature, `unsafe` included. A sealed token whose remainder is reserved gets the uniform sealed refusal.
 
-No image URL loses anything by the rule: `crabcrop` is not an operation, so a reserved remainder is all source text, and it names no source the server fetches (it always failed with `400 invalid_source`). A third-party signer must apply the same rule. One that signs a caller-chosen remainder without it, for example a bare source with no operations, hands out the derived subkeys to whoever chooses that remainder. The reserved entries in the test vectors pin it.
+No image URL loses anything by the rule: `crabcrop` is not an operation, so a reserved remainder is all source text, and it names no source the server fetches (it always failed with `400 invalid_source`). A third-party signer must apply the same rule, so that no image signature it computes equals a derived subkey. The reserved entries in the test vectors pin it.
 
 ## Purge signatures
 

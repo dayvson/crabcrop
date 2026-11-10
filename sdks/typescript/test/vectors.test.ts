@@ -90,6 +90,9 @@ for (const v of vectors) {
     assert.throws(() => buildURL(base, null, operations, source), exact);
     assert.throws(() => buildURL(base, "s3cr3t", operations, source, { keyId: "k2" }), exact);
     assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source), exact);
+    // Plain JavaScript can pass no secret: the input is still
+    // refused first, as in the Rust and Python builders.
+    assert.throws(() => buildSealedURL(base, null as unknown as string, operations, source), exact);
     if (input === "source") {
       assert.throws(() => buildSrcSet(base, "s3cr3t", source, [320]), exact);
     }
@@ -125,6 +128,7 @@ for (const v of vectors) {
     assert.throws(() => buildURL(base, null, operations, source), RESERVED);
     assert.throws(() => buildURL(base, "s3cr3t", operations, source, { keyId: "k2" }), RESERVED);
     assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source), RESERVED);
+    assert.throws(() => buildSealedURL(base, null as unknown as string, operations, source), RESERVED);
     assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source, { keyId: "k2" }), RESERVED);
   });
 }
@@ -133,8 +137,9 @@ test("the spec carries the reserved vectors", () => {
 });
 
 test("no signer returns a derived subkey", () => {
-  // Each subkey is HMAC(secret, label); before the reserved
-  // segment, sign(secret, label) printed it in hex.
+  // Each subkey is HMAC(secret, label), the same function as
+  // sign(secret, label), so sign and the builders refuse every
+  // label.
   const secret = "label-test-secret-0123456789";
   const base = "https://img.example.com";
   for (const label of [

@@ -135,8 +135,10 @@ def upload_key(secret: Union[str, bytes]) -> bytes:
     """The upload subkey: the raw bytes of the HMAC-SHA256
     of the domain label ``crabcrop/upload-key`` under the
     secret. Upload signatures live under this derived key,
-    so neither an image signature nor a purge signature can
-    be replayed as one."""
+    so neither an image signature nor a purge signature
+    verifies as one: a purge signature is under another
+    subkey, and no signer signs a label (see
+    `RESERVED_SEGMENT`)."""
     return _subkey(secret, "crabcrop/upload-key")
 
 

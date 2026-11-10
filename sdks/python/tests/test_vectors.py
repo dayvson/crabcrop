@@ -121,8 +121,8 @@ class TestVectors(unittest.TestCase):
                     self.assertEqual(str(caught.exception), RESERVED_MESSAGE)
 
     def test_no_signer_returns_a_derived_subkey(self):
-        # Each subkey is HMAC(secret, label); before the
-        # reserved segment, sign(secret, label) printed it.
+        # Each subkey is HMAC(secret, label), the same function
+        # as sign(secret, label), so sign refuses every label.
         secret = "label-test-secret-0123456789"
         base = "https://img.example.com"
         for label, subkey in [

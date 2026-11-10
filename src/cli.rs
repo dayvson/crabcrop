@@ -1944,11 +1944,11 @@ mod tests {
         assert!(exec(&args(&["upload"])).await.is_err());
     }
 
-    /// Every derived subkey is the image signature of its
-    /// label, so a CLI that signed `crabcrop/<x>-key` printed
-    /// that subkey. Every signing verb refuses a remainder
-    /// that begins with the reserved segment, before it
-    /// computes anything.
+    /// Every derived subkey is HMAC(secret, label) for a label
+    /// under the reserved segment, the same function as an
+    /// image signature. Every signing verb refuses a remainder
+    /// that begins with the segment, before it computes
+    /// anything.
     #[tokio::test]
     async fn signing_verbs_refuse_the_reserved_segment() {
         for label in [

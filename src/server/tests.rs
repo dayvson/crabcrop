@@ -1814,12 +1814,11 @@ async fn sealed_payload_failures_are_one_uniform_refusal() {
 }
 
 /// Every derived subkey (purge, purge-group, upload, seal,
-/// cache entry) is the image signature of its label under
-/// the secret. An image or explain request whose remainder
-/// begins with the reserved segment answers the same 400
-/// whatever its signature (the right one, a wrong one, a
-/// keyed one, `unsafe`), so the server never tells a caller
-/// whether a signature over a label is that label's subkey.
+/// cache entry) is the HMAC of a label under the reserved
+/// segment. An image or explain request whose remainder
+/// begins with that segment answers the same 400 whatever
+/// its signature (the right one, a wrong one, a keyed one,
+/// `unsafe`): the answer never depends on the signature.
 #[tokio::test]
 async fn a_reserved_remainder_is_refused_before_its_signature_is_checked() {
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
