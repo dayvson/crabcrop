@@ -3387,8 +3387,93 @@ fn gif_frame_cap_rejects_frame_bombs() {
             .unwrap();
         out
     };
-    assert!(decode_gif_frames(&make(201)).is_err());
-    assert_eq!(decode_gif_frames(&make(3)).unwrap().len(), 3);
+    assert!(decode_gif_frames(&make(201), None).is_err());
+    assert_eq!(decode_gif_frames(&make(3), None).unwrap().len(), 3);
+}
+
+/// A GIF with a 1x1 logical screen whose `frames` frames each
+/// declare `width` x `height` pixels, coded in full (palette
+/// index 0 throughout), so a decoder that reads them decodes
+/// every declared pixel before cutting the frame to the screen.
+fn oversized_frame_gif(frames: usize, width: u16, height: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = gif::Encoder::new(&mut out, 1, 1, &[0, 0, 0, 255, 255, 255]).unwrap();
+        let mut frame = gif::Frame {
+            width,
+            height,
+            buffer: std::borrow::Cow::Owned(vec![0; usize::from(width) * usize::from(height)]),
+            ..gif::Frame::default()
+        };
+        frame.make_lzw_pre_encoded();
+        for _ in 0..frames {
+            encoder.write_lzw_pre_encoded_frame(&frame).unwrap();
+        }
+    }
+    out
+}
+
+#[test]
+fn a_gif_frame_larger_than_its_screen_is_charged_at_its_own_size_before_it_decodes() {
+    // Five frames of 4473x4473 (20M pixels each) behind a 1x1
+    // screen: the decoder would decode 100M pixels and keep
+    // five. Charged at their declared size they are past the
+    // 100M decoded-pixel budget, and the walk refuses them
+    // before any decodes.
+    let bytes = oversized_frame_gif(5, 4473, 4473);
+    let started = std::time::Instant::now();
+    let err = match decode_gif_frames(&bytes, None) {
+        Ok(frames) => panic!("decoded {} oversized frames", frames.len()),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("decoded-pixel limit"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+    // A frame past the screen within the budget still decodes,
+    // cut to the screen as before.
+    let small = oversized_frame_gif(2, 64, 64);
+    let frames = decode_gif_frames(&small, None).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.dimensions(), (1, 1));
+    // The frame cap counts descriptors too, before decoding.
+    let many = oversized_frame_gif(MAX_ANIMATED_FRAMES + 1, 1, 1);
+    let err = match decode_gif_frames(&many, None) {
+        Ok(_) => panic!("a GIF past the frame cap decoded"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("more than"), "{err}");
+}
+
+#[test]
+fn animated_frames_stop_at_the_deadline() {
+    // Collection checks the request's deadline before each
+    // frame decodes: past it, no further frame is pulled from
+    // the decoder.
+    let pulled = std::cell::Cell::new(0);
+    let frames = (0..10).map(|_| {
+        pulled.set(pulled.get() + 1);
+        Ok::<image::Frame, image::ImageError>(image::Frame::new(image::RgbaImage::new(4, 4)))
+    });
+    let past = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let err = match collect_frames(frames, "GIF", past) {
+        Ok(frames) => panic!("collected {} frames past the deadline", frames.len()),
+        Err(e) => e,
+    };
+    assert_eq!(err, EngineError::Timeout);
+    assert_eq!(pulled.get(), 0, "frames decoded past the deadline");
+    // Through the decoders, for both animated formats.
+    for result in [
+        decode_gif_frames(&raw_gif(3), past),
+        decode_webp_frames(&animated_webp_bytes(), past),
+    ] {
+        assert!(matches!(result, Err(EngineError::Timeout)));
+    }
+    // A deadline still ahead decodes every frame.
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert_eq!(decode_gif_frames(&raw_gif(3), ahead).unwrap().len(), 3);
 }
 
 #[test]
@@ -3407,7 +3492,7 @@ fn animated_frames_charge_bytes_against_the_decode_budget() {
             delay,
         ))
     });
-    let err = match collect_frames(frames, "GIF") {
+    let err = match collect_frames(frames, "GIF", None) {
         Ok(_) => panic!("collection should refuse on the byte budget"),
         Err(e) => e,
     };
@@ -3422,7 +3507,7 @@ fn animated_frames_charge_bytes_against_the_decode_budget() {
             delay,
         ))
     });
-    assert_eq!(collect_frames(frames, "GIF").unwrap().len(), 100);
+    assert_eq!(collect_frames(frames, "GIF", None).unwrap().len(), 100);
 }
 
 #[test]
@@ -4654,6 +4739,165 @@ fn per_format_quality_applies_after_format_negotiation() {
     assert_ne!(as_jpeg, as_webp);
 }
 
+/// Bits of a hand-built JPEG XL codestream, packed least
+/// significant first, as the format reads them.
+#[derive(Default)]
+struct JxlBits {
+    bytes: Vec<u8>,
+    bit: usize,
+}
+
+impl JxlBits {
+    fn put(&mut self, value: u32, count: usize) {
+        for i in 0..count {
+            if self.bit.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if (value >> i) & 1 == 1 {
+                *self.bytes.last_mut().unwrap() |= 1 << (self.bit % 8);
+            }
+            self.bit += 1;
+        }
+    }
+
+    fn align(&mut self) {
+        self.bit = self.bytes.len() * 8;
+    }
+}
+
+/// An 8x8 JPEG XL image whose one frame declares a crop of
+/// `side` x `side` pixels (2304 to 18687): the codestream and
+/// frame headers, and nothing after them.
+fn jxl_with_crop_frame(side: u32) -> Vec<u8> {
+    let mut b = JxlBits::default();
+    b.put(0xff, 8);
+    b.put(0x0a, 8);
+    // Size: small, 8 px tall, 1:1. Image metadata and
+    // transform data: all default (8-bit sRGB, XYB).
+    b.put(1, 1);
+    b.put(0, 5);
+    b.put(1, 3);
+    b.put(1, 1);
+    b.put(1, 1);
+    b.align();
+    // Frame header: a regular modular frame with no flags,
+    // no upsampling, one pass.
+    b.put(0, 1);
+    b.put(0, 2);
+    b.put(1, 1);
+    b.put(0, 2);
+    b.put(0, 2);
+    b.put(1, 2);
+    b.put(0, 2);
+    // A crop at the origin, `side` wide and tall.
+    b.put(1, 1);
+    b.put(0, 10);
+    b.put(0, 10);
+    for _ in 0..2 {
+        b.put(2, 2);
+        b.put(side - 2304, 14);
+    }
+    // Replace blending (the crop covers the image), the last
+    // frame, no name, default filters, no extensions.
+    b.put(0, 2);
+    b.put(1, 1);
+    b.put(0, 2);
+    b.put(1, 1);
+    b.put(0, 2);
+    b.bytes
+}
+
+#[test]
+fn a_jpeg_xl_frame_larger_than_the_decode_budget_is_refused_at_its_header() {
+    ensure_jxl_decoder();
+    // The image is 8x8, well inside every check on its size;
+    // its frame declares 16384x16384, four times the pixels
+    // the decode budget gives a whole image.
+    let big = jxl_with_crop_frame(16_384);
+    assert_eq!(jxl_dimensions(&big), Some((8, 8)));
+    check_jxl_dimensions(&big).unwrap();
+    let err = decode_image(&big).unwrap_err().to_string();
+    assert!(err.contains("Image size too large: 16384x16384"), "{err}");
+    // A frame within the budget gets past its header and
+    // fails only where this codestream ends.
+    let within = jxl_with_crop_frame(4096);
+    let err = decode_image(&within).unwrap_err().to_string();
+    assert!(err.contains("truncated"), "{err}");
+    // The limit is the budget's pixels, per channel the file
+    // declares.
+    assert_eq!(jxl_sample_limit(0), (MAX_DECODE_ALLOC / 4 * 3) as usize + 1);
+    assert_eq!(jxl_sample_limit(1), (MAX_DECODE_ALLOC / 4 * 4) as usize + 1);
+}
+
+#[test]
+fn jpeg_xl_decodes_to_the_pixels_the_image_hook_decodes() {
+    // decode_jxl stands in for the image crate's JPEG XL hook
+    // on every decode: each output format it can produce comes
+    // out as the hook's decode of the same file, byte for byte.
+    ensure_jxl_decoder();
+    let (w, h) = (23usize, 17usize);
+    let config = jixel::EncodeConfig::default();
+    let ramp8 = |channels: usize| -> Vec<u8> {
+        (0..w * h * channels).map(|i| (i * 7 % 251) as u8).collect()
+    };
+    let ramp16 = |channels: usize| -> Vec<u16> {
+        (0..w * h * channels)
+            .map(|i| (i * 2731 % 65_521) as u16)
+            .collect()
+    };
+    let rampf = |channels: usize| -> Vec<f32> {
+        (0..w * h * channels)
+            .map(|i| (i % 97) as f32 / 96.0)
+            .collect()
+    };
+    let files = [
+        ("rgb8", jixel::encode_image(&ramp8(3), w, h, &config)),
+        (
+            "rgba8",
+            jixel::encode_image_with_alpha(&ramp8(4), w, h, &config),
+        ),
+        ("gray8", jixel::encode_image_gray(&ramp8(1), w, h, &config)),
+        (
+            "gray-alpha8",
+            jixel::encode_image_gray_alpha(&ramp8(2), w, h, &config),
+        ),
+        (
+            "rgb16",
+            jixel::encode_image_16bit(&ramp16(3), w, h, &config),
+        ),
+        (
+            "rgba16",
+            jixel::encode_image_with_alpha_16bit(&ramp16(4), w, h, &config),
+        ),
+        (
+            "gray16",
+            jixel::encode_image_gray_16bit(&ramp16(1), w, h, &config),
+        ),
+        ("rgbf32", jixel::encode_image_f32(&rampf(3), w, h, &config)),
+        (
+            "rgbaf32",
+            jixel::encode_image_with_alpha_f32(&rampf(4), w, h, &config),
+        ),
+    ];
+    for (name, bytes) in files {
+        let bytes = bytes.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let hook = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap_or_else(|e| panic!("{name}: the hook: {e}"));
+        let ours = decode_jxl(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(ours.color(), hook.color(), "{name}");
+        assert_eq!(ours.dimensions(), hook.dimensions(), "{name}");
+        assert_eq!(ours.as_bytes(), hook.as_bytes(), "{name}");
+        assert_eq!(
+            decode_image(&bytes).unwrap().as_bytes(),
+            hook.as_bytes(),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
     let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
@@ -5419,7 +5663,7 @@ fn animated_gif_probe_counts_frames_like_the_decoder() {
         ("animated", animated_gif_bytes()),
         ("still", still),
     ] {
-        let frames = decode_gif_frames(&bytes).unwrap().len();
+        let frames = decode_gif_frames(&bytes, None).unwrap().len();
         assert_eq!(
             is_animated_gif(&bytes),
             frames > 1,
@@ -5468,7 +5712,7 @@ fn animated_gif_probe_survives_hostile_input() {
     let mut overlong = raw_gif(2);
     overlong[6 + 7 + 6 + 11] = 0xFF;
     assert!(!is_animated_gif(&overlong));
-    assert!(decode_gif_frames(&overlong).is_err());
+    assert!(decode_gif_frames(&overlong, None).is_err());
     // No color table anywhere: the decoder refuses the
     // frame, and so does the probe.
     let mut no_palette = b"GIF89a".to_vec();
@@ -5478,7 +5722,7 @@ fn animated_gif_probe_survives_hostile_input() {
     }
     no_palette.push(0x3B);
     assert!(!is_animated_gif(&no_palette));
-    assert!(decode_gif_frames(&no_palette).is_err());
+    assert!(decode_gif_frames(&no_palette, None).is_err());
     // An LZW code size past the format's maximum.
     let mut bad_code_size = raw_gif(2);
     bad_code_size[6 + 7 + 6 + 10] = 13;
@@ -5487,7 +5731,7 @@ fn animated_gif_probe_survives_hostile_input() {
     let mut unknown_block = raw_gif(2);
     unknown_block[6 + 7 + 6] = 0x99;
     assert!(!is_animated_gif(&unknown_block));
-    assert!(decode_gif_frames(&unknown_block).is_err());
+    assert!(decode_gif_frames(&unknown_block, None).is_err());
     // Megabytes of comment sub-blocks ahead of the
     // frames: the walk skips them without buffering and
     // still finds the frame count.
@@ -6368,7 +6612,7 @@ fn frame_delay_ms(frame: &image::Frame) -> u64 {
 
 #[test]
 fn animated_webp_fixture_decodes_to_its_frames() {
-    let frames = decode_webp_frames(&animated_webp_bytes()).unwrap();
+    let frames = decode_webp_frames(&animated_webp_bytes(), None).unwrap();
     assert_eq!(frames.len(), 3);
     assert!(
         frames
@@ -6670,7 +6914,7 @@ fn webp_frame_cap_rejects_frame_bombs() {
             .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
         oxideav_webp::encode_animation(&[frame], &opts).unwrap()
     };
-    assert_eq!(decode_webp_frames(&one).unwrap().len(), 1);
+    assert_eq!(decode_webp_frames(&one, None).unwrap().len(), 1);
     let anmf_at = one
         .windows(4)
         .position(|w| w == b"ANMF")
@@ -6683,7 +6927,7 @@ fn webp_frame_cap_rejects_frame_bombs() {
     }
     let riff_size = (bomb.len() - 8) as u32;
     bomb[4..8].copy_from_slice(&riff_size.to_le_bytes());
-    assert!(decode_webp_frames(&bomb).is_err());
+    assert!(decode_webp_frames(&bomb, None).is_err());
 }
 
 #[test]
@@ -10404,6 +10648,7 @@ fn collected_frames_keep_their_order_and_refuse_none() {
     let frames = collect_frames(
         [frame(10, 100), frame(20, 200), frame(30, 300)].into_iter(),
         "GIF",
+        None,
     )
     .unwrap();
     assert_eq!(frames.len(), 3);
@@ -10415,7 +10660,7 @@ fn collected_frames_keep_their_order_and_refuse_none() {
     assert_eq!(shades, [10, 20, 30]);
     let delays: Vec<u64> = frames.into_iter().map(|f| frame_delay_ms(&f)).collect();
     assert_eq!(delays, [100, 200, 300]);
-    let err = match collect_frames(std::iter::empty(), "GIF") {
+    let err = match collect_frames(std::iter::empty(), "GIF", None) {
         Ok(_) => panic!("an empty animation must be refused"),
         Err(e) => e,
     };

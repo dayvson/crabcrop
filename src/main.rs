@@ -226,10 +226,10 @@ const AI_GATE_PERMITS: usize = 2;
 const ANIM_GATE_PERMITS: usize = 1;
 
 /// Permits on the probe gate: heavy `/explain` probes (an
-/// SVG's parse in a worker process, an AVIF's decode) run
-/// on blocking threads, at most two at once, so a burst of
-/// explain requests cannot occupy the async runtime or
-/// start a worker per request.
+/// SVG's parse in a worker process, an AVIF's decode, a
+/// HEIC's item graph walk) run on blocking threads, at most
+/// two at once, so a burst of explain requests cannot
+/// occupy the async runtime or start a worker per request.
 const PROBE_GATE_PERMITS: usize = 2;
 
 /// The result stores a configuration names, opened (see

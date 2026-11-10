@@ -16826,6 +16826,43 @@ async fn concurrent_slow_svg_file_explains_leave_health_responsive() {
     drop(dir);
 }
 
+/// A HEIC's size takes a walk of its item graph, so explain
+/// sizes a HEIC as it does an SVG or an AVIF: once, on a
+/// blocking thread under the probe gate. The load never sizes
+/// a HEIC head on the runtime after each chunk, and the report
+/// still carries the size.
+#[tokio::test]
+async fn explain_sizes_a_heic_once_off_the_runtime() {
+    let heic = include_bytes!("../../tests/fixtures/orient6.heic");
+    assert!(crate::engine::probe_is_heavy("heic"));
+    assert_eq!(crate::engine::probe_kind(heic), "heic");
+    assert!(!probe_settled(heic));
+    let dir = crate::test_support::scratch_dir("explain-heic-file");
+    let root = std::fs::canonicalize(&dir).unwrap();
+    std::fs::write(root.join("o.heic"), heic).unwrap();
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        });
+    let base = spawn_explain_app_with_roots(Default::default(), loader, Default::default()).await;
+    let remainder = "64x64/file:///o.heic";
+    let resp = client()
+        .get(format!("{base}/explain/{}/{remainder}", sign(remainder)))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let (width, height) = crate::heic::probe_dimensions(heic).unwrap();
+    assert_eq!(json["source"]["kind"], "heic");
+    assert_eq!(json["source"]["width"], width);
+    assert_eq!(json["source"]["height"], height);
+    drop(dir);
+}
+
 /// The same as [`concurrent_slow_svg_file_explains_leave_health_responsive`]
 /// over HTTP, where a probe runs for both the per-chunk
 /// settle check and the handler on a server that sizes SVG

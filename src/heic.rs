@@ -97,6 +97,7 @@ fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
 /// its configuration record only.
 fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).map_err(decode_failed)?;
+    check_item_graphs(&file, bytes.len())?;
     let mut seen = std::collections::HashSet::new();
     if let Ok(node) = oxideav_heif::build_primary_graph(&file) {
         validate_node(&file, &node, &mut seen)?;
@@ -119,6 +120,253 @@ fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
         }
     }
     Ok(())
+}
+
+/// The most work the derivation-graph walks may do on one
+/// file, in the units [`GraphCost`] counts: table entries
+/// scanned plus property and payload bytes read. A grid of
+/// 1,024 distinct tiles (the most 256 px tiles the decode
+/// budget holds) with a thumbnail and two metadata items
+/// costs about 2.3 million, some 30 times less.
+const MAX_GRAPH_WORK: u64 = 1 << 26;
+
+/// Refuse a file whose item graphs would cost more than
+/// [`MAX_GRAPH_WORK`] to build, before any of them is built.
+///
+/// oxideav-heif builds a derivation graph by visiting an item
+/// once for every reference that reaches it, with no memo, up
+/// to 65,536 visits. Each visit scans the file's item,
+/// association, and reference tables, looks up every metadata
+/// item that describes the item, parses its properties, and
+/// copies a derived item's payload. So a grid whose tiles all
+/// name one item, which a few hundred metadata items describe,
+/// costs billions of steps in under 256 KiB. The probe, the
+/// pre-decode validation, the colour lookup, and the decode
+/// itself each build these graphs.
+///
+/// This works out what the walks will cost from the tables
+/// alone: each item's own cost once, summed along the
+/// references with a memo, so the estimate is linear in the
+/// tables. Where the walk would stop (a reference cycle, a
+/// chain deeper than it follows), the estimate stops too.
+/// The graphs counted are the ones the decode builds: the
+/// primary item's, the gain map image's that a `tmap` item
+/// derives from the primary, and those of the primary's `altr`
+/// alternatives.
+fn check_item_graphs<D: AsRef<[u8]>>(
+    file: &oxideav_heif::HeifFile<D>,
+    source_len: usize,
+) -> Result<(), EngineError> {
+    let (Ok(meta), Ok(primary)) = (file.meta(), file.primary_item()) else {
+        return Ok(());
+    };
+    let mut cost = GraphCost::new(meta, source_len as u64);
+    let is_tmap =
+        |item: &&oxideav_heif::meta::ItemInfo| item.item_type == oxideav_heif::meta::ITEM_TYPE_TMAP;
+    let mut roots = vec![primary.id];
+    roots.extend(meta.items.iter().filter(is_tmap).find_map(|item| {
+        match cost.inputs.get(&item.id).map(Vec::as_slice) {
+            Some([base, gain, ..]) if *base == primary.id => Some(*gain),
+            _ => None,
+        }
+    }));
+    for group in meta.groups_containing(primary.id, b"altr") {
+        roots.extend(group.entity_ids.iter().filter(|&&id| id != primary.id));
+    }
+    // Finding the gain map scans every `tmap` item's inputs.
+    let tmaps = meta.items.iter().filter(is_tmap).count() as u64;
+    let mut work: u64 = 0;
+    for root in roots {
+        let walked = cost.walk(root, 0, MAX_GRAPH_WORK.saturating_sub(work));
+        work = work
+            .saturating_add(walked)
+            .saturating_add(tmaps.saturating_mul(meta.references.len() as u64));
+        if work > MAX_GRAPH_WORK {
+            return Err(decode_failed(format!(
+                "its item graph takes more than {MAX_GRAPH_WORK} steps to walk"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The cost model behind [`check_item_graphs`], built in one
+/// pass over the tables: what every item visit scans, what each
+/// item adds to that, and the references a visit follows, in the
+/// walk's own order (derivation inputs, then auxiliary images,
+/// then thumbnails).
+struct GraphCost {
+    /// The table entries every visit scans: the item list once
+    /// (the lookup), the associations once (the properties),
+    /// the references four times (inputs, auxiliaries,
+    /// thumbnails, metadata), and the targets of every
+    /// auxiliary, thumbnail, and metadata reference.
+    per_visit: u64,
+    /// What a visit of each item adds: its property bytes, an
+    /// item lookup per metadata item describing it, and for a
+    /// derived item, a location lookup and its payload.
+    own: std::collections::HashMap<u32, u64>,
+    inputs: std::collections::HashMap<u32, Vec<u32>>,
+    auxiliaries: std::collections::HashMap<u32, Vec<u32>>,
+    thumbnails: std::collections::HashMap<u32, Vec<u32>>,
+    /// The cost of every subtree walked to its end.
+    done: std::collections::HashMap<u32, u64>,
+    /// The items on the current chain, for the cycle check.
+    chain: Vec<u32>,
+}
+
+impl GraphCost {
+    fn new(meta: &oxideav_heif::meta::Meta, source_len: u64) -> Self {
+        use oxideav_heif::meta::{self as heif, reference};
+        let items = meta.items.len() as u64;
+        let mut per_visit = items + meta.associations.len() as u64;
+        let mut own = std::collections::HashMap::<u32, u64>::new();
+        let mut inputs = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut auxiliaries = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut thumbnails = std::collections::HashMap::<u32, Vec<u32>>::new();
+        for r in &meta.references {
+            per_visit += 4;
+            if r.reference_type == reference::DIMG {
+                inputs
+                    .entry(r.from_item_id)
+                    .or_default()
+                    .extend(&r.to_item_ids);
+                continue;
+            }
+            let towards = match r.reference_type {
+                reference::AUXL => &mut auxiliaries,
+                reference::THMB => &mut thumbnails,
+                reference::CDSC => {
+                    per_visit += r.to_item_ids.len() as u64;
+                    let mut targets = r.to_item_ids.clone();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for target in targets {
+                        *own.entry(target).or_default() += items;
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            per_visit += r.to_item_ids.len() as u64;
+            // A visit finds each reference box naming the item
+            // once, however often the box repeats it.
+            let mut targets = r.to_item_ids.clone();
+            targets.sort_unstable();
+            targets.dedup();
+            for target in targets {
+                towards.entry(target).or_default().push(r.from_item_id);
+            }
+        }
+        for row in &meta.associations {
+            let bytes: u64 = row
+                .entries
+                .iter()
+                .map(|entry| {
+                    let body = (entry.index as usize)
+                        .checked_sub(1)
+                        .and_then(|i| meta.properties.get(i))
+                        .map_or(0, |p| p.body.len() as u64);
+                    1 + body
+                })
+                .sum();
+            *own.entry(row.item_id).or_default() += bytes;
+        }
+        // The first location of each item, as the lookup finds it.
+        let mut locations = std::collections::HashMap::new();
+        for loc in &meta.locations {
+            locations.entry(loc.item_id).or_insert(loc);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for item in &meta.items {
+            if !seen.insert(item.id) {
+                continue;
+            }
+            let derived = [
+                heif::ITEM_TYPE_GRID,
+                heif::ITEM_TYPE_IOVL,
+                heif::ITEM_TYPE_CFEN,
+                heif::ITEM_TYPE_TMAP,
+            ]
+            .contains(&item.item_type);
+            if !derived {
+                continue;
+            }
+            let payload = locations.get(&item.id).map_or(0, |loc| {
+                loc.extents
+                    .iter()
+                    .map(|e| {
+                        if e.length == 0 {
+                            source_len
+                        } else {
+                            e.length.min(source_len)
+                        }
+                    })
+                    .fold(0u64, u64::saturating_add)
+            });
+            let entry = own.entry(item.id).or_default();
+            *entry = entry
+                .saturating_add(meta.locations.len() as u64)
+                .saturating_add(payload);
+        }
+        GraphCost {
+            per_visit,
+            own,
+            inputs,
+            auxiliaries,
+            thumbnails,
+            done: std::collections::HashMap::new(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// The work of walking the graph from `item`, reached at
+    /// `depth`. Past `budget` the count stops early, as the
+    /// caller refuses anything over it anyway.
+    fn walk(&mut self, item: u32, depth: usize, budget: u64) -> u64 {
+        self.walk_inner(item, depth, budget).0
+    }
+
+    /// [`Self::walk`], also saying whether the walk reached the
+    /// end of the subtree (`true`) or stops inside it, as the
+    /// graph builder stops at a cycle or past its depth cap. A
+    /// subtree that stops is not remembered: reached again at
+    /// another depth, it may not.
+    fn walk_inner(&mut self, item: u32, depth: usize, budget: u64) -> (u64, bool) {
+        if let Some(&work) = self.done.get(&item) {
+            return (work, true);
+        }
+        if depth > oxideav_heif::derived::MAX_DERIVATION_DEPTH || self.chain.contains(&item) {
+            return (0, false);
+        }
+        let mut work = self
+            .per_visit
+            .saturating_add(self.own.get(&item).copied().unwrap_or(0));
+        let children: Vec<u32> = [&self.inputs, &self.auxiliaries, &self.thumbnails]
+            .into_iter()
+            .filter_map(|edges| edges.get(&item))
+            .flatten()
+            .copied()
+            .collect();
+        self.chain.push(item);
+        for child in children {
+            if work > budget {
+                break;
+            }
+            let (child_work, complete) =
+                self.walk_inner(child, depth + 1, budget.saturating_sub(work));
+            work = work.saturating_add(child_work);
+            if !complete {
+                self.chain.pop();
+                return (work, false);
+            }
+        }
+        self.chain.pop();
+        if work <= budget {
+            self.done.insert(item, work);
+        }
+        (work, true)
+    }
 }
 
 /// The gain map image of a primary that is not itself a `tmap`
@@ -336,6 +584,7 @@ fn cap_metadata(bytes: Option<Vec<u8>>, cap: usize) -> Option<Vec<u8>> {
 /// announces no size.
 pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).ok()?;
+    check_item_graphs(&file, bytes.len()).ok()?;
     let node = oxideav_heif::build_primary_graph(&file).ok()?;
     node.output_size().ok()
 }
@@ -412,6 +661,7 @@ pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), En
 /// a new failure mode.
 fn vui_color(bytes: &[u8]) -> Option<oxideav_heif::ColorInfo> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).ok()?;
+    check_item_graphs(&file, bytes.len()).ok()?;
     let node = oxideav_heif::build_primary_graph(&file).ok()?;
     // The colour node mirrors the decoder's own choice: a
     // tone-mapped primary describes its base rendition's colour.
@@ -909,5 +1159,144 @@ mod tests {
             None
         );
         assert_eq!(cap_metadata(None, crate::color::MAX_META_BYTES), None);
+    }
+
+    /// One ISO-BMFF box.
+    fn bmff_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// One full box: version 0, flags 0, unless `version` says.
+    fn full_box(kind: &[u8; 4], version: u8, body: &[u8]) -> Vec<u8> {
+        let mut inner = vec![version, 0, 0, 0];
+        inner.extend_from_slice(body);
+        bmff_box(kind, &inner)
+    }
+
+    /// A HEIF file whose primary item (1) is a `rows` x `columns`
+    /// grid whose every tile is the same coded item (2), with
+    /// `described` metadata items, each one `cdsc` reference to
+    /// item 2. The container's structure is all there is: item
+    /// 2 carries no coded data, so only the graph walks run.
+    fn shared_tile_heif(rows: u8, columns: u8, described: u16) -> Vec<u8> {
+        let tiles = u16::from(rows) * u16::from(columns);
+        let mut out = bmff_box(b"ftyp", b"heic\0\0\0\0mif1heic");
+        let mut meta = full_box(b"hdlr", 0, b"\0\0\0\0pict\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        meta.extend(full_box(b"pitm", 0, &1u16.to_be_bytes()));
+        // iloc v1: the grid descriptor, 8 bytes at idat offset 0.
+        let mut iloc = vec![0x44, 0x00];
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 1]);
+        iloc.extend_from_slice(&0u32.to_be_bytes());
+        iloc.extend_from_slice(&8u32.to_be_bytes());
+        meta.extend(full_box(b"iloc", 1, &iloc));
+        let infe = |id: u16, kind: &[u8; 4]| {
+            let mut body = id.to_be_bytes().to_vec();
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(kind);
+            body.push(0);
+            full_box(b"infe", 2, &body)
+        };
+        let mut iinf = (2 + described).to_be_bytes().to_vec();
+        iinf.extend(infe(1, b"grid"));
+        iinf.extend(infe(2, b"hvc1"));
+        for id in 0..described {
+            iinf.extend(infe(3 + id, b"Exif"));
+        }
+        meta.extend(full_box(b"iinf", 0, &iinf));
+        let mut dimg = 1u16.to_be_bytes().to_vec();
+        dimg.extend_from_slice(&tiles.to_be_bytes());
+        for _ in 0..tiles {
+            dimg.extend_from_slice(&2u16.to_be_bytes());
+        }
+        let mut iref = bmff_box(b"dimg", &dimg);
+        for id in 0..described {
+            let mut cdsc = (3 + id).to_be_bytes().to_vec();
+            cdsc.extend_from_slice(&[0, 1, 0, 2]);
+            iref.extend(bmff_box(b"cdsc", &cdsc));
+        }
+        meta.extend(full_box(b"iref", 0, &iref));
+        let mut ispe = 64u32.to_be_bytes().to_vec();
+        ispe.extend_from_slice(&64u32.to_be_bytes());
+        let ipco = bmff_box(b"ipco", &full_box(b"ispe", 0, &ispe));
+        let mut ipma = 1u32.to_be_bytes().to_vec();
+        ipma.extend_from_slice(&[0, 2, 1, 0x01]);
+        let mut iprp = ipco;
+        iprp.extend(full_box(b"ipma", 0, &ipma));
+        meta.extend(bmff_box(b"iprp", &iprp));
+        let width = 64 * u16::from(columns);
+        let height = 64 * u16::from(rows);
+        let mut grid = vec![0, 0, rows - 1, columns - 1];
+        grid.extend_from_slice(&width.to_be_bytes());
+        grid.extend_from_slice(&height.to_be_bytes());
+        meta.extend(bmff_box(b"idat", &grid));
+        out.extend(full_box(b"meta", 0, &meta));
+        out
+    }
+
+    #[test]
+    fn an_item_graph_that_revisits_a_described_tile_is_refused_before_it_is_built() {
+        // A 255x255 grid whose 65,025 tiles all name one item,
+        // which 64 metadata items describe: 132 KB, small enough
+        // for the explain probe's head. The graph builder visits
+        // the tile once per reference and looks up every
+        // describing item on each visit, billions of steps in
+        // all. The bound refuses it from the tables, before the
+        // builder runs, in the probe and the decode alike.
+        let bytes = shared_tile_heif(255, 255, 64);
+        let started = std::time::Instant::now();
+        assert_eq!(probe_dimensions(&bytes), None);
+        match decode_heic(&bytes) {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("item graph"), "{msg}"),
+            other => panic!("expected the item graph refusal, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the refusals took {:?}",
+            started.elapsed()
+        );
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        assert!(check_item_graphs(&file, bytes.len()).is_err());
+    }
+
+    #[test]
+    fn item_graphs_within_the_walk_budget_still_build() {
+        // The same shared tile with no metadata items costs a
+        // few cheap steps per visit and stays within the bound,
+        // as does a grid whose tiles are few: the probe sizes
+        // both.
+        for (rows, columns, described) in [(255, 255, 0), (16, 16, 4)] {
+            let bytes = shared_tile_heif(rows, columns, described);
+            let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+            check_item_graphs(&file, bytes.len()).unwrap();
+            let expected = (64 * u32::from(columns), 64 * u32::from(rows));
+            assert_eq!(probe_dimensions(&bytes), Some(expected));
+        }
+        // Every fixture passes, with room to spare.
+        for bytes in [GRID, MAIN10, VUI_LIMITED, P3, ORIENT6] {
+            let file = oxideav_heif::HeifFile::parse_borrowed(bytes).unwrap();
+            let meta = file.meta().unwrap();
+            let mut cost = GraphCost::new(meta, bytes.len() as u64);
+            let work = cost.walk(file.primary_item().unwrap().id, 0, MAX_GRAPH_WORK);
+            assert!(work < MAX_GRAPH_WORK / 1000, "{work}");
+        }
+    }
+
+    #[test]
+    fn the_walk_estimate_stops_where_the_builder_stops() {
+        // A reference cycle: the builder refuses it at the
+        // repeat, and the estimate counts the walk up to there
+        // without looping.
+        let mut bytes = shared_tile_heif(1, 1, 0);
+        // Point the grid's one tile back at the grid itself.
+        let at = bytes.windows(4).position(|w| w == b"dimg").unwrap();
+        bytes[at + 8..at + 10].copy_from_slice(&1u16.to_be_bytes());
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        assert!(oxideav_heif::build_primary_graph(&file).is_err());
+        check_item_graphs(&file, bytes.len()).unwrap();
+        assert_eq!(probe_dimensions(&bytes), None);
     }
 }
