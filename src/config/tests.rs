@@ -76,6 +76,29 @@ fn meta_mode_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
 }
 
 #[test]
+fn client_hints_default_to_on_and_turn_off_by_the_boolean_spellings() {
+    // Unset is on: a deployment that serves browsers keeps
+    // the hint-sized answers it has always served.
+    assert_eq!(
+        client_hints_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(true)
+    );
+    let set = |v: &str| {
+        client_hints_config(env_of(&[("CRABCROP_CLIENT_HINTS", v)])).map_err(|e| e.to_string())
+    };
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    for bad in ["", "dpr", "2"] {
+        let err = expect_err(set(bad));
+        assert!(err.contains("CRABCROP_CLIENT_HINTS"), "{bad:?}: {err}");
+    }
+}
+
+#[test]
 fn clip_config_needs_all_four_paths_or_none() {
     let get = |pairs: &[(&str, &str)]| {
         let map: std::collections::HashMap<String, String> = pairs
@@ -1207,6 +1230,7 @@ fn from_env_reads_every_default() {
     assert_eq!(config.video.max_mb, crate::video::DEFAULT_MAX_OUTPUT_MB);
     assert!(config.video.encoder.is_none() && config.pdf.renderer.is_none());
     assert!(config.provenance.is_none() && !config.meta_enabled);
+    assert!(config.client_hints);
     // The fingerprint is the one the boot defaults give.
     assert_eq!(
         config.config_fingerprint,
