@@ -561,11 +561,13 @@ exceeds specified max pixel count 67108864, see the documentation if you wish to
 #[test]
 fn runs_carry_the_decoder_bounds() {
     // Both runs bound the tool's decoder ahead of the
-    // input: two threads, the frame budget as -max_pixels,
-    // and the decoder list. The extraction also caps the
-    // filter and encoder threads and maps no audio,
-    // subtitle, or data stream, so it opens no decoder but
-    // the video's.
+    // input: its threads, the frame budget (with room for
+    // FFmpeg's row alignment) as -max_pixels, and the
+    // decoder list. The probe's decoder runs on two threads;
+    // the extraction's, for this small frame, on FFmpeg's
+    // default count. The extraction also caps the filter and encoder
+    // threads and maps no audio, subtitle, or data stream,
+    // so it opens no decoder but the video's.
     let records = temp_dir("bounds");
     let record = records.join("argv.log");
     let script = recording_tool(&record, "yuv420p, 64x48, 10 fps, 10 tbr", "", EXTRACT_PNG);
@@ -581,13 +583,15 @@ fn runs_carry_the_decoder_bounds() {
         (crate::engine::MAX_DECODE_ALLOC / 4).to_string(),
         "67108864"
     );
+    assert_eq!(DECODER_MAX_PIXELS, 67_108_864 + 63 * 16_384);
     let has = |argv: &[&str], pair: [&str; 2]| argv.windows(2).any(|w| w == pair);
-    for line in &lines {
+    let cores = decoder_threads(64, 48).to_string();
+    for (line, threads) in lines.iter().zip(["2", cores.as_str()]) {
         let argv: Vec<&str> = line.split_whitespace().collect();
         let input = argv.iter().position(|a| *a == "-i").unwrap();
         let before = &argv[..input];
-        assert!(has(before, ["-threads", "2"]), "{line}");
-        assert!(has(before, ["-max_pixels", "67108864"]), "{line}");
+        assert!(has(before, ["-threads", threads]), "{line}");
+        assert!(has(before, ["-max_pixels", "68141056"]), "{line}");
         assert!(has(before, ["-codec_whitelist", CODEC_WHITELIST]), "{line}");
     }
     let probe: Vec<&str> = lines[0].split_whitespace().collect();
@@ -608,7 +612,8 @@ fn runs_carry_the_decoder_bounds() {
     );
     assert!(has(&extract[input..], ["-threads", "2"]), "{}", lines[1]);
     // The list names a decoder for each video codec the
-    // accepted containers carry, and nothing else.
+    // accepted containers carry from the web, broadcast,
+    // phones, and cameras, and nothing else.
     let decoders: Vec<&str> = CODEC_WHITELIST.split(',').collect();
     for listed in [
         "h264",
@@ -617,14 +622,60 @@ fn runs_carry_the_decoder_bounds() {
         "vp9",
         "libdav1d",
         "mpeg4",
+        "h263",
         "mpeg2video",
         "theora",
         "mjpeg",
+        "prores",
+        "dvvideo",
     ] {
         assert!(decoders.contains(&listed), "{listed}");
     }
-    for absent in ["ffv1", "rawvideo", "msvideo1", "cinepak", "prores", "aac"] {
+    for absent in [
+        "ffv1", "rawvideo", "msvideo1", "cinepak", "wmv2", "vc1", "flv", "vp6f", "aac",
+    ] {
         assert!(!decoders.contains(&absent), "{absent}");
+    }
+}
+
+#[test]
+fn the_extraction_decoder_runs_on_the_default_thread_count_up_to_dci_4k() {
+    // A far seek decodes every frame before it, so frames up
+    // to DCI 4K, which hold little memory in flight, decode
+    // on FFmpeg's default count, one more than the cores the
+    // server may use (at most 16); larger frames on two, so
+    // what a run holds does not grow with the host's cores.
+    // The probe's decoder runs on two either way.
+    let cores = (std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) + 1)
+        .min(16)
+        .to_string();
+    for (size, threads) in [
+        ("1920x1080", cores.as_str()),
+        ("3840x2160", cores.as_str()),
+        ("4096x2160", cores.as_str()),
+        ("4096x2161", "2"),
+        ("7680x4320", "2"),
+    ] {
+        let records = temp_dir("threads");
+        let record = records.join("argv.log");
+        let stream = format!("yuv420p, {size}, 10 fps, 10 tbr");
+        let (_tool, program) = fake_tool(
+            "threads",
+            &recording_tool(&record, &stream, "", EXTRACT_PNG),
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        extractor
+            .extract_frame(b"video bytes", FrameSelection::Poster)
+            .unwrap();
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let decoder = |line: &str| {
+            let argv: Vec<&str> = line.split_whitespace().collect();
+            let at = argv.iter().position(|a| *a == "-threads").unwrap();
+            argv[at + 1].to_string()
+        };
+        assert_eq!(decoder(lines[0]), "2", "{size}: the probe");
+        assert_eq!(decoder(lines[1]), threads, "{size}: the extraction");
     }
 }
 
@@ -1334,14 +1385,15 @@ fn encode_clip(ffmpeg: &Path, path: &Path, args: &[&str]) -> Option<Vec<u8>> {
 
 #[test]
 fn real_tool_refuses_frames_past_the_decode_budget() {
-    // An 8200x8200 frame is 67.24 megapixels, just past the
-    // 64 Mi pixel budget. Alone, the probe reports its size
-    // and the extraction never runs. After a second of
-    // 64x48 frames, which is all the probe reads, the
-    // decoder refuses it (-max_pixels), so a selection that
-    // lands on it fails as a bad source instead of the
-    // decoder holding the large frame and scaling it down;
-    // the small frames still extract.
+    // An 8300x8300 frame is 68.89 megapixels, past the 64 Mi
+    // pixel budget and the decoder's bound (the budget plus
+    // its alignment room). Alone, the probe reports its size
+    // and the extraction never runs. After a second of 64x48
+    // frames, which is all the probe reads, the decoder
+    // refuses it (-max_pixels), so a selection that lands on
+    // it fails as a bad source instead of the decoder holding
+    // the large frame and scaling it down; the small frames
+    // still extract.
     let Some(ffmpeg) = ffmpeg_path() else {
         return;
     };
@@ -1371,7 +1423,7 @@ fn real_tool_refuses_frames_past_the_decode_budget() {
         &ffmpeg,
         &dir.join("big.ts"),
         &h264_ts(
-            "color=red:size=8200x8200:rate=10",
+            "color=red:size=8300x8300:rate=10",
             &["-frames:v", "1", "-output_ts_offset", "1"],
         ),
     )
@@ -1382,7 +1434,7 @@ fn real_tool_refuses_frames_past_the_decode_budget() {
         .extract_frame(&big, FrameSelection::Poster)
         .unwrap_err();
     assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
-    assert!(err.to_string().contains("8200x8200"), "{err}");
+    assert!(err.to_string().contains("8300x8300"), "{err}");
 
     let mut changing = small;
     changing.extend_from_slice(&big);
@@ -1400,6 +1452,41 @@ fn real_tool_refuses_frames_past_the_decode_budget() {
         .unwrap_err();
     assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
     assert!(err.to_string().contains("decode budget"), "{err}");
+}
+
+#[test]
+fn real_tool_extracts_a_frame_within_the_budget_whatever_its_width() {
+    // 16376x4098 is 67108848 pixels, within the 64 Mi pixel
+    // budget, but its width is not a multiple of 64: FFmpeg
+    // counts it as 16384 wide against -max_pixels, so the
+    // bound carries room for that alignment.
+    let Some(ffmpeg) = ffmpeg_path() else {
+        return;
+    };
+    let dir = temp_dir("real-aligned");
+    let bytes = encode_clip(
+        &ffmpeg,
+        &dir.join("edge.avi"),
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=gray:size=16376x4098:rate=1",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "mjpeg",
+            "-pix_fmt",
+            "yuvj420p",
+        ],
+    )
+    .expect("FFmpeg's own MJPEG encoder");
+    let extractor = VideoFrameExtractor::new(ffmpeg, Duration::from_secs(60)).unwrap();
+    let frame = extractor
+        .extract_frame(&bytes, FrameSelection::Poster)
+        .unwrap_or_else(|e| panic!("16376x4098: {e}"));
+    assert_eq!((frame.width, frame.height), (16376, 4098));
+    assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
 
 #[test]
@@ -1429,12 +1516,20 @@ fn real_tool_decodes_only_the_listed_codecs() {
         ("cinepak.mov", "cinepak"),
         ("ffv1.mkv", "ffv1"),
         ("raw.avi", "rawvideo"),
+        ("wmv2.asf", "wmv2"),
+        ("flv1.flv", "flv"),
     ] {
         let bytes = clip(name, &["-c:v", codec]).expect("FFmpeg's own encoder");
+        // Where the container states the frame size, the
+        // extraction finds no decoder; where only the decoder
+        // could tell, the probe finds no stream to read.
         let err = extractor
             .extract_frame(&bytes, FrameSelection::Poster)
             .unwrap_err();
-        assert!(matches!(err, FrameError::Failed(_)), "{name}: {err}");
+        assert!(
+            matches!(err, FrameError::Failed(_) | FrameError::NotVideo(_)),
+            "{name}: {err}"
+        );
     }
     let mut with_audio = source.to_vec();
     with_audio.extend_from_slice(&[
@@ -1462,6 +1557,26 @@ fn real_tool_decodes_only_the_listed_codecs() {
         (
             "mjpeg.avi",
             &["-c:v", "mjpeg", "-pix_fmt", "yuvj420p"][..],
+            true,
+        ),
+        (
+            "h263.3gp",
+            &["-vf", "scale=176:144", "-c:v", "h263"][..],
+            true,
+        ),
+        ("prores.mov", &["-c:v", "prores_ks"][..], true),
+        (
+            "dv.avi",
+            &[
+                "-vf",
+                "scale=720:480,setsar=8/9",
+                "-r",
+                "30000/1001",
+                "-pix_fmt",
+                "yuv411p",
+                "-c:v",
+                "dvvideo",
+            ][..],
             true,
         ),
         (

@@ -23,7 +23,7 @@
 //!
 //! - Probe: `-nostdin -v info -protocol_whitelist fd
 //!   -format_whitelist <containers> -threads 2
-//!   -max_pixels <pixels> -codec_whitelist <decoders>
+//!   -max_pixels <bound> -codec_whitelist <decoders>
 //!   -dump_separator <token> -i fd:`. No output target is
 //!   named, so the tool prints its input report (duration,
 //!   stream list) to stderr and exits nonzero; the probe
@@ -36,7 +36,7 @@
 //!   [`FrameError::NotVideo`].
 //! - Extract: `-nostdin -v info -protocol_whitelist fd
 //!   -format_whitelist <containers> -filter_threads 2
-//!   -threads 2 -max_pixels <pixels> -codec_whitelist
+//!   -threads <n> -max_pixels <bound> -codec_whitelist
 //!   <decoders> -i fd: -ss <t> -frames:v 1 -an -sn -dn
 //!   -threads 2 -f image2pipe -vcodec png pipe:1`. The
 //!   seek is output-side, which is the accurate form:
@@ -60,13 +60,18 @@
 //! the extracted PNG has to pass anyway (issue #605 for the
 //! decoder list): a probed frame size past it is refused
 //! before any extraction runs, `-max_pixels` makes the
-//! decoder refuse a larger frame wherever it appears (a
+//! decoder refuse a larger picture wherever it appears (a
 //! stream can change size after the frames the probe
-//! reads), the thread caps keep the frames a decoder holds
-//! in flight from scaling with the host's cores, and
-//! `-codec_whitelist` lets the tool open only the decoders
-//! of the video codecs it names. On Linux the kernel caps
-//! the tool's address space at 3 GiB behind all of that.
+//! reads), the thread counts keep the frames a decoder holds
+//! in flight from scaling with the host's cores for large
+//! frames, and `-codec_whitelist` lets the tool open only
+//! the decoders of the video codecs it names. `-max_pixels`
+//! counts the picture a decoder outputs: an H.264 stream
+//! can crop a small picture out of a much larger coded
+//! frame, which its decoder still allocates in full. On
+//! Linux the kernel caps the tool's address space at 3 GiB
+//! behind all of that, and that cap is what bounds such a
+//! frame.
 //!
 //! The extracted PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -101,32 +106,68 @@ const FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,m
 /// decoder name: H.264 (`h264`, or `libopenh264` in builds
 /// without the native decoder), HEVC, VP8 and VP9 (native or
 /// libvpx), AV1 (dav1d, libaom, or the native decoder),
-/// MPEG-4 Part 2, MPEG-1 and MPEG-2 video, Theora, and
-/// Motion JPEG: the video codecs a web, broadcast, or camera
-/// file in the accepted containers carries. A stream in any
-/// other codec has no decoder the tool may open, so it
-/// yields no frame. Audio and subtitle decoders are absent
-/// too: the extraction maps no such stream (`-an -sn -dn`),
-/// and the probe only logs that it cannot open them.
+/// MPEG-4 Part 2, H.263 (the 3GP phone codec), MPEG-1 and
+/// MPEG-2 video, Theora, Motion JPEG, ProRes, and DV: the
+/// video codecs the accepted containers carry from the web,
+/// broadcast, phones, and cameras. A stream in any other
+/// codec has no decoder the tool may open, so it yields no
+/// frame: Windows Media (WMV, VC-1) in ASF, Sorenson H.263
+/// and VP6 in FLV, and lossless, raw, and screen codecs
+/// among them. ASF stays an accepted container, as it can
+/// carry a listed codec. Audio and subtitle decoders are
+/// absent too: the extraction maps no such stream
+/// (`-an -sn -dn`), and the probe only logs that it cannot
+/// open them.
 const CODEC_WHITELIST: &str = "h264,libopenh264,hevc,vp8,libvpx,vp9,libvpx-vp9,av1,libdav1d,\
-libaom-av1,mpeg4,mpeg1video,mpeg2video,theora,mjpeg";
+libaom-av1,mpeg4,h263,mpeg1video,mpeg2video,theora,mjpeg,prores,dvvideo";
 
 /// The most pixels a video frame may hold: the engine's
 /// decode allocation budget at four bytes a pixel
 /// ([`crate::engine::MAX_DECODE_ALLOC`], 64 Mi pixels), the
-/// budget the extracted PNG has to pass anyway. The tool's
-/// decoders get it as `-max_pixels`, and a probed frame size
-/// past it, or past [`crate::engine::MAX_DECODE_DIMENSION`]
-/// on a side, is refused before any extraction runs.
+/// budget the extracted PNG has to pass anyway. A probed
+/// frame size past it, or past
+/// [`crate::engine::MAX_DECODE_DIMENSION`] on a side, is
+/// refused before any extraction runs.
 const MAX_FRAME_PIXELS: u64 = crate::engine::MAX_DECODE_ALLOC / 4;
 
-/// The threads the tool's decoder, filters, and PNG encoder
-/// each get. A decoder holds about one frame in flight per
-/// thread, so FFmpeg's default of one thread per core made
-/// a run's memory grow with the host. Two threads measured
-/// as fast as the default or faster for H.264 extractions
-/// up to the frame budget on a 4-core host.
-const TOOL_THREADS: &str = "2";
+/// The pixel bound the tool's decoders get as `-max_pixels`:
+/// the frame budget, plus 63 pixels a row for the tallest
+/// frame the budget allows. FFmpeg checks a picture's width
+/// rounded up to its buffer alignment (up to 64 pixels)
+/// times its height, so a frame within the budget whose
+/// width is not a multiple of 64, such as 16376x4098, would
+/// be refused at the exact budget. The probed size is
+/// checked against the exact budget, and so is the extracted
+/// PNG; a frame the probe did not see can pass it by the
+/// alignment room, at most 1.6%.
+const DECODER_MAX_PIXELS: u64 = MAX_FRAME_PIXELS + 63 * crate::engine::MAX_DECODE_DIMENSION as u64;
+
+/// The threads the probe's decoder, the extraction's filters
+/// and PNG encoder, and the extraction's decoder for a frame
+/// past [`MANY_THREADS_MAX_PIXELS`] get. A decoder holds
+/// about one frame in flight per thread, so for large frames
+/// FFmpeg's default of one thread per core made a run's
+/// memory grow with the host: an 8K 10-bit HEVC extraction
+/// peaked at 2.6 GB with the default on a 4-core host, and
+/// 1.9 GB on two threads.
+const FEW_THREADS: usize = 2;
+
+/// The largest frame the extraction's decoder runs on
+/// FFmpeg's default count of threads for, DCI 4K
+/// (4096x2160). The extraction seeks on its output side, so
+/// it decodes every frame up to the timestamp, and a far
+/// seek in a long clip is as fast as the decoder's threads
+/// make it: on a 4-core host, a seek 19.5 s into a 4K H.264
+/// clip took 8.7 to 13.2 s on two threads and 6.2 to 7.4 s
+/// on the default five, and the gap grows with the cores.
+/// Frames up to this size hold little in flight: the same
+/// seek peaked at 0.45 GB on five threads, and under 1 GB on
+/// sixteen.
+const MANY_THREADS_MAX_PIXELS: u64 = 4096 * 2160;
+
+/// The most threads the extraction's decoder gets, FFmpeg's
+/// own ceiling for its default count.
+const MAX_DECODER_THREADS: usize = 16;
 
 /// The tool's address-space cap on Linux, 3 GiB. An
 /// extraction at the frame budget needs about 1.7 GiB of
@@ -273,7 +314,8 @@ impl VideoFrameExtractor {
     /// invocation (issue #362).
     fn probe_until(&self, input: &File, deadline: Instant) -> Result<VideoProbe, FrameError> {
         let separator = probe_separator();
-        let max_pixels = MAX_FRAME_PIXELS.to_string();
+        let threads = FEW_THREADS.to_string();
+        let max_pixels = DECODER_MAX_PIXELS.to_string();
         let run = self.run(
             &[
                 "-nostdin",
@@ -284,7 +326,7 @@ impl VideoFrameExtractor {
                 "-format_whitelist",
                 FORMAT_WHITELIST,
                 "-threads",
-                TOOL_THREADS,
+                &threads,
                 "-max_pixels",
                 &max_pixels,
                 "-codec_whitelist",
@@ -354,8 +396,9 @@ impl VideoFrameExtractor {
         check_frame_size(probe.width, probe.height)?;
         let mut timestamp = resolve_timestamp(selection, &probe)?;
         let step = frame_interval(probe.fps);
+        let threads = decoder_threads(probe.width, probe.height);
         for attempt in 0..=3 {
-            let png = self.extract_at(&input, timestamp, deadline)?;
+            let png = self.extract_at(&input, timestamp, threads, deadline)?;
             if !png.is_empty() {
                 if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Err(FrameError::Failed(
@@ -393,15 +436,19 @@ impl VideoFrameExtractor {
     /// `NotVideo`, whatever the exit status: an earlier
     /// timestamp would only answer with a different frame
     /// than the one asked for. Any other failure is
-    /// `Failed`.
+    /// `Failed`. The decoder runs on `decoder_threads`
+    /// threads (see [`decoder_threads`]).
     fn extract_at(
         &self,
         input: &File,
         timestamp: f64,
+        decoder_threads: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, FrameError> {
         let seek = format_seconds(timestamp);
-        let max_pixels = MAX_FRAME_PIXELS.to_string();
+        let few = FEW_THREADS.to_string();
+        let decoder = decoder_threads.to_string();
+        let max_pixels = DECODER_MAX_PIXELS.to_string();
         let run = self.run(
             &[
                 "-nostdin",
@@ -412,9 +459,9 @@ impl VideoFrameExtractor {
                 "-format_whitelist",
                 FORMAT_WHITELIST,
                 "-filter_threads",
-                TOOL_THREADS,
+                &few,
                 "-threads",
-                TOOL_THREADS,
+                &decoder,
                 "-max_pixels",
                 &max_pixels,
                 "-codec_whitelist",
@@ -429,7 +476,7 @@ impl VideoFrameExtractor {
                 "-sn",
                 "-dn",
                 "-threads",
-                TOOL_THREADS,
+                &few,
                 "-f",
                 "image2pipe",
                 "-vcodec",
@@ -513,6 +560,24 @@ fn check_frame_size(width: u32, height: u32) -> Result<(), FrameError> {
     Ok(())
 }
 
+/// The threads the extraction's decoder gets for a frame of
+/// `width` by `height`: up to [`MANY_THREADS_MAX_PIXELS`],
+/// FFmpeg's own default count, one more than the cores (here
+/// the cores the server may use, which a container's CPU
+/// quota can lower), at most [`MAX_DECODER_THREADS`]; past
+/// it, [`FEW_THREADS`]. A stream that grows past the probed
+/// size keeps the probed size's count, and the address-space
+/// cap bounds what its larger frames hold (a stream that
+/// grew from 64x48 to 8192x8192 peaked at 0.9 GB on sixteen
+/// threads).
+fn decoder_threads(width: u32, height: u32) -> usize {
+    if u64::from(width) * u64::from(height) > MANY_THREADS_MAX_PIXELS {
+        return FEW_THREADS;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    (cores + 1).clamp(FEW_THREADS, MAX_DECODER_THREADS)
+}
+
 /// The refusal for a frame the decoder refused for its
 /// size, which the run does not name.
 fn frame_past_the_budget() -> FrameError {
@@ -523,7 +588,12 @@ fn frame_past_the_budget() -> FrameError {
 }
 
 /// Whether a run's report says the decoder refused a frame
-/// past `-max_pixels` (see [`PIXEL_BOUND_REPORT`]).
+/// past `-max_pixels` (see [`PIXEL_BOUND_REPORT`]). The
+/// report also carries the source's own metadata, so a
+/// source can plant the phrase; that only turns its own
+/// empty run into a refusal without step-backs to earlier
+/// frames, a failure it could have had anyway, so the whole
+/// report is read.
 fn met_the_pixel_bound(run: &ToolRun) -> bool {
     run.stderr.contains(PIXEL_BOUND_REPORT) || run.stderr_excerpt().contains(PIXEL_BOUND_REPORT)
 }
