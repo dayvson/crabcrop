@@ -15089,6 +15089,109 @@ async fn uploads_answer_uploads_not_configured_without_a_destination() {
 }
 
 #[tokio::test]
+async fn unrouted_paths_answer_404_not_found() {
+    // Issue #563: the catch-all's wildcard cannot match
+    // the empty path, so `/` fell to axum's default
+    // fallback, a bare 404 with no code and no envelope.
+    // The router fallback answers the documented
+    // not_found, for reads and writes alike.
+    let base = spawn_app(false).await;
+    let root = format!("{base}/");
+    let plain = client().get(&root).send().await.unwrap();
+    let json = client()
+        .get(&root)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_error_modes(plain, json, StatusCode::NOT_FOUND, "not_found", "not found").await;
+    let plain = client().put(&root).body(test_png()).send().await.unwrap();
+    let json = client()
+        .put(&root)
+        .header("accept", "application/json")
+        .body(test_png())
+        .send()
+        .await
+        .unwrap();
+    assert_error_modes(plain, json, StatusCode::NOT_FOUND, "not_found", "not found").await;
+}
+
+/// One wrong-method request and the methods its route
+/// serves, for `wrong_methods_answer_405_method_not_allowed`.
+async fn assert_method_not_allowed(
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    allow: &[&str],
+) {
+    let url = format!("{base}{path}");
+    let plain = client().request(method.clone(), &url).send().await.unwrap();
+    let allow_header = plain
+        .headers()
+        .get("allow")
+        .expect("a 405 names the route's methods")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let json = client()
+        .request(method.clone(), &url)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_error_modes(
+        plain,
+        json,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "method not allowed",
+    )
+    .await;
+    let listed: Vec<&str> = allow_header.split(',').map(str::trim).collect();
+    assert_eq!(listed.len(), allow.len(), "{method} {path}: {allow_header}");
+    for method_name in allow {
+        assert!(
+            listed.contains(method_name),
+            "{method} {path}: {allow_header} does not list {method_name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wrong_methods_answer_405_method_not_allowed() {
+    // Issue #563: a method the matched route does not
+    // serve answered axum's bare 405: an empty body, no
+    // code, no envelope. It now answers method_not_allowed
+    // in the documented shape and keeps the Allow header.
+    let base = spawn_app(false).await;
+    let name = "cat.png";
+    let sig = crate::url::upload_signature(SECRET, name);
+    let image_allow = ["GET", "HEAD", "PUT"];
+    for method in [reqwest::Method::POST, reqwest::Method::DELETE] {
+        assert_method_not_allowed(&base, method, "/elsewhere/cat.png", &image_allow).await;
+    }
+    assert_method_not_allowed(
+        &base,
+        reqwest::Method::GET,
+        &format!("/upload/{sig}/{name}"),
+        &["PUT"],
+    )
+    .await;
+    for method in [reqwest::Method::GET, reqwest::Method::PUT] {
+        assert_method_not_allowed(&base, method, "/purge/anything", &["POST"]).await;
+    }
+    let system_allow = ["GET", "HEAD"];
+    assert_method_not_allowed(&base, reqwest::Method::PUT, "/health", &system_allow).await;
+    assert_method_not_allowed(
+        &base,
+        reqwest::Method::PUT,
+        "/explain/anything",
+        &system_allow,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn an_upload_body_read_error_is_a_400_not_a_413() {
     // Issue #467: only the cap is a size answer. These
     // are signed, valid-name uploads well under the cap

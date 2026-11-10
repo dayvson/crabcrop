@@ -12,6 +12,8 @@
 | `GET /explain/<signature>/...` | A report on the URL instead of the image. See [Self-explaining URLs](#self-explaining-urls). |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
+A request to one of these routes with any other method answers `405`, with an `Allow` header naming the methods the route serves.
+
 ### Purge a cached result
 
 ```bash
