@@ -35,6 +35,8 @@ Any platform above can sit behind a CDN. Each recipe in this family configures o
 | BunnyCDN | [BunnyCDN](../deploy/bunnycdn/README.md) | `cache-tag-middleware.ts` (a middleware script) | Cache tags (the `CDN-Tag` header) | Bunny Optimizer |
 | Akamai | [Akamai](../deploy/akamai/README.md) | `property-rules.json` (a rule fragment) | Cache tags (the `Edge-Cache-Tag` header) | Image and Video Manager |
 
+Two things hold behind every CDN. Error responses carry `Cache-Control: no-store`, so an edge that follows the origin's headers never serves one request's failure to the URL's other viewers; the CloudFront recipe also turns off CloudFront's own short caching of errors, which does not wait for headers. And the client hint headers (`DPR`, `Sec-CH-DPR`, the width hints and `Save-Data`) can change a URL's bytes. Cloudflare, CloudFront, BunnyCDN and Akamai, as their recipes set them up, do not key on those headers, so those recipes set `CRABCROP_CLIENT_HINTS=0` on the origin and every request for a URL gets the one response the edge stores. Fastly keys on `Vary` and can leave hints on. With hints on, a response a hint applies to is `private`, which an edge that follows the origin's headers does not store (see [Client hints and shared caches](responses.md#client-hints-and-shared-caches)).
+
 ### Production notes
 
 #### The cache tiers, and what replicas change
