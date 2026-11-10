@@ -63,7 +63,10 @@ fn main() {
                     Err(e) => format!("ERROR:{e:?}"),
                 }
             }
-            "sign" => sign(secret.unwrap(), s(&c["remainder"])),
+            "sign" => match sign(secret.unwrap(), s(&c["remainder"])) {
+                Ok(sig) => sig,
+                Err(e) => format!("ERROR:{e:?}"),
+            },
             "seal" => {
                 let nonce_vec = hex_bytes(&c["nonce"]);
                 let nonce: [u8; 12] = nonce_vec.try_into().unwrap_or([0u8; 12]);

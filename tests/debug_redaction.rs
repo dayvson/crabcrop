@@ -186,6 +186,7 @@ fn state(dir: &std::path::Path) -> AppState {
         avif_speed: crabcrop::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crabcrop::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),

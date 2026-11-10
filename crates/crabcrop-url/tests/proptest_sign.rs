@@ -15,9 +15,9 @@
 
 use base64::Engine as _;
 use crabcrop_url::{
-    MAX_SEALED_REMAINDER, SEALED_PREFIX, SealError, build_sealed_url, build_url,
-    build_url_with_key_id, open_token, seal, seal_with_key_id, seal_with_nonce, sign,
-    sign_with_key_id, unseal, verify,
+    BuildError, MAX_SEALED_REMAINDER, SEALED_PREFIX, SealError, build_sealed_url, build_url,
+    build_url_with_key_id, is_reserved_remainder, open_token, seal, seal_with_key_id,
+    seal_with_nonce, sign, sign_with_key_id, unseal, verify,
 };
 use proptest::prelude::*;
 use proptest::sample::Index;
@@ -142,7 +142,8 @@ proptest! {
         remainder in any_remainder(),
         kid in key_id(),
     ) {
-        let tag = sign(&secret, &remainder);
+        prop_assume!(!is_reserved_remainder(&remainder));
+        let tag = sign(&secret, &remainder).unwrap();
         prop_assert_eq!(tag.len(), 64);
         prop_assert!(tag.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         prop_assert!(verify(&secret, &tag, &remainder));
@@ -167,7 +168,8 @@ proptest! {
         secret_at in any::<Index>(),
         flip in 1u8..=255,
     ) {
-        let tag = sign(&secret, &remainder);
+        prop_assume!(!is_reserved_remainder(&remainder));
+        let tag = sign(&secret, &remainder).unwrap();
         let len = remainder.len();
         for at in [0, len - 1, at.index(len)] {
             let changed = change_ascii_byte(&remainder, at, delta);
@@ -316,6 +318,7 @@ proptest! {
             remainder.push('/');
         }
         remainder.push_str(&source);
+        prop_assume!(!is_reserved_remainder(&remainder));
 
         let url = build_url(&base, Some(&secret), &operations, &source, expires).unwrap();
         let path = url.strip_prefix("https://img.example.com/").unwrap();
@@ -336,5 +339,42 @@ proptest! {
                 .unwrap();
         let segment = sealed.strip_prefix("https://img.example.com/").unwrap();
         prop_assert_eq!(unseal(&secret, segment), Ok(remainder.clone()));
+    }
+
+    /// A remainder that begins with the reserved segment is
+    /// refused by `sign` and by every builder, with a secret
+    /// or without, keyed or not, plain or sealed, wherever
+    /// the split between operations and source falls: every
+    /// derived subkey is the HMAC of such a remainder.
+    #[test]
+    fn reserved_remainders_are_refused_everywhere(
+        secret in secret(),
+        tail in proptest::option::of(url_text(0, 60)),
+        kid in key_id(),
+    ) {
+        let remainder = match &tail {
+            Some(tail) => format!("crabcrop/{tail}"),
+            None => "crabcrop".to_string(),
+        };
+        let refused = Err(BuildError::ReservedRemainder(remainder.clone()));
+        prop_assert_eq!(sign(&secret, &remainder), refused.clone());
+        prop_assert_eq!(sign_with_key_id(&secret, &kid, &remainder), refused.clone());
+        let base = "https://img.example.com";
+        let (operations, source) = match &tail {
+            Some(tail) if !tail.is_empty() => ("crabcrop", tail.as_str()),
+            _ => ("", remainder.as_str()),
+        };
+        for (operations, source) in [("", remainder.as_str()), (operations, source)] {
+            prop_assert_eq!(build_url(base, Some(&secret), operations, source, None), refused.clone());
+            prop_assert_eq!(build_url(base, None, operations, source, None), refused.clone());
+            prop_assert_eq!(
+                build_url_with_key_id(base, Some((&secret, &kid)), operations, source, None),
+                refused.clone()
+            );
+            prop_assert_eq!(
+                build_sealed_url(base, Some(&secret), operations, source, None, None, None),
+                Err(SealError::ReservedRemainder(remainder.clone()))
+            );
+        }
     }
 }
