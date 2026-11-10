@@ -60,12 +60,16 @@
 //!
 //! The decoder bounds hold the tool to the decode budget
 //! the extracted PNG has to pass anyway (issue #605 for the
-//! decoder list). The probe reads two sizes: the picture a
-//! stream displays, and its coded frame, the one its decoder
-//! allocates, which can be larger than the picture. A
-//! displayed size past the budget, or a coded size past the
-//! decoder's pixel bound, is refused before any extraction
-//! runs. `-max_pixels` makes the decoder refuse a larger
+//! decoder list). The probe reads two sizes for each video
+//! stream: the picture it displays, and its coded frame, the
+//! one its decoder allocates, which can be larger than the
+//! picture. Every video stream is sized because the
+//! extraction does not pin one, and FFmpeg's default
+//! selection can decode another than the first (the largest,
+//! or the one flagged default). A displayed size past the
+//! budget, or a coded size past the decoder's pixel bound, in
+//! any of them is refused before any extraction runs.
+//! `-max_pixels` makes the decoder refuse a larger
 //! output picture wherever it appears (a stream can change
 //! size after the frames the probe reads), the thread counts
 //! keep the frames a decoder holds in flight from scaling
@@ -202,7 +206,7 @@ const PIXEL_BOUND_REPORT: &str = "exceeds specified max pixel count";
 const PROBE_REPORT_CAP: usize = 256 * 1024;
 
 /// What a probe learned about a video source.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VideoProbe {
     /// Container duration in seconds, when the tool
     /// reports one (some containers do not).
@@ -211,17 +215,43 @@ pub struct VideoProbe {
     pub width: u32,
     /// The first video stream's displayed height.
     pub height: u32,
-    /// The first video stream's coded width: that of the
-    /// frame its decoder allocates, which can be wider than
-    /// the displayed picture (block padding, or a crop). At
-    /// least `width`; `width` when the report names no other.
-    pub coded_width: u32,
-    /// The first video stream's coded height, at least
-    /// `height`, as `coded_width` is.
-    pub coded_height: u32,
     /// The first video stream's frame rate, when the
     /// report names one.
     pub fps: Option<f64>,
+    /// The frame sizes of every video stream the report
+    /// lists with a size, attached pictures aside, in the
+    /// report's order, so the first video stream's come
+    /// first. Never empty. The extraction does not pin a
+    /// stream, and FFmpeg's default selection can decode
+    /// another than the first, so each one is checked.
+    pub streams: Vec<StreamSize>,
+}
+
+/// One video stream's frame sizes, as the probe read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamSize {
+    /// The displayed size, width by height.
+    pub displayed: (u32, u32),
+    /// The coded size: that of the frame the stream's
+    /// decoder allocates, which can be larger than the
+    /// displayed picture (block padding, or a crop). At least
+    /// the displayed size on each side; the displayed size
+    /// when the report names no other.
+    pub coded: (u32, u32),
+}
+
+impl VideoProbe {
+    /// The largest coded size among the video streams, by
+    /// pixel count: the frames the extraction's decoder holds
+    /// in flight are at most that large, whichever stream it
+    /// decodes.
+    fn largest_coded(&self) -> (u32, u32) {
+        self.streams
+            .iter()
+            .map(|stream| stream.coded)
+            .max_by_key(|&(width, height)| u64::from(width) * u64::from(height))
+            .unwrap_or((self.width, self.height))
+    }
 }
 
 /// One extracted frame and the facts meta reports.
@@ -312,8 +342,9 @@ impl VideoFrameExtractor {
         Ok(Self { program, timeout })
     }
 
-    /// Probe the source: duration, displayed and coded
-    /// sizes, and frame rate of its first video stream.
+    /// Probe the source: its duration, its first video
+    /// stream's frame rate, and every video stream's
+    /// displayed and coded sizes.
     /// `NotVideo` when the report names no usable video
     /// stream. The extraction path probes through
     /// `probe_until` (the shared deadline); this spelling
@@ -412,7 +443,8 @@ impl VideoFrameExtractor {
         check_frame_size(&probe)?;
         let mut timestamp = resolve_timestamp(selection, &probe)?;
         let step = frame_interval(probe.fps);
-        let threads = decoder_threads(probe.coded_width, probe.coded_height);
+        let (coded_width, coded_height) = probe.largest_coded();
+        let threads = decoder_threads(coded_width, coded_height);
         for attempt in 0..=3 {
             let png = self.extract_at(&input, timestamp, threads, deadline)?;
             if !png.is_empty() {
@@ -562,34 +594,38 @@ impl VideoFrameExtractor {
     }
 }
 
-/// Refuse a probed frame past the decode budget, as a bad
-/// source. The displayed size meets the budget itself (see
-/// [`MAX_FRAME_PIXELS`]): the PNG of a larger frame could
-/// never pass the engine's decode limits. The coded size,
-/// the frame the decoder allocates whatever part of it the
-/// stream displays, meets the decoder's pixel bound (see
-/// [`DECODER_MAX_PIXELS`]), which `-max_pixels` applies only
-/// to the output picture, and the same limit on a side.
+/// Refuse a probed frame past the decode budget, in any of
+/// the source's video streams, as a bad source. The displayed
+/// size meets the budget itself (see [`MAX_FRAME_PIXELS`]):
+/// the PNG of a larger frame could never pass the engine's
+/// decode limits. The coded size, the frame the decoder
+/// allocates whatever part of it the stream displays, meets
+/// the decoder's pixel bound (see [`DECODER_MAX_PIXELS`]),
+/// which `-max_pixels` applies only to the output picture,
+/// and the same limit on a side.
 fn check_frame_size(probe: &VideoProbe) -> Result<(), FrameError> {
     let side = crate::engine::MAX_DECODE_DIMENSION;
-    let (width, height) = (probe.width, probe.height);
-    if width > side || height > side || u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS {
-        return Err(FrameError::NotVideo(format!(
-            "the video's frames are {width}x{height}, past the decode budget \
-             ({side} px a side, {MAX_FRAME_PIXELS} pixels)"
-        )));
-    }
-    let (coded_width, coded_height) = (probe.coded_width, probe.coded_height);
-    if coded_width > side
-        || coded_height > side
-        || u64::from(coded_width) * u64::from(coded_height) > DECODER_MAX_PIXELS
-    {
-        return Err(FrameError::NotVideo(format!(
-            "the video's frames are coded at {coded_width}x{coded_height} \
-             (displayed at {width}x{height}), past the decode budget \
-             ({side} px a side, {DECODER_MAX_PIXELS} pixels with the decoder's \
-             alignment room)"
-        )));
+    for stream in &probe.streams {
+        let (width, height) = stream.displayed;
+        if width > side || height > side || u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS
+        {
+            return Err(FrameError::NotVideo(format!(
+                "the video's frames are {width}x{height}, past the decode budget \
+                 ({side} px a side, {MAX_FRAME_PIXELS} pixels)"
+            )));
+        }
+        let (coded_width, coded_height) = stream.coded;
+        if coded_width > side
+            || coded_height > side
+            || u64::from(coded_width) * u64::from(coded_height) > DECODER_MAX_PIXELS
+        {
+            return Err(FrameError::NotVideo(format!(
+                "the video's frames are coded at {coded_width}x{coded_height} \
+                 (displayed at {width}x{height}), past the decode budget \
+                 ({side} px a side, {DECODER_MAX_PIXELS} pixels with the decoder's \
+                 alignment room)"
+            )));
+        }
     }
     Ok(())
 }
@@ -795,8 +831,9 @@ fn probe_separator() -> String {
 }
 
 /// Parse the probe facts out of the tool's stderr report:
-/// the input's `Duration:` line and its first video stream
-/// that carries dimensions. Returns `None` when no usable
+/// the input's `Duration:` line, the frame rate of its first
+/// video stream that carries dimensions, and the sizes of
+/// every such video stream. Returns `None` when no usable
 /// video stream appears, which is the not-a-video answer
 /// for every corrupt, audio-only, or non-video source, and
 /// when the report carries a planted `Duration:` line,
@@ -857,19 +894,31 @@ pub fn parse_probe(report: &str, separator: &str) -> Option<VideoProbe> {
 
     // Streams print after the Duration line, in the order
     // the tool lists them; planted lines never carry the
-    // separator, so they never reach the stream parse.
-    let stream = lines[duration_at + 1..]
+    // separator, so they never reach the stream parse. Each
+    // video stream is sized, since the extraction does not
+    // pin one; the frame rate is the first one's.
+    let streams: Vec<StreamFacts> = lines[duration_at + 1..]
         .iter()
-        .find_map(|line| parse_video_stream(line, separator))?;
-    let (width, height) = stream.size;
-    let (coded_width, coded_height) = stream.coded.unwrap_or(stream.size);
+        .filter_map(|line| parse_video_stream(line, separator))
+        .collect();
+    let first = streams.first()?;
+    let (width, height) = first.size;
     Some(VideoProbe {
         duration,
         width,
         height,
-        coded_width: coded_width.max(width),
-        coded_height: coded_height.max(height),
-        fps: stream.fps,
+        fps: first.fps,
+        streams: streams
+            .iter()
+            .map(|stream| {
+                let (width, height) = stream.size;
+                let (coded_width, coded_height) = stream.coded.unwrap_or(stream.size);
+                StreamSize {
+                    displayed: stream.size,
+                    coded: (coded_width.max(width), coded_height.max(height)),
+                }
+            })
+            .collect(),
     })
 }
 

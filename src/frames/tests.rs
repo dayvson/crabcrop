@@ -24,9 +24,11 @@ fn probe_of(duration: Option<f64>, fps: Option<f64>) -> VideoProbe {
         duration,
         width: 64,
         height: 48,
-        coded_width: 64,
-        coded_height: 48,
         fps,
+        streams: vec![StreamSize {
+            displayed: (64, 48),
+            coded: (64, 48),
+        }],
     }
 }
 
@@ -36,7 +38,7 @@ fn probe_parses_the_reference_report() {
     assert_eq!(probe.duration, Some(3.0));
     assert_eq!((probe.width, probe.height), (64, 48));
     // The report names no other coded size.
-    assert_eq!((probe.coded_width, probe.coded_height), (64, 48));
+    assert_eq!(probe.streams[0].coded, (64, 48));
     assert_eq!(probe.fps, Some(10.0));
 }
 
@@ -355,11 +357,11 @@ fn probe_reads_the_coded_frame_size() {
     // after the displayed size where the two differ.
     let probe = parse_probe(HD_VERBOSE_REPORT, SEP).expect("a 1080p stream parses");
     assert_eq!((probe.width, probe.height), (1920, 1080));
-    assert_eq!((probe.coded_width, probe.coded_height), (1920, 1088));
+    assert_eq!(probe.streams[0].coded, (1920, 1088));
     assert_eq!(probe.fps, Some(10.0));
     let probe = parse_probe(CROPPED_VERBOSE_REPORT, SEP).expect("a cropped stream parses");
     assert_eq!((probe.width, probe.height), (64, 48));
-    assert_eq!((probe.coded_width, probe.coded_height), (8320, 8320));
+    assert_eq!(probe.streams[0].coded, (8320, 8320));
     assert_eq!(probe.fps, Some(20.0));
     // The coded size is never taken as smaller than the
     // displayed one, and only the token right after the
@@ -373,8 +375,47 @@ fn probe_reads_the_coded_frame_size() {
         let streams = format!("  Stream #0:0: Video: h264{SEP}yuv420p, {field}, 25 fps");
         let probe = parse_probe(&mkv_report(&streams), SEP).expect(field);
         assert_eq!((probe.width, probe.height), (64, 48), "{field}");
-        assert_eq!((probe.coded_width, probe.coded_height), coded, "{field}");
+        assert_eq!(probe.streams[0].coded, coded, "{field}");
     }
+}
+
+#[test]
+fn probe_sizes_every_video_stream() {
+    // The extraction does not pin a stream, and FFmpeg's
+    // default selection can decode another than the first
+    // (the largest, or the one flagged default), so the probe
+    // sizes each video stream. The frame rate and the size
+    // meta reports stay the first stream's; a stream of
+    // another type and an attached picture are not sized.
+    let streams = [
+        format!("  Stream #0:0: Video: h264{SEP}yuv420p, 64x48{SEP}10 fps, 10 tbr"),
+        format!("  Stream #0:1: Audio: aac (LC){SEP}44100 Hz, mono, fltp"),
+        format!(
+            "  Stream #0:2: Video: h264{SEP}yuv420p(progressive, left), 128x96 (8320x8320) [SAR 1:1 DAR 4:3]{SEP}20 tbr"
+        ),
+        format!(
+            "  Stream #0:3: Video: mjpeg (Baseline){SEP}yuvj420p(pc){SEP}50x50 [SAR 1:1 DAR 1:1]{SEP}90k tbr, 90k tbn (attached pic)"
+        ),
+    ]
+    .join("\n");
+    let probe = parse_probe(&mkv_report(&streams), SEP).expect("two video streams parse");
+    assert_eq!(probe.duration, Some(2.0));
+    assert_eq!((probe.width, probe.height), (64, 48));
+    assert_eq!(probe.fps, Some(10.0));
+    assert_eq!(
+        probe.streams,
+        [
+            StreamSize {
+                displayed: (64, 48),
+                coded: (64, 48)
+            },
+            StreamSize {
+                displayed: (128, 96),
+                coded: (8320, 8320)
+            },
+        ]
+    );
+    assert_eq!(probe.largest_coded(), (8320, 8320));
 }
 
 #[test]
@@ -844,6 +885,55 @@ fn a_coded_frame_past_the_decode_budget_is_refused_before_extraction() {
             let frame = result.unwrap_or_else(|e| panic!("{coded}: {e}"));
             assert_eq!(format!("{}x{}", frame.width, frame.height), size);
             assert_eq!(runs, 2, "{coded}");
+        }
+    }
+}
+
+#[test]
+fn a_second_video_stream_past_the_decode_budget_is_refused_before_extraction() {
+    // The extraction does not pin a stream, and FFmpeg's
+    // default selection can decode another than the first, so
+    // a second video stream coded or displayed past the budget
+    // is refused before any extraction runs, however small
+    // the first one is. Within the budget, the extraction's
+    // decoder threads follow the largest coded frame among
+    // the streams.
+    let cores = decoder_threads(64, 48).to_string();
+    for (second, refused, threads) in [
+        (
+            "yuv420p(progressive, left), 128x96 (8320x8320) [SAR 1:1 DAR 4:3], 20 tbr",
+            Some("8320x8320"),
+            "",
+        ),
+        ("yuv420p, 16000x16000, 20 tbr", Some("16000x16000"), ""),
+        ("yuv420p, 128x96 (7680x4320), 20 tbr", None, "2"),
+        ("yuv420p, 320x240, 20 tbr", None, cores.as_str()),
+    ] {
+        let records = temp_dir("second-stream");
+        let record = records.join("argv.log");
+        let stream =
+            format!("yuv420p, 64x48, 10 fps, 10 tbr\n  Stream #0:1: Video: h264, {second}");
+        let (_tool, program) = fake_tool(
+            "second-stream",
+            &recording_tool(&record, &stream, "", EXTRACT_PNG),
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        let result = extractor.extract_frame(b"video bytes", FrameSelection::Poster);
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        if let Some(size) = refused {
+            let err = result.unwrap_err();
+            assert!(matches!(err, FrameError::NotVideo(_)), "{second}: {err}");
+            assert!(err.to_string().contains(size), "{second}: {err}");
+            assert!(err.to_string().contains("decode budget"), "{second}: {err}");
+            assert_eq!(lines.len(), 1, "{second}: only the probe runs");
+        } else {
+            let frame = result.unwrap_or_else(|e| panic!("{second}: {e}"));
+            assert_eq!((frame.width, frame.height), (64, 48), "{second}");
+            assert_eq!(lines.len(), 2, "{second}");
+            let argv: Vec<&str> = lines[1].split_whitespace().collect();
+            let at = argv.iter().position(|a| *a == "-threads").unwrap();
+            assert_eq!(argv[at + 1], threads, "{second}: the extraction's decoder");
         }
     }
 }
@@ -1669,7 +1759,7 @@ fn real_tool_refuses_a_coded_frame_past_the_budget_whatever_it_displays() {
 
     let probe = extractor.probe(&hd).unwrap();
     assert_eq!((probe.width, probe.height), (1920, 1080));
-    assert_eq!((probe.coded_width, probe.coded_height), (1920, 1088));
+    assert_eq!(probe.streams[0].coded, (1920, 1088));
     let frame = extractor
         .extract_frame(&hd, FrameSelection::Poster)
         .unwrap_or_else(|e| panic!("1080p: {e}"));
@@ -1679,9 +1769,66 @@ fn real_tool_refuses_a_coded_frame_past_the_budget_whatever_it_displays() {
 
     let probe = extractor.probe(&cropped).unwrap();
     assert_eq!((probe.width, probe.height), (64, 48));
-    assert_eq!((probe.coded_width, probe.coded_height), (8320, 8320));
+    assert_eq!(probe.streams[0].coded, (8320, 8320));
     let err = extractor
         .extract_frame(&cropped, FrameSelection::Poster)
+        .unwrap_err();
+    assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
+    assert!(err.to_string().contains("8320x8320"), "{err}");
+    assert!(err.to_string().contains("decode budget"), "{err}");
+}
+
+#[test]
+fn real_tool_refuses_a_second_stream_coded_past_the_budget() {
+    // An MPEG-TS whose first video stream is 64x48 and whose
+    // second is one H.264 frame coded at 8320x8320 and
+    // displayed at 128x96. The extraction does not pin a
+    // stream, and FFmpeg's default selection takes the larger
+    // picture, the second stream, whose decoder allocates the
+    // whole coded frame. The probe sizes every video stream
+    // and refuses the source before any extraction runs: the
+    // refusal names the coded size, which only the probe's
+    // check reads.
+    let Some(ffmpeg) = ffmpeg_path() else {
+        return;
+    };
+    let dir = temp_dir("real-streams");
+    let bytes = encode_clip(
+        &ffmpeg,
+        &dir.join("two.ts"),
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=64x48:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:size=8320x8320:rate=10",
+            "-map",
+            "0:v",
+            "-map",
+            "1:v",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-bsf:v:1",
+            "h264_metadata=crop_right=8192:crop_bottom=8224",
+            "-f",
+            "mpegts",
+        ],
+    )
+    .expect("an H.264 encoder");
+    let extractor = VideoFrameExtractor::new(ffmpeg, Duration::from_secs(30)).unwrap();
+    let probe = extractor.probe(&bytes).unwrap();
+    assert_eq!((probe.width, probe.height), (64, 48));
+    let err = extractor
+        .extract_frame(&bytes, FrameSelection::Poster)
         .unwrap_err();
     assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
     assert!(err.to_string().contains("8320x8320"), "{err}");

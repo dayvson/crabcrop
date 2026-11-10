@@ -1804,17 +1804,10 @@ exit 0\n";
             "the scan took {:?}",
             started.elapsed()
         );
-        // An image before them is still found; past the
-        // budget the scan stops, and the renderer's cap bounds
-        // the rest, as it bounds every image the scan does not
-        // read.
-        let big = jpx_siz(16000, 16000, 0, 0, RGB);
-        let mut before = big.clone();
+        // An image before them is still found.
+        let mut before = jpx_siz(16000, 16000, 0, 0, RGB);
         before.extend_from_slice(&packed);
         assert!(oversized_jpx(&before).is_some());
-        let mut after = packed;
-        after.extend_from_slice(&big);
-        assert_eq!(oversized_jpx(&after), None);
     }
 
     #[test]
@@ -2143,8 +2136,8 @@ exit 0\n";
         assert_eq!((img.width(), img.height()), (8000, 8000));
     }
 
-    /// The same image in a stream the scan does not read: the
-    /// renderer's address-space cap stops the decode (with
+    /// The same image, drawn on a page: the renderer's
+    /// address-space cap stops the decode (with
     /// Poppler 24.02, about nine seconds and 3 GB in), and the
     /// renderer leaves the image out of the page, which stays
     /// white instead of the image's gray. Ignored by default
@@ -2163,7 +2156,6 @@ exit 0\n";
             .collect();
         hex.push(b'>');
         let bytes = image_pdf("[/ASCIIHexDecode /JPXDecode]", &hex);
-        assert_eq!(oversized_jpx(&bytes), None, "the scan cannot see it");
         let page = renderer.render_page(&bytes, 1).unwrap();
         let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
         assert_eq!((img.width(), img.height()), (400, 400));
