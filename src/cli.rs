@@ -403,13 +403,21 @@ fn one_target(positional: &[String], verb: &str) -> Result<String, CliError> {
     }
 }
 
+/// The image signature for a remainder. A remainder that
+/// begins with the reserved segment is refused: its
+/// signature could be a derived subkey, and the server
+/// refuses such a URL whatever its signature.
+fn sign_remainder(secret: &[u8], remainder: &str) -> Result<String, CliError> {
+    crabcrop_url::sign(secret, remainder).map_err(|e| CliError::Invalid(e.to_string()))
+}
+
 fn sign(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let remainder = one_target(positional, "sign")?;
     let secret = require_secret(config)?;
     // Validate with the server's grammar before signing, so
     // a bad URL fails here instead of at first request.
     parse_with_presets(&remainder)?;
-    let sig = crabcrop_url::sign(secret, &remainder);
+    let sig = sign_remainder(secret, &remainder)?;
     let segment = match &config.key_id {
         Some(kid) => format!("{kid}:{sig}"),
         None => sig,
@@ -437,6 +445,14 @@ fn seal_cmd(config: &Config, positional: &[String]) -> Result<String, CliError> 
     };
     let secret = require_secret(config)?;
     parse_with_presets(&remainder)?;
+    // The server refuses a token whose remainder begins with
+    // the reserved segment, so it is refused here, as the
+    // crate's sealed builder refuses it.
+    if crabcrop_url::is_reserved_remainder(&remainder) {
+        return Err(CliError::Seal(crabcrop_url::SealError::ReservedRemainder(
+            remainder,
+        )));
+    }
     let segment = match &config.key_id {
         Some(kid) => crabcrop_url::seal_with_key_id(secret, kid, &remainder),
         None => crabcrop_url::seal(secret, &remainder),
@@ -497,7 +513,17 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, CliError> {
         Some(Signature::Hmac(hex)) => {
             let note = match &config.secret {
                 Some(secret) => {
-                    if crate::url::verify(secret, &Signature::Hmac(hex.clone()), &rest, false) {
+                    // The server refuses a reserved remainder
+                    // whatever its signature, so no tag is valid
+                    // for one, a derived subkey included.
+                    if crabcrop_url::is_reserved_remainder(&rest) {
+                        "never valid: the remainder begins with the reserved segment crabcrop"
+                    } else if crate::url::verify(
+                        secret,
+                        &Signature::Hmac(hex.clone()),
+                        &rest,
+                        false,
+                    ) {
                         "valid for this remainder"
                     } else {
                         "DOES NOT MATCH this remainder"
@@ -892,7 +918,7 @@ fn target_url(config: &Config, input: &str) -> Result<String, CliError> {
     let secret = require_secret(config)?;
     let (_, _, rest) = split_signed(input, &config.base);
     parse_with_presets(&rest)?;
-    let sig = crabcrop_url::sign(secret, &rest);
+    let sig = sign_remainder(secret, &rest)?;
     Ok(format!("{}/{sig}/{rest}", config.base))
 }
 
@@ -1613,11 +1639,16 @@ pub fn convert_thumbor(
         ))
     })?;
 
+    // A Thumbor source can be any text, so the converted
+    // remainder can begin with the reserved segment: refused
+    // signed or not, as every builder refuses it.
+    if crabcrop_url::is_reserved_remainder(&remainder) {
+        return Err(CliError::Invalid(
+            crabcrop_url::BuildError::ReservedRemainder(remainder).to_string(),
+        ));
+    }
     let url = match secret {
-        Some(secret) => format!(
-            "{base}/{}/{remainder}",
-            crabcrop_url::sign(secret, &remainder)
-        ),
+        Some(secret) => format!("{base}/{}/{remainder}", sign_remainder(secret, &remainder)?),
         None => {
             warnings.push(
                 "no secret given: emitted an unsafe URL; sign it before production use".to_string(),
@@ -1847,7 +1878,8 @@ mod tests {
         ]))
         .await
         .unwrap();
-        let expected_sig = crabcrop_url::sign(b"test-secret", "300x200/https://example.com/a.jpg");
+        let expected_sig =
+            crabcrop_url::sign(b"test-secret", "300x200/https://example.com/a.jpg").unwrap();
         assert_eq!(
             out,
             format!("http://img.test/k2:{expected_sig}/300x200/https://example.com/a.jpg")
@@ -1912,6 +1944,92 @@ mod tests {
         assert!(exec(&args(&["upload"])).await.is_err());
     }
 
+    /// Every derived subkey is HMAC(secret, label) for a label
+    /// under the reserved segment, the same function as an
+    /// image signature. Every signing verb refuses a remainder
+    /// that begins with the segment, before it computes
+    /// anything.
+    #[tokio::test]
+    async fn signing_verbs_refuse_the_reserved_segment() {
+        for label in [
+            "crabcrop/purge-key",
+            "crabcrop/purge-group-key",
+            "crabcrop/upload-key",
+            "crabcrop/seal-key",
+            "crabcrop/entry-key",
+            "crabcrop",
+        ] {
+            for verb in ["sign", "seal"] {
+                for key_id in [None, Some("k2")] {
+                    let mut argv = vec![verb, "--secret", "label-test-secret-0123456789"];
+                    if let Some(kid) = key_id {
+                        argv.extend(["--key-id", kid]);
+                    }
+                    argv.extend(["--base", "http://img.test", label]);
+                    let err = exec(&args(&argv)).await.unwrap_err().to_string();
+                    assert!(
+                        err.contains("reserved segment \"crabcrop\""),
+                        "{verb} {label}: {err}"
+                    );
+                }
+            }
+            // `meta` signs a bare remainder before it sends
+            // anything; the refusal comes first.
+            let err = exec(&args(&[
+                "meta",
+                "--secret",
+                "label-test-secret-0123456789",
+                "--base",
+                "http://127.0.0.1:9",
+                label,
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("reserved segment"), "meta {label}: {err}");
+            // A Thumbor URL whose source is a label converts
+            // to that remainder: refused, signed or not.
+            for secret in [Some(&b"label-test-secret-0123456789"[..]), None] {
+                let err = convert_thumbor(
+                    &format!("http://thumbor.test/unsafe/{label}"),
+                    "http://img.test",
+                    secret,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("reserved segment"), "thumbor {label}: {err}");
+            }
+        }
+        // `explain` never calls a tag over a label valid, the
+        // label's own subkey included.
+        let secret = b"label-test-secret-0123456789";
+        let subkey = hex::encode(crabcrop_url::upload_key(secret));
+        let out = exec(&args(&[
+            "explain",
+            "--secret",
+            "label-test-secret-0123456789",
+            "--base",
+            "http://img.test",
+            &format!("http://img.test/{subkey}/crabcrop/upload-key"),
+        ]))
+        .await
+        .unwrap();
+        assert!(out.contains("never valid"), "{out}");
+        assert!(!out.contains("valid for this remainder"), "{out}");
+        // What only mentions a label further in still signs.
+        for remainder in [
+            "300x200/https://example.com/crabcrop/purge-key.jpg",
+            "crabcrop-assets/photo.jpg",
+        ] {
+            assert!(
+                exec(&args(&["sign", "--secret", "s", remainder]))
+                    .await
+                    .is_ok(),
+                "{remainder}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sign_prints_a_validatable_url() {
         let out = exec(&args(&[
@@ -1924,7 +2042,8 @@ mod tests {
         ]))
         .await
         .unwrap();
-        let expected_sig = crabcrop_url::sign(b"test-secret", "300x200/https://example.com/a.jpg");
+        let expected_sig =
+            crabcrop_url::sign(b"test-secret", "300x200/https://example.com/a.jpg").unwrap();
         assert_eq!(
             out,
             format!("http://img.test/{expected_sig}/300x200/https://example.com/a.jpg")
@@ -1985,7 +2104,7 @@ mod tests {
     async fn explain_describes_the_segments_and_verifies() {
         let secret = "test-secret";
         let remainder = "300x200/filters:grayscale:format(webp)/https://example.com/a.jpg";
-        let sig = crabcrop_url::sign(secret.as_bytes(), remainder);
+        let sig = crabcrop_url::sign(secret.as_bytes(), remainder).unwrap();
         let out = exec(&args(&[
             "explain",
             "--secret",
@@ -2026,7 +2145,7 @@ mod tests {
             url,
             format!(
                 "http://img.test/{}/crop:300x200/https://example.com/cat.jpg",
-                crabcrop_url::sign(b"s", "crop:300x200/https://example.com/cat.jpg")
+                crabcrop_url::sign(b"s", "crop:300x200/https://example.com/cat.jpg").unwrap()
             )
         );
         assert!(warnings.is_empty(), "{warnings:?}");

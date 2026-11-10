@@ -332,5 +332,80 @@
       "input": "source",
       "character": "\u00e9"
     }
+  },
+  {
+    "description": "signs: a source whose path names a key label: only a remainder that begins with the reserved segment is refused",
+    "secret": "s3cr3t",
+    "remainder": "300x200/https://example.com/crabcrop/purge-key.jpg",
+    "signature": "458f13f0e6e221c1be4b0ac8a9848f8c733a49e44f58089ad6359c705fadb5d4"
+  },
+  {
+    "description": "signs: a first segment that only starts with the reserved segment's letters",
+    "secret": "s3cr3t",
+    "remainder": "crabcrop-assets/photo.jpg",
+    "signature": "ae1f5fdaf7a447334c5f897a53e624d0b7e44b581b3f387b705899c01834f5cf"
+  },
+  {
+    "description": "reserved: the purge key label as a bare source (its signature would be the purge subkey)",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/purge-key",
+    "remainder": "crabcrop/purge-key"
+  },
+  {
+    "description": "reserved: the purge-group key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/purge-group-key",
+    "remainder": "crabcrop/purge-group-key"
+  },
+  {
+    "description": "reserved: the upload key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/upload-key",
+    "remainder": "crabcrop/upload-key"
+  },
+  {
+    "description": "reserved: the seal key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/seal-key",
+    "remainder": "crabcrop/seal-key"
+  },
+  {
+    "description": "reserved: the cache entry key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/entry-key",
+    "remainder": "crabcrop/entry-key"
+  },
+  {
+    "description": "reserved: a key label split between the operations and the source",
+    "reserved": true,
+    "operations": "crabcrop",
+    "source": "upload-key",
+    "remainder": "crabcrop/upload-key"
+  },
+  {
+    "description": "reserved: the reserved segment alone",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop",
+    "remainder": "crabcrop"
+  },
+  {
+    "description": "reserved: any source under the reserved segment",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/photo.jpg",
+    "remainder": "crabcrop/photo.jpg"
+  },
+  {
+    "description": "reserved: operations under the reserved segment ahead of a real source",
+    "reserved": true,
+    "operations": "crabcrop/300x200",
+    "source": "https://example.com/photo.jpg",
+    "remainder": "crabcrop/300x200/https://example.com/photo.jpg"
   }
 ]

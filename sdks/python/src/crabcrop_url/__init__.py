@@ -49,11 +49,50 @@ def sign_with_key_id(
     return f"{key_id}:{sign(secret, remainder)}"
 
 
+#: The first remainder segment reserved for key derivation.
+#: Every derived subkey (purge, purge-group, upload, seal, and
+#: the server's cache entry key) is the HMAC of a label such as
+#: ``crabcrop/purge-key`` under the secret, which is the image
+#: signature of that label. No image URL may begin with this
+#: segment (the server refuses one with ``400
+#: reserved_segment``), and `sign` and every builder refuse a
+#: remainder that does, so no image signature is ever a subkey.
+RESERVED_SEGMENT = "crabcrop"
+
+_RESERVED_MESSAGE = (
+    f'remainder begins with the reserved segment "{RESERVED_SEGMENT}": '
+    "it is kept for key derivation, and no image URL may begin with it"
+)
+
+
+def is_reserved_remainder(remainder: str) -> bool:
+    """Whether ``remainder`` begins with `RESERVED_SEGMENT`: it
+    is that segment alone or starts with ``crabcrop/``. The
+    test is on the text as written, as the HMAC is:
+    ``exp:1/crabcrop/x`` and ``CRABCROP/x`` are not reserved."""
+    return remainder.split("/", 1)[0] == RESERVED_SEGMENT
+
+
+def _refuse_reserved(remainder: str) -> None:
+    if is_reserved_remainder(remainder):
+        raise ValueError(_RESERVED_MESSAGE)
+
+
+def _subkey(secret: Union[str, bytes], label: str) -> bytes:
+    """A subkey: the raw HMAC-SHA256 of ``label`` under the
+    secret. Every label begins with `RESERVED_SEGMENT`, which
+    is why `sign` refuses to compute the same value."""
+    return hmac.new(_key(secret), label.encode("utf-8"), hashlib.sha256).digest()
+
+
 def sign(secret: Union[str, bytes], remainder: str) -> str:
     """Compute the signature segment for a remainder: the
     lowercase hex HMAC-SHA256 of ``remainder`` under ``secret``.
     The remainder is everything after the signature segment in
-    the URL, exactly as it will appear."""
+    the URL, exactly as it will appear. A remainder that begins
+    with `RESERVED_SEGMENT` raises ``ValueError``: its
+    signature could be a derived subkey."""
+    _refuse_reserved(remainder)
     return hmac.new(_key(secret), remainder.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -61,8 +100,8 @@ def purge_key(secret: Union[str, bytes]) -> bytes:
     """The purge subkey: the raw bytes of the HMAC-SHA256
     of the domain label ``crabcrop/purge-key`` under the
     secret. Purge signatures live under this derived key,
-    so an image signature can never be replayed as one."""
-    return bytes.fromhex(sign(secret, "crabcrop/purge-key"))
+    so an image signature never verifies as one."""
+    return _subkey(secret, "crabcrop/purge-key")
 
 
 def purge_signature(secret: Union[str, bytes], target: str) -> str:
@@ -80,7 +119,7 @@ def purge_group_key(secret: Union[str, bytes]) -> bytes:
     Purge-group signatures live under this derived key,
     beside the purge key, so a per-target purge signature
     can never be transplanted to the purge-group endpoint."""
-    return bytes.fromhex(sign(secret, "crabcrop/purge-group-key"))
+    return _subkey(secret, "crabcrop/purge-group-key")
 
 
 def purge_group_signature(secret: Union[str, bytes], group: str) -> str:
@@ -96,9 +135,11 @@ def upload_key(secret: Union[str, bytes]) -> bytes:
     """The upload subkey: the raw bytes of the HMAC-SHA256
     of the domain label ``crabcrop/upload-key`` under the
     secret. Upload signatures live under this derived key,
-    so neither an image signature nor a purge signature can
-    be replayed as one."""
-    return bytes.fromhex(sign(secret, "crabcrop/upload-key"))
+    so neither an image signature nor a purge signature
+    verifies as one: a purge signature is under another
+    subkey, and no signer signs a label (see
+    `RESERVED_SEGMENT`)."""
+    return _subkey(secret, "crabcrop/upload-key")
 
 
 def upload_signature(
@@ -140,6 +181,11 @@ def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
         if not is_valid_key_id(key_id):
             return False
         signature = tag
+    # No signature over a reserved remainder is ever valid: the
+    # server refuses it whatever the signature, and this check
+    # must not confirm a derived subkey either.
+    if is_reserved_remainder(remainder):
+        return False
     return hmac.compare_digest(sign(secret, remainder), signature)
 
 
@@ -176,7 +222,7 @@ def seal_key(secret: Union[str, bytes]) -> bytes:
     keyring entry yields its own seal subkey, and the
     rotation window for signatures is the rotation window
     for tokens."""
-    return bytes.fromhex(sign(secret, "crabcrop/seal-key"))
+    return _subkey(secret, "crabcrop/seal-key")
 
 
 def _aesgcm():
@@ -309,14 +355,19 @@ def build_sealed_url(
         _validate_expires(expires)
     _validate_url_text(operations, "operations")
     _validate_url_text(source, "source")
-    if secret is None:
-        raise SealError("sealing requires a secret: there is no unsafe token")
     remainder = ""
     if expires is not None:
         remainder += f"exp:{expires}/"
     if operations:
         remainder += f"{operations}/"
     remainder += source
+    # The server refuses a token whose remainder begins with
+    # the reserved segment, so the builder refuses it, as it
+    # refuses a character that cannot travel.
+    if is_reserved_remainder(remainder):
+        raise SealError(_RESERVED_MESSAGE)
+    if secret is None:
+        raise SealError("sealing requires a secret: there is no unsafe token")
     segment = seal_url(secret, remainder, key_id)
     trimmed = base.rstrip("/")
     if name:
@@ -387,6 +438,9 @@ def build_url(
     if operations:
         remainder += f"{operations}/"
     remainder += source
+    # Refused with or without a secret: the server refuses the
+    # URL whatever its signature.
+    _refuse_reserved(remainder)
     if secret is None:
         if key_id is not None:
             raise ValueError("key_id requires a secret: an unsafe URL has no key to name")
