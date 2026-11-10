@@ -25,14 +25,16 @@ Create a custom cache policy for the behavior:
 - Cache key: no query strings, no cookies, no headers (step 3 adds one header, deliberately)
 - Compression: off (the payloads are already-encoded images)
 
-The managed `CachingOptimized` policy looks close and is wrong for this origin in one specific way: its minimum TTL is 1 second, and **a minimum TTL above 0 makes CloudFront ignore `no-store`, `no-cache`, and `private` from the origin**. crabcrop marks its meta responses and its error responses `private, no-store` on purpose; under a nonzero floor those get cached anyway. Minimum TTL 0 is the whole fix: explicit origin headers then govern, the year-long image TTL is honored (capped by the maximum), and a response with no cache headers at all gets the default TTL of 0, which is to say it is not cached.
+The managed `CachingOptimized` policy looks close and is wrong for this origin in one specific way: its minimum TTL is 1 second, and **a minimum TTL above 0 makes CloudFront ignore `no-store`, `no-cache`, and `private` from the origin**. crabcrop marks its meta responses `private, no-store` and its error responses `no-store` on purpose; under a nonzero floor those get cached anyway. Minimum TTL 0 is the fix for responses that succeed: explicit origin headers then govern, and the year-long image TTL is honored (capped by the maximum).
 
-Pair it with an origin request policy that forwards what crabcrop actually reads and nothing else:
+Errors need one more setting. CloudFront caches a `4xx` or `5xx` answer from the origin on its own, for the error caching minimum TTL (10 seconds by default), apart from the cache policy, and under a key that does not carry the request headers the error may have depended on. In the distribution's error pages, add a custom error response for each of `400`, `403`, `404`, `405`, `500`, `501`, `502`, `503`, and `504`, with **Error caching minimum TTL: 0** and no custom response page. CloudFront then passes crabcrop's own error through and does not keep it, so a request that failed (a source not uploaded yet, a moment of overload) never answers the URL's next viewers.
 
-- Headers: `Accept`, `DPR`, `Sec-CH-DPR`, `Sec-CH-Width`, `Sec-CH-Viewport-Width`
+Pair it with an origin request policy that forwards what crabcrop needs and nothing else:
+
+- Headers: `Accept` only
 - Query strings: none. Cookies: none.
 
-Query strings carry nothing in a crabcrop URL (the whole request is the path), so keeping them out of both the key and the origin request stops a junk parameter from fragmenting the cache or reaching the origin.
+Query strings carry nothing in a crabcrop URL (the whole request is the path), so keeping them out of both the key and the origin request stops a junk parameter from fragmenting the cache or reaching the origin. The client hint headers (`DPR`, `Sec-CH-DPR`, `Sec-CH-Width`, `Width`, `Sec-CH-Viewport-Width`, `Viewport-Width`, `Save-Data`) stay out for the same reason: they can change a URL's size or quality, and no cache key here carries them (step 3). Set `CRABCROP_CLIENT_HINTS=0` on the origin as well, so it ignores them on any request that does reach it with them and its `Vary` names `Accept` alone, matching the key.
 
 ## 2. Nothing to turn off
 
@@ -40,13 +42,13 @@ CloudFront has no built-in image transformation for custom origins, so there is 
 
 ## 3. Format negotiation: normalize it, or split the cache
 
-Without an explicit `filters:format(...)`, crabcrop negotiates the output format from the request's `Accept` header (AVIF, then JPEG XL, then WebP, by q-value) and can vary dimensions by client hints, all under one URL. With no header in the cache key, the first variant cached is the variant every later visitor gets, whatever their browser sent. Three ways to handle it, in order:
+Without an explicit `filters:format(...)`, crabcrop negotiates the output format from the request's `Accept` header (AVIF, then JPEG XL, then WebP, by q-value), all under one URL. With no header in the cache key, the first variant cached is the variant every later visitor gets, whatever their browser sent. Three ways to handle it, in order:
 
 1. **Pin the format in the URL** (`filters:format(avif)`). Each format becomes a different signed URL and its own cache entry. No edge features involved. This is the recommended default behind any CDN, not just CloudFront.
 2. **The `normalize-accept.js` function in this directory** (a CloudFront Function, attached as viewer request). A cache policy *can* add the raw `Accept` header to the cache key, but raw values fragment terribly: browsers and clients send dozens of spellings and orderings that all mean the same three formats. The function rewrites `Accept` to the single token the origin's own negotiation would pick (`image/avif`, `image/jxl`, or `image/webp`), following the server's exact rules (q-values, refusal at q=0, the AVIF/JXL/WebP tie order, wildcards are not an offer). Viewer request functions run before the cache lookup, so the rewritten header is both what the cache key sees (add `Accept` to the key when you use the function) and what reaches the origin. Meta requests pass through untouched: an `Accept` asking for `application/json` is how crabcrop knows to answer with JSON, and rewriting it would break meta. Requests offering no negotiable format also pass through, and the origin serves the source format. The function is verified against the server's negotiation tests' cases; it costs $0.10 per million invocations.
 3. **Raw `Accept` in the cache key**, no function. Correct, and the cache fills with one entry per spelling. Only reasonable on low-traffic distributions.
 
-DPR and client-hint variants are not separated by any of the three: build width variants as distinct operations (the SDKs' `build_srcset` does exactly this) instead of relying on client hints behind a CDN. The origin request policy still forwards the hints, so an origin reached directly behaves the same as one behind the distribution; they just share an edge entry.
+None of the three puts the client hint headers in the key, which is why step 1 forwards none of them and runs the origin with `CRABCROP_CLIENT_HINTS=0`: every request for a URL then gets the bytes the edge stores. Build width variants as distinct operations instead (the SDKs' `build_srcset` does exactly this). If an origin keeps hints on, crabcrop serves every response a hint shaped as `private`, which a minimum TTL of 0 keeps out of the edge.
 
 ## 4. Expiring URLs: the edge does not read them
 
@@ -87,7 +89,9 @@ Run against your distribution after setup:
 3. Invalidate one URL in both layers, then request it: `x-cache: Miss from cloudfront`, then a Hit again on the next request.
 4. If you use tag invalidation: request a `preset:` URL, invalidate `#<name>`, and request it again. A Miss proves the tags landed.
 5. If you left formats unpinned with the function attached, request one URL with a Chrome `Accept` header and then with a Safari one. Different bytes (AVIF versus the Safari-negotiated format) under the two spellings that mean the same thing prove the normalization is keying correctly; identical bytes across an AVIF and a JPEG-only `Accept` mean it is not.
+6. Request a new signed image URL with a `DPR: 3` header, then without it. Identical bytes, and a `Vary` of `Accept` alone, prove the hints neither reach nor change the origin's answer (step 1).
+7. Request a signed URL whose source does not exist, twice. Both answers are crabcrop's `404` with `Cache-Control: no-store`, and crabcrop's log shows both requests: the custom error responses keep CloudFront from caching errors (step 1).
 
 ## Teardown
 
-Disable the distribution, then delete it: that takes the behavior, the custom cache policy, the origin request policy, the `normalize-accept` function association, and the `CacheTagConfig` with it. Delete the policy and the function themselves afterwards if nothing else uses them. If the distribution carries other hostnames, removing only the crabcrop behavior is enough.
+Disable the distribution, then delete it: that takes the behavior, the custom cache policy, the origin request policy, the custom error responses, the `normalize-accept` function association, and the `CacheTagConfig` with it. Delete the policy and the function themselves afterwards if nothing else uses them. If the distribution carries other hostnames, removing only the crabcrop behavior is enough.

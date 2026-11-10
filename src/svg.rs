@@ -9,10 +9,15 @@
 //! handler attributes are dropped, and every reference
 //! (`href`, CSS `url(...)`) that does not point at a fragment
 //! inside the document or an embedded `data:` payload is
-//! stripped, so a sanitized SVG can only draw what it carries.
+//! stripped: an `href` is kept only when it names an element
+//! of the document (`#id`) or is a well-formed `data:` URL.
 //! Rasterization is resvg/usvg (pure Rust), whose render model
-//! has no scripts or network access to begin with: defense in
-//! depth, with the sanitizer as the explicit, tested layer.
+//! has no scripts or network access to begin with. Its image
+//! loader, though, reads any `href` that is not a data URL as
+//! a file path, so [`build`] replaces that loader with one
+//! that resolves nothing: whatever the sanitizer keeps, the
+//! renderer draws only payloads the document embeds, and a
+//! sanitized SVG can only draw what it carries.
 //!
 //! The server never runs usvg in its own process (issue
 //! #447). [`screen`] sanitizes and runs the pre-parse bound
@@ -189,6 +194,22 @@ fn has_external_url_ref(value: &str) -> bool {
     false
 }
 
+/// Whether an `href` value points inside the document: a
+/// fragment reference to an element ID (`#id`, whatever
+/// characters the ID holds, `/` included), or a `data:` URL
+/// with the comma every data URL has between its media type
+/// and its payload. A value that only starts like a data URL
+/// (`data:x.png`) is dropped here. An image href that names no
+/// element (`#x.png`) is kept and draws nothing: usvg hands it
+/// to the renderer's own loader, which resolves nothing but
+/// data URLs (see [`image_href_resolver`]).
+fn is_document_href(value: &str) -> bool {
+    if let Some(id) = value.strip_prefix('#') {
+        return !id.is_empty();
+    }
+    starts_with_ci(value, "data:") && value.contains(',')
+}
+
 fn keep_attribute(attr: roxmltree::Attribute) -> bool {
     let name = attr.name();
     // Event handlers (onclick, onload, ...) are behavior, not
@@ -197,8 +218,7 @@ fn keep_attribute(attr: roxmltree::Attribute) -> bool {
         return false;
     }
     if name.eq_ignore_ascii_case("href") {
-        let value = attr.value().trim();
-        return value.starts_with('#') || starts_with_ci(value, "data:");
+        return is_document_href(attr.value().trim());
     }
     if has_external_url_ref(attr.value()) {
         return false;
@@ -852,10 +872,7 @@ fn build(clean: &str) -> Result<Prepared, String> {
     }));
     let opt = usvg::Options {
         font_resolver: font_resolver(),
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: nested_svg_resolver(budget.clone()),
-            resolve_string: usvg::ImageHrefResolver::default_string_resolver(),
-        },
+        image_href_resolver: image_href_resolver(budget.clone()),
         ..Default::default()
     };
     let tree =
@@ -878,6 +895,21 @@ fn build(clean: &str) -> Result<Prepared, String> {
     // walk visits at most MAX_EXPANDED_NODES nodes.
     check_raster_budget(embedded_raster_bytes(tree.root()))?;
     Ok(Prepared { tree })
+}
+
+/// How the renderer loads what an `<image>` or `feImage` href
+/// names. An embedded `data:` payload goes through the nested
+/// budget ([`nested_svg_resolver`]). Every other href resolves
+/// to nothing: usvg's default treats it as a file path and
+/// reads it from disk, relative to the working directory the
+/// worker inherits, and a source SVG never draws from the
+/// filesystem. usvg resolves the hrefs of an SVG nested in an
+/// image the same way.
+fn image_href_resolver(budget: Arc<Mutex<NestedBudget>>) -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: nested_svg_resolver(budget),
+        resolve_string: Box::new(|_, _| None),
+    }
 }
 
 /// usvg's own font lookups, with the system fonts loaded the
@@ -1314,6 +1346,88 @@ mod tests {
         let clean = sanitize(svg).unwrap();
         assert!(clean.contains("url(#g)"), "{clean}");
         assert!(clean.contains("data:image/png"), "{clean}");
+    }
+
+    #[test]
+    fn the_renderer_reads_no_file_an_href_names() {
+        // usvg hands every href that is not a data URL to the
+        // string resolver, whose default reads it as a file
+        // path. The renderer's resolver must find nothing, even
+        // for an absolute path to a readable PNG.
+        let dir = crate::test_support::scratch_dir("svg-href-file");
+        let png = dir.join("red.png");
+        DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .save(&png)
+        .unwrap();
+        let budget = Arc::new(Mutex::new(NestedBudget {
+            nodes: MAX_EXPANDED_NODES as u64,
+            bytes: crate::engine::MAX_DECODE_ALLOC,
+            depth: MAX_CONVERSION_DEPTH,
+            refusal: None,
+        }));
+        let resolver = image_href_resolver(budget);
+        let options = usvg::Options::default();
+        let path = png.to_str().unwrap();
+        assert!((resolver.resolve_string)(path, &options).is_none());
+        // The same bytes embedded as a data payload still draw.
+        let payload = Arc::new(std::fs::read(&png).unwrap());
+        assert!(
+            (resolver.resolve_data)("image/png", payload, &options).is_some(),
+            "a data payload must still draw"
+        );
+    }
+
+    #[test]
+    fn sanitizer_keeps_only_hrefs_that_point_inside_the_document() {
+        for kept in [
+            "#g",
+            "#a.b-c_d",
+            "#icons/arrow",
+            "#a\\b",
+            "#/../x.png",
+            "data:image/png;base64,iVBORw0KGgo=",
+            "DATA:image/svg+xml,%3Csvg/%3E",
+            "data:,",
+        ] {
+            assert!(is_document_href(kept), "{kept}");
+        }
+        for dropped in [
+            "#",
+            "data:x.png",
+            "data:/../../etc/x.png",
+            "/etc/x.png",
+            "x.png",
+            "file:///etc/x.png",
+        ] {
+            assert!(!is_document_href(dropped), "{dropped}");
+        }
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><image href="data:x.png" width="10" height="10"/><image href="x.png" width="10" height="10"/><use href="#r"/><rect id="r" width="1" height="1"/></svg>"##;
+        let clean = sanitize(svg).unwrap();
+        assert!(!clean.contains("data:x.png"), "{clean}");
+        assert!(!clean.contains("\"x.png\""), "{clean}");
+        assert!(clean.contains("href=\"#r\""), "{clean}");
+    }
+
+    #[test]
+    fn references_to_ids_with_path_characters_still_draw() {
+        // An element ID may hold `/` or `\`, as sprite sheets'
+        // `icons/arrow` do. A reference to one names an element,
+        // not a file, and draws that element.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="40" height="20"><defs><rect id="icons/arrow" width="20" height="20" fill="#ff0000"/><rect id="a\b" width="20" height="20" fill="#0000ff"/></defs><use xlink:href="#icons/arrow"/><use href="#a\b" x="20"/></svg>"##;
+        let clean = sanitize(svg).unwrap();
+        assert!(clean.contains("#icons/arrow"), "{clean}");
+        assert!(clean.contains("#a\\b"), "{clean}");
+        let img = prepare(svg.as_bytes())
+            .unwrap()
+            .render(40, 20)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(img.get_pixel(10, 10), &image::Rgba([255, 0, 0, 255]));
+        assert_eq!(img.get_pixel(30, 10), &image::Rgba([0, 0, 255, 255]));
     }
 
     #[test]

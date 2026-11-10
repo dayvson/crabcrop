@@ -27,7 +27,7 @@ spec:
         fsGroup: 65534
       containers:
         - name: crabcrop
-          image: ghcr.io/dayvson/crabcrop:0.10.1
+          image: ghcr.io/dayvson/crabcrop:0.11.0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

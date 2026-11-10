@@ -161,7 +161,31 @@ async fn spawn_app(allow_unsafe: bool) -> String {
 }
 
 async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String>) -> String {
-    let state = AppState {
+    spawn_state(base_test_state(allow_unsafe, metrics_token)).await
+}
+
+/// [`spawn_app`]'s server with `CRABCROP_CLIENT_HINTS` set
+/// to `client_hints`.
+async fn spawn_app_with_client_hints(client_hints: bool) -> String {
+    let mut state = base_test_state(false, Some(TEST_METRICS_TOKEN.to_string()));
+    state.client_hints = client_hints;
+    spawn_state(state).await
+}
+
+/// Serve `state` on a free local port, returning its base
+/// URL.
+async fn spawn_state(state: AppState) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The state [`spawn_app`] serves.
+fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
+    AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
         allow_unsafe,
         loader: Loader::with_defaults().unwrap(),
@@ -196,6 +220,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -214,13 +239,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app(state)).await.unwrap();
-    });
-    format!("http://{addr}")
+    }
 }
 
 /// Two-frame animated GIF bytes for the video tests.
@@ -340,6 +359,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -403,6 +423,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -466,6 +487,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -539,6 +561,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -622,6 +645,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -906,6 +930,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1265,6 +1290,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -1335,6 +1361,7 @@ async fn spawn_app_rotating() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1408,6 +1435,7 @@ async fn spawn_app_with_fallback() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1444,6 +1472,120 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// The negotiation of a plain request: no hints, no
+/// Accept, no meta.
+fn plain_negotiation(ops: &[crate::url::Operation]) -> Negotiated {
+    Negotiated {
+        directives: crate::url::RequestDirectives::analyze(ops),
+        preferred: None,
+        effective_dpr: 1.0,
+        hinted_width: None,
+        save_data_applies: false,
+        meta: false,
+        debug: false,
+        placeholders: false,
+    }
+}
+
+#[test]
+fn an_ordinary_url_keeps_its_cache_key() {
+    let remainder = "300x200/filters:grayscale/http://x/heroes/cat.jpg";
+    let (ops, source, _, _) = parse_operations_with_expiry(remainder).unwrap();
+    let key = cache_key_for("test", &ops, source, &plain_negotiation(&ops));
+    assert_eq!(
+        key,
+        format!(
+            "{}#cfgtest#source",
+            crate::url::canonical_form(&ops, source)
+        )
+    );
+}
+
+#[test]
+fn a_padded_source_is_keyed_by_a_bounded_digest() {
+    // Empty path segments survive into the source, so a
+    // padded source used to put its whole length into the
+    // key: a 58 KB key for a 70-byte entry.
+    let source = format!("http://origin{}t.png", "/".repeat(58_000));
+    let remainder = format!("filters:format(png)/{source}");
+    let (ops, parsed, _, _) = parse_operations_with_expiry(&remainder).unwrap();
+    assert_eq!(parsed, source);
+    let key = cache_key_for("test", &ops, parsed, &plain_negotiation(&ops));
+    assert!(
+        key.len() <= crate::cache::MAX_KEY_BASE_BYTES + "#cfgtest".len(),
+        "a {}-byte key",
+        key.len()
+    );
+    // Another padding is another entry.
+    let longer = format!("http://origin{}t.png", "/".repeat(58_001));
+    let other = cache_key_for("test", &ops, &longer, &plain_negotiation(&ops));
+    assert_ne!(key, other);
+}
+
+/// A source server that reads each whole request head before
+/// it answers, however long the request line, and counts the
+/// requests.
+async fn spawn_reading_counting_server(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counted = hits.clone();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            tokio::spawn(async move {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                reply_and_close(&mut socket, head.as_bytes(), &body).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn an_over_long_url_caches_and_purges_under_its_bounded_key() {
+    // The serve path and the purge path bound the key the
+    // same way, so a URL past the key bound still caches,
+    // and its purge still finds the entry.
+    let (origin, hits) = spawn_reading_counting_server(test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("300x200/{origin}{}src.png", "/".repeat(6_000));
+    assert!(remainder.len() > crate::cache::MAX_KEY_BASE_BYTES);
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
+    for _ in 0..2 {
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the second request is a hit"
+    );
+    let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+    let resp = client()
+        .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.text().await.unwrap().contains("purged 1"));
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the purge evicted the entry"
+    );
 }
 
 #[tokio::test]
@@ -1795,6 +1937,8 @@ async fn sealed_payload_failures_are_one_uniform_refusal() {
         // A reserved segment at the payload head.
         "purge/anything".to_string(),
         "upload/heroes/cat.jpg".to_string(),
+        "crabcrop/purge-key".to_string(),
+        format!("crabcrop/300x50/{src}"),
         // An unknown preset (a grammar error on every
         // server).
         format!("preset:nope/{src}"),
@@ -1809,6 +1953,63 @@ async fn sealed_payload_failures_are_one_uniform_refusal() {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{remainder}");
         assert_eq!(resp.text().await.unwrap(), "bad signature", "{remainder}");
     }
+}
+
+/// Every derived subkey (purge, purge-group, upload, seal,
+/// cache entry) is the HMAC of a label under the reserved
+/// segment. An image or explain request whose remainder
+/// begins with that segment answers the same 400 whatever
+/// its signature (the right one, a wrong one, a keyed one,
+/// `unsafe`): the answer never depends on the signature.
+#[tokio::test]
+async fn a_reserved_remainder_is_refused_before_its_signature_is_checked() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(true).await;
+    for remainder in [
+        "crabcrop/purge-key".to_string(),
+        "crabcrop/purge-group-key".to_string(),
+        "crabcrop/upload-key".to_string(),
+        "crabcrop/seal-key".to_string(),
+        "crabcrop/entry-key".to_string(),
+        "crabcrop".to_string(),
+        format!("crabcrop/300x50/{src}"),
+    ] {
+        let right = sign(&remainder);
+        for segment in [
+            right.clone(),
+            "0".repeat(64),
+            format!("k2:{right}"),
+            "unsafe".to_string(),
+        ] {
+            for route in ["", "explain/"] {
+                let resp = client()
+                    .get(format!("{base}/{route}{segment}/{remainder}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{route}{segment}/{remainder}"
+                );
+                assert_eq!(
+                    resp.text().await.unwrap(),
+                    "an image URL may not begin with the reserved segment crabcrop",
+                    "{route}{segment}/{remainder}"
+                );
+            }
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was fetched");
+    // A remainder that only names a label further in is an
+    // ordinary image URL: a wrong signature is still a 403.
+    let remainder = format!("300x50/{src}");
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", "0".repeat(64)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -2297,6 +2498,12 @@ async fn assert_error_modes(
 
 fn load_error_cases() -> Vec<(LoadError, StatusCode, &'static str, String)> {
     vec![
+        (
+            LoadError::LookupBusy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_busy",
+            "server busy: too many source host lookups waiting".to_string(),
+        ),
         (
             LoadError::Forbidden("a policy reason".to_string()),
             StatusCode::FORBIDDEN,
@@ -3086,6 +3293,7 @@ async fn spawn_app_with_presets_and_roots(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -4323,6 +4531,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -4505,6 +4714,7 @@ async fn spawn_app_with_moderation(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -4839,6 +5049,7 @@ async fn spawn_app_with_ocr_timeout(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5262,6 +5473,7 @@ async fn spawn_app_with_embeddings(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6008,6 +6220,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6073,6 +6286,7 @@ async fn spawn_app_with_studio() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: Some([0xf5, 0xf0, 0xe8]),
         presets: std::collections::HashMap::new(),
@@ -6138,6 +6352,7 @@ async fn spawn_app_with_inpaint() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6235,6 +6450,7 @@ async fn spawn_app_with_segment() -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6728,6 +6944,7 @@ async fn spawn_app_with_providers(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6807,6 +7024,7 @@ async fn spawn_app_full(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -6940,13 +7158,13 @@ fn oversized_source_is_a_bad_gateway() {
 }
 
 #[tokio::test]
-async fn policy_refusal_body_names_no_resolution() {
-    // The refusal reason can carry a server-side DNS
-    // resolution; the image path answers with the same
-    // generic body as the explain path (issue #196,
-    // requirement 3), and the reason stays in the log.
+async fn policy_refusal_body_names_no_reason() {
+    // The refusal reason can name operator configuration;
+    // the image path answers with the same generic body as
+    // the explain path (issue #196, requirement 3), and the
+    // reason stays in the log.
     let resp = load_error_response(
-        LoadError::Forbidden("host localhost resolves to a non-public address (::1)".to_string()),
+        LoadError::Forbidden("bucket private-media is not an allowed source".to_string()),
         None,
     );
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -6995,6 +7213,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        true,
     );
     finalize_validators(&mut resp, &etag, None);
     assert_eq!(resp.status(), StatusCode::OK);
@@ -7006,6 +7225,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        true,
     );
     finalize_validators(&mut resp, &etag, Some(etag.as_str()));
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
@@ -7021,6 +7241,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        true,
     );
     finalize_validators(&mut resp, &etag, Some("\"other\""));
     assert_eq!(resp.status(), StatusCode::OK);
@@ -7035,14 +7256,26 @@ fn validators_skip_meta_and_error_responses() {
     let etag = etag_for_bytes(b"rendered bytes");
     // Meta responses are private, no-store: no ETag is
     // attached and a matching conditional never 304s them.
-    let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);
+    let mut resp = respond(
+        ImageFormat::Png,
+        None,
+        bytes::Bytes::from(vec![1]),
+        None,
+        true,
+    );
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     finalize_validators(&mut resp, &etag, Some(etag.as_str()));
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers().get(header::ETAG).is_none());
     // An error status is left alone too, public or not.
-    let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);
+    let mut resp = respond(
+        ImageFormat::Png,
+        None,
+        bytes::Bytes::from(vec![1]),
+        None,
+        true,
+    );
     *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     finalize_validators(&mut resp, &etag, Some(etag.as_str()));
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -7234,6 +7467,503 @@ async fn save_data_steps_quality_and_separates_the_cache() {
     let remainder = format!("filters:format(jpeg):quality(90)/{src}");
     let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
     assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+}
+
+#[tokio::test]
+async fn a_save_data_answer_is_stepped_only_where_its_entry_and_privacy_follow() {
+    // One decision settles whether Save-Data steps a
+    // render, gives it its own cache entry, and keeps it
+    // from shared caches. A per-format quality list that
+    // names no value for the output format is where the
+    // engine and the key could part: a stepped encode
+    // stored under the URL's plain entry, served public,
+    // and then returned to plain requests. Whatever the
+    // rule says for such a URL, a stepped answer is private
+    // and the plain answer is never the stepped encode.
+    let detailed = DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 200, |x, y| {
+        image::Rgb([
+            (x * 255 / 320) as u8,
+            (y * 255 / 200) as u8,
+            ((x + y) * 7) as u8,
+        ])
+    }));
+    let mut png = Vec::new();
+    detailed
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let (src, _) = spawn_counting_server(200, "image/png", png).await;
+    for remainder in [
+        format!("filters:format(webp):quality(jpeg:90)/{src}"),
+        format!("200x0/filters:format(jpeg):quality(webp:60)/{src}"),
+    ] {
+        // The URL's plain answer, rendered by a server that
+        // has seen no Save-Data request.
+        let reference = spawn_app(false).await;
+        let resp = get_with_headers(&reference, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{remainder}");
+        let plain = resp.bytes().await.unwrap();
+        // Save-Data first, on a fresh server.
+        let base = spawn_app(false).await;
+        let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{remainder}");
+        let stepped = header(&resp, "x-crabcrop-quality") == "70";
+        let cache_control = header(&resp, "cache-control");
+        let body = resp.bytes().await.unwrap();
+        if stepped {
+            assert_eq!(cache_control, YEAR_PRIVATE, "stepped: {remainder}");
+        } else {
+            assert_eq!(cache_control, YEAR_PUBLIC, "{remainder}");
+            assert_eq!(body, plain, "a public Save-Data answer: {remainder}");
+        }
+        // The plain request after it gets the plain answer.
+        let resp = get_with_headers(&base, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{remainder}");
+        assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC, "{remainder}");
+        assert_eq!(resp.bytes().await.unwrap(), plain, "{remainder}");
+    }
+}
+
+/// The `Vary` every image-route answer carries while client
+/// hints are on, the published value.
+const HINTED_VARY: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
+
+const YEAR_PUBLIC: &str = "public, max-age=31536000, immutable";
+const YEAR_PRIVATE: &str = "private, max-age=31536000, immutable";
+const JSON: Pairs = &[("Accept", "application/json")];
+
+/// Request headers, as name and value pairs.
+type Pairs<'a> = &'a [(&'a str, &'a str)];
+
+/// GET `path` (already signed or sealed) with `pairs` as
+/// request headers.
+async fn get_path(base: &str, path: &str, pairs: &[(&str, &str)]) -> reqwest::Response {
+    let mut req = client().get(format!("{base}{path}"));
+    for (name, value) in pairs {
+        req = req.header(*name, *value);
+    }
+    req.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn image_route_errors_are_no_store_and_vary_like_the_image() {
+    // An error is one request's answer at one moment, never
+    // what the URL is: a cache must not hand it to the next
+    // viewer, so every class leaves with no-store, and with
+    // the image's Vary, since its body follows Accept and a
+    // hint can lead to it.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (missing, _) = spawn_counting_server(404, "text/plain", b"gone".to_vec()).await;
+    let (broken, _) = spawn_counting_server(500, "text/plain", b"boom".to_vec()).await;
+    let base = spawn_app(false).await;
+    let image = format!("20x15/{src}");
+    let resp = get_with_headers(&base, &image, &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC);
+    assert_eq!(header(&resp, "vary"), HINTED_VARY);
+    let unparsable = format!("filters:bogus(1)/{src}");
+    let not_found = format!("20x15/{missing}");
+    let bad_gateway = format!("20x15/{broken}");
+    let debug = format!("debug:focal/crop:50x50:smart/{src}");
+    let signed = |remainder: &str| format!("/{}/{remainder}", sign(remainder));
+    let sealed = |remainder: &str| format!("/{}", sealed_path(remainder, None));
+    let cases: Vec<(&str, String, Pairs, u16)> = vec![
+        ("parse error", signed(&unparsable), &[], 400),
+        ("parse error, envelope", signed(&unparsable), JSON, 400),
+        ("bad signature", format!("/deadbeef/{image}"), &[], 403),
+        ("source not found", signed(&not_found), &[], 404),
+        // Meta mode is on here: the meta path's own failure.
+        ("meta, source not found", signed(&not_found), JSON, 404),
+        ("origin failure", signed(&bad_gateway), &[], 502),
+        ("meta of a debug view", signed(&debug), JSON, 400),
+        ("sealed, source not found", sealed(&not_found), &[], 403),
+        ("sealed meta of a debug view", sealed(&debug), JSON, 403),
+        (
+            "sealed, unopened",
+            "/s1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            &[],
+            403,
+        ),
+    ];
+    for (label, path, pairs, status) in cases {
+        let resp = get_path(&base, &path, pairs).await;
+        assert_eq!(resp.status().as_u16(), status, "{label}");
+        assert_eq!(header(&resp, "cache-control"), "no-store", "{label}");
+        assert_eq!(header(&resp, "vary"), HINTED_VARY, "{label}");
+    }
+    // The meta refusal keeps the meta document's own header.
+    let base = spawn_app_with_meta_enabled(false).await;
+    let resp = get_path(&base, &signed(&image), JSON).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "cache-control"), "private, no-store");
+    assert_eq!(header(&resp, "vary"), HINTED_VARY);
+}
+
+#[tokio::test]
+async fn errors_on_the_other_routes_are_no_store() {
+    let base = spawn_app(false).await;
+    let cases = [
+        (
+            "unrouted method",
+            client().delete(format!("{base}/anything")),
+        ),
+        (
+            "PUT fallback",
+            client().put(format!("{base}/anything")).body("x"),
+        ),
+        (
+            "explain, bad signature",
+            client().get(format!(
+                "{base}/explain/deadbeef/20x15/http://127.0.0.1:9/a.png"
+            )),
+        ),
+        (
+            "purge, bad signature",
+            client().post(format!(
+                "{base}/purge/deadbeef/20x15/http://127.0.0.1:9/a.png"
+            )),
+        ),
+    ];
+    for (label, req) in cases {
+        let resp = req.send().await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "{label}: {}",
+            resp.status()
+        );
+        assert_eq!(header(&resp, "cache-control"), "no-store", "{label}");
+    }
+}
+
+#[tokio::test]
+async fn every_error_status_leaves_with_no_store() {
+    // The middleware is the one place: whatever builder made
+    // an error, and whatever its status, it leaves no-store.
+    // A no-store answer keeps its own value, and a success
+    // with no cache header of its own is left alone.
+    let router = Router::new()
+        .route(
+            "/status/{code}",
+            get(
+                |axum::extract::Path(code): axum::extract::Path<u16>| async move {
+                    let status = StatusCode::from_u16(code).unwrap();
+                    if status == StatusCode::SERVICE_UNAVAILABLE {
+                        busy_response("server busy", 1, None)
+                    } else {
+                        error_response(status, "some_code", "message".to_string(), None)
+                    }
+                },
+            ),
+        )
+        .route(
+            "/meta-refusal",
+            get(|| async {
+                meta_cache_headers(error_response(
+                    StatusCode::FORBIDDEN,
+                    "meta_disabled",
+                    "off".to_string(),
+                    Some("application/json"),
+                ))
+            }),
+        )
+        .route("/ok", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(security_headers));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}");
+    for code in [
+        400, 401, 403, 404, 405, 409, 413, 415, 500, 501, 502, 503, 504,
+    ] {
+        let resp = client()
+            .get(format!("{base}/status/{code}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), code);
+        assert_eq!(header(&resp, "cache-control"), "no-store", "{code}");
+        if code == 503 {
+            assert_eq!(header(&resp, "retry-after"), "1");
+        }
+    }
+    let resp = client()
+        .get(format!("{base}/meta-refusal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(header(&resp, "cache-control"), "private, no-store");
+    let resp = client().get(format!("{base}/ok")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+}
+
+#[test]
+fn directives_are_matched_by_name() {
+    assert!(has_directive("private, no-store", "no-store"));
+    assert!(has_directive("No-Store", "no-store"));
+    assert!(has_directive("public, max-age=60", "public"));
+    assert!(has_directive("public , max-age=60", "max-age"));
+    assert!(!has_directive("private, max-age=60", "public"));
+    assert!(!has_directive("no-store-ish", "no-store"));
+    assert!(!has_directive("", "public"));
+}
+
+#[tokio::test]
+async fn an_answer_a_client_hint_shaped_is_kept_from_shared_caches() {
+    // A hint header is the requester's own: an answer it
+    // shaped is private, so a cache that keys on the URL
+    // alone never hands it to the next viewer. An answer the
+    // hints left as the URL's own stays public.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app(false).await;
+    let unsized_url = format!("filters:format(jpeg)/{src}");
+    let sized = format!("300x0/filters:format(jpeg)/{src}");
+    let own_dpr = format!("300x0/filters:format(jpeg):dpr(2)/{src}");
+    let own_quality = format!("300x0/filters:format(jpeg):quality(80)/{src}");
+    let short = format!("maxage:60/300x0/filters:format(jpeg)/{src}");
+    let cases: [(&str, &str, Pairs, &str); 16] = [
+        ("bare, unsized", &unsized_url, &[], YEAR_PUBLIC),
+        (
+            "Sec-CH-Width",
+            &unsized_url,
+            &[("Sec-CH-Width", "250")],
+            YEAR_PRIVATE,
+        ),
+        ("Width", &unsized_url, &[("Width", "250")], YEAR_PRIVATE),
+        (
+            "Sec-CH-Viewport-Width",
+            &unsized_url,
+            &[("Sec-CH-Viewport-Width", "250")],
+            YEAR_PRIVATE,
+        ),
+        (
+            "Viewport-Width",
+            &unsized_url,
+            &[("Viewport-Width", "250")],
+            YEAR_PRIVATE,
+        ),
+        ("bare, sized", &sized, &[], YEAR_PUBLIC),
+        (
+            "width hint on a sized URL",
+            &sized,
+            &[("Width", "250")],
+            YEAR_PUBLIC,
+        ),
+        ("DPR", &sized, &[("DPR", "2")], YEAR_PRIVATE),
+        ("Sec-CH-DPR", &sized, &[("Sec-CH-DPR", "1.5")], YEAR_PRIVATE),
+        ("DPR 1", &sized, &[("DPR", "1")], YEAR_PUBLIC),
+        ("DPR out of set", &sized, &[("DPR", "7")], YEAR_PUBLIC),
+        (
+            "DPR under the URL's own dpr",
+            &own_dpr,
+            &[("DPR", "3")],
+            YEAR_PUBLIC,
+        ),
+        ("Save-Data", &sized, &[("Save-Data", "on")], YEAR_PRIVATE),
+        (
+            "Save-Data under the URL's own quality",
+            &own_quality,
+            &[("Save-Data", "on")],
+            YEAR_PUBLIC,
+        ),
+        (
+            "maxage with DPR",
+            &short,
+            &[("DPR", "2")],
+            "private, max-age=60, immutable",
+        ),
+        ("maxage bare", &short, &[], "public, max-age=60, immutable"),
+    ];
+    for (label, remainder, pairs, expected) in cases {
+        // The render, then its cache hit: both paths agree.
+        for pass in ["miss", "hit"] {
+            let resp = get_with_headers(&base, remainder, pairs).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{label} ({pass})");
+            assert_eq!(header(&resp, "cache-control"), expected, "{label} ({pass})");
+            assert_eq!(header(&resp, "vary"), HINTED_VARY, "{label} ({pass})");
+            // The browser that asked still revalidates its
+            // copy: the validator stays on a private answer.
+            assert!(!header(&resp, "etag").is_empty(), "{label} ({pass})");
+        }
+    }
+    // A conditional request answers 304 with the same
+    // privacy as the answer it stands for.
+    let resp = get_with_headers(&base, &sized, &[("DPR", "2")]).await;
+    let etag = header(&resp, "etag");
+    let resp = get_with_headers(&base, &sized, &[("DPR", "2"), ("If-None-Match", &etag)]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(header(&resp, "cache-control"), YEAR_PRIVATE);
+    let resp = get_with_headers(&base, &sized, &[]).await;
+    let etag = header(&resp, "etag");
+    let resp = get_with_headers(&base, &sized, &[("If-None-Match", &etag)]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC);
+}
+
+/// Every hint header the server reads, each with a value
+/// that changes the answer of a URL it applies to.
+const HINT_REQUESTS: [(&str, &str); 7] = [
+    ("DPR", "2"),
+    ("Sec-CH-DPR", "2"),
+    ("Sec-CH-Width", "250"),
+    ("Width", "250"),
+    ("Sec-CH-Viewport-Width", "250"),
+    ("Viewport-Width", "250"),
+    ("Save-Data", "on"),
+];
+
+#[test]
+fn the_hinted_vary_names_accept_and_exactly_the_headers_the_hints_read() {
+    let named: std::collections::BTreeSet<&str> = VARY_WITH_HINTS.split(", ").collect();
+    let read: std::collections::BTreeSet<&str> = DPR_HINT_HEADERS
+        .into_iter()
+        .chain(WIDTH_HINT_HEADERS)
+        .chain([SAVE_DATA_HEADER, "Accept"])
+        .collect();
+    assert_eq!(named, read);
+    assert_eq!(VARY_WITH_HINTS, HINTED_VARY);
+    assert_eq!(VARY_WITHOUT_HINTS, "Accept");
+    // The published row the CDN recipes are checked against
+    // (tests/deploy_recipes.rs) is the header sent.
+    let responses = include_str!("../../docs/responses.md");
+    let row = responses
+        .lines()
+        .find(|l| l.starts_with("| `Vary` |"))
+        .unwrap();
+    assert!(
+        row.starts_with(&format!("| `Vary` | `{VARY_WITH_HINTS}`")),
+        "{row}"
+    );
+    let requested: std::collections::BTreeSet<&str> = HINT_REQUESTS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["Accept"])
+        .collect();
+    assert_eq!(requested, read);
+}
+
+#[tokio::test]
+async fn every_hint_header_in_vary_can_change_the_bytes() {
+    // With hints on, each header the Vary names changes the
+    // bytes of a URL it applies to: Vary leaves none out
+    // that matters, and lists none that cannot.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app(false).await;
+    let unsized_url = format!("filters:format(jpeg)/{src}");
+    let sized = format!("300x0/filters:format(jpeg)/{src}");
+    for (name, value) in HINT_REQUESTS {
+        let remainder = if name.ends_with("Width") {
+            &unsized_url
+        } else {
+            &sized
+        };
+        let bare = get_with_headers(&base, remainder, &[])
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let resp = get_with_headers(&base, remainder, &[(name, value)]).await;
+        assert!(
+            header(&resp, "vary").split(", ").any(|h| h == name),
+            "{name}"
+        );
+        assert_ne!(resp.bytes().await.unwrap(), bare, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn with_client_hints_off_no_hint_header_changes_an_answer() {
+    // CRABCROP_CLIENT_HINTS=0: every request for a URL gets
+    // the same bytes, ETag and headers, whatever hint
+    // headers it sends, alone or together, plain, sized or
+    // sealed; the answers vary on Accept alone, and nothing
+    // asks the browser for hints.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app_with_client_hints(false).await;
+    let unsized_url = format!("filters:format(jpeg)/{src}");
+    let sized = format!("300x0/filters:format(jpeg)/{src}");
+    let paths = [
+        format!("/{}/{unsized_url}", sign(&unsized_url)),
+        format!("/{}/{sized}", sign(&sized)),
+        format!("/{}", sealed_path(&sized, None)),
+    ];
+    let mut requests: Vec<Vec<(&str, &str)>> = HINT_REQUESTS.iter().map(|h| vec![*h]).collect();
+    requests.push(HINT_REQUESTS.to_vec());
+    for path in &paths {
+        let resp = get_path(&base, path, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let etag = header(&resp, "etag");
+        let bare = resp.bytes().await.unwrap();
+        for pairs in &requests {
+            let resp = get_path(&base, path, pairs).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path} {pairs:?}");
+            assert_eq!(
+                header(&resp, "cache-control"),
+                YEAR_PUBLIC,
+                "{path} {pairs:?}"
+            );
+            assert_eq!(header(&resp, "vary"), "Accept", "{path} {pairs:?}");
+            assert_eq!(header(&resp, "accept-ch"), "", "{path} {pairs:?}");
+            assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{path} {pairs:?}");
+            assert_eq!(header(&resp, "etag"), etag, "{path} {pairs:?}");
+            assert_eq!(resp.bytes().await.unwrap(), bare, "{path} {pairs:?}");
+        }
+    }
+    // An error varies on Accept alone too.
+    let resp = get_path(&base, &format!("/deadbeef/{sized}"), &[]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "vary"), "Accept");
+    // /explain forecasts what the image request does: no
+    // hinted factor.
+    let resp = get_path(
+        &base,
+        &format!("/explain/{}/{sized}", sign(&sized)),
+        &[("Accept", "application/json"), ("DPR", "3")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let report: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert!(report["forecast"]["dpr_hint"].is_null(), "{report}");
+    assert_eq!(report["forecast"]["dpr"], 1.0);
+}
+
+#[tokio::test]
+async fn a_client_chosen_request_id_stays_off_answers_shared_caches_keep() {
+    // A shared cache stores an answer with its headers and
+    // hands both to every later viewer of the URL, so a
+    // public answer never carries an ID a client chose. The
+    // server's own ID still goes out, and answers no shared
+    // cache keeps echo the client's.
+    let (src, _) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let (missing, _) = spawn_counting_server(404, "text/plain", b"gone".to_vec()).await;
+    let base = spawn_app(false).await;
+    let image = format!("300x0/filters:format(jpeg)/{src}");
+    let chosen = ("X-Request-Id", "chosen-by-client");
+    for pass in ["miss", "hit"] {
+        let resp = get_with_headers(&base, &image, &[chosen]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{pass}");
+        assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC, "{pass}");
+        assert!(resp.headers().get("x-request-id").is_none(), "{pass}");
+    }
+    let resp = get_with_headers(&base, &image, &[]).await;
+    let etag = header(&resp, "etag");
+    let generated = header(&resp, "x-request-id");
+    assert_eq!(generated.len(), 16, "{generated}");
+    assert!(
+        generated.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{generated}"
+    );
+    let resp = get_with_headers(&base, &image, &[chosen, ("If-None-Match", &etag)]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert!(resp.headers().get("x-request-id").is_none());
+    // A hint-shaped answer is private: the ID comes back.
+    let resp = get_with_headers(&base, &image, &[chosen, ("DPR", "2")]).await;
+    assert_eq!(header(&resp, "cache-control"), YEAR_PRIVATE);
+    assert_eq!(header(&resp, "x-request-id"), "chosen-by-client");
+    // So does an error, which is no-store.
+    let not_found = format!("20x15/{missing}");
+    let resp = get_with_headers(&base, &not_found, &[chosen]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(header(&resp, "x-request-id"), "chosen-by-client");
 }
 
 #[tokio::test]
@@ -7741,7 +8471,7 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
     let remainder = format!("50x50/{src}");
     let forged = format!(
         "{base}/{}/{remainder}",
-        crabcrop_url::sign(b"some-other-secret", &remainder)
+        crabcrop_url::sign(b"some-other-secret", &remainder).unwrap()
     );
     let err = crate::cli::exec(&cli(&["meta", &forged]))
         .await
@@ -8325,6 +9055,7 @@ async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -8412,6 +9143,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -9264,8 +9996,8 @@ async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
         let url = format!("{base}/{segment}/{remainder}");
         async move { client().get(url).send().await.unwrap().status() }
     };
-    let new_unkeyed = crabcrop_url::sign(b"the-new-server-secret", &remainder);
-    let old_unkeyed = crabcrop_url::sign(b"the-old-server-secret", &remainder);
+    let new_unkeyed = crabcrop_url::sign(b"the-new-server-secret", &remainder).unwrap();
+    let old_unkeyed = crabcrop_url::sign(b"the-old-server-secret", &remainder).unwrap();
     // Unkeyed URLs from either era verify.
     assert_eq!(get(new_unkeyed.clone()).await, 200);
     assert_eq!(get(old_unkeyed.clone()).await, 200);
@@ -9526,6 +10258,7 @@ fn provenance_job(
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+        progress: Default::default(),
     }
 }
 
@@ -9637,7 +10370,7 @@ fn provenance_step_signs_a_still_and_records_the_facts() {
 }
 
 #[test]
-fn provenance_step_carries_a_signed_source_chain() {
+fn provenance_step_names_a_signed_source_without_its_store() {
     let signer = crate::provenance::test_signer();
     let parent = signer
         .sign(
@@ -9657,7 +10390,10 @@ fn provenance_step_carries_a_signed_source_chain() {
     assert_eq!(source.state, "valid");
     let output = facts.output.expect("the output is signed");
     assert_eq!(output.state, "valid");
-    assert_eq!(output.manifests, 2, "the parent store rides along");
+    assert_eq!(
+        output.manifests, 1,
+        "the parent's store does not ride along"
+    );
     assert_eq!(output.ingredients, 1);
 }
 
@@ -9729,6 +10465,16 @@ async fn spawn_app_with_signer() -> String {
 async fn spawn_app_with_provenance_signer(
     signer: Arc<crate::provenance::ProvenanceSigner>,
 ) -> String {
+    spawn_signing_app(signer, false).await
+}
+
+/// An app that signs its outputs with `signer`, under the
+/// given metadata policy (`CRABCROP_METADATA=preserve` when
+/// `preserve_metadata`).
+async fn spawn_signing_app(
+    signer: Arc<crate::provenance::ProvenanceSigner>,
+    preserve_metadata: bool,
+) -> String {
     let state = AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
         allow_unsafe: false,
@@ -9764,7 +10510,8 @@ async fn spawn_app_with_provenance_signer(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
-        preserve_metadata: false,
+        client_hints: true,
+        preserve_metadata,
         brand_color: None,
         presets: std::collections::HashMap::new(),
         only_presets: false,
@@ -9789,6 +10536,68 @@ async fn spawn_app_with_provenance_signer(
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_signed_crop_or_redaction_carries_nothing_of_its_source() {
+    // The source is shaped like a camera export: a manifest
+    // store whose claim thumbnail is the whole frame, with
+    // EXIF location, a body serial and an author, plus an
+    // XMP instance ID. A crop keeps only the right half; a
+    // pixelated region covers the left. Under either
+    // metadata policy the signed output names its parent and
+    // carries nothing of the store: no thumbnail, no
+    // assertion, no title, and its size does not follow the
+    // store. The XMP instance ID is the one fact `preserve`
+    // keeps, in the XMP packet that policy copies.
+    let source = crate::provenance::test_source_with_credentials(256 * 1024);
+    let src = spawn_bytes_server(source).await;
+    for preserve in [false, true] {
+        let base = spawn_signing_app(crate::provenance::test_signer(), preserve).await;
+        for (ops, mime) in [
+            ("crop-rect:100x0:200x150", "image/jpeg"),
+            ("filters:pixelate_region(0,0,100,150)", "image/jpeg"),
+            ("crop-rect:100x0:200x150/filters:format(png)", "image/png"),
+        ] {
+            let remainder = format!("{ops}/{src}");
+            let url_path = format!("/{}/{remainder}", sign(&remainder));
+            let resp = client()
+                .get(format!("{base}{url_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{ops}");
+            let bytes = resp.bytes().await.unwrap().to_vec();
+            for fact in crate::provenance::TEST_SOURCE_FACTS {
+                if preserve && fact.starts_with("xmp.iid:") {
+                    continue;
+                }
+                assert!(
+                    !bytes.windows(fact.len()).any(|w| w == fact.as_bytes()),
+                    "{ops} preserve={preserve} carries {fact}"
+                );
+            }
+            let jpeg_starts = bytes
+                .windows(3)
+                .filter(|w| *w == [0xFF, 0xD8, 0xFF])
+                .count();
+            let own = usize::from(mime == "image/jpeg");
+            assert_eq!(
+                jpeg_starts, own,
+                "{ops} preserve={preserve}: no embedded picture"
+            );
+            assert!(
+                bytes.len() < 64 * 1024,
+                "{ops} preserve={preserve}: a {}-byte output",
+                bytes.len()
+            );
+            let summary = crate::provenance::read_manifest(&bytes, mime)
+                .expect("the response carries a manifest");
+            assert_eq!(summary.state, "valid", "{ops} preserve={preserve}");
+            assert_eq!(summary.manifests, 1, "{ops} preserve={preserve}");
+            assert_eq!(summary.ingredients, 1, "{ops} preserve={preserve}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -9930,11 +10739,16 @@ fn signed_source(source: &[u8], format: &str) -> Vec<u8> {
 
 /// The output half of the provenance a signing server's
 /// meta document reports for `source` rendered to PNG, a
-/// signed format whatever the source's own is. The image
-/// response for the same URL is read back too: its active
-/// manifest must name one ingredient, the parent, in
+/// signed format whatever the source's own is, and the
+/// parent ingredient the image response's manifest names.
+/// The image response for the same URL is read back: its
+/// active manifest must name one ingredient, the parent, in
 /// `format`, the source's media type.
-async fn signed_png_provenance(name: &str, source: Vec<u8>, format: &str) -> serde_json::Value {
+async fn signed_png_provenance(
+    name: &str,
+    source: Vec<u8>,
+    format: &str,
+) -> (serde_json::Value, serde_json::Value) {
     let base = spawn_app_with_signer().await;
     let src = spawn_bytes_server(source).await;
     let remainder = format!("40x24/filters:format(png)/{src}");
@@ -9966,7 +10780,19 @@ async fn signed_png_provenance(name: &str, source: Vec<u8>, format: &str) -> ser
     );
     assert_eq!(ingredients[0]["relationship"], "parentOf", "{name}");
     assert_eq!(ingredients[0]["format"], format, "{name}");
-    output
+    (output, ingredients[0].clone())
+}
+
+/// Whether a parent ingredient records that the source's
+/// own manifest store was found and its signature checked.
+fn parent_store_was_read(parent: &serde_json::Value) -> bool {
+    parent["validation_results"]["activeManifest"]["success"]
+        .as_array()
+        .is_some_and(|codes| {
+            codes
+                .iter()
+                .any(|status| status["code"] == "claimSignature.validated")
+        })
 }
 
 #[tokio::test]
@@ -9976,7 +10802,7 @@ async fn a_mif1_heic_source_is_the_signed_outputs_parent_ingredient() {
     // only `heic` and `heix` and took a `mif1` file for a
     // video, so its output was signed as a fresh image
     // with no parent.
-    let output = signed_png_provenance("mif1 heic", mif1_heic(), "image/heic").await;
+    let (output, _) = signed_png_provenance("mif1 heic", mif1_heic(), "image/heic").await;
     assert_eq!(output["ingredients"], 1, "{output}");
 }
 
@@ -9985,29 +10811,36 @@ async fn a_container_jxl_source_is_the_signed_outputs_parent_ingredient() {
     // Issue #564: the provenance sniff checked a misspelled
     // container signature, so a JPEG XL in its box
     // container had no parent ingredient.
-    let output = signed_png_provenance("container jxl", container_jxl(), "image/jxl").await;
+    let (output, _) = signed_png_provenance("container jxl", container_jxl(), "image/jxl").await;
     assert_eq!(output["ingredients"], 1, "{output}");
 }
 
 #[tokio::test]
-async fn a_signed_container_jxl_sources_store_rides_into_the_output() {
+async fn a_signed_container_jxl_sources_store_is_read_for_the_output() {
     // The container is the JPEG XL form that carries a
     // manifest, and it was the one whose store was dropped
-    // (issue #564): now the source's own manifest rides
-    // into the output's store.
+    // (issue #564): now the source's own manifest is read,
+    // and the output's parent ingredient records how it
+    // validated. The store itself stays out of the output
+    // (issue #610).
     let source = signed_source(&container_jxl(), "image/jxl");
-    let output = signed_png_provenance("signed container jxl", source, "image/jxl").await;
-    assert_eq!(output["manifests"], 2, "the source's store rides: {output}");
+    let (output, parent) = signed_png_provenance("signed container jxl", source, "image/jxl").await;
+    assert_eq!(
+        output["manifests"], 1,
+        "the source's store stays out: {output}"
+    );
     assert_eq!(output["ingredients"], 1, "{output}");
+    assert!(parent_store_was_read(&parent), "{parent}");
 }
 
 #[tokio::test]
-async fn a_signed_svg_or_tiff_sources_store_rides_into_the_output() {
+async fn a_signed_svg_or_tiff_sources_store_is_read_for_the_output() {
     // The SDK reads a manifest from an SVG and from a TIFF,
     // but both were signed with no parent (issue #564), so
     // the store a signed one carried was dropped. Now each
-    // is the parent ingredient, and its store rides into
-    // the output's.
+    // is the parent ingredient, and the output records how
+    // its store validated, without carrying the store
+    // (issue #610).
     for (name, source, format) in [
         ("signed svg", SVG_SOURCE.to_vec(), "image/svg+xml"),
         (
@@ -10017,12 +10850,13 @@ async fn a_signed_svg_or_tiff_sources_store_rides_into_the_output() {
         ),
     ] {
         let source = signed_source(&source, format);
-        let output = signed_png_provenance(name, source, format).await;
+        let (output, parent) = signed_png_provenance(name, source, format).await;
         assert_eq!(
-            output["manifests"], 2,
-            "{name}: the source's store rides: {output}"
+            output["manifests"], 1,
+            "{name}: the source's store stays out: {output}"
         );
         assert_eq!(output["ingredients"], 1, "{name}: {output}");
+        assert!(parent_store_was_read(&parent), "{name}: {parent}");
     }
 }
 
@@ -10054,7 +10888,7 @@ async fn every_image_source_is_the_signed_outputs_parent_ingredient() {
         ),
         ("bare jxl", bare_jxl(), "image/jxl"),
     ] {
-        let output = signed_png_provenance(name, source, format).await;
+        let (output, _) = signed_png_provenance(name, source, format).await;
         assert_eq!(output["ingredients"], 1, "{name}: {output}");
     }
 }
@@ -10171,6 +11005,7 @@ async fn processing_gate_bounds_concurrency() {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -10217,6 +11052,7 @@ async fn processing_gate_bounds_concurrency() {
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
+        progress: Default::default(),
     };
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let png = test_png();
@@ -10301,6 +11137,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -10349,6 +11186,7 @@ async fn timed_out_encode_releases_the_process_gate() {
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
             jxl_speed: state.jxl_speed,
+            progress: Default::default(),
         }
     };
     let stuck_job = job(
@@ -11038,6 +11876,7 @@ fn lane_test_state(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11093,6 +11932,7 @@ fn lane_test_job(
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+        progress: Default::default(),
     }
 }
 
@@ -11324,6 +12164,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11481,6 +12322,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11533,6 +12375,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
+        progress: Default::default(),
     };
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let png = test_png();
@@ -12430,6 +13273,7 @@ async fn spawn_app_with_upload_gate(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -13229,6 +14073,544 @@ async fn flight_waiters_do_not_take_a_render_a_purge_overtook() {
         "the request after the purge got the render the purge overtook"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+/// The release a held render waits behind (see
+/// `open_release` and `wait_for_open`).
+type Release = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// An upscale double for the disconnect tests: counts the
+/// renders that reach it and holds each one until the test
+/// opens its release, then doubles the image.
+#[derive(Debug)]
+struct HeldUpscale {
+    release: Release,
+    calls: Arc<AtomicUsize>,
+}
+
+impl crate::ai::UpscaleProvider for HeldUpscale {
+    fn factor(&self) -> u32 {
+        2
+    }
+
+    fn upscale(
+        &self,
+        img: &image::DynamicImage,
+    ) -> Result<image::DynamicImage, crate::ai::AiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        wait_for_open(&self.release);
+        Ok(image::DynamicImage::ImageRgba8(image::imageops::resize(
+            &img.to_rgba8(),
+            img.width() * 2,
+            img.height() * 2,
+            image::imageops::FilterType::Nearest,
+        )))
+    }
+}
+
+/// Opens a held render's release when dropped, so a test
+/// that fails before it opens the release does not leave
+/// the render parked on its blocking thread.
+struct OpenOnDrop(Release);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        open_release(&self.0);
+    }
+}
+
+/// A lane test state whose upscale provider holds every
+/// render until the release opens, with the provider's
+/// call count.
+fn held_upscale_state(process_permits: usize) -> (AppState, Release, Arc<AtomicUsize>) {
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), process_permits, 1);
+    state.upscale = Some(Arc::new(HeldUpscale {
+        release: release.clone(),
+        calls: calls.clone(),
+    }));
+    (state, release, calls)
+}
+
+/// Start one signed image request for `remainder` on a
+/// task of its own, the way a connection drives the
+/// handler: aborting the task drops the request where it
+/// is, as a client that disconnects does.
+fn start_request(
+    state: &AppState,
+    remainder: &str,
+    width_hint: Option<u32>,
+) -> tokio::task::JoinHandle<Response> {
+    let uri: axum::http::Uri = format!("/{}/{remainder}", sign(remainder)).parse().unwrap();
+    let mut headers = HeaderMap::new();
+    if let Some(width) = width_hint {
+        headers.insert("sec-ch-width", width.into());
+    }
+    tokio::spawn(handle(State(state.clone()), uri, headers))
+}
+
+/// Drop a started request, as its client disconnecting
+/// does, and wait until it is gone.
+async fn disconnect(request: tokio::task::JoinHandle<Response>) {
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn a_render_whose_client_left_is_stored_and_its_replay_is_a_hit() {
+    // A client that disconnects drops its request while
+    // the render runs. The render runs to its end on its
+    // blocking thread anyway, and it used to be thrown
+    // away there: nothing was stored, so each replay of
+    // the URL, under each width hint, rendered it again.
+    // Now the finished render is stored: each hint
+    // variant renders once, and its replay is a hit. The
+    // lane and AI permits still come back when the render
+    // itself ends.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(2);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    for (rendering, width) in [(1, 150), (2, 250)] {
+        let request = start_request(&state, &remainder, Some(width));
+        wait_until("the render started", || {
+            calls.load(Ordering::SeqCst) == rendering
+        })
+        .await;
+        disconnect(request).await;
+    }
+    assert_eq!(
+        state.process_gate.in_use(),
+        2,
+        "each render holds its lane permit while it runs"
+    );
+    open_release(&release);
+    wait_until("the renders ended and their permits came back", || {
+        state.process_gate.in_use() == 0 && state.ai_gate.available_permits() == 2
+    })
+    .await;
+    for width in [150, 250] {
+        let replay = start_request(&state, &remainder, Some(width))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK, "width {width}");
+        assert_eq!(
+            replay.headers()["cache-status"],
+            "crabcrop; hit",
+            "the replay at width {width} rendered again"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one render per variant");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one fetch per variant");
+}
+
+#[tokio::test]
+async fn followers_of_a_leader_whose_client_left_receive_its_render() {
+    // With every cache tier off nothing stores a render,
+    // so a flight's followers take the leader's response
+    // from the flight (issue #407). A leader whose client
+    // disconnected used to end the flight with its
+    // request: the followers woke to nothing, and one of
+    // them rendered the key a second time while the first
+    // render was still running. Now the flight lasts until
+    // the render it started has finished: a follower that
+    // disconnects too costs nothing, and the one still
+    // connected receives the first render.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(2);
+    state.cache = Arc::new(Cache::new(0));
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    let leader = start_request(&state, &remainder, None);
+    wait_until("the leader's render started", || {
+        calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let leaving = start_request(&state, &remainder, None);
+    let staying = start_request(&state, &remainder, None);
+    // Time for both to find the flight and wait on it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    disconnect(leaving).await;
+    disconnect(leader).await;
+    open_release(&release);
+    let answer = staying.await.unwrap();
+    assert_eq!(answer.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let image = image::load_from_memory(&body).unwrap();
+    assert_eq!((image.width(), image.height()), (200, 120));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the key rendered again after its leader's client left"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_request_dropped_before_its_render_starts_starts_none() {
+    // The other half of the rule: a request whose client
+    // leaves while it still waits, here for the only lane
+    // permit, stops there, as it always has, and gives
+    // back what it holds. Only a render already running is
+    // finished for a client that has gone; one that has
+    // not started is never started.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(1);
+    let _open = OpenOnDrop(release);
+    let held = state.process_gate.clone().acquire_owned().await.unwrap();
+    let remainder = format!("filters:upscale(2)/{src}");
+    let request = start_request(&state, &remainder, None);
+    wait_until(
+        "the request holds its AI permit and waits for a lane",
+        || hits.load(Ordering::SeqCst) == 1 && state.ai_gate.available_permits() == 1,
+    )
+    .await;
+    disconnect(request).await;
+    // The lane frees up right after the client has gone.
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a render started for a request that was gone"
+    );
+    assert_eq!(state.process_gate.in_use(), 0);
+    assert_eq!(
+        state.ai_gate.available_permits(),
+        2,
+        "the dropped request kept its AI permit"
+    );
+}
+
+#[tokio::test]
+async fn a_waiter_past_the_wait_cap_finishes_a_render_its_client_left() {
+    // A request whose flights keep ending without an
+    // answer for it stops waiting once its cap is spent
+    // and runs the miss path itself (issue #375). That
+    // miss is finished like a leader's: once its render
+    // has started, the render is stored even though the
+    // client leaves, and the replay is a hit.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(1);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    // The request's key, read from the flight of a first
+    // request that waits for the only lane and is dropped
+    // there, before any render.
+    let lane = state.process_gate.clone().acquire_owned().await.unwrap();
+    let first = start_request(&state, &remainder, None);
+    wait_until("the first request leads a flight", || {
+        state.inflight.image_flights().len() == 1
+    })
+    .await;
+    let key = state.inflight.image_flights().remove(0).0;
+    disconnect(first).await;
+    drop(lane);
+    wait_until("its flight ended", || {
+        state.inflight.image_flights().is_empty()
+    })
+    .await;
+    // The test leads the key's flights from here: each
+    // ends with no answer for the request, and the next
+    // begins in the same step, so the request follows
+    // each in turn until its cap is spent.
+    let lead = || match state.inflight.lead(&key) {
+        Flight::Leader(guard, _) => guard,
+        Flight::Follower(..) => panic!("the key already had a flight"),
+    };
+    let mut flight = lead();
+    let request = start_request(&state, &remainder, None);
+    for _ in 0..MAX_FLIGHT_WAITS {
+        wait_until("the request waits on the flight", || {
+            state.inflight.image_flights() == [(key.clone(), 1)]
+        })
+        .await;
+        drop(flight);
+        flight = lead();
+    }
+    wait_until("the request's own render started", || {
+        calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    disconnect(request).await;
+    drop(flight);
+    open_release(&release);
+    // The request's own miss runs outside any flight, so a
+    // replay would not wait for it: wait for the entry it
+    // stores. A miss dropped with its client stores none.
+    wait_until("the render is stored", || state.cache.get(&key).is_some()).await;
+    assert_eq!(state.process_gate.in_use(), 0);
+    let replay = start_request(&state, &remainder, None).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay.headers()["cache-status"],
+        "crabcrop; hit",
+        "the replay rendered again"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the first request's fetch and the request's own"
+    );
+}
+
+/// A source server that counts its hits and answers each
+/// one only once the returned sender is set to `true`.
+async fn spawn_held_server(
+    body: Vec<u8>,
+) -> (String, Arc<AtomicUsize>, tokio::sync::watch::Sender<bool>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (open, opened) = tokio::sync::watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counted = hits.clone();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut opened = opened.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let _ = opened.wait_for(|open| *open).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+    (format!("http://{addr}/fallback.png"), hits, open)
+}
+
+#[tokio::test]
+async fn a_source_that_did_not_decode_gets_no_fallback_once_its_client_left() {
+    // A source that loads but does not decode is rendered
+    // again on the configured fallback. A fallback is never
+    // stored, so for a client that has gone that run would
+    // answer nobody: a miss finished for a client that left
+    // during its render neither fetches the fallback nor
+    // starts a second render. The fake decoder holds the
+    // render until the test lets it fail.
+    let dir = crate::test_support::scratch_dir("server-fallback-left");
+    let started = dir.join("started");
+    let release = dir.join("release");
+    let script = format!(
+        "#!/bin/sh\ncat > /dev/null\n: > \"{}\"\nwhile [ ! -e \"{}\" ]; do sleep 0.02; done\nexit 1\n",
+        started.display(),
+        release.display()
+    );
+    let decoder = dir.join("decoder.sh");
+    crate::test_support::write_script(&decoder, &script);
+    let (src, _) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+    let (fallback, fallback_hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), 1, 1);
+    state.frame_extractor = Some(Arc::new(
+        crate::frames::VideoFrameExtractor::new(decoder, std::time::Duration::from_secs(30))
+            .unwrap(),
+    ));
+    state.fallback = Some(Fallback::Url(fallback));
+    let remainder = format!("frame:1.5/40x30/{src}");
+    let request = start_request(&state, &remainder, None);
+    wait_until("the render started", || started.exists()).await;
+    disconnect(request).await;
+    std::fs::write(&release, b"").unwrap();
+    wait_until("the miss ended", || {
+        state.inflight.image_flights().is_empty()
+    })
+    .await;
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "the fallback was fetched for a client that had gone"
+    );
+    assert_eq!(state.slow_gate.in_use(), 0);
+}
+
+#[tokio::test]
+async fn a_fallback_whose_client_left_while_it_loaded_starts_no_render() {
+    // The same rule when the client leaves later, while the
+    // fallback loads: the load ends, and the fallback render
+    // does not start when its lane comes free.
+    let (garbage, _) = spawn_counting_server(200, "image/png", b"not an image".to_vec()).await;
+    let (fallback, fallback_hits, open_fallback) = spawn_held_server(test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(1);
+    // Renders are not held here: the double only counts
+    // them.
+    open_release(&release);
+    state.fallback = Some(Fallback::Url(fallback));
+    let remainder = format!("filters:upscale(2)/{garbage}");
+    let request = start_request(&state, &remainder, None);
+    wait_until("the fallback is loading", || {
+        fallback_hits.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    disconnect(request).await;
+    open_fallback.send_replace(true);
+    wait_until("the miss ended", || {
+        state.inflight.image_flights().is_empty()
+    })
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a fallback render started for a client that had gone"
+    );
+    assert_eq!(state.process_gate.in_use(), 0);
+    assert_eq!(state.ai_gate.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn followers_of_a_leader_that_forwent_its_fallback_get_the_fallback() {
+    // A leader that forwent its fallback run ends with the
+    // decode failure, which is not the answer its request
+    // would have had. A follower with the same request must
+    // not take it from the flight: it makes its own attempt
+    // and gets the fallback, as a request on its own does.
+    let (garbage, garbage_hits) =
+        spawn_counting_server(200, "image/png", b"not an image".to_vec()).await;
+    let (fallback, fallback_hits, open_fallback) = spawn_held_server(test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(2);
+    open_release(&release);
+    state.fallback = Some(Fallback::Url(fallback));
+    let remainder = format!("filters:upscale(2)/{garbage}");
+    let leader = start_request(&state, &remainder, None);
+    wait_until("the leader's fallback is loading", || {
+        fallback_hits.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let follower = start_request(&state, &remainder, None);
+    wait_until("the follower waits on the flight", || {
+        state
+            .inflight
+            .image_flights()
+            .first()
+            .is_some_and(|(_, waiting)| *waiting == 1)
+    })
+    .await;
+    disconnect(leader).await;
+    open_fallback.send_replace(true);
+    let answer = follower.await.unwrap();
+    assert_eq!(answer.status(), StatusCode::OK);
+    assert_eq!(answer.headers()["x-crabcrop-fallback"], "1");
+    let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let image = image::load_from_memory(&body).unwrap();
+    assert_eq!((image.width(), image.height()), (200, 120));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the follower's fallback rendered"
+    );
+    assert_eq!(garbage_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_counts_a_miss_once_its_client_has_left() {
+    // Every image miss runs on a task of its own. While its
+    // client is there it is part of a request in flight, so
+    // the drain does not count it as background work (a
+    // request cut off at the grace used to be reported as
+    // a dropped background write). Once its client has
+    // gone after the render started, the drain waits for
+    // it and, cut off, reports it as a render.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (state, release, calls) = held_upscale_state(1);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    let request = start_request(&state, &remainder, None);
+    wait_until("the render started", || calls.load(Ordering::SeqCst) == 1).await;
+    let nothing = Drained {
+        writes: 0,
+        renders: 0,
+        walks: 0,
+    };
+    assert_eq!(
+        state.background.running(),
+        nothing,
+        "a connected request's miss counted as background work"
+    );
+    disconnect(request).await;
+    wait_until("the miss counts as a render whose client left", || {
+        state.background.running().renders == 1
+    })
+    .await;
+    let left = state.background.drain(tokio::time::Instant::now()).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            renders: 1,
+            walks: 0
+        }
+    );
+    // With time to spare, the drain returns once the render
+    // is stored.
+    open_release(&release);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(deadline).await, nothing);
+    let replay = start_request(&state, &remainder, None).await.unwrap();
+    assert_eq!(replay.headers()["cache-status"], "crabcrop; hit");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_waits_for_the_write_a_left_render_starts() {
+    // A render whose client has gone starts its shared-tier
+    // write when it finishes, after the drain has begun.
+    // The drain waits for the misses before the writes, so
+    // that write is waited for too.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let mut state = tier_test_state(None, &fake.endpoint);
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.upscale = Some(Arc::new(HeldUpscale {
+        release: release.clone(),
+        calls: calls.clone(),
+    }));
+    let _open = OpenOnDrop(release.clone());
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let request = start_request(&state, &format!("filters:upscale(2)/{src}"), None);
+    wait_until("the render started", || calls.load(Ordering::SeqCst) == 1).await;
+    disconnect(request).await;
+    wait_until("the miss counts as a render whose client left", || {
+        state.background.running().renders == 1
+    })
+    .await;
+    let background = state.background.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let drain = tokio::spawn(async move { background.drain(deadline).await });
+    open_release(&release);
+    wait_until("the render's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(
+        !drain.is_finished(),
+        "the drain ended before the write the render started"
+    );
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    assert_eq!(
+        drain.await.unwrap(),
+        Drained {
+            writes: 0,
+            renders: 0,
+            walks: 0
+        }
+    );
+    assert_eq!(entry_objects(&fake), 1);
 }
 
 /// Fire `n` concurrent meta requests for one URL and
@@ -14652,6 +16034,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -16112,6 +17495,7 @@ async fn spawn_explain_app_with_roots(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
+        client_hints: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -16522,6 +17906,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
         left,
         Drained {
             writes: 0,
+            renders: 0,
             walks: 0
         }
     );
@@ -16579,6 +17964,7 @@ async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
         left,
         Drained {
             writes: 1,
+            renders: 0,
             walks: 0
         }
     );
@@ -16592,6 +17978,7 @@ async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
         left,
         Drained {
             writes: 0,
+            renders: 0,
             walks: 0
         }
     );
@@ -16634,6 +18021,7 @@ async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
         left,
         Drained {
             writes: 0,
+            renders: 0,
             walks: 1
         }
     );
@@ -16929,6 +18317,43 @@ async fn concurrent_slow_svg_file_explains_leave_health_responsive() {
     drop(dir);
 }
 
+/// A HEIC's size takes a walk of its item graph, so explain
+/// sizes a HEIC as it does an SVG or an AVIF: once, on a
+/// blocking thread under the probe gate. The load never sizes
+/// a HEIC head on the runtime after each chunk, and the report
+/// still carries the size.
+#[tokio::test]
+async fn explain_sizes_a_heic_once_off_the_runtime() {
+    let heic = include_bytes!("../../tests/fixtures/orient6.heic");
+    assert!(crate::engine::probe_is_heavy("heic"));
+    assert_eq!(crate::engine::probe_kind(heic), "heic");
+    assert!(!probe_settled(heic));
+    let dir = crate::test_support::scratch_dir("explain-heic-file");
+    let root = std::fs::canonicalize(&dir).unwrap();
+    std::fs::write(root.join("o.heic"), heic).unwrap();
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        });
+    let base = spawn_explain_app_with_roots(Default::default(), loader, Default::default()).await;
+    let remainder = "64x64/file:///o.heic";
+    let resp = client()
+        .get(format!("{base}/explain/{}/{remainder}", sign(remainder)))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let (width, height) = crate::heic::probe_dimensions(heic).unwrap();
+    assert_eq!(json["source"]["kind"], "heic");
+    assert_eq!(json["source"]["width"], width);
+    assert_eq!(json["source"]["height"], height);
+    drop(dir);
+}
+
 /// The same as [`concurrent_slow_svg_file_explains_leave_health_responsive`]
 /// over HTTP, where a probe runs for both the per-chunk
 /// settle check and the handler on a server that sizes SVG
@@ -16949,4 +18374,297 @@ async fn concurrent_slow_svg_http_explains_leave_health_responsive() {
         })
         .collect();
     health_stays_responsive_during_slow_explains(urls, &base).await;
+}
+
+/// One answer, as a client can see it: the status, the
+/// headers that do not vary per request, and the body.
+async fn visible_answer(resp: reqwest::Response) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+    let status = resp.status();
+    let mut headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "date" | "x-request-id"))
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
+        .collect();
+    headers.sort();
+    (status, headers, resp.bytes().await.unwrap().to_vec())
+}
+
+/// The answers to the signed `remainders`, on the image route
+/// and the explain route, plain and with a JSON `Accept`.
+async fn answers_for(
+    base: &str,
+    remainders: &[String],
+) -> Vec<Vec<(StatusCode, Vec<(String, String)>, Vec<u8>)>> {
+    let mut all = Vec::new();
+    for route in ["", "explain/"] {
+        for accept in ["*/*", "application/json"] {
+            let mut answers = Vec::new();
+            for remainder in remainders {
+                let resp = client()
+                    .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+                    .header(header::ACCEPT, accept)
+                    .send()
+                    .await
+                    .unwrap();
+                answers.push(visible_answer(resp).await);
+            }
+            all.push(answers);
+        }
+    }
+    all
+}
+
+/// A served state whose loader is `loader`, with `fallback`,
+/// and `/metrics` open to the bearer `metrics-token`.
+async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
+    let mut state = tier_test_state(None, "http://127.0.0.1:9");
+    state.shared_store = None;
+    state.loader = loader;
+    state.fallback = fallback;
+    state.metrics_token = Some("metrics-token".to_string());
+    serve_state(&state).await
+}
+
+/// The value of the unlabeled series `name` in `exposition`.
+fn metric_value(exposition: &str, name: &str) -> Option<String> {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .map(str::to_string)
+}
+
+/// A host name that resolves to a non-public address and one
+/// that does not resolve get the same answer, on the image
+/// and explain routes, with and without a fallback image: the
+/// caller sent only the name, so the answer must not tell it
+/// which names resolve inside the server's network.
+#[tokio::test]
+async fn a_name_resolving_inward_answers_like_a_name_that_does_not_resolve() {
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_policy(crate::loader::SourcePolicy::new(vec![], true))
+        .with_host_lookup(
+            |host| match host {
+                "internal.test" => Ok(vec!["10.96.0.12".parse().unwrap()]),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                )),
+            },
+            crate::loader::LOOKUP_SLOTS,
+            crate::loader::LOOKUP_WAIT,
+        );
+    let remainders = [
+        "64x64/http://internal.test/x.png".to_string(),
+        "64x64/http://missing.test/x.png".to_string(),
+    ];
+    for fallback in [None, Some(Fallback::Bytes(Arc::new(test_png())))] {
+        let with_fallback = fallback.is_some();
+        let base = serve_loader(loader.clone(), fallback).await;
+        for answers in answers_for(&base, &remainders).await {
+            assert_eq!(
+                answers[0], answers[1],
+                "fallback {with_fallback}: inward and missing names differ"
+            );
+        }
+        // The answer is the fetch failure (or the fallback in
+        // its place on the image route), never the refusal.
+        let resp = client()
+            .get(format!("{base}/{}/{}", sign(&remainders[0]), remainders[0]))
+            .send()
+            .await
+            .unwrap();
+        if with_fallback {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers()["x-crabcrop-fallback"], "1");
+        } else {
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(resp.text().await.unwrap(), "source fetch failed");
+        }
+    }
+}
+
+/// File paths that leave the root answer exactly like a
+/// missing file whatever is at them, on the image and explain
+/// routes, through a source and through a watermark.
+#[tokio::test]
+async fn file_paths_outside_the_root_answer_alike_whatever_exists_there() {
+    let dir = crate::test_support::scratch_dir("file-outside-root");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("ok.png"), test_png()).unwrap();
+    std::fs::write(dir.join("outside.png"), test_png()).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        });
+    let base = serve_loader(loader, None).await;
+    let remainders = [
+        "64x64/file:///..%2foutside.png%2fx".to_string(),
+        "64x64/file:///..%2fmissing.png%2fx".to_string(),
+        "64x64/file:///..%2foutside.png".to_string(),
+        "64x64/file:///missing.png".to_string(),
+    ];
+    for answers in answers_for(&base, &remainders).await {
+        for answer in &answers[1..] {
+            assert_eq!(&answers[0], answer, "file answers differ");
+        }
+    }
+    let resp = client()
+        .get(format!("{base}/{}/{}", sign(&remainders[0]), remainders[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // A watermark loads through the same loader.
+    let watermarks: Vec<String> = ["..%252foutside.png%252fx", "..%252fmissing.png%252fx"]
+        .iter()
+        .map(|path| format!("filters:watermark(file%3A%2F%2F%2F{path},0,0,50)/file:///ok.png"))
+        .collect();
+    let mut seen = Vec::new();
+    for remainder in &watermarks {
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(remainder)))
+            .send()
+            .await
+            .unwrap();
+        seen.push(visible_answer(resp).await);
+    }
+    assert_eq!(seen[0], seen[1], "watermark answers differ");
+    assert_eq!(seen[0].0, StatusCode::NOT_FOUND);
+    // Inside the root still loads.
+    let remainder = "64x64/file:///ok.png";
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", sign(remainder)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    drop(dir);
+}
+
+/// A load shed because every host lookup slot stayed taken
+/// answers the gates' `503 server_busy` with `Retry-After`,
+/// on the image route, the explain route and for a
+/// watermark, and never falls back: it is overload, and the
+/// fallback could need a lookup too. Nor is it counted as a
+/// load failure. `/metrics` shows the slots in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_shed_answers_busy_and_never_falls_back() {
+    let dir = crate::test_support::scratch_dir("lookup-shed");
+    std::fs::write(dir.join("ok.png"), test_png()).unwrap();
+    let root = std::fs::canonicalize(&*dir).unwrap();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let started = Arc::new(AtomicUsize::new(0));
+    let held = Arc::clone(&gate);
+    let counter = Arc::clone(&started);
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_policy(crate::loader::SourcePolicy::new(vec![], true))
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        })
+        .with_host_lookup(
+            move |_host| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (released, wake) = &*held;
+                let mut released = released.lock().unwrap();
+                let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !*released && std::time::Instant::now() < give_up {
+                    released = wake
+                        .wait_timeout(released, std::time::Duration::from_millis(50))
+                        .unwrap()
+                        .0;
+                }
+                Err(std::io::Error::other("resolver did not answer"))
+            },
+            1,
+            std::time::Duration::from_millis(100),
+        );
+    let base = serve_loader(loader, Some(Fallback::Bytes(Arc::new(test_png())))).await;
+    let first = "64x64/http://first.test/x.png".to_string();
+    let url = format!("{base}/{}/{first}", sign(&first));
+    let holder = tokio::spawn(async move { client().get(url).send().await.unwrap().status() });
+    // Wait until the held request's lookup has the one slot.
+    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "the lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let shed = [
+        "64x64/http://second.test/x.png".to_string(),
+        "explain/64x64/http://second.test/x.png".to_string(),
+        "64x64/filters:watermark(http%3A%2F%2Fsecond.test%2Fw.png,0,0,50)/file:///ok.png"
+            .to_string(),
+    ];
+    for path in &shed {
+        let remainder = path.strip_prefix("explain/").unwrap_or(path);
+        let route = if path.starts_with("explain/") {
+            "explain/"
+        } else {
+            ""
+        };
+        let resp = client()
+            .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "{path}"
+        );
+        assert!(
+            resp.headers().get("x-crabcrop-fallback").is_none(),
+            "{path}"
+        );
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "server busy: too many source host lookups waiting",
+            "{path}"
+        );
+    }
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "a shed load started a lookup"
+    );
+    let exposition = scrape(&base, "metrics-token").await;
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_loader_errors_total").as_deref(),
+        Some("0"),
+        "a shed counted as a load failure"
+    );
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_in_flight").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_capacity").as_deref(),
+        Some("1")
+    );
+    {
+        let (released, wake) = &*gate;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    // The held request's lookup failed: the fallback stands in.
+    assert_eq!(holder.await.unwrap(), StatusCode::OK);
+    let exposition = scrape(&base, "metrics-token").await;
+    assert_eq!(
+        metric_value(&exposition, "crabcrop_source_lookups_in_flight").as_deref(),
+        Some("0")
+    );
+    drop(dir);
 }

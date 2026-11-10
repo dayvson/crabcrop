@@ -11,13 +11,46 @@ if (!class_exists('CrabcropUrl')) {
     final class CrabcropUrl
     {
         /**
+         * The first remainder segment reserved for key derivation.
+         * Every derived subkey (purge, purge-group, upload, seal,
+         * cache entry) is the HMAC of a label such as
+         * crabcrop/upload-key under the secret, which is the image
+         * signature of that label. The server refuses an image URL
+         * that begins with this segment, and no signer signs one.
+         */
+        const RESERVED_SEGMENT = 'crabcrop';
+
+        /**
+         * Whether $remainder is the reserved segment or starts with
+         * crabcrop/.
+         */
+        public static function is_reserved_remainder($remainder)
+        {
+            $head = explode('/', $remainder, 2);
+            return $head[0] === self::RESERVED_SEGMENT;
+        }
+
+        /**
          * The signature for a remainder: lowercase hex HMAC-SHA256,
          * keyed with the secret, over the remainder exactly as it
-         * appears in the URL.
+         * appears in the URL. Throws InvalidArgumentException for a
+         * remainder that begins with the reserved segment: its
+         * signature could be a derived subkey.
          */
         public static function sign($secret, $remainder)
         {
+            self::check_not_reserved($remainder);
             return hash_hmac('sha256', $remainder, $secret);
+        }
+
+        private static function check_not_reserved($remainder)
+        {
+            if (self::is_reserved_remainder($remainder)) {
+                throw new InvalidArgumentException(
+                    'remainder begins with the reserved segment "' . self::RESERVED_SEGMENT
+                        . '": it is kept for key derivation, and no image URL may begin with it'
+                );
+            }
         }
 
         /**
@@ -39,7 +72,9 @@ if (!class_exists('CrabcropUrl')) {
          * control, or non-ASCII characters (the remainder travels as a
          * raw path, so those bytes cannot be represented in it), or one
          * of " < > \ ^ ` { | }, which a browser rewrites before the
-         * request leaves the page (a URL signed over them answers 403).
+         * request leaves the page (a URL signed over them answers 403),
+         * and a remainder that begins with the reserved segment, signed
+         * or not (the server refuses it whatever the signature).
          */
         public static function build($base, $secret, $operations, $source, $expiry = null, $key_id = null)
         {
@@ -64,6 +99,7 @@ if (!class_exists('CrabcropUrl')) {
             }
             $parts[] = $source;
             $remainder = implode('/', $parts);
+            self::check_not_reserved($remainder);
 
             if ($secret === null) {
                 $signature = 'unsafe';

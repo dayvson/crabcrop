@@ -124,6 +124,7 @@ test("@crabcrop/url: a Vite client build signs and seals with no Node built-ins"
   let signed = 0;
   let sealed = 0;
   let refused = 0;
+  let reserved = 0;
   for (const v of vectors) {
     if (v.signature !== undefined) {
       assert.equal(sdk.sign(v.secret, v.remainder), v.signature, v.description);
@@ -145,8 +146,15 @@ test("@crabcrop/url: a Vite client build signs and seals with no Node built-ins"
       );
       refused++;
     }
+    if (v.reserved === true) {
+      // The browser build refuses the reserved segment too:
+      // a label's signature would be its derived subkey.
+      assert.throws(() => sdk.sign("k", v.remainder), /reserved segment "crabcrop"/, v.description);
+      assert.throws(() => sdk.buildURL(BASE, "k", v.operations, v.source), /reserved segment "crabcrop"/, v.description);
+      reserved++;
+    }
   }
-  assert.ok(signed > 0 && sealed > 0 && refused > 0);
+  assert.ok(signed > 0 && sealed > 0 && refused > 0 && reserved > 0);
   const remainder = "300x200/https://example.com/photo.jpg";
   assert.equal(sdk.unseal("k", sdk.seal("k", remainder)), remainder);
   const url = sdk.buildURL(BASE, "k", "300x200", "https://example.com/photo.jpg");

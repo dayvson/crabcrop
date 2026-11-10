@@ -33,7 +33,10 @@ const srcset = buildSrcSet(
   [400, 800, 1200],
 );
 
-// The raw signature for a remainder, if you assemble URLs yourself.
+// The signature for a remainder, if you assemble URLs yourself. It
+// throws for a remainder that begins with the reserved segment
+// "crabcrop" (isReservedRemainder), as every builder does: the derived
+// subkeys are signatures of labels under that segment.
 const signature = sign("your-secret", "300x200/https://example.com/photo.jpg");
 
 // Verify a signed URL's signature locally, in constant time

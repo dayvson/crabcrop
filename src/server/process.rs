@@ -182,6 +182,20 @@ impl Inflight {
     }
 }
 
+#[cfg(test)]
+impl Inflight {
+    /// The image flights now in flight: each key, with how
+    /// many requests wait on it.
+    pub(in crate::server) fn image_flights(&self) -> Vec<(String, usize)> {
+        self.leaders
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, slot)| (key.clone(), slot.sender.receiver_count()))
+            .collect()
+    }
+}
+
 /// One response shared within a flight: the leader's
 /// status, headers, and body, handed to the followers
 /// that waited on it. Meta flights share every document,
@@ -320,6 +334,92 @@ pub(in crate::server) struct ProcessJob {
     pub(in crate::server) brand_color: Option<[u8; 3]>,
     pub(in crate::server) avif_speed: u8,
     pub(in crate::server) jxl_speed: jixel::Speed,
+    /// How far the miss that built the job has got (see
+    /// [`MissProgress`]): [`run_process`] marks each render
+    /// it starts there, and starts none once the miss's
+    /// client has gone.
+    pub(in crate::server) progress: MissProgress,
+}
+
+/// How far one image miss has got, shared by the request
+/// path and the render jobs it builds (clones share it).
+///
+/// [`run_process`] marks a render started once the run
+/// holds its lane permit, in the same step that hands the
+/// job to its blocking thread. A render that has started
+/// runs to its end on that thread whatever happens to the
+/// request (a blocking job cannot be cancelled), so the
+/// request path reads the mark to decide what a client
+/// that goes away stops: before it, the miss stops where
+/// it is (a source load, a gate wait) and nothing it holds
+/// outlives it; after it, the miss is marked as one whose
+/// client has gone and finishes that render, so the render
+/// is stored and reaches the requests waiting on it
+/// instead of being thrown away.
+///
+/// Such a miss starts no other render: a source that did
+/// not decode gets no fallback run, since a fallback is
+/// never stored and no client is there to receive it.
+/// The miss then ends without the answer its request
+/// would have had, so it is marked as one that forwent a
+/// render, and its flight does not hand what it ends with
+/// to the requests waiting on it: they make their own
+/// attempt instead.
+#[derive(Clone, Debug, Default)]
+pub(in crate::server) struct MissProgress(Arc<MissMarks>);
+
+/// The marks of a [`MissProgress`]; each is set once and
+/// never cleared.
+#[derive(Debug, Default)]
+struct MissMarks {
+    started: std::sync::atomic::AtomicBool,
+    client_gone: std::sync::atomic::AtomicBool,
+    forwent: std::sync::atomic::AtomicBool,
+}
+
+impl MissProgress {
+    fn mark_started(&self) {
+        self.0
+            .started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a render of this miss has started.
+    pub(in crate::server) fn render_started(&self) -> bool {
+        self.0.started.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that the miss's client has gone after a
+    /// render started: the miss finishes that render and
+    /// starts no other.
+    pub(in crate::server) fn mark_client_gone(&self) {
+        self.0
+            .client_gone
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the miss may start a render: not once its
+    /// client has gone. A refusal is recorded, so the
+    /// miss's flight can tell that it ended without its
+    /// request's answer ([`MissProgress::forwent_render`]).
+    pub(in crate::server) fn may_start_render(&self) -> bool {
+        let gone = self
+            .0
+            .client_gone
+            .load(std::sync::atomic::Ordering::Acquire);
+        if gone {
+            self.0
+                .forwent
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        !gone
+    }
+
+    /// Whether the miss declined a render because its
+    /// client had gone.
+    pub(in crate::server) fn forwent_render(&self) -> bool {
+        self.0.forwent.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// A request's watermark images, with their share of the
@@ -361,6 +461,13 @@ pub(in crate::server) enum ProcessFailure {
     /// stuck inside one opaque call runs only until that
     /// call returns.
     TimedOut,
+    /// The miss's client had gone by the time the lane
+    /// came free, so no render started (see
+    /// [`MissProgress`]). Only a fallback run meets this:
+    /// a miss whose client goes before its first render
+    /// starts is dropped where it waits. Nobody receives
+    /// the answer.
+    ClientGone,
 }
 
 /// How long a cache miss may wait for a processing slot
@@ -563,6 +670,14 @@ pub(in crate::server) async fn run_process(
         Ok(Ok(permit)) => permit,
         _ => return Err(ProcessFailure::Busy),
     };
+    // A miss whose client has gone starts no render, and
+    // the permit just taken goes straight back.
+    if !job.progress.may_start_render() {
+        return Err(ProcessFailure::ClientGone);
+    }
+    // No await between here and the spawn below: the
+    // render is marked started exactly when it is.
+    job.progress.mark_started();
     let job = job.clone();
     let engine = state.engine;
     // The processing deadline (issue #260) is the
@@ -689,13 +804,15 @@ pub(in crate::server) async fn run_process(
 /// a signer is configured, sign the output. Byte
 /// preservation of a source manifest is impossible (the
 /// pipeline drops the segments it lives in), so the
-/// source's manifest rides into the output's manifest
-/// store as a parent ingredient instead, keeping the
-/// provenance chain intact. Signing covers still JPEG,
-/// PNG, WebP, and AVIF outputs; GIF, JPEG XL, video, and
-/// animated WebP outputs are served unsigned. A signing
-/// failure fails the request: serving unmarked output
-/// from a server configured to mark would be a silent
+/// output's manifest names the source as its parent
+/// ingredient instead, with the status the source's own
+/// manifest validated to, and none of the source's store,
+/// under either metadata policy (see
+/// `provenance::ProvenanceSigner::sign`). Signing covers
+/// still JPEG, PNG, WebP, and AVIF outputs; GIF, JPEG XL,
+/// video, and animated WebP outputs are served unsigned.
+/// A signing failure fails the request: serving unmarked
+/// output from a server configured to mark would be a silent
 /// policy break. A failed timestamp authority gets its own
 /// error, so the client hears an outage worth retrying
 /// rather than a broken encoder (issue #467).
@@ -723,15 +840,16 @@ pub(in crate::server) fn apply_provenance(
         let animated_webp = processed.format == ImageFormat::WebP
             && crate::provenance::webp_is_animated(&processed.bytes);
         if let (Some(mime), false) = (mime, animated_webp) {
-            // The source asset rides as a parent
-            // ingredient whenever it is an image (any
-            // format the engine's sniff names, which is the
-            // sniff it decodes by), manifest or not: the
-            // ingredient names its format, and carries its
-            // manifest store when it has one. Video and PDF
-            // sources are the only others: the output is a
-            // frame or page rendered from them, and starts
-            // a fresh chain (see provenance::sign).
+            // The source asset is the parent ingredient
+            // whenever it is an image (any format the
+            // engine's sniff names, which is the sniff it
+            // decodes by), manifest or not: the ingredient
+            // names its format, and records how its
+            // manifest store validated when it has one.
+            // Video and PDF sources are the only others:
+            // the output is a frame or page rendered from
+            // them, and starts a fresh chain (see
+            // provenance::sign).
             let ingredient =
                 crate::provenance::is_image(source_format).then_some((source_bytes, source_format));
             let request = crate::provenance::SignRequest {
