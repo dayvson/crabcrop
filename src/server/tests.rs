@@ -1795,6 +1795,8 @@ async fn sealed_payload_failures_are_one_uniform_refusal() {
         // A reserved segment at the payload head.
         "purge/anything".to_string(),
         "upload/heroes/cat.jpg".to_string(),
+        "crabcrop/purge-key".to_string(),
+        format!("crabcrop/300x50/{src}"),
         // An unknown preset (a grammar error on every
         // server).
         format!("preset:nope/{src}"),
@@ -1809,6 +1811,64 @@ async fn sealed_payload_failures_are_one_uniform_refusal() {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{remainder}");
         assert_eq!(resp.text().await.unwrap(), "bad signature", "{remainder}");
     }
+}
+
+/// Every derived subkey (purge, purge-group, upload, seal,
+/// cache entry) is the image signature of its label under
+/// the secret. An image or explain request whose remainder
+/// begins with the reserved segment answers the same 400
+/// whatever its signature (the right one, a wrong one, a
+/// keyed one, `unsafe`), so the server never tells a caller
+/// whether a signature over a label is that label's subkey.
+#[tokio::test]
+async fn a_reserved_remainder_is_refused_before_its_signature_is_checked() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(true).await;
+    for remainder in [
+        "crabcrop/purge-key".to_string(),
+        "crabcrop/purge-group-key".to_string(),
+        "crabcrop/upload-key".to_string(),
+        "crabcrop/seal-key".to_string(),
+        "crabcrop/entry-key".to_string(),
+        "crabcrop".to_string(),
+        format!("crabcrop/300x50/{src}"),
+    ] {
+        let right = sign(&remainder);
+        for segment in [
+            right.clone(),
+            "0".repeat(64),
+            format!("k2:{right}"),
+            "unsafe".to_string(),
+        ] {
+            for route in ["", "explain/"] {
+                let resp = client()
+                    .get(format!("{base}/{route}{segment}/{remainder}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{route}{segment}/{remainder}"
+                );
+                assert_eq!(
+                    resp.text().await.unwrap(),
+                    "an image URL may not begin with the reserved segment crabcrop",
+                    "{route}{segment}/{remainder}"
+                );
+            }
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was fetched");
+    // A remainder that only names a label further in is an
+    // ordinary image URL: a wrong signature is still a 403.
+    let remainder = format!("300x50/{src}");
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", "0".repeat(64)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -7741,7 +7801,7 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
     let remainder = format!("50x50/{src}");
     let forged = format!(
         "{base}/{}/{remainder}",
-        crabcrop_url::sign(b"some-other-secret", &remainder)
+        crabcrop_url::sign(b"some-other-secret", &remainder).unwrap()
     );
     let err = crate::cli::exec(&cli(&["meta", &forged]))
         .await
@@ -9264,8 +9324,8 @@ async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
         let url = format!("{base}/{segment}/{remainder}");
         async move { client().get(url).send().await.unwrap().status() }
     };
-    let new_unkeyed = crabcrop_url::sign(b"the-new-server-secret", &remainder);
-    let old_unkeyed = crabcrop_url::sign(b"the-old-server-secret", &remainder);
+    let new_unkeyed = crabcrop_url::sign(b"the-new-server-secret", &remainder).unwrap();
+    let old_unkeyed = crabcrop_url::sign(b"the-old-server-secret", &remainder).unwrap();
     // Unkeyed URLs from either era verify.
     assert_eq!(get(new_unkeyed.clone()).await, 200);
     assert_eq!(get(old_unkeyed.clone()).await, 200);

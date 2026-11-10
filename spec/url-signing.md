@@ -34,6 +34,19 @@ remainder = everything after the signature segment, exactly as it appears
 - A signature segment may carry a key ID: `<key-id>:<hex>`, where the ID is 1 to 32 characters of `[A-Za-z0-9_-]`. The ID is routing metadata, not secret material: it names which of the server's keys must verify the tag, which is what makes secret rotation possible without invalidating outstanding URLs. A server verifies a keyed segment against the named key only (an unknown ID fails as a bad signature, `403`), and an unkeyed segment against every key it holds. Purge signature segments accept the same prefix and routing. Builders stamp an ID only when asked; verifiers that hold a single secret ignore the ID and check the tag.
 - The signature covers the path only. A query string is not signed, is ignored by the server, and must not be relied on for anything.
 - Verification failure is `403` with the body `bad signature`. An expired URL is `403` with the body `signature expired`. An unknown preset, an unknown or invalid source root, a malformed segment, or free-form operations in presets-only mode is a `400`.
+- A remainder whose first segment is `crabcrop` is never signed and never served (see [Reserved remainders](#reserved-remainders)).
+
+## Reserved remainders
+
+The first remainder segment `crabcrop` is reserved for key derivation. Every derived subkey (the purge, purge-group, upload and seal subkeys below, and the key the server authenticates its stored cache entries with) is `HMAC_SHA256(secret, label)` for a label that begins with `crabcrop/`, and that is exactly the image signature of the label read as a remainder. A signer that signed the remainder `crabcrop/upload-key` would print the upload subkey as the signature.
+
+So the rule, for the server and for every signer:
+
+- A remainder is reserved when it is `crabcrop` or begins with `crabcrop/`. The test is on the bytes as written, as the HMAC is: `exp:1893456000/crabcrop/x`, `CRABCROP/x`, `crabcrop-assets/x.jpg` and `300x200/https://example.com/crabcrop/x.jpg` are ordinary remainders.
+- A signer never computes `HMAC_SHA256(secret, remainder)` for a reserved remainder. `sign` refuses one, and every builder refuses to assemble one, whether the operations, the source, or both hold the reserved text, with or without a secret, with or without a key ID, plain or sealed. Sealing itself computes no HMAC under the secret, so the sealing primitive is not where the rule is enforced; the sealed builders enforce it like a refused character.
+- The server answers an image or `/explain` request whose remainder is reserved with `400` (`reserved_segment`) before it checks the signature, so the answer is the same whatever the signature, `unsafe` included. A sealed token whose remainder is reserved gets the uniform sealed refusal.
+
+No image URL loses anything by the rule: `crabcrop` is not an operation, so a reserved remainder is all source text, and it names no source the server fetches (it always failed with `400 invalid_source`). A third-party signer must apply the same rule. One that signs a caller-chosen remainder without it, for example a bare source with no operations, hands out the derived subkeys to whoever chooses that remainder. The reserved entries in the test vectors pin it.
 
 ## Purge signatures
 
@@ -46,7 +59,7 @@ signature for POST /purge/<signature>/<path>        = lowercase_hex( HMAC_SHA256
 signature for POST /purge-group/<signature>/<group> = lowercase_hex( HMAC_SHA256( purge-group subkey, group ) )
 ```
 
-`path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature can never be replayed as a purge signature, and vice versa, and because each purge endpoint has its own subkey, a per-target purge signature can never be transplanted to `/purge-group` (or the reverse), whatever string it was minted over. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
+`path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature does not verify as a purge signature, and vice versa, and because each purge endpoint has its own subkey, a per-target purge signature can never be transplanted to `/purge-group` (or the reverse), whatever string it was minted over. The separation rests on the [reserved remainders](#reserved-remainders) rule: a subkey is the image signature of its label, so no signer may sign a label. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
 
 ## Upload signatures
 
@@ -57,7 +70,7 @@ subkey = HMAC_SHA256( key = secret, message = "crabcrop/upload-key" )   (raw byt
 signature for PUT /upload/<signature>/<name> = lowercase_hex( HMAC_SHA256( subkey, name ) )
 ```
 
-`name` is the object name exactly as presented after the signature segment (it may contain `/`-separated segments). Domain separation is the point, as with purges: an image signature or a purge signature can never be replayed as an upload signature, and an upload signature authorizes nothing else. Uploads never honor `unsafe`. Signature segments accept the same `<key-id>:` prefix and routing as purge segments. Client libraries expose this as an `upload_signature` / `uploadSignature` helper so the signed string is never assembled by hand.
+`name` is the object name exactly as presented after the signature segment (it may contain `/`-separated segments). Domain separation is the point, as with purges: an image signature or a purge signature does not verify as an upload signature, and an upload signature authorizes nothing else. As with purges, this rests on the [reserved remainders](#reserved-remainders) rule. Uploads never honor `unsafe`. Signature segments accept the same `<key-id>:` prefix and routing as purge segments. Client libraries expose this as an `upload_signature` / `uploadSignature` helper so the signed string is never assembled by hand.
 
 An upload signature may carry an expiry, the grammar's `exp:` segment in its upload spelling (issue #192):
 
@@ -77,7 +90,7 @@ A builder assembles, in order:
 
 then signs the joined remainder and prefixes `{base}/{signature}/`. With a null secret the signature segment is the literal `unsafe` and no HMAC is computed.
 
-Builders reject inputs that can never verify, at build time: an expiry that is not a non-negative integer, and operations or sources containing any of these characters:
+Builders reject inputs that can never verify, at build time: an expiry that is not a non-negative integer, a remainder that is [reserved](#reserved-remainders), and operations or sources containing any of these characters:
 
 - `?` and `#`, which end the path, so the server would never see the rest of the remainder;
 - whitespace, control characters (U+0000 to U+001F and U+007F), and anything outside ASCII, which cannot travel in a request path as-is;
@@ -109,7 +122,7 @@ Implementations: `seal` / `seal_with_nonce` (the deterministic seam the vectors 
 
 ## Test vectors
 
-`test-vectors.json` in this directory is the canonical set: each signing entry gives a `secret`, a `remainder`, and the expected `signature`; each sealed entry (marked `"sealed": true`) gives a `secret`, an optional `key_id`, a `nonce` (hex), a `remainder`, and the expected `token`, which every implementation must reproduce byte for byte with the injected nonce and open back; each refusal entry gives `operations`, a `source`, and `refuses`, naming the `input` (`operations` or `source`) and the first `character` a builder must refuse there, with or without a secret, for plain and sealed URLs alike. Every shipped implementation runs these vectors as its test suite. The first entry is the long-standing known-answer vector (secret `Jefe`); the second is the worked example from the README, computed with OpenSSL. The rest were computed with Python's `hmac` module, independently of the server code. In Rust they run as the `crabcrop-url` crate's tests (`cargo test --workspace`), and the server verifies signatures by calling that crate's `verify`.
+`test-vectors.json` in this directory is the canonical set: each signing entry gives a `secret`, a `remainder`, and the expected `signature`; each sealed entry (marked `"sealed": true`) gives a `secret`, an optional `key_id`, a `nonce` (hex), a `remainder`, and the expected `token`, which every implementation must reproduce byte for byte with the injected nonce and open back; each refusal entry gives `operations`, a `source`, and `refuses`, naming the `input` (`operations` or `source`) and the first `character` a builder must refuse there, with or without a secret, for plain and sealed URLs alike; each reserved entry (marked `"reserved": true`) gives `operations`, a `source`, and the `remainder` they assemble to, which `sign` must refuse and every builder must refuse to build, with or without a secret or a key ID, for plain and sealed URLs alike, with an error whose message names the reserved segment `"crabcrop"`. Every shipped implementation runs these vectors as its test suite. The first entry is the long-standing known-answer vector (secret `Jefe`); the second is the worked example from the README, computed with OpenSSL. The rest were computed with Python's `hmac` module, independently of the server code. In Rust they run as the `crabcrop-url` crate's tests (`cargo test --workspace`), and the server verifies signatures by calling that crate's `verify`.
 
 ## Versioning
 

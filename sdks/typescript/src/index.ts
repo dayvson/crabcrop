@@ -16,19 +16,53 @@ import { fromBase64Url, toBase64Url, toHex, utf8, utf8Strict } from "./bytes.ts"
 import { MAX_DIMENSION } from "./limits.ts";
 
 /**
+ * The first remainder segment reserved for key derivation.
+ * Every derived subkey (purge, purge-group, upload, seal, and
+ * the server's cache entry key) is the HMAC of a label such as
+ * `crabcrop/purge-key` under the secret, which is the image
+ * signature of that label. No image URL may begin with this
+ * segment (the server refuses one with `400 reserved_segment`),
+ * and {@link sign} and every builder refuse a remainder that
+ * does, so no image signature is ever a subkey.
+ */
+export const RESERVED_SEGMENT = "crabcrop";
+
+/**
+ * Whether `remainder` begins with {@link RESERVED_SEGMENT}: it
+ * is that segment alone or starts with `crabcrop/`. The test is
+ * on the text as written, as the HMAC is: `exp:1/crabcrop/x`
+ * and `CRABCROP/x` are not reserved.
+ */
+export function isReservedRemainder(remainder: string): boolean {
+  return remainder === RESERVED_SEGMENT || remainder.startsWith(`${RESERVED_SEGMENT}/`);
+}
+
+function assertNotReserved(remainder: string): void {
+  if (isReservedRemainder(remainder)) {
+    throw new Error(
+      `remainder begins with the reserved segment "${RESERVED_SEGMENT}": it is kept for key derivation, and no image URL may begin with it`,
+    );
+  }
+}
+
+/**
  * Compute the signature segment for a remainder: the lowercase
  * hex HMAC-SHA256 of `remainder` under `secret`. The remainder
  * is everything after the signature segment in the URL,
- * exactly as it will appear.
+ * exactly as it will appear. A remainder that begins with
+ * {@link RESERVED_SEGMENT} throws: its signature could be a
+ * derived subkey.
  */
 export function sign(secret: string, remainder: string): string {
+  assertNotReserved(remainder);
   return toHex(hmacSha256(secret, remainder));
 }
 
 /**
  * A subkey derived from the secret: the raw HMAC-SHA256 of
- * `label` under it (the bytes whose hex is `sign(secret,
- * label)`), one per signing domain.
+ * `label` under it, one per signing domain. Every label begins
+ * with {@link RESERVED_SEGMENT}, which is why {@link sign}
+ * refuses to compute the same value as a signature.
  */
 function subkey(secret: string, label: string): Uint8Array {
   return hmacSha256(secret, label);
@@ -277,6 +311,7 @@ export function buildSealedURL(
     remainder += `${operations}/`;
   }
   remainder += source;
+  assertNotReserved(remainder);
   const segment = seal(secret, remainder, options.keyId);
   return options.name ? `${trimmedBase}/${segment}/${options.name}` : `${trimmedBase}/${segment}`;
 }
@@ -364,6 +399,9 @@ export function buildURL(
     remainder += `${operations}/`;
   }
   remainder += source;
+  // Refused with or without a secret: the server refuses the
+  // URL whatever its signature.
+  assertNotReserved(remainder);
   let signature: string;
   if (secret === null) {
     if (options.keyId !== undefined) {
@@ -438,6 +476,12 @@ export function verifyUrlSignature(
   const { signature, remainder } = explainUrl(input);
   if (!signature || signature.kind !== "hmac") {
     return null;
+  }
+  // No signature over a reserved remainder is ever valid: the
+  // server refuses it whatever the signature, and this check
+  // must not confirm a derived subkey either.
+  if (isReservedRemainder(remainder)) {
+    return false;
   }
   // Constant-time, like the Rust and Python verifiers: a
   // plain === leaks how much of the tag was right.

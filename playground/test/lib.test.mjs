@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { buildPlaygroundUrl, explainUrl, sign, verifyUrlSignature } from "../lib.mjs";
@@ -26,6 +27,29 @@ for (const v of vectors) {
       }
       assert.ok(expected?.startsWith(`${input} contains`), expected);
       assert.ok(expected.includes(JSON.stringify(character)), expected);
+      for (const secret of ["s3cr3t", null]) {
+        await assert.rejects(
+          buildPlaygroundUrl({ base, secret, operations: v.operations, source: v.source }),
+          { message: expected },
+        );
+      }
+    });
+    continue;
+  }
+  if (v.reserved === true) {
+    // A remainder under the reserved segment: the playground
+    // refuses to sign it or build it, with the SDK's message,
+    // signed or not.
+    test(`reserved vector: ${v.description}`, async () => {
+      const base = "https://img.example.com";
+      let expected;
+      try {
+        sdk.sign("s3cr3t", v.remainder);
+      } catch (e) {
+        expected = e.message;
+      }
+      assert.match(expected ?? "", /reserved segment "crabcrop"/);
+      await assert.rejects(sign("s3cr3t", v.remainder), { message: expected });
       for (const secret of ["s3cr3t", null]) {
         await assert.rejects(
           buildPlaygroundUrl({ base, secret, operations: v.operations, source: v.source }),
@@ -278,4 +302,19 @@ test("encoder options and per-format quality explain (issue #319)", () => {
     `https://x/${SIG}/filters:quality(mp4:80)/https://e.com/a.jpg`,
   );
   assert.ok(video.errors.length > 0);
+});
+
+test("the playground never signs a key label, and a subkey never verifies", async () => {
+  // Every derived subkey is HMAC(secret, "crabcrop/<x>-key"):
+  // the playground's signer printed it for a bare label.
+  const secret = "label-test-secret-0123456789";
+  const base = "https://img.example.com";
+  for (const label of ["crabcrop/purge-key", "crabcrop/upload-key", "crabcrop/seal-key"]) {
+    await assert.rejects(
+      buildPlaygroundUrl({ base, secret, operations: "", source: label }),
+      /reserved segment "crabcrop"/,
+    );
+    const subkey = createHmac("sha256", secret).update(label).digest("hex");
+    assert.equal(await verifyUrlSignature(secret, `${base}/${subkey}/${label}`), false);
+  }
 });
