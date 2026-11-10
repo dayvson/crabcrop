@@ -18,15 +18,15 @@ test("trimLikeServer edge cases", () => {
   const cases: [string, string][] = [
     ["", ""],
     [" ", ""],
-    [" \t\n\v\f\r\u0085        　", ""],
+    [" \t\n\v\f\r\u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000", ""],
     ["person", "person"],
     [" traffic light ", "traffic light"],
     // U+FEFF is not white space to the server: it stays.
-    ["﻿person﻿", "﻿person﻿"],
-    [" ﻿ person ﻿ ", "﻿ person ﻿"],
+    ["\ufeffperson\ufeff", "\ufeffperson\ufeff"],
+    [" \ufeff person \ufeff ", "\ufeff person \ufeff"],
     // U+0085 and U+3000 are: they go.
     ["\u0085person\u0085", "person"],
-    ["　person　", "person"],
+    ["\u3000person\u3000", "person"],
     // A character outside the Basic Multilingual Plane stays whole.
     [" \u{1f600} ", "\u{1f600}"],
   ];
