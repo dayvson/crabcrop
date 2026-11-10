@@ -67,13 +67,13 @@ The segment is inside the signed remainder, so the HMAC covers it: extending the
 
 ### Per-request cache lifetime
 
-Image responses are cached by clients and CDNs for a year: `Cache-Control: public, max-age=31536000, immutable`, because a signed URL's bytes never change. When one response should live shorter, add a `maxage:<seconds>` segment anywhere among the operations:
+Image responses are cached by clients and CDNs for a year: `Cache-Control: public, max-age=31536000, immutable`, because a signed URL's bytes never change. A response a client hint applies to carries `private` with the same lifetime instead, so only the browser that asked keeps it (see [Client hints and shared caches](responses.md#client-hints-and-shared-caches)). When one response should live shorter, add a `maxage:<seconds>` segment anywhere among the operations:
 
 ```text
 /<signature>/maxage:60/300x200/https://example.com/photo.jpg
 ```
 
-The value runs from 0 to 31536000. The response to that request carries `Cache-Control: public, max-age=60, immutable` instead of the year; every other response is unchanged. `maxage:0` answers `Cache-Control: public, max-age=0` with no `immutable`: the response is stale on arrival, so caches must revalidate before reusing it.
+The value runs from 0 to 31536000. The response to that request carries `Cache-Control: public, max-age=60, immutable` instead of the year (`private, max-age=60, immutable` when a client hint applies to it); every other response is unchanged. `maxage:0` answers `Cache-Control: public, max-age=0` with no `immutable`: the response is stale on arrival, so caches must revalidate before reusing it.
 
 The directive changes the response header only. It never enters the cache key, so URLs that differ only in `maxage` share one stored image, and purging is unaffected. The shared result cache (S3) stores bodies, not headers, so the per-response header composes there too: each request's lifetime is applied as its response is built, wherever the body came from.
 
@@ -81,7 +81,7 @@ Like `exp`, the segment sits inside the signed remainder and repeated segments r
 
 ### Revalidation
 
-Every cacheable image response also carries a strong `ETag`: a digest of the response's exact bytes, computed when the render is produced and stored with its cache entry. If a re-render under the same URL produces different bytes (the source changed and the old entry was purged), the ETag changes with them. A client or CDN holding a copy can revalidate with `If-None-Match`: when the value matches (an exact match, a weak `W/` spelling, one entry of a comma list, or `*`), the answer is `304 Not Modified` with no body, on cache hits and fresh renders alike; anything else gets the full `200`. The validator applies only to public `200` image responses: meta responses (`private, no-store`), fallbacks, and errors carry no `ETag` and are never answered with a `304`. It pairs with `maxage:0` for URLs whose copies should be checked before every reuse.
+Every cacheable image response also carries a strong `ETag`: a digest of the response's exact bytes, computed when the render is produced and stored with its cache entry. If a re-render under the same URL produces different bytes (the source changed and the old entry was purged), the ETag changes with them. A client or CDN holding a copy can revalidate with `If-None-Match`: when the value matches (an exact match, a weak `W/` spelling, one entry of a comma list, or `*`), the answer is `304 Not Modified` with no body, on cache hits and fresh renders alike; anything else gets the full `200`. The validator applies only to `200` image responses a cache may keep: `public` ones, and the `private` ones a client hint applies to, which the browser that asked revalidates the same way. Meta responses (`private, no-store`), fallbacks, and errors carry no `ETag` and are never answered with a `304`. It pairs with `maxage:0` for URLs whose copies should be checked before every reuse.
 
 ### Output size
 

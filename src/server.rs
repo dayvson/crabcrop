@@ -2523,7 +2523,12 @@ async fn serve(
         placeholders: negotiated.placeholders,
         hinted_width: negotiated.hinted_width,
         dpr_hint,
-        save_data,
+        // The engine steps on the same decision the key and
+        // the private marking take, never on the raw header:
+        // a render the header stepped where the key does not
+        // separate it would be stored, and served publicly,
+        // as the URL's plain answer.
+        save_data: negotiated.save_data_applies,
         accept: accept.map(str::to_string),
         groups: resolved.groups,
         cache_key,
@@ -2537,8 +2542,9 @@ async fn serve(
     (response, record)
 }
 
-/// Make a public answer private, keeping its lifetime: the
-/// answer a client hint shaped (see [`Negotiated::hint_shaped`]).
+/// Make a public answer private, keeping its lifetime: an
+/// answer a client hint gives its own cache entry (see
+/// [`Negotiated::hint_shaped`]).
 ///
 /// The hint headers are request headers any client sets,
 /// and many shared caches (CDNs among them) key on the URL
@@ -2767,7 +2773,9 @@ struct Negotiated {
     effective_dpr: f32,
     /// The quantized width a width hint resolves to.
     hinted_width: Option<u32>,
-    /// Whether `Save-Data` changes the bytes.
+    /// Whether `Save-Data` applies: the engine steps the
+    /// quality of a format that carries one, and the key
+    /// separates the entry.
     save_data_applies: bool,
     meta: bool,
     debug: bool,
@@ -2775,13 +2783,17 @@ struct Negotiated {
 }
 
 impl Negotiated {
-    /// Whether a client hint shaped the answer: a width
-    /// hint sized it, a DPR hint (not the URL's own `dpr`)
-    /// scaled it, or `Save-Data` stepped its quality. This
-    /// is exactly when [`cache_key_for`] gives the key a
-    /// hint's suffix, so the answer differs from the URL's
-    /// hint-free answer by the same rule its own cache entry
-    /// does.
+    /// Whether a client hint gives the answer its own cache
+    /// entry: a width hint sizes it, a DPR hint (not the
+    /// URL's own `dpr`) scales it, or `Save-Data` applies.
+    /// This is exactly when [`cache_key_for`] gives the key
+    /// a hint's suffix, so the answer is set apart from the
+    /// URL's hint-free answer by the same rule its cache
+    /// entry is. It can still match that answer byte for
+    /// byte (a width hint at or past the source width, a DPR
+    /// hint on a URL that sizes nothing, `Save-Data` on PNG
+    /// output), and is set apart all the same: whether the
+    /// bytes differ is only known after the render.
     fn hint_shaped(&self) -> bool {
         self.hinted_width.is_some()
             || self.save_data_applies
@@ -2823,9 +2835,13 @@ fn negotiate(
     } else {
         width_hint.map(|w| quantize_width(w, state.width_step))
     };
-    // Save-Data changes the bytes exactly when the engine
-    // steps (hint present, no quality directive in the URL);
-    // the key separates those entries under the same rule.
+    // Save-Data applies when the hint is present and the URL
+    // names no quality directive. This one decision drives
+    // the engine's step (`MissWork::save_data`), the key's
+    // separate entry, and the private marking, so the three
+    // cannot disagree: a per-format list that names no value
+    // for the output format still counts as a directive, and
+    // the engine does not step it either.
     let save_data_applies = save_data && !directives.quality_directive;
 
     let preferred = negotiate_format(accept);
@@ -3001,9 +3017,10 @@ async fn run_flight(
     // cache lifetime all come from it) and the same header
     // inputs as the miss path sees them: the negotiated
     // format, not the raw Accept (on this path errors are
-    // plain text whatever it says), and the quantized
-    // width, not the raw hint, so browsers that phrase the
-    // same request differently still share one flight. The
+    // plain text whatever it says), the quantized width,
+    // not the raw hint, and whether Save-Data applies, not
+    // the raw header, so browsers that phrase the same
+    // request differently still share one flight. The
     // conditional header is left out: each waiter applies
     // its own. A waiter that cannot take the response
     // (another spelling of the key, a body past the share
@@ -3625,6 +3642,10 @@ struct MissWork {
     placeholders: bool,
     hinted_width: Option<u32>,
     dpr_hint: Option<f32>,
+    /// Whether Save-Data steps this render's quality:
+    /// [`Negotiated::save_data_applies`], the rule the cache
+    /// key and the private marking follow, not the raw
+    /// header.
     save_data: bool,
     accept: Option<String>,
     groups: Vec<String>,

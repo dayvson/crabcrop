@@ -7290,6 +7290,60 @@ async fn save_data_steps_quality_and_separates_the_cache() {
     assert_eq!(header(&resp, "x-crabcrop-quality"), "");
 }
 
+#[tokio::test]
+async fn a_save_data_answer_is_stepped_only_where_its_entry_and_privacy_follow() {
+    // One decision settles whether Save-Data steps a
+    // render, gives it its own cache entry, and keeps it
+    // from shared caches. A per-format quality list that
+    // names no value for the output format is where the
+    // engine and the key could part: a stepped encode
+    // stored under the URL's plain entry, served public,
+    // and then returned to plain requests. Whatever the
+    // rule says for such a URL, a stepped answer is private
+    // and the plain answer is never the stepped encode.
+    let detailed = DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 200, |x, y| {
+        image::Rgb([
+            (x * 255 / 320) as u8,
+            (y * 255 / 200) as u8,
+            ((x + y) * 7) as u8,
+        ])
+    }));
+    let mut png = Vec::new();
+    detailed
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let (src, _) = spawn_counting_server(200, "image/png", png).await;
+    for remainder in [
+        format!("filters:format(webp):quality(jpeg:90)/{src}"),
+        format!("200x0/filters:format(jpeg):quality(webp:60)/{src}"),
+    ] {
+        // The URL's plain answer, rendered by a server that
+        // has seen no Save-Data request.
+        let reference = spawn_app(false).await;
+        let resp = get_with_headers(&reference, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{remainder}");
+        let plain = resp.bytes().await.unwrap();
+        // Save-Data first, on a fresh server.
+        let base = spawn_app(false).await;
+        let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{remainder}");
+        let stepped = header(&resp, "x-crabcrop-quality") == "70";
+        let cache_control = header(&resp, "cache-control");
+        let body = resp.bytes().await.unwrap();
+        if stepped {
+            assert_eq!(cache_control, YEAR_PRIVATE, "stepped: {remainder}");
+        } else {
+            assert_eq!(cache_control, YEAR_PUBLIC, "{remainder}");
+            assert_eq!(body, plain, "a public Save-Data answer: {remainder}");
+        }
+        // The plain request after it gets the plain answer.
+        let resp = get_with_headers(&base, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "", "{remainder}");
+        assert_eq!(header(&resp, "cache-control"), YEAR_PUBLIC, "{remainder}");
+        assert_eq!(resp.bytes().await.unwrap(), plain, "{remainder}");
+    }
+}
+
 /// The `Vary` every image-route answer carries while client
 /// hints are on, the published value.
 const HINTED_VARY: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
