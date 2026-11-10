@@ -4,6 +4,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-10
+
 ### Changed
 
 - In the `crabcrop-url` crate, `sign` returns `Result<String, BuildError>` instead of `String`, `BuildError` and `SealError` gain a `ReservedRemainder` variant, and `RESERVED_SEGMENT` and `is_reserved_remainder` are new. `sign` refuses a remainder that is `crabcrop` or begins with `crabcrop/`, and so do `sign_with_key_id`, `build_url`, `build_url_with_key_id`, `build_srcset` and `build_sealed_url`; the TypeScript and Python SDKs throw or raise for the same remainders and export `RESERVED_SEGMENT` and `isReservedRemainder` / `is_reserved_remainder`. Code that called `sign` unwraps the result. Signatures over every other remainder are unchanged. This changes the crate's public API, so it ships in a minor release (0.11.0), not a patch release.
