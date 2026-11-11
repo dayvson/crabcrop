@@ -1509,12 +1509,8 @@ fn purge_disk_tier(
     let Some(store) = &state.store else {
         return (0, None);
     };
-    let (removed, seqs) = store.purge(target);
+    let (removed, disk) = store.purge_waiting(target);
     store.kick();
-    let disk = crate::storage::DeletionWait {
-        store: store.clone(),
-        seqs,
-    };
     if let Some(shared) = &state.shared_store {
         shared.hold_for_deletions(target, &disk);
     }

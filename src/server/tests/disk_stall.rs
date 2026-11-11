@@ -1362,3 +1362,120 @@ async fn repeated_purges_of_a_target_held_by_a_failing_deletion_keep_one_tombsto
     assert_eq!(tombstones_ended(&fake), [true]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_purge_that_dooms_a_write_holds_its_tombstone_for_the_keys_earlier_deletion() {
+    // Issue #572 third review: a purge that dooms a write in
+    // flight queues the deletion of the file that write renames
+    // into place. When the key already had a deletion queued,
+    // here by an earlier purge of another group, the queue
+    // keeps one job per key, so the purge queued none for that
+    // file and its tombstone ended while the write was still
+    // in flight. The write's own unlink failed, and a restart
+    // indexed the file in the purged group, to serve once the
+    // tombstone's grace had passed.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-doomed-earlier-deletion");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (f, h, n) = (fail.clone(), hold.clone(), held.clone());
+    store.set_hold(Some(Arc::new(move |kind, _| {
+        if kind == OpKind::Unlink && f.load(Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if kind == OpKind::Write && h.load(Ordering::SeqCst) {
+            n.fetch_add(1, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            while h.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(15) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            n.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(())
+    })));
+    // The earlier purge: its deletion of the key's file fails
+    // and waits for its retry.
+    store.put(KEY, &in_groups(&["a"]));
+    assert_eq!(purge_group_call(&base, "a").await, "purged 1\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the first purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    // A fresh render of the key in b, held in its disk write.
+    hold.store(true, Ordering::SeqCst);
+    let crate::storage::WritePlan::Claimed(claim) =
+        store.begin_write(KEY, &group_list(&["b"]), Bucket::Unknown, true)
+    else {
+        panic!("the write did not claim the key");
+    };
+    let image = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..in_groups(&["b"])
+    };
+    let writer = {
+        let store = store.clone();
+        tokio::spawn(async move { store.blocking(move |store| store.land(claim, &image)).await })
+    };
+    within(
+        std::time::Duration::from_secs(5),
+        "the write to start",
+        async {
+            while held.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        },
+    )
+    .await;
+    assert_eq!(purge_group_call(&base, "b").await, "purged 0\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the purge of b to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    let ended = |group: &str| {
+        bucket_tombstones(&fake)
+            .iter()
+            .find(|t| t.target == crate::cache::PurgeTarget::Group(group.into()))
+            .map(|t| t.ended_ms.is_some())
+    };
+    assert_eq!(
+        ended("b"),
+        Some(false),
+        "b's tombstone ended with the doomed write in flight"
+    );
+    // The write lands doomed, and its own unlink fails.
+    hold.store(false, Ordering::SeqCst);
+    assert_eq!(writer.await.unwrap(), Some(None));
+    let file = dir.join(format!("{}.bin", crate::storage::key_stem(KEY)));
+    assert!(file.exists());
+    // A restart long after finds b's purge in force.
+    age_ended_tombstones(&fake, crate::cache::TOMBSTONE_GRACE_MS + 60_000);
+    {
+        let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+        let restarted_shared = restarted.shared_store.clone().unwrap();
+        restarted_shared
+            .refresh_tombstones(&restarted.purge_guard)
+            .await;
+        assert!(restarted.store.as_ref().unwrap().contains(KEY));
+        assert!(lookup_tiers(&restarted, KEY, &[]).await.is_none());
+    }
+    // Once the deletion goes through, both tombstones end.
+    fail.store(false, Ordering::SeqCst);
+    let drained = store.clone();
+    tokio::task::spawn_blocking(move || drained.drain_now())
+        .await
+        .unwrap();
+    assert!(!file.exists());
+    shared.end_held_purges().await;
+    assert_eq!(tombstones_ended(&fake), [true, true]);
+    store.set_hold(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1336,6 +1336,32 @@ impl DiskStore {
     /// [`DiskStore::wait_deletions`]. The caller kicks the
     /// drain.
     pub fn purge(&self, target: &PurgeTarget) -> (usize, Range<u64>) {
+        let (removed, seqs, _) = self.purge_queued(target);
+        (removed, seqs)
+    }
+
+    /// [`DiskStore::purge`], with the deletions its bucket
+    /// tombstones wait for: those it queued, and those queued
+    /// before it for keys whose write it doomed.
+    pub fn purge_waiting(self: &Arc<Self>, target: &PurgeTarget) -> (usize, DeletionWait) {
+        let (removed, seqs, earlier) = self.purge_queued(target);
+        (
+            removed,
+            DeletionWait {
+                store: self.clone(),
+                seqs,
+                earlier,
+            },
+        )
+    }
+
+    /// [`DiskStore::purge`], plus the sequence numbers of the
+    /// deletions queued before it for keys whose write it
+    /// doomed. A key has one deletion queued at a time, so when
+    /// it has one already, that one deletes the file the write
+    /// renames into place, and the purge queues none of its own.
+    fn purge_queued(&self, target: &PurgeTarget) -> (usize, Range<u64>, Vec<u64>) {
+        let mut earlier = Vec::new();
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
         let first = inner.next_seq + 1;
@@ -1367,10 +1393,13 @@ impl DiskStore {
                 && target.covers(key, groups)
             {
                 *doomed = true;
-                deletions.push(key, &key_stem(key), next_seq);
+                match deletions.jobs.get(key) {
+                    Some(job) => earlier.push(job.seq),
+                    None => deletions.push(key, &key_stem(key), next_seq),
+                }
             }
         }
-        (removed.len(), first..inner.next_seq + 1)
+        (removed.len(), first..inner.next_seq + 1, earlier)
     }
 
     /// Remove every entry for `base`: the bare key plus its
@@ -2364,13 +2393,22 @@ struct Scanned {
 pub struct DeletionWait {
     pub store: Arc<DiskStore>,
     pub seqs: Range<u64>,
+    /// Deletions queued before the purge for keys whose write
+    /// it doomed: each deletes the file that write renames
+    /// into place.
+    pub earlier: Vec<u64>,
 }
 
 impl DeletionWait {
-    /// Whether any of the deletions is still queued, failed or
-    /// not.
+    /// Whether any of the deletions, the earlier ones
+    /// included, is still queued, failed or not.
     pub fn pending(&self) -> bool {
-        self.store.deletions_pending(&self.seqs)
+        let inner = self.store.inner.lock().unwrap();
+        inner.deletions.any_in(&self.seqs)
+            || self
+                .earlier
+                .iter()
+                .any(|seq| inner.deletions.by_seq.contains_key(seq))
     }
 
     /// Wait while the deletions make progress (see
