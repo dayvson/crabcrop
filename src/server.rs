@@ -439,27 +439,69 @@ pub fn app(state: AppState) -> Router {
         // from a mistyped path.
         .route("/upload/{*path}", axum::routing::put(upload_handle))
         .route("/{*path}", get(handle))
-        // A PUT that matched no upload route is a 404, not
-        // the 405 the GET catch-all would otherwise produce
-        // for it: the upload route is this server's only
-        // PUT surface (issue #168).
+        // A PUT on an image path is a 404, not the 405 the
+        // GET catch-all would otherwise produce for it:
+        // uploads go to the upload route only (issue #168).
+        // A PUT to a named route other than the upload
+        // route is the 405 below.
         .route("/{*path}", axum::routing::put(put_not_found))
+        // A path no route matches (the catch-all's wildcard
+        // cannot match `/` itself) answers the documented
+        // 404 instead of axum's bare one, and a method the
+        // matched route does not serve answers a documented
+        // 405; axum still sets the `Allow` header on the 405
+        // (issue #563).
+        .fallback(unrouted_path)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .layer(axum::middleware::from_fn(security_headers))
 }
 
-/// The PUT fallback: every PUT that is not to the upload
-/// route is simply not found.
-async fn put_not_found(headers: HeaderMap) -> Response {
-    let accept = headers
+/// The `Accept` header's value, for [`error_response`].
+fn accept_of(headers: &HeaderMap) -> Option<String> {
+    headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .map(str::to_string)
+}
+
+/// The image catch-all's PUT handler: a PUT there is
+/// simply not found. A PUT to a named route other than
+/// `/upload` is a different answer: the router's
+/// method-not-allowed fallback below (issue #563).
+async fn put_not_found(headers: HeaderMap) -> Response {
     error_response(
         StatusCode::NOT_FOUND,
         "not_found",
         "not found".to_string(),
-        accept.as_deref(),
+        accept_of(&headers).as_deref(),
+    )
+}
+
+/// The router fallback: a path no route matches answers
+/// the documented `404 not_found`, in the JSON envelope
+/// when the client asked for it, instead of axum's bare
+/// 404 with no code (issue #563).
+async fn unrouted_path(headers: HeaderMap) -> Response {
+    error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "not found".to_string(),
+        accept_of(&headers).as_deref(),
+    )
+}
+
+/// The router's answer when the path matches a route but
+/// the method does not: `405 method_not_allowed` in the
+/// same shape as every other refusal, instead of axum's
+/// bare 405 (issue #563). axum adds the `Allow` header
+/// naming the matched route's methods.
+async fn method_not_allowed(headers: HeaderMap) -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "method not allowed".to_string(),
+        accept_of(&headers).as_deref(),
     )
 }
 
