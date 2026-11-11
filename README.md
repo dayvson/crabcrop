@@ -44,6 +44,7 @@ A secret of at least 16 bytes is the only required configuration; the server wil
 
 ```bash
 export CRABCROP_SECRET="$(openssl rand -hex 16)"
+echo "$CRABCROP_SECRET"   # keep it: step 3 signs with it
 CRABCROP_ALLOW_UNSAFE=1 cargo run --release
 # crabcrop listening on port 3000
 ```
@@ -56,7 +57,7 @@ curl "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg" --outp
 
 Replace `example.com/photo.jpg` with the URL of an image you control. You get back a 300x200 JPEG.
 
-**3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment. In a shell with the same `CRABCROP_SECRET`, `crabcrop sign` prints the signed URL:
+**3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment. In another shell, export the same `CRABCROP_SECRET` value (step 1 printed it), and `crabcrop sign` prints the signed URL:
 
 ```bash
 curl "$(cargo run --release -q -- sign "300x200/https://example.com/photo.jpg")" --output photo.jpg
