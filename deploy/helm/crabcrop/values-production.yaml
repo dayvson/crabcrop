@@ -16,8 +16,11 @@
 #          --from-literal=CRABCROP_METRICS_TOKEN="$(openssl rand -hex 32)"
 #
 #   2. A result bucket, once you scale past one replica:
-#      add --set resultBucket.name=<your-bucket> (see the
-#      resultBucket block below).
+#      add --set resultBucket.name=<your-bucket> and, for
+#      a Secret holding its AWS keys,
+#      --set resultBucket.credentialsSecret=crabcrop-aws
+#      (see the resultBucket block below and the chart
+#      README's Secrets section).
 #
 # Sizing follows the shape the project runs itself: a
 # 2-CPU-class workload whose memory budget is mostly the
@@ -82,7 +85,9 @@ resultStorage:
 # is what keeps the aggregate hit rate whole, because
 # every replica reads and writes it. Set with --set
 # resultBucket.name=<your-bucket>, or edit this block in
-# your own copy of this file.
+# your own copy of this file. credentialsSecret names the
+# Secret with the AWS keys; never put them in env.
 resultBucket:
   name: ""
   prefix: "results"
+  credentialsSecret: ""

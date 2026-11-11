@@ -102,7 +102,9 @@ impl std::fmt::Debug for ConfigValue {
 
 /// The variables that hold secrets: a [`ConfigError`] keeps
 /// none of their values, and [`Config`] holds them only in
-/// types whose `Debug` prints `[redacted]`.
+/// types whose `Debug` prints `[redacted]`. The Helm chart
+/// reads each from a Secret, and tests/deploy_recipes.rs
+/// checks its list against this one.
 const SECRET_VARIABLES: [&str; 6] = [
     "CRABCROP_SECRET",
     "CRABCROP_SECRET_PREVIOUS",

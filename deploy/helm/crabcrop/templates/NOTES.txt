@@ -1,6 +1,14 @@
 crabcrop is deployed as {{ include "crabcrop.fullname" . }}.
 
-{{- if and (not .Values.existingSecret) (not .Values.secret) }}
+{{- /* The signing secret can also come from env, ai.env (with
+     ai.enabled), extraEnv or envFrom. */}}
+{{- $signing := or .Values.existingSecret .Values.secret .Values.envFrom (hasKey (.Values.env | default dict) "CRABCROP_SECRET") (and .Values.ai.enabled (hasKey (.Values.ai.env | default dict) "CRABCROP_SECRET")) }}
+{{- range .Values.extraEnv }}
+{{- if eq (get . "name") "CRABCROP_SECRET" }}
+{{- $signing = true }}
+{{- end }}
+{{- end }}
+{{- if not $signing }}
 
 WARNING: no signing secret is configured. The server refuses
 to start without CRABCROP_SECRET (16+ bytes). Create one and
@@ -14,6 +22,22 @@ Production installs also put a CRABCROP_METRICS_TOKEN key in
 the same Secret and set metricsToken.existingSecret to it, so
 GET /metrics requires the bearer <redacted>; see
 values-production.yaml.
+{{- end }}
+{{- $plainSecrets := include "crabcrop.plainSecrets" . | fromYaml }}
+{{- if $plainSecrets }}
+
+WARNING: these secrets are plain values in the Deployment
+spec, so anyone who can read the Deployment or its Pods can
+read them. Put each in a Secret, set the value named, and
+remove it from env, ai.env or extraEnv (an entry there wins):
+{{- range $name, $route := $plainSecrets }}
+  {{ $name }}: {{ $route }}
+{{- end }}
+Move AWS_ACCESS_KEY_ID and CRABCROP_GCS_ACCESS_KEY with their
+secret keys. An extraEnv entry with valueFrom.secretKeyRef
+works too.
+This release only warns. A later release will refuse them;
+set refusePlainSecrets=true to refuse them now.
 {{- end }}
 {{- if and .Values.ai.enabled (not .Values.ai.models.existingClaim) }}
 

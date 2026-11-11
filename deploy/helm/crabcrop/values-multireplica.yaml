@@ -5,7 +5,8 @@
 #   helm install crabcrop deploy/helm/crabcrop \
 #     -f deploy/helm/crabcrop/values-production.yaml \
 #     -f deploy/helm/crabcrop/values-multireplica.yaml \
-#     --set resultBucket.name=<your-bucket>
+#     --set resultBucket.name=<your-bucket> \
+#     --set resultBucket.credentialsSecret=crabcrop-aws
 #
 # Read the cache note in the chart README first. The result
 # cache is per-replica (memory) and per-pod (disk tier), so

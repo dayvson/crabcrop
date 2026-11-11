@@ -81,7 +81,13 @@ kubectl apply -k deploy/kustomize/overlays/single
 
 Free-form environment (the chart's `env` map) is an overlay
 patch against the Deployment's container env, as
-`overlays/multi-replica/env-patch.yaml` shows. Ingress and
+`overlays/multi-replica/env-patch.yaml` shows. Give a secret
+(`CRABCROP_SECRET_PREVIOUS`, `CRABCROP_METRICS_TOKEN`, the
+AWS keys, the GCS HMAC pair) as a `valueFrom.secretKeyRef`
+entry, as the patch's AWS example does, never as a `value:`
+line: a `value:` puts it in the Deployment as plain text,
+which anyone who can read the Deployment or its Pods can
+read. Ingress and
 autoscaling are yours to add the same way; the chart ships
 them as values because Helm needs them parameterized,
 while a kustomize overlay is already your own file.

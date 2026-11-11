@@ -1,6 +1,6 @@
 # crabcrop Helm chart
 
-Deploys the crabcrop image service. The chart is deliberately thin: the server is configured entirely through the environment, so the chart wires the common settings structurally (secret, presets, storage, AI models) and passes everything else through a free-form `env` map.
+Deploys the crabcrop image service. The chart is deliberately thin: the server is configured entirely through the environment, so the chart wires the common settings structurally (secrets, presets, storage, AI models) and passes everything else through a free-form `env` map. Secrets never go through `env`: see [Secrets](#secrets).
 
 Two install shapes ship with the chart:
 
@@ -44,15 +44,47 @@ Serving traffic takes the usual extra step: enable the Ingress (`ingress.enabled
 
 ### 3. The shared result bucket (when you scale out)
 
-A single replica is complete with the two local tiers. Before you run several replicas, wire the shared tier so they read and write one result store instead of diverging:
+A single replica is complete with the two local tiers. Before you run several replicas, wire the shared tier so they read and write one result store instead of diverging. Put the bucket's AWS keys in a Secret first:
 
 ```bash
+kubectl create secret generic crabcrop-aws \
+  --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
 helm upgrade crabcrop deploy/helm/crabcrop \
   -f deploy/helm/crabcrop/values-production.yaml \
-  --set resultBucket.name=<your-bucket>
+  --set resultBucket.name=<your-bucket> \
+  --set resultBucket.credentialsSecret=crabcrop-aws
 ```
 
-`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with environment-provided AWS credentials only: set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in the pod environment (through the chart's `env` map, backed by a Secret), because the server reads those variables once at startup and does not fetch credentials from a pod IAM role or any other part of the AWS credential chain. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with environment-provided AWS credentials only, because the server reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` once at startup and does not fetch credentials from a pod IAM role or any other part of the AWS credential chain. `resultBucket.credentialsSecret` names the Secret that holds them, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+
+## Secrets
+
+The server treats six variables as secrets. Read each from a Secret you manage, through the value below. A value in `env` or `ai.env` lands in the Deployment as plain text, and anyone who can read the Deployment or its Pods can read it (the built-in `view` role can, though it cannot read Secrets).
+
+| Variable | Value that reads it from a Secret |
+|---|---|
+| `CRABCROP_SECRET` | `existingSecret`, key `secretKey` |
+| `CRABCROP_SECRET_PREVIOUS` | `previousSecret.existingSecret`, key `previousSecret.secretKey` |
+| `CRABCROP_METRICS_TOKEN` | `metricsToken.existingSecret`, key `metricsToken.secretKey` |
+| `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` | `resultBucket.credentialsSecret`, with `AWS_ACCESS_KEY_ID`, each under its own name; the session token is optional |
+| `CRABCROP_GCS_SECRET_KEY` | `gcsCredentials.existingSecret`, with `CRABCROP_GCS_ACCESS_KEY`, each under its own name |
+
+The AWS keys also sign `s3://` sources and the upload bucket, so `resultBucket.credentialsSecret` works without a bucket name. Two lists cover the rest:
+
+- `extraEnv` takes env entries as written, after the `env` map, so an entry can carry `valueFrom.secretKeyRef`. Use it when your Secret's key names differ.
+- `envFrom` maps whole Secrets or ConfigMaps to variables. A variable set in `env` or `extraEnv` wins over one from `envFrom`.
+
+```yaml
+extraEnv:
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: my-aws-keys
+        key: secret-access-key
+```
+
+This release still renders a secret given in `env`, in `ai.env`, or as an `extraEnv` entry's `value`. It warns in the install notes and in a comment in the rendered Deployment, naming the value to set instead. Set `refusePlainSecrets: true` to fail the render instead. A later release will refuse these by default. To migrate, put each key in a Secret and set the value the warning names. Then remove the key from `env`, `ai.env` or `extraEnv`: an entry left there comes after the Secret's and wins. Move `AWS_ACCESS_KEY_ID` and `CRABCROP_GCS_ACCESS_KEY` with their secret keys the same way.
 
 ## Evaluation install
 
@@ -114,6 +146,8 @@ env:
   CRABCROP_ALLOWED_SOURCES: "images.example.com,upload.wikimedia.org"
 ```
 
+Keep secrets out of this map: see [Secrets](#secrets).
+
 The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Smoke checklist
@@ -125,7 +159,7 @@ Run against the production install, with the service reachable at `<host>` (your
 3. Fetch the same signed URL again. The `Cache-Status` response header reports a hit.
 4. Purge it: `CRABCROP_BASE=https://<host> CRABCROP_SECRET=<secret> crabcrop purge "300x200/https://example.com/photo.jpg"` answers `purged 1` (or more, counting variants), and the next fetch of the signed URL is a miss again.
 5. Metrics auth: `curl https://<host>/metrics` without a token returns 401, and `curl -H "Authorization: Bearer <metrics-token>" https://<host>/metrics` returns 200 with the Prometheus counters. (On an install with no metrics token configured, `/metrics` answers 403 to everyone; that is the evaluation shape, not production.)
-6. Update the Secret and restart the deployment (`kubectl rollout restart deployment/crabcrop`) and the pods pick it up on their next start; for zero-downtime rotation use the key ID flow in the main README (`CRABCROP_SECRET_PREVIOUS` plus key IDs).
+6. Update the Secret and restart the deployment (`kubectl rollout restart deployment/crabcrop`) and the pods pick it up on their next start; for zero-downtime rotation use the key ID flow in the main README (`CRABCROP_SECRET_PREVIOUS` plus key IDs). Put the outgoing secret in a Secret and set `previousSecret.existingSecret` to it; the key IDs are not secret, so `CRABCROP_SECRET_KEY_ID` and `CRABCROP_SECRET_PREVIOUS_KEY_ID` go in `env`.
 
 ## Scaling and cache notes
 
@@ -133,7 +167,8 @@ Run against the production install, with the service reachable at `<host>` (your
 helm install crabcrop deploy/helm/crabcrop \
   -f deploy/helm/crabcrop/values-production.yaml \
   -f deploy/helm/crabcrop/values-multireplica.yaml \
-  --set resultBucket.name=<your-bucket>
+  --set resultBucket.name=<your-bucket> \
+  --set resultBucket.credentialsSecret=crabcrop-aws
 ```
 
 **Read this before scaling out.** crabcrop caches processed results in three tiers, and the first two are local:

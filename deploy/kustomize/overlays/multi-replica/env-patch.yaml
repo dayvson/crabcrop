@@ -1,11 +1,16 @@
 # Free-form environment for the deployment, the kustomize
 # spelling of the chart's `env` map. The shared result tier
 # is the multi-replica example: uncomment and set your
-# bucket (plus CRABCROP_S3_REGION and the AWS credentials
-# as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY entries:
-# the server reads those variables at startup and does not
-# pick up platform-injected role credentials) so every
-# replica reads and writes one cache.
+# bucket (plus CRABCROP_S3_REGION and the AWS credentials:
+# the server reads AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY at startup and does not pick up
+# platform-injected role credentials) so every replica
+# reads and writes one cache. Read the keys from a Secret,
+# as below: a value: line puts them in the Deployment as
+# plain text. Create it with
+#   kubectl create secret generic crabcrop-aws \
+#     --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+#     --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,3 +27,13 @@ spec:
             #   value: my-crabcrop-results
             # - name: CRABCROP_RESULT_PREFIX
             #   value: prod/
+            # - name: AWS_ACCESS_KEY_ID
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: crabcrop-aws
+            #       key: AWS_ACCESS_KEY_ID
+            # - name: AWS_SECRET_ACCESS_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: crabcrop-aws
+            #       key: AWS_SECRET_ACCESS_KEY
