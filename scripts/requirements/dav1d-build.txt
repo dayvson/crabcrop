@@ -1,0 +1,17 @@
+# The tools that build dav1d for every shipped binary: meson and ninja
+# (issues #193, #598). Install with --require-hashes.
+#
+# A version pin alone does not fix the bytes pip installs: PyPI lets a
+# project add files to a version it already published, and pip picks the
+# most specific wheel for the runner. So each line carries the hash of
+# every wheel the runners use, and pip refuses any other file. meson has
+# one wheel for every platform; ninja has one per platform, and the
+# three hashes are its Linux x86_64, Linux aarch64 and macOS (universal2)
+# wheels. A runner on another platform fails here instead of building
+# ninja from source.
+meson==1.12.1 \
+    --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02
+ninja==1.13.2 \
+    --hash=sha256:65a24341b5ac09fcadcc37082660be40a94174e51a937fabf6e2cae26225fa2c \
+    --hash=sha256:d775a5e43e9088f507a6250d57fcf5678eb31268c545feb5064ffeee33735622 \
+    --hash=sha256:fd82e26c0706ad4ab88e5fdd26f3fab0a987a90f810160f6c322e752c6af298b

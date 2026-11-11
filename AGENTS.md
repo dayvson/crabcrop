@@ -67,7 +67,9 @@ both SDKs must all pass.
   never repo content. `.github/workflows/ai-models.yml` downloads the
   pinned artifacts and runs them (`cargo test -- --ignored`) on pull
   requests and main pushes that touch `src/ai/`, `src/tokenizer.rs`,
-  `tests/fixtures/portrait.jpg` or the workflow itself, on every release
+  `tests/fixtures/portrait.jpg`, its hash-locked Python requirements
+  (`scripts/requirements/ai-fixtures.txt`) or the workflow itself, on
+  every release
   tag before anything publishes, weekly, and by hand. When you cannot run
   them locally, that pull-request run is where an AI change is verified.
   A change outside those paths can still break them (the real-model tests

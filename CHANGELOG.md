@@ -32,6 +32,14 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The playground page now carries a Content-Security-Policy (issue #603). The page asks for the signing secret but had no policy, so any script that ended up on it, such as one a CDN feature or a site template adds, could read the secret field. `index.html` now sets `script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'` right after `<meta charset>`, so only scripts from the page's own origin run. The page also said it contacts only the endpoint and the sources you enter, but every visit fetched the prefilled example source from Wikimedia for the size check. It now shows the preview on load and runs the size check after your first edit. playground/README.md describes the policy and its limits, and says to turn off CDN features that inject scripts, such as Cloudflare Rocket Loader, Zaraz and Web Analytics. README.md now calls play.crabcrop.org a demo instance with a public demo key, and says not to paste a production secret into it (issue #602).
 
+- Every job of the release workflow checks the cargo-dist installer before it runs it (issue #597). build-local-artifacts, the job that builds every shipped binary, ran dist's generated `curl ... | sh` with no checksum; only plan checked the script. Both jobs now download it, check it against the pinned SHA-256, and then run it. The URL and the hash are set once, in the workflow's `env`.
+
+- The Python tools in CI and in the release are pinned by hash (issue #598). ninja, which builds the dav1d in the release binaries, was pinned by version only, and a version pin does not fix the bytes: PyPI accepts new files for an existing version, and pip installs the most specific one. meson and ninja (one hash per runner wheel), onnx and its dependencies for the AI release gate, build, setuptools and twine with their dependencies for the PyPI release, and Pillow for the functional tests now come from requirements files that list every hash, installed with `--require-hashes`. The Python SDK builds with `--no-isolation`, so its build backend is the hashed setuptools rather than the newest one.
+
+- The AI release gate pins `actions/cache` by commit SHA (issue #593). It was the one action still used by a moving tag (`v6`), and its code runs inside the release run. `ai-models.yml` now has a mirror, `docs/ai-models-workflow.yml`, like the other workflows, and `scripts/test_all.sh` fails on a live workflow without one.
+
+- A new check, `scripts/check_workflows.py`, fails CI on an action that is not pinned by commit SHA, a download piped into a shell, a cargo-dist installer that runs before its checksum check, and a pip install without hashes (issues #593, #597, #598). It runs in `rust.yml` and in `scripts/test_all.sh`.
+
 ## [0.11.0] - 2026-11-10
 
 ### Changed

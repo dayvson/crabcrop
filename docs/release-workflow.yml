@@ -20,16 +20,31 @@
 # permissions, SHA-pinned actions, the release tag passed
 # to run steps only through environment variables,
 # checksum-pinned cargo-dist and rustup installs, and
-# version-pinned pip tooling. If `cargo dist generate`
-# rewrites the dist jobs, re-apply these changes (and the
-# crabcrop jobs at the bottom, as before), including the
-# host job's wait on the ai-models release gate (issue #414).
+# hash-pinned pip tooling (issue #598). If `cargo dist
+# generate` rewrites the dist jobs, re-apply these changes
+# (and the crabcrop jobs at the bottom, as before),
+# including the host job's wait on the ai-models release
+# gate (issue #414) and both "Install dist" steps: plan's
+# and build-local-artifacts', which dist regenerates as
+# `run: ${{ matrix.install_dist.run }}`, a curl piped into
+# sh (issue #597). Both download the installer, check it
+# against CARGO_DIST_INSTALLER_SHA256 below, and only then
+# run it. scripts/check_workflows.py fails CI on a step
+# that does not.
 
 name: Release
 # Default to read-only; host, the job that creates the
 # GitHub Release, opts back into write for itself below.
 permissions:
   "contents": "read"
+
+# crabcrop (issue #597): the cargo-dist installer and its
+# pinned checksum, in one place for both "Install dist"
+# steps. A dist upgrade changes these two values (and
+# cargo-dist-version in dist-workspace.toml) together.
+env:
+  CARGO_DIST_INSTALLER_URL: "https://github.com/axodotdev/cargo-dist/releases/download/v0.33.1/cargo-dist-installer.sh"
+  CARGO_DIST_INSTALLER_SHA256: "a7b3b0812d624a09a534ba272aa8e04c801e56a83d553327a4a8632bc03abb94"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -113,15 +128,16 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
-        # crabcrop (issue #193): verify the installer script
-        # against a pinned checksum before executing it.
+        # crabcrop (issues #193, #597): download the installer
+        # script, check it against the pinned checksum, and
+        # only then run it. shasum works on the Linux and the
+        # macOS runners alike.
         shell: bash
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.33.1/cargo-dist-installer.sh -o cargo-dist-installer.sh
-          echo "a7b3b0812d624a09a534ba272aa8e04c801e56a83d553327a4a8632bc03abb94  cargo-dist-installer.sh" | sha256sum -c -
-          sh cargo-dist-installer.sh
+          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf "$CARGO_DIST_INSTALLER_URL" -o "$installer"
+          echo "$CARGO_DIST_INSTALLER_SHA256  $installer" | shasum -a 256 -c -
+          sh "$installer"
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -207,8 +223,17 @@ jobs:
             ./rustup-init -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      # crabcrop (issue #597): dist generates this step as
+      # `run: ${{ matrix.install_dist.run }}`, which pipes the
+      # installer into sh unchecked. This job builds every
+      # shipped binary, so it installs dist the way plan does.
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf "$CARGO_DIST_INSTALLER_URL" -o "$installer"
+          echo "$CARGO_DIST_INSTALLER_SHA256  $installer" | shasum -a 256 -c -
+          sh "$installer"
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -226,24 +251,18 @@ jobs:
       # ninja on the PATH.
       - name: Install meson, ninja, and nasm (vendored dav1d)
         run: |
-          # crabcrop (issue #193): pin the tool versions.
-          # The meson wheel is platform-independent, so pin
-          # its hash too; ninja wheels are per-platform, so
-          # there the version pin is what pip can enforce.
-          # pip has no --hash option (v0.1.1's first release
-          # run failed on exactly that); hashes are declared
-          # in a requirements file, so write one and install
-          # from it with --require-hashes.
+          # crabcrop (issues #193, #598): meson and ninja
+          # come from a requirements file that pins the hash
+          # of every wheel the runners use, ninja's three
+          # per-platform wheels included. A version pin alone
+          # does not fix the bytes: PyPI takes new files for
+          # an existing version, and pip picks the most
+          # specific wheel for the runner.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            pip_flags="--user --break-system-packages"
+            python3 -m pip install --user --break-system-packages --require-hashes -r scripts/requirements/dav1d-build.txt
           else
-            pip_flags="--user"
+            python3 -m pip install --user --require-hashes -r scripts/requirements/dav1d-build.txt
           fi
-          printf '%s\n' 'meson==1.12.1 --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' > meson-requirements.txt
-          # shellcheck disable=SC2086
-          python3 -m pip install $pip_flags --require-hashes -r meson-requirements.txt
-          # shellcheck disable=SC2086
-          python3 -m pip install $pip_flags "ninja==1.13.2"
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install nasm
           elif [ "$(uname -m)" = "x86_64" ]; then
@@ -664,10 +683,13 @@ jobs:
       - name: Build and upload
         working-directory: sdks/python
         run: |
-          # Tool versions pinned (issue #193): this step's
-          # environment carries the PyPI token.
-          python -m pip install "build==1.6.1" "twine==7.0.0"
-          python -m build
+          # Every tool and its dependencies pinned by hash
+          # (issue #598), and the build backend too
+          # (--no-isolation builds with the hashed setuptools):
+          # this step's environment carries the PyPI token.
+          python -m pip install --require-hashes -r build-requirements.txt
+          python -m pip install --require-hashes -r publish-requirements.txt
+          python -m build --no-isolation
           python -m twine upload dist/*
         env:
           TWINE_USERNAME: __token__
