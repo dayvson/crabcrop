@@ -7614,11 +7614,11 @@ fn animated_gif_of(n: u32) -> Vec<u8> {
 #[test]
 fn an_animated_source_converts_its_watermark_once() {
     // Issue #604: the filter runs once per frame, and every
-    // run copied the whole watermark to RGBA first. The RGBA
-    // form is made once per request now, when a frame first
-    // draws it. A watermark that is RGBA already is read in
-    // place, and one that lands off the canvas is never
-    // copied at all.
+    // run copied the whole watermark to RGBA first. Each part
+    // that lands is copied once per request now, when a frame
+    // first draws it there. A watermark that is RGBA already
+    // is read in place, and one that lands off the canvas is
+    // never copied at all.
     use crate::url::BlendMode;
     let engine = Engine;
     let rgb =
@@ -7631,6 +7631,14 @@ fn an_animated_source_converts_its_watermark_once() {
     );
     map.insert("off".to_string(), WatermarkImage::new(rgb()));
     map.insert("off-overlay".to_string(), WatermarkImage::new(rgb()));
+    map.insert(
+        "big".to_string(),
+        WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            300,
+            200,
+            image::Rgb([0, 255, 0]),
+        ))),
+    );
     let watermark = |url: &str, x, y| Filter::Watermark {
         url: url.to_string(),
         x,
@@ -7646,6 +7654,8 @@ fn an_animated_source_converts_its_watermark_once() {
         width: None,
     };
     let ops = [Operation::Filters(vec![
+        watermark("big", 30, 15),
+        watermark("big", -1, -1),
         watermark("rgb", 0, 0),
         watermark("rgb", -1, -1),
         overlay("rgb", 3, 3, BlendMode::Screen),
@@ -7674,6 +7684,10 @@ fn an_animated_source_converts_its_watermark_once() {
     assert_eq!(map["rgba"].conversions(), 0);
     assert_eq!(map["off"].conversions(), 0);
     assert_eq!(map["off-overlay"].conversions(), 0);
+    // An image drawn in two places copies the part that lands
+    // at each once, not once per frame.
+    assert_eq!(map["big"].conversions(), 2);
+    assert_eq!(map["big"].copied_pixels(), 10 * 5 + 39 * 19);
 }
 
 #[test]
@@ -7681,9 +7695,9 @@ fn a_partly_visible_watermark_copies_only_the_part_that_lands() {
     // Issue #604: a watermark that did not decode as RGBA was
     // copied whole, on every frame, however little of it
     // landed on the image. Only the part that lands is copied
-    // now, once, and kept for the frames after it. A use that
-    // needs a part the kept copy does not cover copies its
-    // own part.
+    // now, once, and kept for the frames after it. A part
+    // that no kept copy covers is copied and kept too, and a
+    // kept copy that a new part covers is dropped.
     let ctx = ProcessContext::default();
     let base =
         DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 20, image::Rgb([255, 0, 0])));
@@ -7701,16 +7715,33 @@ fn a_partly_visible_watermark_copies_only_the_part_that_lands() {
         assert_eq!(out.get_pixel(39, 19), &image::Rgb([0, 0, 255]));
         assert_eq!(out.get_pixel(29, 19), &image::Rgb([255, 0, 0]));
     }
-    assert_eq!(wm.kept_part(), Some((0, 0, 10, 5)));
+    assert_eq!(wm.kept_parts(), [((0, 0, 10, 5), (10, 5))]);
     assert_eq!(wm.conversions(), 1);
+    assert_eq!(wm.copied_pixels(), 10 * 5);
     // A part inside the kept one is read from it.
     overlay_watermark(&ctx, &base, &wm, 35, 17, 100).unwrap();
     assert_eq!(wm.conversions(), 1);
     // At (-1, -1) a 39x19 part of its bottom-right corner
-    // lands, which the kept copy does not cover.
-    overlay_watermark(&ctx, &base, &wm, -1, -1, 100).unwrap();
+    // lands, which the kept copy does not cover. It is copied
+    // once and kept beside the first.
+    for _ in 0..3 {
+        overlay_watermark(&ctx, &base, &wm, -1, -1, 100).unwrap();
+    }
+    assert_eq!(
+        wm.kept_parts(),
+        [((0, 0, 10, 5), (10, 5)), ((261, 181, 39, 19), (39, 19))]
+    );
     assert_eq!(wm.conversions(), 2);
-    assert_eq!(wm.kept_part(), Some((0, 0, 10, 5)));
+    assert_eq!(wm.copied_pixels(), 10 * 5 + 39 * 19);
+    // At (0, 0) a 40x20 part lands, which covers the first
+    // kept copy, so that copy is dropped.
+    overlay_watermark(&ctx, &base, &wm, 0, 0, 100).unwrap();
+    assert_eq!(
+        wm.kept_parts(),
+        [((261, 181, 39, 19), (39, 19)), ((0, 0, 40, 20), (40, 20))]
+    );
+    assert_eq!(wm.conversions(), 3);
+    assert_eq!(wm.copied_pixels(), 10 * 5 + 39 * 19 + 40 * 20);
     // An RGBA watermark is read in place.
     let rgba = WatermarkImage::new(DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         300,
@@ -7719,6 +7750,48 @@ fn a_partly_visible_watermark_copies_only_the_part_that_lands() {
     )));
     overlay_watermark(&ctx, &base, &rgba, 30, 15, 100).unwrap();
     assert_eq!(rgba.conversions(), 0);
+}
+
+#[test]
+fn a_watermark_keeps_at_most_one_copy_of_itself() {
+    // Issue #604: the kept copies of one watermark hold at
+    // most as many pixels as the whole image, the RGBA copy
+    // the decode budget charges for it (issue #613). A part
+    // past that is copied each time it is drawn, and draws
+    // the same bytes.
+    let ctx = ProcessContext::default();
+    let base = DynamicImage::ImageRgb8(image::RgbImage::from_fn(40, 20, |x, y| {
+        image::Rgb([(x * 6) as u8, (y * 12) as u8, 77])
+    }));
+    let top = DynamicImage::ImageRgb8(image::RgbImage::from_fn(50, 10, |x, y| {
+        image::Rgb([(x * 5) as u8, 200, (y * 25) as u8])
+    }));
+    let wm = WatermarkImage::new(top.clone());
+    let rgba = top.to_rgba8();
+    let draw = |x, y| {
+        let no_check = || Ok::<(), std::convert::Infallible>(());
+        let Ok(want) = composite_before_604(&base, &rgba, (x, y), 60, no_check, |_, o| o);
+        assert_eq!(
+            overlay_watermark(&ctx, &base, &wm, x, y, 60).unwrap(),
+            want,
+            "at ({x}, {y})"
+        );
+    };
+    // At (0, 0) a 40x10 part lands, 400 of the 500 pixels.
+    draw(0, 0);
+    assert_eq!(wm.kept_parts(), [((0, 0, 40, 10), (40, 10))]);
+    // At (-1, 0) a 39x10 part lands. Kept with the first, the
+    // copies would hold 790 pixels, so it is not kept, and
+    // each draw copies it again.
+    for _ in 0..3 {
+        draw(-1, 0);
+    }
+    assert_eq!(wm.kept_parts(), [((0, 0, 40, 10), (40, 10))]);
+    assert_eq!(wm.conversions(), 4);
+    assert_eq!(wm.copied_pixels(), 400 + 3 * 390);
+    // A part inside the kept one is still read from it.
+    draw(10, 0);
+    assert_eq!(wm.conversions(), 4);
 }
 
 #[test]
