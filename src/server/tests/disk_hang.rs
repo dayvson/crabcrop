@@ -1,8 +1,9 @@
-//! A disk that stops answering (issue #572). These tests use
-//! only what main already had (the read hook, `blocking`,
-//! `lookup_tiers`, `running()` and HTTP), so this file alone
-//! applies to a build without the fix, where each one fails
-//! at [`STUCK_DISK_LIMIT`] naming the step that hung.
+//! A disk that stops answering (issue #572). Apart from how
+//! they build and hold a state (`test_state()` and an `Arc`,
+//! issue #475), these tests use only what main had before the
+//! fix (the read hook, `blocking`, `lookup_tiers`, `running()`
+//! and HTTP), so on a build without the fix each one fails at
+//! [`STUCK_DISK_LIMIT`] naming the step that hung.
 
 use super::*;
 
@@ -101,8 +102,11 @@ async fn seed_then_go_cold(state: &Arc<AppState>, src: &str) -> (Arc<AppState>, 
         assert_eq!(resp.status(), StatusCode::OK);
     }
     assert_eq!(state.store.as_ref().unwrap().stats().0, remainders.len());
-    // The second state is `state`'s settings over its disk
-    // store, with memory, gates and tasks of its own.
+    // The second state copies only `state`'s disk store,
+    // presets and metrics token (all a `disk_only_state` sets
+    // past `test_state()` at the 16 MiB memory both callers
+    // use) and takes a cold memory, gates and tasks of its
+    // own from `test_state()`.
     let cold = Arc::new(AppState {
         store: state.store.clone(),
         presets: state.presets.clone(),
