@@ -93,13 +93,6 @@ struct Job {
     not_before: Option<std::time::Instant>,
     /// Being run right now, since then.
     running: Option<std::time::Instant>,
-    /// For a deletion queued outside a purge, which no purge
-    /// holds its tombstones for yet (a lookup, a landing or a
-    /// learn that found the copy under a purge, or an
-    /// eviction): the groups of the copy it deletes, until a
-    /// purge that covers the copy takes it over (see
-    /// [`DiskStore::purge_waiting`]).
-    unheld: Option<Vec<String>>,
 }
 
 /// Jobs by key, at most one per key. A job that can run waits
@@ -117,6 +110,14 @@ struct KeyQueue {
     /// Every queued job's key by its sequence number, for the
     /// waits on one purge's deletions.
     by_seq: BTreeMap<u64, String>,
+    /// The deletions queued outside a purge, which no purge
+    /// holds its tombstones for yet (a lookup, a landing or a
+    /// learn that found the copy under a purge, or an
+    /// eviction), by key, with the groups of the copy each
+    /// deletes, until a purge that covers the copy takes it
+    /// over (see [`DiskStore::purge_waiting`]). Kept apart so
+    /// a purge looks at these only, not the whole queue.
+    unheld: HashMap<String, Vec<String>>,
     /// Jobs running now.
     running: usize,
     /// Jobs that failed at least once.
@@ -144,7 +145,6 @@ impl KeyQueue {
                 attempts: 0,
                 not_before: None,
                 running: None,
-                unheld: None,
             },
         );
         self.by_seq.insert(*seq, key.to_string());
@@ -158,9 +158,7 @@ impl KeyQueue {
             return;
         }
         self.push(key, stem, seq);
-        if let Some(job) = self.jobs.get_mut(key) {
-            job.unheld = Some(groups.to_vec());
-        }
+        self.unheld.insert(key.to_string(), groups.to_vec());
     }
 
     /// Drop `key`'s job. Returns whether there was one.
@@ -169,6 +167,7 @@ impl KeyQueue {
             return false;
         };
         self.by_seq.remove(&job.seq);
+        self.unheld.remove(key);
         // A failed job was counted out when it first failed.
         if self.track_ended && job.attempts == 0 {
             self.ended.push(job.seq);
@@ -1426,22 +1425,18 @@ impl DiskStore {
                 && target.covers(key, groups)
             {
                 *doomed = true;
-                match deletions.jobs.get_mut(key) {
+                match deletions.jobs.get(key) {
                     Some(job) => {
-                        job.unheld = None;
                         earlier.push(job.seq);
+                        deletions.unheld.remove(key);
                     }
                     None => deletions.push(key, &key_stem(key), next_seq),
                 }
             }
         }
-        for (key, job) in &mut deletions.jobs {
-            if job
-                .unheld
-                .as_ref()
-                .is_some_and(|groups| target.covers(key, groups))
-            {
-                job.unheld = None;
+        let KeyQueue { jobs, unheld, .. } = deletions;
+        for (key, _) in unheld.extract_if(|key, groups| target.covers(key, groups)) {
+            if let Some(job) = jobs.get(&key) {
                 earlier.push(job.seq);
             }
         }
@@ -4237,6 +4232,32 @@ mod tests {
             reopened.get("k").is_none(),
             "a restart serves the doomed copy"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deletion_queued_outside_a_purge_is_held_by_the_first_purge_that_covers_it() {
+        // Issue #572 fourth review: a lookup that finds a copy
+        // under a purge removes it and queues its deletion before
+        // the purge's disk step, or after a restart. The first
+        // purge that covers the copy takes that deletion over and
+        // holds its tombstones for it; a purge that does not
+        // cover it, and a repeat purge, record nothing.
+        let dir = temp_dir("unheld-taken-over");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"v1", &["g"]));
+        let (_, id) = store.get_with_id("k").unwrap();
+        assert!(store.forget_if("k", id));
+        let (_, other) = store.purge_waiting(&PurgeTarget::Group("h".into()));
+        assert!(other.earlier.is_empty() && !other.pending());
+        let (_, first) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        assert_eq!(first.earlier.len(), 1);
+        assert!(first.pending());
+        let (_, repeat) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        assert!(repeat.earlier.is_empty() && !repeat.pending());
+        store.drain_now();
+        assert!(!store.file_for(&key_stem("k")).exists());
+        assert!(!first.pending());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
