@@ -728,6 +728,19 @@ fn the_health_verb_probes_the_server_on_its_port() {
     let out = health(&[("CRABCROP_PORT", &port), ("PORT", "1")]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // CRABCROP_BIND=:: probes ::1, then 127.0.0.1 when the
+    // connection to ::1 fails. This server listens on IPv4
+    // only, so ::1 fails here as it does on a host with IPv6
+    // off on loopback, and the probe passes at 127.0.0.1.
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "::")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // `::1` named alone gets no second address: a server
+    // bound to it does not answer on 127.0.0.1.
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "::1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
 
     // A port that never answers: the verb waits out its own
     // 2 s timeout, then exits 1 with the error on stderr. The

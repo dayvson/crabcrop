@@ -134,7 +134,7 @@ crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
 crabcrop health
 ```
 
-`crabcrop health` sends `GET /health` to the address the server listens on, at `CRABCROP_PORT` or `PORT` (3000 by default), and ignores `CRABCROP_BASE`. The address is the one `CRABCROP_BIND` names, or 127.0.0.1 when it is unset or `0.0.0.0`, and `::1` when it is `::`. It reads these variables as the server reads them, so an invalid one is an error. It prints the answer and exits 0 on a `200`. On any other answer, or none within 2 seconds, it exits 1 with the error on stderr. It takes no flags, and `PORT=0` is an error, because the server picked its port at boot. The images run it as their `HEALTHCHECK`, so they need no curl.
+`crabcrop health` sends `GET /health` to the address the server listens on, at `CRABCROP_PORT` or `PORT` (3000 by default), and ignores `CRABCROP_BASE`. The address is the one `CRABCROP_BIND` names, or 127.0.0.1 when it is unset or `0.0.0.0`, and `::1` when it is `::`. With `::`, a connection to `::1` that fails, as on a host with IPv6 off on loopback, is tried again at 127.0.0.1. It reads these variables as the server reads them, so an invalid one is an error. It prints the answer and exits 0 on a `200`. On any other answer, or none within 2 seconds, it exits 1 with the error on stderr. It takes no flags, and `PORT=0` is an error, because the server picked its port at boot. The images run it as their `HEALTHCHECK`, so they need no curl.
 
 Every flag the verbs take. A value flag is spelled `--flag <value>` or `--flag=<value>`, and an unknown flag after the verb (`--key-ids`) is an error too.
 
