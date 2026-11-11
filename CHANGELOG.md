@@ -18,6 +18,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The TypeScript SDK's explainer and builders now trim class names as the server does (issue #537). They used JavaScript's `String.prototype.trim`, which disagrees with Rust's `str::trim` on two characters: it strips U+FEFF, which the server keeps, and it keeps U+0085, which the server strips. The explainer passed a class name wrapped in `%EF%BB%BF`, which the server refuses with `400`, and refused one wrapped in `%C2%85`, which the server accepts. Now it agrees with the server on both. The builders (`filter.blurClass`, `filter.pixelateClass`, `filter.recolorClass` and `ops.cropObjects`) dropped a U+FEFF around a class name and built a working URL for the bare name. Now they throw, as the server refuses that name. They threw on a name wrapped in U+0085. Now they build the bare name, as the server trims it to that. The explainer's trim of its whole input, which mirrors the CLI's, uses the server's set too. The verdict corpus and the generated operation vectors cover both characters on the parser, explainer, and builder sides.
 
+### Security
+
+- The playground page now carries a Content-Security-Policy (issue #603). The page asks for the signing secret but had no policy, so any script that ended up on it, such as one a CDN feature or a site template adds, could read the secret field. `index.html` now sets `script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'` as the first tag in `<head>`, so only the page's own scripts run. The page also said it contacts only the endpoint and the sources you enter, but every visit fetched the prefilled example source from Wikimedia for the size check. It now shows the preview on load and runs the size check after your first edit. playground/README.md describes the policy and its limits, and says to turn off CDN features that inject scripts, such as Cloudflare Rocket Loader, Zaraz and Web Analytics. README.md now calls play.crabcrop.org a demo instance with a public demo key, and says not to paste a production secret into it (issue #602).
+
 ## [0.11.0] - 2026-11-10
 
 ### Changed

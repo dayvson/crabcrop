@@ -27,7 +27,7 @@ for (const chip of CHIPS) {
 
 let builtUrl = "";
 
-async function rebuild() {
+async function rebuild({ measure = true } = {}) {
   const preset = $("preset").value.trim();
   // Presets lead, matching the framework loaders' convention.
   const operations = [preset && `preset:${preset}`, $("operations").value.trim()]
@@ -58,7 +58,11 @@ async function rebuild() {
   }
   $("built").value = builtUrl;
   $("preview").src = builtUrl;
-  void measureSizes(builtUrl);
+  if (measure) {
+    void measureSizes(builtUrl);
+  } else {
+    $("sizes").textContent = "Byte sizes are measured after your first edit.";
+  }
 }
 
 async function fetchSize(url) {
@@ -156,4 +160,7 @@ $("explain-built").addEventListener("click", () => {
   void explainAndVerify();
 });
 
-void rebuild();
+// On load, build and preview the prefilled example, but leave the size
+// check for the first edit. It fetches the source from the browser, and
+// the page says it does not contact the source host until then.
+void rebuild({ measure: false });
