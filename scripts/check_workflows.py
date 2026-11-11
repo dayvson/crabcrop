@@ -11,8 +11,10 @@ these rules:
   pipe       No run step pipes a download into a shell (`| sh`, `| bash`),
              and none runs dist's generated `matrix.install_dist` command,
              which does (issue #597).
-  installer  A step that fetches cargo-dist-installer.sh checks it against
-             a pinned SHA-256 before it runs it (issue #597).
+  installer  A step that fetches cargo-dist-installer.sh, by name or through
+             an env value that names it, checks it against a pinned SHA-256
+             before it runs it, and a failed check stops the step
+             (issue #597).
   pip        Every pip install reads a requirements file with
              --require-hashes and names no package on the command line, and
              `python -m build` runs with --no-isolation, so the build
@@ -322,7 +324,10 @@ PIP_INSTALL = re.compile(r"\bpip3?(?:\.exe)?[\"']?\s+install\b")
 BUILD_RUN = re.compile(r"\bpython(?:3(?:\.\d+)?)?\s+-m\s+build\b")
 PYTHON_PACKAGE_WORK = re.compile(r"\bpip3?(?:\.exe)?[\"']?\s+(?:install|wheel|download)\b|\bpython(?:3(?:\.\d+)?)?\s+-m\s+build\b|\bsetup\.py\b")
 CHECKSUM = re.compile(r"\bsha256sum\b[^\n]*\s(?:-c|--check)\b|\bshasum\b[^\n]*-a\s*256\b[^\n]*\s(?:-c|--check)\b")
-RUNS_A_SCRIPT = re.compile(r"(?:^|[;&|(]\s*|\b(?:then|do|else)\s+)(?:sudo\s+)?(?:(?:ba|da|z)?sh\s+(?!-c\b)\S|\./\S)")
+RUNS_A_SCRIPT = re.compile(r"(?:^|[;&|(]\s*|\b(?:then|do|else)\s+)(?:sudo\s+)?(?:(?:ba|da|z)?sh\s+(?!-c\b)\S|\./\S)", re.M)
+# `|| true`, `|| :` or `|| echo ...` after a check lets a failed check
+# pass; `|| exit 1` and `|| false` still stop the step.
+SOFT_FAIL = re.compile(r"\|\|(?![^\n]*\b(?:exit|false|return)\b)")
 HEX64 = re.compile(r"\b[0-9a-f]{64}\b")
 STATUS_FUNCTIONS = re.compile(r"\b(?:always|failure|cancelled)\s*\(")
 
@@ -415,16 +420,27 @@ def run_problems(script):
 
 def installer_problems(script, env):
     """A step that fetches cargo-dist-installer.sh checks a pinned hash first."""
-    lines = shell_lines(script)
-    if not any("cargo-dist-installer" in line for line in lines):
+    lines = [line.strip() for line in shell_lines(script)]
+    # The URL may live in the workflow, job or step env, as it does in
+    # release.yml: `curl "$CARGO_DIST_INSTALLER_URL" -o dist.sh` fetches it too.
+    via_env = [name for name, value in env.items() if "cargo-dist-installer" in str(value)]
+    names = [rf"\$\{{?{re.escape(name)}\b|\benv\.{re.escape(name)}\b" for name in via_env]
+    if not any("cargo-dist-installer" in line or any(re.search(n, line) for n in names) for line in lines):
         return []
-    check = next((at for at, line in enumerate(lines) if CHECKSUM.search(line)), None)
-    runs = next((at for at, line in enumerate(lines) if RUNS_A_SCRIPT.search(line.strip())), None)
+    # Compare positions in the whole script, not line numbers, so
+    # `sh i.sh && echo "$H  i.sh" | shasum -a 256 -c -` runs before it checks.
+    joined = "\n".join(lines)
+    check = CHECKSUM.search(joined)
+    runs = RUNS_A_SCRIPT.search(joined)
     if check is None:
         return ["fetches cargo-dist-installer.sh but never checks its sha256 (sha256sum -c or shasum -a 256 -c)"]
-    if runs is not None and runs < check:
+    if runs is not None and runs.start() < check.start():
         return ["runs cargo-dist-installer.sh before it checks its sha256"]
-    line = lines[check]
+    start = joined.rfind("\n", 0, check.start()) + 1
+    end = joined.find("\n", check.start())
+    line = joined[start : len(joined) if end < 0 else end]
+    if SOFT_FAIL.search(line, check.start() - start):
+        return ["lets a failed sha256 check of cargo-dist-installer.sh pass (`|| true`); a failed check must stop the step"]
     if HEX64.search(line):
         return []
     for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", line):

@@ -122,7 +122,7 @@ class Pinned(unittest.TestCase):
         self.assertIn("uses actions/cache@v6, which is not pinned", problem)
 
     def test_a_full_sha_passes(self):
-        self.assertEqual(step_problems(f"- uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"), [])
+        self.assertEqual(step_problems("- uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"), [])
         self.assertEqual(step_problems(f"- uses: actions/cache/restore@{SHA}\n"), [])
 
     def test_short_shas_branches_and_docker_tags_fail(self):
@@ -228,6 +228,52 @@ class Installer(unittest.TestCase):
             """
         (problem,) = step_problems(late)
         self.assertIn("before it checks", problem)
+
+    def test_a_fetch_through_the_env_url_is_checked_too(self):
+        for url in ('"$CARGO_DIST_INSTALLER_URL"', '"${CARGO_DIST_INSTALLER_URL}"', "${{ env.CARGO_DIST_INSTALLER_URL }}"):
+            with self.subTest(url=url):
+                step = f"""\
+                    - run: |
+                        curl -LsSf {url} -o "$RUNNER_TEMP/dist.sh"; sh "$RUNNER_TEMP/dist.sh"
+                    """
+                (problem,) = step_problems(step, self.ENV)
+                self.assertIn("never checks its sha256", problem)
+
+    def test_a_run_before_the_check_on_one_line_fails(self):
+        step = """\
+            - run: |
+                curl -LsSf "$CARGO_DIST_INSTALLER_URL" -o i.sh
+                sh i.sh && echo "$CARGO_DIST_INSTALLER_SHA256  i.sh" | shasum -a 256 -c -
+            """
+        (problem,) = step_problems(step, self.ENV)
+        self.assertIn("before it checks", problem)
+        checked_first = """\
+            - run: |
+                curl -LsSf "$CARGO_DIST_INSTALLER_URL" -o i.sh
+                echo "$CARGO_DIST_INSTALLER_SHA256  i.sh" | shasum -a 256 -c - && sh i.sh
+            """
+        self.assertEqual(step_problems(checked_first, self.ENV), [])
+
+    def test_a_check_that_cannot_fail_fails(self):
+        for tail in ("|| true", "|| :", '|| echo "checksum mismatch"'):
+            with self.subTest(tail=tail):
+                step = f"""\
+                    - run: |
+                        curl -LsSf "$CARGO_DIST_INSTALLER_URL" -o i.sh
+                        echo "$CARGO_DIST_INSTALLER_SHA256  i.sh" | shasum -a 256 -c - {tail}
+                        sh i.sh
+                    """
+                (problem,) = step_problems(step, self.ENV)
+                self.assertIn("must stop the step", problem)
+        for tail in ("|| exit 1", '|| { echo "checksum mismatch" >&2; exit 1; }', "|| false"):
+            with self.subTest(tail=tail):
+                step = f"""\
+                    - run: |
+                        curl -LsSf "$CARGO_DIST_INSTALLER_URL" -o i.sh
+                        echo "$CARGO_DIST_INSTALLER_SHA256  i.sh" | shasum -a 256 -c - {tail}
+                        sh i.sh
+                    """
+                self.assertEqual(step_problems(step, self.ENV), [])
 
 
 class Pip(unittest.TestCase):
