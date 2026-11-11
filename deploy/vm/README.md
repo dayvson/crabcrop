@@ -53,9 +53,11 @@ sudoedit /etc/crabcrop/crabcrop.env
 ```
 
 Set `CRABCROP_SECRET` (16+ bytes; it signs and verifies
-every URL) in the editor. `crabcrop.env.example` in this
-directory is the starting point: the secret, the port,
-and the disk tier directory. Any variable from the main
+every URL) in the editor, for example to the output of
+`openssl rand -hex 32`. The example ships `REPLACE_ME`,
+which the server refuses at boot. `crabcrop.env.example`
+in this directory is the starting point: the secret, the
+port, and the disk tier directory. Any variable from the main
 README's Configuration table can go in the same file.
 
 ## 3. The systemd unit

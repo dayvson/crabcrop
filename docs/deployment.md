@@ -6,7 +6,7 @@ The repo ships a multi-stage `Dockerfile` (the runtime image carries the binary,
 
 ```bash
 docker build -t crabcrop:latest .
-docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret-change-me -e CRABCROP_BLOCK_PRIVATE_SOURCES=1 crabcrop:latest
+docker run -p 3000:3000 -e CRABCROP_SECRET="$(openssl rand -hex 32)" -e CRABCROP_BLOCK_PRIVATE_SOURCES=1 crabcrop:latest
 ```
 
 For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](ai-features.md#ai-features).

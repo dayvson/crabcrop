@@ -188,6 +188,60 @@ fn source_policy_blocks_private_addresses_by_default() {
 }
 
 #[test]
+fn a_set_allowlist_that_names_no_host_stops_the_boot() {
+    // Issue #590: a set value that normalizes to no entries
+    // read as no allowlist, which lets every public host
+    // through. It is a startup error naming the variable now,
+    // whatever the other source settings say.
+    for blank in ["", " ", ",", ".", " , . ,", "..", "\t"] {
+        for extra in [
+            &[][..],
+            &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+            &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+        ] {
+            let mut pairs = vec![("CRABCROP_ALLOWED_SOURCES", blank)];
+            pairs.extend_from_slice(extra);
+            let err = build_source_policy(env_of(&pairs)).map(|_| ()).unwrap_err();
+            match &err {
+                ConfigError::Invalid { var, value, .. } => {
+                    assert_eq!(*var, "CRABCROP_ALLOWED_SOURCES");
+                    assert_eq!(*value, ConfigValue::Text(blank.to_string()));
+                }
+                other => panic!("{blank:?}: {other:?}"),
+            }
+            assert_eq!(
+                err.to_string(),
+                "CRABCROP_ALLOWED_SOURCES is set but names no host: list at least one \
+                 host, or unset it for no allowlist"
+            );
+            // Boot reads it the same way.
+            let err = refusal(&pairs);
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "CRABCROP_ALLOWED_SOURCES",
+                        ..
+                    }
+                ),
+                "{blank:?}: {err:?}"
+            );
+        }
+    }
+    // Unset is still no allowlist, with blocking on.
+    let policy = build_source_policy(env_of(&[])).unwrap();
+    assert!(policy.allowed_suffixes.is_empty() && policy.block_private);
+    // Blank entries inside a list that names a host are
+    // still dropped, as before.
+    let policy = build_source_policy(env_of(&[(
+        "CRABCROP_ALLOWED_SOURCES",
+        ",images.example.com,, .",
+    )]))
+    .unwrap();
+    assert_eq!(policy.allowed_suffixes, ["images.example.com"]);
+}
+
+#[test]
 fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
     let proxied = |name: &'static str| {
         move |n: &str| (n == name).then(|| "http://proxy.internal:3128".to_string())
@@ -264,6 +318,218 @@ fn secrets_below_the_minimum_are_rejected() {
     assert!(validate_secret(b"fifteen-bytes!!").is_err());
     assert!(validate_secret(b"sixteen-bytes!!!").is_ok());
     assert!(validate_secret(b"a much longer production secret").is_ok());
+}
+
+/// Placeholder values crabcrop's docs and deploy recipes
+/// ship or have shipped for the secret variables (issue
+/// #588). The first four are 16 bytes or more and booted.
+const SHIPPED_PLACEHOLDERS: [&str; 10] = [
+    "your-secret-change-me",
+    "replace-with-a-long-random-value",
+    "REPLACE_ME_signing_secret",
+    "local-dev-secret",
+    "CHANGE-ME-generate-with-openssl-rand-hex-32",
+    "your-secret",
+    "REPLACE_ME",
+    "CHANGE-ME",
+    "<redacted>",
+    "correct horse battery staple",
+];
+
+#[test]
+fn published_placeholders_stop_the_boot_without_being_echoed() {
+    // Each shipped placeholder is refused as each secret
+    // variable, in any letter case and with surrounding
+    // white space, as an env file can carry it. The error
+    // names the variable and keeps no value (issue #455).
+    for placeholder in SHIPPED_PLACEHOLDERS {
+        for spelling in [
+            placeholder.to_string(),
+            placeholder.to_ascii_lowercase(),
+            placeholder.to_ascii_uppercase(),
+            format!(" {placeholder}\n"),
+        ] {
+            for var in [
+                "CRABCROP_SECRET",
+                "CRABCROP_SECRET_PREVIOUS",
+                "CRABCROP_METRICS_TOKEN",
+            ] {
+                let pairs = if var == "CRABCROP_SECRET" {
+                    vec![(var, spelling.as_str())]
+                } else {
+                    vec![("CRABCROP_SECRET", SECRET), (var, spelling.as_str())]
+                };
+                let err = match Config::from_env(env_of(&pairs)) {
+                    Err(e) => e,
+                    Ok(_) => panic!("{var}={spelling:?} booted"),
+                };
+                match &err {
+                    ConfigError::Invalid { var: v, value, .. } => {
+                        assert_eq!(*v, var);
+                        assert_eq!(*value, ConfigValue::Secret);
+                    }
+                    other => panic!("{var}={spelling:?}: {other:?}"),
+                }
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "{var} is a placeholder published in crabcrop's docs or recipes: \
+                         generate a new value, for example with openssl rand -hex 32"
+                    )
+                );
+                for rendered in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+                    assert_no_secret(var, &rendered, spelling.trim());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_value_that_only_contains_a_placeholder_is_not_one() {
+    // The refusal is for the published value itself, not
+    // for a real secret that happens to contain it.
+    let config = config_of(&[
+        ("CRABCROP_SECRET_PREVIOUS", "your-secret-change-me-7f3a9c41"),
+        ("CRABCROP_METRICS_TOKEN", "local-dev-secret-0b8e2d"),
+    ])
+    .unwrap();
+    assert!(config.keyring.previous.is_some());
+    assert!(config.metrics_token.is_some());
+    let config = config_of(&[("CRABCROP_SECRET", "REPLACE_ME_signing_secret_2026")]);
+    assert!(config.is_ok());
+    // A metrics token under 16 bytes still boots for this
+    // release; boot warns about it (tests/boot_smoke.rs).
+    let config = config_of(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]).unwrap();
+    assert_eq!(
+        config.metrics_token.as_ref().map(Secret::expose),
+        Some("fifteen-bytes!!")
+    );
+    // An empty token is still no token, which closes /metrics.
+    assert!(
+        config_of(&[("CRABCROP_METRICS_TOKEN", "")])
+            .unwrap()
+            .metrics_token
+            .is_none()
+    );
+}
+
+#[test]
+fn a_metrics_token_under_16_bytes_warns_without_quoting_it() {
+    let warning = metrics_token_warning(&Secret("fifteen-bytes!!".to_string()))
+        .expect("a warning for 15 bytes");
+    assert_eq!(
+        warning,
+        "CRABCROP_METRICS_TOKEN is 15 bytes, under the 16 bytes a later release will \
+         require: generate a new one, for example with openssl rand -hex 32"
+    );
+    assert_no_secret("CRABCROP_METRICS_TOKEN", &warning, "fifteen-bytes!!");
+    assert!(metrics_token_warning(&Secret("a".to_string())).is_some());
+    assert!(metrics_token_warning(&Secret("sixteen-bytes!!!".to_string())).is_none());
+}
+
+#[test]
+fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
+    // Issue #590: one boot line names the request mode, the
+    // allowlist's host count and the private-address check.
+    let presets = temp_file("posture-presets", b"thumb = 300x200\n");
+    let presets = presets.path.as_str();
+    let cases: [(&[(&str, &str)], &str); 8] = [
+        (
+            &[],
+            "request mode: signed; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[("CRABCROP_ALLOW_UNSAFE", "1")],
+            "request mode: unsafe; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[
+                ("CRABCROP_ONLY_PRESETS", "1"),
+                ("CRABCROP_PRESETS_FILE", presets),
+            ],
+            "request mode: signed presets-only; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[
+                ("CRABCROP_ALLOW_UNSAFE", "1"),
+                ("CRABCROP_ONLY_PRESETS", "1"),
+                ("CRABCROP_PRESETS_FILE", presets),
+            ],
+            "request mode: presets-only; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[("CRABCROP_ALLOWED_SOURCES", "images.example.com")],
+            "request mode: signed; source allowlist: 1 host; private-address check: on",
+        ),
+        (
+            &[(
+                "CRABCROP_ALLOWED_SOURCES",
+                "a.example, ,b.example,.c.example",
+            )],
+            "request mode: signed; source allowlist: 3 hosts; private-address check: on",
+        ),
+        (
+            &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+            "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+        (
+            &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+            "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+    ];
+    for (pairs, line) in cases {
+        let config = config_of(pairs).unwrap();
+        assert_eq!(config.posture_line(), line, "{pairs:?}");
+    }
+}
+
+#[test]
+fn unsigned_urls_with_no_allowlist_warn_at_boot() {
+    // Issue #590 and docs/operations.md: unsafe mode alone
+    // runs any operations on any host a request names, and
+    // presets-only mode still fetches any host. Either one
+    // with no allowlist warns; signed modes and an allowlist
+    // do not.
+    let presets = temp_file("posture-presets", b"thumb = 300x200\n");
+    let presets = presets.path.as_str();
+    let unsafe_on = ("CRABCROP_ALLOW_UNSAFE", "1");
+    let only = ("CRABCROP_ONLY_PRESETS", "1");
+    let file = ("CRABCROP_PRESETS_FILE", presets);
+    let allowlist = ("CRABCROP_ALLOWED_SOURCES", "images.example.com");
+    let warning = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().posture_warning();
+    assert_eq!(
+        warning(&[unsafe_on]).unwrap(),
+        "unsafe mode is on with no CRABCROP_ALLOWED_SOURCES and no CRABCROP_ONLY_PRESETS: \
+         anyone can run any operations on images from any public host. Keep it to local \
+         development or behind access control of your own (see docs/operations.md)"
+    );
+    assert!(
+        warning(&[unsafe_on, ("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")])
+            .unwrap()
+            .contains("from any host, private addresses included.")
+    );
+    assert_eq!(
+        warning(&[unsafe_on, only, file]).unwrap(),
+        "presets-only mode takes unsigned URLs with no CRABCROP_ALLOWED_SOURCES: anyone \
+         can render the presets on images from any public host. Set \
+         CRABCROP_ALLOWED_SOURCES to the hosts your images come from (see \
+         docs/operations.md)"
+    );
+    for pairs in [
+        &[][..],
+        &[only, file],
+        &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+        &[unsafe_on, allowlist],
+        &[unsafe_on, only, file, allowlist],
+    ] {
+        assert!(warning(pairs).is_none(), "{pairs:?}");
+    }
+    // The proxy warning test at boot reads "proxy" on
+    // stderr as its own warning.
+    for pairs in [&[unsafe_on][..], &[unsafe_on, only, file]] {
+        assert!(!warning(pairs).unwrap().contains("proxy"), "{pairs:?}");
+    }
 }
 
 #[test]

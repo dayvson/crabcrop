@@ -308,10 +308,13 @@ impl Config {
     /// The settings are read in the order boot has always
     /// read them, so of two bad settings the same one is
     /// reported. The lines boot prints while reading them
-    /// print here, in the same order: the proxy warning on
-    /// stderr, then the bucket endpoint note, the upload
-    /// destination, the source roots, the default
-    /// operations, and the brand color.
+    /// print here, in the same order: the short metrics
+    /// token warning and the proxy warning on stderr, then
+    /// the bucket endpoint note, the upload destination, the
+    /// source roots, the default operations, and the brand
+    /// color. The posture line and its warning
+    /// ([`Config::posture_line`]) need the whole
+    /// configuration, so `run` prints them.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigError> {
         let keyring = build_keyring(&get)?;
         let allow_unsafe =
@@ -336,12 +339,10 @@ impl Config {
                 format!("CRABCROP_SSIM_TARGET must be between 0 and 100, got {ssim_target}"),
             ));
         }
-        // The /metrics bearer token (issue #270): an empty
-        // value is no token, and no token closes the
-        // endpoint rather than serving it publicly.
-        let metrics_token = get("CRABCROP_METRICS_TOKEN")
-            .filter(|v| !v.is_empty())
-            .map(Secret);
+        let metrics_token = metrics_token_config(&get)?;
+        if let Some(warning) = metrics_token.as_ref().and_then(metrics_token_warning) {
+            eprintln!("warning: {warning}");
+        }
         let process_timeout_secs: u64 = parse_env_value(
             "CRABCROP_PROCESS_TIMEOUT_SECS",
             get("CRABCROP_PROCESS_TIMEOUT_SECS"),
@@ -576,6 +577,65 @@ impl Config {
     }
 }
 
+impl Config {
+    /// The boot line that names the request and source
+    /// posture (issue #590): the request mode, the source
+    /// allowlist's host count, and the private-address
+    /// check.
+    pub fn posture_line(&self) -> String {
+        let mode = match (self.allow_unsafe, self.only_presets) {
+            (false, false) => "signed",
+            (false, true) => "signed presets-only",
+            (true, false) => "unsafe",
+            (true, true) => "presets-only",
+        };
+        let allowlist = match self.policy.allowed_suffixes.len() {
+            0 => "none".to_string(),
+            1 => "1 host".to_string(),
+            n => format!("{n} hosts"),
+        };
+        let check = if self.policy.block_private {
+            "on"
+        } else {
+            "off"
+        };
+        format!(
+            "request mode: {mode}; source allowlist: {allowlist}; private-address check: {check}"
+        )
+    }
+
+    /// The boot warning for unsigned URLs with no source
+    /// allowlist (issue #590), or `None`. Unsafe mode alone
+    /// then runs any operations on any host a request names
+    /// (see docs/operations.md); presets-only mode limits the
+    /// operations, but not the hosts.
+    pub fn posture_warning(&self) -> Option<String> {
+        if !self.allow_unsafe || !self.policy.allowed_suffixes.is_empty() {
+            return None;
+        }
+        let hosts = if self.policy.block_private {
+            "any public host"
+        } else {
+            "any host, private addresses included"
+        };
+        Some(if self.only_presets {
+            format!(
+                "presets-only mode takes unsigned URLs with no CRABCROP_ALLOWED_SOURCES: \
+                 anyone can render the presets on images from {hosts}. Set \
+                 CRABCROP_ALLOWED_SOURCES to the hosts your images come from \
+                 (see docs/operations.md)"
+            )
+        } else {
+            format!(
+                "unsafe mode is on with no CRABCROP_ALLOWED_SOURCES and no \
+                 CRABCROP_ONLY_PRESETS: anyone can run any operations on images from \
+                 {hosts}. Keep it to local development or behind access control of \
+                 your own (see docs/operations.md)"
+            )
+        })
+    }
+}
+
 /// Load the preset configuration: the presets file (one
 /// `name = operations` entry per line) and the presets-only
 /// flag, both validated strictly. Presets-only with no
@@ -796,10 +856,19 @@ pub fn check_bucket_policy(
 /// opt-out: it switches the private-address check off
 /// entirely. A configured allowlist still applies either
 /// way.
+///
+/// A set allowlist must name at least one host (issue
+/// #590). A value that normalizes to no entries (empty,
+/// blank, or only commas and dots) would read as no
+/// allowlist, which lets every public host through, so it
+/// is a startup error. Blank entries next to a host are
+/// dropped.
 pub fn build_source_policy(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<SourcePolicy, ConfigError> {
-    let allowed_sources: Vec<String> = get("CRABCROP_ALLOWED_SOURCES")
+    let raw = get("CRABCROP_ALLOWED_SOURCES");
+    let allowed_sources: Vec<String> = raw
+        .as_deref()
         .map(|v| v.split(',').map(str::to_string).collect())
         .unwrap_or_default();
     let block_private = parse_bool_value(
@@ -812,10 +881,18 @@ pub fn build_source_policy(
         get("CRABCROP_ALLOW_ANY_SOURCE"),
         false,
     )?;
-    Ok(SourcePolicy::new(
-        allowed_sources,
-        block_private && !allow_any,
-    ))
+    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any);
+    if let Some(raw) = &raw
+        && policy.allowed_suffixes.is_empty()
+    {
+        return Err(ConfigError::invalid(
+            "CRABCROP_ALLOWED_SOURCES",
+            raw,
+            "CRABCROP_ALLOWED_SOURCES is set but names no host: list at least one host, \
+             or unset it for no allowlist",
+        ));
+    }
+    Ok(policy)
 }
 
 /// A bucket store's base URL from the variable `name`: an
@@ -1015,13 +1092,68 @@ pub fn parse_bool_value(
 /// (and purge) is forgeable (security audit PL-3, P-6).
 const MIN_SECRET_BYTES: usize = 16;
 
+/// Values crabcrop's docs, deploy recipes and specs ship, or
+/// have shipped, for a secret (issue #588). Anyone can read
+/// them in this repository, so none may sign URLs or open
+/// `/metrics`: `CRABCROP_SECRET`, `CRABCROP_SECRET_PREVIOUS`
+/// and `CRABCROP_METRICS_TOKEN` refuse each one, in any
+/// letter case and with surrounding white space.
+const PUBLISHED_PLACEHOLDERS: [&str; 12] = [
+    // README.md and docs/deployment.md, and the site's docs.
+    "your-secret-change-me",
+    // README.md and CONTRIBUTING.md, for local runs.
+    "local-dev-secret",
+    // deploy/vm/crabcrop.env.example.
+    "replace-with-a-long-random-value",
+    // deploy/container-apps/containerapp.yaml.
+    "REPLACE_ME_signing_secret",
+    // deploy/compose/crabcrop.env.example, the metrics token.
+    "CHANGE-ME-generate-with-openssl-rand-hex-32",
+    // deploy/compose/crabcrop.env.example, the secret.
+    "<redacted>",
+    // The recipes' placeholders since issue #588.
+    "REPLACE_ME",
+    "CHANGE-ME",
+    // The CLI, MCP and SDK examples.
+    "your-secret",
+    "your-new-secret",
+    // The signing test vectors (spec/test-vectors.json).
+    "s3cr3t",
+    "correct horse battery staple",
+];
+
+/// Whether `value` is one of [`PUBLISHED_PLACEHOLDERS`].
+fn is_published_placeholder(value: &[u8]) -> bool {
+    let value = value.trim_ascii();
+    PUBLISHED_PLACEHOLDERS
+        .iter()
+        .any(|p| value.eq_ignore_ascii_case(p.as_bytes()))
+}
+
+/// The refusal of a published placeholder as `name`. It
+/// names the variable, never the value (issue #455).
+fn placeholder_refusal(name: &'static str) -> ConfigError {
+    ConfigError::Invalid {
+        var: name,
+        value: ConfigValue::Secret,
+        reason: format!(
+            "{name} is a placeholder published in crabcrop's docs or recipes: \
+             generate a new value, for example with openssl rand -hex 32"
+        ),
+    }
+}
+
 pub fn validate_secret(secret: &[u8]) -> Result<(), ConfigError> {
     validate_secret_named("CRABCROP_SECRET", secret)
 }
 
 /// The refusal names the variable and the length, never the
-/// secret (issue #455).
+/// secret (issue #455). A published placeholder is refused
+/// whatever its length (issue #588).
 fn validate_secret_named(name: &'static str, secret: &[u8]) -> Result<(), ConfigError> {
+    if is_published_placeholder(secret) {
+        return Err(placeholder_refusal(name));
+    }
     if secret.len() < MIN_SECRET_BYTES {
         return Err(ConfigError::Invalid {
             var: name,
@@ -1033,6 +1165,39 @@ fn validate_secret_named(name: &'static str, secret: &[u8]) -> Result<(), Config
         });
     }
     Ok(())
+}
+
+/// The `/metrics` bearer token (issue #270): an empty value
+/// is no token, and no token closes the endpoint rather than
+/// serving it publicly. A published placeholder is refused
+/// (issue #588).
+pub fn metrics_token_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Secret>, ConfigError> {
+    match get("CRABCROP_METRICS_TOKEN") {
+        Some(token) if !token.is_empty() => {
+            if is_published_placeholder(token.as_bytes()) {
+                return Err(placeholder_refusal("CRABCROP_METRICS_TOKEN"));
+            }
+            Ok(Some(Secret(token)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The boot warning for a metrics token under the signing
+/// secret's 16 bytes (issue #588). This release only warns;
+/// a later one refuses such a token. It names the length,
+/// never the token.
+pub fn metrics_token_warning(token: &Secret) -> Option<String> {
+    let len = token.expose().len();
+    (len < MIN_SECRET_BYTES).then(|| {
+        format!(
+            "CRABCROP_METRICS_TOKEN is {len} bytes, under the {MIN_SECRET_BYTES} bytes \
+             a later release will require: generate a new one, for example with \
+             openssl rand -hex 32"
+        )
+    })
 }
 
 /// The signing keyring (issue #143): the current secret under

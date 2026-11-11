@@ -120,6 +120,15 @@ impl StderrDrain {
 /// that keeps printing never blocks on a full pipe.
 /// [`ServerGuard::stderr`] returns what stderr carried.
 pub(crate) fn serve(command: &mut Command) -> (ServerGuard, u16, Receiver<String>) {
+    let (server, port, lines, _) = serve_printing(command);
+    (server, port, lines)
+}
+
+/// [`serve`], plus the lines the server printed to stdout
+/// before its listening line: the boot lines, in order.
+pub(crate) fn serve_printing(
+    command: &mut Command,
+) -> (ServerGuard, u16, Receiver<String>, Vec<String>) {
     let mut child = command
         .env_remove("CRABCROP_PORT")
         .env("PORT", "0")
@@ -166,7 +175,7 @@ pub(crate) fn serve(command: &mut Command) -> (ServerGuard, u16, Receiver<String
                         port, 0,
                         "the listening line names port 0, not the bound one"
                     );
-                    return (server, port, lines);
+                    return (server, port, lines, printed);
                 }
                 printed.push(line);
             }
