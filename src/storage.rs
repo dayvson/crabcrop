@@ -1198,17 +1198,17 @@ impl DiskStore {
         let landed = {
             let mut guard = self.inner.lock().unwrap();
             let inner = &mut *guard;
-            // The rename replaced the file a queued deletion was
-            // for.
-            if inner.deletions.remove(key) {
-                inner.wake_deletion_waits();
-                self.progress.send_modify(|n| *n += 1);
-            }
             match inner.claims.remove(key) {
                 Some(Claim::Write {
                     groups,
                     doomed: false,
                 }) => {
+                    // The rename replaced the file a queued
+                    // deletion was for.
+                    if inner.deletions.remove(key) {
+                        inner.wake_deletion_waits();
+                        self.progress.send_modify(|n| *n += 1);
+                    }
                     let groups = with_groups(&entry.groups, &groups);
                     if groups.len() > entry.groups.len() {
                         inner.rewrites.push(key, &stem, &mut inner.next_seq);
@@ -1249,7 +1249,10 @@ impl DiskStore {
                 }
                 _ => {
                     // Doomed: the file just written goes again,
-                    // under the key's claim.
+                    // under the key's claim. The deletion the
+                    // purge queued for it stays, so a failed
+                    // unlink here is retried, and the purge's
+                    // waits hold until the file is gone.
                     inner.claims.insert(key.to_string(), Claim::File);
                     None
                 }
@@ -1330,7 +1333,9 @@ impl DiskStore {
     /// Remove every record `target` covers from the index at
     /// once, with no file I/O (issue #572), and queue their
     /// files' deletion. A write in flight that the purge
-    /// covers is doomed: it lands nothing. Returns how many
+    /// covers is doomed: it lands nothing, and the deletion of
+    /// the file it renames into place is queued with the
+    /// others, so the purge's waits cover it. Returns how many
     /// records were removed, and the sequence numbers of the
     /// deletions this purge queued, for
     /// [`DiskStore::wait_deletions`]. The caller kicks the
@@ -1356,11 +1361,18 @@ impl DiskStore {
             }
             inner.deletions.push(key, &record.stem, &mut inner.next_seq);
         }
-        for (key, claim) in inner.claims.iter_mut() {
+        let Inner {
+            claims,
+            deletions,
+            next_seq,
+            ..
+        } = inner;
+        for (key, claim) in claims.iter_mut() {
             if let Claim::Write { groups, doomed } = claim
                 && target.covers(key, groups)
             {
                 *doomed = true;
+                deletions.push(key, &key_stem(key), next_seq);
             }
         }
         (removed.len(), first..inner.next_seq + 1)
@@ -4036,6 +4048,103 @@ mod tests {
         store.purge(&PurgeTarget::Group("g".into()));
         assert_eq!(store.known_groups("k"), None);
         drop(claim);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hook that fails the next unlink, as a disk with a
+    /// passing fault does, and lets the rest through.
+    fn fail_next_unlink() -> TestHold {
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        Arc::new(move |op, _| {
+            if op == OpKind::Unlink && !failed.swap(true, Ordering::SeqCst) {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })
+    }
+
+    /// Claim `key` for a write of `bytes` in `group` and land it
+    /// on another thread, held in its file write until the
+    /// returned sender sends or drops.
+    fn held_write(
+        store: &Arc<DiskStore>,
+        key: &str,
+        bytes: &'static [u8],
+        group: &str,
+    ) -> (
+        std::thread::JoinHandle<Option<Landed>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let WritePlan::Claimed(claim) =
+            store.begin_write(key, &groups(&[group]), Bucket::Unknown, true)
+        else {
+            panic!("the key was not claimed");
+        };
+        let (hook, held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        let writer = {
+            let (store, group) = (store.clone(), group.to_string());
+            std::thread::spawn(move || store.land(claim, &grouped_image(bytes, &[&group])))
+        };
+        held.recv().unwrap();
+        (writer, release)
+    }
+
+    #[test]
+    fn a_purge_deletes_the_file_of_a_write_it_dooms_though_the_first_unlink_fails() {
+        // Issue #572 second review: a doomed write unlinked its
+        // file once when it landed, a failure ignored, and its
+        // purge queued nothing, so the purge's waits and its
+        // bucket tombstone did not wait for the file, and a
+        // restart indexed it in the purged group.
+        let dir = temp_dir("doomed-deletion");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let (writer, release) = held_write(&store, "k", b"v", "g");
+        let (removed, seqs) = store.purge(&PurgeTarget::Group("g".into()));
+        assert_eq!(removed, 0);
+        assert!(store.deletions_pending(&seqs));
+        store.set_hold(Some(fail_next_unlink()));
+        drop(release);
+        assert_eq!(writer.join().unwrap(), None);
+        assert!(store.file_for(&key_stem("k")).exists());
+        assert!(
+            store.deletions_pending(&seqs),
+            "the failed unlink is not retried"
+        );
+        store.set_hold(None);
+        store.drain_now();
+        assert!(!store.deletions_pending(&seqs));
+        assert!(!store.file_for(&key_stem("k")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_doomed_write_keeps_an_earlier_purges_deletion_of_its_key() {
+        // The first purge queues the deletion of k's file. A
+        // fresh write of k claims it and is doomed by a second
+        // purge, so the key's one deletion job stays the first
+        // purge's. The doomed landing removed that job, as a
+        // landing that stands does, and its own unlink failed:
+        // nothing deleted the file, and a restart served it.
+        let dir = temp_dir("doomed-earlier");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"v1", &["g"]));
+        let (_, first) = store.purge(&PurgeTarget::Group("g".into()));
+        let (writer, release) = held_write(&store, "k", b"v2", "g");
+        store.purge(&PurgeTarget::Group("g".into()));
+        store.set_hold(Some(fail_next_unlink()));
+        drop(release);
+        assert_eq!(writer.join().unwrap(), None);
+        assert!(store.deletions_pending(&first));
+        store.set_hold(None);
+        store.drain_now();
+        assert!(!store.file_for(&key_stem("k")).exists());
+        drop(store);
+        let reopened = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert!(
+            reopened.get("k").is_none(),
+            "a restart serves the doomed copy"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
