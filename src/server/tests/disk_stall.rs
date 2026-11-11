@@ -816,6 +816,62 @@ async fn a_bucket_hit_keeps_its_group_when_a_purge_of_a_known_group_begins_durin
 }
 
 #[tokio::test]
+async fn a_bucket_hit_keeps_the_known_groups_no_purge_covers() {
+    // Issue #572 second review: the disk record holds `a` and
+    // `b`, the bucket copy no group. The disk is skipped, and a
+    // purge of `a` begins during the bucket read. The request
+    // with `c` is served the bucket copy, which took `c` alone,
+    // dropping `b` though no purge covers it, and the learn
+    // reconcile removed the disk record. A purge of `b` then
+    // left that copy serving.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-known-uncovered");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    shared.put(KEY, &tier_test_entry()).await;
+    store.put(KEY, &in_groups(&["a", "b"]));
+    fake.hold_object_gets.store(true, Ordering::SeqCst);
+    let lookup = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            lookup_tiers_within(
+                &state,
+                KEY,
+                &group_list(&["c"]),
+                &mut DiskBudget::with(std::time::Duration::ZERO),
+            )
+            .await
+        })
+    };
+    wait_until("the bucket read is held", || {
+        fake.held_object_gets.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let purge_a = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Group("a".into()));
+    fake.hold_object_gets.store(false, Ordering::SeqCst);
+    let (_, status) = within(STUCK_DISK_LIMIT, "the bucket hit", lookup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
+    writes_settle(&state).await;
+    drop(purge_a);
+    let (_, copy) = bucket_entry(&fake);
+    assert_eq!(copy.groups, group_list(&["b", "c"]));
+    assert_eq!(purge_group_call(&base, "b").await, "purged 2\n");
+    wait_for_purges_to_end(&state).await;
+    assert!(
+        lookup_tiers(&state, KEY, &[]).await.is_none(),
+        "the entry served under b outlives the purge of b"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn a_bucket_hit_keeps_its_group_under_a_running_purge_of_a_known_group() {
     // A purge of `a` is running. The disk record in `a` was
     // written after it began, and the bucket copy before. The

@@ -4339,7 +4339,7 @@ async fn lookup_tiers_within(
         // them. When a purge covers one of those known groups,
         // the write-back would be dropped and the copy would
         // not learn the request's groups either, so it takes
-        // the request's alone.
+        // the request's and the known ones no purge covers.
         let mut wanted = crate::cache::union_groups(groups, &known_groups(state, cache_key));
         let covered = |extra: &[String]| {
             state.purge_guard.write_covered(
@@ -4350,7 +4350,17 @@ async fn lookup_tiers_within(
             )
         };
         if covered(&wanted) && !covered(groups) {
-            wanted = groups.to_vec();
+            let kept: Vec<String> = wanted
+                .iter()
+                .filter(|g| {
+                    !covered(&crate::cache::union_groups(
+                        groups,
+                        std::slice::from_ref(*g),
+                    ))
+                })
+                .cloned()
+                .collect();
+            wanted = crate::cache::union_groups(groups, &kept);
         }
         let sent = if adds_groups(&image.groups, &wanted) {
             image.groups = crate::cache::union_groups(&image.groups, &wanted);
