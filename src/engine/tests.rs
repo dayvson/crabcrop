@@ -6489,6 +6489,14 @@ fn the_video_argv_is_the_pipe_contract_for_each_format() {
         "format=yuv420p",
     ];
     let mp4 = [
+        // Bitexact muxing (issue #612) and a fixed x264
+        // thread count (issue #626): the bytes name no
+        // FFmpeg version and do not depend on the host's
+        // core count.
+        "-fflags",
+        "+bitexact",
+        "-threads",
+        "6",
         "-c:v",
         "libx264",
         "-preset",
