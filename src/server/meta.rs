@@ -235,7 +235,7 @@ pub(in crate::server) async fn annotate_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
 ) -> Option<Annotation> {
-    let tagger = state.tagger.as_ref()?;
+    let tagger = state.providers.tagger.as_ref()?;
     // The permit moves into the blocking task below and
     // drops when the inference returns (issue #357): the
     // caller wraps this helper in the annotation deadline
@@ -289,10 +289,10 @@ pub(in crate::server) async fn detect_meta(
     processed: &crate::engine::ProcessedImage,
 ) -> Option<Vec<(String, crate::ai::Detection)>> {
     let mut providers: Vec<(String, Arc<dyn crate::ai::DetectionProvider>)> = Vec::new();
-    if let Some(detector) = &state.detect {
+    if let Some(detector) = &state.providers.detect {
         providers.push(("builtin".to_string(), detector.clone()));
     }
-    for declared in &state.detectors {
+    for declared in &state.providers.detectors {
         providers.push((declared.name.clone(), declared.provider.clone()));
     }
     if providers.is_empty() {
@@ -407,7 +407,7 @@ pub(in crate::server) async fn moderate_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
 ) -> ModerationMeta {
-    let Some(provider) = state.moderation.as_ref() else {
+    let Some(provider) = state.providers.moderation.as_ref() else {
         return ModerationMeta::Unavailable("not_configured");
     };
     // The permit moves into the blocking task and drops
@@ -589,7 +589,7 @@ pub(in crate::server) async fn embed_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
 ) -> EmbeddingMeta {
-    let Some(provider) = state.embeddings.as_ref() else {
+    let Some(provider) = state.providers.embeddings.as_ref() else {
         return EmbeddingMeta::Unavailable("not_configured");
     };
     // The permit moves into the blocking task and drops
@@ -676,7 +676,7 @@ pub(in crate::server) async fn ocr_meta(
     processed: &crate::engine::ProcessedImage,
     deadline: Instant,
 ) -> OcrMeta {
-    let Some(provider) = state.ocr.as_ref() else {
+    let Some(provider) = state.providers.ocr.as_ref() else {
         return OcrMeta::Unavailable("not_configured");
     };
     // The permit moves into the blocking task and drops
@@ -751,7 +751,7 @@ pub(in crate::server) fn compose_aesthetic(
     state: &AppState,
     run: Option<&EmbeddingMeta>,
 ) -> Option<AestheticMeta> {
-    let head = state.aesthetic.as_ref()?;
+    let head = state.providers.aesthetic.as_ref()?;
     let (model, outcome) = match run {
         Some(EmbeddingMeta::Report(embedding)) => {
             let outcome = match head.score(&embedding.vector) {

@@ -1205,7 +1205,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
         std::time::Duration::from_secs(config.process_timeout_secs)
     );
     assert!(state.store.is_none() && state.shared_store.is_none());
-    assert!(state.font.is_none() && state.fallback.is_none());
+    assert!(state.providers.font.is_none() && state.fallback.is_none());
 }
 
 #[test]

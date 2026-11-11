@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 mod disk_hang;
 mod disk_stall;
+mod shared_state;
 
 const SECRET: &[u8] = b"test-secret";
 
@@ -187,32 +188,25 @@ async fn spawn_state(state: AppState) -> String {
     format!("http://{addr}")
 }
 
-/// The state [`spawn_app`] serves.
-fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
+/// The state every test server starts from (issue #475):
+/// each field at the value most tests want, with no tier
+/// beyond memory, no provider, no token, and small gates.
+/// A test names only the fields it sets, as in
+/// `AppState { presets, ..test_state() }`, so a field added
+/// to `AppState` is added here and in `main.rs`, not in
+/// every test.
+fn test_state() -> AppState {
     AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe,
+        allow_unsafe: false,
         loader: Loader::with_defaults().unwrap(),
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(30),
         metrics: Arc::new(Metrics::default()),
-        metrics_token,
+        metrics_token: None,
         cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
+        providers: Arc::new(Providers::default()),
         tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
         fallback: None,
         store: None,
         shared_store: None,
@@ -232,9 +226,6 @@ fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppStat
         only_presets: false,
         source_roots: std::collections::HashMap::new(),
         default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -242,8 +233,22 @@ fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppStat
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         background: Default::default(),
-        provenance_signer: None,
         config_fingerprint: "test".to_string(),
+    }
+}
+
+/// `state`'s providers, for a test to set one before it
+/// serves the state: until then nothing else holds them.
+fn providers_mut(state: &mut AppState) -> &mut Providers {
+    Arc::get_mut(&mut state.providers).expect("the providers are not shared yet")
+}
+
+/// The state [`spawn_app`] serves.
+fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
+    AppState {
+        allow_unsafe,
+        metrics_token,
+        ..test_state()
     }
 }
 
@@ -330,60 +335,8 @@ async fn metrics_text(base: &str) -> String {
 
 async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate,
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -395,60 +348,8 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
 
 async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
         ai_gate,
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -460,60 +361,8 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
 
 async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
         meta_enabled,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -535,60 +384,11 @@ async fn spawn_app_with_video(script: &str) -> String {
         crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
             .unwrap();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: Some(Arc::new(encoder)),
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            video_encoder: Some(Arc::new(encoder)),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -620,60 +420,11 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
     let extractor =
         crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: Some(Arc::new(extractor)),
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            frame_extractor: Some(Arc::new(extractor)),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -906,60 +657,11 @@ async fn spawn_app_with_pdf_renderer() -> String {
     let renderer =
         crate::pdf::PdfRenderer::new(program, std::time::Duration::from_secs(30)).unwrap();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: Some(Arc::new(renderer)),
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            pdf_renderer: Some(Arc::new(renderer)),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1267,61 +969,11 @@ async fn video_requests_fail_specifically() {
 async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
     let presets = std::collections::HashMap::new();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
         presets,
         only_presets,
-        source_roots: std::collections::HashMap::new(),
         default_ops: crate::url::parse_default_ops(defaults, &std::collections::HashMap::new())
             .unwrap(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1340,59 +992,7 @@ async fn spawn_app_rotating() -> String {
             current: b"the-new-server-secret".to_vec(),
             previous: Some(("k-old".to_string(), b"the-old-server-secret".to_vec())),
         },
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1414,60 +1014,8 @@ async fn spawn_app_with_fallback() -> String {
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
         fallback: Some(Fallback::Bytes(Arc::new(png))),
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3273,60 +2821,10 @@ async fn spawn_app_with_presets_and_roots(
     source_roots: std::collections::HashMap<String, String>,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
         presets,
         only_presets,
         source_roots,
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4666,60 +4164,11 @@ impl crate::ai::InpaintProvider for FakeInpaint {
 
 async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: Some(tagger),
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            tagger: Some(tagger),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4850,60 +4299,11 @@ async fn spawn_app_with_moderation(
     provider: Option<Arc<dyn crate::ai::ModerationProvider>>,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: provider,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            moderation: provider,
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -5186,60 +4586,12 @@ async fn spawn_app_with_ocr_timeout(
     process_timeout: std::time::Duration,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
         process_timeout,
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: provider,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            ocr: provider,
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -5611,60 +4963,12 @@ async fn spawn_app_with_embeddings(
     aesthetic: Option<Arc<crate::ai::AestheticHead>>,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: provider,
-        ocr: None,
-        aesthetic,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            embeddings: provider,
+            aesthetic,
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -6359,60 +5663,14 @@ fn compose_moderation_rounds_and_orders() {
 /// the permit-reuse test below.
 async fn spawn_app_with_ai_and_meta() -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: Some(Arc::new(FakeMask)),
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: Some(Arc::new(FakeTagger)),
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: Some(Arc::new(FakeDetector)),
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
+        providers: Arc::new(Providers {
+            removebg: Some(Arc::new(FakeMask)),
+            tagger: Some(Arc::new(FakeTagger)),
+            detect: Some(Arc::new(FakeDetector)),
+            ..Providers::default()
+        }),
         ai_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -6426,60 +5684,12 @@ async fn spawn_app_with_ai_and_meta() -> String {
 /// configured, for the studio meta test.
 async fn spawn_app_with_studio() -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: Some(Arc::new(FakeMask)),
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
+        providers: Arc::new(Providers {
+            removebg: Some(Arc::new(FakeMask)),
+            ..Providers::default()
+        }),
         brand_color: Some([0xf5, 0xf0, 0xe8]),
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -6493,60 +5703,11 @@ async fn spawn_app_with_studio() -> String {
 /// the remove_region tests.
 async fn spawn_app_with_inpaint() -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: Some(Arc::new(FakeInpaint)),
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            inpaint: Some(Arc::new(FakeInpaint)),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -6592,60 +5753,12 @@ impl crate::ai::SegmentProvider for FakeSegment {
 /// configured, for the segment tests.
 async fn spawn_app_with_segment() -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: Some(Arc::new(FakeSegment)),
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: Some(Arc::new(FakeDetector)),
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            segment: Some(Arc::new(FakeSegment)),
+            detect: Some(Arc::new(FakeDetector)),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -7087,60 +6200,12 @@ async fn spawn_app_with_providers(
     detectors: Vec<NamedDetector>,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect,
-        detectors,
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            detect,
+            detectors,
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -7159,30 +6224,7 @@ async fn spawn_app_full(
     cache_bytes: usize,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
         cache: Arc::new(Cache::new(cache_bytes)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
         store: dir.map(|d| {
             Arc::new(
                 crate::storage::DiskStore::open(
@@ -7193,35 +6235,8 @@ async fn spawn_app_full(
                 .unwrap(),
             )
         }),
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
         presets,
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -9200,60 +8215,8 @@ fn test_store(dir: &std::path::Path) -> Arc<crate::storage::DiskStore> {
 /// handle to.
 async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
         store: Some(store),
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -9270,30 +8233,6 @@ async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
 /// tier-chain tests drive it directly.
 fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
     AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
         store: dir.map(|d| {
             Arc::new(
                 crate::storage::DiskStore::open(
@@ -9315,34 +8254,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
             )
             .unwrap(),
         )),
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     }
 }
 
@@ -9382,7 +8294,7 @@ fn entry_objects(fake: &crate::s3store::test_support::FakeS3) -> usize {
 /// Poll a lookup future exactly once, then drop it:
 /// the shape of a client disconnecting at the first
 /// await that cannot complete synchronously.
-fn poll_lookup_once(state: &AppState, key: &str, groups: &[String]) {
+fn poll_lookup_once(state: &Arc<AppState>, key: &str, groups: &[String]) {
     let fut = lookup_tiers(state, key, groups);
     let mut fut = Box::pin(fut);
     let waker = std::task::Waker::noop();
@@ -9411,7 +8323,7 @@ async fn shared_learns_group(shared: &crate::s3store::S3Store, key: &str, group:
 async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-drop3");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png";
@@ -9438,7 +8350,7 @@ async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
     // (issues #347, #350).
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-drop4");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png";
@@ -10529,19 +9441,10 @@ fn provenance_job(
         preferred: None,
         watermark_sources: Default::default(),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: signer,
+        providers: Arc::new(Providers {
+            provenance_signer: signer,
+            ..Providers::default()
+        }),
         ai_edited,
         want_provenance: true,
         dpr: None,
@@ -10766,60 +9669,12 @@ async fn spawn_signing_app(
     preserve_metadata: bool,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
         preserve_metadata,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: Some(signer),
-        config_fingerprint: "test".to_string(),
+        providers: Arc::new(Providers {
+            provenance_signer: Some(signer),
+            ..Providers::default()
+        }),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -11307,60 +10162,8 @@ async fn processing_gate_bounds_concurrency() {
     // a gated run must wait, then proceed once released
     // (audit E-5).
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(Gate::new(1)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let job = ProcessJob {
         save_data: false,
@@ -11370,19 +10173,7 @@ async fn processing_gate_bounds_concurrency() {
         preferred: None,
         watermark_sources: Default::default(),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: None,
+        providers: Arc::new(Providers::default()),
         ai_edited: false,
         want_provenance: false,
         dpr: None,
@@ -11440,60 +10231,9 @@ async fn timed_out_encode_releases_the_process_gate() {
     )
     .unwrap();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
         process_timeout: std::time::Duration::from_millis(300),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(Gate::new(1)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let job = |video_encoder: Option<Arc<crate::video::VideoEncoder>>, ops_str: &str| {
         let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
@@ -11505,19 +10245,10 @@ async fn timed_out_encode_releases_the_process_gate() {
             preferred: None,
             watermark_sources: Default::default(),
             placeholders: false,
-            mask_provider: None,
-            upscale_provider: None,
-            inpaint_provider: None,
-            segment_provider: None,
-            face_provider: None,
-            detect_provider: None,
-            declared_detect_providers: Vec::new(),
-            focal_provider: None,
-            text_renderer: None,
-            video_encoder,
-            frame_extractor: None,
-            pdf_renderer: None,
-            provenance_signer: None,
+            providers: Arc::new(Providers {
+                video_encoder,
+                ..Providers::default()
+            }),
             ai_edited: false,
             want_provenance: false,
             dpr: None,
@@ -11639,9 +10370,12 @@ async fn an_ai_permit_is_held_until_the_job_actually_finishes() {
     let state = lane_test_state(std::time::Duration::from_millis(300), 1, 1);
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
-    job.upscale_provider = Some(Arc::new(BlockingUpscale {
-        release: release.clone(),
-    }));
+    job.providers = Arc::new(Providers {
+        upscale: Some(Arc::new(BlockingUpscale {
+            release: release.clone(),
+        })),
+        ..Providers::default()
+    });
     let png = test_png();
     let permit = state.ai_gate.clone().acquire_owned().await.unwrap();
     assert_eq!(state.ai_gate.available_permits(), 1);
@@ -11698,9 +10432,12 @@ async fn a_source_budget_share_is_held_until_the_job_actually_finishes() {
     let budget = crate::loader::SourceBudget::new(1 << 20);
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
-    job.upscale_provider = Some(Arc::new(BlockingUpscale {
-        release: release.clone(),
-    }));
+    job.providers = Arc::new(Providers {
+        upscale: Some(Arc::new(BlockingUpscale {
+            release: release.clone(),
+        })),
+        ..Providers::default()
+    });
     let png = test_png();
     let share = budget.charge(std::time::Duration::from_secs(1));
     share.grow_to(png.len()).await.unwrap();
@@ -12067,7 +10804,7 @@ async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.tagger = Some(Arc::new(BlockingTagger {
+    providers_mut(&mut state).tagger = Some(Arc::new(BlockingTagger {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
@@ -12088,7 +10825,7 @@ async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.moderation = Some(Arc::new(BlockingModeration {
+    providers_mut(&mut state).moderation = Some(Arc::new(BlockingModeration {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
@@ -12108,7 +10845,7 @@ async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.detect = Some(Arc::new(BlockingDetector {
+    providers_mut(&mut state).detect = Some(Arc::new(BlockingDetector {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
@@ -12133,11 +10870,11 @@ async fn meta_sections_never_run_inference_without_an_ai_permit() {
     // answer, so the degrade is the gate's doing.
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.tagger = Some(Arc::new(FakeTagger));
-    state.detect = Some(Arc::new(FakeDetector));
-    state.moderation = Some(Arc::new(FakeModeration));
-    state.embeddings = Some(Arc::new(FakeEmbedding));
-    state.ocr = Some(Arc::new(FakeOcr));
+    providers_mut(&mut state).tagger = Some(Arc::new(FakeTagger));
+    providers_mut(&mut state).detect = Some(Arc::new(FakeDetector));
+    providers_mut(&mut state).moderation = Some(Arc::new(FakeModeration));
+    providers_mut(&mut state).embeddings = Some(Arc::new(FakeEmbedding));
+    providers_mut(&mut state).ocr = Some(Arc::new(FakeOcr));
     let processed = still_processed(test_png(), ImageFormat::Png);
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     let held = state.ai_gate.clone().acquire_owned().await.unwrap();
@@ -12180,60 +10917,10 @@ fn lane_test_state(
     slow_permits: usize,
 ) -> AppState {
     AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
         process_timeout,
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(Gate::new(process_permits)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(slow_permits)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     }
 }
 
@@ -12252,19 +10939,10 @@ fn lane_test_job(
         preferred: None,
         watermark_sources: Default::default(),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: None,
+        providers: Arc::new(Providers {
+            video_encoder,
+            ..Providers::default()
+        }),
         ai_edited: false,
         want_provenance: false,
         dpr: None,
@@ -12469,60 +11147,10 @@ async fn slow_lane_overflow_waits_in_its_own_lane() {
 /// lane occupancy exposition can be read back.
 async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
         metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate,
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate,
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -12628,60 +11256,8 @@ async fn watermark_decode_waits_for_the_process_gate() {
     // watermark decoded inline in the async handler
     // before the fix, outside this seam entirely.
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(Gate::new(1)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let job = ProcessJob {
         save_data: false,
@@ -12697,19 +11273,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
             share: None,
         }),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: None,
+        providers: Arc::new(Providers::default()),
         ai_edited: false,
         want_provenance: false,
         dpr: None,
@@ -13571,69 +12135,20 @@ async fn spawn_app_with_upload_gate(
     std::fs::create_dir_all(dir).unwrap();
     let dir = std::fs::canonicalize(dir).unwrap();
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
         loader: Loader::with_defaults()
             .unwrap()
             .with_sources(crate::loader::SourceConfig {
                 file_root: Some(dir.clone()),
                 ..Default::default()
             }),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
         metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
         upload: Some(Arc::new(crate::upload::UploadStore::local(
             dir,
             max_bytes,
             allow_overwrite,
         ))),
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate,
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -14468,7 +12983,7 @@ fn held_upscale_state(process_permits: usize) -> (AppState, Release, Arc<AtomicU
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), process_permits, 1);
-    state.upscale = Some(Arc::new(HeldUpscale {
+    providers_mut(&mut state).upscale = Some(Arc::new(HeldUpscale {
         release: release.clone(),
         calls: calls.clone(),
     }));
@@ -14480,7 +12995,7 @@ fn held_upscale_state(process_permits: usize) -> (AppState, Release, Arc<AtomicU
 /// handler: aborting the task drops the request where it
 /// is, as a client that disconnects does.
 fn start_request(
-    state: &AppState,
+    state: &Arc<AppState>,
     remainder: &str,
     width_hint: Option<u32>,
 ) -> tokio::task::JoinHandle<Response> {
@@ -14512,6 +13027,7 @@ async fn a_render_whose_client_left_is_stored_and_its_replay_is_a_hit() {
     // itself ends.
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(2);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     for (rendering, width) in [(1, 150), (2, 250)] {
@@ -14562,6 +13078,7 @@ async fn followers_of_a_leader_whose_client_left_receive_its_render() {
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (mut state, release, calls) = held_upscale_state(2);
     state.cache = Arc::new(Cache::new(0));
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     let leader = start_request(&state, &remainder, None);
@@ -14601,6 +13118,7 @@ async fn a_request_dropped_before_its_render_starts_starts_none() {
     // not started is never started.
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(1);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release);
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let remainder = format!("filters:upscale(2)/{src}");
@@ -14637,6 +13155,7 @@ async fn a_waiter_past_the_wait_cap_finishes_a_render_its_client_left() {
     // client leaves, and the replay is a hit.
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(1);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     // The request's key, read from the flight of a first
@@ -14757,11 +13276,12 @@ async fn a_source_that_did_not_decode_gets_no_fallback_once_its_client_left() {
     let (src, _) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
     let (fallback, fallback_hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 1, 1);
-    state.frame_extractor = Some(Arc::new(
+    providers_mut(&mut state).frame_extractor = Some(Arc::new(
         crate::frames::VideoFrameExtractor::new(decoder, std::time::Duration::from_secs(30))
             .unwrap(),
     ));
     state.fallback = Some(Fallback::Url(fallback));
+    let state = Arc::new(state);
     let remainder = format!("frame:1.5/40x30/{src}");
     let request = start_request(&state, &remainder, None);
     wait_until("the render started", || started.exists()).await;
@@ -14791,6 +13311,7 @@ async fn a_fallback_whose_client_left_while_it_loaded_starts_no_render() {
     // them.
     open_release(&release);
     state.fallback = Some(Fallback::Url(fallback));
+    let state = Arc::new(state);
     let remainder = format!("filters:upscale(2)/{garbage}");
     let request = start_request(&state, &remainder, None);
     wait_until("the fallback is loading", || {
@@ -14825,6 +13346,7 @@ async fn followers_of_a_leader_that_forwent_its_fallback_get_the_fallback() {
     let (mut state, release, calls) = held_upscale_state(2);
     open_release(&release);
     state.fallback = Some(Fallback::Url(fallback));
+    let state = Arc::new(state);
     let remainder = format!("filters:upscale(2)/{garbage}");
     let leader = start_request(&state, &remainder, None);
     wait_until("the leader's fallback is loading", || {
@@ -14869,6 +13391,7 @@ async fn the_shutdown_drain_counts_a_miss_once_its_client_has_left() {
     // it and, cut off, reports it as a render.
     let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(1);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     let request = start_request(&state, &remainder, None);
@@ -14918,10 +13441,11 @@ async fn the_shutdown_drain_waits_for_the_write_a_left_render_starts() {
     let mut state = tier_test_state(None, &fake.endpoint);
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let calls = Arc::new(AtomicUsize::new(0));
-    state.upscale = Some(Arc::new(HeldUpscale {
+    providers_mut(&mut state).upscale = Some(Arc::new(HeldUpscale {
         release: release.clone(),
         calls: calls.clone(),
     }));
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
     let request = start_request(&state, &format!("filters:upscale(2)/{src}"), None);
@@ -15350,7 +13874,7 @@ struct WalkFixture {
     fake: crate::s3store::test_support::FakeS3,
     dir: crate::test_support::ScratchDir,
     hits: Arc<AtomicUsize>,
-    probe: AppState,
+    probe: Arc<AppState>,
     server: tokio::task::JoinHandle<()>,
     base: String,
     url: String,
@@ -15366,6 +13890,7 @@ impl WalkFixture {
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
         let mut state = tier_test_state(Some(&dir), &fake.endpoint);
         state.presets = preset_test_map();
+        let state = Arc::new(state);
         let probe = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -15446,10 +13971,10 @@ impl WalkFixture {
     /// A replica over the fixture's bucket that did not
     /// receive the purge, with its own disk tier at `dir`
     /// when given.
-    fn other_replica(&self, dir: Option<&std::path::Path>) -> AppState {
+    fn other_replica(&self, dir: Option<&std::path::Path>) -> Arc<AppState> {
         let mut state = tier_test_state(dir, &self.fake.endpoint);
         state.presets = preset_test_map();
-        state
+        Arc::new(state)
     }
 
     /// Purge group `small` and wait until its background
@@ -15587,7 +14112,7 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     // serves again.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-active");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png#cfgtest#w300";
@@ -15794,7 +14319,7 @@ async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
     // the shared tier once it knows the purge, or the copy
     // would outlive the walk that removed it.
     let fake = crate::s3store::test_support::start_fake().await;
-    let holder = tier_test_state(None, &fake.endpoint);
+    let holder = Arc::new(tier_test_state(None, &fake.endpoint));
     let purger = tier_test_state(None, &fake.endpoint);
     let key = "40x24/example.com/i.png#cfgtest";
     holder.cache.put(key.to_string(), tier_test_entry());
@@ -15964,6 +14489,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
     state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let disk = state.store.clone().unwrap();
     let g = vec!["g".to_string()];
@@ -16015,7 +14541,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     assert_eq!(purge_group_call(&base, "g").await, "purged 2\n");
     wait_for_purges_to_end(&state).await;
     assert!(lookup_tiers(&state, k1, &[]).await.is_none());
-    let fresh = tier_test_state(None, &fake.endpoint);
+    let fresh = Arc::new(tier_test_state(None, &fake.endpoint));
     let shared = fresh.shared_store.clone().unwrap();
     assert!(shared.refresh_tombstones(&fresh.purge_guard).await);
     assert!(lookup_tiers(&fresh, k1, &[]).await.is_none());
@@ -16039,6 +14565,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut first = tier_test_state(Some(&dir), &fake.endpoint);
     first.presets = twin_presets();
+    let first = Arc::new(first);
     let base = serve_state(&first).await;
     let resp = get_signed(&base, &format!("preset:a/{src}")).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16049,7 +14576,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
 
     // Another replica purges group a; its walk removes the
     // bucket copy and ends.
-    let purger = tier_test_state(None, &fake.endpoint);
+    let purger = Arc::new(tier_test_state(None, &fake.endpoint));
     let purger_base = serve_state(&purger).await;
     assert_eq!(purge_group_call(&purger_base, "a").await, "purged 1\n");
     wait_for_purges_to_end(&purger).await;
@@ -16066,6 +14593,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
     // read the tombstone.
     let mut restarted = tier_test_state(Some(&dir), &fake.endpoint);
     restarted.presets = twin_presets();
+    let restarted = Arc::new(restarted);
     let base = serve_state(&restarted).await;
     *fake.name_break.unanswered.lock().unwrap() = Some(tombstone);
     refresh_with_one_unread(&restarted).await;
@@ -16086,7 +14614,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
 
     // A replica without the tombstone, as every replica is
     // once it expires, serves the copy.
-    let expired = tier_test_state(None, &fake.endpoint);
+    let expired = Arc::new(tier_test_state(None, &fake.endpoint));
     let (_, status) = lookup_tiers(&expired, &key, &[]).await.unwrap();
     assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
 
@@ -16097,7 +14625,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
     assert_eq!(purge_group_call(&base, "a").await, "purged 3\n");
     wait_for_purges_to_end(&restarted).await;
     assert_eq!(entry_objects(&fake), 0);
-    let cold = tier_test_state(None, &fake.endpoint);
+    let cold = Arc::new(tier_test_state(None, &fake.endpoint));
     assert!(lookup_tiers(&cold, &key, &[]).await.is_none());
     assert!(lookup_tiers(&restarted, &key, &[]).await.is_none());
 }
@@ -16138,6 +14666,7 @@ async fn a_hit_under_an_unread_tombstone_teaches_every_tier(probe: UnreadProbe) 
         tier_test_state(Some(&dir), &fake.endpoint)
     };
     writer.presets = twin_presets();
+    let writer = Arc::new(writer);
     let writer_base = serve_state(&writer).await;
     let resp = get_signed(&writer_base, &first).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16147,6 +14676,7 @@ async fn a_hit_under_an_unread_tombstone_teaches_every_tier(probe: UnreadProbe) 
     } else {
         let mut state = tier_test_state(Some(&dir), &fake.endpoint);
         state.presets = twin_presets();
+        let state = Arc::new(state);
         let base = serve_state(&state).await;
         (state, base)
     };
@@ -16203,6 +14733,7 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut first = tier_test_state(Some(&dir), &fake.endpoint);
     first.presets = twin_presets();
+    let first = Arc::new(first);
     let base = serve_state(&first).await;
     let plain = format!("30x20/{src}");
     assert_eq!(get_signed(&base, &plain).await.status(), StatusCode::OK);
@@ -16214,6 +14745,7 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
 
     let mut restarted = tier_test_state(Some(&dir), &fake.endpoint);
     restarted.presets = twin_presets();
+    let restarted = Arc::new(restarted);
     let base = serve_state(&restarted).await;
     list_an_unread_tombstone(&restarted, &fake, unrelated_purge()).await;
     let resp = get_signed(&base, &plain).await;
@@ -16229,6 +14761,7 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
     assert_eq!(entry_objects(&fake), 0);
     let mut cold = tier_test_state(None, &fake.endpoint);
     cold.presets = twin_presets();
+    let cold = Arc::new(cold);
     let cold_base = serve_state(&cold).await;
     let resp = get_signed(&cold_base, &format!("preset:a/{src}")).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16254,7 +14787,7 @@ async fn an_unread_name_ahead_or_just_behind_does_not_stop_caching() {
         let fake = crate::s3store::test_support::start_fake().await;
         let dir = crate::test_support::scratch_dir("srv-unread-name");
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
-        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
         let base = serve_state(&state).await;
         let name = format!("purges/{start_ms}-{writer:016x}-1");
         fake.objects
@@ -16297,6 +14830,7 @@ async fn a_request_under_an_unread_tombstone_teaches_the_bucket_copy_its_group()
     let (src, hits, current) = spawn_swappable_server(test_png()).await;
     let mut writer = tier_test_state(None, &fake.endpoint);
     writer.presets = twin_presets();
+    let writer = Arc::new(writer);
     let writer_base = serve_state(&writer).await;
     let resp = get_signed(&writer_base, &format!("preset:a/{src}")).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16306,6 +14840,7 @@ async fn a_request_under_an_unread_tombstone_teaches_the_bucket_copy_its_group()
 
     let mut state = tier_test_state(None, &fake.endpoint);
     state.presets = twin_presets();
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     list_an_unread_tombstone(&state, &fake, unrelated_purge()).await;
     let resp = get_signed(&base, &format!("preset:b/{src}")).await;
@@ -16336,7 +14871,7 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
     let dir = crate::test_support::scratch_dir("srv-unread-stall");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let url = |i: usize| format!("{}x20/{src}", 20 + i);
-    let first = tier_test_state(Some(&dir), &fake.endpoint);
+    let first = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&first).await;
     for i in 0..N {
         assert_eq!(get_signed(&base, &url(i)).await.status(), StatusCode::OK);
@@ -16346,7 +14881,7 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
     assert_eq!(entry_objects(&fake), N);
     tombstone_from_another_replica(&fake, unrelated_purge()).await;
 
-    let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+    let restarted = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&restarted).await;
     fake.fail.lock().unwrap().get_object = true;
     refresh_with_one_unread(&restarted).await;
@@ -16386,8 +14921,8 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
 async fn spawn_walk_app(
     fake: &crate::s3store::test_support::FakeS3,
     objects: usize,
-) -> (String, AppState) {
-    let state = tier_test_state(None, &fake.endpoint);
+) -> (String, Arc<AppState>) {
+    let state = Arc::new(tier_test_state(None, &fake.endpoint));
     let probe = state.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -16905,63 +15440,12 @@ async fn a_failed_relist_leaves_the_joined_purges_in_force() {
 /// configuration fingerprint (the epoch tests).
 async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &str) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
-        loader: Loader::with_defaults().unwrap(),
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
         store: Some(Arc::new(
             crate::storage::DiskStore::open(dir, 16 * 1024 * 1024, crate::url::entry_key(SECRET))
                 .unwrap(),
         )),
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
-        presets: std::collections::HashMap::new(),
-        only_presets: false,
-        source_roots: std::collections::HashMap::new(),
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
         config_fingerprint: fingerprint.to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -18370,60 +16854,10 @@ async fn spawn_explain_app_with_roots(
     source_roots: std::collections::HashMap<String, String>,
 ) -> String {
     let state = AppState {
-        keyring: crate::url::Keyring::single(SECRET.to_vec()),
-        allow_unsafe: false,
         loader,
-        engine: Engine,
-        process_timeout: std::time::Duration::from_secs(30),
-        metrics: Arc::new(Metrics::default()),
-        metrics_token: None,
-        cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
-        tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
-        fallback: None,
-        store: None,
-        shared_store: None,
-        upload: None,
-        meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(Gate::new(4)),
-        ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
-        avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
-        jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
-        width_step: 100,
-        client_hints: true,
-        explain_enabled: true,
-        preserve_metadata: false,
-        brand_color: None,
         presets,
-        only_presets: false,
         source_roots,
-        default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        slow_gate: Arc::new(Gate::new(2)),
-        inflight: Arc::new(Inflight::default()),
-        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        background: Default::default(),
-        provenance_signer: None,
-        config_fingerprint: "test".to_string(),
+        ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -18722,7 +17156,7 @@ async fn explain_escapes_markup_bearing_strings() {
 
 /// Serve `state` on an ephemeral port: the tests that read
 /// `/metrics` while they drive the state directly.
-async fn serve_state(state: &AppState) -> String {
+async fn serve_state(state: &Arc<AppState>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = state.clone();
@@ -18755,6 +17189,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     fake.hold_puts.store(true, Ordering::SeqCst);
     let mut state = tier_test_state(None, &fake.endpoint);
     state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
     let shared = state.shared_store.clone().unwrap();
     let base = serve_state(&state).await;
     let snapshot = state.purge_guard.snapshot();
@@ -18911,7 +17346,7 @@ async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
     // The request scans the inline budget itself; the
     // background walk parks on its first read past it.
     *fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
-    let state = tier_test_state(None, &fake.endpoint);
+    let state = Arc::new(tier_test_state(None, &fake.endpoint));
     purge_source_everywhere(&state, "example.com/i.png").await;
     wait_until("the background walk parks", || {
         fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
@@ -18981,7 +17416,7 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool, 
     // sent it again; the bucket copy never learned it, the
     // group purge left it, and every replica served it.
     let fake = crate::s3store::test_support::start_fake().await;
-    let state = tier_test_state(None, &fake.endpoint);
+    let state = Arc::new(tier_test_state(None, &fake.endpoint));
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/hero.png";
     let entry = tier_test_entry();
@@ -19048,7 +17483,7 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool, 
     assert!(lookup_tiers(&state, key, &groups).await.is_none());
     // Another replica, with the bucket's tombstones read,
     // misses as well.
-    let other = tier_test_state(None, &fake.endpoint);
+    let other = Arc::new(tier_test_state(None, &fake.endpoint));
     shared.refresh_tombstones(&other.purge_guard).await;
     assert!(lookup_tiers(&other, key, &groups).await.is_none());
 }
@@ -19361,6 +17796,7 @@ async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     state.loader = loader;
     state.fallback = fallback;
     state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
     serve_state(&state).await
 }
 
