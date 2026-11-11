@@ -1,9 +1,10 @@
 # crabcrop server image.
 #
 # Multi-stage: the builder compiles the release binary; the
-# runtime stage carries only the binary and CA certificates
-# (source fetching is HTTPS). The AI variant layers on top of
-# this image: see Dockerfile.ai.
+# runtime stage carries only the binary, CA certificates
+# (source fetching is HTTPS) and the dav1d library. It has
+# no curl: the binary checks its own health. The AI variant
+# layers on top of this image: see Dockerfile.ai.
 #
 # Base images are digest-pinned (audit PL-13); refresh the
 # digests deliberately when moving to a newer base.
@@ -25,7 +26,7 @@ RUN cargo build --release --locked --features avif-decode \
 
 FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libdav1d7 \
+    && apt-get install -y --no-install-recommends ca-certificates libdav1d7 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/crabcrop /usr/local/bin/crabcrop
 ENV PORT=3000
@@ -36,7 +37,11 @@ EXPOSE 3000
 # CRABCROP_RESULT_STORAGE_DIR is not writable.
 RUN mkdir -p /var/cache/crabcrop \
     && chown 65534:65534 /var/cache/crabcrop
-USER nobody
+# nobody, by number: Kubernetes can check runAsNonRoot only
+# against a numeric user.
+USER 65534:65534
+# `crabcrop health` asks the server on this container's
+# port for /health and exits 1 unless it answers 200.
 HEALTHCHECK --interval=30s --timeout=3s \
-    CMD curl -f "http://127.0.0.1:${PORT:-3000}/health" || exit 1
+    CMD ["crabcrop", "health"]
 ENTRYPOINT ["crabcrop"]

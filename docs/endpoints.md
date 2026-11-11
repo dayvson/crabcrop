@@ -129,14 +129,19 @@ crabcrop upload ./photo.jpg heroes/photo.jpg
 
 # Convert a Thumbor URL (re-signed; losses are reported on stderr)
 crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
+
+# Check the server on this host, as the images' HEALTHCHECK does
+crabcrop health
 ```
+
+`crabcrop health` sends `GET /health` to 127.0.0.1 at `CRABCROP_PORT` or `PORT` (3000 by default), read as the server reads them, and ignores `CRABCROP_BASE`. It prints the answer and exits 0 on a `200`. On any other answer, or none within 2 seconds, it exits 1 with the error on stderr. It takes no flags, and `PORT=0` is an error, because the server picked its port at boot. The images run it as their `HEALTHCHECK`, so they need no curl.
 
 Every flag the verbs take. A value flag is spelled `--flag <value>` or `--flag=<value>`, and an unknown flag after the verb (`--key-ids`) is an error too.
 
 | Flag | Environment | Verbs | Meaning |
 |---|---|---|---|
-| `--base <url>` | `CRABCROP_BASE` | all | The server's base URL. Default `http://localhost:3000`. |
-| `--secret <secret>` | `CRABCROP_SECRET` | all | The signing secret. |
+| `--base <url>` | `CRABCROP_BASE` | all but `health` | The server's base URL. Default `http://localhost:3000`. |
+| `--secret <secret>` | `CRABCROP_SECRET` | all but `health` | The signing secret. |
 | `--key-id <id>` | `CRABCROP_SECRET_KEY_ID` | `sign`, `seal`, `purge`, `purge-group`, `upload` | The key ID stamped on the signature or token the verb mints (`<key-id>:<tag>`), for [rotating the secret](configuration.md#rotating-the-secret): 1 to 32 characters of `[A-Za-z0-9_-]`. Unset, the verbs mint with no key ID. |
 | `--placeholders` | | `meta` | Include the placeholder fields. |
 | `--detections` | | `meta` | Include the detection boxes. |

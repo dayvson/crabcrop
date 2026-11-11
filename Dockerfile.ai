@@ -18,12 +18,15 @@
 # anything beyond local use, e.g.
 #   --build-arg BASE_IMAGE=crabcrop@sha256:<digest>
 ARG BASE_IMAGE=crabcrop:latest
-FROM ${BASE_IMAGE}
 
-# The base image runs as nobody; the payload steps below
-# write to /opt and /models and need root. The runtime user
-# is restored at the end of this file.
-USER root
+# ONNX Runtime is downloaded and checked in a stage of its
+# own, so the runtime image needs no curl. The stage runs on
+# the build host's platform and fetches the target's
+# tarball. Its base is pinned like the runtime images'.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS onnxruntime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # ONNX Runtime publishes per-architecture tarballs; pick the
 # one matching the target platform and verify both hashes.
@@ -46,11 +49,20 @@ RUN set -eu; \
     echo "$so_sha  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c -; \
     rm -rf /tmp/ort.tgz "/tmp/onnxruntime-linux-${ort_arch}-1.31.0"
 
+FROM ${BASE_IMAGE}
+
+# The base image runs as 65534; the steps below set the
+# models' mode and need root. The runtime user is restored
+# at the end of this file.
+USER root
+
+COPY --from=onnxruntime /opt/onnxruntime /opt/onnxruntime
+
 ADD --checksum=sha256:309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8 https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
 
 ADD --checksum=sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4 https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx /models/yunet.onnx
 
-# Remote ADD files land mode 0600; the runtime user (nobody)
+# Remote ADD files land mode 0600; the runtime user (65534)
 # must be able to read the models at boot preload.
 RUN chmod 644 /models/u2netp.onnx /models/yunet.onnx
 
@@ -66,5 +78,5 @@ ENV ORT_DISABLE_TELEMETRY=1 \
     CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx \
     CRABCROP_FACE_MODEL=/models/yunet.onnx
 
-# Restore the base image's runtime user.
-USER nobody
+# Restore the base image's runtime user, by number.
+USER 65534:65534
