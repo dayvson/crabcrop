@@ -127,7 +127,7 @@ async fn a_disk_budget_charges_only_the_time_spent_waiting() {
     assert_eq!(budget.spend(tokio::time::sleep(ms(50))).await, Some(()));
     // Time outside the budget is not charged.
     tokio::time::sleep(ms(400)).await;
-    assert!(!budget.spent());
+    assert_eq!(budget.spend(tokio::time::sleep(ms(100))).await, Some(()));
     assert_eq!(budget.spend(tokio::time::sleep(ms(2000))).await, None);
     assert!(budget.spent());
     let started = std::time::Instant::now();
