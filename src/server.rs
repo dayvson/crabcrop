@@ -1517,20 +1517,22 @@ fn purge_disk_tier(
 }
 
 /// Wait for a purge's disk deletions (issue #572) while they
-/// make progress: on a healthy disk the files are gone when
-/// the purge answers, as before. Once none finishes for
-/// [`DISK_WRITE_WAIT`], or after [`PURGE_DELETE_CAP`] in all,
-/// the purge answers and the deletions go on in the
-/// background; that wait counts as a stall.
+/// make progress: on a healthy disk with no deletions queued
+/// before them, the files are gone when the purge answers, as
+/// before. Once none finishes for [`DISK_WRITE_WAIT`], or after
+/// [`PURGE_DELETE_CAP`] in all, the purge answers and the
+/// deletions go on in the background. That counts as a stall
+/// only on a stuck disk, not on one busy with the deletions
+/// queued before these.
 async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
     let Some(disk) = disk else {
         return;
     };
-    if !disk
+    let waited = disk
         .store
         .wait_deletions(disk.seqs.clone(), DISK_WRITE_WAIT, PURGE_DELETE_CAP)
-        .await
-    {
+        .await;
+    if waited == crate::storage::Waited::Stalled {
         disk.store.note_stall(crate::storage::Stall::PurgeDelete);
     }
 }

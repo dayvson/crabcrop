@@ -91,8 +91,8 @@ struct Job {
     /// Not run again before this, after a failure: the job
     /// waits in [`KeyQueue::later`].
     not_before: Option<std::time::Instant>,
-    /// Being run right now.
-    running: bool,
+    /// Being run right now, since then.
+    running: Option<std::time::Instant>,
 }
 
 /// Jobs by key, at most one per key. A job that can run waits
@@ -136,7 +136,7 @@ impl KeyQueue {
                 stem: stem.to_string(),
                 attempts: 0,
                 not_before: None,
-                running: false,
+                running: None,
             },
         );
         self.by_seq.insert(*seq, key.to_string());
@@ -156,7 +156,7 @@ impl KeyQueue {
         if let Some(at) = job.not_before {
             self.later.remove(&(at, job.seq));
         }
-        if job.running {
+        if job.running.is_some() {
             self.running -= 1;
         }
         if job.attempts > 0 {
@@ -187,7 +187,7 @@ impl KeyQueue {
         while let Some((key, seq)) = self.order.pop_front() {
             if let Some(job) = self.jobs.get(&key)
                 && job.seq == seq
-                && !job.running
+                && job.running.is_none()
                 && job.not_before.is_none()
             {
                 let stem = job.stem.clone();
@@ -200,7 +200,7 @@ impl KeyQueue {
     /// Mark `key`'s job as running.
     fn start(&mut self, key: &str) {
         if let Some(job) = self.jobs.get_mut(key) {
-            job.running = true;
+            job.running = Some(std::time::Instant::now());
             self.running += 1;
         }
     }
@@ -209,8 +209,8 @@ impl KeyQueue {
     /// again at once.
     fn finish(&mut self, key: &str, again: bool) {
         match self.jobs.get_mut(key) {
-            Some(job) if again && job.running => {
-                job.running = false;
+            Some(job) if again && job.running.is_some() => {
+                job.running = None;
                 self.running -= 1;
                 if job.attempts > 0 {
                     job.attempts = 0;
@@ -229,9 +229,9 @@ impl KeyQueue {
     /// again after a backoff.
     fn retry(&mut self, key: &str) {
         if let Some(job) = self.jobs.get_mut(key)
-            && job.running
+            && job.running.is_some()
         {
-            job.running = false;
+            job.running = None;
             self.running -= 1;
             if job.attempts == 0 {
                 self.failing += 1;
@@ -284,6 +284,17 @@ impl KeyQueue {
     /// not.
     fn any_in(&self, seqs: &Range<u64>) -> bool {
         self.by_seq.range(seqs.clone()).next().is_some()
+    }
+
+    /// Whether a job in `seqs` has been running since `since` or
+    /// before. Walks the range: once per wait that runs out.
+    fn running_since(&self, seqs: &Range<u64>, since: std::time::Instant) -> bool {
+        self.by_seq.range(seqs.clone()).any(|(_, key)| {
+            self.jobs
+                .get(key)
+                .and_then(|job| job.running)
+                .is_some_and(|started| started <= since)
+        })
     }
 }
 
@@ -435,6 +446,10 @@ pub struct DiskStore {
     /// Bumped whenever a background job ends or a queued job
     /// goes, for the waits on them.
     progress: tokio::sync::watch::Sender<u64>,
+    /// When a background job last finished its work, on
+    /// [`monotonic_ms`] (0: never): a disk that finishes jobs
+    /// works, even while one purge's deletions wait their turn.
+    last_job_done_ms: AtomicU64,
     /// Rate-limits the log lines for disk waits that ran out.
     stall_log: StallLog,
     /// Rate-limits the log lines for background jobs that
@@ -650,6 +665,7 @@ impl DiskStore {
             permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
             drain_wake: tokio::sync::Notify::new(),
             progress: tokio::sync::watch::Sender::new(0),
+            last_job_done_ms: AtomicU64::new(0),
             stall_log: StallLog::new("disk waits ran out"),
             job_log: StallLog::new("background disk jobs failed"),
             #[cfg(test)]
@@ -1330,7 +1346,12 @@ impl DiskStore {
         for (key, record) in &removed {
             inner.total_bytes -= record.charge;
             inner.stamps.remove(key);
-            if inner.rewrites.jobs.get(key).is_some_and(|job| !job.running) {
+            if inner
+                .rewrites
+                .jobs
+                .get(key)
+                .is_some_and(|job| job.running.is_none())
+            {
                 inner.rewrites.remove(key);
             }
             inner.deletions.push(key, &record.stem, &mut inner.next_seq);
@@ -1643,10 +1664,12 @@ impl DiskStore {
     }
 
     /// Wait until the deletions a purge queued (`seqs`) are
-    /// done (issue #572). Returns false when none of them
-    /// finished for `idle`, or `cap` passed in all: a disk that
-    /// stops answering, or a slow one. Deletions that failed
-    /// are not waited for; they are retried and counted. Only
+    /// done (issue #572), or until none of them has finished for
+    /// `idle`, or `cap` has passed in all, and say which (see
+    /// [`Waited`]): a disk that stops answering, a slow one, or
+    /// one busy with other jobs that come first. Deletions that
+    /// failed are not waited for; they are retried and counted.
+    /// Only
     /// these deletions wake the wait, and each one counts down
     /// what it waits for at a constant cost, so other jobs
     /// ending do not restart the idle time, and neither many
@@ -1656,7 +1679,7 @@ impl DiskStore {
         seqs: Range<u64>,
         idle: std::time::Duration,
         cap: std::time::Duration,
-    ) -> bool {
+    ) -> Waited {
         let count = Arc::new(DeletionCount::default());
         let mut left = {
             let mut guard = self.inner.lock().unwrap();
@@ -1666,7 +1689,7 @@ impl DiskStore {
             inner.wake_deletion_waits();
             let left = inner.deletions.count_in(&seqs);
             if left == 0 {
-                return true;
+                return Waited::Done;
             }
             count.left.store(left, Ordering::Relaxed);
             inner
@@ -1690,16 +1713,44 @@ impl DiskStore {
                 .await
                 .is_err()
             {
-                return false;
+                return self.stopped_waiting(&seqs, idle);
             }
             let now_left = count.left.load(Ordering::Relaxed);
             if now_left == 0 {
-                return true;
+                return Waited::Done;
             }
             if now_left < left {
                 left = now_left;
                 quiet_until = tokio::time::Instant::now() + idle;
             }
+        }
+    }
+
+    /// Why a wait on the deletions in `seqs` ran out: the disk
+    /// stalled when no background job finished for `idle`, or
+    /// when one of these deletions has run for half that long,
+    /// which no working disk takes for one deletion. Otherwise
+    /// the disk works, and they wait their turn behind other
+    /// jobs.
+    fn stopped_waiting(&self, seqs: &Range<u64>, idle: std::time::Duration) -> Waited {
+        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        let done_ms = self.last_job_done_ms.load(Ordering::Relaxed);
+        if done_ms == 0 || monotonic_ms().saturating_sub(done_ms) >= idle_ms {
+            return Waited::Stalled;
+        }
+        let stuck = std::time::Instant::now()
+            .checked_sub(idle / 2)
+            .is_some_and(|since| {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .deletions
+                    .running_since(seqs, since)
+            });
+        if stuck {
+            Waited::Stalled
+        } else {
+            Waited::Behind
         }
     }
 
@@ -1761,7 +1812,12 @@ fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     let record = inner.entries.remove(key)?;
     inner.total_bytes -= record.charge;
     inner.stamps.remove(key);
-    if inner.rewrites.jobs.get(key).is_some_and(|job| !job.running) {
+    if inner
+        .rewrites
+        .jobs
+        .get(key)
+        .is_some_and(|job| job.running.is_none())
+    {
         inner.rewrites.remove(key);
     }
     Some(record)
@@ -1977,6 +2033,11 @@ impl<S: std::ops::Deref<Target = DiskStore>> Drop for FileClaim<S> {
             inner.wake_deletion_waits();
         }
         if self.job.is_some() {
+            if self.done {
+                store
+                    .last_job_done_ms
+                    .store(monotonic_ms().max(1), Ordering::Relaxed);
+            }
             store.progress.send_modify(|n| *n += 1);
         }
     }
@@ -2166,6 +2227,30 @@ pub struct Backlog {
     pub owed: usize,
 }
 
+/// How a wait on a purge's disk deletions ended (see
+/// [`DiskStore::wait_deletions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waited {
+    /// Every one of them that has not failed is done.
+    Done,
+    /// The wait ran out while other background jobs kept
+    /// finishing: the disk works, and the deletions wait their
+    /// turn behind those jobs.
+    Behind,
+    /// The wait ran out on a stuck disk: no background job
+    /// finished for the idle time, or one of the deletions has
+    /// run for half that long.
+    Stalled,
+}
+
+/// Milliseconds since the first call, on a clock that a step of
+/// the wall clock does not move.
+fn monotonic_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// A disk wait that ran out (issue #572).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stall {
@@ -2176,8 +2261,9 @@ pub(crate) enum Stall {
     /// A write found no free disk slot in time and was
     /// skipped.
     Write,
-    /// A purge's deletions made no progress in time; they go
-    /// on in the background.
+    /// A purge's deletions made no progress in time on a disk
+    /// that finished no job meanwhile, or on which one of them
+    /// is stuck; they go on in the background.
     PurgeDelete,
 }
 
@@ -2188,7 +2274,7 @@ impl Stall {
             Stall::LookupRead => "a disk lookup's read did not answer in time",
             Stall::Write => "a disk write found no free disk slot in time and was skipped",
             Stall::PurgeDelete => {
-                "a purge's disk deletions stopped making progress; they go on in the background"
+                "a purge's disk deletions stopped making progress on a stuck disk; they go on in the background"
             }
         }
     }
@@ -4315,14 +4401,14 @@ mod tests {
             let store = store.clone();
             async move {
                 let started = std::time::Instant::now();
-                let done = store
+                let waited = store
                     .wait_deletions(
                         seqs,
                         std::time::Duration::from_secs(1),
                         std::time::Duration::from_secs(30),
                     )
                     .await;
-                (done, started.elapsed())
+                (waited == Waited::Done, started.elapsed())
             }
         };
         let (_, a) = store.purge(&PurgeTarget::Key("a".into()));
@@ -4496,7 +4582,7 @@ mod tests {
         };
         let (_, seqs) = store.purge(&PurgeTarget::Key("stuck".into()));
         let started = std::time::Instant::now();
-        let done = store
+        let waited = store
             .wait_deletions(
                 seqs,
                 std::time::Duration::from_millis(500),
@@ -4508,7 +4594,8 @@ mod tests {
         teacher.await.unwrap();
         drop(release);
         store.set_hold(None);
-        assert!(!done);
+        // Other jobs finish, but this one has hung.
+        assert_eq!(waited, Waited::Stalled);
         assert!(took < std::time::Duration::from_secs(3), "{took:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4561,7 +4648,7 @@ mod tests {
         .await
         .unwrap();
         for task in tasks {
-            assert!(task.await.unwrap());
+            assert_eq!(task.await.unwrap(), Waited::Done);
         }
         let took = started.elapsed();
         store.set_hold(None);
@@ -4617,7 +4704,7 @@ mod tests {
         .await
         .unwrap();
         let (_, seqs) = store.purge(&PurgeTarget::Key("b".into()));
-        let done = store
+        let waited = store
             .wait_deletions(
                 seqs,
                 std::time::Duration::from_secs(2),
@@ -4626,7 +4713,11 @@ mod tests {
             .await;
         store.set_hold(None);
         drop(release);
-        assert!(done, "the deletion waited for the held rewrite");
+        assert_eq!(
+            waited,
+            Waited::Done,
+            "the deletion waited for the held rewrite"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

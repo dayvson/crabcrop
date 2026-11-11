@@ -699,6 +699,70 @@ async fn a_slow_write_that_has_its_slot_is_not_a_stall() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_purge_queued_behind_other_deletions_on_a_working_disk_is_not_a_stall() {
+    // Issue #572 second review: deletions run in the order they
+    // were queued, so a purge sent while another purge's
+    // deletions run waits behind them. None of its own finished
+    // for a second, and it counted a stall on a disk that
+    // works. It still answers then, and its file goes when its
+    // turn comes; only a stuck disk counts.
+    let dir = crate::test_support::scratch_dir("srv-purge-behind");
+    let state = disk_only_state(&dir, 16 * 1024 * 1024);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    for i in 0..3_000 {
+        store.put(&format!("{i}/big.png"), &in_groups(&["big"]));
+    }
+    store.put(KEY, &in_groups(&["small"]));
+    // Each deletion takes 4 ms: 3,000 take about 1.5 s, eight
+    // at a time.
+    store.set_hold(Some(Arc::new(|kind, _| {
+        if kind == OpKind::Unlink {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        Ok(())
+    })));
+    store.purge(&crate::cache::PurgeTarget::Group("big".into()));
+    store.kick();
+    let errors = store.errors();
+    let answer = within(
+        STUCK_DISK_LIMIT,
+        "the purge",
+        purge_group_call(&base, "small"),
+    )
+    .await;
+    assert_eq!(answer, "purged 1\n");
+    assert_eq!(
+        store.errors(),
+        errors,
+        "a purge behind a working disk's deletions counted a stall"
+    );
+    within(STUCK_DISK_LIMIT, "the deletions", async {
+        while store.queued().1 > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        !dir.join(format!("{}.bin", crate::storage::key_stem(KEY)))
+            .exists()
+    );
+    // A stuck disk still counts.
+    let (gate, _held) = DiskOpGate::hold(&store, &[OpKind::Unlink]);
+    store.put("41x24/example.com/i.png", &in_groups(&["stuck"]));
+    let answer = within(
+        STUCK_DISK_LIMIT,
+        "the purge",
+        purge_group_call(&base, "stuck"),
+    )
+    .await;
+    assert_eq!(answer, "purged 1\n");
+    assert_eq!(store.errors(), errors + 1, "a stuck disk counted no stall");
+    drop(gate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn a_bucket_hit_keeps_its_group_when_a_purge_of_a_known_group_begins_during_the_read() {
     // The disk record holds `a` and the bucket copy holds no
