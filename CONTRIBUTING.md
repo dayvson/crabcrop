@@ -134,16 +134,67 @@ script on that branch too.
 
 ## Changelog
 
-Give user-facing changes an entry under `## [Unreleased]` in
-[CHANGELOG.md](CHANGELOG.md). The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Give user-facing changes a changelog entry. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Write the entry as a
+fragment: a file of its own in [`changelog.d/`](changelog.d/), which the
+release moves into [CHANGELOG.md](CHANGELOG.md). Every pull request adds a
+different file, so entries no longer conflict when another pull request
+merges first (issue #539).
+
+- **Name** the file `changelog.d/<issue>.<section>.md`, for example
+  `changelog.d/521.changed.md`. The section is one of `added`, `changed`,
+  `deprecated`, `removed`, `fixed` or `security`. A short slug after the
+  number, in lowercase words joined by hyphens, is always allowed:
+  `changelog.d/521-chained-resize.changed.md`. Use one when the plain name is
+  taken (a second entry for the same issue and section), and also when
+  another pull request for the same issue may add an entry to that section
+  while yours is open: two pull requests that both add `521.changed.md`
+  conflict, as two CHANGELOG.md lines would.
+- **Name an issue.** Every fragment names one. A change with no issue opens
+  one first, unless it cannot name a public issue, such as the fix for a
+  private security advisory: that change keeps its entry as a line under
+  `## [Unreleased]` in CHANGELOG.md (below), which needs no issue number.
+- **Write** one paragraph in the style of the entries in CHANGELOG.md, naming
+  the issue the same way, `(issue #521)` or `(issues #604 and #613)`. The
+  issue in the file name must be one of those the text names. Leave out the
+  leading `- `: the release adds it. You may wrap the paragraph; its lines are
+  joined with a space, but no line may open with `- `, `* `, `+ ` or `# `,
+  which would start a second entry or a heading: rewrap it instead. A blank
+  line, a second bullet or a heading is refused, since an entry is one
+  paragraph and a second entry is a second fragment.
+- **Preview** `## [Unreleased]` as the release will write it. Each section
+  lists the entries already written under `## [Unreleased]` first, as they
+  are, then the fragments in issue order:
+
+  ```bash
+  python3 scripts/assemble_changelog.py --check
+  ```
+
+A pull request that raises `RENDERING_VERSION` also says that the release
+starts a new cache epoch (RELEASING.md step 4), in an entry that opens with
+"This release starts a new cache epoch". As a fragment, name it
+`<issue>.changed.md`: the release puts it first under Changed, ahead of the
+other entries, since it describes the changes below it. A release has one
+such note, so a later pull request whose change belongs to the same epoch adds
+its change to that note, the fragment or the CHANGELOG.md line, instead of
+writing a second one.
+
+A line under `## [Unreleased]` in CHANGELOG.md still counts as the entry, so
+a pull request opened before fragments existed needs no change, and a change
+that cannot name a public issue uses one. Such lines conflict with each
+other, so otherwise prefer a fragment.
 
 The changelog workflow enforces this: a pull request that touches `src/`,
-`sdks/`, `frameworks/`, or `plugins/` fails until it adds a line under
-`## [Unreleased]`. When nothing user-facing changed (a refactor, a test, a
-dependency bump), a maintainer adds the `no-changelog` label instead, and the
-check passes. To run the same check locally, against the branch point with
-`main`:
+`sdks/`, `frameworks/`, or `plugins/` fails until it adds a fragment or
+changes one's entry, or adds a line under `## [Unreleased]`. When nothing
+user-facing changed (a refactor, a test, a dependency bump), a maintainer adds
+the `no-changelog` label instead, and the check passes. A fragment the pull
+request adds or edits must be well formed even then, a second cache-epoch note
+fails, and a file named like a fragment outside `changelog.d/` fails, so a
+fragment the release could not assemble never reaches `main`;
+`scripts/check_docs.py`, which `scripts/test_all.sh` runs, checks every
+fragment in the tree too. To run the same check locally, against the branch
+point with `main`:
 
 ```bash
 python3 scripts/check_docs.py --changelog-entry origin/main

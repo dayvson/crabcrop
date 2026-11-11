@@ -124,6 +124,9 @@ class RenderingVersionCheck(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("2 upgrade corpus entries were re-baselined since v1.0.0 (b, c)", out)
         self.assertIn("RENDERING_VERSION is still 1", out)
+        # The epoch note can be a CHANGELOG line or a fragment (issue #539).
+        self.assertIn("'This release starts a new cache epoch'", out)
+        self.assertIn("changelog.d/<issue>.changed.md", out)
 
     def test_each_golden_field_counts_as_a_rebaseline(self):
         self.release([entry("a")], 1)

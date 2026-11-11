@@ -6,7 +6,10 @@ temporary directory: every tracked file that mentions the current version
 (a bump cannot leave the old version in a file that never had it), the
 sites in scripts/version_sites.py, and the version tools themselves. It
 then bumps the copy with its own bump_version.py and reads it back with
-its own check_versions.py, as a release does (RELEASING.md, step 2).
+its own check_versions.py, as a release does (RELEASING.md, step 2). The
+copy also carries CHANGELOG.md and an empty changelog.d/, since the bump
+assembles the release's CHANGELOG section (RELEASING.md, step 1); the
+release notes, fragments included, stay out of the leftover scan.
 Run directly: python3 scripts/test_version_tools.py
 """
 import json
@@ -16,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
@@ -23,7 +27,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import version_sites  # noqa: E402
 
-TOOLS = ("bump_version.py", "check_versions.py", "version_sites.py")
+TOOLS = ("bump_version.py", "check_versions.py", "version_sites.py", "assemble_changelog.py")
 
 # Files that spell versions on purpose, as test inputs or examples: a
 # bump must not move them, and the release version appearing in one is
@@ -116,12 +120,15 @@ class VersionToolsTest(unittest.TestCase):
         files = set(carriers(self.version)) | {site.path for site in version_sites.SITES}
         files |= {f"scripts/{tool}" for tool in TOOLS}
         # Release notes name every version, and moving them is the
-        # changelog's job (RELEASING.md, step 1).
-        files.discard("CHANGELOG.md")
-        for rel in files:
+        # changelog's job (RELEASING.md, step 1): the copy carries the
+        # CHANGELOG for the bump to assemble, outside the leftover scan,
+        # and no fragments but the ones a case writes.
+        files = {rel for rel in files if rel != "CHANGELOG.md" and not rel.startswith("changelog.d/")}
+        for rel in files | {"CHANGELOG.md"}:
             target = self.tree / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / rel).read_bytes())
+        (self.tree / "changelog.d").mkdir()
         self.files = sorted(files)
 
     def tearDown(self):
@@ -155,7 +162,9 @@ class VersionToolsTest(unittest.TestCase):
         return hits
 
     def snapshot(self):
-        return {rel: (self.tree / rel).read_bytes() for rel in self.files}
+        tracked = [*self.files, "CHANGELOG.md"]
+        tracked += [f"changelog.d/{p.name}" for p in sorted((self.tree / "changelog.d").iterdir())]
+        return {rel: (self.tree / rel).read_bytes() for rel in tracked}
 
     def bump(self, version):
         code, out, err = self.run_tool("bump_version.py", version)
@@ -200,6 +209,63 @@ class VersionToolsTest(unittest.TestCase):
         new = bumped(self.version, "patch")
         self.bump(new)
         self.assertEqual(self.own_build_pins(), [new] * 3)
+
+    def test_a_bump_assembles_the_changelog(self):
+        new = bumped(self.version, "patch")
+        (self.tree / "changelog.d/README.md").write_text("# Changelog fragments\n", encoding="utf-8")
+        (self.tree / "changelog.d/1.fixed.md").write_text("A bump fragment (issue #1).\n", encoding="utf-8")
+        before = (self.tree / "CHANGELOG.md").read_text(encoding="utf-8")
+        code, out, err = self.run_tool("bump_version.py", new, "--date", "2026-02-03")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"all artifacts at {new}", out)
+        self.assertIn("removed changelog.d/1.fixed.md", out)
+        text = (self.tree / "CHANGELOG.md").read_text(encoding="utf-8")
+        head = f"## [Unreleased]\n\n## [{new}] - 2026-02-03\n\n"
+        self.assertIn(head, text)
+        released = text[text.index(head) : text.index(f"## [{self.version}]")]
+        self.assertIn("- A bump fragment (issue #1).\n", released)
+        # The hand-written entries move with it, as written.
+        unreleased = before[before.index("## [Unreleased]") : before.index(f"## [{self.version}]")]
+        for line in unreleased.splitlines():
+            if line.startswith("- "):
+                self.assertIn(line, released)
+        self.assertEqual(sorted(p.name for p in (self.tree / "changelog.d").iterdir()), ["README.md"])
+
+    def test_a_fragment_that_names_the_version_is_no_leftover(self):
+        # `git grep` lists a tracked changelog.d/ file that names the
+        # current version (a fragment saying "a regression from X.Y.Z",
+        # or the README) with the carriers. The copy leaves it out, as it
+        # does CHANGELOG.md, since the bump assembles and deletes a
+        # fragment, and the release notes are no leftover.
+        found = [*carriers(self.version), "changelog.d/README.md"]
+        self.tmp.cleanup()
+        with mock.patch.object(sys.modules[__name__], "carriers", lambda version: found):
+            self.setUp()
+        self.assertFalse([rel for rel in self.files if rel.startswith("changelog.d/")], self.files)
+        fragment = f"Fixed a regression from {self.version} (issue #720).\n"
+        (self.tree / "changelog.d/720.fixed.md").write_text(fragment, encoding="utf-8")
+        new = bumped(self.version, "patch")
+        self.bump(new)
+        self.assert_nothing_left()
+        self.assertIn(f"- {fragment}", (self.tree / "CHANGELOG.md").read_text(encoding="utf-8"))
+        self.assertEqual(list((self.tree / "changelog.d").iterdir()), [])
+
+    def test_a_dry_run_bump_writes_no_changelog(self):
+        (self.tree / "changelog.d/1.fixed.md").write_text("A bump fragment (issue #1).\n", encoding="utf-8")
+        snapshot = self.snapshot()
+        code, out, err = self.run_tool("bump_version.py", bumped(self.version, "patch"), "--dry-run")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("would update CHANGELOG.md", out)
+        self.assertIn("would remove changelog.d/1.fixed.md", out)
+        self.assertEqual(self.snapshot(), snapshot, "a dry run wrote files")
+
+    def test_a_malformed_fragment_stops_the_bump(self):
+        (self.tree / "changelog.d/1.feature.md").write_text("A thing (issue #1).\n", encoding="utf-8")
+        snapshot = self.snapshot()
+        code, out, err = self.run_tool("bump_version.py", bumped(self.version, "patch"))
+        self.assert_reported(code, out, err, ["changelog.d/1.feature.md: unknown section 'feature': use one of added, changed, deprecated, removed, fixed, security"])
+        self.assertIn("nothing was written", err)
+        self.assertEqual(self.snapshot(), snapshot, "a refused bump wrote files")
 
     def test_the_check_fails_on_a_stale_helm_image_tag(self):
         # A pin that was stale before a bump is not the old version
