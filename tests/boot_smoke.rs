@@ -385,7 +385,10 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
     let unsafe_on = ("CRABCROP_ALLOW_UNSAFE", "1");
     let only_presets = ("CRABCROP_ONLY_PRESETS", "1");
     let presets_file = ("CRABCROP_PRESETS_FILE", presets);
-    let cases: Vec<(Vec<(&str, &str)>, &str, Option<&str>)> = vec![
+    // The extra environment, the posture line, and the
+    // start of the one warning expected, if any.
+    type Case<'a> = (Vec<(&'a str, &'a str)>, &'a str, Option<&'a str>);
+    let cases: Vec<Case> = vec![
         (
             vec![],
             "request mode: signed; source allowlist: none; private-address check: on",
