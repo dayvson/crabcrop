@@ -37,27 +37,29 @@ async fn the_router_and_a_request_share_the_served_state() {
     let during = (Arc::strong_count(&cache), Arc::strong_count(&metrics));
     request.abort();
     assert_eq!(before, (2, 2), "the router copied the state");
-    assert_eq!(during, (2, 2), "the request copied the state");
+    // A whole-state copy no longer builds (`AppState` is not
+    // `Clone`), but a handler or a task that clones the cache
+    // or the metrics `Arc` itself also lands here: count it
+    // in if that is meant.
+    assert_eq!(
+        during,
+        (2, 2),
+        "the request copied the state, or holds a clone of its cache or metrics"
+    );
 }
 
-#[tokio::test]
-async fn the_router_hands_each_handler_the_state_it_was_given() {
-    // `app` keeps the `Arc` it is given, and the extractor
-    // every handler takes clones that `Arc`, so a handler
-    // reads the very state the server was built with.
-    use axum::extract::FromRequestParts as _;
+#[test]
+fn the_router_holds_the_arc_it_is_given_and_releases_it() {
+    // `app` keeps the `Arc` it is given, not a state of its
+    // own, so the routes hold clones of the caller's `Arc`,
+    // and dropping the router lets go of every one.
     let state = Arc::new(base_test_state(false, None));
     let router = app(state.clone());
     assert!(
         Arc::strong_count(&state) > 1,
         "the router holds no handle on the state"
     );
-    let (mut parts, ()) = axum::http::Request::new(()).into_parts();
-    let State(seen) = State::<Arc<AppState>>::from_request_parts(&mut parts, &state)
-        .await
-        .unwrap();
-    assert!(Arc::ptr_eq(&seen, &state));
-    drop((seen, router));
+    drop(router);
     assert_eq!(
         Arc::strong_count(&state),
         1,
@@ -103,7 +105,10 @@ fn full_state_literals(source: &str) -> usize {
         let before = rest[..at].trim_end();
         rest = &rest[at + opening.len()..];
         // A signature or a definition, not a literal.
-        if before.ends_with("->") || before.ends_with("struct") || before.ends_with("for") {
+        if ["->", "struct", "for", "impl"]
+            .iter()
+            .any(|word| before.ends_with(word))
+        {
             continue;
         }
         // Read the literal to its closing brace, looking for
@@ -127,20 +132,61 @@ fn full_state_literals(source: &str) -> usize {
     full
 }
 
+/// Every `.rs` file under `dir`, at any depth.
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read a source directory") {
+        let path = entry.expect("read a directory entry").path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
 #[test]
 fn only_test_state_spells_out_every_field() {
     // A test names the fields it sets and takes the rest from
     // `test_state()`, so a field added to `AppState` is added
-    // there (and in `main.rs`), not in every test.
-    let sources = [
-        include_str!("../tests.rs"),
-        include_str!("disk_hang.rs"),
-        include_str!("disk_stall.rs"),
-    ];
-    let full: usize = sources.iter().map(|s| full_state_literals(s)).sum();
-    assert_eq!(full, 1, "a test spells out every AppState field");
+    // there, in `main.rs`, and in the one integration test
+    // that cannot reach `test_state()`, not in every test.
+    // Every source file in `src/` and `tests/` is read, so a
+    // new file is counted too, except this one: its checks
+    // below spell literals in strings.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("tests"), &mut files);
+    let mut full: Vec<(String, usize)> = files
+        .iter()
+        .filter(|path| !path.ends_with("src/server/tests/shared_state.rs"))
+        .map(|path| {
+            let source = std::fs::read_to_string(path).expect("read a source file");
+            let name = path
+                .strip_prefix(root)
+                .expect("a file under the package")
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            (name, full_state_literals(&source))
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    full.sort();
+    let expected = [
+        "src/main.rs",
+        "src/server/tests.rs",
+        "tests/debug_redaction.rs",
+    ]
+    .map(|name| (name.to_string(), 1));
+    assert_eq!(
+        full, expected,
+        "an AppState literal spells out every field outside main.rs, test_state() \
+         and tests/debug_redaction.rs"
+    );
     // The counter finds a full literal, also one with a `..`
-    // nested in a field, and passes a spread.
+    // nested in a field, and passes a spread and an `impl`.
     assert_eq!(full_state_literals("let s = AppState { a: 1, b: 2 };"), 1);
     assert_eq!(
         full_state_literals("AppState { a: S { x, ..S::default() }, b: f(0..2) }"),
@@ -150,4 +196,5 @@ fn only_test_state_spells_out_every_field() {
         full_state_literals("let s = AppState { a: 1, ..test_state() };"),
         0
     );
+    assert_eq!(full_state_literals("impl AppState { fn f() {} }"), 0);
 }
