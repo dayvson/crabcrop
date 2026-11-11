@@ -410,10 +410,32 @@ impl std::fmt::Debug for AppState {
         );
         // The provider handles print where they printed
         // before they moved into `Providers` (issue #475),
-        // so the output is what it was.
+        // so the output is what it was. The pattern names
+        // every handle, so a handle added to `Providers`
+        // does not build until it is printed below too.
+        let Providers {
+            removebg,
+            upscale,
+            inpaint,
+            segment,
+            face,
+            tagger,
+            moderation,
+            embeddings,
+            aesthetic,
+            ocr,
+            detect,
+            detectors,
+            focal,
+            font,
+            video_encoder,
+            frame_extractor,
+            pdf_renderer,
+            provenance_signer,
+        } = &*self.providers;
         macro_rules! providers {
             ($($name:ident),* $(,)?) => {
-                $(out.field(stringify!($name), &self.providers.$name);)*
+                $(out.field(stringify!($name), $name);)*
             };
         }
         fields!(cache);
