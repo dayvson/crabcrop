@@ -10,7 +10,7 @@ python3 -m http.server --directory playground 8910
 ## What it does
 
 - **Build**: enter the endpoint, secret, source, and operations (quick-add chips included), optionally a preset name and an expiry. The URL is assembled and signed locally, with a live preview and the byte savings versus the original. Sizes are read by fetching both images; if the endpoint or source does not send CORS headers, the preview still works and the page says the sizes are unavailable instead of guessing.
-- **Explain**: paste any crabcrop URL and get its anatomy back: the signature kind, each operation segment with a plain-language explanation, `exp:` rendered as a UTC instant with an expired/valid verdict, and the source. Malformed segments and unknown filters are highlighted as errors, mirroring the server's own parsing. Paste the secret in the builder and the debugger also verifies the signature locally.
+- **Explain**: paste any crabcrop URL and get its anatomy back: the signature kind, each operation segment with a plain-language explanation, `exp:` rendered as a UTC instant with an expired/valid verdict, and the source. Malformed segments and unknown filters are highlighted as errors, mirroring the server's own parsing. Paste the secret in the builder and the debugger also verifies the signature locally. Text longer than 64 KiB is not explained or verified.
 
 ## The secret stays in the browser
 

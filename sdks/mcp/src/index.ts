@@ -200,7 +200,8 @@ const TOOLS = [
       "Parse a crabcrop URL back into its pieces: the signature kind, each " +
       "operation segment with a plain-language explanation, exp: rendered as " +
       "a UTC instant with an expired verdict, and the source. Malformed " +
-      "segments and unknown filters are reported as errors.",
+      "segments and unknown filters are reported as errors. A URL longer " +
+      "than 64 KiB is refused.",
     inputSchema: {
       type: "object",
       properties: {

@@ -319,6 +319,34 @@ async function startMcp(env) {
   return client;
 }
 
+test("a long explain_url does not hold up the request after it (issue #594)", { timeout: 60000 }, async () => {
+  // Requests are answered one at a time on one event loop, so a
+  // slow explanation delays every request behind it. A float
+  // argument now costs linear time (this run took about 10 s
+  // with the old pattern), and input over 64 KiB is refused
+  // before the grammar reads it.
+  const client = await startMcp({ ...process.env, CRABCROP_BASE: "http://127.0.0.1:9" });
+  try {
+    const url = (digits) =>
+      `https://x/${"a".repeat(64)}/filters:blur(${"1".repeat(digits)}z)/https://e.com/a.jpg`;
+    const started = performance.now();
+    const explained = client.request("tools/call", { name: "explain_url", arguments: { url: url(65_000) } });
+    const list = await client.request("tools/list", {});
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 2000, `tools/list answered after ${elapsed.toFixed(0)} ms`);
+    assert.equal(list.tools.length, 4);
+    const result = await explained;
+    assert.equal(result.isError, true);
+    assert.match(result.content.map((c) => c.text).join("\n"), /the server rejects this filter: blur\(1+z\)/);
+
+    const over = await client.request("tools/call", { name: "explain_url", arguments: { url: url(100_000) } });
+    assert.equal(over.isError, true);
+    assert.match(over.content.map((c) => c.text).join("\n"), /^ERROR: .*longer than 64 KiB/m);
+  } finally {
+    client.child.kill();
+  }
+});
+
 test("purge_result POSTs only to /purge/ under CRABCROP_BASE, whatever the base argument (issue #459)", { timeout: 60000 }, async () => {
   // Before the fix only the per-call base's origin was
   // checked and the request URL was concatenated, so a base

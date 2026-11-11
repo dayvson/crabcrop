@@ -40,7 +40,8 @@ const srcset = buildSrcSet(
 const signature = sign("your-secret", "300x200/https://example.com/photo.jpg");
 
 // Verify a signed URL's signature locally, in constant time
-// (unsigned or malformed URLs return null).
+// (unsigned or malformed URLs return null, and so do URLs longer
+// than 64 KiB).
 const ok = verifyUrlSignature("your-secret", url);
 
 // Purge signatures for the server's /purge and /purge-group endpoints
@@ -71,6 +72,8 @@ const remainder = unseal("your-secret", seal("your-secret", "300x200/https://exa
 ```
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.
+
+`explainUrl(url)` parses a URL back into its signature, its explained segments and its source, and lists every error. It reads at most 64 KiB (65,536 bytes of UTF-8), which bounds the time one call takes. A longer input gets a single error and no signature, so `verifyUrlSignature` returns null for it.
 
 The builders throw on operations or a source that can never verify: `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded). Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
 

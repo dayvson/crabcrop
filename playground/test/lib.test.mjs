@@ -319,3 +319,27 @@ test("the playground never signs a key label, and a subkey never verifies", asyn
     assert.equal(await verifyUrlSignature(secret, `${base}/${subkey}/${label}`), false);
   }
 });
+
+// Issue #594: the page explains on every edit, so a long digit
+// run in a float argument must cost linear time, and input over
+// 64 KiB is refused before the grammar reads it.
+test("a long float argument explains in linear time, and input over 64 KiB is refused", async () => {
+  const url = (digits) => `https://x/${SIG}/filters:blur(${"1".repeat(digits)}z)/https://e.com/a.jpg`;
+  const cases = [
+    // Under the cap: the grammar reads it all (about 10 s
+    // with the old float pattern).
+    [65_000, /^the server rejects this filter: blur\(1+z\)$/, false],
+    // Over the cap: refused at once, and nothing to verify.
+    [100_000, /longer than 64 KiB/, null],
+  ];
+  for (const [digits, error, verdict] of cases) {
+    const started = performance.now();
+    const out = explainUrl(url(digits));
+    const verified = await verifyUrlSignature("secret", url(digits));
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 2000, `${digits} digits took ${elapsed.toFixed(0)} ms`);
+    assert.equal(out.errors.length, 1, `${digits} digits`);
+    assert.match(out.errors[0], error);
+    assert.equal(verified, verdict, `${digits} digits`);
+  }
+});
