@@ -1350,16 +1350,19 @@ impl DiskStore {
     }
 
     /// Start background jobs for queued work (issue #572), up
-    /// to [`DRAIN_JOBS`] at once, and wake one that waits. Jobs
-    /// waiting out a backoff start no task: the last one left
-    /// waits for them. Without a runtime the work stays queued.
+    /// to [`DRAIN_JOBS`] at once, and wake one that waits: a
+    /// task for each job that can run and has no task free for
+    /// it. Jobs waiting out a backoff start no task: the last
+    /// one left waits for them. Without a runtime the work
+    /// stays queued.
     pub fn kick(self: &Arc<Self>) {
         let (spawn, ready) = {
             let mut inner = self.inner.lock().unwrap();
             let ready = inner.rewrites.ready() + inner.deletions.ready();
+            let running = inner.rewrites.running + inner.deletions.running;
             let later = inner.rewrites.next_due().is_some() || inner.deletions.next_due().is_some();
             let spawn = inner.workers < DRAIN_JOBS
-                && (ready > inner.workers || (inner.workers == 0 && later));
+                && (ready + running > inner.workers || (inner.workers == 0 && later));
             if spawn {
                 inner.workers += 1;
             }
@@ -4552,6 +4555,38 @@ mod tests {
             waited < alone * 5 + std::time::Duration::from_secs(1),
             "{alone:?} with no waits, {waited:?} with 1,000"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_queued_while_another_runs_starts_at_once() {
+        // A job that can run gets a drain task of its own while
+        // another job holds one, up to the limit.
+        let dir = temp_dir("parallel-jobs");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("a", &image(b"1"));
+        store.put("b", &image(b"2"));
+        let (hook, held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        store.learn_groups("a", &groups(&["g"]), Bucket::Unknown);
+        store.kick();
+        tokio::task::spawn_blocking(move || {
+            held.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let (_, seqs) = store.purge(&PurgeTarget::Key("b".into()));
+        let done = store
+            .wait_deletions(
+                seqs,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        store.set_hold(None);
+        drop(release);
+        assert!(done, "the deletion waited for the held rewrite");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
