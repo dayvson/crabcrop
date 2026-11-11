@@ -225,6 +225,8 @@ pub struct Config {
     /// The configured listen port: `CRABCROP_PORT`, else
     /// `PORT`. 0 binds a free port (issue #536).
     pub port: u16,
+    /// The address the listener binds (issue #592).
+    pub bind: std::net::IpAddr,
     pub ssim_target: f64,
     /// The `/metrics` bearer token (issue #270): none closes
     /// the endpoint.
@@ -239,6 +241,8 @@ pub struct Config {
     pub fetch_timeout_secs: u64,
     /// How long a stopping server drains (issue #463).
     pub shutdown_grace_secs: u64,
+    /// The bounds on each connection (issue #607).
+    pub connections: crate::server::ConnectionLimits,
     /// The source buffer budget, in bytes (issue #403).
     pub source_buffer_bytes: u64,
     pub avif_speed: u8,
@@ -327,6 +331,7 @@ impl Config {
             None => ("PORT", get("PORT")),
         };
         let port: u16 = parse_env_value(port_name, port_value, 3000)?;
+        let bind = bind_address(&get)?;
         let ssim_target: f64 = parse_env_value(
             "CRABCROP_SSIM_TARGET",
             get("CRABCROP_SSIM_TARGET"),
@@ -387,6 +392,7 @@ impl Config {
         let fetch_cap_mb = source_max_mb(&get)?;
         let fetch_timeout_secs = source_timeout_secs(&get)?;
         let shutdown_grace_secs = shutdown_grace_secs(&get)?;
+        let connections = connection_limits(&get)?;
         let source_buffer_bytes = source_buffer_budget(&get, process_permits + slow_lane_permits)?;
         let avif_speed: u8 = parse_env_value(
             "CRABCROP_AVIF_SPEED",
@@ -540,6 +546,7 @@ impl Config {
             keyring,
             allow_unsafe,
             port,
+            bind,
             ssim_target,
             metrics_token,
             process_timeout_secs,
@@ -548,6 +555,7 @@ impl Config {
             fetch_cap_mb,
             fetch_timeout_secs,
             shutdown_grace_secs,
+            connections,
             source_buffer_bytes,
             avif_speed,
             jxl_speed,
@@ -601,6 +609,20 @@ impl Config {
         };
         format!(
             "request mode: {mode}; source allowlist: {allowlist}; private-address check: {check}"
+        )
+    }
+
+    /// The boot line that names the listen address and the
+    /// connection bounds (issues #592, #607). The cap's
+    /// default comes from the open-file limit, so the line
+    /// says what it came to.
+    pub fn connections_line(&self) -> String {
+        format!(
+            "connections: bind {}, at most {} open, header timeout {}s, idle timeout {}s",
+            self.bind,
+            self.connections.max_connections,
+            self.connections.header_timeout.as_secs(),
+            self.connections.idle_timeout.as_secs()
         )
     }
 
@@ -1325,6 +1347,108 @@ pub fn shutdown_grace_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64,
         ));
     }
     Ok(secs)
+}
+
+/// The address the server listens on (issue #592):
+/// `CRABCROP_BIND`, an IP address. Unset, it is `0.0.0.0`,
+/// every IPv4 interface, as before the setting existed. A
+/// value that is not an address stops the boot, an empty
+/// one included: read as unset, a template's blank value
+/// would open the port on every interface.
+pub fn bind_address(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<std::net::IpAddr, ConfigError> {
+    match get("CRABCROP_BIND") {
+        None => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        Some(value) => value.parse().map_err(|_| {
+            ConfigError::invalid(
+                "CRABCROP_BIND",
+                &value,
+                format!(
+                    "CRABCROP_BIND must be an IP address, such as 127.0.0.1 or ::1, got {value:?}"
+                ),
+            )
+        }),
+    }
+}
+
+/// The most connections `CRABCROP_MAX_CONNECTIONS` may
+/// allow.
+const MAX_CONNECTIONS_LIMIT: usize = 1_000_000;
+
+/// The bounds the accept loop keeps on each connection
+/// (issue #607): `CRABCROP_HEADER_TIMEOUT_SECS`, 1 to 600
+/// like the other wall-clock limits;
+/// `CRABCROP_IDLE_TIMEOUT_SECS`, 1 to 86400, since an edge
+/// may pool connections for longer than 10 minutes; and
+/// `CRABCROP_MAX_CONNECTIONS`, 1 to a million, by default
+/// three quarters of the open-file limit.
+pub fn connection_limits(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<crate::server::ConnectionLimits, ConfigError> {
+    let header: u64 = parse_env_value(
+        "CRABCROP_HEADER_TIMEOUT_SECS",
+        get("CRABCROP_HEADER_TIMEOUT_SECS"),
+        crate::server::DEFAULT_HEADER_TIMEOUT_SECS,
+    )?;
+    if !(1..=600).contains(&header) {
+        return Err(ConfigError::invalid(
+            "CRABCROP_HEADER_TIMEOUT_SECS",
+            &get("CRABCROP_HEADER_TIMEOUT_SECS").unwrap_or_default(),
+            format!("CRABCROP_HEADER_TIMEOUT_SECS must be between 1 and 600, got {header}"),
+        ));
+    }
+    let idle: u64 = parse_env_value(
+        "CRABCROP_IDLE_TIMEOUT_SECS",
+        get("CRABCROP_IDLE_TIMEOUT_SECS"),
+        crate::server::DEFAULT_IDLE_TIMEOUT_SECS,
+    )?;
+    if !(1..=86_400).contains(&idle) {
+        return Err(ConfigError::invalid(
+            "CRABCROP_IDLE_TIMEOUT_SECS",
+            &get("CRABCROP_IDLE_TIMEOUT_SECS").unwrap_or_default(),
+            format!("CRABCROP_IDLE_TIMEOUT_SECS must be between 1 and 86400, got {idle}"),
+        ));
+    }
+    let max_connections: usize = parse_env_value(
+        "CRABCROP_MAX_CONNECTIONS",
+        get("CRABCROP_MAX_CONNECTIONS"),
+        default_max_connections(),
+    )?;
+    if !(1..=MAX_CONNECTIONS_LIMIT).contains(&max_connections) {
+        return Err(ConfigError::invalid(
+            "CRABCROP_MAX_CONNECTIONS",
+            &get("CRABCROP_MAX_CONNECTIONS").unwrap_or_default(),
+            format!(
+                "CRABCROP_MAX_CONNECTIONS must be between 1 and {MAX_CONNECTIONS_LIMIT}, got {max_connections}"
+            ),
+        ));
+    }
+    Ok(crate::server::ConnectionLimits {
+        header_timeout: std::time::Duration::from_secs(header),
+        idle_timeout: std::time::Duration::from_secs(idle),
+        max_connections,
+    })
+}
+
+/// The connection cap when `CRABCROP_MAX_CONNECTIONS` is
+/// unset (issue #607): three quarters of the process's
+/// open-file limit (`ulimit -n`) at boot. Connections then
+/// never take the descriptors the server needs for source
+/// fetches, its stores and its workers, and a limit raised
+/// for a busy host raises the cap with it. An unlimited
+/// limit gives the most the setting allows.
+pub fn default_max_connections() -> usize {
+    #[cfg(unix)]
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(u64::MAX);
+    // No open-file limit to read here: a fixed one.
+    #[cfg(not(unix))]
+    let limit: u64 = 1024;
+    usize::try_from(limit / 4 * 3)
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_CONNECTIONS_LIMIT)
 }
 
 /// The proxy variables the HTTP client honours, as pairs

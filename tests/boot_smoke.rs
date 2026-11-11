@@ -1198,3 +1198,325 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
         "{line}"
     );
 }
+
+/// A connection to the server on `port`.
+fn connect(port: u16) -> TcpStream {
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+}
+
+/// Read one response from `stream`, its head and a body of
+/// `Content-Length` bytes, and leave the connection open:
+/// the status line.
+fn read_response(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("closed before a response: {buf:?}"),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => panic!("no response: {e}"),
+        }
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let length: usize = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap())
+        })
+        .expect("a content-length");
+    while buf.len() < head_end + length {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("closed inside a body"),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => panic!("no body: {e}"),
+        }
+    }
+    head.lines().next().unwrap_or("").to_string()
+}
+
+/// One keep-alive `GET /health` on `stream`: the status
+/// line. The connection stays open.
+fn health_on(stream: &mut TcpStream) -> String {
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    read_response(stream)
+}
+
+/// Read from `stream` until the server closes it: how long
+/// that took, or `None` when it is still open after
+/// `within`. Bytes the server sends first are read past.
+fn wait_for_close(stream: &mut TcpStream, within: Duration) -> Option<Duration> {
+    let began = Instant::now();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let left = within.checked_sub(began.elapsed())?;
+        stream
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .unwrap();
+        match stream.read(&mut chunk) {
+            Ok(0) => return Some(began.elapsed()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return None;
+            }
+            // A reset is a close too.
+            Err(_) => return Some(began.elapsed()),
+        }
+    }
+}
+
+/// A server with a minimal environment plus `env`, once it
+/// listens: the server, its port, and its boot lines.
+fn serving(env: &[(&str, &str)]) -> (ServerGuard, u16, Vec<String>) {
+    let (server, port, _, printed) = common::serve_printing(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .envs(env.iter().copied()),
+    );
+    (server, port, printed)
+}
+
+#[test]
+fn a_connection_that_never_finishes_its_request_head_is_closed_at_the_header_timeout() {
+    // Issue #607: the server never set a timer on its
+    // connections, so one that sent nothing, stopped half
+    // way through a request head, or sent the head a byte at
+    // a time was held open for good, and a client could hold
+    // the process's whole file table that way. The header
+    // timeout counts from the connection's start, so bytes
+    // that keep arriving do not extend it.
+    let (_server, port, _) = serving(&[("CRABCROP_HEADER_TIMEOUT_SECS", "1")]);
+    let mut silent = connect(port);
+    let mut partial = connect(port);
+    partial
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .unwrap();
+    let mut drip = connect(port);
+    let mut writer = drip.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for byte in b"GET /health HTTP/1.1\r\nX-Slow: one byte at a time, five a second\r\n" {
+            if writer.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    for (name, stream) in [
+        ("silent", &mut silent),
+        ("partial head", &mut partial),
+        ("byte-a-second head", &mut drip),
+    ] {
+        assert!(
+            wait_for_close(stream, Duration::from_secs(10)).is_some(),
+            "the {name} connection is still open 10 s after it started, past a 1 s header timeout"
+        );
+    }
+    // The server still serves.
+    assert!(status_line(port, "/health", "").contains("200"));
+}
+
+#[test]
+fn an_idle_keep_alive_connection_is_closed_at_the_idle_timeout_and_not_before() {
+    // Issue #607: a keep-alive connection that went quiet
+    // after its response was held open for good. It now
+    // closes at the idle timeout, which is apart from the
+    // header timeout: an edge that keeps the connection in
+    // its pool past the header timeout still finds it open.
+    let (_server, port, _) = serving(&[
+        ("CRABCROP_HEADER_TIMEOUT_SECS", "1"),
+        ("CRABCROP_IDLE_TIMEOUT_SECS", "4"),
+    ]);
+    let mut stream = connect(port);
+    assert!(health_on(&mut stream).contains("200"));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        health_on(&mut stream).contains("200"),
+        "a connection idle past the header timeout but inside the idle timeout serves"
+    );
+    let closed = wait_for_close(&mut stream, Duration::from_secs(15));
+    let closed = closed.expect(
+        "the connection is still open 15 s after its last response, past a 4 s idle timeout",
+    );
+    assert!(
+        closed >= Duration::from_secs(3),
+        "closed {closed:?} after its last response, before the 4 s idle timeout"
+    );
+}
+
+#[test]
+fn at_the_connection_cap_a_new_connection_is_served_once_a_slot_frees() {
+    // Issue #607: nothing capped the open connections. At
+    // CRABCROP_MAX_CONNECTIONS the server stops accepting:
+    // a new connection waits in the kernel's queue, and is
+    // served as soon as an open one closes.
+    let (_server, port, _) = serving(&[("CRABCROP_MAX_CONNECTIONS", "2")]);
+    let mut first = connect(port);
+    assert!(health_on(&mut first).contains("200"));
+    let mut second = connect(port);
+    assert!(health_on(&mut second).contains("200"));
+    let mut third = connect(port);
+    third
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    third
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    match third.read(&mut byte) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        other => panic!("a third connection was answered with two open and a cap of 2: {other:?}"),
+    }
+    drop(first);
+    third
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(read_response(&mut third).contains("200"));
+    // The second is still served on its slot.
+    assert!(health_on(&mut second).contains("200"));
+}
+
+#[test]
+#[cfg(unix)]
+fn silent_connections_past_the_open_file_limit_do_not_shut_out_health() {
+    // Issue #607, as reproduced there: under a low open-file
+    // limit, connections that send nothing took every file
+    // descriptor and a fresh /health timed out for as long
+    // as they stayed. The default cap is three quarters of
+    // the limit, so the server keeps descriptors for its own
+    // work, and the header timeout frees the slots.
+    let (_server, port, _, printed) = common::serve_printing(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -n 64 && exec \"$0\"")
+            .arg(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("CRABCROP_HEADER_TIMEOUT_SECS", "2"),
+    );
+    let silent: Vec<TcpStream> = (0..80).map(|_| connect(port)).collect();
+    let mut fresh = connect(port);
+    fresh
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    fresh
+        .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = fresh.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.0 200"),
+        "/health with 80 silent connections open and a limit of 64 files: {response:?}"
+    );
+    drop(silent);
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("connections: ") && l.contains("at most 48 open")),
+        "{printed:#?}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn crabcrop_bind_listens_on_the_named_address_only() {
+    // Issue #592: the server always listened on every
+    // interface, so on a VM the port the proxy fronts was
+    // open to anyone who could reach the host. 127.0.0.2 is
+    // a loopback address on Linux that a listener on every
+    // interface answers on, and one on 127.0.0.1 does not.
+    let (_server, port, _) = serving(&[]);
+    assert!(
+        TcpStream::connect(("127.0.0.2", port)).is_ok(),
+        "by default the server listens on every IPv4 interface"
+    );
+    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+    assert!(status_line(port, "/health", "").contains("200"));
+    let refused = TcpStream::connect(("127.0.0.2", port)).map(|_| ());
+    assert_eq!(
+        refused.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::ConnectionRefused),
+        "CRABCROP_BIND=127.0.0.1 answers on 127.0.0.2"
+    );
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("connections: bind 127.0.0.1, ")),
+        "{printed:#?}"
+    );
+}
+
+#[test]
+fn bad_connection_settings_stop_the_boot_naming_the_variable() {
+    // Issue #607 and #592: each new setting is checked at
+    // boot like the others. An empty CRABCROP_BIND, as a
+    // template with an unset value writes it, is refused
+    // rather than read as every interface.
+    let cases = [
+        (
+            "CRABCROP_BIND",
+            "localhost",
+            "crabcrop: CRABCROP_BIND must be an IP address",
+        ),
+        (
+            "CRABCROP_BIND",
+            "",
+            "crabcrop: CRABCROP_BIND must be an IP address",
+        ),
+        (
+            "CRABCROP_BIND",
+            "127.0.0.1:3000",
+            "crabcrop: CRABCROP_BIND must be an IP address",
+        ),
+        (
+            "CRABCROP_HEADER_TIMEOUT_SECS",
+            "0",
+            "crabcrop: CRABCROP_HEADER_TIMEOUT_SECS must be between 1 and 600",
+        ),
+        (
+            "CRABCROP_HEADER_TIMEOUT_SECS",
+            "601",
+            "crabcrop: CRABCROP_HEADER_TIMEOUT_SECS must be between 1 and 600",
+        ),
+        (
+            "CRABCROP_IDLE_TIMEOUT_SECS",
+            "0",
+            "crabcrop: CRABCROP_IDLE_TIMEOUT_SECS must be between 1 and 86400",
+        ),
+        (
+            "CRABCROP_MAX_CONNECTIONS",
+            "0",
+            "crabcrop: CRABCROP_MAX_CONNECTIONS must be between 1 and 1000000",
+        ),
+        (
+            "CRABCROP_MAX_CONNECTIONS",
+            "-1",
+            "crabcrop: invalid CRABCROP_MAX_CONNECTIONS",
+        ),
+    ];
+    for (var, value, error) in cases {
+        let stderr = refused_boot(&[(var, value)]);
+        assert!(stderr.starts_with(error), "{var}={value:?}: {stderr}");
+    }
+}
