@@ -586,11 +586,16 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// generic `Lavf` and `Lavc` tags instead of a random
 /// track UID and the encoder build's own tags, so WebM
 /// bytes change once and then repeat render for render on
-/// one encoder build #567, PR #585; and MP4 output written
+/// one encoder build #567, PR #585; MP4 output written
 /// with bitexact muxing, so no tag names the FFmpeg build's
 /// version, and with x264 held to 6 threads, so MP4 bytes
 /// change once and then repeat on every replica of one
-/// encoder build, whatever its core count #612, #626).
+/// encoder build, whatever its core count #612, #626; and
+/// under `CRABCROP_METADATA=preserve`, JPEG and PNG output
+/// whose source EXIF or Photoshop segment holds a
+/// thumbnail, a size tag or another part preserve now
+/// removes, now copied without those parts and with the
+/// output's size #611).
 const RENDERING_VERSION: u32 = 6;
 
 /// Fingerprint the configuration that shapes rendered

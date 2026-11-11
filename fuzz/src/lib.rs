@@ -328,9 +328,10 @@ pub fn check_decode(data: &[u8]) {
 /// The source-metadata invariants (issue #387):
 /// extracting and re-injecting the metadata of
 /// attacker-controlled bytes is total. Extraction reads
-/// the JPEG and PNG segment structures; the TIFF patch
-/// walks the extracted EXIF stream; the injectors walk
-/// the container again on the way out. When the bytes
+/// the JPEG and PNG segment structures and removes the
+/// EXIF and Photoshop thumbnails (issue #611); the TIFF
+/// patches walk the extracted EXIF stream; the injectors
+/// walk the container again on the way out. When the bytes
 /// carry a profile and decode as a small image, the
 /// color conversion runs too, since it parses the
 /// profile with a real color engine.
@@ -339,6 +340,8 @@ pub fn check_meta(data: &[u8]) {
     if let Some(exif) = &meta.exif_tiff {
         let mut tiff = exif.clone();
         color::patch_tiff_orientation(&mut tiff);
+        color::patch_tiff_dimensions(&mut tiff, 1, u32::MAX);
+        color::strip_tiff_thumbnails(&mut tiff);
     }
     let _ = color::inject_jpeg(data, meta.icc.as_deref(), &meta, true);
     let _ = color::inject_png(data, meta.icc.as_deref(), &meta, true);

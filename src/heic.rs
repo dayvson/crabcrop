@@ -942,9 +942,10 @@ pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), En
         photoshop: None,
     };
     // The pixels are upright now; a preserved EXIF must say so,
-    // exactly as the JPEG/PNG extraction path records it.
+    // and must not carry a thumbnail of the source, exactly as
+    // the JPEG/PNG extraction path records it.
     if let Some(tiff) = &mut meta.exif_tiff {
-        crate::color::patch_tiff_orientation(tiff);
+        crate::color::sanitize_preserved_exif(tiff);
     }
     Ok((image, meta))
 }
@@ -1151,6 +1152,59 @@ mod tests {
         // The preserved EXIF reports the orientation the pixels
         // now have (1), not the one they were stored with.
         let tiff = meta.exif_tiff.expect("EXIF survives");
+        assert_eq!(crate::engine::exif_orientation(&tiff), Some(1));
+    }
+
+    /// The orientation fixture with its EXIF item replaced by
+    /// `tiff`. The new item goes at the end of `mdat`, the last
+    /// box, and the item's iloc extent (8-byte offset and
+    /// length) points at it; the old item's bytes stay where
+    /// they were, unreferenced.
+    fn orient6_with_exif(tiff: &[u8]) -> Vec<u8> {
+        let mut bytes = ORIENT6.to_vec();
+        let old_extent = [676u64.to_be_bytes(), 30u64.to_be_bytes()].concat();
+        let at = bytes
+            .windows(16)
+            .position(|w| w == old_extent)
+            .expect("the fixture's EXIF extent");
+        let item = [&[0u8; 4][..], tiff].concat();
+        let new_extent = [
+            (bytes.len() as u64).to_be_bytes(),
+            (item.len() as u64).to_be_bytes(),
+        ]
+        .concat();
+        bytes[at..at + 16].copy_from_slice(&new_extent);
+        let mdat = bytes
+            .windows(4)
+            .position(|w| w == b"mdat")
+            .expect("the fixture's mdat")
+            - 4;
+        let size = u32::from_be_bytes(bytes[mdat..mdat + 4].try_into().unwrap());
+        assert_eq!(mdat + size as usize, bytes.len(), "mdat is the last box");
+        bytes[mdat..mdat + 4].copy_from_slice(&(size + item.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&item);
+        bytes
+    }
+
+    #[test]
+    fn exif_thumbnails_are_cut_from_heic_metadata() {
+        // Issue #611: the HEIC path hands the decoder's EXIF
+        // to a preserving output as JPEG and PNG sources do,
+        // so it drops the IFD1 thumbnail the same way.
+        use crate::color::fixture;
+        let thumbnail = fixture::thumbnail_jpeg();
+        let cam = fixture::camera(false, 6, (64, 48), &thumbnail);
+        let (img, meta) = decode_heic(&orient6_with_exif(&cam.tiff)).unwrap();
+        // The new EXIF is the one read: Orientation 6 still
+        // turns the stored 64x48 upright.
+        assert_eq!((img.width(), img.height()), (48, 64));
+        let tiff = meta.exif_tiff.expect("EXIF survives");
+        assert!(
+            !fixture::contains(&tiff, &thumbnail),
+            "the thumbnail is still there"
+        );
+        assert_eq!(fixture::next_ifd(&tiff, 8), Some(0));
+        assert_eq!(tiff.len(), cam.ifd1);
         assert_eq!(crate::engine::exif_orientation(&tiff), Some(1));
     }
 

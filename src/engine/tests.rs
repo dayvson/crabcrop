@@ -935,6 +935,101 @@ fn metadata_is_stripped_by_default_and_preserved_on_policy() {
     );
 }
 
+/// An 80x60 JPEG as a camera and Photoshop leave one: EXIF
+/// with the source's size and an IFD1 thumbnail of the
+/// whole frame, and a Photoshop segment with an IPTC record
+/// and the same thumbnail as resource 0x0409.
+fn camera_jpeg(thumbnail: &[u8]) -> Vec<u8> {
+    use crate::color::fixture;
+    let img = image::RgbImage::from_fn(80, 60, |x, y| {
+        if x < 40 && (15..45).contains(&y) {
+            image::Rgb([220, 10, 10])
+        } else {
+            image::Rgb([128, 128, 128])
+        }
+    });
+    let mut base = Vec::new();
+    DynamicImage::ImageRgb8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut base),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    let photoshop = [
+        b"Photoshop 3.0\0".as_slice(),
+        &fixture::irb(0x0404, b"\x1c\x02\x00\x00\x02\x00\x04"),
+        &fixture::irb(0x0409, &fixture::irb_thumbnail(thumbnail)),
+    ]
+    .concat();
+    let meta = crate::color::SourceMeta {
+        exif_tiff: Some(fixture::camera(true, 1, (80, 60), thumbnail).tiff),
+        photoshop: Some(photoshop),
+        ..Default::default()
+    };
+    crate::color::inject_jpeg(&base, None, &meta, true)
+}
+
+#[test]
+fn preserved_metadata_carries_no_thumbnail_and_the_output_size() {
+    // Issue #611: under preserve, a crop or a redaction
+    // carried the source's EXIF and Photoshop thumbnails,
+    // small copies of the whole uncut frame, and EXIF
+    // sizes that named the source's. The outputs now carry
+    // neither thumbnail, and their EXIF sizes are their own.
+    use crate::color::fixture;
+    let thumbnail = fixture::thumbnail_jpeg();
+    let src = camera_jpeg(&thumbnail);
+    assert!(fixture::contains(&src, &thumbnail));
+    let crop = || rect_op(40, 15, 80, 45);
+    let pixelate = || {
+        Operation::Filters(vec![Filter::PixelateRegion {
+            x: 0,
+            y: 15,
+            w: 40,
+            h: 30,
+        }])
+    };
+    let png = || Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Png))]);
+    let cases = [
+        ("crop-rect", vec![crop()], (40, 30)),
+        ("pixelate_region", vec![pixelate()], (80, 60)),
+        ("crop-rect to PNG", vec![crop(), png()], (40, 30)),
+        ("pixelate_region to PNG", vec![pixelate(), png()], (80, 60)),
+    ];
+    let engine = Engine;
+    for (name, ops, size) in cases {
+        let out = engine
+            .process_preferred(
+                &src,
+                &ops,
+                ProcessContext {
+                    preserve_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(decode_dims(&out.bytes), size, "{name}");
+        assert!(
+            !fixture::contains(&out.bytes, &thumbnail),
+            "{name}: the output carries the source's thumbnail"
+        );
+        let tiff = fixture::carried_exif(&out.bytes).expect(name);
+        assert_eq!(fixture::next_ifd(&tiff, 8), Some(0), "{name}: IFD1 kept");
+        assert_eq!(fixture::tag(&tiff, 8, 0x0112), Some(1), "{name}");
+        let exif = fixture::tag(&tiff, 8, 0x8769).expect(name) as usize;
+        let sizes = (
+            fixture::tag(&tiff, exif, 0xA002),
+            fixture::tag(&tiff, exif, 0xA003),
+        );
+        assert_eq!(sizes, (Some(size.0), Some(size.1)), "{name}: EXIF size");
+        if name.ends_with("PNG") {
+            continue;
+        }
+        let photoshop = fixture::carried_photoshop(&out.bytes).expect(name);
+        assert_eq!(fixture::irb_ids(&photoshop), [0x0404], "{name}");
+    }
+}
+
 /// A zlib stream that inflates to `len` zero bytes, at
 /// about a thousandth of that size.
 fn zlib_bomb(len: usize) -> Vec<u8> {
