@@ -255,7 +255,7 @@ pub struct ManifestSummary {
     /// The active manifest's signer, as a validator would
     /// show it: the certificate's common name, or its
     /// issuer when the name is absent or has nothing left
-    /// to show (see [`signer_name`]). It is a name the
+    /// to show (see `signer_name`). It is a name the
     /// certificate claims, so whoever made the asset chose
     /// it, and `valid` does not vouch for it. It is reported
     /// as one line of at most 64 characters (issue #595).
