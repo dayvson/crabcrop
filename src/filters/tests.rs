@@ -678,7 +678,7 @@ fn blur_region_smooths_only_the_region() {
         let v = if (x + y) % 2 == 0 { 0 } else { 255 };
         *p = Rgb([v, v, v]);
     }
-    let out = blur_region(&img, 10, 10, 20, 20);
+    let out = blur_region(&img, 10, 10, 20, 20, None).unwrap();
     let rgb = out.to_rgb8();
     // Outside the region: pixel-exact.
     assert_eq!(rgb.get_pixel(0, 0).0, [0, 0, 0]);
@@ -958,7 +958,9 @@ fn face_redaction_replaces_the_face_under_any_alpha() {
     // whole and at alpha 128 a third of it did.
     let bx = (8, 8, 40, 40);
     let faces = [face_box(8, 8, 40, 40)];
-    assert_redacted_under_any_alpha("blur_faces", bx, |img| blur_faces(img, &faces));
+    assert_redacted_under_any_alpha("blur_faces", bx, |img| {
+        blur_faces(img, &faces, None).unwrap()
+    });
     assert_redacted_under_any_alpha("pixelate_faces", bx, |img| pixelate_faces(img, &faces));
 }
 
@@ -968,7 +970,9 @@ fn region_redaction_replaces_the_region_under_any_alpha() {
     // to reach it. A 40 px region pixelates in 4 px blocks,
     // so no 1 px strip is left at the edges.
     let bx = (8, 8, 40, 40);
-    assert_redacted_under_any_alpha("blur_region", bx, |img| blur_region(img, 8, 8, 40, 40));
+    assert_redacted_under_any_alpha("blur_region", bx, |img| {
+        blur_region(img, 8, 8, 40, 40, None).unwrap()
+    });
     assert_redacted_under_any_alpha("pixelate_region", bx, |img| {
         pixelate_region(img, 8, 8, 40, 40)
     });
@@ -986,12 +990,14 @@ fn class_redaction_replaces_the_object_under_any_alpha() {
             mask: image::GrayImage::from_pixel(40, 40, image::Luma([255])),
         }]
     };
-    assert_redacted_under_any_alpha("blur_detections", bx, |img| blur_detections(img, &boxes));
+    assert_redacted_under_any_alpha("blur_detections", bx, |img| {
+        blur_detections(img, &boxes, None).unwrap()
+    });
     assert_redacted_under_any_alpha("pixelate_detections", bx, |img| {
         pixelate_detections(img, &boxes)
     });
     assert_redacted_under_any_alpha("blur_detections_masked", bx, |img| {
-        blur_detections_masked(img, &masked())
+        blur_detections_masked(img, &masked(), None).unwrap()
     });
     assert_redacted_under_any_alpha("pixelate_detections_masked", bx, |img| {
         pixelate_detections_masked(img, &masked())
@@ -1008,7 +1014,10 @@ fn region_redaction_redacts_detail_carried_in_alpha() {
         image::Rgba([20, 20, 20, if (x + y) % 2 == 0 { 0 } else { 255 }])
     }));
     for (name, out) in [
-        ("blur_region", blur_region(&src, 8, 8, 40, 40)),
+        (
+            "blur_region",
+            blur_region(&src, 8, 8, 40, 40, None).unwrap(),
+        ),
         ("pixelate_region", pixelate_region(&src, 8, 8, 40, 40)),
     ] {
         let out = out.to_rgba8();
@@ -1041,14 +1050,18 @@ fn redaction_keeps_an_opaque_rgba_image_opaque() {
     let region = src.crop_imm(10, 10, 240, 240);
     let blurred = blur_fast(&region, 30.0).to_rgba8();
     assert!(blurred.get_pixel(120, 120)[3] < 255, "the premise moved");
-    let out = blur_region(&src, 10, 10, 240, 240).to_rgba8();
+    let out = blur_region(&src, 10, 10, 240, 240, None)
+        .unwrap()
+        .to_rgba8();
     assert!(out.pixels().all(|p| p[3] == 255));
     // Inside the box the color is the blur's, with nothing
     // of the original blended in.
     for (x, y, p) in blurred.enumerate_pixels() {
         assert_eq!(out.get_pixel(x + 10, y + 10).0[..3], p.0[..3], "({x}, {y})");
     }
-    let out = blur_faces(&src, &[face_box(10, 10, 240, 240)]).to_rgba8();
+    let out = blur_faces(&src, &[face_box(10, 10, 240, 240)], None)
+        .unwrap()
+        .to_rgba8();
     assert!(out.pixels().all(|p| p[3] == 255));
 }
 
@@ -2096,7 +2109,9 @@ fn blur_masked_leaves_the_unmasked_box_pixels_alone() {
         detection: detection(5, 2, 10, 6),
         mask,
     }];
-    let out = blur_detections_masked(&img, &masked).to_rgb8();
+    let out = blur_detections_masked(&img, &masked, None)
+        .unwrap()
+        .to_rgb8();
     // (11, 4): box-local (6, 2), unmasked: (11+4) is
     // odd, so the source pixel is white, exactly.
     assert_eq!(out.get_pixel(11, 4), &Rgb([255, 255, 255]));
@@ -2104,4 +2119,100 @@ fn blur_masked_leaves_the_unmasked_box_pixels_alone() {
     // so the pixel is neither source extreme.
     let blurred = out.get_pixel(7, 4);
     assert!(blurred[0] > 40 && blurred[0] < 215, "{blurred:?}");
+}
+
+#[test]
+fn blur_stops_at_the_deadline() {
+    // Issue #614: blur(512) on a large canvas ran for minutes
+    // in one call, past the request's deadline. Both banded
+    // paths now check the deadline before each row: one
+    // already passed blurs no row, and one that passes part
+    // way stops the pass there.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(1200, 800, |x, y| {
+        Rgb([(x % 256) as u8, (y % 256) as u8, 9])
+    }));
+    let past = Some(std::time::Instant::now());
+    // Sigma 2 takes the ring path, 8.5 and 512 the transient.
+    for sigma in [2.0, 8.5, 512.0] {
+        assert_eq!(
+            blur_fast_within(&img, sigma, past).map(|_| ()),
+            Err(DeadlinePassed),
+            "sigma {sigma}"
+        );
+    }
+    // A 16-bit image blurs in one call to the image crate,
+    // which has no row to stop at: the deadline is checked
+    // before it.
+    let deep = DynamicImage::ImageRgb16(img.to_rgb16());
+    assert_eq!(
+        blur_fast_within(&deep, 2.0, past).map(|_| ()),
+        Err(DeadlinePassed)
+    );
+    // Part way: sigma 512 here takes far longer than 20 ms,
+    // and the pass stops within a row of the deadline.
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(20);
+    assert_eq!(
+        blur_fast_within(&img, 512.0, Some(deadline)).map(|_| ()),
+        Err(DeadlinePassed)
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    // The plain filter path passes the deadline down.
+    assert_eq!(
+        apply_filters_within(img, &[Filter::Blur(512.0)], None, past).map(|_| ()),
+        Err(DeadlinePassed)
+    );
+}
+
+#[test]
+fn redaction_blurs_stop_at_the_deadline() {
+    // Issue #614: the face, region, and class blurs run the
+    // same banded passes; the face blur's sigma follows the
+    // face and has no cap. Each stops at the deadline, and a
+    // deadline still ahead redacts exactly as none does.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 160, |x, y| {
+        Rgb([(x * 3 % 256) as u8, (y * 5 % 256) as u8, 40])
+    }));
+    let faces = [face_box(10, 10, 120, 100)];
+    let boxes = [detection(10, 10, 120, 100)];
+    let masked = || {
+        vec![MaskedDetection {
+            detection: detection(10, 10, 120, 100),
+            mask: image::GrayImage::from_fn(120, 100, |x, _| image::Luma([(x * 2) as u8])),
+        }]
+    };
+    let past = Some(std::time::Instant::now());
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    type Redact<'a> =
+        Box<dyn Fn(Option<std::time::Instant>) -> Result<DynamicImage, DeadlinePassed> + 'a>;
+    let cases: [(&str, Redact); 4] = [
+        (
+            "blur_region",
+            Box::new(|deadline| blur_region(&img, 10, 10, 120, 100, deadline)),
+        ),
+        (
+            "blur_faces",
+            Box::new(|deadline| blur_faces(&img, &faces, deadline)),
+        ),
+        (
+            "blur_detections",
+            Box::new(|deadline| blur_detections(&img, &boxes, deadline)),
+        ),
+        (
+            "blur_detections_masked",
+            Box::new(|deadline| blur_detections_masked(&img, &masked(), deadline)),
+        ),
+    ];
+    for (name, redact) in cases {
+        assert_eq!(redact(past).map(|_| ()), Err(DeadlinePassed), "{name}");
+        assert_eq!(
+            redact(ahead).unwrap().to_rgba8().into_raw(),
+            redact(None).unwrap().to_rgba8().into_raw(),
+            "{name}"
+        );
+    }
+    // Nothing to blur is nothing to stop.
+    assert!(blur_faces(&img, &[], past).is_ok());
+    assert!(blur_detections(&img, &[], past).is_ok());
 }

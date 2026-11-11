@@ -5,6 +5,8 @@
 //! `MaxBytes` do not touch pixels; they are recorded for the
 //! encoder.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use image::DynamicImage;
 
 use crate::url::{
@@ -313,6 +315,22 @@ pub fn apply_filters_filled(
     filters: &[Filter],
     fill: Option<[u8; 3]>,
 ) -> (DynamicImage, EncodeOptions) {
+    match apply_filters_within(img, filters, fill, None) {
+        Ok(done) => done,
+        Err(DeadlinePassed) => unreachable!("no deadline never passes"),
+    }
+}
+
+/// [`apply_filters_filled`] under the request's processing
+/// deadline (`None` for none), which a blur checks before
+/// each row (issue #614). Past the deadline it stops and
+/// answers [`DeadlinePassed`]; the image is dropped.
+pub fn apply_filters_within(
+    img: DynamicImage,
+    filters: &[Filter],
+    fill: Option<[u8; 3]>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(DynamicImage, EncodeOptions), DeadlinePassed> {
     let mut img = img;
     let mut options = EncodeOptions::default();
     for filter in filters {
@@ -324,7 +342,7 @@ pub fn apply_filters_filled(
                 });
             }
             Filter::Invert => img.invert(),
-            Filter::Blur(sigma) => img = blur_fast(&img, blur_sigma(*sigma)),
+            Filter::Blur(sigma) => img = blur_fast_within(&img, blur_sigma(*sigma), deadline)?,
             Filter::Brighten(amount) => img = brighten_fast(img, *amount),
             Filter::Contrast(amount) => {
                 img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
@@ -459,7 +477,18 @@ pub fn apply_filters_filled(
             }
         }
     }
-    (img, options)
+    Ok((img, options))
+}
+
+/// The processing deadline passed while a filter ran (issues
+/// #606, #614). The filter stopped part way and its result
+/// was dropped; the engine answers its own timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlinePassed;
+
+/// Whether `deadline` has passed. `None` never does.
+fn passed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
 /// The canvas a rotation of a `w` by `h` image lands on:
@@ -753,6 +782,51 @@ fn blur_q15_out(acc: u32) -> u8 {
     ((acc + (1 << 14)) >> 15).min(255) as u8
 }
 
+/// The processing deadline as the banded blur passes check it
+/// (issue #614): each band asks before each of its rows, and
+/// the first band to find the deadline passed raises a flag
+/// that stops the others at their next row. The arithmetic of
+/// every row is untouched, so a blur that finishes writes the
+/// same bytes as one with no deadline.
+struct RowGate {
+    deadline: Option<std::time::Instant>,
+    stopped: AtomicBool,
+}
+
+impl RowGate {
+    fn new(deadline: Option<std::time::Instant>) -> Self {
+        RowGate {
+            deadline,
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether a band should stop before its next row.
+    fn stop(&self) -> bool {
+        if self.deadline.is_none() {
+            return false;
+        }
+        if self.stopped.load(Ordering::Relaxed) {
+            return true;
+        }
+        let stop = passed(self.deadline);
+        if stop {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        stop
+    }
+
+    /// `Err` when a band stopped before its last row, so the
+    /// pass left rows unwritten.
+    fn finished(&self) -> Result<(), DeadlinePassed> {
+        if self.stopped.load(Ordering::Relaxed) {
+            Err(DeadlinePassed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn blur_par_bands<T, F>(dst: &mut [T], row_len: usize, rows: usize, f: F)
 where
     T: Send,
@@ -917,10 +991,21 @@ fn blur_sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
     }
 }
 
-pub fn blur_ring<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> Vec<u8> {
+/// Ring-buffer variant for small kernels: each band blurs its
+/// rows horizontally into a ring of `kernel` rows as the
+/// column pass needs them. `deadline` is checked before each
+/// output row (issue #614); past it the blur answers
+/// [`DeadlinePassed`].
+pub fn blur_ring<const N: usize>(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, DeadlinePassed> {
     let sigma = if sigma == 0.0 { 0.8 } else { sigma };
     if w == 0 || h == 0 {
-        return src.to_vec();
+        return Ok(src.to_vec());
     }
     let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
     let kernel: Vec<u32> =
@@ -929,6 +1014,7 @@ pub fn blur_ring<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> 
     let pad = half.max(1);
     let row_len = w * N;
     let mut out = vec![0u8; src.len()];
+    let gate = RowGate::new(deadline);
     blur_par_bands(&mut out, row_len, h, |y0, band| {
         let perm_band_rows = band.len() / row_len;
         let klen = kernel.len();
@@ -936,6 +1022,9 @@ pub fn blur_ring<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> 
         let mut arena: Vec<u8> = Vec::new();
         let mut next_row = blur_clamp_idx(y0 as isize - half as isize, h);
         for ly in 0..perm_band_rows {
+            if gate.stop() {
+                return;
+            }
             let y = y0 + ly;
             let need_hi = blur_clamp_idx(y as isize + half as isize, h);
             while next_row <= need_hi {
@@ -960,17 +1049,26 @@ pub fn blur_ring<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> 
             blur_sym_col(&brows, &mut band[ly * row_len..(ly + 1) * row_len], &kernel);
         }
     });
-    out
+    gate.finished()?;
+    Ok(out)
 }
 
 /// Banded-transient variant for large kernels: horizontal pass
 /// into a full transient buffer (rows in parallel), then the
 /// column pass in output-row bands over the shared transient.
 /// Same inner functions, so the same per-pixel arithmetic.
-pub fn blur_transient<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> Vec<u8> {
+/// `deadline` is checked before each row of both passes
+/// (issue #614); past it the blur answers [`DeadlinePassed`].
+pub fn blur_transient<const N: usize>(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, DeadlinePassed> {
     let sigma = if sigma == 0.0 { 0.8 } else { sigma };
     if w == 0 || h == 0 {
-        return src.to_vec();
+        return Ok(src.to_vec());
     }
     let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
     let kernel: Vec<u32> =
@@ -979,17 +1077,25 @@ pub fn blur_transient<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32
     let pad = half.max(1);
     let row_len = w * N;
     let mut transient = vec![0u8; src.len()];
+    let gate = RowGate::new(deadline);
     blur_par_bands(&mut transient, row_len, h, |y0, band| {
         let mut arena: Vec<u8> = Vec::new();
         for (ly, dst_row) in band.chunks_mut(row_len).enumerate() {
+            if gate.stop() {
+                return;
+            }
             let y = y0 + ly;
             blur_arena_row::<N>(&src[y * row_len..(y + 1) * row_len], pad, &mut arena);
             blur_sym_row::<N>(&arena, dst_row, &kernel);
         }
     });
+    gate.finished()?;
     let mut out = vec![0u8; src.len()];
     blur_par_bands(&mut out, row_len, h, |y0, band| {
         for (ly, dst_row) in band.chunks_mut(row_len).enumerate() {
+            if gate.stop() {
+                return;
+            }
             let y = y0 + ly;
             let mut brows: Vec<&[u8]> = Vec::with_capacity(kernel.len());
             for k in 0..kernel.len() {
@@ -999,10 +1105,31 @@ pub fn blur_transient<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32
             blur_sym_col(&brows, dst_row, &kernel);
         }
     });
-    out
+    gate.finished()?;
+    Ok(out)
 }
 
+/// [`blur_fast_within`] with no deadline: the byte-identical
+/// stand-in for the image crate's `blur` that the proofs pin.
+#[cfg(test)]
 pub(crate) fn blur_fast(img: &DynamicImage, sigma: f32) -> DynamicImage {
+    match blur_fast_within(img, sigma, None) {
+        Ok(out) => out,
+        Err(DeadlinePassed) => unreachable!("no deadline never passes"),
+    }
+}
+
+/// Gaussian blur, byte for byte the image crate's, under the
+/// request's processing deadline (issue #614): the 8-bit
+/// paths check it before each row and answer
+/// [`DeadlinePassed`] past it. A 16-bit or float image blurs
+/// in one call to the image crate, which has no row to stop
+/// at, so the deadline is checked before that call only.
+pub(crate) fn blur_fast_within(
+    img: &DynamicImage,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, DeadlinePassed> {
     // Ring for kernel < 55 (the crate's own cutoff), transient
     // above it: same split as the crate, both banded.
     let sigma = if sigma == 0.0 { 0.8 } else { sigma };
@@ -1011,11 +1138,11 @@ pub(crate) fn blur_fast(img: &DynamicImage, sigma: f32) -> DynamicImage {
         ($i:expr, $ch:expr, $ctor:expr) => {{
             let (w, h) = ($i.width() as usize, $i.height() as usize);
             let out = if klen < 55 {
-                blur_ring::<$ch>($i.as_raw(), w, h, sigma)
+                blur_ring::<$ch>($i.as_raw(), w, h, sigma, deadline)?
             } else {
-                blur_transient::<$ch>($i.as_raw(), w, h, sigma)
+                blur_transient::<$ch>($i.as_raw(), w, h, sigma, deadline)?
             };
-            $ctor(out)
+            Ok($ctor(out))
         }};
     }
     match img {
@@ -1031,7 +1158,8 @@ pub(crate) fn blur_fast(img: &DynamicImage, sigma: f32) -> DynamicImage {
         DynamicImage::ImageRgba8(i) => arm!(i, 4, |out| DynamicImage::ImageRgba8(
             image::RgbaImage::from_raw(i.width(), i.height(), out).expect("blur size")
         )),
-        other => other.blur(sigma),
+        _ if passed(deadline) => Err(DeadlinePassed),
+        other => Ok(other.blur(sigma)),
     }
 }
 
@@ -1966,19 +2094,20 @@ fn average_blocks<P: image::Pixel>(
 /// the result into an RGBA copy in place of the rectangle's
 /// pixels (see [`put_redacted`]); pixels outside the
 /// rectangle are untouched. The caller guarantees the
-/// rectangle is in bounds.
-fn apply_to_region(
+/// rectangle is in bounds. An error from `f` is returned as
+/// is.
+fn apply_to_region<E>(
     img: &DynamicImage,
     x: u32,
     y: u32,
     w: u32,
     h: u32,
-    f: impl Fn(&DynamicImage) -> DynamicImage,
-) -> DynamicImage {
+    f: impl Fn(&DynamicImage) -> Result<DynamicImage, E>,
+) -> Result<DynamicImage, E> {
     let mut base = img.to_rgba8();
     let region = img.crop_imm(x, y, w, h);
-    put_redacted(&mut base, f(&region).to_rgba8(), x, y);
-    DynamicImage::ImageRgba8(base)
+    put_redacted(&mut base, f(&region)?.to_rgba8(), x, y);
+    Ok(DynamicImage::ImageRgba8(base))
 }
 
 /// Write the redacted pixels `done` over the rectangle of
@@ -2015,10 +2144,20 @@ fn put_redacted(base: &mut image::RgbaImage, mut done: image::RgbaImage, x: u32,
 /// Gaussian-blur one rectangle of `img` (explicit region
 /// redaction: plates, screens, documents). The sigma scales
 /// with the region, min(w, h) / 8 clamped to [1, 30], so a
-/// tall thin region blurs to its own scale.
-pub fn blur_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> DynamicImage {
+/// tall thin region blurs to its own scale. The blur checks
+/// `deadline` before each row (issue #614).
+pub fn blur_region(
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, DeadlinePassed> {
     let sigma = (w.min(h) as f32 / 8.0).clamp(1.0, 30.0);
-    apply_to_region(img, x, y, w, h, |region| blur_fast(region, sigma))
+    apply_to_region(img, x, y, w, h, |region| {
+        blur_fast_within(region, sigma, deadline)
+    })
 }
 
 /// Pixelate one rectangle of `img`, with the block size
@@ -2026,7 +2165,10 @@ pub fn blur_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> Dynami
 /// using the same block averaging as the `pixelate` filter.
 pub fn pixelate_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> DynamicImage {
     let block = (w.min(h) / 10).max(2);
-    apply_to_region(img, x, y, w, h, |region| pixelate(region, block))
+    let Ok(out) = apply_to_region(img, x, y, w, h, |region| {
+        Ok::<_, std::convert::Infallible>(pixelate(region, block))
+    });
+    out
 }
 
 /// Round the corners of `img` by the given radii (CSS order:
@@ -2179,10 +2321,16 @@ pub fn draw_border(img: &DynamicImage, width: u32, color: [u8; 3]) -> DynamicIma
 /// Blur every detected face region in `img`. The blur sigma
 /// scales with each face's size, so the redaction holds up at
 /// any resolution. Pixels outside the face boxes are untouched.
-pub fn blur_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
+/// The sigma has no cap, so the blur checks `deadline` before
+/// each row (issue #614).
+pub fn blur_faces(
+    img: &DynamicImage,
+    faces: &[crate::ai::FaceBox],
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, DeadlinePassed> {
     redact_faces(img, faces, |region, face| {
         let sigma = (face.w.min(face.h) as f32 / 6.0).max(1.0);
-        blur_fast(region, sigma)
+        blur_fast_within(region, sigma, deadline)
     })
 }
 
@@ -2200,10 +2348,11 @@ const FACE_MOSAIC_CELLS: u32 = 8;
 /// keeps a quarter of the pixels of slightly larger ones).
 /// Pixels outside the face boxes are untouched.
 pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
-    redact_faces(img, faces, |region, face| {
+    let Ok(out) = redact_faces(img, faces, |region, face| {
         let cell = face.w.max(face.h).div_ceil(FACE_MOSAIC_CELLS).max(2);
-        mosaic(region, cell)
-    })
+        Ok::<_, std::convert::Infallible>(mosaic(region, cell))
+    });
+    out
 }
 
 /// Paint `img` as a grid of cells, each with the average of its
@@ -2251,9 +2400,16 @@ fn mosaic(img: &DynamicImage, cell: u32) -> DynamicImage {
 /// Blur every detection's box in `img`, through the
 /// region redaction mechanics (strength derived from the
 /// box size). Boxes are clamped to the image; empty or
-/// fully out-of-frame boxes are skipped.
-pub fn blur_detections(img: &DynamicImage, detections: &[crate::ai::Detection]) -> DynamicImage {
-    redact_detections(img, detections, blur_region)
+/// fully out-of-frame boxes are skipped. Each blur checks
+/// `deadline` before each row (issue #614).
+pub fn blur_detections(
+    img: &DynamicImage,
+    detections: &[crate::ai::Detection],
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, DeadlinePassed> {
+    redact_detections(img, detections, |img, x, y, w, h| {
+        blur_region(img, x, y, w, h, deadline)
+    })
 }
 
 /// Pixelate every detection's box in `img`, through the
@@ -2262,14 +2418,17 @@ pub fn pixelate_detections(
     img: &DynamicImage,
     detections: &[crate::ai::Detection],
 ) -> DynamicImage {
-    redact_detections(img, detections, pixelate_region)
+    let Ok(out) = redact_detections(img, detections, |img, x, y, w, h| {
+        Ok::<_, std::convert::Infallible>(pixelate_region(img, x, y, w, h))
+    });
+    out
 }
 
-fn redact_detections(
+fn redact_detections<E>(
     img: &DynamicImage,
     detections: &[crate::ai::Detection],
-    redact: fn(&DynamicImage, u32, u32, u32, u32) -> DynamicImage,
-) -> DynamicImage {
+    redact: impl Fn(&DynamicImage, u32, u32, u32, u32) -> Result<DynamicImage, E>,
+) -> Result<DynamicImage, E> {
     let mut out = img.clone();
     for det in detections {
         let x = det.x.min(img.width());
@@ -2279,9 +2438,9 @@ fn redact_detections(
         if w == 0 || h == 0 {
             continue;
         }
-        out = redact(&out, x, y, w, h);
+        out = redact(&out, x, y, w, h)?;
     }
-    out
+    Ok(out)
 }
 
 /// Clamp a detection's box to the image, the redaction
@@ -2354,31 +2513,41 @@ fn blend_masked(
 /// blur, so strength matches the rectangle form exactly
 /// and only the shape changes. Pixels outside every
 /// silhouette are untouched, including the parts of a
-/// detection's rectangle the object does not fill.
-pub fn blur_detections_masked(img: &DynamicImage, masked: &[MaskedDetection]) -> DynamicImage {
-    redact_masked(img, masked, blur_region)
+/// detection's rectangle the object does not fill. Each blur
+/// checks `deadline` before each row (issue #614).
+pub fn blur_detections_masked(
+    img: &DynamicImage,
+    masked: &[MaskedDetection],
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, DeadlinePassed> {
+    redact_masked(img, masked, |img, x, y, w, h| {
+        blur_region(img, x, y, w, h, deadline)
+    })
 }
 
 /// Pixelate every detection's silhouette in `img`: the
 /// mask-tight form of [`pixelate_detections`].
 pub fn pixelate_detections_masked(img: &DynamicImage, masked: &[MaskedDetection]) -> DynamicImage {
-    redact_masked(img, masked, pixelate_region)
+    let Ok(out) = redact_masked(img, masked, |img, x, y, w, h| {
+        Ok::<_, std::convert::Infallible>(pixelate_region(img, x, y, w, h))
+    });
+    out
 }
 
-fn redact_masked(
+fn redact_masked<E>(
     img: &DynamicImage,
     masked: &[MaskedDetection],
-    redact: fn(&DynamicImage, u32, u32, u32, u32) -> DynamicImage,
-) -> DynamicImage {
+    redact: impl Fn(&DynamicImage, u32, u32, u32, u32) -> Result<DynamicImage, E>,
+) -> Result<DynamicImage, E> {
     let mut out = img.clone();
     for item in masked {
         let Some((x, y, w, h)) = clamped_box(&out, &item.detection) else {
             continue;
         };
-        let done = redact(&out, x, y, w, h);
+        let done = redact(&out, x, y, w, h)?;
         out = blend_masked(&out, &done, &item.mask, x, y, w, h);
     }
-    out
+    Ok(out)
 }
 
 /// One detection with its segmentation mask, the unit the
@@ -2471,13 +2640,13 @@ fn paint_box(
 /// results back in place of the face pixels (see
 /// [`put_redacted`]). Face boxes are clamped to the image;
 /// empty or fully out-of-frame boxes are skipped.
-fn redact_faces(
+fn redact_faces<E>(
     img: &DynamicImage,
     faces: &[crate::ai::FaceBox],
-    redact: impl Fn(&DynamicImage, &crate::ai::FaceBox) -> DynamicImage,
-) -> DynamicImage {
+    redact: impl Fn(&DynamicImage, &crate::ai::FaceBox) -> Result<DynamicImage, E>,
+) -> Result<DynamicImage, E> {
     if faces.is_empty() {
-        return img.clone();
+        return Ok(img.clone());
     }
     let mut base = img.to_rgba8();
     for face in faces {
@@ -2489,9 +2658,9 @@ fn redact_faces(
             continue;
         }
         let region = img.crop_imm(x, y, w, h);
-        put_redacted(&mut base, redact(&region, face).to_rgba8(), x, y);
+        put_redacted(&mut base, redact(&region, face)?.to_rgba8(), x, y);
     }
-    DynamicImage::ImageRgba8(base)
+    Ok(DynamicImage::ImageRgba8(base))
 }
 
 /// Crop away the uniform border: keep the bounding box of

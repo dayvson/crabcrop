@@ -29,11 +29,14 @@ import {
   JPEG_SUBSAMPLINGS,
   MASK_SHAPES,
   MAX_OBJECTS_CLASSES,
+  MAX_TEXT_EXTENT,
+  MAX_TEXT_GLYPHS,
   QUALITY_FORMATS,
   STUDIO_BACKDROPS,
   STUDIO_MODES,
   STUDIO_SHADOWS,
   TEXT_ANCHORS,
+  textLabelFits,
   trimLikeServer,
   UPSCALE_FACTORS,
 } from "./explain.ts";
@@ -874,6 +877,8 @@ export const filter = {
   /**
    * Draw a text overlay. Color is RRGGBB or RRGGBBAA; the
    * canonical spelling is always eight lowercase hex digits.
+   * The label holds at most 1000 characters, and characters
+   * times size is at most 100000 (the server's caps).
    */
   text(content: string, size: number, color: string, anchor: Anchor): string {
     if (!isOneOf(TEXT_ANCHORS, anchor)) {
@@ -881,6 +886,13 @@ export const filter = {
     }
     if (content === "") fail("text", content, "a non-empty label");
     intIn("text size", size, 1, 1000);
+    if (!textLabelFits(content, size)) {
+      fail(
+        "text",
+        content,
+        `at most ${MAX_TEXT_GLYPHS} characters, and characters times size at most ${MAX_TEXT_EXTENT}`,
+      );
+    }
     return `text(${encodeArg(content)},${size},${hex6or8("text color", color)},${anchor})`;
   },
   /** Blur every detected object of the named class. */

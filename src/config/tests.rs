@@ -1170,6 +1170,26 @@ fn parses_preset_files() {
     assert_eq!(err, "preset big is 262145 bytes, over the 262144 byte cap");
 }
 
+#[test]
+fn a_text_label_past_its_caps_stops_the_boot() {
+    // Issue #606: presets and default operations are parsed
+    // at boot, so a `text` label past the caps (1000
+    // characters; characters times size at most 100000)
+    // stops the server from starting. At the caps it boots.
+    let text = |chars: usize, size: u32| {
+        format!("filters:text({},{size},ffffff,top-left)", "a".repeat(chars))
+    };
+    assert!(parse_presets(&format!("label = {}", text(1000, 100))).is_ok());
+    assert!(parse_presets(&format!("label = {}", text(100, 1000))).is_ok());
+    for (chars, size) in [(1001, 12), (101, 1000)] {
+        let err = expect_err(parse_presets(&format!("label = {}", text(chars, size))));
+        assert!(err.contains("invalid operations for preset label"), "{err}");
+    }
+    config_of(&[("CRABCROP_DEFAULT_OPS", &text(100, 1000))]).unwrap();
+    let err = refusal(&[("CRABCROP_DEFAULT_OPS", &text(101, 1000))]).to_string();
+    assert!(err.contains("invalid CRABCROP_DEFAULT_OPS"), "{err}");
+}
+
 /// The secret every `Config::from_env` test boots with.
 const SECRET: &str = "a production-grade secret";
 

@@ -1121,6 +1121,15 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// A filter that stopped at the processing deadline (issues
+/// #606, #614) fails the render as any other deadline check
+/// does.
+impl From<crate::filters::DeadlinePassed> for EngineError {
+    fn from(_: crate::filters::DeadlinePassed) -> Self {
+        EngineError::Timeout
+    }
+}
+
 /// Default AVIF speed tier (issue #281): speed 9 encodes
 /// about 1.8x faster than 8 for about 15 percent more bytes.
 pub const DEFAULT_AVIF_SPEED: u8 = 9;
@@ -4062,8 +4071,15 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         ));
                     }
                 };
-                let (padded, placed) =
-                    apply_pad(img, tw, th, *fill, self.directives.fill, self.cap)?;
+                let (padded, placed) = apply_pad(
+                    img,
+                    tw,
+                    th,
+                    *fill,
+                    self.directives.fill,
+                    self.cap,
+                    self.ctx.deadline,
+                )?;
                 img = padded;
                 let dims = (img.width(), img.height());
                 self.focal = self.focal.map(|f| f.placed(placed, dims));
@@ -4592,18 +4608,21 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 // unredacted would be the real
                 // failure.
                 let faces = detect_faces(&mut self.face_memo, &img, self.ctx)?;
-                img = crate::filters::blur_faces(&img, &faces);
+                img = crate::filters::blur_faces(&img, &faces, self.ctx.deadline)?;
             }
             Filter::PixelateFaces => {
                 let faces = detect_faces(&mut self.face_memo, &img, self.ctx)?;
                 img = crate::filters::pixelate_faces(&img, &faces);
             }
             Filter::BlurClass(class) => {
+                let deadline = self.ctx.deadline;
                 img = match self.class_targets(&img, class)? {
                     ClassTargets::Masked(masked) => {
-                        crate::filters::blur_detections_masked(&img, &masked)
+                        crate::filters::blur_detections_masked(&img, &masked, deadline)?
                     }
-                    ClassTargets::Boxes(boxes) => crate::filters::blur_detections(&img, &boxes),
+                    ClassTargets::Boxes(boxes) => {
+                        crate::filters::blur_detections(&img, &boxes, deadline)?
+                    }
                 };
             }
             Filter::PixelateClass(class) => {
@@ -4645,7 +4664,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
             Filter::BlurRegion { x, y, w, h } => {
                 check_region("blur_region", *x, *y, *w, *h, &img)?;
-                img = crate::filters::blur_region(&img, *x, *y, *w, *h);
+                img = crate::filters::blur_region(&img, *x, *y, *w, *h, self.ctx.deadline)?;
             }
             Filter::PixelateRegion { x, y, w, h } => {
                 check_region("pixelate_region", *x, *y, *w, *h, &img)?;
@@ -4681,9 +4700,14 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         "text is not configured on this server (no font)".to_string(),
                     )
                 })?;
+                // The renderer checks the deadline between
+                // glyphs (issue #606).
                 img = renderer
-                    .draw(&img, text, *size, *color, *anchor)
-                    .map_err(EngineError::Render)?;
+                    .draw(&img, text, *size, *color, *anchor, self.ctx.deadline)
+                    .map_err(|e| match e {
+                        crate::text::DrawError::Timeout => EngineError::Timeout,
+                        crate::text::DrawError::Failed(message) => EngineError::Render(message),
+                    })?;
             }
             other => img = self.plain_filter(img, other)?,
         }
@@ -4766,11 +4790,14 @@ impl<'r, 'a> ChainState<'r, 'a> {
             let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
             check_output_size(cw, ch, (img.width(), img.height()))?;
         }
-        let (new_img, options) = crate::filters::apply_filters_filled(
+        // A blur checks the deadline before each row (issue
+        // #614).
+        let (new_img, options) = crate::filters::apply_filters_within(
             img,
             std::slice::from_ref(filter),
             self.directives.fill,
-        );
+            self.ctx.deadline,
+        )?;
         self.encode_opts.absorb(options);
         Ok(new_img)
     }
@@ -5577,7 +5604,8 @@ pub(crate) fn resize_lanczos3_cropped(
 /// directive, or black), or a blurred cover-scaled copy of the
 /// image itself. Also returns where the fitted image sits on
 /// the canvas, which the pending focal form follows (issue
-/// #465).
+/// #465). The blurred fill checks `deadline` before each row
+/// (issue #614).
 fn apply_pad(
     img: DynamicImage,
     target_w: u32,
@@ -5585,6 +5613,7 @@ fn apply_pad(
     fill: PadFill,
     directive_fill: Option<[u8; 3]>,
     cap: Option<(u32, u32)>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(DynamicImage, Window), EngineError> {
     if target_w == 0 || target_h == 0 {
         let whole = (0, 0, img.width(), img.height());
@@ -5624,10 +5653,11 @@ fn apply_pad(
             // canvas, then blurred hard enough that only its
             // broad colors survive.
             let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
-            crate::filters::blur_fast(
+            crate::filters::blur_fast_within(
                 &img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
                 sigma,
-            )
+                deadline,
+            )?
         }
     };
     let mut base = canvas.to_rgba8();

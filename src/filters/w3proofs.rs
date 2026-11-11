@@ -86,6 +86,42 @@ fn w3_blur_fast_matches_crate() {
 }
 
 #[test]
+fn w3_blur_under_a_deadline_matches_crate() {
+    // Issue #614: with a deadline the passes check the clock
+    // before each row. A deadline still ahead changes no
+    // byte: the same sweep as above, through the checks.
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+    for make in [photo as fn(u32, u32) -> DynamicImage, checker] {
+        for (w, h) in [(333u32, 257u32), (64, 48), (7, 5), (3, 2), (1, 1), (31, 17)] {
+            let base = make(w, h);
+            for v in variants(&base) {
+                for sigma in [0.3f32, 0.5, 1.0, 2.0, 4.0, 8.0, 8.4, 8.5, 12.0, 16.0, 40.0] {
+                    assert_eq!(
+                        bytes(&blur_fast_within(&v, sigma, ahead).unwrap()),
+                        bytes(&v.blur(sigma)),
+                        "blur sigma {sigma} at {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+    let big = photo(1200, 900);
+    for sigma in [2.0f32, 8.5, 16.0, 0.0] {
+        assert_eq!(
+            bytes(&blur_fast_within(&big, sigma, ahead).unwrap()),
+            bytes(&big.blur(sigma)),
+            "big blur {sigma}"
+        );
+    }
+    // A 16-bit image takes the crate's own blur either way.
+    let deep = DynamicImage::ImageRgb16(photo(64, 48).to_rgb16());
+    assert_eq!(
+        bytes(&blur_fast_within(&deep, 4.0, ahead).unwrap()),
+        bytes(&deep.blur(4.0))
+    );
+}
+
+#[test]
 fn w3_perms_match_crate() {
     // 1601x901 RGB is above the fast-path size gate, so
     // these exercise the tiled/banded code, not the

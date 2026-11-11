@@ -543,18 +543,24 @@ pub(in crate::server) fn wants_slow_lane(
 /// it finishes (issue #357). The engine checks the deadline between
 /// stages and inside its chunked encode loops (per frame
 /// for animated GIF and WebP, per attempt for the
-/// quality ladders), so a checkpointed job aborts on its
-/// own within this window and answers with the engine's
-/// own Timeout. A job still running when the grace runs
-/// out is inside a single opaque encoder call (one still
-/// encode, libwebp's animated `try_encode`, one AI
-/// inference, the external video encoder), which no
-/// checkpoint can interrupt: detaching is what bounds
-/// its hold on the server, and it aborts at the first
-/// deadline check after that call returns. The detached
-/// job keeps its permits deliberately (issue #357): the
-/// deadline checks bound the hold (the deadline plus the
-/// longest single opaque call).
+/// quality ladders). It also checks it inside the two
+/// filters whose work grows with an argument and not only
+/// with the image: `text` between glyphs and every blur
+/// (the `blur` filter, the blurred `pad` fill, and the
+/// face, region, and class blurs) before each row (issues
+/// #606, #614). So a checkpointed job aborts on its own
+/// within this window and answers with the engine's own
+/// Timeout. A job still running when the grace runs out
+/// is inside a single opaque call (one still encode,
+/// libwebp's animated `try_encode`, one AI inference, the
+/// external video encoder, the image crate's blur of a
+/// 16-bit or float image), which no checkpoint can
+/// interrupt: detaching is what bounds its hold on the
+/// server, and it aborts at the first deadline check after
+/// that call returns. The detached job keeps its permits
+/// deliberately (issue #357): the deadline checks bound
+/// the hold (the deadline plus the longest single opaque
+/// call).
 const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an AI-backed request may wait for an inference
