@@ -255,6 +255,11 @@ pub struct S3Store {
     /// each with the identical purges that joined it and
     /// wait for its re-list (issue #462).
     walks: std::sync::Mutex<HashMap<PurgeTarget, Vec<SharedPurge>>>,
+    /// The purges in this process whose disk files are not all
+    /// deleted yet, by target, with the tombstones of that
+    /// target waiting for them before they are marked ended
+    /// (issue #572).
+    held_ends: std::sync::Mutex<HashMap<PurgeTarget, HeldEnds>>,
     /// Background walk turns (issue #462):
     /// [`PURGE_WALKS_AT_ONCE`] permits, granted in arrival
     /// order.
@@ -330,6 +335,7 @@ impl S3Store {
             tombstones_unread: std::sync::atomic::AtomicU64::new(0),
             tombstones_listed_ms: std::sync::atomic::AtomicU64::new(0),
             walks: std::sync::Mutex::new(HashMap::new()),
+            held_ends: std::sync::Mutex::new(HashMap::new()),
             walk_turns: tokio::sync::Semaphore::new(PURGE_WALKS_AT_ONCE),
             inline_reads: tokio::sync::Semaphore::new(PURGE_INLINE_READS_AT_ONCE),
             max_entry_bytes: MAX_ENTRY_BYTES,
@@ -1309,6 +1315,104 @@ impl S3Store {
         }
     }
 
+    /// Keep every tombstone of `target` from being marked ended
+    /// while `disk`, one purge's disk deletions, are pending
+    /// (issue #572). A restart before they are done indexes
+    /// those files again, and only an unended tombstone keeps
+    /// them misses. A later purge of the target has no
+    /// deletions of its own for them, and its tombstone, once
+    /// ended, supersedes the earlier ones, so it waits for them
+    /// too. Called before the purge's walk lets a later one of
+    /// the target lead its own.
+    pub fn hold_for_deletions(&self, target: &PurgeTarget, disk: &crate::storage::DeletionWait) {
+        if disk.pending() {
+            self.held_ends
+                .lock()
+                .unwrap()
+                .entry(target.clone())
+                .or_default()
+                .deletions
+                .push(disk.clone());
+        }
+    }
+
+    /// Mark `tombstone`, stored at `object`, ended (issue
+    /// #461): now when no purge of its target has disk
+    /// deletions pending in this process, or else on the
+    /// [`S3Store::end_held_purges`] after they are done.
+    pub async fn end_tombstone(&self, object: &str, tombstone: &Tombstone) {
+        let ready = {
+            let mut held = self.held_ends.lock().unwrap();
+            let entry = (object.to_string(), tombstone.clone());
+            match held.get_mut(&tombstone.target) {
+                None => vec![entry],
+                Some(waiting) => {
+                    waiting
+                        .deletions
+                        .retain(crate::storage::DeletionWait::pending);
+                    waiting.tombstones.push(entry);
+                    if !waiting.deletions.is_empty() {
+                        return;
+                    }
+                    held.remove(&tombstone.target)
+                        .map(|waiting| waiting.tombstones)
+                        .unwrap_or_default()
+                }
+            }
+        };
+        self.write_ended(ready).await;
+    }
+
+    /// Mark ended the held tombstones of every target whose
+    /// purges have all their disk files deleted now (issue
+    /// #572), however long that took: run on every tombstone
+    /// refresh. Ends within [`TOMBSTONE_REFRESH_DEADLINE`]; a
+    /// tombstone whose write fails or does not finish by then
+    /// stays in force, as when a walk's end cannot be written.
+    pub async fn end_held_purges(&self) {
+        let ready: Vec<(String, Tombstone)> = {
+            let mut held = self.held_ends.lock().unwrap();
+            let mut ready = Vec::new();
+            held.retain(|_, waiting| {
+                waiting
+                    .deletions
+                    .retain(crate::storage::DeletionWait::pending);
+                if waiting.deletions.is_empty() {
+                    ready.append(&mut waiting.tombstones);
+                    return false;
+                }
+                true
+            });
+            ready
+        };
+        self.write_ended(ready).await;
+    }
+
+    /// Write each tombstone marked ended now, at most
+    /// [`TOMBSTONE_READS_AT_ONCE`] at a time and within
+    /// [`TOMBSTONE_REFRESH_DEADLINE`].
+    async fn write_ended(&self, tombstones: Vec<(String, Tombstone)>) {
+        use futures_util::StreamExt as _;
+        if tombstones.is_empty() {
+            return;
+        }
+        let ended_ms = Some(now_ms());
+        let _ = tokio::time::timeout(
+            TOMBSTONE_REFRESH_DEADLINE,
+            futures_util::stream::iter(tombstones).for_each_concurrent(
+                TOMBSTONE_READS_AT_ONCE,
+                |(object, tombstone)| async move {
+                    let ended = Tombstone {
+                        ended_ms,
+                        ..tombstone
+                    };
+                    self.write_tombstone(&object, &ended).await;
+                },
+            ),
+        )
+        .await;
+    }
+
     /// Read one tombstone object: capped, authenticated, and
     /// consistent with the name it is stored under. Anything
     /// else (a plant, another deployment's record, a copy
@@ -1648,6 +1752,16 @@ pub struct SharedPurge {
     pub disk: Option<crate::storage::DeletionWait>,
     pub event: &'static str,
     pub log_target: String,
+}
+
+/// What keeps a target's tombstones from being marked ended
+/// (issue #572): the disk deletions of its purges in this
+/// process not known to be done, and the tombstones to mark
+/// once they are.
+#[derive(Debug, Default)]
+struct HeldEnds {
+    deletions: Vec<crate::storage::DeletionWait>,
+    tombstones: Vec<(String, Tombstone)>,
 }
 
 /// A target's walk, held by the purge that leads it

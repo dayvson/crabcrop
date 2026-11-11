@@ -2378,13 +2378,11 @@ impl DeletionWait {
     }
 
     /// Wait while the deletions make progress (see
-    /// [`DiskStore::wait_deletions`]), then say whether every
-    /// one of them is done. One that failed is not.
-    pub async fn finished(&self, idle: std::time::Duration, cap: std::time::Duration) -> bool {
+    /// [`DiskStore::wait_deletions`]).
+    pub async fn wait(&self, idle: std::time::Duration, cap: std::time::Duration) -> Waited {
         self.store
             .wait_deletions(self.seqs.clone(), idle, cap)
-            .await;
-        !self.pending()
+            .await
     }
 }
 

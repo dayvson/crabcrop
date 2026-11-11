@@ -1021,6 +1021,136 @@ async fn a_purge_whose_disk_deletion_keeps_failing_still_ends() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Rewrite every ended tombstone in the bucket as if it had
+/// ended `ago_ms` ago: the clock moving on.
+fn age_ended_tombstones(fake: &crate::s3store::test_support::FakeS3, ago_ms: u64) {
+    let key = crate::url::entry_key(b"disk-key-test");
+    let mut objects = fake.objects.lock().unwrap();
+    for (name, data) in objects.iter_mut() {
+        if !name.starts_with("purges/") {
+            continue;
+        }
+        let mut tombstone = crate::storage::parse_tombstone(data, &key).unwrap();
+        if tombstone.ended_ms.is_some() {
+            tombstone.ended_ms = Some(crate::cache::now_ms() - ago_ms);
+            *data = crate::storage::serialize_tombstone(&tombstone, &key);
+        }
+    }
+}
+
+fn tombstones_ended(fake: &crate::s3store::test_support::FakeS3) -> Vec<bool> {
+    bucket_tombstones(fake)
+        .iter()
+        .map(|tombstone| tombstone.ended_ms.is_some())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_later_purge_of_the_target_keeps_its_tombstone_while_an_earlier_purges_file_is_left() {
+    // Issue #572 second review: the first purge's disk deletion
+    // fails, so its tombstone stays unended. A second purge of
+    // the target had no deletions of its own and marked its
+    // tombstone ended at once. That one superseded the first,
+    // a refresh collected the first, and a restart after the
+    // second's grace indexed the purged file and served it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-later-purge-held");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    store.put(KEY, &in_groups(&["g"]));
+    fail_unlinks(&store);
+    assert_eq!(purge_group_call(&base, "g").await, "purged 1\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the first purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert_eq!(purge_group_call(&base, "g").await, "purged 0\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the second purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert_eq!(
+        tombstones_ended(&fake),
+        [false, false],
+        "a tombstone ended with the purged file still there"
+    );
+    shared.refresh_tombstones(&state.purge_guard).await;
+    assert_eq!(tombstones_ended(&fake), [false, false]);
+    // Long after, a restart indexes the file again; the
+    // tombstones keep it a miss.
+    age_ended_tombstones(&fake, crate::cache::TOMBSTONE_GRACE_MS + 60_000);
+    {
+        let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+        let restarted_shared = restarted.shared_store.clone().unwrap();
+        restarted_shared
+            .refresh_tombstones(&restarted.purge_guard)
+            .await;
+        assert!(restarted.store.as_ref().unwrap().contains(KEY));
+        assert!(lookup_tiers(&restarted, KEY, &[]).await.is_none());
+    }
+    // Once the deletion goes through, both tombstones end.
+    store.set_hold(None);
+    let drained = store.clone();
+    tokio::task::spawn_blocking(move || drained.drain_now())
+        .await
+        .unwrap();
+    shared.end_held_purges().await;
+    assert_eq!(tombstones_ended(&fake), [true, true]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_purge_whose_disk_deletion_fails_once_ends_its_tombstone_once_the_file_is_gone() {
+    // Issue #572 second review: the end of a purge waited for
+    // its deletions only while they made progress, and none
+    // that had failed. A deletion that failed once and then
+    // went through on its retry left the tombstone unended for
+    // good, until a later purge of the target. The tombstone
+    // refresh now ends it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unlink-fails-once");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    store.put(KEY, &in_groups(&["g"]));
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook = failed.clone();
+    store.set_hold(Some(Arc::new(move |kind, _| {
+        if kind == OpKind::Unlink && !hook.swap(true, Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        Ok(())
+    })));
+    assert_eq!(purge_group_call(&base, "g").await, "purged 1\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert!(failed.load(Ordering::SeqCst));
+    start_purge_tombstones(&state).await;
+    let file = dir.join(format!("{}.bin", crate::storage::key_stem(KEY)));
+    within(
+        std::time::Duration::from_secs(15),
+        "the file to go and the tombstone to end",
+        async {
+            while file.exists() || tombstones_ended(&fake) != [true] {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        },
+    )
+    .await;
+    store.set_hold(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn a_purge_after_one_whose_disk_deletion_is_stuck_still_walks_the_bucket() {
     // The first purge's disk deletion is stuck. A bucket copy

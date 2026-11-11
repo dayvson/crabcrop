@@ -1440,42 +1440,45 @@ async fn walk_for_joined(
 /// failed to list the bucket or to answer for an object, so
 /// a copy the purge covers may still be there, and it must
 /// stay a miss after the grace. The tombstone is marked
-/// ended only once the purge's disk files are deleted (issue
-/// #572): a restart before then indexes them again, and the
-/// unended tombstone keeps them misses until a later purge of
-/// the target finishes. The wait for them is bounded: when a
-/// deletion fails, or they stop making progress, the purge
-/// ends with its tombstone in force, as for a walk that was
-/// not complete.
+/// ended only once the disk files of every purge of its
+/// target in this process are deleted (issue #572): a
+/// restart before then indexes them again, and the unended
+/// tombstone keeps them misses. The purge waits for its own
+/// while they make progress; when they stop, or one fails,
+/// it ends here, and its tombstone is marked by the
+/// tombstone refresh after they are gone.
 async fn end_purge(
     shared: &crate::s3store::S3Store,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
-    let deleted = match &purge.disk {
-        Some(disk) => disk.finished(PURGE_END_IDLE, PURGE_END_CAP).await,
-        None => true,
-    };
-    if complete
-        && deleted
-        && let Some(object) = &purge.tombstone
-    {
-        let mut ended = purge.active.tombstone().clone();
-        ended.ended_ms = Some(crate::cache::now_ms());
-        shared.write_tombstone(object, &ended).await;
+    if let Some(disk) = &purge.disk {
+        disk.wait(PURGE_END_IDLE, PURGE_END_CAP).await;
+    }
+    if complete && let Some(object) = &purge.tombstone {
+        shared.end_tombstone(object, purge.active.tombstone()).await;
     }
     drop(purge);
 }
 
 /// [`end_purge`], on a task of its own when the purge still
 /// waits for disk deletions (issue #572): the walk lease, and
-/// the purges that joined it, do not wait on the disk.
+/// the purges that joined it, do not wait on the disk. The
+/// deletions hold the target's tombstones first, before a
+/// later purge of the target can lead a walk and end. A purge
+/// with no tombstone to mark ended waits for nothing.
 async fn end_purge_apart(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
+    if let Some(disk) = &purge.disk {
+        shared.hold_for_deletions(&purge.active.tombstone().target, disk);
+    }
+    if !complete || purge.tombstone.is_none() {
+        return;
+    }
     if purge.disk.as_ref().is_some_and(|disk| disk.pending()) {
         let shared = shared.clone();
         background.spawn_walk(async move { end_purge(&shared, purge, complete).await });
@@ -1528,10 +1531,7 @@ async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
     let Some(disk) = disk else {
         return;
     };
-    let waited = disk
-        .store
-        .wait_deletions(disk.seqs.clone(), DISK_WRITE_WAIT, PURGE_DELETE_CAP)
-        .await;
+    let waited = disk.wait(DISK_WRITE_WAIT, PURGE_DELETE_CAP).await;
     if waited == crate::storage::Waited::Stalled {
         disk.store.note_stall(crate::storage::Stall::PurgeDelete);
     }
@@ -1549,7 +1549,9 @@ async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
 /// retries: the tier stays best-effort, like every other
 /// shared read. Serving does not start first: lookups
 /// consult the tombstones, so a request served before them
-/// could hand out a copy a purge removed.
+/// could hand out a copy a purge removed. Each refresh after
+/// boot first marks ended the tombstones that waited for disk
+/// deletions now done (issue #572).
 pub async fn start_purge_tombstones(state: &AppState) {
     let Some(shared) = state.shared_store.clone() else {
         return;
@@ -1566,6 +1568,7 @@ pub async fn start_purge_tombstones(state: &AppState) {
         tick.tick().await;
         loop {
             tick.tick().await;
+            shared.end_held_purges().await;
             shared.refresh_tombstones(&guard).await;
         }
     });
@@ -4079,8 +4082,9 @@ const PURGE_DELETE_CAP: std::time::Duration = std::time::Duration::from_secs(30)
 
 /// How long the end of a purge, in the background, waits for
 /// one of its disk deletions to finish (issue #572). When none
-/// does for that long, the purge ends with its bucket
-/// tombstone in force.
+/// does for that long, the purge ends, and its bucket
+/// tombstone is marked ended by the tombstone refresh once
+/// they are done.
 const PURGE_END_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the end of a purge waits for its disk deletions
