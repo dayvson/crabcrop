@@ -106,7 +106,7 @@ Run crabcrop behind a reverse proxy or CDN in production. The application bounds
 
 #### Container hardening
 
-The images run as user and group 65534 (nobody), given by number, so Kubernetes can check `runAsNonRoot` against it. They carry no curl. The `HEALTHCHECK` runs `crabcrop health`, which asks the server on the container's own port (`CRABCROP_PORT` or `PORT`) for `/health`. It exits 0 on a `200`, and 1 on any other answer or none within 2 seconds. Use it for your own checks inside the container too, such as `docker compose exec crabcrop crabcrop health`.
+The images run as user and group 65534 (nobody), given by number, so Kubernetes can check `runAsNonRoot` against it. They carry no curl. The `HEALTHCHECK` runs `crabcrop health`, which asks the server on the container's own port (`CRABCROP_PORT` or `PORT`) for `/health`, at the address `CRABCROP_BIND` names or at 127.0.0.1 by default. It exits 0 on a `200`, and 1 on any other answer or none within 2 seconds. Use it for your own checks inside the container too, such as `docker compose exec crabcrop crabcrop health`.
 
 The server needs no writable root filesystem. It writes to the disk tier's directory (`CRABCROP_RESULT_STORAGE_DIR`), to the upload directory (`CRABCROP_UPLOAD_DIR`) when one is set, and to the temporary directory (`TMPDIR`, else `/tmp`). There `frame:` stages the source and the video and PDF tools run, so only images that add those tools use it. Where a platform can make the root filesystem read-only, those directories need writable mounts.
 

@@ -7,9 +7,9 @@
 //! `CRABCROP_BASE` / `CRABCROP_SECRET` /
 //! `CRABCROP_SECRET_KEY_ID`, the same convention as the MCP
 //! server. `health` takes no flags: it probes the server on
-//! this host's port. The verbs use the server's own URL
-//! grammar, so what the CLI validates is what the server
-//! will do.
+//! this host's address and port. The verbs use the server's
+//! own URL grammar, so what the CLI validates is what the
+//! server will do.
 
 use crate::url::{
     Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, ParseError, Quality,
@@ -44,10 +44,11 @@ CLI verbs (flags go after the verb; see Flags below):
                                       (--expires <unix-seconds> mints an upload token
                                       that stops working at that second.)
   crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.
-  crabcrop health                     Check the server on this host: GET /health on 127.0.0.1 at
-                                      CRABCROP_PORT or PORT (default 3000). Prints the answer and
-                                      exits 0 when it is a 200, 1 otherwise. Takes no flags. The
-                                      images' HEALTHCHECK runs it.
+  crabcrop health                     Check the server on this host: GET /health at CRABCROP_PORT
+                                      or PORT (default 3000), on the address CRABCROP_BIND names
+                                      (127.0.0.1 when it is unset or 0.0.0.0, ::1 when it is ::).
+                                      Prints the answer and exits 0 when it is a 200, 1 otherwise.
+                                      Takes no flags. The images' HEALTHCHECK runs it.
 
 Flags (each value flag also takes the --flag=<value> spelling):
   --base <url>                        Server base URL. Env CRABCROP_BASE; default
@@ -388,7 +389,8 @@ pub async fn exec(args: &[String]) -> Result<String, CliError> {
             std::env::var("CRABCROP_PORT").ok(),
             std::env::var("PORT").ok(),
         )?;
-        return probe_health(port).await;
+        let address = health_address(std::env::var("CRABCROP_BIND").ok())?;
+        return probe_health(std::net::SocketAddr::new(address, port)).await;
     }
     let (config, positional) = parse_flags(&args[1..])?;
     if verb != "meta" && (config.placeholders || config.detections) {
@@ -949,19 +951,42 @@ fn health_port(crabcrop_port: Option<String>, port: Option<String>) -> Result<u1
     }
 }
 
-/// `GET /health` on 127.0.0.1 at `port` (issue #592): the
-/// trimmed body on a 200, else the status error, or the
-/// request error when nothing answers in [`HEALTH_TIMEOUT`].
-/// It uses no proxy, so a proxy set for source fetches never
-/// carries a loopback probe.
-async fn probe_health(port: u16) -> Result<String, CliError> {
+/// The address `health` probes: the one the server listens
+/// on, read from `CRABCROP_BIND` as the server reads it. A
+/// server on every interface (unset, `0.0.0.0` or `::`)
+/// answers on loopback, so those probe 127.0.0.1 or ::1.
+/// Any other address is probed as named: a server bound to
+/// one address does not answer on loopback. A value that is
+/// not an address is an error naming the variable, as at
+/// the server's boot.
+fn health_address(bind: Option<String>) -> Result<std::net::IpAddr, CliError> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let Some(value) = bind else {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    };
+    match value.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) if v4.is_unspecified() => Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        Ok(IpAddr::V6(v6)) if v6.is_unspecified() => Ok(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        Ok(address) => Ok(address),
+        Err(_) => Err(CliError::Invalid(format!(
+            "invalid CRABCROP_BIND: {value:?}"
+        ))),
+    }
+}
+
+/// `GET /health` at `address` (issue #592): the trimmed
+/// body on a 200, else the status error, or the request
+/// error when nothing answers in [`HEALTH_TIMEOUT`]. It uses
+/// no proxy, so a proxy set for source fetches never
+/// carries a probe of the server on this host.
+async fn probe_health(address: std::net::SocketAddr) -> Result<String, CliError> {
     let client = reqwest::Client::builder()
         .timeout(HEALTH_TIMEOUT)
         .no_proxy()
         .build()
         .map_err(CliError::Client)?;
     let response = client
-        .get(format!("http://127.0.0.1:{port}/health"))
+        .get(format!("http://{address}/health"))
         .send()
         .await
         .map_err(CliError::Request)?;
@@ -1994,20 +2019,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn health_probes_the_address_the_server_binds() {
+        // `CRABCROP_BIND` (issue #592) can name one address. A
+        // server bound to it does not answer on loopback, so
+        // the probe goes to that address. Every-interface
+        // binds answer on loopback of their family.
+        let some = |v: &str| Some(v.to_string());
+        let ip = |v: &str| v.parse::<std::net::IpAddr>().unwrap();
+        for (bind, probed) in [
+            (None, "127.0.0.1"),
+            (some("0.0.0.0"), "127.0.0.1"),
+            (some("::"), "::1"),
+            (some("127.0.0.1"), "127.0.0.1"),
+            (some("127.0.0.2"), "127.0.0.2"),
+            (some("10.1.2.3"), "10.1.2.3"),
+            (some("::1"), "::1"),
+            (some("fd00::5"), "fd00::5"),
+        ] {
+            assert_eq!(
+                health_address(bind.clone()).unwrap(),
+                ip(probed),
+                "{bind:?}"
+            );
+        }
+        // A value the server refuses at boot is an error here
+        // too, naming the variable: no fallback to loopback.
+        for (bind, message) in [
+            ("", "invalid CRABCROP_BIND: \"\""),
+            ("localhost", "invalid CRABCROP_BIND: \"localhost\""),
+            (
+                "127.0.0.1:3000",
+                "invalid CRABCROP_BIND: \"127.0.0.1:3000\"",
+            ),
+        ] {
+            let err = health_address(some(bind)).unwrap_err();
+            assert!(matches!(&err, CliError::Invalid(_)), "{err:?}");
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
     #[tokio::test]
     async fn health_passes_a_200_and_fails_anything_else() {
-        let port = |base: &str| base.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        let address = |base: &str| {
+            base.trim_start_matches("http://")
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+        };
         let base = answer_once("200 OK", "ok\n").await;
-        assert_eq!(probe_health(port(&base)).await.unwrap(), "ok");
+        assert_eq!(probe_health(address(&base)).await.unwrap(), "ok");
         // Another answer is a failure, a success status included.
         let base = answer_once("503 Service Unavailable", "draining").await;
-        let err = probe_health(port(&base)).await.unwrap_err();
+        let err = probe_health(address(&base)).await.unwrap_err();
         assert_eq!(err.to_string(), "HTTP 503 Service Unavailable: draining");
         let base = answer_once("204 No Content", "").await;
-        let err = probe_health(port(&base)).await.unwrap_err();
+        let err = probe_health(address(&base)).await.unwrap_err();
         assert!(matches!(err, CliError::Status { .. }), "{err:?}");
         // Nothing listening (port 9, as above).
-        let err = probe_health(9).await.unwrap_err();
+        let err = probe_health(address("http://127.0.0.1:9"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, CliError::Request(_)), "{err:?}");
         // The verb gives up before the images' HEALTHCHECK
         // (`--timeout=3s`) does, so a slow server fails with

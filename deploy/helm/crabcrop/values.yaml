@@ -75,7 +75,7 @@ onlyPresets: false
 #     CRABCROP_CACHE_MAX_MB: "512"
 #     CRABCROP_METADATA: "preserve"
 # The one default below is the evaluation source posture
-# (see the README's Configuration section).
+# (see docs/configuration.md).
 env:
   CRABCROP_BLOCK_PRIVATE_SOURCES: "1"
 

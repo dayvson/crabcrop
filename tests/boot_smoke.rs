@@ -1586,6 +1586,93 @@ fn crabcrop_bind_listens_on_the_named_address_only() {
 }
 
 #[test]
+fn health_probes_pass_under_the_tightest_connection_bounds() {
+    // Issues #592 and #607: the images' HEALTHCHECK runs
+    // `crabcrop health`, and the Kubernetes and platform
+    // recipes probe `GET /health` over HTTP. A probe sends
+    // its whole head at once and closes after the answer, so
+    // the smallest header and idle timeouts do not cut it
+    // off, and its slot frees when it closes: with a cap of
+    // one connection, probe after probe still passes.
+    let (_server, port, _) = serving(&[
+        ("CRABCROP_HEADER_TIMEOUT_SECS", "1"),
+        ("CRABCROP_IDLE_TIMEOUT_SECS", "1"),
+        ("CRABCROP_MAX_CONNECTIONS", "1"),
+    ]);
+    let started = Instant::now();
+    let port_text = port.to_string();
+    for _ in 0..3 {
+        let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg("health")
+            .env_clear()
+            .env("PORT", &port_text)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+    }
+    // A kubelet probe: HTTP/1.1 with `Connection: close`.
+    for _ in 0..3 {
+        let mut stream = connect(port);
+        stream
+            .write_all(
+                b"GET /health HTTP/1.1\r\nHost: 10.0.0.1:3000\r\nUser-Agent: kube-probe/1.31\r\n\
+                  Accept: */*\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(status_line(port, "/health", "").contains("200"));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_health_verb_probes_the_address_crabcrop_bind_names() {
+    // Issues #592 and #607: `crabcrop health` probed
+    // 127.0.0.1, and a server bound to one other address
+    // does not answer there, so the images' HEALTHCHECK
+    // failed on a healthy server. The verb reads
+    // CRABCROP_BIND as the server does and probes that
+    // address. 127.0.0.2 is a loopback address on Linux.
+    let (_server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+    let health = |vars: &[(&str, &str)]| {
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg("health")
+            .env_clear()
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap()
+    };
+    let port = port.to_string();
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "127.0.0.2")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    // Without the setting the verb probes 127.0.0.1, where
+    // this server does not listen.
+    let out = health(&[("PORT", &port)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
+    // A value the server refuses is an error here too.
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "localhost")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_BIND: \"localhost\""),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn bad_connection_settings_stop_the_boot_naming_the_variable() {
     // Issue #607 and #592: each new setting is checked at
     // boot like the others. An empty CRABCROP_BIND, as a
