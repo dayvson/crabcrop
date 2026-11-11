@@ -108,7 +108,12 @@ const MAX_RASTER_SIDE: u32 = crate::engine::MAX_DECODE_DIMENSION;
 /// The environment the worker keeps: only what the system
 /// font lookup reads (fontdb and fontconfig), so text renders
 /// with the fonts the server would use. Everything else, the
-/// server's secrets and credentials included, is cleared.
+/// server's secrets and credentials included, is cleared, so
+/// the worker is not handed them. That alone does not keep
+/// them from a compromised worker, which runs as the server's
+/// user: the server's non-dumpable mark (issue #605) keeps it
+/// out of the server's `/proc` files, but not out of the
+/// files the server can read. See SECURITY.md.
 const FONT_ENV: &[&str] = &[
     "HOME",
     "XDG_CONFIG_HOME",

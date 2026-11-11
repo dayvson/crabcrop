@@ -52,6 +52,10 @@ fn main() {
     if crabcrop::svg::is_worker_invocation() {
         std::process::exit(crabcrop::svg::worker_main());
     }
+    // The worker branched off above and stays dumpable: its
+    // environment holds no secret, and it sets its own OOM
+    // score through `/proc`.
+    not_dumpable();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -70,6 +74,27 @@ fn main() {
     // wait for that work without bound, past the deadline.
     if let Some(deadline) = runtime.block_on(start()) {
         runtime.shutdown_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+/// Mark the process non-dumpable on Linux (issue #605),
+/// before any child starts. The children the server starts
+/// (the SVG and AVIF worker, and the tools) run as its user.
+/// Without this, a compromised child could read the server's
+/// secrets from `/proc/<pid>/environ`, read its memory, or
+/// attach to it. Now only a privileged process can, such as
+/// one with `CAP_SYS_PTRACE`, and the server leaves no core
+/// dump. A child is dumpable again after its exec, so the
+/// server can still set a tool's OOM score, and the worker
+/// its own. This does not stop a child from signalling the
+/// server or reading its files: only a separate user or a
+/// sandbox would (see SECURITY.md).
+fn not_dumpable() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(e) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        eprintln!("crabcrop: cannot mark the process non-dumpable: {e}");
     }
 }
 

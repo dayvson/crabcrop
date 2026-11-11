@@ -42,6 +42,20 @@
 //! #447) caps itself instead, with `limit_self` as it
 //! starts: `setrlimit` on oneself has no startup window
 //! and works on macOS as well.
+//!
+//! What the empty environment does and does not do (issue
+//! #605): the server's secrets are not passed to a tool, in
+//! its argv or its environment. It is not a sandbox. A tool
+//! runs as the server's user, so a tool that a hostile
+//! source compromises can signal the server and read or
+//! write whatever the server can: the presets and source
+//! roots files, the C2PA key, the disk result tier. On
+//! Linux the server marks itself non-dumpable at startup,
+//! which keeps such a tool out of the server's `/proc`
+//! files (its environment and memory). A tool whose program
+//! the server's user can read is dumpable again after its
+//! exec, so the OOM score write above still works.
+//! SECURITY.md records this.
 
 use std::fs::File;
 use std::io::{Read, Write};

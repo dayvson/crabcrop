@@ -18,6 +18,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The TypeScript SDK's explainer and builders now trim class names as the server does (issue #537). They used JavaScript's `String.prototype.trim`, which disagrees with Rust's `str::trim` on two characters: it strips U+FEFF, which the server keeps, and it keeps U+0085, which the server strips. The explainer passed a class name wrapped in `%EF%BB%BF`, which the server refuses with `400`, and refused one wrapped in `%C2%85`, which the server accepts. Now it agrees with the server on both. The builders (`filter.blurClass`, `filter.pixelateClass`, `filter.recolorClass` and `ops.cropObjects`) dropped a U+FEFF around a class name and built a working URL for the bare name. Now they throw, as the server refuses that name. They threw on a name wrapped in U+0085. Now they build the bare name, as the server trims it to that. The explainer's trim of its whole input, which mirrors the CLI's, uses the server's set too. The verdict corpus and the generated operation vectors cover both characters on the parser, explainer, and builder sides.
 
+### Security
+
+- On Linux the server marks itself non-dumpable at startup (issue #605). Its children (the SVG and AVIF worker, and the video and PDF tools when configured) run as the server's user, and a child that a hostile source took over could read the server's environment, `CRABCROP_SECRET` and the bucket credentials included, from `/proc/<pid>/environ`, and its memory where Yama allows. A child without capabilities, as the images run it, now cannot. Two side effects: the server leaves no core dump, and unprivileged tools that run as the server's user (a debugger, a profiler, a process exporter, a `kubectl exec` shell) can no longer read its `/proc` files. The children still run as the server's user, with no sandbox, so a child that is taken over can still signal the server and reach its files. SECURITY.md now says what a child can and cannot reach, and docs/media.md no longer suggests that the empty environment keeps secrets from it. Rendered bytes are unchanged.
+
 ## [0.11.0] - 2026-11-10
 
 ### Changed

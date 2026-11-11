@@ -57,3 +57,33 @@ resource limits that protect the service.
 Out of scope: vulnerabilities in third-party dependencies (please report those
 upstream, though a heads-up is welcome), and issues that require a
 misconfiguration the documentation explicitly warns against.
+
+## Child processes
+
+The server does some work in child processes: the SVG and AVIF worker, and,
+when they are configured, the video encoder, the video frame decoder, and the
+PDF tools. A hostile source that exploits a bug in one of their decoders takes
+over the child, not the server. Each child:
+
+- starts with an empty environment (the worker keeps only the font variables),
+  so it is not handed the server's secrets;
+- runs in its own process group, under a wall-clock limit and, on Linux, kernel
+  limits on address space and CPU time.
+
+On Linux the server marks itself non-dumpable at startup (issue #605). A child
+then cannot read the server's environment or memory through `/proc`, or attach
+to it. This holds for a child without capabilities, as the images run the
+server: as `nobody`, with none. A privileged process, such as one with
+`CAP_SYS_PTRACE`, can still read them. The mark has two side effects: the
+server leaves no core dump, and unprivileged tools that run as the server's
+user (a debugger, a profiler, a process exporter) can no longer read its
+`/proc` files. If the kernel refuses the mark, the server says so on stderr and
+starts anyway.
+
+The children still run as the server's user, with no sandbox. A compromised
+child can signal the server and read or write any file the server can: the
+presets and source roots files, the C2PA signing key (`CRABCROP_C2PA_KEY`), and
+the disk result tier (`CRABCROP_RESULT_STORAGE_DIR`). Running children under a
+separate user or in a sandbox (seccomp or Landlock) is not decided yet; issue
+#605 tracks it. Until then, configure only the tools you need, and give the
+server's user no files it does not need.
