@@ -2544,8 +2544,8 @@ fn decode_webp_frames(
 
 /// Encode frames as an animated WebP through libwebp's
 /// animated encoder (the `webp` crate's `AnimEncoder`, method
-/// 4; issue #323). The pure-Rust alternative (oxideav-webp)
-/// writes lossless VP8L frames only and has no lossy
+/// 4 by default; issue #323). The pure-Rust alternative
+/// (oxideav-webp) writes lossless VP8L frames only and has no lossy
 /// animation mode, so animated output through it has no
 /// quality lever, and a cold encode of a real animation ran past the
 /// 600 s processing deadline on the production soak host
@@ -2624,6 +2624,20 @@ fn encode_animated_webp(
     } else {
         0
     };
+    // libwebp's animation options (`minimize_size`,
+    // `allow_mixed`, `kmin`/`kmax`) stay at their defaults
+    // (issue #340). The `webp` crate fills them in inside
+    // `try_encode` and exposes none of them, and reaching
+    // them needs unsafe FFI, which `#![forbid(unsafe_code)]`
+    // rules out. Measured through libwebp-sys,
+    // `minimize_size` is the one that matters: 13.0% fewer bytes (75,826
+    // against 87,164) and +0.21 dB, for 46% more encode time
+    // (1,031 ms against 708 ms). `allow_mixed` left photo
+    // content byte-identical, kmax 17 with kmin 9 saved 1.2%,
+    // and both flags together took 10.2x the time of
+    // `minimize_size` alone for the same bytes. That saving
+    // is not worth a new unsafe FFI surface plus a fork of
+    // the crate's assemble path, so the defaults stay.
     let mut encoder = webp::AnimEncoder::new(width, height, &config);
     encoder.set_loop_count(i32::from(loop_count));
     for (frame, delay_ms) in frames.iter().zip(&delays_ms) {
