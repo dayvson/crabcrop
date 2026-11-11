@@ -260,8 +260,8 @@ const _: fn() = || {
     trait AmbiguousIfClone<A> {
         fn check() {}
     }
-    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-    impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+    impl<T> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
     <AppState as AmbiguousIfClone<_>>::check();
 };
 
