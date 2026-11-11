@@ -725,16 +725,12 @@ pub(in crate::server) async fn run_process(
         // watermarked requests must not run ungated on the
         // runtime workers, and a decoder panic on crafted
         // watermark bytes is contained by the same
-        // catch_unwind as the engine run (audit R2-16).
+        // catch_unwind as the engine run (audit R2-16). They
+        // share one decoded-memory budget, and the deadline is
+        // checked before each one (issue #613).
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut watermarks = crate::filters::WatermarkImages::new();
-            for (url, wm_bytes) in &job.watermark_sources.images {
-                // An AVIF watermark decodes in the capped worker
-                // under the request deadline, like the source
-                // (issue #522).
-                let img = crate::engine::decode_source_image(wm_bytes, Some(deadline))?;
-                watermarks.insert(url.clone(), img);
-            }
+            let watermarks =
+                crate::engine::decode_watermarks(&job.watermark_sources.images, Some(deadline))?;
             let ctx = crate::engine::ProcessContext {
                 preferred: job.preferred,
                 watermarks: Some(&watermarks),

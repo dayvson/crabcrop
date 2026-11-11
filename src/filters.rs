@@ -66,7 +66,79 @@ impl EncodeOptions {
 /// Watermark images resolved by the server, keyed by the URL
 /// the request referenced. The engine only ever sees pixels;
 /// fetching happens outside it.
-pub type WatermarkImages = std::collections::HashMap<String, DynamicImage>;
+pub type WatermarkImages = std::collections::HashMap<String, WatermarkImage>;
+
+/// One decoded watermark or overlay image (issue #604). The
+/// composite reads RGBA pixels. An image that decoded as RGBA
+/// is read in place. Any other is copied to RGBA once, the
+/// first time a composite draws it, and the copy is kept for
+/// the rest of the request, so an animated source does not
+/// copy it again for every frame. The decoded image stays as
+/// it is, because `overlay(...,width)` resizes that one.
+#[derive(Debug)]
+pub struct WatermarkImage {
+    image: DynamicImage,
+    rgba: std::sync::OnceLock<image::RgbaImage>,
+    /// How many RGBA copies were made: at most one.
+    #[cfg(test)]
+    conversions: std::sync::atomic::AtomicUsize,
+}
+
+impl WatermarkImage {
+    pub fn new(image: DynamicImage) -> Self {
+        WatermarkImage {
+            image,
+            rgba: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            conversions: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The image as it decoded.
+    pub fn image(&self) -> &DynamicImage {
+        &self.image
+    }
+
+    /// The image's RGBA pixels: the decoded ones when they
+    /// are RGBA already, otherwise the copy, made on the
+    /// first call.
+    pub fn rgba(&self) -> &image::RgbaImage {
+        if let Some(pixels) = self.image.as_rgba8() {
+            return pixels;
+        }
+        self.rgba.get_or_init(|| {
+            #[cfg(test)]
+            self.conversions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.image.to_rgba8()
+        })
+    }
+
+    /// The most memory this image holds (issue #613): its
+    /// decoded pixels, plus the RGBA copy when it did not
+    /// decode as RGBA, counted whether or not the copy has
+    /// been made yet.
+    pub fn held_bytes(&self) -> u64 {
+        let decoded = self.image.as_bytes().len() as u64;
+        if self.image.as_rgba8().is_some() {
+            decoded
+        } else {
+            decoded + self.image.width() as u64 * self.image.height() as u64 * 4
+        }
+    }
+
+    /// How many RGBA copies were made.
+    #[cfg(test)]
+    pub(crate) fn conversions(&self) -> usize {
+        self.conversions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl From<DynamicImage> for WatermarkImage {
+    fn from(image: DynamicImage) -> Self {
+        WatermarkImage::new(image)
+    }
+}
 
 /// The sigma a `Filter::Blur` applies with. The parser caps
 /// sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,

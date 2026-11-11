@@ -268,6 +268,11 @@ fn parse_error_codes_are_the_frozen_v2_set() {
         ParseError::ExpansionTooLong(MAX_EXPANDED_LEN + 1).code(),
         "unsupported_operation"
     );
+    // So is a request over the watermark URL cap (issue #613).
+    assert_eq!(
+        ParseError::TooManyWatermarks(MAX_WATERMARK_URLS + 1).code(),
+        "unsupported_operation"
+    );
 }
 
 #[test]
@@ -2305,6 +2310,52 @@ fn watermark_urls_are_distinct_and_ordered() {
         RequestDirectives::analyze(&ops).watermark_urls,
         ["a/1.png", "b/2.png"]
     );
+}
+
+#[test]
+fn distinct_watermark_urls_are_capped() {
+    // Issue #613: each distinct watermark or overlay URL is one
+    // fetch and one decode, so a request may name at most
+    // MAX_WATERMARK_URLS of them. They count as the server
+    // fetches them, by exact string: a repeat counts once, each
+    // `?v=` variant of one object counts again, and watermark
+    // and overlay URLs share the cap.
+    let parse = |filters: &[String]| {
+        parse_operations(&format!(
+            "filters:{}/example.com/img.jpg",
+            filters.join(":")
+        ))
+        .unwrap()
+        .0
+    };
+    let variant = |i: usize| {
+        if i.is_multiple_of(2) {
+            format!("watermark(wm.png%3Fv%3D{i},0,0,50)")
+        } else {
+            format!("overlay(wm.png%3Fv%3D{i},0,0,50,normal)")
+        }
+    };
+    let at_cap: Vec<String> = (0..MAX_WATERMARK_URLS).map(variant).collect();
+    assert_eq!(
+        RequestDirectives::analyze(&parse(&at_cap))
+            .watermark_urls
+            .len(),
+        MAX_WATERMARK_URLS
+    );
+    assert!(check_watermark_count(&parse(&at_cap)).is_ok());
+    let twice: Vec<String> = at_cap.iter().chain(&at_cap).cloned().collect();
+    assert!(check_watermark_count(&parse(&twice)).is_ok());
+    let mut over = at_cap;
+    over.push(variant(MAX_WATERMARK_URLS));
+    let err = check_watermark_count(&parse(&over)).unwrap_err();
+    assert_eq!(err, ParseError::TooManyWatermarks(MAX_WATERMARK_URLS + 1));
+    assert_eq!(err.code(), "unsupported_operation");
+    assert_eq!(
+        err.to_string(),
+        "request names 17 distinct watermark and overlay URLs, over the 16 URL limit"
+    );
+    // A request with no watermark passes.
+    assert!(check_watermark_count(&parse(&["invert".to_string()])).is_ok());
 }
 
 #[test]

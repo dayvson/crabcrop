@@ -186,6 +186,76 @@ pub(crate) fn decode_source_image(
     decode_image(bytes)
 }
 
+/// The most memory the decoded watermark and overlay images
+/// of one request may hold together (issue #613): twice the
+/// decode allocation limit, so the largest image the limits
+/// admit fits with its RGBA copy (see
+/// [`crate::filters::WatermarkImage::held_bytes`]).
+pub(crate) const MAX_WATERMARK_BYTES: u64 = 2 * MAX_DECODE_ALLOC;
+
+/// Decode a request's watermark and overlay images, keyed by
+/// URL, within [`MAX_WATERMARK_BYTES`] (issue #613). Each
+/// image used to be bounded alone, so a request naming many
+/// large ones held all of them at once.
+pub(crate) fn decode_watermarks(
+    sources: &[(String, Vec<u8>)],
+    deadline: Option<std::time::Instant>,
+) -> Result<crate::filters::WatermarkImages, EngineError> {
+    decode_watermarks_within(sources, deadline, MAX_WATERMARK_BYTES)
+}
+
+/// [`decode_watermarks`] against any budget. Each image is
+/// charged before it decodes, at four bytes a pixel of the
+/// size its header declares, and again after, at what it
+/// holds. The deadline is checked before each decode.
+fn decode_watermarks_within(
+    sources: &[(String, Vec<u8>)],
+    deadline: Option<std::time::Instant>,
+    budget: u64,
+) -> Result<crate::filters::WatermarkImages, EngineError> {
+    let over = |need: u64| {
+        EngineError::Unsupported(format!(
+            "watermark and overlay images would hold {need} bytes decoded, over the {budget} byte limit"
+        ))
+    };
+    let mut images = crate::filters::WatermarkImages::new();
+    let mut held: u64 = 0;
+    for (url, bytes) in sources {
+        state::check_deadline(deadline)?;
+        if let Some((width, height)) = declared_size(bytes) {
+            let need = held.saturating_add(width as u64 * height as u64 * 4);
+            if need > budget {
+                return Err(over(need));
+            }
+        }
+        // An AVIF watermark decodes in the capped worker under
+        // the request deadline, like the source (issue #522).
+        let image = crate::filters::WatermarkImage::new(decode_source_image(bytes, deadline)?);
+        held = held.saturating_add(image.held_bytes());
+        if held > budget {
+            return Err(over(held));
+        }
+        images.insert(url.clone(), image);
+    }
+    Ok(images)
+}
+
+/// The size an image's header declares, read without a
+/// decode, for the formats a watermark can be. `None` when
+/// the header states none; the decode limits still bound
+/// such an image.
+fn declared_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    match probe_kind(bytes) {
+        "jxl" => jxl_dimensions(bytes),
+        "avif" => crate::avif::declared_size(bytes),
+        "svg" | "heic" | "video" | "pdf" | "unknown" => None,
+        _ => image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()
+            .and_then(|probe| probe.into_dimensions().ok()),
+    }
+}
+
 /// JPEG decode through zune-jpeg directly: the same decoder
 /// the image crate wraps, with the same options the wrapper
 /// uses, minus the wrapper's input copy, header pre-pass, and
@@ -4487,7 +4557,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     .ok_or_else(|| {
                         EngineError::Unsupported(format!("watermark was not resolved: {url}"))
                     })?;
-                img = overlay_watermark(&img, wm, *x, *y, *alpha);
+                img = overlay_watermark(self.ctx, &img, wm, *x, *y, *alpha)?;
             }
             Filter::Overlay {
                 url,
@@ -5031,16 +5101,19 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 fn blend_overlay(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
-    ov: &DynamicImage,
+    ov: &crate::filters::WatermarkImage,
     x: i32,
     y: i32,
     alpha: u8,
     mode: crate::url::BlendMode,
     width_pct: Option<u32>,
 ) -> Result<DynamicImage, EngineError> {
-    let scaled;
-    let ov = match width_pct {
+    // The deadline is checked before anything is copied or
+    // scaled, as well as per row of the blend (issue #604).
+    ctx.check_deadline()?;
+    let target = match width_pct {
         Some(pct) => {
+            let ov = ov.image();
             let target = ((base.width() as u64 * pct as u64) / 100).max(1);
             // The scaled height follows the overlay's aspect
             // with no bound of its own, so an extreme aspect
@@ -5056,21 +5129,34 @@ fn blend_overlay(
                     "scaled overlay {target}x{scaled_h} exceeds the {MAX_OUTPUT_PIXELS} pixel limit"
                 )));
             }
-            scaled = ov.resize(
-                target as u32,
-                u32::MAX,
-                image::imageops::FilterType::Lanczos3,
-            );
+            Some(target as u32)
+        }
+        None => None,
+    };
+    // An overlay that lands off the canvas is neither scaled
+    // nor copied (issue #604).
+    if !lands_on((base.width(), base.height()), (x, y)) {
+        return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
+    }
+    // The scaled overlay is converted to RGBA after the
+    // resize, as before: the resize reads the decoded image.
+    let scaled;
+    let top = match target {
+        Some(target) => {
+            scaled = ov
+                .image()
+                .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
+                .into_rgba8();
             &scaled
         }
-        None => ov,
+        None => ov.rgba(),
     };
     // The blend walks every overlay pixel; a large legal pair
     // still runs long, so the deadline is honored per row
     // (issue #358).
     composite(
         base,
-        &ov.to_rgba8(),
+        top,
         (x, y),
         alpha,
         || ctx.check_deadline(),
@@ -5083,17 +5169,42 @@ fn blend_overlay(
 /// Negative coordinates anchor from the right/bottom edges
 /// (x = -1 puts the watermark's right edge one pixel from the
 /// base's right edge). Parts falling outside the base are
-/// clipped, never a panic.
+/// clipped, never a panic. The deadline is checked before
+/// anything is copied and per row of the composite, as the
+/// overlay checks it (issue #604), and a watermark that lands
+/// off the canvas is not copied at all.
 fn overlay_watermark(
+    ctx: &ProcessContext<'_>,
     base: &DynamicImage,
-    wm: &DynamicImage,
+    wm: &crate::filters::WatermarkImage,
     x: i32,
     y: i32,
     alpha: u8,
-) -> DynamicImage {
-    let no_check = || Ok::<(), std::convert::Infallible>(());
-    let Ok(out) = composite(base, &wm.to_rgba8(), (x, y), alpha, no_check, |_, o| o);
-    out
+) -> Result<DynamicImage, EngineError> {
+    ctx.check_deadline()?;
+    if !lands_on((base.width(), base.height()), (x, y)) {
+        return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
+    }
+    composite(
+        base,
+        wm.rgba(),
+        (x, y),
+        alpha,
+        || ctx.check_deadline(),
+        |_, o| o,
+    )
+}
+
+/// Whether an image placed at (x, y) on a base of
+/// `(width, height)` covers any base pixel, by the anchoring
+/// rule [`composite`] follows. The answer does not depend on
+/// the placed image's size, as long as it has a pixel: a
+/// coordinate of 0 or more must fall inside the base, and a
+/// negative one, which anchors the far edge that many pixels
+/// in from the base's far edge, must be less than the base's
+/// extent. So it can be asked before an overlay is scaled.
+fn lands_on((width, height): (u32, u32), (x, y): (i32, i32)) -> bool {
+    x.unsigned_abs() < width && y.unsigned_abs() < height
 }
 
 /// The anchor, clip, and alpha loop the overlay and the
@@ -5104,8 +5215,9 @@ fn overlay_watermark(
 /// alpha times `alpha` percent, and each color channel moves
 /// that far toward `blend(base, top)`, the per-pixel blend of
 /// the base channel and the top one; the base alpha channel is
-/// kept. `each_row` runs before each row of `top`, where the
-/// overlay checks its deadline.
+/// kept. Only the rows and columns of `top` that land on
+/// `base` are walked (issue #604), and `each_row` runs before
+/// each of those rows, where the callers check the deadline.
 fn composite<E>(
     base: &DynamicImage,
     top: &image::RgbaImage,
@@ -5115,31 +5227,26 @@ fn composite<E>(
     blend: impl Fn(f32, f32) -> f32,
 ) -> Result<DynamicImage, E> {
     let mut out = base.to_rgba8();
-    let left = if x >= 0 {
-        x as i64
-    } else {
-        out.width() as i64 - top.width() as i64 + x as i64
-    };
-    let upper = if y >= 0 {
-        y as i64
-    } else {
-        out.height() as i64 - top.height() as i64 + y as i64
-    };
-    let opacity = alpha as f32 / 100.0;
     let (bw, bh) = (out.width() as i64, out.height() as i64);
-    for ty in 0..top.height() as i64 {
+    let (tw, th) = (top.width() as i64, top.height() as i64);
+    let left = if x >= 0 { x as i64 } else { bw - tw + x as i64 };
+    let upper = if y >= 0 { y as i64 } else { bh - th + y as i64 };
+    // The top's columns and rows that land on the base.
+    let columns = (-left).max(0)..(bw - left).min(tw);
+    let rows = (-upper).max(0)..(bh - upper).min(th);
+    if columns.is_empty() || rows.is_empty() {
+        return Ok(DynamicImage::ImageRgba8(out));
+    }
+    let opacity = alpha as f32 / 100.0;
+    for ty in rows {
         each_row()?;
-        for tx in 0..top.width() as i64 {
-            let (bx, by) = (left + tx, upper + ty);
-            if bx < 0 || by < 0 || bx >= bw || by >= bh {
-                continue;
-            }
+        for tx in columns.clone() {
             let top_px = top.get_pixel(tx as u32, ty as u32);
             let a = opacity * (top_px[3] as f32 / 255.0);
             if a <= 0.0 {
                 continue;
             }
-            let bot = out.get_pixel_mut(bx as u32, by as u32);
+            let bot = out.get_pixel_mut((left + tx) as u32, (upper + ty) as u32);
             for c in 0..3 {
                 let blended = blend(bot[c] as f32, top_px[c] as f32);
                 bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
