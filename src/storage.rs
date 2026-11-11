@@ -396,12 +396,10 @@ impl Inner {
             if let Some((_, waits)) = self.deletion_waits.range(..=seq).next_back() {
                 for (end, count) in waits {
                     if seq < *end {
-                        let _ =
-                            count
-                                .left
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                                    left.checked_sub(1)
-                                });
+                        // Only this, under the index lock, writes
+                        // the count; the wait only reads it.
+                        let left = count.left.load(Ordering::Relaxed);
+                        count.left.store(left.saturating_sub(1), Ordering::Relaxed);
                         count.wake.notify_one();
                     }
                 }
