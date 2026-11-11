@@ -8,7 +8,8 @@ sites in scripts/version_sites.py, and the version tools themselves. It
 then bumps the copy with its own bump_version.py and reads it back with
 its own check_versions.py, as a release does (RELEASING.md, step 2). The
 copy also carries CHANGELOG.md and an empty changelog.d/, since the bump
-assembles the release's CHANGELOG section (RELEASING.md, step 1).
+assembles the release's CHANGELOG section (RELEASING.md, step 1); the
+release notes, fragments included, stay out of the leftover scan.
 Run directly: python3 scripts/test_version_tools.py
 """
 import json
@@ -115,22 +116,30 @@ class VersionToolsTest(unittest.TestCase):
         self.assertEqual(self.problems, [], "the working tree's own version sites disagree")
         self.tmp = tempfile.TemporaryDirectory(prefix="crabcrop-version-tools-")
         self.tree = Path(self.tmp.name)
-        files = set(carriers(self.version)) | {site.path for site in version_sites.SITES}
+        self.files = self.copy(carriers(self.version))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def copy(self, found):
+        """Copy the tracked files `found` (the carriers), the version
+        sites and the tools into the empty self.tree, and return the
+        ones the leftover scan reads, sorted."""
+        files = set(found) | {site.path for site in version_sites.SITES}
         files |= {f"scripts/{tool}" for tool in TOOLS}
         # Release notes name every version, and moving them is the
         # changelog's job (RELEASING.md, step 1): the copy carries the
         # CHANGELOG for the bump to assemble, outside the leftover scan,
-        # and no fragments but the ones a case writes.
-        files.discard("CHANGELOG.md")
+        # and no fragments but the ones a case writes. A tracked fragment
+        # that names the current version is a carrier too; the bump
+        # would assemble and delete it, so it stays out of the copy.
+        files = {rel for rel in files if rel != "CHANGELOG.md" and not rel.startswith("changelog.d/")}
         for rel in files | {"CHANGELOG.md"}:
             target = self.tree / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / rel).read_bytes())
         (self.tree / "changelog.d").mkdir()
-        self.files = sorted(files)
-
-    def tearDown(self):
-        self.tmp.cleanup()
+        return sorted(files)
 
     def run_tool(self, name, *args):
         done = subprocess.run(
@@ -228,6 +237,24 @@ class VersionToolsTest(unittest.TestCase):
             if line.startswith("- "):
                 self.assertIn(line, released)
         self.assertEqual(sorted(p.name for p in (self.tree / "changelog.d").iterdir()), ["README.md"])
+
+    def test_a_fragment_that_names_the_version_is_no_leftover(self):
+        # `git grep` lists a tracked changelog.d/ file that names the
+        # current version (a fragment saying "a regression from X.Y.Z",
+        # or the README) with the carriers. The copy leaves it out, as it
+        # does CHANGELOG.md, and the release notes are no leftover.
+        fresh = tempfile.TemporaryDirectory(prefix="crabcrop-version-tools-")
+        self.addCleanup(fresh.cleanup)
+        self.tree = Path(fresh.name)
+        self.files = self.copy([*carriers(self.version), "changelog.d/README.md"])
+        self.assertFalse([rel for rel in self.files if rel.startswith("changelog.d/")], self.files)
+        fragment = f"Fixed a regression from {self.version} (issue #720).\n"
+        (self.tree / "changelog.d/720.fixed.md").write_text(fragment, encoding="utf-8")
+        new = bumped(self.version, "patch")
+        self.bump(new)
+        self.assert_nothing_left()
+        self.assertIn(f"- {fragment}", (self.tree / "CHANGELOG.md").read_text(encoding="utf-8"))
+        self.assertEqual(list((self.tree / "changelog.d").iterdir()), [])
 
     def test_a_dry_run_bump_writes_no_changelog(self):
         (self.tree / "changelog.d/1.fixed.md").write_text("A bump fragment (issue #1).\n", encoding="utf-8")
