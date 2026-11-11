@@ -92,3 +92,62 @@ fn an_engine_job_shares_the_states_providers() {
     let job = build_job(&state, &work, Default::default());
     assert!(Arc::ptr_eq(&job.providers, &state.providers));
 }
+
+/// How many `AppState` literals in `source` spell out every
+/// field, with no `..` of their own to take the rest.
+fn full_state_literals(source: &str) -> usize {
+    let opening = "AppState {";
+    let mut full = 0;
+    let mut rest = source;
+    while let Some(at) = rest.find(opening) {
+        let before = rest[..at].trim_end();
+        rest = &rest[at + opening.len()..];
+        // A signature or a definition, not a literal.
+        if before.ends_with("->") || before.ends_with("struct") || before.ends_with("for") {
+            continue;
+        }
+        // Read the literal to its closing brace, looking for
+        // a `..` at its own level, outside any nested braces
+        // or brackets.
+        let mut depth = 0;
+        let mut spread = false;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' | '(' | '[' => depth += 1,
+                '}' if depth == 0 => break,
+                '}' | ')' | ']' => depth -= 1,
+                '.' if depth == 0 && rest[i..].starts_with("..") => spread = true,
+                _ => {}
+            }
+        }
+        if !spread {
+            full += 1;
+        }
+    }
+    full
+}
+
+#[test]
+fn only_test_state_spells_out_every_field() {
+    // A test names the fields it sets and takes the rest from
+    // `test_state()`, so a field added to `AppState` is added
+    // there (and in `main.rs`), not in every test.
+    let sources = [
+        include_str!("../tests.rs"),
+        include_str!("disk_hang.rs"),
+        include_str!("disk_stall.rs"),
+    ];
+    let full: usize = sources.iter().map(|s| full_state_literals(s)).sum();
+    assert_eq!(full, 1, "a test spells out every AppState field");
+    // The counter finds a full literal, also one with a `..`
+    // nested in a field, and passes a spread.
+    assert_eq!(full_state_literals("let s = AppState { a: 1, b: 2 };"), 1);
+    assert_eq!(
+        full_state_literals("AppState { a: S { x, ..S::default() }, b: f(0..2) }"),
+        1
+    );
+    assert_eq!(
+        full_state_literals("let s = AppState { a: 1, ..test_state() };"),
+        0
+    );
+}

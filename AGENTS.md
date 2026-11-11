@@ -122,6 +122,12 @@ both SDKs must all pass.
 - New behavior ships with tests. Anything that parses untrusted input
   (URLs, images, uploads) also gets hostile-input tests that prove the
   process survives.
+- Server tests build their `AppState` from `test_state()` in
+  `src/server/tests.rs` and name only the fields they set, as in
+  `AppState { presets, ..test_state() }` (issue #475). A field added to
+  `AppState` goes there, in `build_state` in `main.rs`, and in the
+  `Debug` impl beside the struct; `tests/debug_redaction.rs` builds the
+  one other full state, and the compiler names it.
 - Errors are part of the API: responses carry structured error codes, and
   the error lists in the README and docs stay accurate.
 
