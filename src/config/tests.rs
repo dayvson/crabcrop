@@ -99,6 +99,38 @@ fn client_hints_default_to_on_and_turn_off_by_the_boolean_spellings() {
 }
 
 #[test]
+fn explain_defaults_to_on_and_turns_off_by_the_boolean_spellings() {
+    // Issue #591: unset is on, so a deployment that relies on
+    // `/explain` keeps it after the upgrade.
+    assert_eq!(
+        explain_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(true)
+    );
+    let set =
+        |v: &str| explain_config(env_of(&[("CRABCROP_EXPLAIN", v)])).map_err(|e| e.to_string());
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    // A typo is a boot error naming the variable, never a
+    // silent default that leaves the route on.
+    for bad in ["", "of", "disabled", "2"] {
+        let err = expect_err(set(bad));
+        assert!(err.contains("CRABCROP_EXPLAIN"), "{bad:?}: {err}");
+    }
+    // The setting reaches the configuration.
+    let config = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRABCROP_SECRET", "a production-grade secret")];
+        env.extend_from_slice(extra);
+        Config::from_env(env_of(&env)).unwrap()
+    };
+    assert!(config(&[]).explain_enabled);
+    assert!(!config(&[("CRABCROP_EXPLAIN", "0")]).explain_enabled);
+}
+
+#[test]
 fn clip_config_needs_all_four_paths_or_none() {
     let get = |pairs: &[(&str, &str)]| {
         let map: std::collections::HashMap<String, String> = pairs

@@ -389,6 +389,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if !config.client_hints {
         println!("client hints: off");
     }
+    if !config.explain_enabled {
+        println!("explain: off");
+    }
 
     Ok(AppState {
         keyring: config.keyring.clone(),
@@ -439,6 +442,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         jxl_speed: config.jxl_speed,
         width_step: config.width_step,
         client_hints: config.client_hints,
+        explain_enabled: config.explain_enabled,
         preserve_metadata: config.preserve_metadata,
         brand_color: config.brand_color,
         presets: config.presets.clone(),

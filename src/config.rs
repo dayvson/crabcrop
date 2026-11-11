@@ -275,6 +275,9 @@ pub struct Config {
     /// Whether the server reads the client hint headers
     /// (`CRABCROP_CLIENT_HINTS`).
     pub client_hints: bool,
+    /// Whether the server serves `/explain/...`
+    /// (`CRABCROP_EXPLAIN`, issue #591).
+    pub explain_enabled: bool,
 }
 
 /// Disk result storage: `CRABCROP_RESULT_STORAGE_DIR`, with
@@ -536,6 +539,7 @@ impl Config {
         let provenance = provenance_config(&get)?;
         let meta_enabled = meta_mode_config(&get)?;
         let client_hints = client_hints_config(&get)?;
+        let explain_enabled = explain_config(&get)?;
         Ok(Config {
             keyring,
             allow_unsafe,
@@ -573,6 +577,7 @@ impl Config {
             provenance,
             meta_enabled,
             client_hints,
+            explain_enabled,
         })
     }
 }
@@ -1714,6 +1719,16 @@ pub fn meta_mode_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, Co
 /// headers needs from its origin.
 pub fn client_hints_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
     parse_bool_value("CRABCROP_CLIENT_HINTS", get("CRABCROP_CLIENT_HINTS"), true)
+}
+
+/// Whether the server serves the `/explain/...` report:
+/// `CRABCROP_EXPLAIN`, on by default (issue #591). The
+/// report prints the presets a URL references and the
+/// default operations in full, watermark and overlay URLs
+/// included, to anyone who holds a signed URL. Off, every
+/// request to the route answers `404 not_found`.
+pub fn explain_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
+    parse_bool_value("CRABCROP_EXPLAIN", get("CRABCROP_EXPLAIN"), true)
 }
 
 /// The AI settings: every model path, checked for

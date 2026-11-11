@@ -465,6 +465,48 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
     }
 }
 
+#[test]
+fn explain_off_answers_404_while_images_still_render() {
+    // Issue #591: `/explain` could not be turned off. With
+    // `CRABCROP_EXPLAIN=0` it answers 404, boot says so, and
+    // the image route serves as before. Unset, the report
+    // is served as it always was.
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let image = "/unsafe/40x30/file:///portrait.jpg";
+    let explain = format!("/explain{image}");
+    for (value, explain_status, says_off) in [(None, "200", false), (Some("0"), "404", true)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+        command
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("CRABCROP_ALLOW_UNSAFE", "1")
+            .env("CRABCROP_FILE_ROOT", fixtures);
+        if let Some(value) = value {
+            command.env("CRABCROP_EXPLAIN", value);
+        }
+        let (_server, port, _, printed) = common::serve_printing(&mut command);
+        let status = status_line(port, image, "");
+        assert!(status.contains("200"), "{value:?}: image {status:?}");
+        let status = status_line(port, &explain, "");
+        assert!(
+            status.contains(explain_status),
+            "{value:?}: explain {status:?}"
+        );
+        assert_eq!(
+            printed.iter().any(|l| l == "explain: off"),
+            says_off,
+            "{value:?}: {printed:#?}"
+        );
+    }
+    // A typo stops the boot and names the variable, rather
+    // than leaving the route on.
+    let stderr = refused_boot(&[("CRABCROP_EXPLAIN", "of")]);
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_EXPLAIN"),
+        "{stderr}"
+    );
+}
+
 /// A model file that exists, so a boot failure is about
 /// the runtime, never about a missing model, and the
 /// directory it lives in.

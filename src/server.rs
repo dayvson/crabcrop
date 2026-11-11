@@ -235,6 +235,10 @@ pub struct AppState {
     /// hint header is ignored, image answers vary on
     /// `Accept` alone, and no `Accept-CH` is advertised.
     pub client_hints: bool,
+    /// Whether `/explain/...` is served (`CRABCROP_EXPLAIN`,
+    /// on by default, issue #591). Off, every request to the
+    /// route answers `404 not_found` before anything else.
+    pub explain_enabled: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -400,6 +404,7 @@ impl std::fmt::Debug for AppState {
             jxl_speed,
             width_step,
             client_hints,
+            explain_enabled,
             preserve_metadata,
             brand_color,
             presets,
@@ -962,6 +967,18 @@ async fn explain_handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // With `CRABCROP_EXPLAIN=0` the route is off (issue #591):
+    // every request answers the router's own `404 not_found`
+    // before the signature is read, so the answer is the
+    // same whatever the URL, and no source is fetched.
+    if !state.explain_enabled {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found".to_string(),
+            accept.as_deref(),
+        );
+    }
     let Some(tail) = uri.path().strip_prefix("/explain/") else {
         return error_response(
             StatusCode::BAD_REQUEST,

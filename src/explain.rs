@@ -4,12 +4,14 @@
 //! request and its source probed through the loader.
 //!
 //! Everything in the report is derivable from the URL
-//! itself plus the source's own headers. It carries no
-//! secret or derived key material, no configuration values
-//! (no model or file paths, no upload roots), no config
-//! fingerprint, no filesystem paths, and no internal error
-//! text: the handler maps failures to the frozen codes and
-//! generic messages before anything reaches this module.
+//! itself, the presets and default operations that shape
+//! its output, and the source's own headers. It carries no
+//! secret or derived key material, no other configuration
+//! values (no model or file paths, no upload roots, no
+//! source root base URLs), no config fingerprint, no
+//! filesystem paths, and no internal error text: the
+//! handler maps failures to the frozen codes and generic
+//! messages before anything reaches this module.
 //! The one judgement the report makes beyond the URL's own
 //! text is the forecast, a walk over the operation chain
 //! in the engine's own arithmetic; it is a forecast, and
@@ -20,6 +22,16 @@
 //! canonical form already spells them; the operation list
 //! stays the URL's own, so the report never credits the
 //! URL with a default.
+//!
+//! The presets a URL references and the server's default
+//! operations are shown in full, as the operator wrote
+//! them (issue #591). A watermark or overlay URL in either
+//! is printed with its host and query string, in the
+//! glosses and in the canonical form, to anyone who holds
+//! a signed URL. A watermark or overlay URL cannot use a
+//! source root, so operators keep tokens and internal
+//! hosts out of those URLs, block `/explain/` at the edge,
+//! or turn the route off with `CRABCROP_EXPLAIN=0`.
 
 use crate::engine::SourceProbe;
 use crate::url::{Dimension, Filter, Operation, RequestDirectives, canonical_form, format_text};
