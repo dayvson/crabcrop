@@ -769,6 +769,22 @@ struct Inner {
     total_bytes: usize,
 }
 
+/// What a promotion did (see [`Cache::promote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Promoted {
+    /// No copy was held; this one was stored.
+    Inserted,
+    /// A copy was held and kept, with `groups` now. `took`
+    /// are the groups it held that the promoted copy lacked.
+    Merged {
+        groups: Vec<String>,
+        took: Vec<String>,
+    },
+    /// Not stored: memory keeps nothing, or the copy is
+    /// larger than the whole budget.
+    Skipped,
+}
+
 /// A byte-bounded LRU cache: the entries' charges (see
 /// [`entry_cost`]) stay within `max_bytes`. A `max_bytes` of 0
 /// disables it.
@@ -851,27 +867,99 @@ impl Cache {
     /// (audit R2-15): provenance is accumulated on every
     /// hit, so an entry first stored by a group-free
     /// spelling is still found by a later group purge.
-    /// Returns whether the stored entry changed.
+    /// Returns the stored copy when its set grew (issue
+    /// #572): the copy the caller writes back and checks
+    /// against purges, which may not be the one it read.
     ///
     /// The entry is charged again for its grown group set, and
     /// least recently used entries make room if that takes the
     /// cache over its budget.
-    pub fn merge_groups(&self, key: &str, groups: &[String]) -> bool {
+    pub fn merge_groups(&self, key: &str, groups: &[String]) -> Option<CachedImage> {
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
-        let Some(entry) = inner.entries.get_mut(key) else {
-            return false;
-        };
-        let merged = union_groups(&entry.image.groups, groups);
-        if merged == entry.image.groups {
-            return false;
+        let entry = inner.entries.get_mut(key)?;
+        if groups.iter().all(|g| entry.image.groups.contains(g)) {
+            return None;
         }
-        entry.image.groups = merged;
+        entry.image.groups = union_groups(&entry.image.groups, groups);
+        let held = entry.image.clone();
         let cost = entry_cost(key, &entry.image);
         let old = std::mem::replace(&mut entry.cost, cost);
         inner.total_bytes = inner.total_bytes - old + cost;
         evict_to_fit(inner, self.max_bytes, 0);
-        true
+        Some(held)
+    }
+
+    /// Whether memory holds `image`'s copy under `key`,
+    /// recency left alone.
+    pub fn holds_copy(&self, key: &str, image: &CachedImage) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .entries
+            .get(key)
+            .is_some_and(|entry| same_copy(&entry.image, image))
+    }
+
+    /// The groups of the copy held under `key`, recency left
+    /// alone (issue #572): a copy written to a slower tier
+    /// takes them, so it carries every group memory has
+    /// served the entry under.
+    pub fn groups(&self, key: &str) -> Option<Vec<String>> {
+        let inner = self.inner.lock().unwrap();
+        Some(inner.entries.get(key)?.image.groups.clone())
+    }
+
+    /// Promote a copy read from a slower tier (issue #572). A
+    /// copy already held keeps its bytes, ETag and stamp and
+    /// gains `image`'s groups; otherwise `image` is stored as
+    /// [`Cache::put`] stores it. Promotions only ever add
+    /// groups, so a late one cannot take back a group a hit
+    /// taught memory meanwhile.
+    pub fn promote(&self, key: &str, image: &CachedImage) -> Promoted {
+        if self.max_bytes == 0 {
+            return Promoted::Skipped;
+        }
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if let Some(entry) = inner.entries.get_mut(key) {
+            let took: Vec<String> = entry
+                .image
+                .groups
+                .iter()
+                .filter(|g| !image.groups.contains(g))
+                .cloned()
+                .collect();
+            let grew = !image.groups.iter().all(|g| entry.image.groups.contains(g));
+            if grew {
+                entry.image.groups = union_groups(&entry.image.groups, &image.groups);
+                let cost = entry_cost(key, &entry.image);
+                let old = std::mem::replace(&mut entry.cost, cost);
+                inner.total_bytes = inner.total_bytes - old + cost;
+            }
+            let groups = entry.image.groups.clone();
+            touch(inner, key);
+            if grew {
+                evict_to_fit(inner, self.max_bytes, 0);
+            }
+            return Promoted::Merged { groups, took };
+        }
+        let cost = entry_cost(key, image);
+        if cost > self.max_bytes {
+            return Promoted::Skipped;
+        }
+        evict_to_fit(inner, self.max_bytes, cost);
+        inner.total_bytes += cost;
+        inner.clock += 1;
+        let stamp = inner.clock;
+        inner.stamps.insert(key.to_string(), stamp);
+        inner.entries.insert(
+            key.to_string(),
+            Entry {
+                image: image.clone(),
+                cost,
+            },
+        );
+        Promoted::Inserted
     }
 
     /// Remove every entry whose result derives from
@@ -898,13 +986,35 @@ impl Cache {
 
     /// Store `image` under `key`, evicting least recently used
     /// entries until its charge fits. Entries whose charge is
-    /// larger than the whole budget are not stored.
-    pub fn put(&self, key: String, image: CachedImage) {
-        let cost = entry_cost(&key, &image);
-        if self.max_bytes == 0 || cost > self.max_bytes {
-            return;
+    /// larger than the whole budget are not stored. A copy
+    /// held under `key` is replaced, but its groups are kept
+    /// (issue #572): every group memory served the entry under
+    /// stays. Returns those it added to `image`'s, which the
+    /// slower tiers have to learn too.
+    pub fn put(&self, key: String, mut image: CachedImage) -> Vec<String> {
+        if self.max_bytes == 0 {
+            return Vec::new();
         }
         let mut inner = self.inner.lock().unwrap();
+        let took: Vec<String> = inner
+            .entries
+            .get(&key)
+            .map(|old| {
+                old.image
+                    .groups
+                    .iter()
+                    .filter(|g| !image.groups.contains(g))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !took.is_empty() {
+            image.groups = union_groups(&image.groups, &took);
+        }
+        let cost = entry_cost(&key, &image);
+        if cost > self.max_bytes {
+            return Vec::new();
+        }
         if let Some(old) = inner.entries.remove(&key) {
             inner.total_bytes -= old.cost;
             inner.stamps.remove(&key);
@@ -915,6 +1025,7 @@ impl Cache {
         let stamp = inner.clock;
         inner.stamps.insert(key.clone(), stamp);
         inner.entries.insert(key, Entry { image, cost });
+        took
     }
 
     /// The stored entries' total charge.
@@ -1056,9 +1167,13 @@ mod tests {
         // A later spelling of the same entry brings its
         // own group: the stored set is the union, so a
         // group purge finds the entry either way (R2-15).
-        assert!(cache.merge_groups("a", &["hero".to_string()]));
-        assert!(!cache.merge_groups("a", &["thumb".to_string()]));
-        assert!(!cache.merge_groups("missing", &["hero".to_string()]));
+        assert!(cache.merge_groups("a", &["hero".to_string()]).is_some());
+        assert!(cache.merge_groups("a", &["thumb".to_string()]).is_none());
+        assert!(
+            cache
+                .merge_groups("missing", &["hero".to_string()])
+                .is_none()
+        );
         assert_eq!(cache.get("a").unwrap().groups, ["hero", "thumb"]);
         assert_eq!(cache.purge_group("hero"), 1);
     }
@@ -1151,7 +1266,11 @@ mod tests {
         cache.put("a".to_string(), img(10));
         cache.put("b".to_string(), img(10));
         let group = "g".repeat(64);
-        assert!(cache.merge_groups("b", std::slice::from_ref(&group)));
+        assert!(
+            cache
+                .merge_groups("b", std::slice::from_ref(&group))
+                .is_some()
+        );
         assert_eq!(
             cache.charged_bytes(),
             entry_cost("b", &grouped(10, &[group.as_str()])),
@@ -1185,8 +1304,16 @@ mod tests {
             .sum();
         assert_eq!(cache.charged_bytes(), charged);
         // A merge grows two entries' charges before they go.
-        assert!(cache.merge_groups(&keys[0], &["hero".to_string()]));
-        assert!(cache.merge_groups(&keys[3], &["hero".to_string()]));
+        assert!(
+            cache
+                .merge_groups(&keys[0], &["hero".to_string()])
+                .is_some()
+        );
+        assert!(
+            cache
+                .merge_groups(&keys[3], &["hero".to_string()])
+                .is_some()
+        );
         assert_eq!(cache.purge_source(source), 3);
         assert_eq!(cache.purge_matching("a/b.png"), 1);
         assert!(cache.remove("c/d.png"));
@@ -1604,5 +1731,68 @@ mod tests {
         assert!(guard.purge_covers(start, &format!("key-{}", MAX_TOMBSTONES + 4), &[]));
         // ...and the oldest have been trimmed away.
         assert!(!guard.purge_covers(start, "key-0", &[]));
+    }
+
+    // Issue #572: promotions and renders never take a group
+    // back out of memory.
+
+    #[test]
+    fn promote_merges_into_a_held_copy_and_keeps_its_bytes() {
+        let cache = Cache::new(ROOMY);
+        let held = grouped(10, &["a", "d"]);
+        cache.put("k".to_string(), held.clone());
+        let late = CachedImage {
+            bytes: bytes::Bytes::from_static(b"late copy"),
+            etag: etag_for_bytes(b"late copy"),
+            ..grouped(10, &["c"])
+        };
+        assert_eq!(
+            cache.promote("k", &late),
+            Promoted::Merged {
+                groups: vec!["a".into(), "c".into(), "d".into()],
+                took: vec!["a".into(), "d".into()],
+            }
+        );
+        let now = cache.get("k").unwrap();
+        assert!(same_copy(&now, &held), "the held bytes were replaced");
+        assert_eq!(now.groups, ["a", "c", "d"]);
+    }
+
+    #[test]
+    fn promote_inserts_when_absent() {
+        let cache = Cache::new(ROOMY);
+        assert_eq!(cache.promote("k", &grouped(10, &["c"])), Promoted::Inserted);
+        assert_eq!(cache.get("k").unwrap().groups, ["c"]);
+        assert_eq!(Cache::new(0).promote("k", &img(10)), Promoted::Skipped);
+    }
+
+    #[test]
+    fn put_keeps_a_held_entrys_groups() {
+        let cache = Cache::new(ROOMY);
+        cache.put("k".to_string(), grouped(10, &["a"]));
+        let render = CachedImage {
+            bytes: bytes::Bytes::from_static(b"fresh render"),
+            etag: etag_for_bytes(b"fresh render"),
+            ..grouped(10, &["c"])
+        };
+        assert_eq!(cache.put("k".to_string(), render.clone()), ["a"]);
+        let now = cache.get("k").unwrap();
+        assert_eq!(now.etag, render.etag, "a render takes its own bytes");
+        assert_eq!(now.groups, ["a", "c"]);
+        let carries_all = CachedImage {
+            groups: vec!["a".into(), "c".into()],
+            ..render
+        };
+        assert!(cache.put("k".to_string(), carries_all).is_empty());
+    }
+
+    #[test]
+    fn merge_groups_returns_the_merged_copy() {
+        let cache = Cache::new(ROOMY);
+        cache.put("k".to_string(), grouped(10, &["thumb", "hero"]));
+        assert!(cache.merge_groups("k", &["hero".to_string()]).is_none());
+        let merged = cache.merge_groups("k", &["a".to_string()]).unwrap();
+        assert_eq!(merged.groups, ["a", "hero", "thumb"]);
+        assert_eq!(cache.groups("k").unwrap(), merged.groups);
     }
 }

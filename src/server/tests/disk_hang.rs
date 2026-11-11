@@ -370,3 +370,108 @@ async fn a_stuck_disk_queues_no_work_per_request() {
     drop(held);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_lookup_that_answers_late_leaves_no_copy_a_group_purge_misses() {
+    // Issue #572, race 2, the probe: a lookup whose disk read
+    // answers after its request went on to the bucket put its
+    // own view back into memory and the bucket, taking back a
+    // group a memory hit had added meanwhile. A purge of that
+    // group then missed the copies. Hangs at R1 on a build
+    // without the fix.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-late-lookup");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/i.png";
+    let in_a = CachedImage {
+        groups: vec!["a".to_string()],
+        ..tier_test_entry()
+    };
+    store.put(key, &in_a);
+    shared.put(key, &tier_test_entry()).await;
+    let (gate, _held) = DiskReadGate::hold(&store);
+    let (_, status) = within(
+        STUCK_DISK_LIMIT,
+        "R1, whose disk read is stuck",
+        lookup_tiers(&state, key, &["c".to_string()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
+    shared_learns_group(&shared, key, "c").await;
+    let (_, status) = within(
+        STUCK_DISK_LIMIT,
+        "R2",
+        lookup_tiers(&state, key, &["d".to_string()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, "crabcrop; hit");
+    // The stuck read answers.
+    gate.release();
+    writes_settle(&state).await;
+    shared_learns_group(&shared, key, "d").await;
+    purge_group_call(&base, "d").await;
+    wait_for_purges_to_end(&state).await;
+    assert!(
+        lookup_tiers(&state, key, &[]).await.is_none(),
+        "a copy served under d outlived its purge"
+    );
+    assert_eq!(entry_objects(&fake), 0);
+    drop(gate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn two_disk_hits_at_once_keep_both_groups_in_memory() {
+    // Issue #572, race 2, the two-hit case: two disk hits for
+    // one key, each with its own group, each built its set
+    // from its own read and put it into memory and the disk
+    // file, so one group was lost.
+    let dir = crate::test_support::scratch_dir("srv-two-hits");
+    let mut state = tier_test_state(Some(&dir), "http://127.0.0.1:9");
+    state.shared_store = None;
+    let store = state.store.clone().unwrap();
+    let key = "40x24/example.com/i.png";
+    store.put(key, &tier_test_entry());
+    let (gate, mut held) = DiskReadGate::hold(&store);
+    let lookups: Vec<_> = ["c", "d"]
+        .into_iter()
+        .map(|group| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                within(
+                    STUCK_DISK_LIMIT,
+                    "a disk hit",
+                    lookup_tiers(&state, key, &[group.to_string()]),
+                )
+                .await
+            })
+        })
+        .collect();
+    for _ in 0..2 {
+        within(STUCK_DISK_LIMIT, "both reads to be held", held.recv())
+            .await
+            .unwrap();
+    }
+    gate.release();
+    for lookup in lookups {
+        let (_, status) = lookup.await.unwrap().unwrap();
+        assert_eq!(status, "crabcrop; hit; detail=\"disk\"");
+    }
+    drop(gate);
+    let memory = state.cache.get(key).unwrap().groups;
+    assert!(
+        memory.contains(&"c".to_string()) && memory.contains(&"d".to_string()),
+        "memory holds {memory:?}"
+    );
+    let disk = store.get(key).unwrap().groups;
+    assert!(
+        disk.contains(&"c".to_string()) && disk.contains(&"d".to_string()),
+        "the disk holds {disk:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1643,6 +1643,9 @@ fn store_failed(status: reqwest::StatusCode) -> bool {
 pub struct SharedPurge {
     pub active: ActivePurge,
     pub tombstone: Option<String>,
+    /// The purge's disk deletions (issue #572): its tombstone
+    /// is marked ended only once they are done.
+    pub disk: Option<crate::storage::DeletionWait>,
     pub event: &'static str,
     pub log_target: String,
 }
@@ -2758,6 +2761,7 @@ mod tests {
         SharedPurge {
             active: guard.begin(PurgeTarget::Group(group.into())),
             tombstone: None,
+            disk: None,
             event: "purge-group",
             log_target: format!("purge-group/{group}"),
         }

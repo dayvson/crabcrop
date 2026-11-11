@@ -17,10 +17,20 @@
 //! from file times at open. Each entry is charged its file
 //! and the record the in-memory index keeps for it, so the
 //! budget bounds the index's memory as well as the files.
+//!
+//! The index is the authority on an entry's cache groups
+//! (issue #572). A group learned on a hit goes into the index
+//! at once, with no file I/O, and a background drain writes it
+//! into the entry file later. Purges remove index records at
+//! once and the drain deletes their files. Only one writer or
+//! deleter works on an entry file at a time: it holds the
+//! key's claim.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -30,9 +40,143 @@ use crate::url::ImageFormat;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// An index record: the entry's file stem, its charge (see
-/// [`entry_charge`]), and its cache groups.
-type Record = (String, usize, Vec<String>);
+/// An index record (issue #572).
+#[derive(Debug)]
+struct Record {
+    /// The entry's file stem.
+    stem: String,
+    /// The length of the file as last written.
+    file_bytes: usize,
+    /// What the entry is charged (see [`entry_charge`]).
+    charge: usize,
+    /// The entry's cache groups: every group the entry has
+    /// been served under since it was indexed. Purges match
+    /// on these. The file may lack some until the drain
+    /// writes them.
+    groups: Vec<String>,
+    /// The copy's write stamp, for the purge checks a learn
+    /// runs.
+    written: Option<WriteStamp>,
+    /// The copy's identity, fresh at scan and at every write:
+    /// a read whose record changed meanwhile is a miss.
+    id: u64,
+    /// Groups were added while the bucket write that carries
+    /// them was skipped (issue #463): the next disk or shared
+    /// hit writes them back.
+    owes_shared: bool,
+}
+
+/// Who works on a key's entry file right now (issue #572).
+/// Only the holder renames into or unlinks the file.
+#[derive(Debug)]
+enum Claim {
+    /// A fresh write in flight. The key is not indexed; the
+    /// groups learned meanwhile land with it. A purge that
+    /// covers it marks it doomed, and it then lands nothing.
+    Write { groups: Vec<String>, doomed: bool },
+    /// The drain or an inline delete owns the file.
+    File,
+}
+
+/// One queued job for a key: a rewrite of its file's groups,
+/// or the deletion of its file.
+#[derive(Debug)]
+struct Job {
+    /// Order of queueing; a purge waits for its own range.
+    seq: u64,
+    /// The file to delete (deletions only).
+    stem: String,
+    /// Failed runs so far.
+    attempts: u32,
+    /// Not run again before this, after a failure.
+    not_before: Option<std::time::Instant>,
+    /// Being run right now.
+    running: bool,
+}
+
+/// Jobs by key, at most one per key, in queueing order. Keys
+/// whose job is running are not in `order`.
+#[derive(Debug, Default)]
+struct KeyQueue {
+    order: VecDeque<String>,
+    jobs: HashMap<String, Job>,
+}
+
+impl KeyQueue {
+    /// Queue a job for `key` unless one is queued already.
+    fn push(&mut self, key: &str, stem: &str, seq: &mut u64) {
+        if self.jobs.contains_key(key) {
+            return;
+        }
+        *seq += 1;
+        self.jobs.insert(
+            key.to_string(),
+            Job {
+                seq: *seq,
+                stem: stem.to_string(),
+                attempts: 0,
+                not_before: None,
+                running: false,
+            },
+        );
+        self.order.push_back(key.to_string());
+    }
+
+    /// Drop `key`'s job. Returns whether there was one.
+    fn remove(&mut self, key: &str) -> bool {
+        match self.jobs.remove(key) {
+            Some(job) => {
+                if !job.running {
+                    self.order.retain(|k| k != key);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// End a running job: drop it, or keep it queued to run
+    /// again at once.
+    fn finish(&mut self, key: &str, again: bool) {
+        if again {
+            if let Some(job) = self.jobs.get_mut(key) {
+                job.running = false;
+                job.attempts = 0;
+                job.not_before = None;
+                self.order.push_back(key.to_string());
+            }
+        } else {
+            self.jobs.remove(key);
+        }
+    }
+
+    /// Put a running job that failed back in the queue, to run
+    /// again after a backoff.
+    fn retry(&mut self, key: &str) {
+        if let Some(job) = self.jobs.get_mut(key)
+            && job.running
+        {
+            job.running = false;
+            job.attempts = job.attempts.saturating_add(1);
+            let backoff =
+                std::time::Duration::from_secs(1 << job.attempts.min(5).saturating_sub(1))
+                    .min(DRAIN_RETRY_CAP);
+            job.not_before = Some(std::time::Instant::now() + backoff);
+            self.order.push_back(key.to_string());
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.jobs.len()
+    }
+}
+
+/// What a background job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Rewrite,
+    Delete,
+}
 
 /// The allocator's bookkeeping charged for each separate heap
 /// allocation an index record makes: its header and size
@@ -67,6 +211,19 @@ fn entry_charge(key: &str, file_bytes: usize, groups: &[String]) -> usize {
 struct Inner {
     /// Cache key -> its index record.
     entries: HashMap<String, Record>,
+    /// Cache key -> who works on its file (issue #572).
+    claims: HashMap<String, Claim>,
+    /// Indexed keys whose file lacks groups the record has.
+    rewrites: KeyQueue,
+    /// Keys whose record is gone and whose file is still to
+    /// be deleted.
+    deletions: KeyQueue,
+    /// The last record id handed out.
+    next_id: u64,
+    /// The last job sequence number handed out.
+    next_seq: u64,
+    /// Drain tasks running.
+    workers: usize,
     /// Last-access stamp per key (monotonic clock). Eviction
     /// removes the smallest stamp, the least recently used
     /// entry: the same order the VecDeque kept, at O(1) per
@@ -107,13 +264,38 @@ pub struct DiskStore {
     /// taken on the async side, so operations waiting for
     /// one hold no thread, and a slow disk cannot crowd
     /// out the other work the pool carries.
-    permits: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Test-only: run ahead of every entry read in `get`, so
-    /// a test can hold a read the way a slow disk would. The
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Wakes a drain task that waits for a job (issue #572).
+    drain_wake: tokio::sync::Notify,
+    /// Bumped whenever a background job ends or a queued job
+    /// goes, for the waits on them.
+    progress: tokio::sync::watch::Sender<u64>,
+    /// Rate-limits the log lines for disk waits that ran out.
+    stall_log: StallLog,
+    /// Test-only: run at every entry read (after the bytes are
+    /// in, as a read stuck in the kernel has its file open),
+    /// write and delete, on the blocking thread, with the
+    /// file's path, so a test can hold or fail the
+    /// operation the way a stuck or failing disk would. The
     /// store refuses FIFOs (issue #545), so a test cannot
     /// hold a read on one.
     #[cfg(test)]
-    read_hold: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    hold: Mutex<Option<TestHold>>,
+}
+
+/// A test hook for [`DiskStore`]'s file operations.
+#[cfg(test)]
+pub(crate) type TestHold = Arc<dyn Fn(OpKind, &Path) -> std::io::Result<()> + Send + Sync>;
+
+/// The file operations a test can hold (issue #572).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpKind {
+    /// An entry read: a lookup or a drain rewrite.
+    Read,
+    /// An entry write and its rename into place.
+    Write,
+    /// An entry file's deletion.
+    Unlink,
 }
 
 impl std::fmt::Debug for DiskStore {
@@ -134,7 +316,20 @@ impl std::fmt::Debug for DiskStore {
 /// at once (issue #347). Fixed, not configured: the disk
 /// acceptance for this boundary is that waiting work
 /// holds no thread, not a new tuning knob.
-const DISK_OP_PERMITS: usize = 32;
+pub(crate) const DISK_OP_PERMITS: usize = 32;
+
+/// How many background jobs (group rewrites and deletions)
+/// run at once (issue #572). Claims keep them apart per key;
+/// the rest of the slots stay for lookups and writes.
+const DRAIN_JOBS: usize = DISK_OP_PERMITS / 4;
+
+/// The longest wait before a failed background job runs
+/// again.
+const DRAIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a disk wait that ran out is logged at most
+/// (issue #572). Each one still counts on /metrics.
+const STALL_LOG_EVERY_MS: u64 = 10_000;
 
 /// Entry format version. CRABDISK2 adds the entry's cache
 /// groups to the header; CRABDISK3 marks the move to
@@ -283,9 +478,12 @@ impl DiskStore {
             entry_key,
             inner: Mutex::new(Inner::default()),
             errors: std::sync::atomic::AtomicU64::new(0),
-            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
+            permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
+            drain_wake: tokio::sync::Notify::new(),
+            progress: tokio::sync::watch::Sender::new(0),
+            stall_log: StallLog::default(),
             #[cfg(test)]
-            read_hold: Mutex::new(None),
+            hold: Mutex::new(None),
         };
         store.scan()?;
         Ok(store)
@@ -327,29 +525,59 @@ impl DiskStore {
         self.max_bytes != 0 && self.inner.lock().unwrap().entries.contains_key(key)
     }
 
+    /// Count and log a disk wait that ran out (issue #572):
+    /// the request went on without the disk. Every one counts
+    /// on /metrics; the log has the first at once, then at
+    /// most one line every 10 seconds with a count.
+    pub(crate) fn note_stall(&self, stall: Stall) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(line) = self.stall_log.note(crate::cache::now_ms(), stall.what()) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// A slot for one store operation (issue #347), waited
+    /// for with no limit: the caller bounds the wait. `None`
+    /// cannot happen; the semaphore is never closed.
+    pub async fn permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permits.clone().acquire_owned().await.ok()
+    }
+
+    /// Store operations holding a slot right now.
+    pub fn ops_in_flight(&self) -> usize {
+        DISK_OP_PERMITS - self.permits.available_permits()
+    }
+
     /// Run one store operation on tokio's blocking pool
-    /// and wait for its result (issue #347). The store is
-    /// synchronous filesystem I/O; calling it from the
-    /// request path directly would stall a runtime worker
-    /// for the duration of the read, the write, or the
-    /// purge walk. A permit bounds how many operations
-    /// run at once and is acquired before the hop, so
-    /// waiting operations hold no thread. `None` when the
-    /// task died before reporting: the caller degrades to
-    /// the operation's failure shape (a miss, a count of
-    /// zero, a dropped write), the store's standing
-    /// best-effort rule, with the failure counted through
-    /// [`DiskStore::note_task_failure`].
-    pub async fn blocking<T, F>(self: &std::sync::Arc<Self>, op: F) -> Option<T>
+    /// under `permit` and wait for its result (issue #347).
+    /// The store is synchronous filesystem I/O; calling it
+    /// from the request path directly would stall a runtime
+    /// worker for the duration of the read or the write.
+    /// `None` when the task died before reporting: the caller
+    /// degrades to the operation's failure shape (a miss, a
+    /// dropped write), the store's standing best-effort rule,
+    /// with the failure counted through
+    /// [`DiskStore::note_task_failure`]. The operation runs
+    /// to its end even when the caller stops waiting: an
+    /// operation stuck in the kernel cannot be cancelled. Work
+    /// it queued is started on the blocking thread, so a
+    /// caller that stopped waiting cannot lose it.
+    pub async fn blocking_with<T, F>(
+        self: &Arc<Self>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        op: F,
+    ) -> Option<T>
     where
-        F: FnOnce(&DiskStore) -> T + Send + 'static,
+        F: FnOnce(&Arc<DiskStore>) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let permit = self.permits.clone().acquire_owned().await.ok()?;
         let store = self.clone();
         match tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            op(&store)
+            let out = op(&store);
+            store.kick();
+            out
         })
         .await
         {
@@ -361,6 +589,17 @@ impl DiskStore {
         }
     }
 
+    /// [`DiskStore::blocking_with`] after waiting for a slot
+    /// with no limit: for tests and work no request waits on.
+    pub async fn blocking<T, F>(self: &Arc<Self>, op: F) -> Option<T>
+    where
+        F: FnOnce(&DiskStore) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.permit().await?;
+        self.blocking_with(permit, move |store| op(store)).await
+    }
+
     /// Index existing entry files, oldest first, so the LRU
     /// order approximates the previous run's. Files that do
     /// not parse are deleted on sight. When the entries found
@@ -368,9 +607,7 @@ impl DiskStore {
     /// deleted until the rest fit, so the budget holds from
     /// the first request.
     fn scan(&self) -> Result<(), String> {
-        // (modified, key, file stem, charge, groups)
-        let mut found: Vec<(std::time::SystemTime, String, String, usize, Vec<String>)> =
-            Vec::new();
+        let mut found: Vec<Scanned> = Vec::new();
         let read = std::fs::read_dir(&self.dir)
             .map_err(|e| format!("cannot read the result storage directory: {e}"))?;
         for entry in read.flatten() {
@@ -422,8 +659,9 @@ impl DiskStore {
                 self.max_bytes
             };
             match read_header(&path, cap, &self.entry_key) {
-                Some((key, groups)) => {
-                    let charge = entry_charge(&key, meta.len() as usize, &groups);
+                Some((key, groups, written)) => {
+                    let file_bytes = meta.len() as usize;
+                    let charge = entry_charge(&key, file_bytes, &groups);
                     // `put` never stores an entry charged more
                     // than the whole budget. One here was
                     // stored under a larger budget or by a
@@ -434,38 +672,58 @@ impl DiskStore {
                         let _ = std::fs::remove_file(&path);
                         continue;
                     }
-                    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    found.push((mtime, key, stem, charge, groups));
+                    found.push(Scanned {
+                        mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        key,
+                        stem,
+                        file_bytes,
+                        charge,
+                        groups,
+                        written,
+                    });
                 }
                 None => {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
-        found.sort_by_key(|(mtime, _, _, _, _)| *mtime);
+        found.sort_by_key(|scanned| scanned.mtime);
         // A directory filled under a larger budget, or by a
         // build that charged each entry its file alone, can
         // hold more than the budget. The oldest entries are
         // the ones `put` would evict first: delete them until
         // the rest fit, in one pass over the sorted list.
-        let mut total: usize = found.iter().map(|(_, _, _, charge, _)| charge).sum();
+        let mut total: usize = found.iter().map(|scanned| scanned.charge).sum();
         let mut over = 0;
         if self.max_bytes > 0 {
             while total > self.max_bytes && over < found.len() {
-                total -= found[over].3;
+                total -= found[over].charge;
                 over += 1;
             }
         }
-        for (_, _, stem, _, _) in found.drain(..over) {
-            let _ = std::fs::remove_file(self.file_for(&stem));
+        for scanned in found.drain(..over) {
+            let _ = std::fs::remove_file(self.file_for(&scanned.stem));
         }
         let mut inner = self.inner.lock().unwrap();
-        for (_, key, stem, charge, groups) in found {
-            inner.total_bytes += charge;
+        for scanned in found {
+            inner.total_bytes += scanned.charge;
             inner.clock += 1;
             let stamp = inner.clock;
-            inner.stamps.insert(key.clone(), stamp);
-            inner.entries.insert(key, (stem, charge, groups));
+            inner.stamps.insert(scanned.key.clone(), stamp);
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.entries.insert(
+                scanned.key,
+                Record {
+                    stem: scanned.stem,
+                    file_bytes: scanned.file_bytes,
+                    charge: scanned.charge,
+                    groups: scanned.groups,
+                    written: scanned.written,
+                    id,
+                    owes_shared: false,
+                },
+            );
         }
         Ok(())
     }
@@ -473,228 +731,806 @@ impl DiskStore {
     /// Run `hold` ahead of every entry read from now on, or
     /// stop with `None`.
     #[cfg(test)]
-    pub(crate) fn set_read_hold(&self, hold: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
-        *self.read_hold.lock().unwrap() = hold;
+    pub(crate) fn set_read_hold(&self, hold: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.set_hold(hold.map(|hold| -> TestHold {
+            Arc::new(move |kind, _| {
+                if kind == OpKind::Read {
+                    hold();
+                }
+                Ok(())
+            })
+        }));
     }
 
+    /// Run `hold` at every entry read, write and delete from
+    /// now on, or stop with `None`. An `Err` fails that
+    /// operation as the disk would.
     #[cfg(test)]
-    fn run_read_hold(&self) {
+    pub(crate) fn set_hold(&self, hold: Option<TestHold>) {
+        *self.hold.lock().unwrap() = hold;
+    }
+
+    /// The test hook for an operation of `kind`.
+    #[cfg(test)]
+    fn held(&self, kind: OpKind, path: &Path) -> std::io::Result<()> {
         // Cloned out first: the hook blocks, and the lock
-        // must stay free for `set_read_hold`.
-        let hold = self.read_hold.lock().unwrap().clone();
-        if let Some(hold) = hold {
-            hold();
+        // must stay free for `set_hold`.
+        let hold = self.hold.lock().unwrap().clone();
+        match hold {
+            Some(hold) => hold(kind, path),
+            None => Ok(()),
         }
+    }
+
+    #[cfg(not(test))]
+    fn held(&self, _kind: OpKind, _path: &Path) -> std::io::Result<()> {
+        Ok(())
     }
 
     fn file_for(&self, stem: &str) -> PathBuf {
         self.dir.join(format!("{stem}.bin"))
     }
 
-    /// Look up `key`. A corrupt or vanished file is a miss and
-    /// is cleaned up, never served.
+    /// Look up `key`, marking it most recently used. A corrupt
+    /// or vanished file is a miss and is cleaned up, never
+    /// served.
     pub fn get(&self, key: &str) -> Option<CachedImage> {
+        let (image, id) = self.get_with_id(key)?;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.entries.get(key).is_some_and(|record| record.id == id) {
+            touch(&mut inner, key);
+        }
+        Some(image)
+    }
+
+    /// Read the copy indexed under `key`, with its record id.
+    /// The copy carries every group its record holds, also
+    /// ones its file has not caught up with. A read whose
+    /// record was removed or replaced while it ran is a miss
+    /// (issue #572): its bytes may be a purged copy's. A
+    /// corrupt or vanished file is a miss and is cleaned up,
+    /// never served. Recency is left alone: only a hit that
+    /// serves counts as a use (see [`DiskStore::learn_hit`]).
+    pub fn get_with_id(&self, key: &str) -> Option<(CachedImage, u64)> {
         if self.max_bytes == 0 {
             return None;
         }
-        let stem = {
+        let (stem, id) = {
             let inner = self.inner.lock().unwrap();
-            inner.entries.get(key)?.0.clone()
+            let record = inner.entries.get(key)?;
+            (record.stem.clone(), record.id)
         };
         let path = self.file_for(&stem);
-        #[cfg(test)]
-        self.run_read_hold();
-        let parsed =
-            read_capped(&path, self.max_bytes).and_then(|data| parse_entry(&data, &self.entry_key));
+        let data = read_capped(&path, self.max_bytes);
+        let parsed = match self.held(OpKind::Read, &path) {
+            Ok(()) => data.and_then(|data| parse_entry(&data, &self.entry_key)),
+            Err(_) => None,
+        };
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner.entries.get(key).filter(|record| record.id == id)?;
         match parsed {
-            Some((stored_key, image)) if stored_key == key => {
-                let mut inner = self.inner.lock().unwrap();
-                if inner.entries.contains_key(key) {
-                    touch(&mut inner, key);
-                }
-                Some(image)
+            Some((stored_key, mut image)) if stored_key == key => {
+                image.groups = with_groups(&image.groups, &record.groups);
+                Some((image, id))
             }
             _ => {
-                let delete = {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.entries.contains_key(key) && evict_entry(&mut inner, key).is_some()
-                };
-                if delete {
-                    let _ = std::fs::remove_file(&path);
+                let stem = evict_entry(&mut inner, key).map(|record| record.stem);
+                let claimed = stem.and_then(|stem| claim_or_queue(&mut inner, key, &stem));
+                drop(inner);
+                if let Some(stem) = claimed {
+                    let _claim = FileClaim::inline(self, key);
+                    self.unlink(&self.file_for(&stem));
                 }
                 None
             }
         }
     }
 
-    /// Store `image` under `key`, evicting least recently used
-    /// entries until the new entry's charge fits the budget.
-    pub fn put(&self, key: &str, image: &CachedImage) {
+    /// The groups this process knows for `key`: its record's,
+    /// or those of a write of it in flight.
+    pub fn known_groups(&self, key: &str) -> Option<Vec<String>> {
         if self.max_bytes == 0 {
-            return;
+            return None;
         }
-        let data = serialize_entry(key, image, &self.entry_key);
-        let charge = entry_charge(key, data.len(), &image.groups);
-        if charge > self.max_bytes {
-            return;
+        let inner = self.inner.lock().unwrap();
+        match (inner.entries.get(key), inner.claims.get(key)) {
+            (Some(record), _) => Some(record.groups.clone()),
+            (None, Some(Claim::Write { groups, .. })) => Some(groups.clone()),
+            _ => None,
+        }
+    }
+
+    /// Record that a copy of `key` was served under `groups`
+    /// (issue #572), with no file I/O: the index record learns
+    /// them, or the write of the key in flight does. A record
+    /// that grows is queued for the drain, which writes the
+    /// groups into its file. `bucket` says what the bucket
+    /// copy carries (see [`Bucket`]).
+    pub fn learn_groups(&self, key: &str, groups: &[String], bucket: Bucket<'_>) -> Learned {
+        if self.max_bytes == 0 {
+            return Learned::Absent;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        learn_locked(&mut inner, key, groups, bucket)
+    }
+
+    /// [`DiskStore::learn_groups`] for the copy a disk hit
+    /// read: `None` when the record is no longer the one read
+    /// (`id`). A hit counts as a use. The record's debt to the
+    /// bucket is cleared and returned in `owed`: the caller
+    /// pays it with a write-back.
+    pub fn learn_hit(&self, key: &str, id: u64, groups: &[String]) -> Option<HitLearn> {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if !inner.entries.get(key).is_some_and(|record| record.id == id) {
+            return None;
+        }
+        let learned = learn_locked(inner, key, groups, Bucket::Unknown);
+        touch(inner, key);
+        let record = inner.entries.get_mut(key)?;
+        let owed = std::mem::take(&mut record.owes_shared);
+        match learned {
+            Learned::Indexed { grew, groups, .. } => Some(HitLearn { grew, owed, groups }),
+            _ => None,
+        }
+    }
+
+    /// Remove `key`'s record if it is still copy `id`, and
+    /// queue its file's deletion. No file I/O; the caller
+    /// kicks the drain. Returns whether it was removed.
+    pub fn forget_if(&self, key: &str, id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.entries.get(key).is_some_and(|record| record.id == id) {
+            return false;
+        }
+        if let Some(record) = evict_entry(&mut inner, key) {
+            let inner = &mut *inner;
+            inner.deletions.push(key, &record.stem, &mut inner.next_seq);
+        }
+        true
+    }
+
+    /// Start a write of `key` (issue #572). A key the index
+    /// holds is never written again: its record learns
+    /// `groups` and the plan is [`WritePlan::Held`]. A key
+    /// another write is in flight for joins it with `groups`.
+    /// A key whose file the drain holds, or a write that may
+    /// not claim (`may_claim` false: a purge covers it), is
+    /// [`WritePlan::Busy`]. Otherwise the key is claimed: the
+    /// write lands through [`DiskStore::land`], and dropping
+    /// the claim unregisters it.
+    pub fn begin_write(
+        self: &Arc<Self>,
+        key: &str,
+        groups: &[String],
+        bucket: Bucket<'_>,
+        may_claim: bool,
+    ) -> WritePlan {
+        if self.max_bytes == 0 {
+            return WritePlan::Off;
+        }
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if inner.entries.contains_key(key) {
+            return WritePlan::Held(learn_locked(inner, key, groups, bucket));
+        }
+        match inner.claims.get_mut(key) {
+            Some(Claim::Write { groups: held, .. }) => {
+                *held = with_groups(held, groups);
+                WritePlan::Joined
+            }
+            Some(Claim::File) => WritePlan::Busy,
+            None if !may_claim => WritePlan::Busy,
+            None => {
+                inner.claims.insert(
+                    key.to_string(),
+                    Claim::Write {
+                        groups: groups.to_vec(),
+                        doomed: false,
+                    },
+                );
+                WritePlan::Claimed(WriteClaim {
+                    store: self.clone(),
+                    key: key.to_string(),
+                    landed: false,
+                })
+            }
+        }
+    }
+
+    /// Land the write `claim` started: write `image` with
+    /// every group learned meanwhile, index it, and evict
+    /// least recently used entries until its charge fits. A
+    /// write a purge doomed while it ran is deleted again and
+    /// not indexed. `None` when nothing was indexed.
+    pub fn land(&self, mut claim: WriteClaim, image: &CachedImage) -> Option<Landed> {
+        claim.landed = true;
+        self.land_claimed(&claim.key, image)
+    }
+
+    /// [`DiskStore::land`] for a key this store holds a write
+    /// claim on. The claim goes on every path.
+    fn land_claimed(&self, key: &str, image: &CachedImage) -> Option<Landed> {
+        let release = ReleaseWrite { store: self, key };
+        let entry = {
+            let inner = self.inner.lock().unwrap();
+            match inner.claims.get(key) {
+                Some(Claim::Write {
+                    groups,
+                    doomed: false,
+                }) if self.max_bytes != 0 => CachedImage {
+                    groups: with_groups(&image.groups, groups),
+                    ..image.clone()
+                },
+                _ => return None,
+            }
+        };
+        let data = serialize_entry(key, &entry, &self.entry_key);
+        if entry_charge(key, data.len(), &entry.groups) > self.max_bytes {
+            return None;
         }
         let stem = key_stem(key);
         let tmp = self.dir.join(tmp_name(&stem));
-        if let Err(e) = std::fs::write(&tmp, &data) {
+        if let Err(e) = self
+            .held(OpKind::Write, &tmp)
+            .and_then(|()| std::fs::write(&tmp, &data))
+        {
             self.note_error("cannot write a cache entry", &e);
-            return;
+            let _ = std::fs::remove_file(&tmp);
+            return None;
         }
         if let Err(e) = std::fs::rename(&tmp, self.file_for(&stem)) {
             self.note_error("cannot move a cache entry into place", &e);
             let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        std::mem::forget(release);
+        let mut evicted: Vec<(String, String)> = Vec::new();
+        let landed = {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            // The rename replaced the file a queued deletion was
+            // for.
+            if inner.deletions.remove(key) {
+                self.progress.send_modify(|n| *n += 1);
+            }
+            match inner.claims.remove(key) {
+                Some(Claim::Write {
+                    groups,
+                    doomed: false,
+                }) => {
+                    let groups = with_groups(&entry.groups, &groups);
+                    if groups.len() > entry.groups.len() {
+                        inner.rewrites.push(key, &stem, &mut inner.next_seq);
+                    }
+                    let charge = entry_charge(key, data.len(), &groups);
+                    while inner.total_bytes + charge > self.max_bytes {
+                        let oldest = inner
+                            .stamps
+                            .iter()
+                            .min_by_key(|(_, stamp)| *stamp)
+                            .map(|(k, _)| k.clone());
+                        let Some(oldest) = oldest else { break };
+                        if let Some(record) = evict_entry(inner, &oldest)
+                            && let Some(stem) = claim_or_queue(inner, &oldest, &record.stem)
+                        {
+                            evicted.push((oldest, stem));
+                        }
+                    }
+                    inner.next_id += 1;
+                    let id = inner.next_id;
+                    inner.total_bytes += charge;
+                    inner.clock += 1;
+                    let stamp = inner.clock;
+                    inner.stamps.insert(key.to_string(), stamp);
+                    inner.entries.insert(
+                        key.to_string(),
+                        Record {
+                            stem: stem.clone(),
+                            file_bytes: data.len(),
+                            charge,
+                            groups: groups.clone(),
+                            written: entry.written,
+                            id,
+                            owes_shared: false,
+                        },
+                    );
+                    Some(Landed { id, groups })
+                }
+                _ => {
+                    // Doomed: the file just written goes again,
+                    // under the key's claim.
+                    inner.claims.insert(key.to_string(), Claim::File);
+                    None
+                }
+            }
+        };
+        if landed.is_none() {
+            let _claim = FileClaim::inline(self, key);
+            self.unlink(&self.file_for(&stem));
+        }
+        for (old_key, old_stem) in evicted {
+            let _claim = FileClaim::inline(self, &old_key);
+            self.unlink(&self.file_for(&old_stem));
+        }
+        landed
+    }
+
+    /// Store `image` under `key` at once, replacing any copy
+    /// held, and keeping every group the old record had.
+    /// Evicts least recently used entries until the new
+    /// entry's charge fits the budget. The server writes
+    /// through [`DiskStore::begin_write`] instead.
+    pub fn put(&self, key: &str, image: &CachedImage) {
+        if self.max_bytes == 0 {
             return;
         }
-        let mut evicted: Vec<String> = Vec::new();
         {
             let mut inner = self.inner.lock().unwrap();
-            if let Some((_, old_size, _)) = inner.entries.remove(key) {
-                inner.total_bytes -= old_size;
-                inner.stamps.remove(key);
+            if inner.claims.contains_key(key) {
+                return;
             }
-            while inner.total_bytes + charge > self.max_bytes {
-                let oldest = inner
-                    .stamps
-                    .iter()
-                    .min_by_key(|(_, stamp)| *stamp)
-                    .map(|(k, _)| k.clone());
-                let Some(oldest) = oldest else { break };
-                if let Some((old_stem, size, _)) = inner.entries.remove(&oldest) {
-                    inner.total_bytes -= size;
-                    evicted.push(old_stem);
-                }
-                inner.stamps.remove(&oldest);
+            let groups = evict_entry(&mut inner, key)
+                .map(|record| record.groups)
+                .unwrap_or_default();
+            inner.claims.insert(
+                key.to_string(),
+                Claim::Write {
+                    groups,
+                    doomed: false,
+                },
+            );
+        }
+        self.land_claimed(key, image);
+    }
+
+    /// Remove `key`'s record if it is still copy `id`, and
+    /// delete its file now, or queue the deletion if another
+    /// job holds the file. Returns whether it was removed.
+    pub fn remove_copy(&self, key: &str, id: u64) -> bool {
+        let claimed = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.entries.get(key).is_some_and(|record| record.id == id) {
+                return false;
             }
-            inner.total_bytes += charge;
-            inner.clock += 1;
-            let stamp = inner.clock;
-            inner.stamps.insert(key.to_string(), stamp);
-            inner
-                .entries
-                .insert(key.to_string(), (stem, charge, image.groups.clone()));
+            let record = evict_entry(&mut inner, key);
+            record.and_then(|record| claim_or_queue(&mut inner, key, &record.stem))
+        };
+        if let Some(stem) = claimed {
+            let _claim = FileClaim::inline(self, key);
+            self.unlink(&self.file_for(&stem));
         }
-        for old_stem in evicted {
-            let _ = std::fs::remove_file(self.file_for(&old_stem));
-        }
+        true
     }
 
     /// Remove the single entry stored under `key`, if
     /// any: its index record and its file. Returns whether
     /// an entry was removed.
     pub fn remove(&self, key: &str) -> bool {
-        let stem = {
-            let mut inner = self.inner.lock().unwrap();
-            evict_entry(&mut inner, key).map(|(stem, _)| stem)
-        };
-        match stem {
-            Some(stem) => {
-                let _ = std::fs::remove_file(self.file_for(&stem));
-                true
+        let id = {
+            let inner = self.inner.lock().unwrap();
+            match inner.entries.get(key) {
+                Some(record) => record.id,
+                None => return false,
             }
-            None => false,
+        };
+        self.remove_copy(key, id)
+    }
+
+    /// Remove every record `target` covers from the index at
+    /// once, with no file I/O (issue #572), and queue their
+    /// files' deletion. A write in flight that the purge
+    /// covers is doomed: it lands nothing. Returns how many
+    /// records were removed, and the sequence numbers of the
+    /// deletions this purge queued, for
+    /// [`DiskStore::wait_deletions`]. The caller kicks the
+    /// drain.
+    pub fn purge(&self, target: &PurgeTarget) -> (usize, Range<u64>) {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let first = inner.next_seq + 1;
+        let removed: Vec<(String, Record)> = inner
+            .entries
+            .extract_if(|key, record| target.covers(key, &record.groups))
+            .collect();
+        for (key, record) in &removed {
+            inner.total_bytes -= record.charge;
+            inner.stamps.remove(key);
+            if inner.rewrites.jobs.get(key).is_some_and(|job| !job.running) {
+                inner.rewrites.remove(key);
+            }
+            inner.deletions.push(key, &record.stem, &mut inner.next_seq);
         }
+        for (key, claim) in inner.claims.iter_mut() {
+            if let Claim::Write { groups, doomed } = claim
+                && target.covers(key, groups)
+            {
+                *doomed = true;
+            }
+        }
+        (removed.len(), first..inner.next_seq + 1)
     }
 
     /// Remove every entry for `base`: the bare key plus its
     /// `#`-suffixed variants (Accept class, DPR). Returns how
-    /// many entries were removed.
+    /// many entries were removed. Their files are deleted
+    /// before it returns: for tests.
+    #[cfg(test)]
     pub fn purge_matching(&self, base: &str) -> usize {
-        let stems: Vec<String> = {
-            let mut guard = self.inner.lock().unwrap();
-            let inner = &mut *guard;
-            // Built once, not per key examined.
-            let prefix = format!("{base}#");
-            inner
-                .entries
-                .extract_if(|k, _| k.as_str() == base || k.starts_with(&prefix))
-                .map(|(key, (stem, size, _))| {
-                    inner.total_bytes -= size;
-                    inner.stamps.remove(&key);
-                    stem
-                })
-                .collect()
-        };
-        for stem in &stems {
-            let _ = std::fs::remove_file(self.file_for(stem));
-        }
-        stems.len()
+        let (removed, _) = self.purge(&PurgeTarget::Key(base.to_string()));
+        self.drain_now();
+        removed
     }
 
     /// Remove every entry belonging to `group` (RFC 9875
-    /// grouped invalidation), using the groups indexed at
-    /// scan and at store time. Returns how many entries
-    /// were removed.
+    /// grouped invalidation), as [`DiskStore::purge_matching`]
+    /// does: for tests.
+    #[cfg(test)]
     pub fn purge_group(&self, group: &str) -> usize {
-        let stems: Vec<String> = {
-            let mut guard = self.inner.lock().unwrap();
-            let inner = &mut *guard;
-            inner
-                .entries
-                .extract_if(|_, (_, _, groups)| groups.iter().any(|g| g == group))
-                .map(|(key, (stem, size, _))| {
-                    inner.total_bytes -= size;
-                    inner.stamps.remove(&key);
-                    stem
-                })
-                .collect()
-        };
-        for stem in &stems {
-            let _ = std::fs::remove_file(self.file_for(stem));
-        }
-        stems.len()
+        let (removed, _) = self.purge(&PurgeTarget::Group(group.to_string()));
+        self.drain_now();
+        removed
     }
 
-    /// Union `groups` into the stored entry for `key`
-    /// (audit R2-15): provenance is accumulated, not
-    /// first-writer only, so a group purge can find an
-    /// entry however it was first populated. The file is
-    /// rewritten only when the union actually grows the
-    /// set. Returns whether the stored entry changed.
-    pub fn merge_groups(&self, key: &str, groups: &[String]) -> bool {
-        let Some(mut image) = self.get(key) else {
-            return false;
+    /// Remove every entry whose result derives from `source`,
+    /// as [`DiskStore::purge_matching`] does: for tests.
+    #[cfg(test)]
+    pub fn purge_source(&self, source: &str) -> usize {
+        let (removed, _) = self.purge(&PurgeTarget::Source(source.to_string()));
+        self.drain_now();
+        removed
+    }
+
+    /// Start background jobs for queued work (issue #572), up
+    /// to [`DRAIN_JOBS`] at once, and wake one that waits.
+    /// Without a runtime the work stays queued.
+    pub fn kick(self: &Arc<Self>) {
+        let spawn = {
+            let mut inner = self.inner.lock().unwrap();
+            let queued = inner.rewrites.len() + inner.deletions.len();
+            if queued > inner.workers && inner.workers < DRAIN_JOBS {
+                inner.workers += 1;
+                true
+            } else {
+                false
+            }
         };
-        let merged = crate::cache::union_groups(&image.groups, groups);
-        if merged == image.groups {
+        self.drain_wake.notify_one();
+        if spawn {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    let store = self.clone();
+                    drop(runtime.spawn(async move { store.drain().await }));
+                }
+                Err(_) => self.inner.lock().unwrap().workers -= 1,
+            }
+        }
+    }
+
+    /// One background drain task: take a disk slot, then a
+    /// job, run it, and go on until no job is left. The slot
+    /// comes first, so a job's claim is held only while its
+    /// file operation can run. A job whose retry time has not
+    /// come is waited for by the last task left.
+    async fn drain(self: Arc<Self>) {
+        let mut worker = Worker {
+            store: &self,
+            counted: true,
+        };
+        loop {
+            let Some(permit) = self.permit().await else {
+                return;
+            };
+            let next = {
+                let mut inner = self.inner.lock().unwrap();
+                let next = next_job(&mut inner, false);
+                if matches!(next, Next::Empty) {
+                    inner.workers -= 1;
+                    worker.counted = false;
+                }
+                next
+            };
+            match next {
+                Next::Job(job) => {
+                    let claim = FileClaim::job(self.clone(), &job.key, job.kind);
+                    let _ = self
+                        .blocking_with(permit, move |store| store.run_job(claim, &job))
+                        .await;
+                }
+                Next::Wait(until) => {
+                    drop(permit);
+                    {
+                        let mut inner = self.inner.lock().unwrap();
+                        if inner.workers > 1 {
+                            inner.workers -= 1;
+                            worker.counted = false;
+                            return;
+                        }
+                    }
+                    let woken = self.drain_wake.notified();
+                    match until {
+                        Some(until) => {
+                            let _ = tokio::time::timeout_at(until.into(), woken).await;
+                        }
+                        None => woken.await,
+                    }
+                }
+                Next::Empty => return,
+            }
+        }
+    }
+
+    /// Run one job on a blocking thread, holding its claim.
+    fn run_job<S: std::ops::Deref<Target = DiskStore>>(
+        &self,
+        mut claim: FileClaim<S>,
+        job: &Taken,
+    ) {
+        let path = self.file_for(&job.stem);
+        match job.kind {
+            JobKind::Delete => {
+                match self
+                    .held(OpKind::Unlink, &path)
+                    .and_then(|()| std::fs::remove_file(&path))
+                {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        // The claim's drop queues it again.
+                        self.note_error("cannot delete a purged cache entry", &e);
+                        return;
+                    }
+                }
+                self.inner.lock().unwrap().deletions.finish(&job.key, false);
+                claim.done = true;
+            }
+            JobKind::Rewrite => {
+                if self.rewrite(&job.key, &job.stem, job.id) {
+                    claim.done = true;
+                }
+            }
+        }
+    }
+
+    /// Write the record's groups into `key`'s file, keeping
+    /// its bytes, ETag and stamp. Returns false when the job
+    /// failed and runs again later.
+    fn rewrite(&self, key: &str, stem: &str, id: u64) -> bool {
+        let path = &self.file_for(stem);
+        let data = read_capped(path, self.max_bytes);
+        let parsed = match self.held(OpKind::Read, path) {
+            Ok(()) => data.and_then(|data| parse_entry(&data, &self.entry_key)),
+            Err(e) => {
+                self.note_error("cannot read a cache entry to add its groups", &e);
+                return false;
+            }
+        };
+        let Some((_, mut image)) = parsed.filter(|(stored, _)| stored == key) else {
+            // Corrupt or gone: a copy that cannot carry its
+            // groups does not stay.
+            self.drop_copy(key, id, path);
+            return true;
+        };
+        let groups = {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.entries.get(key).filter(|record| record.id == id) {
+                Some(record) => record.groups.clone(),
+                None => {
+                    inner.rewrites.finish(key, false);
+                    return true;
+                }
+            }
+        };
+        if groups.iter().all(|g| image.groups.contains(g)) {
+            self.inner.lock().unwrap().rewrites.finish(key, false);
+            return true;
+        }
+        image.groups = with_groups(&image.groups, &groups);
+        let data = serialize_entry(key, &image, &self.entry_key);
+        if entry_charge(key, data.len(), &image.groups) > self.max_bytes {
+            self.drop_copy(key, id, path);
+            return true;
+        }
+        let tmp = self.dir.join(tmp_name(stem));
+        if let Err(e) = self
+            .held(OpKind::Write, &tmp)
+            .and_then(|()| std::fs::write(&tmp, &data))
+            .and_then(|()| std::fs::rename(&tmp, path))
+        {
+            self.note_error("cannot add cache groups to a cache entry", &e);
+            let _ = std::fs::remove_file(&tmp);
             return false;
         }
-        image.groups = merged;
-        self.put(key, &image);
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        match inner.entries.get_mut(key).filter(|record| record.id == id) {
+            Some(record) => {
+                record.file_bytes = data.len();
+                let charge = entry_charge(key, record.file_bytes, &record.groups);
+                inner.total_bytes = inner.total_bytes - record.charge + charge;
+                record.charge = charge;
+                let again = record.groups.iter().any(|g| !image.groups.contains(g));
+                inner.rewrites.finish(key, again);
+            }
+            None => {
+                // A purge or an eviction removed the record
+                // while the file was rewritten: the file is
+                // this job's, under its claim.
+                inner.rewrites.finish(key, false);
+                drop(guard);
+                self.unlink(path);
+            }
+        }
         true
     }
 
-    /// Remove every entry whose result derives from
-    /// `source`, whatever operations produced it (audit
-    /// R2-07): an upload overwrite calls this so the
-    /// replaced original's derivatives stop serving.
-    /// Returns how many entries were removed.
-    pub fn purge_source(&self, source: &str) -> usize {
-        let stems: Vec<String> = {
-            let mut guard = self.inner.lock().unwrap();
-            let inner = &mut *guard;
-            // Built once, not per key examined.
-            let suffix = format!("/{source}");
-            inner
-                .entries
-                .extract_if(|k, _| {
-                    let base = k.split('#').next().unwrap_or(k);
-                    base == source || base.ends_with(&suffix)
-                })
-                .map(|(key, (stem, size, _))| {
-                    inner.total_bytes -= size;
-                    inner.stamps.remove(&key);
-                    stem
-                })
-                .collect()
-        };
-        for stem in &stems {
-            let _ = std::fs::remove_file(self.file_for(stem));
+    /// Evict copy `id` of `key` and delete its file, under the
+    /// claim the caller holds.
+    fn drop_copy(&self, key: &str, id: u64, path: &Path) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.entries.get(key).is_some_and(|record| record.id == id) {
+                evict_entry(&mut inner, key);
+            }
+            inner.rewrites.finish(key, false);
         }
-        stems.len()
+        self.unlink(path);
+    }
+
+    /// Delete an entry file under the claim the caller holds,
+    /// best-effort: a file left behind by a failure is one the
+    /// next boot indexes again or deletes as corrupt.
+    fn unlink(&self, path: &Path) {
+        let _ = self
+            .held(OpKind::Unlink, path)
+            .and_then(|()| std::fs::remove_file(path));
+    }
+
+    /// Run every queued job now, on this thread, retry times
+    /// ignored: for tests, which may have no runtime.
+    #[cfg(test)]
+    pub(crate) fn drain_now(&self) {
+        loop {
+            let next = next_job(&mut self.inner.lock().unwrap(), true);
+            let Next::Job(job) = next else { return };
+            let claim = FileClaim::job(self, &job.key, job.kind);
+            self.run_job(claim, &job);
+        }
+    }
+
+    /// Run the next queued job now, on this thread: for
+    /// tests. Returns whether there was one.
+    #[cfg(test)]
+    pub(crate) fn run_one_job(&self) -> bool {
+        let next = next_job(&mut self.inner.lock().unwrap(), true);
+        let Next::Job(job) = next else { return false };
+        let claim = FileClaim::job(self, &job.key, job.kind);
+        self.run_job(claim, &job);
+        true
+    }
+
+    /// The keys the index holds: for tests.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<String> {
+        self.inner.lock().unwrap().entries.keys().cloned().collect()
+    }
+
+    /// Wait until the background jobs that have not failed
+    /// are done, or until `deadline` (issue #572), and report
+    /// what is left. A job that keeps failing is not waited
+    /// for: it would hold every shutdown to its whole grace.
+    pub async fn settle(self: &Arc<Self>, deadline: tokio::time::Instant) -> Backlog {
+        self.kick();
+        let mut progress = self.progress.subscribe();
+        loop {
+            let busy = {
+                let inner = self.inner.lock().unwrap();
+                [&inner.rewrites, &inner.deletions].iter().any(|queue| {
+                    queue
+                        .jobs
+                        .values()
+                        .any(|job| job.running || job.attempts == 0)
+                })
+            };
+            if !busy
+                || tokio::time::timeout_at(deadline, progress.changed())
+                    .await
+                    .is_err()
+            {
+                return self.backlog();
+            }
+        }
+    }
+
+    /// Whether a deletion in `seqs` is still queued or
+    /// running; failed ones count only with `failed`.
+    fn deletions_left(&self, seqs: &Range<u64>, failed: bool) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .deletions
+            .jobs
+            .values()
+            .any(|job| seqs.contains(&job.seq) && (failed || job.attempts == 0))
+    }
+
+    /// Wait until the deletions a purge queued (`seqs`) are
+    /// done (issue #572). Returns false when none finished for
+    /// `idle`, or `cap` passed in all: a disk that stops
+    /// answering, or a slow one. Deletions that failed are not
+    /// waited for; they are retried and counted.
+    pub async fn wait_deletions(
+        self: &Arc<Self>,
+        seqs: Range<u64>,
+        idle: std::time::Duration,
+        cap: std::time::Duration,
+    ) -> bool {
+        if seqs.is_empty() {
+            return true;
+        }
+        self.kick();
+        let mut progress = self.progress.subscribe();
+        let end = tokio::time::Instant::now() + cap;
+        loop {
+            if !self.deletions_left(&seqs, false) {
+                return true;
+            }
+            let wait = idle.min(end.saturating_duration_since(tokio::time::Instant::now()));
+            if wait.is_zero()
+                || tokio::time::timeout(wait, progress.changed())
+                    .await
+                    .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    /// Whether a deletion in `seqs` is still queued, failed or
+    /// not.
+    pub fn deletions_pending(&self, seqs: &Range<u64>) -> bool {
+        self.deletions_left(seqs, true)
+    }
+
+    /// Wait, with no limit, until every deletion in `seqs`
+    /// is done, failed ones included: what a purge's bucket
+    /// tombstone waits for before it is marked ended.
+    pub async fn deletions_done(self: &Arc<Self>, seqs: Range<u64>) {
+        self.kick();
+        let mut progress = self.progress.subscribe();
+        while self.deletions_left(&seqs, true) {
+            if progress.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// What background work is left (issue #572). Scans the
+    /// queues and the index: for shutdown and tests, never
+    /// for /metrics.
+    pub fn backlog(&self) -> Backlog {
+        let inner = self.inner.lock().unwrap();
+        let failing = [&inner.rewrites, &inner.deletions]
+            .iter()
+            .map(|queue| queue.jobs.values().filter(|job| job.attempts > 0).count())
+            .sum();
+        Backlog {
+            behind: inner.rewrites.len(),
+            deletions: inner.deletions.len(),
+            failing,
+            owed: inner
+                .entries
+                .values()
+                .filter(|record| record.owes_shared)
+                .count(),
+        }
+    }
+
+    /// Entries whose file lacks groups its record has, and
+    /// deleted entries whose file is still there: queue
+    /// lengths, cheap enough for every /metrics scrape.
+    pub fn queued(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.rewrites.len(), inner.deletions.len())
     }
 
     /// (entries, total charge) currently indexed, for the boot
@@ -717,11 +1553,492 @@ fn touch(inner: &mut Inner, key: &str) {
     }
 }
 
-fn evict_entry(inner: &mut Inner, key: &str) -> Option<(String, usize)> {
-    let (stem, size, _) = inner.entries.remove(key)?;
-    inner.total_bytes -= size;
+/// Remove `key`'s record from the index, with its charge,
+/// its recency and a rewrite queued for it.
+fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
+    let record = inner.entries.remove(key)?;
+    inner.total_bytes -= record.charge;
     inner.stamps.remove(key);
-    Some((stem, size))
+    if inner.rewrites.jobs.get(key).is_some_and(|job| !job.running) {
+        inner.rewrites.remove(key);
+    }
+    Some(record)
+}
+
+/// Claim `key`'s file for an inline delete and return its
+/// stem, or, when another job holds it, queue the deletion.
+fn claim_or_queue(inner: &mut Inner, key: &str, stem: &str) -> Option<String> {
+    if inner.claims.contains_key(key) {
+        inner.deletions.push(key, stem, &mut inner.next_seq);
+        return None;
+    }
+    inner.claims.insert(key.to_string(), Claim::File);
+    Some(stem.to_string())
+}
+
+/// `existing` with `extra` added. Unchanged, order and all,
+/// when it holds them already; otherwise the sorted union
+/// every tier stores.
+fn with_groups(existing: &[String], extra: &[String]) -> Vec<String> {
+    if extra.iter().all(|g| existing.contains(g)) {
+        existing.to_vec()
+    } else {
+        crate::cache::union_groups(existing, extra)
+    }
+}
+
+/// [`DiskStore::learn_groups`] under the index lock.
+fn learn_locked(inner: &mut Inner, key: &str, groups: &[String], bucket: Bucket<'_>) -> Learned {
+    if let Some(record) = inner.entries.get_mut(key) {
+        let merged = with_groups(&record.groups, groups);
+        let grew = merged.len() > record.groups.len();
+        if grew {
+            record.groups = merged;
+            let charge = entry_charge(key, record.file_bytes, &record.groups);
+            inner.total_bytes = inner.total_bytes - record.charge + charge;
+            record.charge = charge;
+            if matches!(bucket, Bucket::Skipped) {
+                record.owes_shared = true;
+            }
+            inner.rewrites.push(key, &record.stem, &mut inner.next_seq);
+            inner.clock += 1;
+            let stamp = inner.clock;
+            if let Some(s) = inner.stamps.get_mut(key) {
+                *s = stamp;
+            }
+        }
+        if let Bucket::Carries(carried) = bucket
+            && record.groups.iter().all(|g| carried.contains(g))
+        {
+            record.owes_shared = false;
+        }
+        return Learned::Indexed {
+            grew,
+            groups: record.groups.clone(),
+            written: record.written,
+            id: record.id,
+        };
+    }
+    if let Some(Claim::Write { groups: held, .. }) = inner.claims.get_mut(key) {
+        *held = with_groups(held, groups);
+        return Learned::InFlight;
+    }
+    Learned::Absent
+}
+
+/// What a drain task does next.
+enum Next {
+    /// Run this job; its key is claimed.
+    Job(Taken),
+    /// Nothing can run yet: wait until the earliest retry, or
+    /// with `None` until a claim is released.
+    Wait(Option<std::time::Instant>),
+    /// Nothing is queued that is not running.
+    Empty,
+}
+
+/// A job taken off a queue, its key claimed.
+struct Taken {
+    key: String,
+    stem: String,
+    /// The record a rewrite is for.
+    id: u64,
+    kind: JobKind,
+}
+
+/// Take the next job that can run, claiming its key:
+/// deletions first, since a purge waits for them. A key
+/// another job or write holds is passed over until released.
+/// `now_for_all` runs jobs whose retry time has not come.
+fn next_job(inner: &mut Inner, now_for_all: bool) -> Next {
+    let now = std::time::Instant::now();
+    let mut earliest: Option<std::time::Instant> = None;
+    let mut blocked = false;
+    for _ in 0..inner.deletions.order.len() {
+        let Some(key) = inner.deletions.order.pop_front() else {
+            break;
+        };
+        let Some(job) = inner.deletions.jobs.get_mut(&key) else {
+            continue;
+        };
+        if inner.entries.contains_key(&key) {
+            // Indexed again: a later write replaced the file.
+            inner.deletions.jobs.remove(&key);
+            continue;
+        }
+        if let Some(at) = job.not_before.filter(|at| !now_for_all && *at > now) {
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
+            inner.deletions.order.push_back(key);
+            continue;
+        }
+        if inner.claims.contains_key(&key) {
+            blocked = true;
+            inner.deletions.order.push_back(key);
+            continue;
+        }
+        job.running = true;
+        let stem = job.stem.clone();
+        inner.claims.insert(key.clone(), Claim::File);
+        return Next::Job(Taken {
+            key,
+            stem,
+            id: 0,
+            kind: JobKind::Delete,
+        });
+    }
+    for _ in 0..inner.rewrites.order.len() {
+        let Some(key) = inner.rewrites.order.pop_front() else {
+            break;
+        };
+        let Some(job) = inner.rewrites.jobs.get_mut(&key) else {
+            continue;
+        };
+        let Some(record) = inner.entries.get(&key) else {
+            inner.rewrites.jobs.remove(&key);
+            continue;
+        };
+        if let Some(at) = job.not_before.filter(|at| !now_for_all && *at > now) {
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
+            inner.rewrites.order.push_back(key);
+            continue;
+        }
+        if inner.claims.contains_key(&key) {
+            blocked = true;
+            inner.rewrites.order.push_back(key);
+            continue;
+        }
+        job.running = true;
+        let (stem, id) = (record.stem.clone(), record.id);
+        inner.claims.insert(key.clone(), Claim::File);
+        return Next::Job(Taken {
+            key,
+            stem,
+            id,
+            kind: JobKind::Rewrite,
+        });
+    }
+    if earliest.is_some() || blocked {
+        Next::Wait(earliest)
+    } else {
+        Next::Empty
+    }
+}
+
+/// A key's file claim, released when dropped, on every path
+/// a panic included. A job's claim that drops before the job
+/// is done puts the job back in its queue to run again after
+/// a backoff.
+struct FileClaim<S: std::ops::Deref<Target = DiskStore>> {
+    store: S,
+    key: String,
+    job: Option<JobKind>,
+    done: bool,
+}
+
+impl<'s> FileClaim<&'s DiskStore> {
+    /// The claim an inline delete took under the index lock.
+    fn inline(store: &'s DiskStore, key: &str) -> Self {
+        FileClaim {
+            store,
+            key: key.to_string(),
+            job: None,
+            done: true,
+        }
+    }
+}
+
+impl<S: std::ops::Deref<Target = DiskStore>> FileClaim<S> {
+    /// The claim a background job took when it was taken.
+    fn job(store: S, key: &str, kind: JobKind) -> Self {
+        FileClaim {
+            store,
+            key: key.to_string(),
+            job: Some(kind),
+            done: false,
+        }
+    }
+}
+
+impl<S: std::ops::Deref<Target = DiskStore>> Drop for FileClaim<S> {
+    fn drop(&mut self) {
+        let store = &*self.store;
+        {
+            let mut inner = store
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(inner.claims.get(&self.key), Some(Claim::File)) {
+                inner.claims.remove(&self.key);
+            }
+            match (self.job, self.done) {
+                (Some(JobKind::Rewrite), false) => inner.rewrites.retry(&self.key),
+                (Some(JobKind::Delete), false) => inner.deletions.retry(&self.key),
+                _ => {}
+            }
+        }
+        if self.job.is_some() {
+            store.progress.send_modify(|n| *n += 1);
+        }
+    }
+}
+
+/// Removes a write claim that did not land.
+struct ReleaseWrite<'s> {
+    store: &'s DiskStore,
+    key: &'s str,
+}
+
+impl Drop for ReleaseWrite<'_> {
+    fn drop(&mut self) {
+        let mut inner = self
+            .store
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(inner.claims.get(self.key), Some(Claim::Write { .. })) {
+            inner.claims.remove(self.key);
+        }
+    }
+}
+
+/// Counts a drain task as running until it stops, on every
+/// path.
+struct Worker<'s> {
+    store: &'s DiskStore,
+    counted: bool,
+}
+
+impl Drop for Worker<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            let mut inner = self
+                .store
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.workers -= 1;
+        }
+    }
+}
+
+/// What the bucket copy carries, said by the caller of a
+/// learn (issue #572).
+#[derive(Debug, Clone, Copy)]
+pub enum Bucket<'a> {
+    /// A bucket write carrying these groups was spawned, or
+    /// one is queued: a debt for them is paid.
+    Carries(&'a [String]),
+    /// The render's bucket write was skipped for want of a
+    /// slot (issue #463): groups the record learns now are
+    /// owed to the bucket.
+    Skipped,
+    /// Nothing is known: the debt stays as it is.
+    Unknown,
+}
+
+/// What a learn did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Learned {
+    /// The record learned: whether it grew, its groups now,
+    /// the copy's stamp and its id.
+    Indexed {
+        grew: bool,
+        groups: Vec<String>,
+        written: Option<WriteStamp>,
+        id: u64,
+    },
+    /// A write of the key in flight learned; it lands with
+    /// the groups.
+    InFlight,
+    /// No copy of the key is indexed or being written.
+    Absent,
+}
+
+/// What a disk hit's learn did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitLearn {
+    /// The record grew.
+    pub grew: bool,
+    /// The record owed the bucket groups (see
+    /// [`Bucket::Skipped`]); the debt is now the caller's.
+    pub owed: bool,
+    /// The record's groups now.
+    pub groups: Vec<String>,
+}
+
+/// How a write goes (see [`DiskStore::begin_write`]).
+#[derive(Debug)]
+pub enum WritePlan {
+    /// The key is claimed for this write.
+    Claimed(WriteClaim),
+    /// The index holds the key; its record learned.
+    Held(Learned),
+    /// Another write of the key is in flight and learned.
+    Joined,
+    /// Another job holds the key's file, or the write may not
+    /// claim it; nothing is written.
+    Busy,
+    /// The store keeps nothing (a budget of 0).
+    Off,
+}
+
+/// A write's claim on a key the index does not hold (issue
+/// #572). Groups learned for the key while it is held land
+/// with the write. Dropped before it lands, it unregisters.
+pub struct WriteClaim {
+    store: Arc<DiskStore>,
+    key: String,
+    landed: bool,
+}
+
+impl std::fmt::Debug for WriteClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteClaim")
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+impl Drop for WriteClaim {
+    fn drop(&mut self) {
+        if self.landed {
+            return;
+        }
+        {
+            let mut inner = self
+                .store
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(inner.claims.get(&self.key), Some(Claim::Write { .. })) {
+                inner.claims.remove(&self.key);
+            }
+        }
+        // A deletion passed over while the key was claimed
+        // can run now.
+        self.store.kick();
+    }
+}
+
+/// A landed write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    /// The new record's id.
+    pub id: u64,
+    /// The groups it landed with.
+    pub groups: Vec<String>,
+}
+
+/// Background disk work left (see [`DiskStore::backlog`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Backlog {
+    /// Entries whose file lacks groups its record has.
+    pub behind: usize,
+    /// Deleted entries whose file is still there.
+    pub deletions: usize,
+    /// Of those jobs, the ones that failed and wait to run
+    /// again.
+    pub failing: usize,
+    /// Records whose groups the bucket copy may lack.
+    pub owed: usize,
+}
+
+/// A disk wait that ran out (issue #572).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stall {
+    /// A lookup found no free disk slot in time.
+    LookupSlot,
+    /// A lookup's read did not answer in time.
+    LookupRead,
+    /// A write found no free disk slot in time and was
+    /// skipped.
+    Write,
+    /// A purge's deletions made no progress in time; they go
+    /// on in the background.
+    PurgeDelete,
+}
+
+impl Stall {
+    fn what(self) -> &'static str {
+        match self {
+            Stall::LookupSlot => "a disk lookup found no free disk slot in time",
+            Stall::LookupRead => "a disk lookup's read did not answer in time",
+            Stall::Write => "a disk write found no free disk slot in time and was skipped",
+            Stall::PurgeDelete => {
+                "a purge's disk deletions stopped making progress; they go on in the background"
+            }
+        }
+    }
+}
+
+/// The log of disk waits that ran out: the first at once,
+/// then at most one line every [`STALL_LOG_EVERY_MS`], with
+/// how many were left out since the last one.
+#[derive(Debug, Default)]
+pub(crate) struct StallLog {
+    next_line_ms: AtomicU64,
+    since: AtomicU64,
+}
+
+impl StallLog {
+    /// Count one stall at `now_ms`, and return the line to
+    /// log, if one is due.
+    pub(crate) fn note(&self, now_ms: u64, what: &str) -> Option<String> {
+        let next = self.next_line_ms.load(Ordering::Relaxed);
+        if now_ms < next
+            || self
+                .next_line_ms
+                .compare_exchange(
+                    next,
+                    now_ms + STALL_LOG_EVERY_MS,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            self.since.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(match self.since.swap(0, Ordering::Relaxed) {
+            0 => format!("result storage: {what}"),
+            more => format!(
+                "result storage: {what}; {more} more disk waits ran out since the last line"
+            ),
+        })
+    }
+}
+
+/// An entry the boot scan found.
+struct Scanned {
+    mtime: std::time::SystemTime,
+    key: String,
+    stem: String,
+    file_bytes: usize,
+    charge: usize,
+    groups: Vec<String>,
+    written: Option<WriteStamp>,
+}
+
+/// The disk deletions one purge queued (issue #572): what its
+/// bucket tombstone waits for before it is marked ended, so a
+/// restart that indexes those files again still finds the
+/// purge in force.
+#[derive(Debug, Clone)]
+pub struct DeletionWait {
+    pub store: Arc<DiskStore>,
+    pub seqs: Range<u64>,
+}
+
+impl DeletionWait {
+    /// Whether any of the deletions is still queued.
+    pub fn pending(&self) -> bool {
+        self.store.deletions_pending(&self.seqs)
+    }
+
+    /// Wait until every one of the deletions is done.
+    pub async fn done(&self) {
+        self.store.deletions_done(self.seqs.clone()).await;
+    }
 }
 
 fn format_name(format: ImageFormat) -> &'static str {
@@ -1072,13 +2389,17 @@ pub(crate) fn parse_entry_header(data: &[u8], total_len: usize) -> Option<Header
 /// file has to be in memory, but never more than `cap`.
 /// The MAC is verified: a file planted in the directory
 /// is dropped at scan, not indexed.
-fn read_header(path: &Path, cap: usize, entry_key: &[u8]) -> Option<(String, Vec<String>)> {
+fn read_header(
+    path: &Path,
+    cap: usize,
+    entry_key: &[u8],
+) -> Option<(String, Vec<String>, Option<WriteStamp>)> {
     let data = read_capped(path, cap)?;
     let header = parse_header_bytes(&data, data.len())?;
     if !verify_entry_mac(entry_key, &data[header.covered_start..], &header.mac) {
         return None;
     }
-    Some((header.key, header.groups))
+    Some((header.key, header.groups, header.written))
 }
 
 /// The purge tombstone format (issue #461): what a purge
@@ -1899,18 +3220,32 @@ mod tests {
     }
 
     #[test]
-    fn merge_groups_unions_provenance_and_persists() {
+    fn learned_groups_union_provenance_and_persist() {
         let dir = temp_dir("merge");
         {
             let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
             store.put("k", &grouped_image(b"x", &["thumb"]));
             // A later spelling brings a second group: the
             // stored set grows to the union (R2-15), and a
-            // repeat merge changes nothing.
-            assert!(store.merge_groups("k", &["hero".to_string()]));
-            assert!(!store.merge_groups("k", &["thumb".to_string()]));
+            // repeat learn changes nothing.
+            let grew = |learned| matches!(learned, Learned::Indexed { grew: true, .. });
+            assert!(grew(store.learn_groups(
+                "k",
+                &["hero".to_string()],
+                Bucket::Unknown
+            )));
+            assert!(!grew(store.learn_groups(
+                "k",
+                &["thumb".to_string()],
+                Bucket::Unknown
+            )));
             assert_eq!(store.get("k").unwrap().groups, ["hero", "thumb"]);
-            assert!(!store.merge_groups("missing", &["hero".to_string()]));
+            assert_eq!(
+                store.learn_groups("missing", &["hero".to_string()], Bucket::Unknown),
+                Learned::Absent
+            );
+            // The drain writes the union into the file.
+            store.drain_now();
         }
         // The union is in the file, so it survives a
         // reopen and either group purges the entry.
@@ -2145,6 +3480,616 @@ mod tests {
         assert!(planted.is_dir(), "the directory is left in place");
         assert_eq!(store.stats().0, 1, "only the real entry is indexed");
         assert_eq!(store.get("good").unwrap().bytes.as_ref(), b"payload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Issue #572: the index as the groups' authority, the
+    // claims, and the background drain.
+
+    fn groups(names: &[&str]) -> Vec<String> {
+        names.iter().map(|g| g.to_string()).collect()
+    }
+
+    /// The groups in `key`'s entry file, as the boot scan
+    /// reads them.
+    fn file_groups(store: &DiskStore, key: &str) -> Vec<String> {
+        let data = std::fs::read(store.file_for(&key_stem(key))).unwrap();
+        parse_entry_header(&data, data.len()).unwrap().groups
+    }
+
+    fn grew(learned: Learned) -> bool {
+        matches!(learned, Learned::Indexed { grew: true, .. })
+    }
+
+    /// A hook that holds every operation of `kind` until the
+    /// returned sender sends or drops, and reports each one it
+    /// holds on the returned receiver.
+    fn hold_kind(
+        kind: OpKind,
+    ) -> (
+        TestHold,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held_tx = Mutex::new(held_tx);
+        let release_rx = Mutex::new(release_rx);
+        let hook: TestHold = Arc::new(move |op, _| {
+            if op == kind {
+                let _ = held_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+            Ok(())
+        });
+        (hook, held_rx, release_tx)
+    }
+
+    #[test]
+    fn learn_groups_records_in_the_index_and_get_unions_while_the_file_is_behind() {
+        let dir = temp_dir("learn");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("k", &grouped_image(b"x", &["a"]));
+        assert!(grew(store.learn_groups(
+            "k",
+            &groups(&["c"]),
+            Bucket::Unknown
+        )));
+        assert_eq!(store.get("k").unwrap().groups, ["a", "c"]);
+        assert_eq!(file_groups(&store, "k"), ["a"], "no file I/O at learn");
+        assert_eq!(store.backlog().behind, 1);
+        store.drain_now();
+        assert_eq!(file_groups(&store, "k"), ["a", "c"]);
+        assert_eq!(store.backlog(), Backlog::default());
+        assert!(!grew(store.learn_groups(
+            "k",
+            &groups(&["c"]),
+            Bucket::Unknown
+        )));
+        assert_eq!(
+            store.learn_groups("missing", &groups(&["c"]), Bucket::Unknown),
+            Learned::Absent
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_keeps_the_file_group_order_when_up_to_date() {
+        let dir = temp_dir("order");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("k", &grouped_image(b"x", &["thumb", "hero"]));
+        assert!(!grew(store.learn_groups(
+            "k",
+            &groups(&["hero"]),
+            Bucket::Unknown
+        )));
+        assert_eq!(store.get("k").unwrap().groups, ["thumb", "hero"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_for_an_indexed_key_learns_and_never_replaces() {
+        let dir = temp_dir("held");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"x", &["a"]));
+        let etag = store.get("k").unwrap().etag;
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = writes.clone();
+        store.set_hold(Some(Arc::new(move |kind, _| {
+            if kind == OpKind::Write {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+        let plan = store.begin_write("k", &groups(&["c"]), Bucket::Unknown, true);
+        assert!(matches!(
+            plan,
+            WritePlan::Held(Learned::Indexed { grew: true, .. })
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        let held = store.get("k").unwrap();
+        assert_eq!((held.etag, held.groups), (etag, groups(&["a", "c"])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_in_flight_collects_groups_learned_meanwhile() {
+        let dir = temp_dir("in-flight");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let WritePlan::Claimed(claim) =
+            store.begin_write("k", &groups(&["c"]), Bucket::Unknown, true)
+        else {
+            panic!("the key was not claimed");
+        };
+        assert_eq!(
+            store.learn_groups("k", &groups(&["d"]), Bucket::Unknown),
+            Learned::InFlight
+        );
+        assert_eq!(store.known_groups("k").unwrap(), ["c", "d"]);
+        // A group learned while the file is written lands too.
+        let (hook, held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || store.land(claim, &grouped_image(b"x", &["c"])))
+        };
+        held.recv().unwrap();
+        store.learn_groups("k", &groups(&["e"]), Bucket::Unknown);
+        drop(release);
+        let landed = writer.join().unwrap().unwrap();
+        assert_eq!(landed.groups, ["c", "d", "e"]);
+        store.set_hold(None);
+        assert_eq!(file_groups(&store, "k"), ["c", "d"]);
+        store.drain_now();
+        assert_eq!(file_groups(&store, "k"), ["c", "d", "e"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dropped_write_claim_unregisters() {
+        let dir = temp_dir("dropped-claim");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let plan = store.begin_write("k", &groups(&["c"]), Bucket::Unknown, true);
+        assert!(matches!(plan, WritePlan::Claimed(_)));
+        drop(plan);
+        assert_eq!(store.known_groups("k"), None);
+        let plan = store.begin_write("k", &[], Bucket::Unknown, true);
+        assert!(matches!(plan, WritePlan::Claimed(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_write_of_a_key_joins_the_first() {
+        let dir = temp_dir("join");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let WritePlan::Claimed(claim) =
+            store.begin_write("k", &groups(&["c"]), Bucket::Unknown, true)
+        else {
+            panic!("the key was not claimed");
+        };
+        assert!(matches!(
+            store.begin_write("k", &groups(&["d"]), Bucket::Unknown, true),
+            WritePlan::Joined
+        ));
+        let landed = store.land(claim, &grouped_image(b"x", &["c"])).unwrap();
+        assert_eq!(landed.groups, ["c", "d"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_in_flight_when_its_key_is_purged_never_lands() {
+        // A purge that covers a write in flight dooms it: the
+        // write began before the purge, and its copy must not
+        // stand once the purge's tombstones are gone.
+        let dir = temp_dir("doomed");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        for (key, target) in [
+            ("k1", PurgeTarget::Group("g".into())),
+            ("k2", PurgeTarget::Key("k2".into())),
+        ] {
+            let WritePlan::Claimed(claim) =
+                store.begin_write(key, &groups(&["g"]), Bucket::Unknown, true)
+            else {
+                panic!("the key was not claimed");
+            };
+            assert_eq!(store.purge(&target).0, 0);
+            assert_eq!(store.land(claim, &grouped_image(b"x", &["g"])), None);
+            assert!(!store.contains(key));
+            assert!(!store.file_for(&key_stem(key)).exists());
+            // The key is free for the next write.
+            assert!(matches!(
+                store.begin_write(key, &[], Bucket::Unknown, true),
+                WritePlan::Claimed(_)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purges_remove_records_at_once_and_queue_the_files() {
+        let dir = temp_dir("purge-queue");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("a", &image(b"1"));
+        store.put("a#avif", &image(b"2"));
+        store.put("b", &image(b"3"));
+        let (removed, seqs) = store.purge(&PurgeTarget::Key("a".into()));
+        assert_eq!((removed, seqs.end - seqs.start), (2, 2));
+        assert!(!store.contains("a") && !store.contains("a#avif"));
+        assert!(
+            store.file_for(&key_stem("a")).exists(),
+            "no file I/O at purge"
+        );
+        assert!(store.deletions_pending(&seqs));
+        assert_eq!(store.backlog().deletions, 2);
+        store.drain_now();
+        assert!(!store.file_for(&key_stem("a")).exists());
+        assert!(!store.file_for(&key_stem("a#avif")).exists());
+        assert!(!store.deletions_pending(&seqs));
+        assert!(store.get("b").is_some());
+        // A purge that matched nothing queued nothing.
+        let (removed, seqs) = store.purge(&PurgeTarget::Group("none".into()));
+        assert_eq!(removed, 0);
+        assert!(seqs.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn learned_groups_are_charged_and_the_next_landing_evicts_to_fit() {
+        let dir = temp_dir("learn-charge");
+        let payload = vec![7u8; 100];
+        let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
+        let budget = 2 * entry_charge("a", file, &[]) + 200;
+        let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+        store.put("a", &image(&payload));
+        store.put("b", &image(&payload));
+        let before = store.stats().1;
+        let group = "g".repeat(300);
+        store.learn_groups("a", std::slice::from_ref(&group), Bucket::Unknown);
+        assert!(
+            store.stats().1 > before,
+            "the learned group was not charged"
+        );
+        assert!(store.stats().1 > budget, "the learn itself evicts nothing");
+        store.put("c", &image(&payload));
+        assert!(store.stats().1 <= budget);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_evicted_key_is_unlinked_under_a_claim() {
+        let dir = temp_dir("evict-claim");
+        let payload = vec![7u8; 100];
+        let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
+        let budget = entry_charge("a", file, &[]) + 50;
+        let store = Arc::new(DiskStore::open(&dir, budget, test_entry_key()).unwrap());
+        store.put("a", &image(&payload));
+        let (hook, held, release) = hold_kind(OpKind::Unlink);
+        store.set_hold(Some(hook));
+        let writer = {
+            let store = store.clone();
+            let payload = payload.clone();
+            std::thread::spawn(move || store.put("b", &image(&payload)))
+        };
+        // The landing of `b` evicts `a` and deletes its file
+        // under `a`'s claim: a fresh write of `a` meanwhile
+        // writes nothing.
+        held.recv().unwrap();
+        assert!(!store.contains("a"));
+        assert!(matches!(
+            store.begin_write("a", &[], Bucket::Unknown, true),
+            WritePlan::Busy
+        ));
+        drop(release);
+        writer.join().unwrap();
+        store.set_hold(None);
+        assert!(!store.file_for(&key_stem("a")).exists());
+        assert!(matches!(
+            store.begin_write("a", &[], Bucket::Unknown, true),
+            WritePlan::Claimed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_misses_when_the_record_is_replaced_during_the_read() {
+        // A read of copy X whose record a purge removes and a
+        // fresh write Y replaces before the read returns: X's
+        // bytes are a purged copy's, and they must not serve
+        // with Y's groups, which may lack the purged group.
+        let dir = temp_dir("replaced-read");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"x", &["a"]));
+        store.learn_groups("k", &groups(&["g"]), Bucket::Unknown);
+        let (hook, held, release) = hold_kind(OpKind::Read);
+        store.set_hold(Some(hook));
+        let reader = {
+            let store = store.clone();
+            std::thread::spawn(move || store.get_with_id("k"))
+        };
+        held.recv().unwrap();
+        store.set_hold(None);
+        assert_eq!(store.purge(&PurgeTarget::Group("g".into())).0, 1);
+        store.drain_now();
+        store.put("k", &grouped_image(b"y", &["b"]));
+        drop(release);
+        assert_eq!(reader.join().unwrap(), None);
+        assert_eq!(store.get("k").unwrap().bytes.as_ref(), b"y");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stall_lines_are_rate_limited() {
+        let log = StallLog::default();
+        let t0 = 1_000_000;
+        let first = log.note(t0, "a disk wait ran out").unwrap();
+        assert_eq!(first, "result storage: a disk wait ran out");
+        for i in 1..50 {
+            assert_eq!(log.note(t0 + i * 100, "a disk wait ran out"), None);
+        }
+        let next = log.note(t0 + STALL_LOG_EVERY_MS, "a disk wait ran out");
+        assert_eq!(
+            next.unwrap(),
+            "result storage: a disk wait ran out; 49 more disk waits ran out since the last line"
+        );
+        // Every stall counts, logged or not.
+        let dir = temp_dir("stall-count");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        for _ in 0..50 {
+            store.note_stall(Stall::LookupRead);
+        }
+        assert_eq!(store.errors(), 50);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rewrite_stays_queued_and_counted_until_it_lands() {
+        let dir = temp_dir("failed-rewrite");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"x", &["a"]));
+        store.set_hold(Some(Arc::new(|kind, _| match kind {
+            OpKind::Write => Err(std::io::Error::other("disk full")),
+            _ => Ok(()),
+        })));
+        store.learn_groups("k", &groups(&["g"]), Bucket::Unknown);
+        store.kick();
+        let failed = async {
+            while store.errors() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), failed)
+            .await
+            .unwrap();
+        let backlog = store.backlog();
+        assert_eq!((backlog.behind, backlog.failing), (1, 1));
+        // A shutdown does not wait for a job that keeps failing.
+        let started = std::time::Instant::now();
+        let left = store
+            .settle(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(left.behind, 1);
+        // Once the disk takes writes, the retry lands.
+        store.set_hold(None);
+        let landed = async {
+            while file_groups(&store, "k") != ["a", "g"] {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), landed)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.backlog() != Backlog::default() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_panicking_drain_job_releases_its_claim_and_requeues() {
+        let dir = temp_dir("panicking-job");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &image(b"x"));
+        store.purge(&PurgeTarget::Key("k".into()));
+        store.set_hold(Some(Arc::new(|kind, _| {
+            if kind == OpKind::Unlink {
+                panic!("the disk went away");
+            }
+            Ok(())
+        })));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.run_one_job()));
+        assert!(ran.is_err());
+        store.set_hold(None);
+        assert_eq!(store.backlog().deletions, 1, "the deletion is not queued");
+        let plan = store.begin_write("k", &[], Bucket::Unknown, true);
+        assert!(matches!(plan, WritePlan::Claimed(_)), "{plan:?}");
+        drop(plan);
+        store.drain_now();
+        assert!(!store.file_for(&key_stem("k")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_deletion_never_unlinks_a_fresh_write() {
+        // No runtime here, so nothing starts the deletion the
+        // purge queues before the fresh write lands.
+        let dir = temp_dir("fresh-over-deletion");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &image(b"old"));
+        store.purge(&PurgeTarget::Key("k".into()));
+        let WritePlan::Claimed(claim) = store.begin_write("k", &[], Bucket::Unknown, true) else {
+            panic!("the key was not claimed");
+        };
+        store.land(claim, &image(b"new")).unwrap();
+        store.drain_now();
+        assert!(store.file_for(&key_stem("k")).exists());
+        assert_eq!(store.get("k").unwrap().bytes.as_ref(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_purge_during_a_rewrite_deletes_the_rewritten_file() {
+        let dir = temp_dir("purge-rewrite");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"x", &["a"]));
+        store.learn_groups("k", &groups(&["g"]), Bucket::Unknown);
+        let (hook, held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        let drain = {
+            let store = store.clone();
+            std::thread::spawn(move || store.run_one_job())
+        };
+        held.recv().unwrap();
+        assert_eq!(store.purge(&PurgeTarget::Group("a".into())).0, 1);
+        // The rewrite holds the file: a fresh write of the key
+        // waits for nothing and writes nothing.
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Busy
+        ));
+        drop(release);
+        assert!(drain.join().unwrap());
+        store.set_hold(None);
+        assert!(
+            !store.file_for(&key_stem("k")).exists(),
+            "the rewrite left its file behind a purged record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_write_during_a_deletion_is_busy() {
+        let dir = temp_dir("busy-delete");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &image(b"x"));
+        store.purge(&PurgeTarget::Key("k".into()));
+        let (hook, held, release) = hold_kind(OpKind::Unlink);
+        store.set_hold(Some(hook));
+        let drain = {
+            let store = store.clone();
+            std::thread::spawn(move || store.run_one_job())
+        };
+        held.recv().unwrap();
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Busy
+        ));
+        drop(release);
+        assert!(drain.join().unwrap());
+        store.set_hold(None);
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Claimed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn groups_learned_for_many_keys_during_a_stall_all_land() {
+        // Issue #572, race 3: group merges queued during a
+        // stall overwrote each other. Each key's file now has
+        // one writer at a time, and a group learned while it
+        // writes queues the key again.
+        let dir = temp_dir("stall-groups");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let keys: Vec<String> = (0..15).map(|i| format!("k{i}")).collect();
+        for key in &keys {
+            store.put(key, &grouped_image(key.as_bytes(), &["a"]));
+        }
+        let (hook, _held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        for key in &keys {
+            store.learn_groups(key, &groups(&["c"]), Bucket::Unknown);
+        }
+        store.kick();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for key in &keys {
+            store.learn_groups(key, &groups(&["d"]), Bucket::Unknown);
+        }
+        store.kick();
+        store.set_hold(None);
+        drop(release);
+        let left = store
+            .settle(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
+        assert_eq!(left, Backlog::default());
+        drop(store);
+        let reopened = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        for key in &keys {
+            assert_eq!(file_groups(&reopened, key), ["a", "c", "d"], "{key}");
+        }
+        assert_eq!(reopened.purge(&PurgeTarget::Group("c".into())).0, 15);
+        let reopened = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert_eq!(reopened.purge(&PurgeTarget::Group("d".into())).0, 15);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn settle_returns_at_its_deadline_with_the_backlog_and_at_once_when_idle() {
+        let dir = temp_dir("settle");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let started = std::time::Instant::now();
+        let left = store
+            .settle(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(left, Backlog::default());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        store.put("k", &grouped_image(b"x", &["a"]));
+        let (hook, _held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        store.learn_groups("k", &groups(&["g"]), Bucket::Unknown);
+        let started = std::time::Instant::now();
+        let left = store
+            .settle(tokio::time::Instant::now() + std::time::Duration::from_millis(300))
+            .await;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert_eq!(left.behind, 1);
+        store.set_hold(None);
+        drop(release);
+        let left = store
+            .settle(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
+        assert_eq!(left, Backlog::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_purge_waits_only_for_its_own_deletions_and_not_for_failed_ones() {
+        let dir = temp_dir("own-deletions");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("a", &image(b"1"));
+        store.put("b", &image(b"2"));
+        let failing = store.file_for(&key_stem("a"));
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            if kind == OpKind::Unlink && path == failing {
+                return Err(std::io::Error::other("read-only"));
+            }
+            Ok(())
+        })));
+        let wait = |seqs| {
+            let store = store.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let done = store
+                    .wait_deletions(
+                        seqs,
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                (done, started.elapsed())
+            }
+        };
+        let (_, a) = store.purge(&PurgeTarget::Key("a".into()));
+        store.kick();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.backlog().failing == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, b) = store.purge(&PurgeTarget::Key("b".into()));
+        let (done, took) = wait(b).await;
+        assert!(
+            done && took < std::time::Duration::from_millis(900),
+            "{took:?}"
+        );
+        assert!(!store.file_for(&key_stem("b")).exists());
+        // The failed one is retried and counted, not waited for.
+        let (done, took) = wait(a.clone()).await;
+        assert!(
+            done && took < std::time::Duration::from_millis(900),
+            "{took:?}"
+        );
+        assert!(store.deletions_pending(&a));
+        let (done, _) = wait(store.purge(&PurgeTarget::Key("none".into())).1).await;
+        assert!(done);
+        store.set_hold(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
