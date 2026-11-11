@@ -761,6 +761,12 @@ fn the_helm_chart_warns_when_a_secret_variable_is_a_plain_value() {
         .position(|l| l.starts_with("# WARNING: {{ $name }} "))
         .expect("deployment.yaml: a comment names each plain secret");
     assert!(at < comment, "the comment follows the refusal");
+    // The env map and extraEnv render after the Secret routes,
+    // so a plain entry left there wins over the Secret's.
+    assert!(
+        lines[comment].contains("remove it from env"),
+        "deployment.yaml: the comment says to remove the plain entry"
+    );
     assert_eq!(
         lines[comment - 1],
         "{{- range $name, $route := $plainSecrets }}"

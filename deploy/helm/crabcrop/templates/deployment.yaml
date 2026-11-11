@@ -163,7 +163,7 @@ spec:
             {{- fail (printf "refusePlainSecrets is on, and these secrets are plain values in env, ai.env or extraEnv: %s. Read each from a Secret instead (see the chart README)" (join ", " $refused)) }}
             {{- end }}
             {{- range $name, $route := $plainSecrets }}
-            # WARNING: {{ $name }} is a plain value in this spec, readable by anyone who can read the Deployment. Read it from a Secret: set {{ $route }}.
+            # WARNING: {{ $name }} is a plain value in this spec, readable by anyone who can read the Deployment. Read it from a Secret: set {{ $route }}, and remove it from env, ai.env or extraEnv.
             {{- end }}
             {{- range $k := keys $allEnv | sortAlpha }}
             - name: {{ $k }}

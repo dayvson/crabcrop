@@ -27,11 +27,14 @@ values-production.yaml.
 
 WARNING: these secrets are plain values in the Deployment
 spec, so anyone who can read the Deployment or its Pods can
-read them. Put each in a Secret and set the value named:
+read them. Put each in a Secret, set the value named, and
+remove it from env, ai.env or extraEnv (an entry there wins):
 {{- range $name, $route := $plainSecrets }}
   {{ $name }}: {{ $route }}
 {{- end }}
-An extraEnv entry with valueFrom.secretKeyRef works too.
+Move AWS_ACCESS_KEY_ID and CRABCROP_GCS_ACCESS_KEY with their
+secret keys. An extraEnv entry with valueFrom.secretKeyRef
+works too.
 This release only warns. A later release will refuse them;
 set refusePlainSecrets=true to refuse them now.
 {{- end }}
