@@ -161,6 +161,12 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // the kernel picked (issue #536).
     let port = listener.local_addr()?.port();
     let state = build_state(&config, stores)?;
+    // The request and source posture (issue #590), with a
+    // warning when unsigned URLs may fetch from any host.
+    println!("{}", config.posture_line());
+    if let Some(warning) = config.posture_warning() {
+        eprintln!("warning: {warning}");
+    }
     println!(
         "source fetch: cap {} MB, timeout {}s, buffer budget {} MB",
         config.fetch_cap_mb,

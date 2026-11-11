@@ -29,10 +29,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 ```bash
 docker pull ghcr.io/dayvson/crabcrop:0.11.0
 docker pull ghcr.io/dayvson/crabcrop-ai:0.11.0
-docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.11.0
+docker run -e CRABCROP_SECRET="$(openssl rand -hex 32)" -p 3000:3000 ghcr.io/dayvson/crabcrop:0.11.0
 ```
 
-A secret of at least 16 bytes is the only required configuration; the server will not start without one. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
+A secret of at least 16 bytes is the only required configuration; the server will not start without one, or with a placeholder from these docs. The command above makes a new secret on each run; to sign URLs, generate one once and keep it. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases).
 
@@ -40,10 +40,11 @@ A secret of at least 16 bytes is the only required configuration; the server wil
 
 ## Quickstart
 
-**1. Start the server.** For local development, also allow unsigned URLs:
+**1. Start the server.** Generate a secret, and for local development also allow unsigned URLs:
 
 ```bash
-CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 cargo run --release
+export CRABCROP_SECRET="$(openssl rand -hex 16)"
+CRABCROP_ALLOW_UNSAFE=1 cargo run --release
 # crabcrop listening on port 3000
 ```
 
@@ -55,13 +56,13 @@ curl "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg" --outp
 
 Replace `example.com/photo.jpg` with the URL of an image you control. You get back a 300x200 JPEG.
 
-**3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment:
+**3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment. In a shell with the same `CRABCROP_SECRET`, `crabcrop sign` prints the signed URL:
 
 ```bash
-curl "http://localhost:3000/9e24ae8bf61c0d40cb6f1ca9f9e1d3e771f6c8bc8b8ab7270e6d15458d4c14ab/300x200/https://example.com/photo.jpg" --output photo.jpg
+curl "$(cargo run --release -q -- sign "300x200/https://example.com/photo.jpg")" --output photo.jpg
 ```
 
-That signature is HMAC-SHA256 of `300x200/https://example.com/photo.jpg` under the secret from step 1. The SDKs and the `crabcrop sign` command compute it for you; the full signing rules are in [URL grammar and signing](docs/url-grammar.md).
+The signature is HMAC-SHA256 of `300x200/https://example.com/photo.jpg` under the secret from step 1. The SDKs compute it too; the full signing rules are in [URL grammar and signing](docs/url-grammar.md).
 
 ## How requests work
 

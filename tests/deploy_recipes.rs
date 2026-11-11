@@ -11,7 +11,10 @@
 //! recipes set the pod `fsGroup` that makes a mounted claim
 //! group-writable by 65534.
 
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const RESULT_DIR: &str = "/var/cache/crabcrop";
 
@@ -165,7 +168,7 @@ fn yaml_keys<'a>(text: &'a str, keys: &[&str]) -> Vec<&'a str> {
 }
 
 /// Every YAML file under `dir`, recursively, sorted.
-fn yaml_files(dir: &Path) -> Vec<std::path::PathBuf> {
+fn yaml_files(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -465,4 +468,279 @@ fn cdn_recipes_name_the_error_header_the_server_sends() {
             "{rel}: error responses are no-store, not private, no-store"
         );
     }
+}
+
+/// The variables that hold a secret the server checks at
+/// boot (issue #588).
+const SECRET_VARS: [&str; 3] = [
+    "CRABCROP_SECRET",
+    "CRABCROP_SECRET_PREVIOUS",
+    "CRABCROP_METRICS_TOKEN",
+];
+
+/// The value at the start of `rest`: a quoted string's
+/// contents, or the text up to white space, a quote or a
+/// backtick.
+fn leading_value(rest: &str) -> String {
+    for quote in ['"', '\''] {
+        if let Some(inner) = rest.strip_prefix(quote) {
+            return inner.split(quote).next().unwrap_or("").to_string();
+        }
+    }
+    rest.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The trimmed lines of each YAML list item `- name: <name>`
+/// in `lines`, after its name line.
+fn yaml_items<'a>(lines: &[&'a str], name: &str) -> Vec<Vec<&'a str>> {
+    let mut items = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let Some(named) = t.strip_prefix("- name:") else {
+            continue;
+        };
+        if named.trim().trim_matches(|c| c == '"' || c == '\'') != name {
+            continue;
+        }
+        let indent = line.len() - t.len();
+        items.push(
+            lines[i + 1..]
+                .iter()
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .take_while(|l| l.len() - l.trim_start().len() > indent)
+                .map(|l| l.trim())
+                .collect(),
+        );
+    }
+    items
+}
+
+/// Every value `text` gives one of [`SECRET_VARS`], as
+/// (variable, value): `NAME=value` (shell, env files,
+/// `--from-literal`), `NAME: value` (YAML maps),
+/// `"NAME": "value"` (JSON), and a YAML env item
+/// `- name: NAME` with a `value:`, or with a `secretRef:`
+/// to an item that has one (Container Apps).
+fn secret_literals(text: &str) -> Vec<(&'static str, String)> {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut found = Vec::new();
+    for line in text.lines() {
+        for var in SECRET_VARS {
+            for (at, _) in line.match_indices(var) {
+                if line[..at].chars().next_back().is_some_and(is_name) {
+                    continue;
+                }
+                let rest = &line[at + var.len()..];
+                if rest.chars().next().is_some_and(is_name) {
+                    continue;
+                }
+                let value = if let Some(r) = rest.strip_prefix('=') {
+                    Some(leading_value(r))
+                } else if let Some(r) = rest.strip_prefix(": ") {
+                    Some(leading_value(r.trim_start()))
+                } else {
+                    rest.strip_prefix('"')
+                        .and_then(|r| r.trim_start().strip_prefix(':'))
+                        .map(|r| leading_value(r.trim_start()))
+                };
+                if let Some(value) = value {
+                    found.push((var, value));
+                }
+            }
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    for var in SECRET_VARS {
+        for item in yaml_items(&lines, var) {
+            for key in item {
+                if let Some(v) = key.strip_prefix("value:") {
+                    found.push((var, leading_value(v.trim())));
+                } else if let Some(name) = key.strip_prefix("secretRef:") {
+                    for secret in yaml_items(&lines, name.trim()) {
+                        for key in secret {
+                            if let Some(v) = key.strip_prefix("value:") {
+                                found.push((var, leading_value(v.trim())));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn secret_literals_reads_every_spelling_the_docs_use() {
+    let text = "\
+CRABCROP_SECRET=a1 crabcrop
+docker run -e CRABCROP_SECRET=\"a2\" -p 3000:3000
+{\"CRABCROP_METRICS_TOKEN\": \"a3\"}
+  CRABCROP_SECRET_PREVIOUS: a4
+`CRABCROP_SECRET=a5` in prose
+env:
+  - name: CRABCROP_METRICS_TOKEN
+    # a comment
+    value: a6
+  - name: CRABCROP_SECRET
+    secretRef: signing
+secrets:
+  - name: signing
+    value: a7
+CRABCROP_SECRET_KEY_ID=no NUXT_CRABCROP_SECRET=no
+CRABCROP_SECRET: \"${CRABCROP_SECRET:?CRABCROP_SECRET must be set}\"
+Set `CRABCROP_SECRET` (16+ bytes) and CRABCROP_SECRET.
+{\"name\":\"CRABCROP_SECRET\",\"valueFrom\":\"arn\"}
+";
+    let found = secret_literals(text);
+    let found: Vec<(&str, &str)> = found
+        .iter()
+        .map(|(var, value)| (*var, value.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("CRABCROP_SECRET", "a1"),
+            ("CRABCROP_SECRET", "a2"),
+            ("CRABCROP_METRICS_TOKEN", "a3"),
+            ("CRABCROP_SECRET_PREVIOUS", "a4"),
+            ("CRABCROP_SECRET", "a5"),
+            (
+                "CRABCROP_SECRET",
+                "${CRABCROP_SECRET:?CRABCROP_SECRET must be set}"
+            ),
+            ("CRABCROP_SECRET", "a7"),
+            ("CRABCROP_METRICS_TOKEN", "a6"),
+        ]
+    );
+}
+
+/// The text files the scan reads: the root README and
+/// CONTRIBUTING, everything under `docs/` and `deploy/`, and
+/// the READMEs of the SDKs, framework integrations, plugins
+/// and crates, which an operator copies commands from too.
+fn documented_files() -> Vec<PathBuf> {
+    fn walk(dir: &Path, readmes_only: bool, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name != "node_modules" && name != "target" && !name.starts_with('.') {
+                    walk(&path, readmes_only, out);
+                }
+            } else if !readmes_only || name == "README.md" {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("README.md"), root.join("CONTRIBUTING.md")];
+    for dir in ["docs", "deploy"] {
+        walk(&root.join(dir), false, &mut files);
+    }
+    for dir in ["sdks", "frameworks", "plugins", "crates"] {
+        walk(&root.join(dir), true, &mut files);
+    }
+    files.sort();
+    files
+}
+
+/// Boot the binary with `var` set to `value` (and a real
+/// signing secret, when `var` is another variable). `Ok`
+/// when the boot is refused with an error that names `var`;
+/// otherwise what happened instead.
+fn boot_refuses(var: &str, value: &str) -> Result<(), String> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+    command.env_clear().env("PORT", "0");
+    if var != "CRABCROP_SECRET" {
+        command.env("CRABCROP_SECRET", "deploy-recipes-scan-4d1f0a9c2e7b");
+    }
+    let mut child = command
+        .env(var, value)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        if let Ok(line) = lines.recv_timeout(Duration::from_millis(50))
+            && line.starts_with("crabcrop listening on port ")
+        {
+            break Err("it booted and listened".to_string());
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+            break if status.code() == Some(1) && stderr.contains(var) {
+                Ok(())
+            } else {
+                Err(format!("it exited with {status}: {stderr}"))
+            };
+        }
+        if Instant::now() >= deadline {
+            break Err("it neither exited nor listened within 30 s".to_string());
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
+#[test]
+fn no_secret_value_in_the_docs_or_recipes_boots_the_server() {
+    // Issue #588: the README, the VM and Container Apps
+    // recipes and the compose metrics line shipped values the
+    // server accepted, so a deployment that kept one ran with
+    // a key anyone can read here. Every literal value given
+    // to a secret variable must stop the boot now. Shell
+    // substitutions (`$(openssl rand -hex 32)`, `${VAR}`) are
+    // not literals, and neither is a `<placeholder>` in
+    // Markdown, where it reads as a shell redirect.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut literals: Vec<(&str, String, Vec<String>)> = Vec::new();
+    for path in documented_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let markdown = path.extension().is_some_and(|e| e == "md");
+        let rel = path.strip_prefix(root).unwrap().display().to_string();
+        for (var, value) in secret_literals(&text) {
+            let placeholder = markdown && value.starts_with('<') && value.ends_with('>');
+            if value.is_empty() || value.starts_with('$') || placeholder {
+                continue;
+            }
+            match literals
+                .iter_mut()
+                .find(|(v, x, _)| *v == var && *x == value)
+            {
+                Some((_, _, files)) => files.push(rel.clone()),
+                None => literals.push((var, value, vec![rel.clone()])),
+            }
+        }
+    }
+    // The scan reads what it claims: the docs do give the
+    // CLI's signing secret as a literal.
+    assert!(
+        literals
+            .iter()
+            .any(|(_, _, files)| files.iter().any(|f| f == "docs/endpoints.md")),
+        "{literals:?}"
+    );
+    let mut booted = Vec::new();
+    for (var, value, files) in &literals {
+        if let Err(what) = boot_refuses(var, value) {
+            booted.push(format!("{var}={value:?} in {files:?}: {what}"));
+        }
+    }
+    assert!(booted.is_empty(), "{booted:#?}");
 }

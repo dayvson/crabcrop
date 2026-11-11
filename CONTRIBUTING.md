@@ -30,7 +30,7 @@ SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always cargo build --features avif-decode
 Running the server locally needs only a secret:
 
 ```bash
-CRABCROP_SECRET=local-dev-secret cargo run
+CRABCROP_SECRET="$(openssl rand -hex 16)" cargo run
 ```
 
 ## Testing
