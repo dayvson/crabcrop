@@ -177,4 +177,4 @@ The safety rules:
 - The source allowlist (`CRABCROP_ALLOWED_SOURCES`) and every other loader check apply to the expanded URL, exactly as if the client had spelled it out. A root never widens what the server will fetch.
 - The path must stay under the root. Dot segments are normalized, and a path that climbs above the root, plainly or percent-encoded, is a `400` (`invalid_root`).
 - An unknown root name is a `400` (`unknown_root`), including on a server with no roots configured.
-- Root base URLs are operator configuration and stay private: `explain` reports the source as written plus the root's name, and never prints a base URL.
+- Root base URLs are operator configuration and stay private: `explain` reports the source as written plus the root's name, and never prints a base URL. A watermark or overlay URL cannot use a root, so `explain` prints one from a preset or the default operations in full (see [Self-explaining URLs](endpoints.md#self-explaining-urls)).

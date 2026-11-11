@@ -9,7 +9,7 @@
 | `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, across this server's cache tiers. See below. |
 | `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, across this server's cache tiers. See below. |
 | `PUT /upload/<signature>/<name>` | Store one original in the configured upload destination. With no destination configured it answers `404` (`uploads_not_configured`). See [Upload an original](#upload-an-original). |
-| `GET /explain/<signature>/...` | A report on the URL instead of the image. See [Self-explaining URLs](#self-explaining-urls). |
+| `GET /explain/<signature>/...` | A report on the URL instead of the image. With `CRABCROP_EXPLAIN=0` it answers `404` (`not_found`). See [Self-explaining URLs](#self-explaining-urls). |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
 A `GET` route also answers `HEAD`, without the body. A request to one of these routes with any other method answers `405`, with an `Allow` header naming the methods the route serves. The exception is a `PUT` on an image path, which answers `404` (`not_found`). An image path's `Allow` also names `PUT`.
@@ -53,7 +53,7 @@ One posture note, stated plainly: enabling uploads changes this server from fetc
 
 ### Self-explaining URLs
 
-Every crabcrop URL can explain itself. Take any image URL, put `explain/` in front of the signature segment, and the server answers with a report on that URL instead of the image:
+Every crabcrop URL can explain itself, unless the server sets `CRABCROP_EXPLAIN=0`. Take any image URL, put `explain/` in front of the signature segment, and the server answers with a report on that URL instead of the image:
 
 ```bash
 curl "http://localhost:3000/explain/<signature>/crop:1200x630:smart/filters:format(avif):quality(auto)/https://example.com/photo.jpg"
@@ -65,7 +65,9 @@ The forecast walks the operations the image request runs, so with [server-wide d
 
 The forecast applies the DPR factor the image request would: a `dpr(...)` in the operations, or else the request's own `DPR` or `Sec-CH-DPR` header, read the way the image path reads it (not at all with `CRABCROP_CLIENT_HINTS=0`). A hinted factor steps down the way the image request steps it, to the largest of 1, 1.5, 2, and 3 whose sizes fit the [output limits](url-grammar.md#output-size), so send the header a browser sends to see what that browser gets. The JSON's `forecast.dpr` is the factor applied, `forecast.dpr_from` says where it came from (`operation`, `default`, `hint`, or `none`), and `forecast.dpr_hint` is the hint the request carried (null without one): `/explain/unsafe/6000x1/<source>` with `DPR: 3` forecasts 12000x2 with `dpr` 2 and `dpr_hint` 3. Where the forecast cannot size the chain (its dimensions are null, as after a `trim`) or the limit is the budget an animated source's frames share, which the forecast does not count, `forecast.dpr` is the factor the image request starts at, and the render may step it further.
 
-Explain is safe to expose to the same callers who hold signed URLs: the signature and expiry are verified exactly as the image path verifies them, before any source access, so a bad or expired URL is refused with the image path's own response and costs zero source fetches, and the one probe a valid URL pays for reads only the source's head through the loader, stopping as soon as the head identifies the source, with no detection and nothing written to any cache tier. An SVG's size needs the whole document, so an SVG head is read to its end (up to 256 KB) and parsed once in the SVG worker; an AVIF's size goes through the decoder, so an AVIF head is read the same way and sized once, and so is a HEIC head, whose size takes a walk of its item graph. That parse and the AVIF and HEIC size probes run on a blocking thread, at most two at once, and a probe that cannot start within 5 seconds is shed with `503` (`server_busy`) and `Retry-After`. The encoded size is reported when the fetch itself states it (a declared length, or a body small enough to end inside the head); the probe never downloads a body just to count it, so a large source can report no size. The report contains only facts derivable from the URL and the source itself: no secrets or key material, no configuration values (beyond the default operations, which shape the output and already show in the canonical form), paths, or fingerprints, no redirect or address details, and errors are the usual frozen codes and generic messages.
+Explain is safe to expose to the same callers who hold signed URLs: the signature and expiry are verified exactly as the image path verifies them, before any source access, so a bad or expired URL is refused with the image path's own response and costs zero source fetches, and the one probe a valid URL pays for reads only the source's head through the loader, stopping as soon as the head identifies the source, with no detection and nothing written to any cache tier. An SVG's size needs the whole document, so an SVG head is read to its end (up to 256 KB) and parsed once in the SVG worker; an AVIF's size goes through the decoder, so an AVIF head is read the same way and sized once, and so is a HEIC head, whose size takes a walk of its item graph. That parse and the AVIF and HEIC size probes run on a blocking thread, at most two at once, and a probe that cannot start within 5 seconds is shed with `503` (`server_busy`) and `Retry-After`. The encoded size is reported when the fetch itself states it (a declared length, or a body small enough to end inside the head); the probe never downloads a body just to count it, so a large source can report no size. The report contains only facts derivable from the URL, the presets and default operations that shape its output, and the source itself: no secrets or key material, no other configuration values, paths, or fingerprints, no redirect or address details, and errors are the usual frozen codes and generic messages.
+
+Presets and default operations are shown in full, as the operator wrote them. A watermark or overlay URL is printed with its host, path and query string: from a preset the URL references, in the operation glosses, the preset entries and the canonical form, and from `CRABCROP_DEFAULT_OPS`, in the canonical form. Anyone who holds a signed URL can read them. With `CRABCROP_ALLOW_UNSAFE=1`, as in presets-only public mode, anyone can, by explaining `unsafe/preset:<name>/<source>`. A [source root](url-grammar.md#source-roots)'s base URL stays private, but a watermark or overlay URL cannot use a root. So keep tokens and internal hosts out of the watermark and overlay URLs in presets and defaults. Where you cannot, block `/explain/` at the CDN or proxy, or set `CRABCROP_EXPLAIN=0`. Every `GET` or `HEAD` to the route then answers `404` (`not_found`), before the signature is checked and with no source fetch. Image requests are unchanged.
 
 ### Cache headers and groups
 
@@ -127,14 +129,19 @@ crabcrop upload ./photo.jpg heroes/photo.jpg
 
 # Convert a Thumbor URL (re-signed; losses are reported on stderr)
 crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
+
+# Check the server on this host, as the images' HEALTHCHECK does
+crabcrop health
 ```
+
+`crabcrop health` sends `GET /health` to the address the server listens on, at `CRABCROP_PORT` or `PORT` (3000 by default), and ignores `CRABCROP_BASE`. The address is the one `CRABCROP_BIND` names, or 127.0.0.1 when it is unset or `0.0.0.0`, and `::1` when it is `::`. With `::`, a connection to `::1` that fails, as on a host with IPv6 off on loopback, is tried again at 127.0.0.1. It reads these variables as the server reads them, so an invalid one is an error. It prints the answer and exits 0 on a `200`. On any other answer, or none within 2 seconds, it exits 1 with the error on stderr. It takes no flags, and `PORT=0` is an error, because the server picked its port at boot. The images run it as their `HEALTHCHECK`, so they need no curl.
 
 Every flag the verbs take. A value flag is spelled `--flag <value>` or `--flag=<value>`, and an unknown flag after the verb (`--key-ids`) is an error too.
 
 | Flag | Environment | Verbs | Meaning |
 |---|---|---|---|
-| `--base <url>` | `CRABCROP_BASE` | all | The server's base URL. Default `http://localhost:3000`. |
-| `--secret <secret>` | `CRABCROP_SECRET` | all | The signing secret. |
+| `--base <url>` | `CRABCROP_BASE` | all but `health` | The server's base URL. Default `http://localhost:3000`. |
+| `--secret <secret>` | `CRABCROP_SECRET` | all but `health` | The signing secret. |
 | `--key-id <id>` | `CRABCROP_SECRET_KEY_ID` | `sign`, `seal`, `purge`, `purge-group`, `upload` | The key ID stamped on the signature or token the verb mints (`<key-id>:<tag>`), for [rotating the secret](configuration.md#rotating-the-secret): 1 to 32 characters of `[A-Za-z0-9_-]`. Unset, the verbs mint with no key ID. |
 | `--placeholders` | | `meta` | Include the placeholder fields. |
 | `--detections` | | `meta` | Include the detection boxes. |

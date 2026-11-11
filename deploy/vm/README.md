@@ -19,9 +19,12 @@ disk tier in a directory the unit owns (step 3).
   `images.example.com`) pointing at the host, with ports
   80 and 443 open: the proxy gets its TLS certificate for
   that name. Port 3000 stays closed to the public
-  internet; only the proxy talks to it. The Production
-  notes in the main README's Deployment section explain
-  why `/health` and `/metrics` need that protection.
+  internet; only the proxy talks to it. The environment
+  file in step 2 binds the server to `127.0.0.1`
+  (`CRABCROP_BIND`), so other hosts cannot reach the
+  port. [Lock down the edge](../../docs/deployment.md#lock-down-the-edge)
+  explains why `/health` and `/metrics` need that
+  protection.
 
 ## 1. Install the binary
 
@@ -57,8 +60,19 @@ every URL) in the editor, for example to the output of
 `openssl rand -hex 32`. The example ships `REPLACE_ME`,
 which the server refuses at boot. `crabcrop.env.example`
 in this directory is the starting point: the secret, the
-port, and the disk tier directory. Any variable from the main
-README's Configuration table can go in the same file.
+listen address and port, and the disk tier directory. Any
+variable from [docs/configuration.md](../../docs/configuration.md)
+can go in the same file.
+
+The example listens on `127.0.0.1` only. A host firewall
+that lets in only SSH, HTTP and HTTPS is a second layer;
+with ufw, for example:
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80,443/tcp
+sudo ufw enable
+```
 
 ## 3. The systemd unit
 
@@ -80,8 +94,9 @@ systemctl status crabcrop
 Pick one. Both examples in this directory proxy
 `images.example.com` to `127.0.0.1:3000` and serve
 `/health` and `/metrics` to localhost only: `/health` is
-unauthenticated, and `/metrics` exposes traffic and
-error counters.
+unauthenticated, and `/metrics` answers `403` while
+`CRABCROP_METRICS_TOKEN` is unset, and `401` without the
+right bearer token once it is set.
 
 **Caddy** (`Caddyfile`): Caddy obtains and renews the
 certificate automatically once the DNS name points at
@@ -105,10 +120,11 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## Smoke checklist
 
-1. Health: `curl http://localhost:3000/health` on the
+1. Health: `curl http://127.0.0.1:3000/health` on the
    host returns 200 with the body `ok`. (Through the
    proxy, `/health` answers only from localhost, by
-   design.)
+   design.) From another host, a connection to port 3000
+   is refused.
 2. Sign one request with the same secret and fetch it
    through the proxy:
    `CRABCROP_SECRET=<secret> crabcrop sign "300x200/https://example.com/photo.jpg"`,
@@ -135,8 +151,8 @@ When one host stops being enough, nothing here is
 throwaway: the same environment file drives the
 Kubernetes and cloud recipes, and several hosts behind a
 load balancer can share the third tier by setting
-`CRABCROP_RESULT_BUCKET` (see the main README's
-Configuration table).
+`CRABCROP_RESULT_BUCKET` (see
+[docs/configuration.md](../../docs/configuration.md)).
 
 ## Teardown
 

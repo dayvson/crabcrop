@@ -2,8 +2,8 @@
 # certificate for the hostname automatically once its DNS
 # points at this host. Everything proxies to crabcrop on
 # port 3000, except /health (unauthenticated) and /metrics
-# (traffic and error counters), which are served to
-# localhost only.
+# (403 with no CRABCROP_METRICS_TOKEN set, 401 without the
+# right bearer token), which are served to localhost only.
 images.example.com {
 	@internal path /health /metrics
 	handle @internal {

@@ -60,7 +60,7 @@ A fresh or empty volume needs none of this.
 
 ### Smoke checklist (production)
 
-1. Health, from inside (the public face does not serve it): `docker compose -f docker-compose.prod.yml exec crabcrop curl -s http://localhost:3000/health` returns `ok`.
+1. Health, from inside (the public face does not serve it): `docker compose -f docker-compose.prod.yml exec crabcrop crabcrop health` prints `ok` and exits 0.
 2. Sign one request and fetch it through the public name, using the CLI built into the image:
 
    ```bash
@@ -80,7 +80,14 @@ A fresh or empty volume needs none of this.
    ```
 
    It answers `purged 1` (or more, counting variants), and the next fetch of the signed URL is a miss again.
-5. Metrics auth, from inside: `docker compose -f docker-compose.prod.yml exec crabcrop curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/metrics` returns 401 without a token, and with the token from `crabcrop.env` (`curl -H "Authorization: Bearer <metrics-token>"` in place of the bare call) it returns 200 and the Prometheus counters.
+5. Metrics auth, from inside. The app image carries no curl, so run the check from the Caddy container, which has `wget` and reaches the app on the compose network:
+
+   ```bash
+   docker compose -f docker-compose.prod.yml exec caddy \
+     wget -qO- --header "Authorization: Bearer <metrics-token>" http://crabcrop:3000/metrics
+   ```
+
+   With the token from `crabcrop.env` it prints the Prometheus counters. Without the `--header` it fails with `server returned error: HTTP/1.1 401 Unauthorized`.
 
 ## Evaluation
 
@@ -110,7 +117,7 @@ CRABCROP_SECRET=$(openssl rand -hex 32) docker compose up --build
    The fetch returns 200 and image bytes.
 3. Fetch the same signed URL again and look at the headers: `curl -i "<the signed URL it printed>"`. The `Cache-Status` header reports a hit.
 
-The image carries its own `HEALTHCHECK` (the `/health` endpoint), so `docker compose ps` reports health once the server is up.
+The image carries its own `HEALTHCHECK` (`crabcrop health`, which asks the server for `/health`), so `docker compose ps` reports health once the server is up.
 
 ## Scaling and cache notes
 

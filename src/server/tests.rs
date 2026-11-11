@@ -222,6 +222,7 @@ fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppStat
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -361,6 +362,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -425,6 +427,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -489,6 +492,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -563,6 +567,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -647,6 +652,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -932,6 +938,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1292,6 +1299,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -1363,6 +1371,7 @@ async fn spawn_app_rotating() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1437,6 +1446,7 @@ async fn spawn_app_with_fallback() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -3295,6 +3305,7 @@ async fn spawn_app_with_presets_and_roots(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -4171,6 +4182,160 @@ async fn explain_reports_the_root_name_and_never_the_base() {
     assert!(!body.contains(&origin), "{body}");
 }
 
+/// [`spawn_app`]'s server with `CRABCROP_EXPLAIN` set to
+/// `explain`.
+async fn spawn_app_with_explain(explain: bool) -> String {
+    let mut state = base_test_state(false, Some(TEST_METRICS_TOKEN.to_string()));
+    state.explain_enabled = explain;
+    spawn_state(state).await
+}
+
+#[tokio::test]
+async fn explain_off_answers_404_for_every_spelling_and_fetches_nothing() {
+    // Issue #591: `/explain` was always routed. With
+    // `CRABCROP_EXPLAIN=0` every request to it answers the
+    // router's own `404 not_found`, whatever its signature,
+    // so the answer tells a caller nothing about the URL,
+    // and the source is never fetched.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_explain(false).await;
+    let remainder = format!("100x50/{src}");
+    let expired = format!("exp:{}/100x50/{src}", now_unix() - 60);
+    let paths = [
+        format!("{}/{remainder}", sign(&remainder)),
+        format!("deadbeef/{remainder}"),
+        format!("unsafe/{remainder}"),
+        sealed_path(&remainder, Some("photo.png")),
+        format!("{}/{expired}", sign(&expired)),
+        format!("{}/crabcrop/{remainder}", sign(&remainder)),
+        "not-a-url".to_string(),
+    ];
+    for path in &paths {
+        let resp = client()
+            .get(format!("{base}/explain/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(resp.text().await.unwrap(), "not found", "{path}");
+        let resp = client()
+            .get(format!("{base}/explain/{path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["error"]["code"], "not_found", "{path}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no source fetch");
+}
+
+#[tokio::test]
+async fn explain_off_leaves_the_image_route_unchanged() {
+    // Issue #591: the switch turns off the report only. The
+    // image itself, its meta document, and the report on a
+    // server that leaves the switch on are served as before.
+    let src = spawn_image_server().await;
+    let on = spawn_app_with_explain(true).await;
+    let off = spawn_app_with_explain(false).await;
+    let remainder = format!("100x50/filters:format(png)/{src}");
+    let path = format!("{}/{remainder}", sign(&remainder));
+    let mut bodies = Vec::new();
+    for base in [&on, &off] {
+        let resp = client().get(format!("{base}/{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{base}");
+        assert_eq!(resp.headers()["content-type"], "image/png", "{base}");
+        bodies.push(resp.bytes().await.unwrap());
+        let resp = client()
+            .get(format!("{base}/{path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{base}");
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["width"], 100, "{base}");
+    }
+    assert_eq!(bodies[0], bodies[1], "the same bytes either way");
+    let resp = client()
+        .get(format!("{on}/explain/{path}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["forecast"]["width"], 100);
+}
+
+#[tokio::test]
+async fn explain_shows_preset_and_default_watermark_and_overlay_urls_in_full() {
+    // Issue #591: what docs/endpoints.md now says the report
+    // shows from operator configuration. A watermark URL in
+    // a preset is printed in full in the preset's entry, and
+    // an overlay URL in the defaults in the canonical form,
+    // query string included. The report fetches neither. An
+    // operator who wants them private keeps tokens and
+    // internal hosts out of them, or sets
+    // `CRABCROP_EXPLAIN=0`.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let origin = src.strip_suffix("/src.png").unwrap();
+    let watermark = format!("{origin}/wm.png?token=preset-token");
+    let overlay = format!("{origin}/texture.png?sig=default-sig");
+    let encode = |url: &str| {
+        url.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('?', "%3F")
+            .replace('=', "%3D")
+    };
+    let mut state = base_test_state(false, None);
+    state.presets.insert(
+        "branded".to_string(),
+        format!("40x0/filters:watermark({},0,0,50)", encode(&watermark))
+            .parse()
+            .unwrap(),
+    );
+    let defaults = format!("filters:overlay({},0,0,60,multiply)", encode(&overlay));
+    state.default_ops = crate::url::parse_default_ops(&defaults, &state.presets).unwrap();
+    let base = spawn_state(state).await;
+    let remainder = format!("preset:branded/{src}");
+    let url = format!("{base}/explain/{}/{remainder}", sign(&remainder));
+    let resp = client()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["presets"][0]["name"], "branded");
+    let gloss = json["presets"][0]["operations"][1]["descriptions"].to_string();
+    assert!(
+        gloss.contains(&format!("watermark: {watermark} at 0,0, alpha 50")),
+        "{gloss}"
+    );
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(
+        canonical.starts_with(&format!("{defaults}/")),
+        "{canonical}"
+    );
+    // The HTML form shows the same two URLs.
+    let html = client()
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("preset-token"), "{html}");
+    assert!(html.contains("default-sig"), "{html}");
+    // One source probe per report: the watermark and the
+    // overlay, on the same origin, were never fetched.
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
 /// An image server that counts how many times it was hit:
 /// how cache behavior becomes observable from outside.
 async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
@@ -4533,6 +4698,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -4716,6 +4882,7 @@ async fn spawn_app_with_moderation(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5051,6 +5218,7 @@ async fn spawn_app_with_ocr_timeout(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5475,6 +5643,7 @@ async fn spawn_app_with_embeddings(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6222,6 +6391,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6288,6 +6458,7 @@ async fn spawn_app_with_studio() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: Some([0xf5, 0xf0, 0xe8]),
         presets: std::collections::HashMap::new(),
@@ -6354,6 +6525,7 @@ async fn spawn_app_with_inpaint() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6452,6 +6624,7 @@ async fn spawn_app_with_segment() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6946,6 +7119,7 @@ async fn spawn_app_with_providers(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -7026,6 +7200,7 @@ async fn spawn_app_full(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -9057,6 +9232,7 @@ async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -9145,6 +9321,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -10654,6 +10831,7 @@ async fn spawn_signing_app(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11194,6 +11372,7 @@ async fn processing_gate_bounds_concurrency() {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11326,6 +11505,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -12065,6 +12245,7 @@ fn lane_test_state(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -12353,6 +12534,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -12511,6 +12693,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -13462,6 +13645,7 @@ async fn spawn_app_with_upload_gate(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -16767,6 +16951,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -18228,6 +18413,7 @@ async fn spawn_explain_app_with_roots(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
