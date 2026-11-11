@@ -1559,9 +1559,10 @@ async fn a_disk_hit_a_purge_covers_while_its_tombstone_is_written_holds_that_tom
     tokio::task::spawn_blocking(move || drained.drain_now())
         .await
         .unwrap();
-    assert!(!dir
-        .join(format!("{}.bin", crate::storage::key_stem(KEY)))
-        .exists());
+    assert!(
+        !dir.join(format!("{}.bin", crate::storage::key_stem(KEY)))
+            .exists()
+    );
     shared.end_held_purges().await;
     assert_eq!(tombstones_ended(&fake), [true]);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1625,15 +1626,11 @@ async fn a_render_landing_under_a_purge_whose_tombstone_is_being_written_holds_t
     tombstone_write_held(&fake).await;
     // The write lands, under the purge.
     hold.store(false, Ordering::SeqCst);
-    within(
-        std::time::Duration::from_secs(5),
-        "the landing",
-        async {
-            while store.ops_in_flight() > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-        },
-    )
+    within(std::time::Duration::from_secs(5), "the landing", async {
+        while store.ops_in_flight() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
     .await;
     writer.await.unwrap();
     let file = dir.join(format!("{}.bin", crate::storage::key_stem(KEY)));
@@ -1723,9 +1720,10 @@ async fn a_purge_after_a_restart_holds_its_tombstone_for_a_covered_copy_a_lookup
     tokio::task::spawn_blocking(move || drained.drain_now())
         .await
         .unwrap();
-    assert!(!dir
-        .join(format!("{}.bin", crate::storage::key_stem(KEY)))
-        .exists());
+    assert!(
+        !dir.join(format!("{}.bin", crate::storage::key_stem(KEY)))
+            .exists()
+    );
     restarted_shared.end_held_purges().await;
     assert_eq!(tombstones_ended(&fake), [false, true]);
     store.set_hold(None);
