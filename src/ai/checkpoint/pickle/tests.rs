@@ -61,13 +61,44 @@ fn unpickle_refuses_memo_copies_past_the_budget() {
 #[test]
 fn unpickle_counts_memo_copies_of_a_string_by_their_bytes() {
     // One 32 KiB string, stored and read back twice: three
-    // values, but 128 KiB of copied bytes. Without the
-    // bytes in the count, a 512 KiB string read back from
-    // the memo 250,000 times would copy 128 GiB.
+    // values, but 128 KiB of copied bytes. The count
+    // passes the budget at the store already. Without the
+    // bytes in the count, an 896 KiB string read back from
+    // the memo 65,000 times would copy about 55 GiB.
     let mut pkl = b"\x80\x02(X".to_vec();
     pkl.extend_from_slice(&(32 * 1024u32).to_le_bytes());
     pkl.resize(pkl.len() + 32 * 1024, b'a');
     pkl.extend_from_slice(b"q\x00h\x00h\x00t.");
+    let err = unpickle(&pkl).unwrap_err();
+    assert!(err.contains(&budget_error()), "{err}");
+}
+
+#[test]
+fn unpickle_counts_every_memo_read() {
+    // A 1,000-item tuple, stored once and read back 100
+    // times. Each read counts at the tuple's size.
+    let mut pkl = b"\x80\x02((".to_vec();
+    pkl.resize(pkl.len() + 1000, b'N');
+    pkl.extend_from_slice(b"tq\x00");
+    for _ in 0..100 {
+        pkl.extend_from_slice(b"h\x00");
+    }
+    pkl.extend_from_slice(b"t.");
+    let err = unpickle(&pkl).unwrap_err();
+    assert!(err.contains(&budget_error()), "{err}");
+}
+
+#[test]
+fn unpickle_counts_every_memo_write() {
+    // The same tuple stored in 100 memo slots. Each store
+    // counts at the tuple's size.
+    let mut pkl = b"\x80\x02(".to_vec();
+    pkl.resize(pkl.len() + 1000, b'N');
+    pkl.push(b't');
+    for i in 0..100u8 {
+        pkl.extend_from_slice(&[b'q', i]);
+    }
+    pkl.push(b'.');
     let err = unpickle(&pkl).unwrap_err();
     assert!(err.contains(&budget_error()), "{err}");
 }
