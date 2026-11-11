@@ -57,9 +57,9 @@ spec:
                   key: {{ .Values.secretKey }}
             {{- end }}
             {{- /* previousSecret and gcsCredentials are read in
-                 parentheses, so values kept from 0.11.0 or earlier
-                 (helm upgrade --reuse-values), which lack them,
-                 still render. */}}
+                 parentheses, so values kept from an earlier
+                 release (helm upgrade --reuse-values), which lack
+                 them, still render. */}}
             {{- if (.Values.previousSecret).existingSecret }}
             - name: CRABCROP_SECRET_PREVIOUS
               valueFrom:
