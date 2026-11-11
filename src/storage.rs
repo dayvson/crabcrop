@@ -114,9 +114,10 @@ struct KeyQueue {
     running: usize,
     /// Jobs that failed at least once.
     failing: usize,
-    /// The sequence numbers of jobs that ended, failed or went
-    /// since the waits on them last heard, with
-    /// `track_ended` (deletions only).
+    /// The sequence numbers of jobs that stopped counting for
+    /// the waits on them since those last heard: each job once,
+    /// when it ends, goes, or first fails, with `track_ended`
+    /// (deletions only).
     ended: Vec<u64>,
     track_ended: bool,
 }
@@ -148,7 +149,8 @@ impl KeyQueue {
             return false;
         };
         self.by_seq.remove(&job.seq);
-        if self.track_ended {
+        // A failed job was counted out when it first failed.
+        if self.track_ended && job.attempts == 0 {
             self.ended.push(job.seq);
         }
         if let Some(at) = job.not_before {
@@ -269,13 +271,19 @@ impl KeyQueue {
         self.later.first_key_value().map(|((at, _), _)| *at)
     }
 
-    /// How many jobs in `seqs` are queued or running; failed
-    /// ones count only with `failed`.
-    fn count_in(&self, seqs: &Range<u64>, failed: bool) -> usize {
+    /// How many jobs in `seqs` are queued or running and have
+    /// not failed. Walks the range: once per wait.
+    fn count_in(&self, seqs: &Range<u64>) -> usize {
         self.by_seq
             .range(seqs.clone())
-            .filter(|(_, key)| failed || self.jobs.get(*key).is_some_and(|job| job.attempts == 0))
+            .filter(|(_, key)| self.jobs.get(*key).is_some_and(|job| job.attempts == 0))
             .count()
+    }
+
+    /// Whether a job in `seqs` is queued or running, failed or
+    /// not.
+    fn any_in(&self, seqs: &Range<u64>) -> bool {
+        self.by_seq.range(seqs.clone()).next().is_some()
     }
 }
 
@@ -342,8 +350,18 @@ struct Inner {
     total_bytes: usize,
     /// Waits on one purge's deletions, by the first sequence
     /// number of its range: the range's end and the wait's
-    /// wake. Purge ranges never overlap.
-    deletion_waits: BTreeMap<u64, Vec<(u64, Arc<tokio::sync::Notify>)>>,
+    /// count. Purge ranges never overlap.
+    deletion_waits: BTreeMap<u64, Vec<(u64, Arc<DeletionCount>)>>,
+}
+
+/// One wait on a purge's deletions (issue #572): how many of
+/// them are still queued or running and have not failed, kept
+/// as each one ends, goes or fails, so the wait never counts
+/// them again, and its wake.
+#[derive(Debug, Default)]
+struct DeletionCount {
+    left: std::sync::atomic::AtomicUsize,
+    wake: tokio::sync::Notify,
 }
 
 impl Inner {
@@ -357,15 +375,23 @@ impl Inner {
         }
     }
 
-    /// Wake the waits whose purge had a deletion end, fail or
-    /// go since they last heard (issue #572). Only those wake,
-    /// so many waiting purges cost the drain nothing.
+    /// Count down and wake the waits whose purge had a deletion
+    /// end, fail or go since they last heard (issue #572). Only
+    /// those wake, each at a constant cost, so many waiting
+    /// purges, or one purge of many files, cost the drain
+    /// nothing.
     fn wake_deletion_waits(&mut self) {
         for seq in self.deletions.ended.drain(..) {
             if let Some((_, waits)) = self.deletion_waits.range(..=seq).next_back() {
-                for (end, wake) in waits {
+                for (end, count) in waits {
                     if seq < *end {
-                        wake.notify_one();
+                        let _ =
+                            count
+                                .left
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                                    left.checked_sub(1)
+                                });
+                        count.wake.notify_one();
                     }
                 }
             }
@@ -1616,58 +1642,57 @@ impl DiskStore {
         }
     }
 
-    /// How many deletions in `seqs` are queued or running;
-    /// failed ones count only with `failed`. Looks at that
-    /// range only.
-    fn deletions_left(&self, seqs: &Range<u64>, failed: bool) -> usize {
-        self.inner.lock().unwrap().deletions.count_in(seqs, failed)
-    }
-
     /// Wait until the deletions a purge queued (`seqs`) are
     /// done (issue #572). Returns false when none of them
     /// finished for `idle`, or `cap` passed in all: a disk that
     /// stops answering, or a slow one. Deletions that failed
     /// are not waited for; they are retried and counted. Only
-    /// these deletions wake the wait, so other jobs ending do
-    /// not restart the idle time, and many waits cost the drain
-    /// nothing.
+    /// these deletions wake the wait, and each one counts down
+    /// what it waits for at a constant cost, so other jobs
+    /// ending do not restart the idle time, and neither many
+    /// waits nor one purge of many files slows the drain.
     pub async fn wait_deletions(
         self: &Arc<Self>,
         seqs: Range<u64>,
         idle: std::time::Duration,
         cap: std::time::Duration,
     ) -> bool {
-        let wake = Arc::new(tokio::sync::Notify::new());
+        let count = Arc::new(DeletionCount::default());
         let mut left = {
-            let mut inner = self.inner.lock().unwrap();
-            let left = inner.deletions.count_in(&seqs, false);
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            // What ended before this wait is counted out here,
+            // so it must not reach the new count as well.
+            inner.wake_deletion_waits();
+            let left = inner.deletions.count_in(&seqs);
             if left == 0 {
                 return true;
             }
+            count.left.store(left, Ordering::Relaxed);
             inner
                 .deletion_waits
                 .entry(seqs.start)
                 .or_default()
-                .push((seqs.end, wake.clone()));
+                .push((seqs.end, count.clone()));
             left
         };
         let _registered = DeletionWaitEntry {
             store: self,
             start: seqs.start,
-            wake: &wake,
+            count: &count,
         };
         self.kick();
         let started = tokio::time::Instant::now();
         let end = started + cap;
         let mut quiet_until = started + idle;
         loop {
-            if tokio::time::timeout_at(quiet_until.min(end), wake.notified())
+            if tokio::time::timeout_at(quiet_until.min(end), count.wake.notified())
                 .await
                 .is_err()
             {
                 return false;
             }
-            let now_left = self.deletions_left(&seqs, false);
+            let now_left = count.left.load(Ordering::Relaxed);
             if now_left == 0 {
                 return true;
             }
@@ -1681,7 +1706,7 @@ impl DiskStore {
     /// Whether a deletion in `seqs` is still queued, failed or
     /// not.
     pub fn deletions_pending(&self, seqs: &Range<u64>) -> bool {
-        self.deletions_left(seqs, true) > 0
+        self.inner.lock().unwrap().deletions.any_in(seqs)
     }
 
     /// What background work is left (issue #572). Scans the
@@ -1961,7 +1986,7 @@ impl<S: std::ops::Deref<Target = DiskStore>> Drop for FileClaim<S> {
 struct DeletionWaitEntry<'s> {
     store: &'s DiskStore,
     start: u64,
-    wake: &'s Arc<tokio::sync::Notify>,
+    count: &'s Arc<DeletionCount>,
 }
 
 impl Drop for DeletionWaitEntry<'_> {
@@ -1972,7 +1997,7 @@ impl Drop for DeletionWaitEntry<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(waits) = inner.deletion_waits.get_mut(&self.start) {
-            waits.retain(|(_, wake)| !Arc::ptr_eq(wake, self.wake));
+            waits.retain(|(_, count)| !Arc::ptr_eq(count, self.count));
             if waits.is_empty() {
                 inner.deletion_waits.remove(&self.start);
             }
@@ -4488,13 +4513,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// How long 4,000 queued deletions from 1,000 purges take to
-    /// drain once a stuck disk answers, with or without a wait
-    /// on each purge's deletions.
-    async fn drain_after_a_stall(waiters: bool) -> std::time::Duration {
-        let dir = temp_dir(&format!("drain-waiters-{waiters}"));
+    /// How long the queued deletions of `purges` purges of
+    /// `files` keys each take to drain once a stuck disk
+    /// answers, with `waits` waits on each purge's deletions.
+    async fn drain_after_a_stall(purges: usize, files: usize, waits: usize) -> std::time::Duration {
+        let dir = temp_dir(&format!("drain-waiters-{purges}-{files}-{waits}"));
         let store = Arc::new(DiskStore::open(&dir, usize::MAX / 4, test_entry_key()).unwrap());
-        index_without_files(&store, 4_000, |i| format!("g{}", i / 4));
+        index_without_files(&store, purges * files, |i| format!("g{}", i / files));
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let hook = gate.clone();
         store.set_hold(Some(Arc::new(move |kind, _| {
@@ -4507,12 +4532,12 @@ mod tests {
             }
             Ok(())
         })));
-        let mut waits = Vec::new();
-        for g in 0..1_000 {
+        let mut tasks = Vec::new();
+        for g in 0..purges {
             let (_, seqs) = store.purge(&PurgeTarget::Group(format!("g{g}")));
-            if waiters {
-                let store = store.clone();
-                waits.push(tokio::spawn(async move {
+            for _ in 0..waits {
+                let (store, seqs) = (store.clone(), seqs.clone());
+                tasks.push(tokio::spawn(async move {
                     store
                         .wait_deletions(
                             seqs,
@@ -4535,8 +4560,8 @@ mod tests {
         })
         .await
         .unwrap();
-        for wait in waits {
-            assert!(wait.await.unwrap());
+        for task in tasks {
+            assert!(task.await.unwrap());
         }
         let took = started.elapsed();
         store.set_hold(None);
@@ -4549,11 +4574,27 @@ mod tests {
         // Issue #572 review: each wait scanned every queued
         // deletion whenever any job ended, so 1,000 waiting
         // purges made the drain after a stall 60 times slower.
-        let alone = drain_after_a_stall(false).await;
-        let waited = drain_after_a_stall(true).await;
+        let alone = drain_after_a_stall(1_000, 4, 0).await;
+        let waited = drain_after_a_stall(1_000, 4, 1).await;
         assert!(
             waited < alone * 5 + std::time::Duration::from_secs(1),
             "{alone:?} with no waits, {waited:?} with 1,000"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_purge_waiting_on_its_own_many_deletions_does_not_slow_them() {
+        // Issue #572 second review: each of a purge's deletions
+        // woke its waits, and each wake counted what was left of
+        // the purge's whole range under the index lock, so one
+        // purge of n files cost n²/2 steps there. 10,000 took
+        // 20 s to drain under the request's wait and the bucket
+        // tombstone's, against 0.3 s with no wait.
+        let alone = drain_after_a_stall(1, 10_000, 0).await;
+        let waited = drain_after_a_stall(1, 10_000, 2).await;
+        assert!(
+            waited < alone * 3 + std::time::Duration::from_secs(1),
+            "{alone:?} with no waits, {waited:?} with two"
         );
     }
 
