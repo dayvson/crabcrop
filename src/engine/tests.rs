@@ -7676,6 +7676,160 @@ fn an_animated_source_converts_its_watermark_once() {
     assert_eq!(map["off-overlay"].conversions(), 0);
 }
 
+#[test]
+fn a_partly_visible_watermark_copies_only_the_part_that_lands() {
+    // Issue #604: a watermark that did not decode as RGBA was
+    // copied whole, on every frame, however little of it
+    // landed on the image. Only the part that lands is copied
+    // now, once, and kept for the frames after it. A use that
+    // needs a part the kept copy does not cover copies its
+    // own part.
+    let ctx = ProcessContext::default();
+    let base =
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 20, image::Rgb([255, 0, 0])));
+    let wm = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        300,
+        200,
+        image::Rgb([0, 0, 255]),
+    )));
+    // At (30, 15) its 10x5 corner lands.
+    for _ in 0..3 {
+        let out = overlay_watermark(&ctx, &base, &wm, 30, 15, 100)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(out.get_pixel(30, 15), &image::Rgb([0, 0, 255]));
+        assert_eq!(out.get_pixel(39, 19), &image::Rgb([0, 0, 255]));
+        assert_eq!(out.get_pixel(29, 19), &image::Rgb([255, 0, 0]));
+    }
+    assert_eq!(wm.kept_part(), Some((0, 0, 10, 5)));
+    assert_eq!(wm.conversions(), 1);
+    // A part inside the kept one is read from it.
+    overlay_watermark(&ctx, &base, &wm, 35, 17, 100).unwrap();
+    assert_eq!(wm.conversions(), 1);
+    // At (-1, -1) a 39x19 part of its bottom-right corner
+    // lands, which the kept copy does not cover.
+    overlay_watermark(&ctx, &base, &wm, -1, -1, 100).unwrap();
+    assert_eq!(wm.conversions(), 2);
+    assert_eq!(wm.kept_part(), Some((0, 0, 10, 5)));
+    // An RGBA watermark is read in place.
+    let rgba = WatermarkImage::new(DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        300,
+        200,
+        image::Rgba([0, 0, 255, 255]),
+    )));
+    overlay_watermark(&ctx, &base, &rgba, 30, 15, 100).unwrap();
+    assert_eq!(rgba.conversions(), 0);
+}
+
+#[test]
+fn landing_does_not_depend_on_the_top_size() {
+    // The overlay skips its resize when nothing would land,
+    // before it knows the scaled size (issue #604). That
+    // holds only because whether anything lands does not
+    // depend on the top's size.
+    for base in [(1, 1), (13, 9), (9, 13)] {
+        for x in -30..=30 {
+            for y in -30..=30 {
+                for top in [(1, 1), (5, 3), (3, 5), (13, 9), (40, 40)] {
+                    assert_eq!(
+                        landing(base, top, (x, y)).is_some(),
+                        lands_on(base, (x, y)),
+                        "base {base:?}, top {top:?}, at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
+    // The filters read only the part of the image that lands
+    // now, from a copy of that part when the image is not
+    // RGBA (issue #604). They must still write the old bytes:
+    // those of the old loop over the whole image converted to
+    // RGBA. Checked for each kind of pixel, at offsets inside,
+    // across and past each edge, with one image kept across
+    // all the offsets as a request keeps it, with a fresh one
+    // each time, and through `overlay(...,width)`.
+    use crate::url::BlendMode;
+    let ctx = ProcessContext::default();
+    let bases = [
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(13, 9, |x, y| {
+            image::Rgb([(x * 19) as u8, (y * 27) as u8, ((x + y) * 7) as u8])
+        })),
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(9, 13, |x, y| {
+            image::Rgba([
+                (x * 29) as u8,
+                (200 - y * 9) as u8,
+                40,
+                ((x * y * 11) % 256) as u8,
+            ])
+        })),
+    ];
+    let tops = [
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(6, 5, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 50) as u8, 120])
+        })),
+        DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_fn(5, 7, |x, y| {
+            image::LumaA([(x * 50) as u8, ((x + y) * 30) as u8])
+        })),
+        DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(7, 4, |x, y| {
+            image::Rgba([
+                (x * 9000) as u16,
+                (y * 15000) as u16,
+                777,
+                ((x + y) * 6000) as u16,
+            ])
+        })),
+        DynamicImage::ImageRgb32F(image::ImageBuffer::from_fn(4, 6, |x, y| {
+            image::Rgb([x as f32 / 4.0, y as f32 / 6.0, 0.7])
+        })),
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(5, 5, |x, y| {
+            image::Rgba([(x * 60) as u8, 30, (y * 60) as u8, ((x * y) * 15) as u8])
+        })),
+    ];
+    let no_check = || Ok::<(), std::convert::Infallible>(());
+    for base in &bases {
+        for top in &tops {
+            let kept = WatermarkImage::new(top.clone());
+            let rgba = top.to_rgba8();
+            let target = (base.width() * 150 / 100).max(1);
+            let scaled = top
+                .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
+            for x in -16..=16 {
+                for y in -16..=16 {
+                    let at = format!("{:?} on {:?} at ({x}, {y})", top.color(), base.color());
+                    let Ok(want) =
+                        composite_before_604(base, &rgba, (x, y), 70, no_check, |_, o| o);
+                    assert_eq!(
+                        overlay_watermark(&ctx, base, &kept, x, y, 70).unwrap(),
+                        want,
+                        "{at}"
+                    );
+                    let fresh = WatermarkImage::new(top.clone());
+                    assert_eq!(
+                        overlay_watermark(&ctx, base, &fresh, x, y, 70).unwrap(),
+                        want,
+                        "{at}"
+                    );
+                    let overlay = |b, o| blend_channel(BlendMode::Overlay, b, o);
+                    let Ok(want) = composite_before_604(base, &rgba, (x, y), 55, no_check, overlay);
+                    let got = blend_overlay(&ctx, base, &kept, x, y, 55, BlendMode::Overlay, None);
+                    assert_eq!(got.unwrap(), want, "{at}");
+                    let screen = |b, o| blend_channel(BlendMode::Screen, b, o);
+                    let Ok(want) =
+                        composite_before_604(base, &scaled, (x, y), 90, no_check, screen);
+                    let got =
+                        blend_overlay(&ctx, base, &kept, x, y, 90, BlendMode::Screen, Some(150));
+                    assert_eq!(got.unwrap(), want, "{at}, scaled");
+                }
+            }
+        }
+    }
+}
+
 /// `png` with its pixel data zeroed: the header still states
 /// the size, but the image no longer decodes.
 fn png_without_pixels(png: &[u8]) -> Vec<u8> {

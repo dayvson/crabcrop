@@ -69,20 +69,27 @@ impl EncodeOptions {
 pub type WatermarkImages = std::collections::HashMap<String, WatermarkImage>;
 
 /// One decoded watermark or overlay image (issue #604). The
-/// composite reads RGBA pixels. An image that decoded as RGBA
-/// is read in place. Any other is copied to RGBA once, the
-/// first time a composite draws it, and the copy is kept for
-/// the rest of the request, so an animated source does not
-/// copy it again for every frame. The decoded image stays as
-/// it is, because `overlay(...,width)` resizes that one.
+/// composite reads RGBA pixels, and only those of the part
+/// that lands on the image below. An image that decoded as
+/// RGBA is read in place. Any other has that part copied to
+/// RGBA the first time a composite draws it, and the copy is
+/// kept for the rest of the request, so an animated source,
+/// whose frames all place it the same way, copies it once. A
+/// later use that needs a part the kept copy does not cover
+/// copies its own part. The decoded image stays as it is,
+/// because `overlay(...,width)` resizes that one.
 #[derive(Debug)]
 pub struct WatermarkImage {
     image: DynamicImage,
-    rgba: std::sync::OnceLock<image::RgbaImage>,
-    /// How many RGBA copies were made: at most one.
+    /// The kept RGBA copy, and the part of the image it covers.
+    rgba: std::sync::OnceLock<(Rect, image::RgbaImage)>,
+    /// How many RGBA copies were made, kept or not.
     #[cfg(test)]
     conversions: std::sync::atomic::AtomicUsize,
 }
+
+/// A part of an image: x, y, width, height.
+pub type Rect = (u32, u32, u32, u32);
 
 impl WatermarkImage {
     pub fn new(image: DynamicImage) -> Self {
@@ -99,25 +106,43 @@ impl WatermarkImage {
         &self.image
     }
 
-    /// The image's RGBA pixels: the decoded ones when they
-    /// are RGBA already, otherwise the copy, made on the
-    /// first call.
-    pub fn rgba(&self) -> &image::RgbaImage {
-        if let Some(pixels) = self.image.as_rgba8() {
-            return pixels;
+    /// The RGBA pixels of the part `rect` of the image: read
+    /// in place when the image decoded as RGBA, from the kept
+    /// copy when it covers `rect`, and otherwise from a copy
+    /// of `rect` alone, which is kept when it is the first.
+    pub fn rgba_part(&self, rect: Rect) -> RgbaPart<'_> {
+        if self.image.as_rgba8().is_some() {
+            return RgbaPart::of(&self.image, rect);
         }
-        self.rgba.get_or_init(|| {
-            #[cfg(test)]
-            self.conversions
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.image.to_rgba8()
-        })
+        let (kept, pixels) = self.rgba.get_or_init(|| (rect, self.copy_part(rect)));
+        let (kx, ky, kw, kh) = *kept;
+        let (x, y, w, h) = rect;
+        if x >= kx && y >= ky && x + w <= kx + kw && y + h <= ky + kh {
+            return RgbaPart {
+                pixels: std::borrow::Cow::Borrowed(pixels),
+                origin: (kx, ky),
+                size: (self.image.width(), self.image.height()),
+            };
+        }
+        RgbaPart {
+            pixels: std::borrow::Cow::Owned(self.copy_part(rect)),
+            origin: (x, y),
+            size: (self.image.width(), self.image.height()),
+        }
+    }
+
+    fn copy_part(&self, rect: Rect) -> image::RgbaImage {
+        #[cfg(test)]
+        self.conversions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        copy_part(&self.image, rect)
     }
 
     /// The most memory this image holds (issue #613): its
-    /// decoded pixels, plus the RGBA copy when it did not
-    /// decode as RGBA, counted whether or not the copy has
-    /// been made yet.
+    /// decoded pixels, plus an RGBA copy of all of it when it
+    /// did not decode as RGBA. The kept copy covers one part
+    /// at most, and is counted at the whole image's size
+    /// whether or not it has been made.
     pub fn held_bytes(&self) -> u64 {
         let decoded = self.image.as_bytes().len() as u64;
         if self.image.as_rgba8().is_some() {
@@ -127,10 +152,66 @@ impl WatermarkImage {
         }
     }
 
-    /// How many RGBA copies were made.
+    /// How many RGBA copies were made, kept or not.
     #[cfg(test)]
     pub(crate) fn conversions(&self) -> usize {
         self.conversions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The part of the image the kept RGBA copy covers.
+    #[cfg(test)]
+    pub(crate) fn kept_part(&self) -> Option<Rect> {
+        self.rgba.get().map(|(rect, _)| *rect)
+    }
+}
+
+/// The part `rect` of `image` in RGBA. Each pixel converts on
+/// its own, so the part converts to the same pixels as the
+/// same part of the whole image does.
+fn copy_part(image: &DynamicImage, (x, y, w, h): Rect) -> image::RgbaImage {
+    image.crop_imm(x, y, w, h).into_rgba8()
+}
+
+/// The RGBA pixels of a part of an image (issue #604), read
+/// in the whole image's coordinates. A composite reads only
+/// the part it asked for; reading a pixel outside it panics.
+pub struct RgbaPart<'a> {
+    pixels: std::borrow::Cow<'a, image::RgbaImage>,
+    /// Where `pixels` starts in the whole image.
+    origin: (u32, u32),
+    /// The whole image's size.
+    size: (u32, u32),
+}
+
+impl<'a> RgbaPart<'a> {
+    /// The part `rect` of `image`: all of it read in place
+    /// when it is RGBA, otherwise a copy of `rect` alone.
+    pub fn of(image: &'a DynamicImage, rect: Rect) -> Self {
+        let size = (image.width(), image.height());
+        match image.as_rgba8() {
+            Some(pixels) => RgbaPart {
+                pixels: std::borrow::Cow::Borrowed(pixels),
+                origin: (0, 0),
+                size,
+            },
+            None => RgbaPart {
+                pixels: std::borrow::Cow::Owned(copy_part(image, rect)),
+                origin: (rect.0, rect.1),
+                size,
+            },
+        }
+    }
+}
+
+impl image::GenericImageView for RgbaPart<'_> {
+    type Pixel = image::Rgba<u8>;
+
+    fn dimensions(&self) -> (u32, u32) {
+        self.size
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> image::Rgba<u8> {
+        *self.pixels.get_pixel(x - self.origin.0, y - self.origin.1)
     }
 }
 

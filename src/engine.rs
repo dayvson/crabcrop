@@ -5138,25 +5138,29 @@ fn blend_overlay(
     if !lands_on((base.width(), base.height()), (x, y)) {
         return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
     }
-    // The scaled overlay is converted to RGBA after the
-    // resize, as before: the resize reads the decoded image.
-    let scaled;
-    let top = match target {
-        Some(target) => {
-            scaled = ov
-                .image()
-                .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
-                .into_rgba8();
-            &scaled
-        }
-        None => ov.rgba(),
+    // The overlay is scaled first and its RGBA pixels read
+    // after, as before: the resize reads the decoded image.
+    let scaled = target.map(|target| {
+        ov.image()
+            .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
+    });
+    let top_size = match &scaled {
+        Some(scaled) => (scaled.width(), scaled.height()),
+        None => (ov.image().width(), ov.image().height()),
+    };
+    let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
+        return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
+    };
+    let top = match &scaled {
+        Some(scaled) => crate::filters::RgbaPart::of(scaled, part.0),
+        None => ov.rgba_part(part.0),
     };
     // The blend walks every overlay pixel; a large legal pair
     // still runs long, so the deadline is honored per row
     // (issue #358).
     composite(
         base,
-        top,
+        &top,
         (x, y),
         alpha,
         || ctx.check_deadline(),
@@ -5171,8 +5175,8 @@ fn blend_overlay(
 /// base's right edge). Parts falling outside the base are
 /// clipped, never a panic. The deadline is checked before
 /// anything is copied and per row of the composite, as the
-/// overlay checks it (issue #604), and a watermark that lands
-/// off the canvas is not copied at all.
+/// overlay checks it, and only the part of the watermark that
+/// lands on the base is read or copied (issue #604).
 fn overlay_watermark(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
@@ -5182,12 +5186,13 @@ fn overlay_watermark(
     alpha: u8,
 ) -> Result<DynamicImage, EngineError> {
     ctx.check_deadline()?;
-    if !lands_on((base.width(), base.height()), (x, y)) {
+    let top_size = (wm.image().width(), wm.image().height());
+    let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
         return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
-    }
+    };
     composite(
         base,
-        wm.rgba(),
+        &wm.rgba_part(part.0),
         (x, y),
         alpha,
         || ctx.check_deadline(),
@@ -5207,6 +5212,37 @@ fn lands_on((width, height): (u32, u32), (x, y): (i32, i32)) -> bool {
     x.unsigned_abs() < width && y.unsigned_abs() < height
 }
 
+/// The part of a top image of size `top` placed at (x, y) on
+/// a base of size `base` that lands on the base, and the base
+/// pixel its top-left corner lands on (issue #604). A
+/// negative coordinate anchors the top's right or bottom edge
+/// that many pixels in from the base's. `None` when no pixel
+/// lands.
+fn landing(
+    (bw, bh): (u32, u32),
+    (tw, th): (u32, u32),
+    (x, y): (i32, i32),
+) -> Option<(crate::filters::Rect, (u32, u32))> {
+    let (bw, bh, tw, th) = (bw as i64, bh as i64, tw as i64, th as i64);
+    let left = if x >= 0 { x as i64 } else { bw - tw + x as i64 };
+    let upper = if y >= 0 { y as i64 } else { bh - th + y as i64 };
+    let columns = (-left).max(0)..(bw - left).min(tw);
+    let rows = (-upper).max(0)..(bh - upper).min(th);
+    if columns.is_empty() || rows.is_empty() {
+        return None;
+    }
+    let part = (
+        columns.start as u32,
+        rows.start as u32,
+        (columns.end - columns.start) as u32,
+        (rows.end - rows.start) as u32,
+    );
+    Some((
+        part,
+        ((left + columns.start) as u32, (upper + rows.start) as u32),
+    ))
+}
+
 /// The anchor, clip, and alpha loop the overlay and the
 /// watermark share (issue #480). `top` sits on `base` at
 /// `(x, y)`, a negative coordinate anchoring from the right or
@@ -5215,38 +5251,36 @@ fn lands_on((width, height): (u32, u32), (x, y): (i32, i32)) -> bool {
 /// alpha times `alpha` percent, and each color channel moves
 /// that far toward `blend(base, top)`, the per-pixel blend of
 /// the base channel and the top one; the base alpha channel is
-/// kept. Only the rows and columns of `top` that land on
-/// `base` are walked (issue #604), and `each_row` runs before
-/// each of those rows, where the callers check the deadline.
-fn composite<E>(
+/// kept. Only the part of `top` that lands on `base` is read
+/// (issue #604, see [`landing`]), and `each_row` runs before
+/// each of its rows, where the callers check the deadline.
+fn composite<E, T>(
     base: &DynamicImage,
-    top: &image::RgbaImage,
+    top: &T,
     (x, y): (i32, i32),
     alpha: u8,
     mut each_row: impl FnMut() -> Result<(), E>,
     blend: impl Fn(f32, f32) -> f32,
-) -> Result<DynamicImage, E> {
+) -> Result<DynamicImage, E>
+where
+    T: image::GenericImageView<Pixel = image::Rgba<u8>>,
+{
     let mut out = base.to_rgba8();
-    let (bw, bh) = (out.width() as i64, out.height() as i64);
-    let (tw, th) = (top.width() as i64, top.height() as i64);
-    let left = if x >= 0 { x as i64 } else { bw - tw + x as i64 };
-    let upper = if y >= 0 { y as i64 } else { bh - th + y as i64 };
-    // The top's columns and rows that land on the base.
-    let columns = (-left).max(0)..(bw - left).min(tw);
-    let rows = (-upper).max(0)..(bh - upper).min(th);
-    if columns.is_empty() || rows.is_empty() {
+    let Some(((tx0, ty0, w, h), (bx0, by0))) =
+        landing((out.width(), out.height()), top.dimensions(), (x, y))
+    else {
         return Ok(DynamicImage::ImageRgba8(out));
-    }
+    };
     let opacity = alpha as f32 / 100.0;
-    for ty in rows {
+    for row in 0..h {
         each_row()?;
-        for tx in columns.clone() {
-            let top_px = top.get_pixel(tx as u32, ty as u32);
+        for column in 0..w {
+            let top_px = top.get_pixel(tx0 + column, ty0 + row);
             let a = opacity * (top_px[3] as f32 / 255.0);
             if a <= 0.0 {
                 continue;
             }
-            let bot = out.get_pixel_mut((left + tx) as u32, (upper + ty) as u32);
+            let bot = out.get_pixel_mut(bx0 + column, by0 + row);
             for c in 0..3 {
                 let blended = blend(bot[c] as f32, top_px[c] as f32);
                 bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
