@@ -103,12 +103,12 @@ async fn seed_then_go_cold(state: &Arc<AppState>, src: &str) -> (Arc<AppState>, 
     assert_eq!(state.store.as_ref().unwrap().stats().0, remainders.len());
     // The second state is `state`'s settings over its disk
     // store, with memory, gates and tasks of its own.
-    let mut cold = tier_test_state(None, "http://127.0.0.1:9");
-    cold.store = state.store.clone();
-    cold.shared_store = None;
-    cold.presets = state.presets.clone();
-    cold.metrics_token = state.metrics_token.clone();
-    let cold = Arc::new(cold);
+    let cold = Arc::new(AppState {
+        store: state.store.clone(),
+        presets: state.presets.clone(),
+        metrics_token: state.metrics_token.clone(),
+        ..test_state()
+    });
     let cold_base = serve_state(&cold).await;
     let resp = get_within(&cold_base, &format!("30x20/{src}"), "the warming hit").await;
     assert_eq!(
