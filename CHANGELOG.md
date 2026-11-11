@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Fixed
+
+- Requests the router itself answers now carry the documented error shape (issue #563). A path no route matches, such as `/`, answered a bare `404` with an empty body, and a method a matched route does not serve (a `POST` or `DELETE` to an image path, a `GET` on `/upload/...` or `/purge/...`, a `PUT` on `/health` or `/explain/...`) answered a bare `405`. Neither had a code, and neither used the v2 JSON envelope for a client sending `Accept: application/json`, though docs/responses.md said every failure did. The router now has a fallback that answers `404 not_found` and a method-not-allowed fallback that answers `405` with the new code `method_not_allowed`, both through the same error shape as every other refusal, and the `405` keeps its `Allow` header naming the matched route's methods. docs/responses.md gains the `method_not_allowed` code row and a `405` status row, and its `not_found` and `404` rows now say which requests they cover; docs/endpoints.md notes the `405` answer.
+
 ## [0.11.0] - 2026-11-10
 
 ### Changed
