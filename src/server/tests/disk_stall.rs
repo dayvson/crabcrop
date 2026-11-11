@@ -431,7 +431,12 @@ async fn a_follower_does_not_wait_for_its_leaders_disk_write() {
     let follower = tokio::spawn(request(base.clone(), remainder));
     let (leader_done, _) = leader.await.unwrap();
     let (follower_done, status) = follower.await.unwrap();
-    assert!(follower_done < leader_done, "the follower waited");
+    // The leader waits up to 1 s for its held disk write after
+    // the follower is woken.
+    assert!(
+        follower_done + std::time::Duration::from_millis(500) < leader_done,
+        "the follower waited for the leader's disk write"
+    );
     assert_eq!(status, "crabcrop; hit");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     drop(gate);
