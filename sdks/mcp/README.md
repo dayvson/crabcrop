@@ -7,7 +7,7 @@ A first-party MCP (Model Context Protocol) server for crabcrop, so coding agents
 | Tool | What it does |
 |---|---|
 | `sign_url` | Build and sign a URL from an operation string and a source (optional expiry). Like every builder, it refuses a remainder that begins with the reserved segment `crabcrop`. |
-| `explain_url` | Parse a URL back into its signature kind, explained segments, and source; malformed segments are flagged. |
+| `explain_url` | Parse a URL back into its signature kind, explained segments, and source; malformed segments are flagged. A URL longer than 64 KiB is refused with an error. |
 | `fetch_meta` | Fetch the server's meta JSON for a URL (dimensions, format, bytes, quality, placeholders on request). The server needs meta mode on (`CRABCROP_META_MODE=1`); it is off by default, and the tool then reports the server's `403 meta_disabled`. Only fetches URLs on the configured `CRABCROP_BASE` origin, never follows redirects, and caps the response at 256 KiB. |
 | `purge_result` | Evict a cached result by its URL remainder; a preset URL works as-is (the server expands it before matching). Only POSTs to `/purge/` under the configured `CRABCROP_BASE` (a per-call `base` must equal it) and refuses paths with dot segments. |
 
