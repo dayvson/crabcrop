@@ -8,10 +8,14 @@ deletes them.
 
 - Name the file `<issue>.<section>.md`, for example `521.changed.md`. The
   section is one of `added`, `changed`, `deprecated`, `removed`, `fixed`,
-  `security`. For a second entry with the same issue and section, add a slug:
-  `521-chained-resize.changed.md`.
+  `security`. A slug is always allowed, `521-chained-resize.changed.md`: use
+  one for a second entry with the same issue and section, and whenever
+  another open pull request for that issue may add one to that section.
 - Write one paragraph in the style of CHANGELOG.md, naming the issue as the
   entries there do: `(issue #521)`. Leave out the leading `- `.
+- A change that cannot name a public issue, such as the fix for a private
+  security advisory, writes a line under `## [Unreleased]` in CHANGELOG.md
+  instead.
 - Preview `## [Unreleased]` with the fragments in place:
   `python3 scripts/assemble_changelog.py --check`.
 

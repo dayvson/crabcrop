@@ -7,8 +7,9 @@ request now adds one file instead, changelog.d/<issue>.<section>.md, holding
 its entry's paragraph; two pull requests never touch the same file, and the
 release gathers them.
 
-  Name     <issue>.<section>.md, or <issue>-<slug>.<section>.md when that
-           name is taken (a second entry for the same issue and section).
+  Name     <issue>.<section>.md, or <issue>-<slug>.<section>.md, which is
+           always allowed and needed for a second entry for the same issue
+           and section, or one another open pull request may add.
            The issue is a number without leading zeros, the slug lowercase
            letters and digits in hyphen-separated words, the section one of
            added, changed, deprecated, removed, fixed, security.
@@ -392,7 +393,8 @@ def plan(root, version, date=None):
         raise AssembleError(
             [
                 f"{CHANGELOG} already has ## [{version}], and {UNRELEASED} or {FRAGMENTS}/ "
-                "still holds entries: release them under a new version"
+                f"still holds entries: move them into ## [{version}] by hand, deleting each "
+                "fragment, or release them under a new version"
             ]
         )
     section = trimmed(assemble_body(body, fragments))

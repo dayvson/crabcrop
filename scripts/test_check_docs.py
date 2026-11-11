@@ -1493,7 +1493,11 @@ class AssembleChangelog(unittest.TestCase):
             (("0.2",), "X.Y.Z"),
             (("v0.2.0",), "X.Y.Z"),
             (("0.2.0", "--date", "2026-02-30"), "YYYY-MM-DD"),
-            (("0.1.0", "--date", "2026-02-03"), "already has ## [0.1.0]"),
+            (
+                ("0.1.0", "--date", "2026-02-03"),
+                "already has ## [0.1.0], and ## [Unreleased] or changelog.d/ still holds entries: "
+                "move them into ## [0.1.0] by hand, deleting each fragment, or release them under a new version",
+            ),
             ((), "--check or a version"),
         ):
             with self.subTest(args=args):
@@ -1501,6 +1505,19 @@ class AssembleChangelog(unittest.TestCase):
                 self.assertNotEqual(done.returncode, 0, done.stdout)
                 self.assertIn(message, done.stderr)
                 self.assertEqual(self.snapshot(), before)
+
+    def test_a_fragment_written_after_the_bump_is_refused(self):
+        # RELEASING.md steps 3 and 4 come after the bump: a note written
+        # then as a fragment would wait for the next release, so running
+        # the release again says to write it into the section by hand.
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.write("changelog.d/6.changed.md", "This release starts a new cache epoch (issue #6).\n")
+        before = self.snapshot()
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("move them into ## [0.2.0] by hand", done.stderr)
+        self.assertEqual(self.snapshot(), before)
 
     def test_a_second_unreleased_section_is_refused(self):
         self.write(
