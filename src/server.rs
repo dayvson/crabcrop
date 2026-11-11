@@ -1366,6 +1366,7 @@ async fn purge_shared_tier(
         .await;
     removed += inline.removed;
     let shared = shared.clone();
+    let tasks = background.clone();
     match pending {
         Some(pending) => {
             background.spawn_walk(async move {
@@ -1374,28 +1375,19 @@ async fn purge_shared_tier(
                     shared.finish_purge(pending).await
                 };
                 let (event, log_target) = (purge.event, purge.log_target.clone());
-                end_purge(&shared, purge, inline.complete && rest.complete).await;
+                end_purge_apart(&shared, &tasks, purge, inline.complete && rest.complete).await;
                 purge_log(event, &log_target, Some(rest.removed));
                 let joined = lease.take_joined();
-                walk_for_joined(&shared, lease, joined).await;
-            });
-        }
-        None if purge.disk.as_ref().is_some_and(|disk| disk.pending()) => {
-            // The tombstone is marked ended once the purge's
-            // disk files are gone (issue #572), which the
-            // request does not wait for.
-            let complete = inline.complete;
-            background.spawn_walk(async move {
-                end_purge(&shared, purge, complete).await;
-                let joined = lease.take_joined();
-                walk_for_joined(&shared, lease, joined).await;
+                walk_for_joined(&shared, &tasks, lease, joined).await;
             });
         }
         None => {
-            end_purge(&shared, purge, inline.complete).await;
+            end_purge_apart(&shared, background, purge, inline.complete).await;
             let joined = lease.take_joined();
             if !joined.is_empty() {
-                background.spawn_walk(async move { walk_for_joined(&shared, lease, joined).await });
+                background.spawn_walk(async move {
+                    walk_for_joined(&shared, &tasks, lease, joined).await;
+                });
             }
         }
     }
@@ -1412,7 +1404,8 @@ async fn purge_shared_tier(
 /// ones do. Each purge the pass served logs the pass's
 /// count under its own target.
 async fn walk_for_joined(
-    shared: &crate::s3store::S3Store,
+    shared: &Arc<crate::s3store::S3Store>,
+    background: &Background,
     mut lease: crate::s3store::WalkLease,
     mut joined: Vec<crate::s3store::SharedPurge>,
 ) {
@@ -1428,7 +1421,7 @@ async fn walk_for_joined(
         };
         for purge in joined {
             let (event, log_target) = (purge.event, purge.log_target.clone());
-            end_purge(shared, purge, swept.complete).await;
+            end_purge_apart(shared, background, purge, swept.complete).await;
             purge_log(event, &log_target, Some(swept.removed));
         }
         joined = lease.take_joined();
@@ -1450,21 +1443,45 @@ async fn walk_for_joined(
 /// ended only once the purge's disk files are deleted (issue
 /// #572): a restart before then indexes them again, and the
 /// unended tombstone keeps them misses until a later purge of
-/// the target finishes.
+/// the target finishes. The wait for them is bounded: when a
+/// deletion fails, or they stop making progress, the purge
+/// ends with its tombstone in force, as for a walk that was
+/// not complete.
 async fn end_purge(
     shared: &crate::s3store::S3Store,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
-    if let Some(disk) = &purge.disk {
-        disk.done().await;
-    }
-    if complete && let Some(object) = &purge.tombstone {
+    let deleted = match &purge.disk {
+        Some(disk) => disk.finished(PURGE_END_IDLE, PURGE_END_CAP).await,
+        None => true,
+    };
+    if complete
+        && deleted
+        && let Some(object) = &purge.tombstone
+    {
         let mut ended = purge.active.tombstone().clone();
         ended.ended_ms = Some(crate::cache::now_ms());
         shared.write_tombstone(object, &ended).await;
     }
     drop(purge);
+}
+
+/// [`end_purge`], on a task of its own when the purge still
+/// waits for disk deletions (issue #572): the walk lease, and
+/// the purges that joined it, do not wait on the disk.
+async fn end_purge_apart(
+    shared: &Arc<crate::s3store::S3Store>,
+    background: &Background,
+    purge: crate::s3store::SharedPurge,
+    complete: bool,
+) {
+    if purge.disk.as_ref().is_some_and(|disk| disk.pending()) {
+        let shared = shared.clone();
+        background.spawn_walk(async move { end_purge(&shared, purge, complete).await });
+    } else {
+        end_purge(shared, purge, complete).await;
+    }
 }
 
 /// A purge that has begun, as its shared-tier half takes it:
@@ -4040,8 +4057,19 @@ const DISK_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long a purge waits for its disk deletions in all
 /// while they make progress (issue #572). It stops sooner, at
-/// [`DISK_WRITE_WAIT`], once none finishes for that long.
+/// [`DISK_WRITE_WAIT`], once none of them finishes for that
+/// long.
 const PURGE_DELETE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the end of a purge, in the background, waits for
+/// one of its disk deletions to finish (issue #572). When none
+/// does for that long, the purge ends with its bucket
+/// tombstone in force.
+const PURGE_END_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the end of a purge waits for its disk deletions
+/// in all while they make progress.
+const PURGE_END_CAP: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What is left of a request's [`DISK_LOOKUP_BUDGET`]. Only
 /// time spent waiting on the disk is charged: a request that

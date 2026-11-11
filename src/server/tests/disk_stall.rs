@@ -698,3 +698,115 @@ async fn a_slow_write_that_has_its_slot_is_not_a_stall() {
     drop(held);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Make every disk deletion on `store` fail, as on a disk
+/// remounted read-only.
+fn fail_unlinks(store: &Arc<crate::storage::DiskStore>) {
+    store.set_hold(Some(Arc::new(|kind, _| {
+        if kind == OpKind::Unlink {
+            return Err(std::io::Error::from_raw_os_error(30));
+        }
+        Ok(())
+    })));
+}
+
+/// A bucket copy of another key in `group`, rendered after
+/// every purge `state` has begun.
+async fn fresh_bucket_copy_in(state: &AppState, group: &str) {
+    let fresh = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..in_groups(&[group])
+    };
+    state
+        .shared_store
+        .as_ref()
+        .unwrap()
+        .put("41x24/example.com/i.png", &fresh)
+        .await;
+}
+
+#[tokio::test]
+async fn a_purge_whose_disk_deletion_keeps_failing_still_ends() {
+    // A disk deletion that keeps failing does not keep its
+    // purge running. Its tombstone stays unended, as for a
+    // walk that did not finish, and a later purge of the
+    // target walks the bucket.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unlink-fails");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    store.put(KEY, &in_groups(&["g"]));
+    fail_unlinks(&store);
+    let answer = within(
+        std::time::Duration::from_secs(3),
+        "the purge",
+        purge_group_call(&base, "g"),
+    )
+    .await;
+    assert_eq!(answer, "purged 1\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert_eq!(bucket_tombstones(&fake)[0].ended_ms, None);
+    fresh_bucket_copy_in(&state, "g").await;
+    let answer = within(
+        std::time::Duration::from_secs(3),
+        "the second purge",
+        purge_group_call(&base, "g"),
+    )
+    .await;
+    assert_eq!(answer, "purged 1\n");
+    assert_eq!(entry_objects(&fake), 0);
+    within(
+        std::time::Duration::from_secs(5),
+        "the second purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert!(store.backlog().failing > 0);
+    store.set_hold(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_purge_after_one_whose_disk_deletion_is_stuck_still_walks_the_bucket() {
+    // The first purge's disk deletion is stuck. A bucket copy
+    // in the group is written after it began, and a second
+    // purge of the group reaches that copy while the disk is
+    // still stuck: the first purge's wait for its files does
+    // not hold the bucket walk.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unlink-stuck-walk");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    store.put(KEY, &in_groups(&["g"]));
+    let (gate, _held) = DiskOpGate::hold(&store, &[OpKind::Unlink]);
+    let answer = within(
+        std::time::Duration::from_secs(3),
+        "the first purge",
+        purge_group_call(&base, "g"),
+    )
+    .await;
+    assert_eq!(answer, "purged 1\n");
+    fresh_bucket_copy_in(&state, "g").await;
+    let answer = within(
+        std::time::Duration::from_secs(3),
+        "the second purge",
+        purge_group_call(&base, "g"),
+    )
+    .await;
+    assert_eq!(answer, "purged 1\n");
+    assert_eq!(gate.seen(OpKind::Unlink), 1);
+    assert_eq!(
+        entry_objects(&fake),
+        0,
+        "the second purge left its bucket copy while the disk was stuck"
+    );
+    drop(gate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
