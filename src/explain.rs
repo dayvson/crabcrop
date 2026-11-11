@@ -25,13 +25,15 @@
 //!
 //! The presets a URL references and the server's default
 //! operations are shown in full, as the operator wrote
-//! them (issue #591). A watermark or overlay URL in either
-//! is printed with its host and query string, in the
-//! glosses and in the canonical form, to anyone who holds
-//! a signed URL. A watermark or overlay URL cannot use a
-//! source root, so operators keep tokens and internal
-//! hosts out of those URLs, block `/explain/` at the edge,
-//! or turn the route off with `CRABCROP_EXPLAIN=0`.
+//! them (issue #591). A watermark or overlay URL in a
+//! preset is printed with its host and query string in
+//! the operation glosses, the preset entries and the
+//! canonical form, and one in the default operations in
+//! the canonical form, to anyone who holds a signed URL.
+//! A watermark or overlay URL cannot use a source root, so
+//! operators keep tokens and internal hosts out of those
+//! URLs, block `/explain/` at the edge, or turn the route
+//! off with `CRABCROP_EXPLAIN=0`.
 
 use crate::engine::SourceProbe;
 use crate::url::{Dimension, Filter, Operation, RequestDirectives, canonical_form, format_text};

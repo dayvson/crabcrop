@@ -1726,7 +1726,7 @@ pub fn client_hints_config(get: impl Fn(&str) -> Option<String>) -> Result<bool,
 /// report prints the presets a URL references and the
 /// default operations in full, watermark and overlay URLs
 /// included, to anyone who holds a signed URL. Off, every
-/// request to the route answers `404 not_found`.
+/// `GET` or `HEAD` to the route answers `404 not_found`.
 pub fn explain_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
     parse_bool_value("CRABCROP_EXPLAIN", get("CRABCROP_EXPLAIN"), true)
 }

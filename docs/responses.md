@@ -70,7 +70,7 @@ Operational failures carry these codes:
 | `invalid_path` | `400` | An explain, purge, purge-group, or upload path does not have the route's shape. |
 | `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |
 | `meta_disabled` | `403` | Meta mode is off on this server, which is the default (`CRABCROP_META_MODE` unset or `0`). |
-| `not_found` | `404` | A `PUT` on the image route, a request to a path no route matches, such as `/`, or any request to `/explain/...` with `CRABCROP_EXPLAIN=0`. |
+| `not_found` | `404` | A `PUT` on the image route, a request to a path no route matches, such as `/`, or a `GET` or `HEAD` to `/explain/...` with `CRABCROP_EXPLAIN=0`. |
 | `method_not_allowed` | `405` | The path matches a route, but not for this method. The answer carries an `Allow` header listing the methods the route does serve. An image path's `Allow` also names `PUT`, which answers `404 not_found` there. |
 | `metrics_disabled` | `403` | `GET /metrics` when no `CRABCROP_METRICS_TOKEN` is configured. |
 | `metrics_unauthorized` | `401` | `GET /metrics` with a missing or wrong bearer token. |

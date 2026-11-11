@@ -236,8 +236,9 @@ pub struct AppState {
     /// `Accept` alone, and no `Accept-CH` is advertised.
     pub client_hints: bool,
     /// Whether `/explain/...` is served (`CRABCROP_EXPLAIN`,
-    /// on by default, issue #591). Off, every request to the
-    /// route answers `404 not_found` before anything else.
+    /// on by default, issue #591). Off, every `GET` or
+    /// `HEAD` to the route answers `404 not_found` before
+    /// anything else.
     pub explain_enabled: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
