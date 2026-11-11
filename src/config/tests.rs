@@ -99,6 +99,38 @@ fn client_hints_default_to_on_and_turn_off_by_the_boolean_spellings() {
 }
 
 #[test]
+fn explain_defaults_to_on_and_turns_off_by_the_boolean_spellings() {
+    // Issue #591: unset is on, so a deployment that relies on
+    // `/explain` keeps it after the upgrade.
+    assert_eq!(
+        explain_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(true)
+    );
+    let set =
+        |v: &str| explain_config(env_of(&[("CRABCROP_EXPLAIN", v)])).map_err(|e| e.to_string());
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    // A typo is a boot error naming the variable, never a
+    // silent default that leaves the route on.
+    for bad in ["", "of", "disabled", "2"] {
+        let err = expect_err(set(bad));
+        assert!(err.contains("CRABCROP_EXPLAIN"), "{bad:?}: {err}");
+    }
+    // The setting reaches the configuration.
+    let config = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRABCROP_SECRET", "a production-grade secret")];
+        env.extend_from_slice(extra);
+        Config::from_env(env_of(&env)).unwrap()
+    };
+    assert!(config(&[]).explain_enabled);
+    assert!(!config(&[("CRABCROP_EXPLAIN", "0")]).explain_enabled);
+}
+
+#[test]
 fn clip_config_needs_all_four_paths_or_none() {
     let get = |pairs: &[(&str, &str)]| {
         let map: std::collections::HashMap<String, String> = pairs
@@ -188,6 +220,60 @@ fn source_policy_blocks_private_addresses_by_default() {
 }
 
 #[test]
+fn a_set_allowlist_that_names_no_host_stops_the_boot() {
+    // Issue #590: a set value that normalizes to no entries
+    // read as no allowlist, which lets every public host
+    // through. It is a startup error naming the variable now,
+    // whatever the other source settings say.
+    for blank in ["", " ", ",", ".", " , . ,", "..", "\t"] {
+        for extra in [
+            &[][..],
+            &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+            &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+        ] {
+            let mut pairs = vec![("CRABCROP_ALLOWED_SOURCES", blank)];
+            pairs.extend_from_slice(extra);
+            let err = build_source_policy(env_of(&pairs)).map(|_| ()).unwrap_err();
+            match &err {
+                ConfigError::Invalid { var, value, .. } => {
+                    assert_eq!(*var, "CRABCROP_ALLOWED_SOURCES");
+                    assert_eq!(*value, ConfigValue::Text(blank.to_string()));
+                }
+                other => panic!("{blank:?}: {other:?}"),
+            }
+            assert_eq!(
+                err.to_string(),
+                "CRABCROP_ALLOWED_SOURCES is set but names no host: list at least one \
+                 host, or unset it for no allowlist"
+            );
+            // Boot reads it the same way.
+            let err = refusal(&pairs);
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "CRABCROP_ALLOWED_SOURCES",
+                        ..
+                    }
+                ),
+                "{blank:?}: {err:?}"
+            );
+        }
+    }
+    // Unset is still no allowlist, with blocking on.
+    let policy = build_source_policy(env_of(&[])).unwrap();
+    assert!(policy.allowed_suffixes.is_empty() && policy.block_private);
+    // Blank entries inside a list that names a host are
+    // still dropped, as before.
+    let policy = build_source_policy(env_of(&[(
+        "CRABCROP_ALLOWED_SOURCES",
+        ",images.example.com,, .",
+    )]))
+    .unwrap();
+    assert_eq!(policy.allowed_suffixes, ["images.example.com"]);
+}
+
+#[test]
 fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
     let proxied = |name: &'static str| {
         move |n: &str| (n == name).then(|| "http://proxy.internal:3128".to_string())
@@ -264,6 +350,218 @@ fn secrets_below_the_minimum_are_rejected() {
     assert!(validate_secret(b"fifteen-bytes!!").is_err());
     assert!(validate_secret(b"sixteen-bytes!!!").is_ok());
     assert!(validate_secret(b"a much longer production secret").is_ok());
+}
+
+/// Placeholder values crabcrop's docs and deploy recipes
+/// ship or have shipped for the secret variables (issue
+/// #588). The first four are 16 bytes or more and booted.
+const SHIPPED_PLACEHOLDERS: [&str; 10] = [
+    "your-secret-change-me",
+    "replace-with-a-long-random-value",
+    "REPLACE_ME_signing_secret",
+    "local-dev-secret",
+    "CHANGE-ME-generate-with-openssl-rand-hex-32",
+    "your-secret",
+    "REPLACE_ME",
+    "CHANGE-ME",
+    "<redacted>",
+    "correct horse battery staple",
+];
+
+#[test]
+fn published_placeholders_stop_the_boot_without_being_echoed() {
+    // Each shipped placeholder is refused as each secret
+    // variable, in any letter case and with surrounding
+    // white space, as an env file can carry it. The error
+    // names the variable and keeps no value (issue #455).
+    for placeholder in SHIPPED_PLACEHOLDERS {
+        for spelling in [
+            placeholder.to_string(),
+            placeholder.to_ascii_lowercase(),
+            placeholder.to_ascii_uppercase(),
+            format!(" {placeholder}\n"),
+        ] {
+            for var in [
+                "CRABCROP_SECRET",
+                "CRABCROP_SECRET_PREVIOUS",
+                "CRABCROP_METRICS_TOKEN",
+            ] {
+                let pairs = if var == "CRABCROP_SECRET" {
+                    vec![(var, spelling.as_str())]
+                } else {
+                    vec![("CRABCROP_SECRET", SECRET), (var, spelling.as_str())]
+                };
+                let err = match Config::from_env(env_of(&pairs)) {
+                    Err(e) => e,
+                    Ok(_) => panic!("{var}={spelling:?} booted"),
+                };
+                match &err {
+                    ConfigError::Invalid { var: v, value, .. } => {
+                        assert_eq!(*v, var);
+                        assert_eq!(*value, ConfigValue::Secret);
+                    }
+                    other => panic!("{var}={spelling:?}: {other:?}"),
+                }
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "{var} is a placeholder published in crabcrop's docs or recipes: \
+                         generate a new value, for example with openssl rand -hex 32"
+                    )
+                );
+                for rendered in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+                    assert_no_secret(var, &rendered, spelling.trim());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_value_that_only_contains_a_placeholder_is_not_one() {
+    // The refusal is for the published value itself, not
+    // for a real secret that happens to contain it.
+    let config = config_of(&[
+        ("CRABCROP_SECRET_PREVIOUS", "your-secret-change-me-7f3a9c41"),
+        ("CRABCROP_METRICS_TOKEN", "local-dev-secret-0b8e2d"),
+    ])
+    .unwrap();
+    assert!(config.keyring.previous.is_some());
+    assert!(config.metrics_token.is_some());
+    let config = config_of(&[("CRABCROP_SECRET", "REPLACE_ME_signing_secret_2026")]);
+    assert!(config.is_ok());
+    // A metrics token under 16 bytes still boots for this
+    // release; boot warns about it (tests/boot_smoke.rs).
+    let config = config_of(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]).unwrap();
+    assert_eq!(
+        config.metrics_token.as_ref().map(Secret::expose),
+        Some("fifteen-bytes!!")
+    );
+    // An empty token is still no token, which closes /metrics.
+    assert!(
+        config_of(&[("CRABCROP_METRICS_TOKEN", "")])
+            .unwrap()
+            .metrics_token
+            .is_none()
+    );
+}
+
+#[test]
+fn a_metrics_token_under_16_bytes_warns_without_quoting_it() {
+    let warning = metrics_token_warning(&Secret("fifteen-bytes!!".to_string()))
+        .expect("a warning for 15 bytes");
+    assert_eq!(
+        warning,
+        "CRABCROP_METRICS_TOKEN is 15 bytes, under the 16 bytes a later release will \
+         require: generate a new one, for example with openssl rand -hex 32"
+    );
+    assert_no_secret("CRABCROP_METRICS_TOKEN", &warning, "fifteen-bytes!!");
+    assert!(metrics_token_warning(&Secret("a".to_string())).is_some());
+    assert!(metrics_token_warning(&Secret("sixteen-bytes!!!".to_string())).is_none());
+}
+
+#[test]
+fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
+    // Issue #590: one boot line names the request mode, the
+    // allowlist's host count and the private-address check.
+    let presets = temp_file("posture-presets", b"thumb = 300x200\n");
+    let presets = presets.path.as_str();
+    let cases: [(&[(&str, &str)], &str); 8] = [
+        (
+            &[],
+            "request mode: signed; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[("CRABCROP_ALLOW_UNSAFE", "1")],
+            "request mode: unsafe; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[
+                ("CRABCROP_ONLY_PRESETS", "1"),
+                ("CRABCROP_PRESETS_FILE", presets),
+            ],
+            "request mode: signed presets-only; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[
+                ("CRABCROP_ALLOW_UNSAFE", "1"),
+                ("CRABCROP_ONLY_PRESETS", "1"),
+                ("CRABCROP_PRESETS_FILE", presets),
+            ],
+            "request mode: presets-only; source allowlist: none; private-address check: on",
+        ),
+        (
+            &[("CRABCROP_ALLOWED_SOURCES", "images.example.com")],
+            "request mode: signed; source allowlist: 1 host; private-address check: on",
+        ),
+        (
+            &[(
+                "CRABCROP_ALLOWED_SOURCES",
+                "a.example, ,b.example,.c.example",
+            )],
+            "request mode: signed; source allowlist: 3 hosts; private-address check: on",
+        ),
+        (
+            &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+            "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+        (
+            &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+            "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+    ];
+    for (pairs, line) in cases {
+        let config = config_of(pairs).unwrap();
+        assert_eq!(config.posture_line(), line, "{pairs:?}");
+    }
+}
+
+#[test]
+fn unsigned_urls_with_no_allowlist_warn_at_boot() {
+    // Issue #590 and docs/operations.md: unsafe mode alone
+    // runs any operations on any host a request names, and
+    // presets-only mode still fetches any host. Either one
+    // with no allowlist warns; signed modes and an allowlist
+    // do not.
+    let presets = temp_file("posture-presets", b"thumb = 300x200\n");
+    let presets = presets.path.as_str();
+    let unsafe_on = ("CRABCROP_ALLOW_UNSAFE", "1");
+    let only = ("CRABCROP_ONLY_PRESETS", "1");
+    let file = ("CRABCROP_PRESETS_FILE", presets);
+    let allowlist = ("CRABCROP_ALLOWED_SOURCES", "images.example.com");
+    let warning = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().posture_warning();
+    assert_eq!(
+        warning(&[unsafe_on]).unwrap(),
+        "unsafe mode is on with no CRABCROP_ALLOWED_SOURCES and no CRABCROP_ONLY_PRESETS: \
+         anyone can run any operations on images from any public host. Keep it to local \
+         development or behind access control of your own (see docs/operations.md)"
+    );
+    assert!(
+        warning(&[unsafe_on, ("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")])
+            .unwrap()
+            .contains("from any host, private addresses included.")
+    );
+    assert_eq!(
+        warning(&[unsafe_on, only, file]).unwrap(),
+        "presets-only mode takes unsigned URLs with no CRABCROP_ALLOWED_SOURCES: anyone \
+         can render the presets on images from any public host. Set \
+         CRABCROP_ALLOWED_SOURCES to the hosts your images come from (see \
+         docs/operations.md)"
+    );
+    for pairs in [
+        &[][..],
+        &[only, file],
+        &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+        &[unsafe_on, allowlist],
+        &[unsafe_on, only, file, allowlist],
+    ] {
+        assert!(warning(pairs).is_none(), "{pairs:?}");
+    }
+    // The proxy warning test at boot reads "proxy" on
+    // stderr as its own warning.
+    for pairs in [&[unsafe_on][..], &[unsafe_on, only, file]] {
+        assert!(!warning(pairs).unwrap().contains("proxy"), "{pairs:?}");
+    }
 }
 
 #[test]
@@ -890,6 +1188,76 @@ fn the_shutdown_grace_defaults_under_ten_seconds_and_checks_its_range() {
 }
 
 #[test]
+fn the_bind_address_defaults_to_every_ipv4_interface_and_takes_only_an_address() {
+    // Issue #592: unset keeps the listener where it always
+    // was. A host name, a port, brackets, or an empty value
+    // stop the boot instead of falling back to every
+    // interface.
+    let bind = |v: &str| bind_address(&env_of(&[("CRABCROP_BIND", v)]));
+    assert_eq!(
+        bind_address(&env_of(&[])).unwrap(),
+        std::net::IpAddr::from([0, 0, 0, 0])
+    );
+    assert_eq!(
+        bind("127.0.0.1").unwrap(),
+        std::net::IpAddr::from([127, 0, 0, 1])
+    );
+    assert_eq!(bind("::1").unwrap(), std::net::Ipv6Addr::LOCALHOST);
+    assert_eq!(bind("::").unwrap(), std::net::Ipv6Addr::UNSPECIFIED);
+    for bad in [
+        "",
+        "localhost",
+        "[::1]",
+        "127.0.0.1:3000",
+        " 127.0.0.1",
+        "0",
+    ] {
+        let err = expect_err(bind(bad));
+        assert!(
+            err.starts_with("CRABCROP_BIND must be an IP address"),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_connection_bounds_default_and_check_their_range() {
+    // Issue #607: the header and idle timeouts and the
+    // connection cap, each with its own range.
+    let limits = connection_limits(&env_of(&[])).unwrap();
+    assert_eq!(limits.header_timeout, std::time::Duration::from_secs(30));
+    assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(3900));
+    assert_eq!(limits.max_connections, default_max_connections());
+    assert!(limits.max_connections >= 1);
+    let set = |name: &str, v: &str| connection_limits(&env_of(&[(name, v)]));
+    let header = "CRABCROP_HEADER_TIMEOUT_SECS";
+    assert_eq!(set(header, "1").unwrap().header_timeout.as_secs(), 1);
+    assert_eq!(set(header, "600").unwrap().header_timeout.as_secs(), 600);
+    let idle = "CRABCROP_IDLE_TIMEOUT_SECS";
+    assert_eq!(set(idle, "1").unwrap().idle_timeout.as_secs(), 1);
+    assert_eq!(set(idle, "86400").unwrap().idle_timeout.as_secs(), 86_400);
+    let max = "CRABCROP_MAX_CONNECTIONS";
+    assert_eq!(set(max, "1").unwrap().max_connections, 1);
+    assert_eq!(set(max, "1000000").unwrap().max_connections, 1_000_000);
+    for (name, bad) in [
+        (header, "0"),
+        (header, "601"),
+        (header, "30s"),
+        (header, ""),
+        (idle, "0"),
+        (idle, "86401"),
+        (idle, "-1"),
+        (max, "0"),
+        (max, "1000001"),
+        (max, "-1"),
+        (max, "many"),
+    ] {
+        let err = expect_err(set(name, bad));
+        assert!(err.contains(name), "{name}={bad:?}: {err}");
+    }
+}
+
+#[test]
 fn the_source_buffer_budget_follows_the_configured_fetch_cap() {
     const MB: u64 = 1024 * 1024;
     let budget = |pairs: &[(&str, &str)], permits| source_buffer_budget(env_of(pairs), permits);
@@ -1170,6 +1538,26 @@ fn parses_preset_files() {
     assert_eq!(err, "preset big is 262145 bytes, over the 262144 byte cap");
 }
 
+#[test]
+fn a_text_label_past_its_caps_stops_the_boot() {
+    // Issue #606: presets and default operations are parsed
+    // at boot, so a `text` label past the caps (1000
+    // characters; characters times size at most 100000)
+    // stops the server from starting. At the caps it boots.
+    let text = |chars: usize, size: u32| {
+        format!("filters:text({},{size},ffffff,top-left)", "a".repeat(chars))
+    };
+    assert!(parse_presets(&format!("label = {}", text(1000, 100))).is_ok());
+    assert!(parse_presets(&format!("label = {}", text(100, 1000))).is_ok());
+    for (chars, size) in [(1001, 12), (101, 1000)] {
+        let err = expect_err(parse_presets(&format!("label = {}", text(chars, size))));
+        assert!(err.contains("invalid operations for preset label"), "{err}");
+    }
+    config_of(&[("CRABCROP_DEFAULT_OPS", &text(100, 1000))]).unwrap();
+    let err = refusal(&[("CRABCROP_DEFAULT_OPS", &text(101, 1000))]).to_string();
+    assert!(err.contains("invalid CRABCROP_DEFAULT_OPS"), "{err}");
+}
+
 /// The secret every `Config::from_env` test boots with.
 const SECRET: &str = "a production-grade secret";
 
@@ -1206,6 +1594,17 @@ fn from_env_reads_every_default() {
     assert_eq!(
         config.shutdown_grace_secs,
         crate::server::DEFAULT_SHUTDOWN_GRACE_SECS
+    );
+    assert_eq!(config.bind, std::net::IpAddr::from([0, 0, 0, 0]));
+    assert_eq!(
+        config.connections,
+        crate::server::ConnectionLimits {
+            header_timeout: std::time::Duration::from_secs(
+                crate::server::DEFAULT_HEADER_TIMEOUT_SECS
+            ),
+            idle_timeout: std::time::Duration::from_secs(crate::server::DEFAULT_IDLE_TIMEOUT_SECS),
+            max_connections: default_max_connections(),
+        }
     );
     let lanes = (config.process_permits + config.slow_lane_permits) as u64;
     assert_eq!(

@@ -10,11 +10,13 @@ properties:
       external: true
       targetPort: 3000
     secrets:
-      # For anything real, replace `value` with a Key Vault
-      # reference (keyVaultUrl plus a managed identity), as
-      # the recipe README shows.
+      # Replace `value` with a Key Vault reference
+      # (keyVaultUrl plus a managed identity), or set a
+      # generated value with `az containerapp secret set`,
+      # as the recipe README shows. The server refuses to
+      # start with REPLACE_ME.
       - name: crabcrop-secret
-        value: REPLACE_ME_signing_secret
+        value: REPLACE_ME
   template:
     containers:
       - name: crabcrop

@@ -222,6 +222,7 @@ fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppStat
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -361,6 +362,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -425,6 +427,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -489,6 +492,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -563,6 +567,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -647,6 +652,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -932,6 +938,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1292,6 +1299,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -1363,6 +1371,7 @@ async fn spawn_app_rotating() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1437,6 +1446,7 @@ async fn spawn_app_with_fallback() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -3295,6 +3305,7 @@ async fn spawn_app_with_presets_and_roots(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -4171,6 +4182,160 @@ async fn explain_reports_the_root_name_and_never_the_base() {
     assert!(!body.contains(&origin), "{body}");
 }
 
+/// [`spawn_app`]'s server with `CRABCROP_EXPLAIN` set to
+/// `explain`.
+async fn spawn_app_with_explain(explain: bool) -> String {
+    let mut state = base_test_state(false, Some(TEST_METRICS_TOKEN.to_string()));
+    state.explain_enabled = explain;
+    spawn_state(state).await
+}
+
+#[tokio::test]
+async fn explain_off_answers_404_for_every_spelling_and_fetches_nothing() {
+    // Issue #591: `/explain` was always routed. With
+    // `CRABCROP_EXPLAIN=0` every request to it answers the
+    // router's own `404 not_found`, whatever its signature,
+    // so the answer tells a caller nothing about the URL,
+    // and the source is never fetched.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_explain(false).await;
+    let remainder = format!("100x50/{src}");
+    let expired = format!("exp:{}/100x50/{src}", now_unix() - 60);
+    let paths = [
+        format!("{}/{remainder}", sign(&remainder)),
+        format!("deadbeef/{remainder}"),
+        format!("unsafe/{remainder}"),
+        sealed_path(&remainder, Some("photo.png")),
+        format!("{}/{expired}", sign(&expired)),
+        format!("{}/crabcrop/{remainder}", sign(&remainder)),
+        "not-a-url".to_string(),
+    ];
+    for path in &paths {
+        let resp = client()
+            .get(format!("{base}/explain/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(resp.text().await.unwrap(), "not found", "{path}");
+        let resp = client()
+            .get(format!("{base}/explain/{path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["error"]["code"], "not_found", "{path}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no source fetch");
+}
+
+#[tokio::test]
+async fn explain_off_leaves_the_image_route_unchanged() {
+    // Issue #591: the switch turns off the report only. The
+    // image itself, its meta document, and the report on a
+    // server that leaves the switch on are served as before.
+    let src = spawn_image_server().await;
+    let on = spawn_app_with_explain(true).await;
+    let off = spawn_app_with_explain(false).await;
+    let remainder = format!("100x50/filters:format(png)/{src}");
+    let path = format!("{}/{remainder}", sign(&remainder));
+    let mut bodies = Vec::new();
+    for base in [&on, &off] {
+        let resp = client().get(format!("{base}/{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{base}");
+        assert_eq!(resp.headers()["content-type"], "image/png", "{base}");
+        bodies.push(resp.bytes().await.unwrap());
+        let resp = client()
+            .get(format!("{base}/{path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{base}");
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["width"], 100, "{base}");
+    }
+    assert_eq!(bodies[0], bodies[1], "the same bytes either way");
+    let resp = client()
+        .get(format!("{on}/explain/{path}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["forecast"]["width"], 100);
+}
+
+#[tokio::test]
+async fn explain_shows_preset_and_default_watermark_and_overlay_urls_in_full() {
+    // Issue #591: what docs/endpoints.md now says the report
+    // shows from operator configuration. A watermark URL in
+    // a preset is printed in full in the preset's entry, and
+    // an overlay URL in the defaults in the canonical form,
+    // query string included. The report fetches neither. An
+    // operator who wants them private keeps tokens and
+    // internal hosts out of them, or sets
+    // `CRABCROP_EXPLAIN=0`.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let origin = src.strip_suffix("/src.png").unwrap();
+    let watermark = format!("{origin}/wm.png?token=preset-token");
+    let overlay = format!("{origin}/texture.png?sig=default-sig");
+    let encode = |url: &str| {
+        url.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('?', "%3F")
+            .replace('=', "%3D")
+    };
+    let mut state = base_test_state(false, None);
+    state.presets.insert(
+        "branded".to_string(),
+        format!("40x0/filters:watermark({},0,0,50)", encode(&watermark))
+            .parse()
+            .unwrap(),
+    );
+    let defaults = format!("filters:overlay({},0,0,60,multiply)", encode(&overlay));
+    state.default_ops = crate::url::parse_default_ops(&defaults, &state.presets).unwrap();
+    let base = spawn_state(state).await;
+    let remainder = format!("preset:branded/{src}");
+    let url = format!("{base}/explain/{}/{remainder}", sign(&remainder));
+    let resp = client()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["presets"][0]["name"], "branded");
+    let gloss = json["presets"][0]["operations"][1]["descriptions"].to_string();
+    assert!(
+        gloss.contains(&format!("watermark: {watermark} at 0,0, alpha 50")),
+        "{gloss}"
+    );
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(
+        canonical.starts_with(&format!("{defaults}/")),
+        "{canonical}"
+    );
+    // The HTML form shows the same two URLs.
+    let html = client()
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("preset-token"), "{html}");
+    assert!(html.contains("default-sig"), "{html}");
+    // One source probe per report: the watermark and the
+    // overlay, on the same origin, were never fetched.
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
 /// An image server that counts how many times it was hit:
 /// how cache behavior becomes observable from outside.
 async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
@@ -4533,6 +4698,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -4716,6 +4882,7 @@ async fn spawn_app_with_moderation(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5051,6 +5218,7 @@ async fn spawn_app_with_ocr_timeout(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -5475,6 +5643,7 @@ async fn spawn_app_with_embeddings(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6222,6 +6391,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6288,6 +6458,7 @@ async fn spawn_app_with_studio() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: Some([0xf5, 0xf0, 0xe8]),
         presets: std::collections::HashMap::new(),
@@ -6354,6 +6525,7 @@ async fn spawn_app_with_inpaint() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6452,6 +6624,7 @@ async fn spawn_app_with_segment() -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -6946,6 +7119,7 @@ async fn spawn_app_with_providers(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -7026,6 +7200,7 @@ async fn spawn_app_full(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -9057,6 +9232,7 @@ async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -9145,6 +9321,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -9747,6 +9924,61 @@ async fn over_cap_requests_answer_400_before_any_fetch() {
     let resp = get_signed(&base, &at_cap).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn too_many_watermark_urls_answer_400_before_any_fetch() {
+    // Issue #613: every distinct watermark or overlay URL is
+    // one fetch and one decode held for the whole render, and
+    // a request could name as many as the operation cap
+    // allows. Past 16 the request answers 400, on the image
+    // and explain routes, before anything is fetched. URLs
+    // count as the server fetches them, by exact string, so
+    // each `?v=` variant of one object counts, and watermark
+    // and overlay URLs share the cap.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (wm, wm_hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let encoded = wm.replace(':', "%3A").replace('/', "%2F");
+    let variants = |n: usize| {
+        (0..n)
+            .map(|i| {
+                if i.is_multiple_of(2) {
+                    format!("watermark({encoded}%3Fv%3D{i},0,0,50)")
+                } else {
+                    format!("overlay({encoded}%3Fv%3D{i},0,0,50,normal)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let over = format!("filters:{}/{src}", variants(17));
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(body["error"]["code"], "unsupported_operation", "{route}");
+        assert_eq!(
+            body["error"]["message"],
+            "request names 17 distinct watermark and overlay URLs, over the 16 URL limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the source was fetched");
+    assert_eq!(wm_hits.load(Ordering::SeqCst), 0, "a watermark was fetched");
+    // At the cap the request renders, each variant fetched
+    // once.
+    let at_cap = format!("filters:{}/{src}", variants(16));
+    let resp = get_signed(&base, &at_cap).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(wm_hits.load(Ordering::SeqCst), 16);
+    // A URL named again is not fetched again, so it does not
+    // count again: 40 references to one URL render.
+    let one = format!("watermark({encoded},1,1,50)");
+    let repeated = format!("filters:{}/{src}", vec![one.as_str(); 40].join(":"));
+    let resp = get_signed(&base, &repeated).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(wm_hits.load(Ordering::SeqCst), 17);
 }
 
 #[tokio::test]
@@ -10599,6 +10831,7 @@ async fn spawn_signing_app(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -10718,6 +10951,51 @@ async fn meta_reports_provenance_without_a_signer() {
     assert_eq!(prov["source"]["state"], "valid");
     assert_eq!(prov["source"]["signer"], "crabcrop test signer");
     assert!(prov["output"].is_null());
+}
+
+#[tokio::test]
+async fn meta_reports_signer_names_as_one_bounded_line() {
+    // Issue #595: a signer is the name its certificate
+    // gives, and whoever made the source chose the source's.
+    // A name of 174 characters over two lines reads back as
+    // one line of 64 characters, cut with a marker, on the
+    // source side and on the output side alike.
+    let long_name = crate::provenance::test_signer_with_a_long_name();
+    let signed_source = long_name
+        .sign(
+            &test_png(),
+            "image/png",
+            &crate::provenance::SignRequest {
+                ingredient: None,
+                ai_edited: false,
+            },
+        )
+        .unwrap();
+    let src = spawn_bytes_server(signed_source).await;
+    let remainder = format!("40x24/{src}");
+    let url_path = format!("/{}/{remainder}", sign(&remainder));
+    let reader = spawn_app(false).await;
+    let signing = spawn_app_with_provenance_signer(long_name).await;
+    for (base, side) in [(reader, "source"), (signing, "output")] {
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let summary = &meta["provenance"][side];
+        assert_eq!(summary["state"], "valid", "{side}");
+        let signer = summary["signer"].as_str().expect("a signer is named");
+        assert_eq!(signer.chars().count(), 64, "{side}: {signer:?}");
+        assert!(!signer.chars().any(char::is_control), "{side}: {signer:?}");
+        assert!(
+            signer.starts_with("crabcrop test signer with a long name"),
+            "{side}: {signer:?}"
+        );
+        assert!(signer.ends_with('…'), "{side}: {signer:?}");
+    }
 }
 
 #[tokio::test]
@@ -11094,6 +11372,7 @@ async fn processing_gate_bounds_concurrency() {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11226,6 +11505,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -11965,6 +12245,7 @@ fn lane_test_state(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -12253,6 +12534,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -12411,6 +12693,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -13362,6 +13645,7 @@ async fn spawn_app_with_upload_gate(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -15554,6 +15838,550 @@ async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
     drop(active);
 }
 
+/// Begin a purge of `target` on another replica that shares
+/// `fake`, which stops before its walk ends: its tombstone
+/// stays in the bucket, live, and is never marked ended.
+/// Returns the tombstone's object name.
+async fn tombstone_from_another_replica(
+    fake: &crate::s3store::test_support::FakeS3,
+    target: crate::cache::PurgeTarget,
+) -> String {
+    let purger = tier_test_state(None, &fake.endpoint);
+    let (active, object) = begin_purge(&purger, target).await;
+    drop(active);
+    object.expect("the purger wrote no tombstone")
+}
+
+/// Refresh `state`'s tombstones while the bucket fails the
+/// read of one of them, and check that the refresh lists it
+/// and counts it as never read (issue #577).
+async fn refresh_with_one_unread(state: &AppState) {
+    let shared = state.shared_store.clone().unwrap();
+    assert!(!shared.refresh_tombstones(&state.purge_guard).await);
+    assert_eq!(shared.tombstones_unread(), 1);
+}
+
+/// List a tombstone that `state` cannot read (issue #577):
+/// another replica begins a purge of `target`, and every read
+/// of its tombstone closes the connection unanswered.
+/// Returns the tombstone's object name.
+async fn list_an_unread_tombstone(
+    state: &AppState,
+    fake: &crate::s3store::test_support::FakeS3,
+    target: crate::cache::PurgeTarget,
+) -> String {
+    let object = tombstone_from_another_replica(fake, target).await;
+    *fake.name_break.unanswered.lock().unwrap() = Some(object.clone());
+    refresh_with_one_unread(state).await;
+    object
+}
+
+/// Let the bucket answer the tombstone reads again, and
+/// refresh `state` until it has read every one.
+async fn read_every_tombstone(state: &AppState, fake: &crate::s3store::test_support::FakeS3) {
+    *fake.name_break.unanswered.lock().unwrap() = None;
+    fake.fail.lock().unwrap().get_object = false;
+    let shared = state.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&state.purge_guard).await);
+    assert_eq!(shared.tombstones_unread(), 0);
+}
+
+/// A purge of a key no probe requests: the target of the
+/// unread tombstone in the probes below.
+fn unrelated_purge() -> crate::cache::PurgeTarget {
+    crate::cache::PurgeTarget::Key("40x24/example.com/unrelated.png".into())
+}
+
+/// Two presets with the same operation: their requests share
+/// one cache key, and each names a cache group.
+fn twin_presets() -> crate::url::Presets {
+    [
+        ("a".to_string(), "30x20".parse().unwrap()),
+        ("b".to_string(), "30x20".parse().unwrap()),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Wait until `state`'s detached writes, the bucket
+/// write-throughs and write-backs among them, have finished.
+async fn writes_settle(state: &AppState) {
+    wait_until("the detached writes finish", || {
+        state.background.running().writes == 0
+    })
+    .await;
+}
+
+/// The one cache entry the fake bucket holds, with its key.
+fn bucket_entry(fake: &crate::s3store::test_support::FakeS3) -> (String, CachedImage) {
+    let objects = fake.objects.lock().unwrap();
+    let mut entries = objects.iter().filter(|(name, _)| name.ends_with(".bin"));
+    let (_, data) = entries.next().expect("the bucket holds no entry");
+    assert!(entries.next().is_none(), "the bucket holds more than one");
+    crate::storage::parse_entry(data, &crate::url::entry_key(b"disk-key-test")).unwrap()
+}
+
+/// The end of every probe below (issue #577): once `state`
+/// reads every tombstone, purge `group` on the server at
+/// `base` and check that the purge reached every tier. The
+/// bucket holds no entry, and a request for
+/// `preset:<group>/<src>` renders from the origin. Returns
+/// the purge's answer.
+async fn group_purge_reaches_every_tier(
+    state: &AppState,
+    base: &str,
+    fake: &crate::s3store::test_support::FakeS3,
+    (src, hits): (&str, &AtomicUsize),
+    group: &str,
+) -> String {
+    read_every_tombstone(state, fake).await;
+    let answer = purge_group_call(base, group).await;
+    wait_for_purges_to_end(state).await;
+    wait_until(
+        &format!("the purge of group {group} removes the bucket copy"),
+        || entry_objects(fake) == 0,
+    )
+    .await;
+    let rendered = hits.load(Ordering::SeqCst);
+    let resp = get_signed(base, &format!("preset:{group}/{src}")).await;
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; fwd=uri-miss",
+        "a copy served under group {group} outlived its purge"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), rendered + 1);
+    answer
+}
+
+#[tokio::test]
+async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_purge_is_sent_again()
+ {
+    // Issue #577 pins the gap docs/deployment.md describes. A
+    // replica that has never read a purge's tombstone does not
+    // apply the purge: it serves the disk copies the purge
+    // covers and keeps them in memory. Once it reads the
+    // tombstone, its disk lookups apply it, but its memory
+    // keeps what it served until the purge is sent to it
+    // again. Fails with the unread rule issue #577 describes
+    // (8d6b14f): K1's first lookup misses. Fails too without
+    // part 1's `fresh.insert` for a read tombstone (K2 still
+    // hits after the read), or with a memory check against
+    // read tombstones (K1 misses before the purge is sent
+    // again), which the docs would have to follow.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unread-gap");
+    let mut state = tier_test_state(Some(&dir), &fake.endpoint);
+    state.metrics_token = Some("metrics-token".to_string());
+    let base = serve_state(&state).await;
+    let disk = state.store.clone().unwrap();
+    let g = vec!["g".to_string()];
+    let (k1, k2) = ("40x24/example.com/k1.png", "40x24/example.com/k2.png");
+    for key in [k1, k2] {
+        disk.put(
+            key,
+            &CachedImage {
+                groups: g.clone(),
+                ..tier_test_entry()
+            },
+        );
+    }
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("\ncrabcrop_cache_shared_tombstones_unread 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("\ncrabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000\n"),
+        "{metrics}"
+    );
+    list_an_unread_tombstone(&state, &fake, crate::cache::PurgeTarget::Group("g".into())).await;
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("\ncrabcrop_cache_shared_tombstones_unread 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("\ncrabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000\n"),
+        "{metrics}"
+    );
+
+    // In the gap: the disk copy serves, and moves to memory.
+    let (_, status) = lookup_tiers(&state, k1, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"disk\"");
+    let (_, status) = lookup_tiers(&state, k1, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit");
+
+    // Once read, the purge applies to the disk tier, not to
+    // what memory already holds.
+    read_every_tombstone(&state, &fake).await;
+    assert!(lookup_tiers(&state, k2, &[]).await.is_none());
+    assert!(disk.get(k2).is_none(), "the covered disk copy stayed");
+    let (_, status) = lookup_tiers(&state, k1, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit");
+
+    // Sent again to this replica, the purge closes the gap.
+    assert_eq!(purge_group_call(&base, "g").await, "purged 2\n");
+    wait_for_purges_to_end(&state).await;
+    assert!(lookup_tiers(&state, k1, &[]).await.is_none());
+    let fresh = tier_test_state(None, &fake.endpoint);
+    let shared = fresh.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&fresh.purge_guard).await);
+    assert!(lookup_tiers(&fresh, k1, &[]).await.is_none());
+}
+
+#[tokio::test]
+async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again() {
+    // Issue #577 pins the bucket half of the gap. A replica
+    // that has not read a purge's tombstone writes a covered
+    // copy back to the bucket when a request adds a group to
+    // it, under the copy's own stamp, after the purge's walk
+    // has passed. Once the tombstone expires, that copy serves
+    // on every replica. The purge sent again to that replica
+    // removes it. Fails if group write-backs are stamped anew
+    // (the stamp check), if they skip copies an unread
+    // tombstone may cover (the bucket never holds [a, b]), or
+    // if the walk skips copies stamped before it began (the
+    // bucket keeps the copy).
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unread-write-back");
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let mut first = tier_test_state(Some(&dir), &fake.endpoint);
+    first.presets = twin_presets();
+    let base = serve_state(&first).await;
+    let resp = get_signed(&base, &format!("preset:a/{src}")).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    writes_settle(&first).await;
+    let (key, copy) = bucket_entry(&fake);
+    assert_eq!(copy.groups, ["a"]);
+    assert!(copy.written.is_some());
+
+    // Another replica purges group a; its walk removes the
+    // bucket copy and ends.
+    let purger = tier_test_state(None, &fake.endpoint);
+    let purger_base = serve_state(&purger).await;
+    assert_eq!(purge_group_call(&purger_base, "a").await, "purged 1\n");
+    wait_for_purges_to_end(&purger).await;
+    assert_eq!(entry_objects(&fake), 0);
+    let tombstone = {
+        let objects = fake.objects.lock().unwrap();
+        let mut names = objects.keys().filter(|name| name.starts_with("purges/"));
+        let name = names.next().expect("the purge left no tombstone").clone();
+        assert!(names.next().is_none());
+        name
+    };
+
+    // The first replica restarts over its disk, and cannot
+    // read the tombstone.
+    let mut restarted = tier_test_state(Some(&dir), &fake.endpoint);
+    restarted.presets = twin_presets();
+    let base = serve_state(&restarted).await;
+    *fake.name_break.unanswered.lock().unwrap() = Some(tombstone);
+    refresh_with_one_unread(&restarted).await;
+    let resp = get_signed(&base, &format!("preset:b/{src}")).await;
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"disk\""
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    writes_settle(&restarted).await;
+    let (held_key, held) = bucket_entry(&fake);
+    assert_eq!(held_key, key);
+    assert_eq!(held.groups, ["a", "b"]);
+    assert_eq!(
+        held.written, copy.written,
+        "the write-back took a new stamp"
+    );
+
+    // A replica without the tombstone, as every replica is
+    // once it expires, serves the copy.
+    let expired = tier_test_state(None, &fake.endpoint);
+    let (_, status) = lookup_tiers(&expired, &key, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
+
+    // The purge sent again to the restarted replica, once it
+    // reads the tombstone, removes the copy from its memory,
+    // its disk and the bucket.
+    read_every_tombstone(&restarted, &fake).await;
+    assert_eq!(purge_group_call(&base, "a").await, "purged 3\n");
+    wait_for_purges_to_end(&restarted).await;
+    assert_eq!(entry_objects(&fake), 0);
+    let cold = tier_test_state(None, &fake.endpoint);
+    assert!(lookup_tiers(&cold, &key, &[]).await.is_none());
+    assert!(lookup_tiers(&restarted, &key, &[]).await.is_none());
+}
+
+/// The tier that serves the hit in
+/// [`a_hit_under_an_unread_tombstone_teaches_every_tier`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnreadProbe {
+    /// The replica that rendered the copy, from memory.
+    Memory,
+    /// That replica restarted, from its disk.
+    Disk,
+    /// Another replica, from the bucket.
+    Shared,
+    /// The restarted replica, from its disk, for a copy in no
+    /// group.
+    NoGroup,
+}
+
+/// Issue #577, sequence 1: a hit under an unread tombstone,
+/// here a purge of some other key, adds the request's group
+/// to every tier that holds the copy, and a purge of that
+/// group then reaches every tier. Fails with the unread rule
+/// issue #577 describes (8d6b14f): the hit turns into a
+/// render, and the copy's write-back is dropped.
+async fn a_hit_under_an_unread_tombstone_teaches_every_tier(probe: UnreadProbe) {
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unread-hit");
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (first, group, groups) = match probe {
+        UnreadProbe::NoGroup => (format!("30x20/{src}"), "a", vec!["a"]),
+        _ => (format!("preset:a/{src}"), "b", vec!["a", "b"]),
+    };
+    // The bucket hit's copy comes from a replica with no disk.
+    let mut writer = if probe == UnreadProbe::Shared {
+        tier_test_state(None, &fake.endpoint)
+    } else {
+        tier_test_state(Some(&dir), &fake.endpoint)
+    };
+    writer.presets = twin_presets();
+    let writer_base = serve_state(&writer).await;
+    let resp = get_signed(&writer_base, &first).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    writes_settle(&writer).await;
+    let (state, base) = if probe == UnreadProbe::Memory {
+        (writer, writer_base)
+    } else {
+        let mut state = tier_test_state(Some(&dir), &fake.endpoint);
+        state.presets = twin_presets();
+        let base = serve_state(&state).await;
+        (state, base)
+    };
+    list_an_unread_tombstone(&state, &fake, unrelated_purge()).await;
+
+    let resp = get_signed(&base, &format!("preset:{group}/{src}")).await;
+    let served = match probe {
+        UnreadProbe::Memory => "crabcrop; hit",
+        UnreadProbe::Disk | UnreadProbe::NoGroup => "crabcrop; hit; detail=\"disk\"",
+        UnreadProbe::Shared => "crabcrop; hit; detail=\"shared\"",
+    };
+    assert_eq!(header(&resp, "cache-status"), served, "{probe:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "{probe:?}");
+    writes_settle(&state).await;
+    let (key, copy) = bucket_entry(&fake);
+    assert_eq!(copy.groups, groups, "{probe:?}: the bucket copy");
+    let disk = state.store.as_ref().unwrap().get(&key).unwrap();
+    assert_eq!(disk.groups, groups, "{probe:?}: the disk copy");
+    assert_eq!(state.cache.get(&key).unwrap().groups, groups, "{probe:?}");
+    group_purge_reaches_every_tier(&state, &base, &fake, (&src, &hits), group).await;
+}
+
+#[tokio::test]
+async fn an_unread_tombstone_drops_no_group_write_back_on_a_memory_hit() {
+    a_hit_under_an_unread_tombstone_teaches_every_tier(UnreadProbe::Memory).await;
+}
+
+#[tokio::test]
+async fn an_unread_tombstone_drops_no_group_write_back_on_a_disk_hit() {
+    a_hit_under_an_unread_tombstone_teaches_every_tier(UnreadProbe::Disk).await;
+}
+
+#[tokio::test]
+async fn an_unread_tombstone_drops_no_group_write_back_on_a_bucket_hit() {
+    a_hit_under_an_unread_tombstone_teaches_every_tier(UnreadProbe::Shared).await;
+}
+
+#[tokio::test]
+async fn an_unread_tombstone_drops_no_group_write_back_for_a_copy_in_no_group() {
+    a_hit_under_an_unread_tombstone_teaches_every_tier(UnreadProbe::NoGroup).await;
+}
+
+#[tokio::test]
+async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
+    // Issue #577, sequence 2: after a restart under an unread
+    // tombstone, a group-free request is a disk hit, so the
+    // groups the disk copy learned stay, and a purge of one
+    // of them removes the copy from every tier. Fails with
+    // the unread rule issue #577 describes (8d6b14f): the
+    // request renders a copy in no group, the purge answers
+    // `purged 0`, and the bucket copy serves.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unread-restart");
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let mut first = tier_test_state(Some(&dir), &fake.endpoint);
+    first.presets = twin_presets();
+    let base = serve_state(&first).await;
+    let plain = format!("30x20/{src}");
+    assert_eq!(get_signed(&base, &plain).await.status(), StatusCode::OK);
+    writes_settle(&first).await;
+    let resp = get_signed(&base, &format!("preset:a/{src}")).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    writes_settle(&first).await;
+    assert_eq!(bucket_entry(&fake).1.groups, ["a"]);
+
+    let mut restarted = tier_test_state(Some(&dir), &fake.endpoint);
+    restarted.presets = twin_presets();
+    let base = serve_state(&restarted).await;
+    list_an_unread_tombstone(&restarted, &fake, unrelated_purge()).await;
+    let resp = get_signed(&base, &plain).await;
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"disk\""
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    read_every_tombstone(&restarted, &fake).await;
+    assert_eq!(purge_group_call(&base, "a").await, "purged 3\n");
+    wait_for_purges_to_end(&restarted).await;
+    assert_eq!(entry_objects(&fake), 0);
+    let mut cold = tier_test_state(None, &fake.endpoint);
+    cold.presets = twin_presets();
+    let cold_base = serve_state(&cold).await;
+    let resp = get_signed(&cold_base, &format!("preset:a/{src}")).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn an_unread_name_ahead_or_just_behind_does_not_stop_caching() {
+    // Issue #577, sequences 3 and 4: a tombstone name that the
+    // replica lists but cannot read never reaches its guard,
+    // whatever start the name gives. A name dated a day ahead,
+    // and one from another writer stamped a second ago, inside
+    // the clock margin, leave caching as it is: one render,
+    // then hits, and every tier holds the entry. Fails with
+    // the unread rule issue #577 describes (8d6b14f) without
+    // its listing cutoff (three renders), or with the name's
+    // start and the clock margin (the render is not stored).
+    let now = crate::cache::now_ms();
+    for (what, start_ms, writer) in [
+        ("a day ahead", now + 86_400_000, 0xa_u64),
+        ("a second behind", now - 1_000, 0xb),
+    ] {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = crate::test_support::scratch_dir("srv-unread-name");
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let base = serve_state(&state).await;
+        let name = format!("purges/{start_ms}-{writer:016x}-1");
+        fake.objects
+            .lock()
+            .unwrap()
+            .insert(name.clone(), b"never read".to_vec());
+        *fake.name_break.unanswered.lock().unwrap() = Some(name);
+        refresh_with_one_unread(&state).await;
+        let url = format!("30x20/{src}");
+        for (i, expected) in ["crabcrop; fwd=uri-miss", "crabcrop; hit", "crabcrop; hit"]
+            .into_iter()
+            .enumerate()
+        {
+            let resp = get_signed(&base, &url).await;
+            assert_eq!(
+                header(&resp, "cache-status"),
+                expected,
+                "{what}: request {i}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "{what}");
+        writes_settle(&state).await;
+        let (key, _) = bucket_entry(&fake);
+        assert!(state.cache.get(&key).is_some(), "{what}");
+        assert!(state.store.as_ref().unwrap().get(&key).is_some(), "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_under_an_unread_tombstone_teaches_the_bucket_copy_its_group() {
+    // Issue #577, sequence 5: a replica with no disk tier and
+    // an unread tombstone serves the bucket copy another
+    // replica wrote, and the bucket copy learns the request's
+    // group, so a purge of that group reaches it. The origin
+    // now answers with other bytes, so a render would show.
+    // Fails with the unread rule issue #577 describes
+    // (8d6b14f): the request renders, and the bucket copy
+    // keeps [a] and serves after the purge of b.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (src, hits, current) = spawn_swappable_server(test_png()).await;
+    let mut writer = tier_test_state(None, &fake.endpoint);
+    writer.presets = twin_presets();
+    let writer_base = serve_state(&writer).await;
+    let resp = get_signed(&writer_base, &format!("preset:a/{src}")).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    writes_settle(&writer).await;
+    let (_, copy) = bucket_entry(&fake);
+    *current.lock().unwrap() = test_png_red();
+
+    let mut state = tier_test_state(None, &fake.endpoint);
+    state.presets = twin_presets();
+    let base = serve_state(&state).await;
+    list_an_unread_tombstone(&state, &fake, unrelated_purge()).await;
+    let resp = get_signed(&base, &format!("preset:b/{src}")).await;
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(header(&resp, "etag"), copy.etag);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    writes_settle(&state).await;
+    assert_eq!(bucket_entry(&fake).1.groups, ["a", "b"]);
+    let answer = group_purge_reaches_every_tier(&state, &base, &fake, (&src, &hits), "b").await;
+    assert_eq!(answer, "purged 2\n", "memory and the bucket");
+}
+
+#[tokio::test]
+async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
+    // Issue #577, sequence 7: a replica restarts while the
+    // bucket fails every object read, so it lists a tombstone
+    // it cannot read, and every write slot is taken. Its disk
+    // copies serve: no render, no write queued, and the write
+    // bound holds. Fails with the unread rule issue #577
+    // describes (8d6b14f): N renders, or earlier, when the
+    // rule also drops the filler writes that take the slots.
+    // Fails too with a write queued per turned-down copy.
+    const N: usize = 16;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-unread-stall");
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let url = |i: usize| format!("{}x20/{src}", 20 + i);
+    let first = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&first).await;
+    for i in 0..N {
+        assert_eq!(get_signed(&base, &url(i)).await.status(), StatusCode::OK);
+    }
+    writes_settle(&first).await;
+    assert_eq!(hits.load(Ordering::SeqCst), N);
+    assert_eq!(entry_objects(&fake), N);
+    tombstone_from_another_replica(&fake, unrelated_purge()).await;
+
+    let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&restarted).await;
+    fake.fail.lock().unwrap().get_object = true;
+    refresh_with_one_unread(&restarted).await;
+    hold_every_shared_write_slot(&restarted, &fake).await;
+    let skipped = restarted.background.puts_skipped();
+    let writes = restarted.background.running().writes;
+    for i in 0..N {
+        let resp = get_signed(&base, &url(i)).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit; detail=\"disk\""
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), N);
+    assert_eq!(restarted.background.puts_skipped(), skipped);
+    assert!(restarted.background.puts_in_flight() <= SHARED_PUTS_AT_ONCE);
+    wait_until("no write is queued", || {
+        restarted.background.running().writes == writes
+    })
+    .await;
+
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    read_every_tombstone(&restarted, &fake).await;
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(restarted.background.drain(far).await.writes, 0);
+}
+
 /// A served app over a shared tier alone for the purge
 /// walk pacing tests (issue #462), its bucket filled to
 /// `objects` filler objects that are not cache entries: the
@@ -16123,6 +16951,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -17584,6 +18413,7 @@ async fn spawn_explain_app_with_roots(
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
+        explain_enabled: true,
         preserve_metadata: false,
         brand_color: None,
         presets,
@@ -18149,8 +18979,10 @@ async fn hold_every_shared_write_slot(
 /// every shared write slot is taken, from memory or from the
 /// bucket; then the bucket recovers and the group is purged.
 /// The purge must reach the bucket copy, on this replica and
-/// on any other.
-async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) {
+/// on any other. With `unread`, the replica also lists a
+/// tombstone it cannot read, a purge of another key, which
+/// changes none of this (issue #577, sequence 6).
+async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool, unread: bool) {
     // Issue #463 review: the bound skipped a tier hit's
     // group write-back like a render write-through. The
     // local merge had already recorded the group, so nothing
@@ -18164,6 +18996,11 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) 
     shared.put(key, &entry).await;
     if from_memory {
         put_memory_tier(&state, state.purge_guard.snapshot(), key, &entry);
+    }
+    if unread {
+        // Listed before the slots are taken: the other
+        // replica's tombstone write would wait behind them.
+        list_an_unread_tombstone(&state, &fake, unrelated_purge()).await;
     }
     hold_every_shared_write_slot(&state, &fake).await;
 
@@ -18195,6 +19032,9 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) 
         "the bucket copy never learned the group"
     );
     assert_eq!(state.background.puts_skipped(), 0);
+    if unread {
+        read_every_tombstone(&state, &fake).await;
+    }
 
     let base = serve_state(&state).await;
     let sig = crate::url::purge_group_signature(SECRET, "hero");
@@ -18223,12 +19063,30 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) 
 
 #[tokio::test]
 async fn a_memory_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
-    group_purge_after_a_hit_with_every_write_slot_taken(true).await;
+    group_purge_after_a_hit_with_every_write_slot_taken(true, false).await;
 }
 
 #[tokio::test]
 async fn a_shared_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
-    group_purge_after_a_hit_with_every_write_slot_taken(false).await;
+    group_purge_after_a_hit_with_every_write_slot_taken(false, false).await;
+}
+
+// Issue #577, sequence 6: the same with a tombstone listed
+// that the replica cannot read. Fails with the unread rule
+// issue #577 describes (8d6b14f): a miss, and a render whose
+// write is skipped, so the bucket copy keeps no group, or
+// earlier, when the rule also drops the filler writes that
+// take the slots. Fails too with a write queued per
+// turned-down copy (more than 64 writes waiting).
+
+#[tokio::test]
+async fn a_memory_hit_group_write_back_waits_for_a_slot_while_a_tombstone_is_unread() {
+    group_purge_after_a_hit_with_every_write_slot_taken(true, true).await;
+}
+
+#[tokio::test]
+async fn a_shared_hit_group_write_back_waits_for_a_slot_while_a_tombstone_is_unread() {
+    group_purge_after_a_hit_with_every_write_slot_taken(false, true).await;
 }
 
 #[tokio::test]

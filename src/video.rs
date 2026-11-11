@@ -360,6 +360,20 @@ impl VideoEncoder {
         match format {
             VideoFormat::Mp4 => args.extend(
                 [
+                    // Without bitexact the muxer and
+                    // encoder tags named the FFmpeg build's
+                    // version (issue #612).
+                    "-fflags",
+                    "+bitexact",
+                    // Left alone, x264 sizes its thread pool
+                    // from the host's cores, and its bytes
+                    // depend on the thread count, so
+                    // replicas with different core counts
+                    // rendered one URL to different bytes
+                    // (issue #626). Six is what x264 picks
+                    // by itself on four cores.
+                    "-threads",
+                    "6",
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -727,6 +741,53 @@ mod tests {
     }
 
     #[test]
+    fn encode_mp4_uses_the_x264_argv() {
+        let dir = test_dir("mp4");
+        let argv_file = dir.join("argv.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\nprintf 'FAKE-MP4'\n",
+            argv_file.display()
+        );
+        let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
+        let frames = vec![frame(4, 4, [9, 9, 9, 255], 100)];
+        let out = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        assert_eq!(out, b"FAKE-MP4");
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let lines: Vec<&str> = argv.lines().collect();
+        // Bitexact muxing drops the FFmpeg build's version
+        // tags (issue #612), and a fixed thread count keeps
+        // x264's bytes the same on any number of cores (issue
+        // #626). Both are output options, so they come after
+        // the input and before `pipe:1`.
+        let output = lines
+            .iter()
+            .position(|arg| *arg == "format=yuv420p")
+            .expect("the argv converts to yuv420p")
+            + 1;
+        assert_eq!(
+            lines[output..],
+            [
+                "-fflags",
+                "+bitexact",
+                "-threads",
+                "6",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-movflags",
+                "frag_keyframe+empty_moov+default_base_moof",
+                "-f",
+                "mp4",
+                "pipe:1",
+            ],
+            "{argv}"
+        );
+    }
+
+    #[test]
     fn encoder_failures_are_specific() {
         // Non-zero exit, with its stderr in the message.
         let dir = test_dir("fail-exit");
@@ -877,19 +938,32 @@ mod tests {
         }
     }
 
+    /// The FFmpeg the real-encoder tests run.
+    fn real_ffmpeg() -> String {
+        std::env::var("CRABCROP_TEST_FFMPEG").unwrap_or_else(|_| "/usr/bin/ffmpeg".to_string())
+    }
+
+    /// Whether `bytes` holds `tag` followed by a digit: the
+    /// versioned tag FFmpeg writes without bitexact, such as
+    /// `Lavf60.16.100`.
+    fn names_a_version(bytes: &[u8], tag: &[u8]) -> bool {
+        bytes
+            .windows(tag.len() + 1)
+            .any(|w| w.starts_with(tag) && w[tag.len()].is_ascii_digit())
+    }
+
     /// Encode two frames with the real FFmpeg and check the
     /// containers: an MP4 carries the ftyp box, a WebM the
     /// EBML header. Each format is encoded twice and the
     /// two renders must be byte-identical: a render that
     /// differs run to run gives the same URL a new ETag
-    /// every time (issue #567). Run it with:
+    /// every time (issue #567). Neither names the FFmpeg
+    /// build's version (issue #612). Run it with:
     /// `cargo test -- --ignored real_ffmpeg`
     #[test]
     #[ignore = "needs a real encoder binary (ffmpeg) on this machine"]
     fn real_ffmpeg_encodes_mp4_and_webm() {
-        let program =
-            std::env::var("CRABCROP_TEST_FFMPEG").unwrap_or_else(|_| "/usr/bin/ffmpeg".to_string());
-        let encoder = VideoEncoder::with_defaults(program).unwrap();
+        let encoder = VideoEncoder::with_defaults(real_ffmpeg()).unwrap();
         let frames = vec![
             frame(64, 48, [200, 40, 40, 255], 100),
             frame(64, 48, [40, 40, 200, 255], 100),
@@ -911,5 +985,92 @@ mod tests {
             webm, webm_again,
             "two WebM renders of the same frames differ"
         );
+        for (name, bytes) in [("MP4", &mp4), ("WebM", &webm)] {
+            for tag in [&b"Lavf"[..], b"Lavc"] {
+                assert!(
+                    !names_a_version(bytes, tag),
+                    "the {name} output names the {} version",
+                    String::from_utf8_lossy(tag)
+                );
+            }
+        }
+    }
+
+    /// Encode the same frames twice with the real FFmpeg:
+    /// once free to use every CPU this test may use, and
+    /// once through a wrapper that pins it to one CPU with
+    /// `taskset`. The bytes must match, or replicas with
+    /// different core counts would render one URL to
+    /// different bytes (issue #626). Left alone, x264 sizes
+    /// its thread pool from the cores it sees, but caps it
+    /// at small heights, so the frames are 240 px high.
+    /// WebM is checked too: libvpx's threads do not change
+    /// its bytes. VP9's threads work on separate tile
+    /// columns, each at least 256 px wide, so the frames
+    /// are 640 px wide: two columns. Run it with:
+    /// `cargo test -- --ignored real_ffmpeg`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a real encoder binary (ffmpeg) and taskset on this machine"]
+    fn real_ffmpeg_bytes_do_not_depend_on_the_core_count() {
+        // The CPUs this process may use, from a list such as
+        // `0-3` or `2,5-7`. The encoder inherits them.
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let ranges: Vec<(u32, u32)> = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .expect("no Cpus_allowed_list in /proc/self/status")
+            .trim()
+            .split(',')
+            .map(|part| {
+                let (low, high) = part.split_once('-').unwrap_or((part, part));
+                (low.parse().unwrap(), high.parse().unwrap())
+            })
+            .collect();
+        let cpus: u32 = ranges.iter().map(|(low, high)| high - low + 1).sum();
+        assert!(cpus > 1, "this test needs at least two CPUs, not {cpus}");
+        let first_cpu = ranges[0].0;
+        let taskset = std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("taskset"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .expect("this test needs taskset on PATH");
+        let dir = test_dir("real-ffmpeg-cpus");
+        let wrapper = fake_encoder(
+            &dir,
+            &format!(
+                "#!/bin/sh\nexec '{}' -c {first_cpu} '{}' \"$@\"\n",
+                taskset.display(),
+                real_ffmpeg()
+            ),
+        );
+        let free = VideoEncoder::with_defaults(real_ffmpeg()).unwrap();
+        let pinned = VideoEncoder::with_defaults(wrapper).unwrap();
+        let frames: Vec<VideoFrame> = (0..6u32)
+            .map(|i| VideoFrame {
+                pixels: image::RgbaImage::from_fn(640, 240, |x, y| {
+                    image::Rgba([
+                        (x + 9 * i) as u8,
+                        (y * 2 + i) as u8,
+                        ((x ^ y) + 31 * i) as u8,
+                        255,
+                    ])
+                }),
+                delay_ms: 100,
+            })
+            .collect();
+        for format in [VideoFormat::Mp4, VideoFormat::WebM] {
+            let on_all = free.encode(&frames, format).unwrap();
+            let on_one = pinned.encode(&frames, format).unwrap();
+            assert!(on_all.len() > 100, "suspiciously small {format:?}");
+            assert!(
+                on_all == on_one,
+                "{format:?} bytes differ between {cpus} CPUs and one ({} and {} bytes)",
+                on_all.len(),
+                on_one.len()
+            );
+        }
     }
 }

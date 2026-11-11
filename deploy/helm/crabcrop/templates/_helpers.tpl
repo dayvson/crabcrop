@@ -42,3 +42,42 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "crabcrop.fullname" . }}
 {{- end }}
 {{- end }}
+
+{{/*
+The variables the server treats as secrets (SECRET_VARIABLES
+in src/config.rs), each with the value that reads it from a
+Secret. tests/deploy_recipes.rs keeps this list equal to the
+server's.
+*/}}
+{{- define "crabcrop.secretRoutes" -}}
+CRABCROP_SECRET: existingSecret
+CRABCROP_SECRET_PREVIOUS: previousSecret.existingSecret
+AWS_SECRET_ACCESS_KEY: resultBucket.credentialsSecret
+AWS_SESSION_TOKEN: resultBucket.credentialsSecret
+CRABCROP_GCS_SECRET_KEY: gcsCredentials.existingSecret
+CRABCROP_METRICS_TOKEN: metricsToken.existingSecret
+{{- end }}
+
+{{/*
+The secrets the Deployment would carry as plain values: those
+in env, in ai.env when ai.enabled, and extraEnv entries with
+value:. As YAML, each name mapped to the value to set instead;
+empty when there are none.
+*/}}
+{{- define "crabcrop.plainSecrets" -}}
+{{- $routes := include "crabcrop.secretRoutes" . | fromYaml }}
+{{- $names := keys (.Values.env | default dict) }}
+{{- if .Values.ai.enabled }}
+{{- $names = concat $names (keys (.Values.ai.env | default dict)) }}
+{{- end }}
+{{- range .Values.extraEnv }}
+{{- if hasKey . "value" }}
+{{- $names = append $names (get . "name") }}
+{{- end }}
+{{- end }}
+{{- range $name := $names | uniq | sortAlpha }}
+{{- if hasKey $routes $name }}
+{{ $name }}: {{ get $routes $name }}
+{{- end }}
+{{- end }}
+{{- end }}

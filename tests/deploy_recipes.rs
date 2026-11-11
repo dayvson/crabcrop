@@ -11,19 +11,26 @@
 //! recipes set the pod `fsGroup` that makes a mounted claim
 //! group-writable by 65534.
 
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const RESULT_DIR: &str = "/var/cache/crabcrop";
+
+/// The images' runtime user: nobody, by number. The kubelet
+/// checks `runAsNonRoot` only against a numeric user.
+const RUNTIME_USER: &str = "USER 65534:65534";
 
 fn read(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// The instructions of a Dockerfile's last stage, comments
-/// dropped and line continuations joined, so a multi-line
-/// `RUN` reads as one string.
-fn final_stage(dockerfile: &str) -> Vec<String> {
+/// The instructions of a Dockerfile, comments dropped and
+/// line continuations joined, so a multi-line `RUN` reads as
+/// one string.
+fn instructions(dockerfile: &str) -> Vec<String> {
     let mut instructions = Vec::new();
     let mut current = String::new();
     for line in dockerfile.lines() {
@@ -42,11 +49,32 @@ fn final_stage(dockerfile: &str) -> Vec<String> {
             }
         }
     }
+    instructions
+}
+
+/// The instructions of a Dockerfile's last stage, as
+/// [`instructions`] reads them.
+fn final_stage(dockerfile: &str) -> Vec<String> {
+    let mut instructions = instructions(dockerfile);
     let last_from = instructions
         .iter()
         .rposition(|i| i.starts_with("FROM "))
         .expect("a FROM instruction");
     instructions.split_off(last_from)
+}
+
+/// Every stage of a Dockerfile, in order, each from its
+/// `FROM`. What comes before the first `FROM` is left out.
+fn stages(dockerfile: &str) -> Vec<Vec<String>> {
+    let mut stages: Vec<Vec<String>> = Vec::new();
+    for instruction in instructions(dockerfile) {
+        if instruction.starts_with("FROM ") {
+            stages.push(vec![instruction]);
+        } else if let Some(stage) = stages.last_mut() {
+            stage.push(instruction);
+        }
+    }
+    stages
 }
 
 /// The lines nested under the first `key:` that sits at
@@ -73,7 +101,7 @@ fn images_create_the_result_directory_for_nobody() {
             .iter()
             .rposition(|i| i.starts_with("USER "))
             .unwrap_or_else(|| panic!("{rel}: the runtime stage sets a USER"));
-        assert_eq!(stage[user], "USER nobody", "{rel}: runs as nobody");
+        assert_eq!(stage[user], RUNTIME_USER, "{rel}: runs as nobody");
         let prepares = stage[..user].iter().any(|i| {
             i.starts_with("RUN ")
                 && i.contains(&format!("mkdir -p {RESULT_DIR}"))
@@ -82,7 +110,7 @@ fn images_create_the_result_directory_for_nobody() {
         assert!(
             prepares,
             "{rel}: the runtime stage must create {RESULT_DIR} owned by 65534 \
-             before USER nobody, or a fresh volume mounted there is root-owned \
+             before {RUNTIME_USER}, or a fresh volume mounted there is root-owned \
              and the server exits at boot"
         );
     }
@@ -141,10 +169,18 @@ fn kubernetes_recipes_set_the_pod_fs_group_for_nobody() {
 
 #[test]
 fn the_helpers_read_what_they_claim() {
-    let dockerfile = "FROM a AS b\nRUN x\nFROM c\n# note\nRUN one \\\n    && two\nUSER nobody\n";
+    let dockerfile =
+        "ARG A=1\nFROM a AS b\nRUN x\nFROM c\n# note\nRUN one \\\n    && two\nUSER nobody\n";
     assert_eq!(
         final_stage(dockerfile),
         vec!["FROM c", "RUN one && two", "USER nobody"]
+    );
+    assert_eq!(
+        stages(dockerfile),
+        vec![
+            vec!["FROM a AS b", "RUN x"],
+            vec!["FROM c", "RUN one && two", "USER nobody"]
+        ]
     );
     let yaml = "a:\n  b: 1\n  # c\n\n  d: 2\ne:\n  f: 3\n";
     assert_eq!(yaml_block(yaml, 0, "a").unwrap(), vec!["  b: 1", "  d: 2"]);
@@ -165,7 +201,7 @@ fn yaml_keys<'a>(text: &'a str, keys: &[&str]) -> Vec<&'a str> {
 }
 
 /// Every YAML file under `dir`, recursively, sorted.
-fn yaml_files(dir: &Path) -> Vec<std::path::PathBuf> {
+fn yaml_files(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -465,4 +501,1167 @@ fn cdn_recipes_name_the_error_header_the_server_sends() {
             "{rel}: error responses are no-store, not private, no-store"
         );
     }
+}
+
+/// The variables that hold a secret the server checks at
+/// boot (issue #588).
+const SECRET_VARS: [&str; 3] = [
+    "CRABCROP_SECRET",
+    "CRABCROP_SECRET_PREVIOUS",
+    "CRABCROP_METRICS_TOKEN",
+];
+
+/// The value at the start of `rest`: a quoted string's
+/// contents, or the text up to white space, a quote or a
+/// backtick.
+fn leading_value(rest: &str) -> String {
+    for quote in ['"', '\''] {
+        if let Some(inner) = rest.strip_prefix(quote) {
+            return inner.split(quote).next().unwrap_or("").to_string();
+        }
+    }
+    rest.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The trimmed lines of each YAML list item `- name: <name>`
+/// in `lines`, after its name line.
+fn yaml_items<'a>(lines: &[&'a str], name: &str) -> Vec<Vec<&'a str>> {
+    let mut items = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let Some(named) = t.strip_prefix("- name:") else {
+            continue;
+        };
+        if named.trim().trim_matches(|c| c == '"' || c == '\'') != name {
+            continue;
+        }
+        let indent = line.len() - t.len();
+        items.push(
+            lines[i + 1..]
+                .iter()
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .take_while(|l| l.len() - l.trim_start().len() > indent)
+                .map(|l| l.trim())
+                .collect(),
+        );
+    }
+    items
+}
+
+/// Every value `text` gives one of [`SECRET_VARS`], as
+/// (variable, value): `NAME=value` (shell, env files,
+/// `--from-literal`), `NAME: value` (YAML maps),
+/// `"NAME": "value"` (JSON), and a YAML env item
+/// `- name: NAME` with a `value:`, or with a `secretRef:`
+/// to an item that has one (Container Apps).
+fn secret_literals(text: &str) -> Vec<(&'static str, String)> {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut found = Vec::new();
+    for line in text.lines() {
+        for var in SECRET_VARS {
+            for (at, _) in line.match_indices(var) {
+                if line[..at].chars().next_back().is_some_and(is_name) {
+                    continue;
+                }
+                let rest = &line[at + var.len()..];
+                if rest.chars().next().is_some_and(is_name) {
+                    continue;
+                }
+                let value = if let Some(r) = rest.strip_prefix('=') {
+                    Some(leading_value(r))
+                } else if let Some(r) = rest.strip_prefix(": ") {
+                    Some(leading_value(r.trim_start()))
+                } else {
+                    rest.strip_prefix('"')
+                        .and_then(|r| r.trim_start().strip_prefix(':'))
+                        .map(|r| leading_value(r.trim_start()))
+                };
+                if let Some(value) = value {
+                    found.push((var, value));
+                }
+            }
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    for var in SECRET_VARS {
+        for item in yaml_items(&lines, var) {
+            for key in item {
+                if let Some(v) = key.strip_prefix("value:") {
+                    found.push((var, leading_value(v.trim())));
+                } else if let Some(name) = key.strip_prefix("secretRef:") {
+                    for secret in yaml_items(&lines, name.trim()) {
+                        for key in secret {
+                            if let Some(v) = key.strip_prefix("value:") {
+                                found.push((var, leading_value(v.trim())));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn secret_literals_reads_every_spelling_the_docs_use() {
+    let text = "\
+CRABCROP_SECRET=a1 crabcrop
+docker run -e CRABCROP_SECRET=\"a2\" -p 3000:3000
+{\"CRABCROP_METRICS_TOKEN\": \"a3\"}
+  CRABCROP_SECRET_PREVIOUS: a4
+`CRABCROP_SECRET=a5` in prose
+env:
+  - name: CRABCROP_METRICS_TOKEN
+    # a comment
+    value: a6
+  - name: CRABCROP_SECRET
+    secretRef: signing
+secrets:
+  - name: signing
+    value: a7
+CRABCROP_SECRET_KEY_ID=no NUXT_CRABCROP_SECRET=no
+CRABCROP_SECRET: \"${CRABCROP_SECRET:?CRABCROP_SECRET must be set}\"
+Set `CRABCROP_SECRET` (16+ bytes) and CRABCROP_SECRET.
+{\"name\":\"CRABCROP_SECRET\",\"valueFrom\":\"arn\"}
+";
+    let found = secret_literals(text);
+    let found: Vec<(&str, &str)> = found
+        .iter()
+        .map(|(var, value)| (*var, value.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("CRABCROP_SECRET", "a1"),
+            ("CRABCROP_SECRET", "a2"),
+            ("CRABCROP_METRICS_TOKEN", "a3"),
+            ("CRABCROP_SECRET_PREVIOUS", "a4"),
+            ("CRABCROP_SECRET", "a5"),
+            (
+                "CRABCROP_SECRET",
+                "${CRABCROP_SECRET:?CRABCROP_SECRET must be set}"
+            ),
+            ("CRABCROP_SECRET", "a7"),
+            ("CRABCROP_METRICS_TOKEN", "a6"),
+        ]
+    );
+}
+
+/// The text files the scan reads: the root README and
+/// CONTRIBUTING, everything under `docs/` and `deploy/`, and
+/// the READMEs of the SDKs, framework integrations, plugins
+/// and crates, which an operator copies commands from too.
+/// Helm's `.tpl` files are left out: they hold template code,
+/// where `NAME: value` maps a variable to the chart value
+/// that reads it from a Secret, not to a secret.
+fn documented_files() -> Vec<PathBuf> {
+    fn walk(dir: &Path, readmes_only: bool, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name != "node_modules" && name != "target" && !name.starts_with('.') {
+                    walk(&path, readmes_only, out);
+                }
+            } else if name.ends_with(".tpl") {
+                continue;
+            } else if !readmes_only || name == "README.md" {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("README.md"), root.join("CONTRIBUTING.md")];
+    for dir in ["docs", "deploy"] {
+        walk(&root.join(dir), false, &mut files);
+    }
+    for dir in ["sdks", "frameworks", "plugins", "crates"] {
+        walk(&root.join(dir), true, &mut files);
+    }
+    files.sort();
+    files
+}
+
+/// Boot the binary with `var` set to `value` (and a real
+/// signing secret, when `var` is another variable). `Ok`
+/// when the boot is refused with an error that names `var`;
+/// otherwise what happened instead.
+fn boot_refuses(var: &str, value: &str) -> Result<(), String> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+    command.env_clear().env("PORT", "0");
+    if var != "CRABCROP_SECRET" {
+        command.env("CRABCROP_SECRET", "deploy-recipes-scan-4d1f0a9c2e7b");
+    }
+    let mut child = command
+        .env(var, value)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        if let Ok(line) = lines.recv_timeout(Duration::from_millis(50))
+            && line.starts_with("crabcrop listening on port ")
+        {
+            break Err("it booted and listened".to_string());
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+            break if status.code() == Some(1) && stderr.contains(var) {
+                Ok(())
+            } else {
+                Err(format!("it exited with {status}: {stderr}"))
+            };
+        }
+        if Instant::now() >= deadline {
+            break Err("it neither exited nor listened within 30 s".to_string());
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
+#[test]
+fn no_secret_value_in_the_docs_or_recipes_boots_the_server() {
+    // Issue #588: the README, the VM and Container Apps
+    // recipes and the compose metrics line shipped values the
+    // server accepted, so a deployment that kept one ran with
+    // a key anyone can read here. Every literal value given
+    // to a secret variable must stop the boot now. Shell
+    // substitutions (`$(openssl rand -hex 32)`, `${VAR}`) are
+    // not literals, and neither is a `<placeholder>` in
+    // Markdown, where it reads as a shell redirect.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut literals: Vec<(&str, String, Vec<String>)> = Vec::new();
+    for path in documented_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let markdown = path.extension().is_some_and(|e| e == "md");
+        let rel = path.strip_prefix(root).unwrap().display().to_string();
+        for (var, value) in secret_literals(&text) {
+            let placeholder = markdown && value.starts_with('<') && value.ends_with('>');
+            if value.is_empty() || value.starts_with('$') || placeholder {
+                continue;
+            }
+            match literals
+                .iter_mut()
+                .find(|(v, x, _)| *v == var && *x == value)
+            {
+                Some((_, _, files)) => files.push(rel.clone()),
+                None => literals.push((var, value, vec![rel.clone()])),
+            }
+        }
+    }
+    // The scan reads what it claims: the docs do give the
+    // CLI's signing secret as a literal.
+    assert!(
+        literals
+            .iter()
+            .any(|(_, _, files)| files.iter().any(|f| f == "docs/endpoints.md")),
+        "{literals:?}"
+    );
+    let mut booted = Vec::new();
+    for (var, value, files) in &literals {
+        if let Err(what) = boot_refuses(var, value) {
+            booted.push(format!("{var}={value:?} in {files:?}: {what}"));
+        }
+    }
+    assert!(booted.is_empty(), "{booted:#?}");
+}
+
+/// The variables the server treats as secrets: the names in
+/// `SECRET_VARIABLES` in src/config.rs. That module belongs
+/// to the binary, which an integration test cannot import,
+/// so the list is read from the source.
+fn server_secret_variables() -> Vec<String> {
+    let config = read("src/config.rs");
+    let head = "const SECRET_VARIABLES: [&str; ";
+    let start = config.find(head).expect("src/config.rs: SECRET_VARIABLES");
+    let rest = &config[start + head.len()..];
+    let len: usize = rest[..rest.find(']').unwrap()].parse().unwrap();
+    let body = &rest[rest.find("= [").unwrap()..rest.find("];").unwrap()];
+    let names: Vec<String> = body
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect();
+    assert_eq!(names.len(), len, "SECRET_VARIABLES: {names:?}");
+    names
+}
+
+/// Key IDs the server reads next to a secret: not secret
+/// themselves, but set together with it, so the chart reads
+/// each from the same Secret as its partner.
+const SECRET_PARTNERS: [(&str, &str); 2] = [
+    ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+    ("CRABCROP_GCS_ACCESS_KEY", "CRABCROP_GCS_SECRET_KEY"),
+];
+
+/// The env entries of a chart template that read a Secret
+/// (`- name:` then `valueFrom:` then `secretKeyRef:`), each
+/// with the closest `{{- if ... }}` above it, the condition
+/// that renders it.
+fn secret_ref_entries(template: &str) -> std::collections::BTreeMap<String, String> {
+    let lines: Vec<&str> = template.lines().map(str::trim).collect();
+    let mut found = std::collections::BTreeMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(name) = line.strip_prefix("- name: ") else {
+            continue;
+        };
+        if lines.get(i + 1..i + 3) != Some(&["valueFrom:", "secretKeyRef:"][..]) {
+            continue;
+        }
+        let guard = lines[..i]
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("{{- if "))
+            .map_or(String::new(), |l| l.to_string());
+        found.insert(name.to_string(), guard);
+    }
+    found
+}
+
+/// The lines of a named template, `{{- define "<name>" -}}`
+/// up to the `{{- end }}` that closes it, with each action
+/// on its own line as the chart writes them.
+fn template_define<'a>(text: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let open = format!("{{{{- define \"{name}\" -}}}}");
+    let mut lines = text.lines();
+    lines.find(|l| l.trim() == open)?;
+    let mut depth = 1;
+    let mut body = Vec::new();
+    for line in lines {
+        let t = line.trim();
+        if ["{{- if ", "{{- range ", "{{- with ", "{{- define "]
+            .iter()
+            .any(|p| t.starts_with(p))
+        {
+            depth += 1;
+        } else if t.starts_with("{{- end") {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body);
+            }
+        }
+        body.push(line);
+    }
+    None
+}
+
+/// The scalar at a dotted path of a YAML file, as written
+/// (`a.b` is `b:` nested two spaces under `a:`).
+fn yaml_scalar(text: &str, path: &str) -> Option<String> {
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let mut scope = text.to_string();
+    let mut indent = 0;
+    let mut keys = path.split('.').peekable();
+    while let Some(key) = keys.next() {
+        if keys.peek().is_none() {
+            let head = format!("{key}:");
+            return scope
+                .lines()
+                .find(|l| depth(l) == indent && l.trim_start().starts_with(&head))
+                .map(|l| l.trim_start()[head.len()..].trim().to_string());
+        }
+        scope = yaml_block(&scope, indent, key)?.join("\n");
+        indent += 2;
+    }
+    None
+}
+
+#[test]
+fn the_secret_helpers_read_what_they_claim() {
+    let template = "{{- if .Values.a }}\n- name: A\n  valueFrom:\n    secretKeyRef:\n      \
+                    name: s\n{{- end }}\n- name: B\n  value: x\n- name: C\n  valueFrom:\n    \
+                    configMapKeyRef:\n";
+    let entries = secret_ref_entries(template);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries["A"], "{{- if .Values.a }}");
+    let helpers = "{{- define \"x\" -}}\na: b\n{{- if .c }}\nd\n{{- end }}\n{{- end }}\ne\n";
+    assert_eq!(
+        template_define(helpers, "x").unwrap(),
+        vec!["a: b", "{{- if .c }}", "d", "{{- end }}"]
+    );
+    assert!(template_define(helpers, "y").is_none());
+    let yaml = "a: \"\"\nb:\n  a: 1\n  c:\n    d: []\n";
+    assert_eq!(yaml_scalar(yaml, "a").as_deref(), Some("\"\""));
+    assert_eq!(yaml_scalar(yaml, "b.a").as_deref(), Some("1"));
+    assert_eq!(yaml_scalar(yaml, "b.c.d").as_deref(), Some("[]"));
+    assert!(yaml_scalar(yaml, "c").is_none());
+    let secrets = server_secret_variables();
+    assert!(
+        secrets.contains(&"CRABCROP_SECRET".to_string()),
+        "{secrets:?}"
+    );
+}
+
+#[test]
+fn the_helm_chart_reads_every_secret_variable_from_a_secret() {
+    // Issue #589: the chart read only CRABCROP_SECRET and
+    // CRABCROP_METRICS_TOKEN from a Secret. Every other secret
+    // went through `env`, which writes it into the Deployment
+    // as plain text, readable by anyone who can read the
+    // Deployment or its Pods.
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let entries = secret_ref_entries(&deployment);
+    let secrets = server_secret_variables();
+    let wanted = secrets
+        .iter()
+        .map(String::as_str)
+        .chain(SECRET_PARTNERS.iter().map(|(id, _)| *id));
+    let missing: Vec<&str> = wanted.filter(|n| !entries.contains_key(*n)).collect();
+    assert!(
+        missing.is_empty(),
+        "deployment.yaml: no secretKeyRef entry for {missing:?}"
+    );
+    for (id, secret) in SECRET_PARTNERS {
+        assert_eq!(
+            entries[id], entries[secret],
+            "deployment.yaml: {id} comes from the same Secret as {secret}"
+        );
+    }
+
+    // The chart's route map names, for each secret, the value
+    // that turns its entry on. The plain-value warning points
+    // there, so it must match the server's list and the
+    // template.
+    let helpers = read("deploy/helm/crabcrop/templates/_helpers.tpl");
+    let routes: std::collections::BTreeMap<&str, &str> =
+        template_define(&helpers, "crabcrop.secretRoutes")
+            .expect("_helpers.tpl: defines crabcrop.secretRoutes")
+            .into_iter()
+            .map(|l| l.split_once(": ").expect("NAME: value"))
+            .collect();
+    let mut listed: Vec<&str> = routes.keys().copied().collect();
+    let mut server: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    listed.sort_unstable();
+    server.sort_unstable();
+    assert_eq!(
+        listed, server,
+        "crabcrop.secretRoutes lists SECRET_VARIABLES"
+    );
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    for (name, route) in routes {
+        let guard = entries[name].replace(['(', ')'], "");
+        assert!(
+            guard.contains(&format!(".Values.{route}")),
+            "deployment.yaml: {name} renders under {route}, not {guard:?}"
+        );
+        assert_eq!(
+            yaml_scalar(&values, route).as_deref(),
+            Some("\"\""),
+            "values.yaml: {route} is a value, empty by default"
+        );
+    }
+}
+
+#[test]
+fn the_helm_chart_takes_env_entries_and_whole_secrets() {
+    // Issue #589: the `env` map renders every entry as a plain
+    // string, so a `valueFrom` in it became the literal text
+    // "map[valueFrom:...]". `extraEnv` takes entries as
+    // written and `envFrom` maps whole Secrets.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    for key in ["extraEnv", "envFrom"] {
+        assert_eq!(
+            yaml_scalar(&values, key).as_deref(),
+            Some("[]"),
+            "values.yaml: {key} is a list, empty by default"
+        );
+    }
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let lines: Vec<&str> = deployment.lines().map(str::trim).collect();
+    let extra = lines
+        .iter()
+        .position(|l| *l == "{{- with .Values.extraEnv }}")
+        .expect("deployment.yaml: renders extraEnv");
+    assert_eq!(lines[extra + 1], "{{- toYaml . | nindent 12 }}");
+    let listed = lines
+        .iter()
+        .position(|l| l.contains("range $k := keys $allEnv"))
+        .unwrap();
+    assert!(listed < extra, "extraEnv follows the env map");
+    let from = lines
+        .iter()
+        .position(|l| *l == "{{- with .Values.envFrom }}")
+        .expect("deployment.yaml: renders envFrom");
+    assert_eq!(
+        lines[from + 1..from + 3],
+        ["envFrom:", "{{- toYaml . | nindent 12 }}"]
+    );
+
+    // extraEnv cannot carry the drain grace past its guard
+    // (issue #463) either.
+    let guard = lines
+        .iter()
+        .position(|l| l.contains(r#"eq (get . "name") "CRABCROP_SHUTDOWN_GRACE_SECS""#))
+        .expect("deployment.yaml: refuses CRABCROP_SHUTDOWN_GRACE_SECS in extraEnv");
+    assert!(
+        lines[guard + 1].starts_with("{{- fail "),
+        "{}",
+        lines[guard + 1]
+    );
+    let range = lines[..guard]
+        .iter()
+        .rposition(|l| l.starts_with("{{- range "))
+        .unwrap();
+    assert_eq!(lines[range], "{{- range .Values.extraEnv }}");
+}
+
+#[test]
+fn the_helm_chart_warns_when_a_secret_variable_is_a_plain_value() {
+    // The owner's call on #589: for one release a secret in
+    // `env`, `ai.env` or a plain `extraEnv` value still
+    // renders, with a warning in the install notes and in the
+    // manifest; `refusePlainSecrets` fails the render instead.
+    let helpers = read("deploy/helm/crabcrop/templates/_helpers.tpl");
+    let plain = template_define(&helpers, "crabcrop.plainSecrets")
+        .expect("_helpers.tpl: defines crabcrop.plainSecrets")
+        .join("\n");
+    for read_from in [
+        "include \"crabcrop.secretRoutes\" .",
+        ".Values.env",
+        ".Values.ai.env",
+        ".Values.extraEnv",
+    ] {
+        assert!(
+            plain.contains(read_from),
+            "crabcrop.plainSecrets reads {read_from}"
+        );
+    }
+
+    let include = "{{- $plainSecrets := include \"crabcrop.plainSecrets\" . | fromYaml }}";
+    let notes = read("deploy/helm/crabcrop/templates/NOTES.txt");
+    let notes: Vec<&str> = notes.lines().map(str::trim).collect();
+    let at = notes
+        .iter()
+        .position(|l| *l == include)
+        .expect("NOTES.txt: reads crabcrop.plainSecrets");
+    assert_eq!(notes[at + 1], "{{- if $plainSecrets }}");
+    assert!(
+        notes[at + 2..].iter().any(|l| l.starts_with("WARNING: ")),
+        "NOTES.txt: warns about plain secrets"
+    );
+
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let lines: Vec<&str> = deployment.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|l| *l == include)
+        .expect("deployment.yaml: reads crabcrop.plainSecrets");
+    assert_eq!(
+        lines[at + 1..at + 3],
+        [
+            "{{- if and $plainSecrets .Values.refusePlainSecrets }}",
+            "{{- $refused := list }}"
+        ],
+        "deployment.yaml: fails only behind refusePlainSecrets"
+    );
+    let comment = lines
+        .iter()
+        .position(|l| l.starts_with("# WARNING: {{ $name }} "))
+        .expect("deployment.yaml: a comment names each plain secret");
+    assert!(at < comment, "the comment follows the refusal");
+    // The env map and extraEnv render after the Secret routes,
+    // so a plain entry left there wins over the Secret's.
+    assert!(
+        lines[comment].contains("remove it from env"),
+        "deployment.yaml: the comment says to remove the plain entry"
+    );
+    assert_eq!(
+        lines[comment - 1],
+        "{{- range $name, $route := $plainSecrets }}"
+    );
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    assert_eq!(
+        yaml_scalar(&values, "refusePlainSecrets").as_deref(),
+        Some("false"),
+        "values.yaml: refusePlainSecrets is off for this release"
+    );
+}
+
+#[test]
+fn the_secret_docs_describe_routes_that_work() {
+    // values.yaml and the chart README said the AWS keys could
+    // go through the `env` map "backed by a Secret", which the
+    // template could not do.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    assert!(
+        !values.contains("through the env map"),
+        "values.yaml: sends the AWS keys through env"
+    );
+    let readme = read("deploy/helm/crabcrop/README.md");
+    assert!(
+        !readme.contains("through the chart's `env` map"),
+        "README.md: sends the AWS keys through env"
+    );
+    for route in [
+        "resultBucket.credentialsSecret",
+        "previousSecret.existingSecret",
+        "gcsCredentials.existingSecret",
+        "extraEnv",
+        "envFrom",
+        "refusePlainSecrets",
+    ] {
+        assert!(readme.contains(&format!("`{route}")), "README.md: {route}");
+    }
+    // The kustomize env patch shows the AWS keys as Secret
+    // references, never as `value:` lines.
+    let patch = read("deploy/kustomize/overlays/multi-replica/env-patch.yaml");
+    let commented: Vec<&str> = patch
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("# "))
+        .map(str::trim)
+        .collect();
+    for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+        let at = commented
+            .iter()
+            .position(|l| *l == format!("- name: {key}"))
+            .unwrap_or_else(|| panic!("env-patch.yaml: a commented {key} entry"));
+        assert_eq!(
+            commented.get(at + 1..at + 3),
+            Some(&["valueFrom:", "secretKeyRef:"][..]),
+            "env-patch.yaml: {key} reads a Secret"
+        );
+    }
+}
+
+/// The three images, each with its own Dockerfile.
+const DOCKERFILES: [&str; 3] = ["Dockerfile", "Dockerfile.release", "Dockerfile.ai"];
+
+/// The images' health check: the binary probes its own
+/// server, so the image needs no HTTP client.
+const HEALTHCHECK: &str = r#"HEALTHCHECK --interval=30s --timeout=3s CMD ["crabcrop", "health"]"#;
+
+#[test]
+fn images_run_as_a_numeric_user() {
+    // Issue #592: the images said `USER nobody`. The kubelet
+    // cannot check a user name against `runAsNonRoot`, so a
+    // pod that set only that never started ("image has
+    // non-numeric user (nobody), cannot verify user is
+    // non-root"). The AI image switches to root for its
+    // payload steps and must end on the same user.
+    for rel in DOCKERFILES {
+        let stage = final_stage(&read(rel));
+        let users: Vec<&str> = stage
+            .iter()
+            .map(String::as_str)
+            .filter(|i| i.starts_with("USER "))
+            .collect();
+        assert_eq!(users.last(), Some(&RUNTIME_USER), "{rel}: {users:?}");
+    }
+}
+
+#[test]
+fn runtime_images_carry_no_curl() {
+    // Issue #592: both runtime images installed curl only for
+    // their HEALTHCHECK. The binary probes itself now
+    // (`crabcrop health`), and the AI image downloads ONNX
+    // Runtime in a stage of its own.
+    for rel in DOCKERFILES {
+        let stage = final_stage(&read(rel));
+        let curl: Vec<&String> = stage.iter().filter(|i| i.contains("curl")).collect();
+        assert!(
+            curl.is_empty(),
+            "{rel}: the runtime stage uses curl: {curl:?}"
+        );
+    }
+    for rel in ["Dockerfile", "Dockerfile.release"] {
+        let stage = final_stage(&read(rel));
+        let checks: Vec<&str> = stage
+            .iter()
+            .map(String::as_str)
+            .filter(|i| i.starts_with("HEALTHCHECK"))
+            .collect();
+        assert_eq!(checks, [HEALTHCHECK], "{rel}");
+    }
+    // The check runs a verb the CLI knows.
+    let usage = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(crabcrop::cli::exec(&["--help".to_string()]))
+        .unwrap();
+    assert!(
+        usage.contains("crabcrop health "),
+        "the CLI lists no health verb:\n{usage}"
+    );
+
+    // The AI image keeps the base image's check. ONNX Runtime
+    // comes from a download stage that checks both hashes;
+    // the runtime stage copies only the library.
+    let ai = stages(&read("Dockerfile.ai"));
+    let [download, runtime] = &ai[..] else {
+        panic!("Dockerfile.ai: a download stage, then the runtime stage: {ai:#?}");
+    };
+    assert!(download[0].ends_with(" AS onnxruntime"), "{}", download[0]);
+    let fetch = download
+        .iter()
+        .find(|i| i.contains("curl -fsSL "))
+        .expect("Dockerfile.ai: the download stage fetches ONNX Runtime");
+    assert_eq!(
+        fetch.matches("sha256sum -c").count(),
+        2,
+        "Dockerfile.ai: the tarball and the library are both checked: {fetch}"
+    );
+    assert!(
+        runtime
+            .iter()
+            .any(|i| i == "COPY --from=onnxruntime /opt/onnxruntime /opt/onnxruntime"),
+        "Dockerfile.ai: {runtime:#?}"
+    );
+    assert!(
+        !runtime.iter().any(|i| i.starts_with("HEALTHCHECK")),
+        "Dockerfile.ai: inherits the base image's check"
+    );
+
+    // Every Debian base, the download stage's included, is
+    // the one pinned digest.
+    let bases: std::collections::BTreeSet<String> = DOCKERFILES
+        .iter()
+        .flat_map(|rel| stages(&read(rel)))
+        .filter_map(|stage| {
+            stage[0]
+                .split_whitespace()
+                .find(|word| word.starts_with("debian:"))
+                .map(String::from)
+        })
+        .collect();
+    assert_eq!(bases.len(), 1, "one pinned Debian base: {bases:?}");
+}
+
+/// Every file under `dir`, recursively, sorted.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The lines of a text with continuation lines (a trailing
+/// `\`) joined, each line's comment markers (`#`) and
+/// indentation dropped, so a command split over commented
+/// lines reads as one.
+fn commands(text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let line = line.trim_start().trim_start_matches('#').trim();
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                current.push_str(head.trim_end());
+                current.push(' ');
+            }
+            None => {
+                current.push_str(line);
+                commands.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    commands
+}
+
+#[test]
+fn no_recipe_runs_curl_inside_the_app_container() {
+    // The images carry no curl (issue #592), so a check that
+    // runs it in the app container (`docker compose exec
+    // crabcrop curl ...`, `kubectl exec ... curl`) fails. Each
+    // inline code span is read on its own.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = files_under(&root.join("deploy"));
+    files.extend(
+        files_under(&root.join("docs"))
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "md")),
+    );
+    files.extend(["README.md", "SECURITY.md", "CONTRIBUTING.md"].map(|f| root.join(f)));
+    let mut found = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for command in commands(&text) {
+            for span in command.split('`') {
+                let exec = span
+                    .find("exec crabcrop")
+                    .or_else(|| span.find("kubectl exec"));
+                if exec.is_some_and(|at| span[at..].contains("curl")) {
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    found.push(format!("{rel}: {span}"));
+                }
+            }
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+
+    // The reading is not vacuous.
+    assert_eq!(
+        commands("#   docker compose exec crabcrop \\\n#     curl -s x\nnext\n"),
+        ["docker compose exec crabcrop curl -s x", "next"]
+    );
+}
+
+/// The settings Pod Security "restricted" needs on the pod,
+/// with the `fsGroup` the disk tier needs, as paths under
+/// the pod `securityContext`.
+const POD_SECURITY: [(&str, &str); 5] = [
+    ("runAsNonRoot", "true"),
+    ("runAsUser", "65534"),
+    ("runAsGroup", "65534"),
+    ("fsGroup", "65534"),
+    ("seccompProfile.type", "RuntimeDefault"),
+];
+
+/// The container `securityContext`: what "restricted" needs,
+/// and a read-only root filesystem.
+const CONTAINER_SECURITY: [(&str, &str); 3] = [
+    ("allowPrivilegeEscalation", "false"),
+    ("readOnlyRootFilesystem", "true"),
+    ("capabilities.drop", r#"["ALL"]"#),
+];
+
+/// `lines`, a block [`yaml_block`] returned, as a text whose
+/// keys start at column 0.
+fn dedent(lines: &[&str]) -> String {
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let by = lines.iter().map(|l| depth(l)).min().unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| &l[by..])
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How deep in `if`, `range` and `with` blocks line `at` of
+/// a chart template sits: 0 renders whatever the values.
+fn template_depth(lines: &[&str], at: usize) -> i64 {
+    let count = |l: &str, words: &[&str]| -> i64 {
+        words
+            .iter()
+            .map(|w| {
+                l.matches(&format!("{{{{- {w}")).count() + l.matches(&format!("{{{{ {w}")).count()
+            })
+            .sum::<usize>() as i64
+    };
+    lines[..at]
+        .iter()
+        .map(|l| count(l, &["if ", "range ", "with "]) - count(l, &["end"]))
+        .sum()
+}
+
+/// The index of the line `- name: <name>` whose next line,
+/// trimmed, is `next`.
+fn named_entry(lines: &[&str], name: &str, next: &str) -> Option<usize> {
+    (0..lines.len().saturating_sub(1))
+        .find(|&i| lines[i].trim() == format!("- name: {name}") && lines[i + 1].trim() == next)
+}
+
+#[test]
+fn kubernetes_recipes_meet_pod_security_restricted() {
+    // Issue #592: Pod Security "restricted" refused the pods
+    // (no runAsNonRoot, no seccomp profile), and they skipped
+    // the usual containment: the root filesystem was writable
+    // and the namespace's service account token was mounted.
+    // The server writes outside its configured directories
+    // only in /tmp, so that is an emptyDir.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    for (path, want) in POD_SECURITY {
+        assert_eq!(
+            yaml_scalar(&values, &format!("podSecurityContext.{path}")).as_deref(),
+            Some(want),
+            "values.yaml: podSecurityContext.{path}"
+        );
+    }
+    for (path, want) in CONTAINER_SECURITY {
+        assert_eq!(
+            yaml_scalar(&values, &format!("securityContext.{path}")).as_deref(),
+            Some(want),
+            "values.yaml: securityContext.{path}"
+        );
+    }
+    assert_eq!(
+        yaml_scalar(&values, "automountServiceAccountToken").as_deref(),
+        Some("false"),
+        "values.yaml: automountServiceAccountToken"
+    );
+    let size =
+        yaml_scalar(&values, "tmpVolume.sizeLimit").expect("values.yaml: tmpVolume.sizeLimit");
+
+    // The template renders the token setting and /tmp whatever
+    // the values, a release upgraded with --reuse-values
+    // included (its values lack them).
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let lines: Vec<&str> = deployment.lines().collect();
+    let token = lines
+        .iter()
+        .position(|l| {
+            l.trim()
+                == "automountServiceAccountToken: {{ .Values.automountServiceAccountToken | default false }}"
+        })
+        .expect("deployment.yaml: sets automountServiceAccountToken from the value");
+    let mount = named_entry(&lines, "tmp", "mountPath: /tmp")
+        .expect("deployment.yaml: mounts the tmp volume at /tmp");
+    let volume = named_entry(&lines, "tmp", "emptyDir:")
+        .expect("deployment.yaml: the tmp volume is an emptyDir");
+    assert_eq!(
+        lines[volume + 2].trim(),
+        r#"sizeLimit: {{ (.Values.tmpVolume).sizeLimit | default "1Gi" }}"#,
+        "deployment.yaml: the tmp volume's size"
+    );
+    for at in [token, mount, volume] {
+        assert_eq!(
+            template_depth(&lines, at),
+            0,
+            "deployment.yaml:{}: renders under a condition",
+            at + 1
+        );
+    }
+    assert_eq!(size, "1Gi", "values.yaml: the template's default size");
+
+    // The kustomize base sets the same.
+    let base = read("deploy/kustomize/base/deployment.yaml");
+    let lines: Vec<&str> = base.lines().collect();
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let containers = lines
+        .iter()
+        .position(|l| l.trim() == "containers:")
+        .expect("kustomize base: containers");
+    let pod_indent = depth(lines[containers]);
+    let pod =
+        dedent(&yaml_block(&base, pod_indent, "securityContext").expect("pod securityContext"));
+    for (path, want) in POD_SECURITY {
+        assert_eq!(
+            yaml_scalar(&pod, path).as_deref(),
+            Some(want),
+            "kustomize base: pod securityContext.{path}"
+        );
+    }
+    let container_indent = depth(lines[containers + 1]) + 2;
+    let container = dedent(
+        &yaml_block(&base, container_indent, "securityContext").expect("container securityContext"),
+    );
+    for (path, want) in CONTAINER_SECURITY {
+        assert_eq!(
+            yaml_scalar(&container, path).as_deref(),
+            Some(want),
+            "kustomize base: container securityContext.{path}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| depth(l) == pod_indent && l.trim() == "automountServiceAccountToken: false"),
+        "kustomize base: automountServiceAccountToken: false on the pod"
+    );
+    named_entry(&lines, "tmp", "mountPath: /tmp").expect("kustomize base: mounts /tmp");
+    let volume = named_entry(&lines, "tmp", "emptyDir:").expect("kustomize base: a tmp emptyDir");
+    assert_eq!(
+        lines[volume + 2].trim(),
+        format!("sizeLimit: {size}"),
+        "kustomize base: the chart's tmp size"
+    );
+
+    // Nothing layered on top takes the settings back.
+    let keys = [
+        "securityContext",
+        "podSecurityContext",
+        "runAsNonRoot",
+        "runAsUser",
+        "runAsGroup",
+        "seccompProfile",
+        "readOnlyRootFilesystem",
+        "allowPrivilegeEscalation",
+        "automountServiceAccountToken",
+    ];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut layered = yaml_files(&root.join("deploy/kustomize/components"));
+    layered.extend(yaml_files(&root.join("deploy/kustomize/overlays")));
+    layered.extend(
+        ["values-production.yaml", "values-multireplica.yaml"]
+            .map(|f| root.join("deploy/helm/crabcrop").join(f)),
+    );
+    for path in layered {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let found = yaml_keys(&text, &keys);
+        assert!(found.is_empty(), "{}: {found:?}", path.display());
+    }
+}
+
+#[test]
+fn kubernetes_recipes_request_modest_resources() {
+    // Issue #592: the chart's default was `resources: {}`,
+    // so a default install ran BestEffort, the first class
+    // the kubelet evicts. The owner chose modest requests
+    // and no limits by default; values-production.yaml sets
+    // limits.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    let base = read("deploy/kustomize/base/deployment.yaml");
+    let resources =
+        dedent(&yaml_block(&base, 10, "resources").expect("kustomize base: container resources"));
+    for (path, want) in [("requests.cpu", "100m"), ("requests.memory", "128Mi")] {
+        assert_eq!(
+            yaml_scalar(&values, &format!("resources.{path}")).as_deref(),
+            Some(want),
+            "values.yaml: resources.{path}"
+        );
+        assert_eq!(
+            yaml_scalar(&resources, path).as_deref(),
+            Some(want),
+            "kustomize base: resources.{path}"
+        );
+    }
+    assert!(yaml_scalar(&values, "resources.limits").is_none());
+    assert!(yaml_scalar(&resources, "limits").is_none());
+    let production = read("deploy/helm/crabcrop/values-production.yaml");
+    for path in ["limits.cpu", "limits.memory"] {
+        assert!(
+            yaml_scalar(&production, &format!("resources.{path}")).is_some(),
+            "values-production.yaml: resources.{path}"
+        );
+    }
+}
+
+/// The ranges the optional NetworkPolicy keeps the pod from
+/// reaching: the private ranges, link-local (the cloud
+/// metadata address) and carrier-grade NAT.
+const PRIVATE_RANGES: [&str; 5] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+];
+
+/// The items of the list under the first `key:` line, at any
+/// indent: the `- ` lines at the depth of the first line
+/// below the key, quotes dropped. Comments are skipped.
+fn list_under(text: &str, key: &str) -> Vec<String> {
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let mut lines = text.lines();
+    let Some(head) = lines.find(|l| l.trim() == format!("{key}:")) else {
+        return Vec::new();
+    };
+    let block: Vec<&str> = lines
+        .take_while(|l| l.trim().is_empty() || depth(l) > depth(head))
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .collect();
+    let Some(items) = block.first().map(|l| depth(l)) else {
+        return Vec::new();
+    };
+    block
+        .iter()
+        .filter(|l| depth(l) == items)
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|item| item.trim_matches('"').to_string())
+        .collect()
+}
+
+#[test]
+fn the_pod_helpers_read_what_they_claim() {
+    let yaml = "a:\n  # c\n  - x\n  - y:\n      z:\n        - q\n  - \"w\"\nb:\n  - v\n";
+    assert_eq!(list_under(yaml, "a"), ["x", "y:", "w"]);
+    assert_eq!(list_under(yaml, "z"), ["q"]);
+    assert_eq!(list_under(yaml, "b"), ["v"]);
+    assert!(list_under(yaml, "c").is_empty());
+    assert_eq!(dedent(&["    a:", "      b: 1"]), "a:\n  b: 1");
+    let template = [
+        "{{- if .a }}",
+        "x",
+        "{{- end }}",
+        "y: \"{{ if .b }}1{{ else }}2{{ end }}\"",
+        "z",
+    ];
+    assert_eq!(template_depth(&template, 1), 1);
+    assert_eq!(template_depth(&template, 4), 0);
+    let entries = [
+        "- name: tmp",
+        "  emptyDir:",
+        "- name: tmp",
+        "  mountPath: /tmp",
+    ];
+    assert_eq!(named_entry(&entries, "tmp", "mountPath: /tmp"), Some(2));
+    assert_eq!(named_entry(&entries, "tmp", "emptyDir:"), Some(0));
+    assert_eq!(named_entry(&entries, "x", "emptyDir:"), None);
+}
+
+#[test]
+fn the_network_policy_is_optional_and_allows_public_egress() {
+    // Issue #592: no NetworkPolicy shipped. The in-app check
+    // (CRABCROP_BLOCK_PRIVATE_SOURCES) skips hosts in the
+    // allowlist, and code running in the pod is not bound by
+    // it at all. The policy is off by default in the chart
+    // and a component in kustomize.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    assert_eq!(
+        yaml_scalar(&values, "networkPolicy.enabled").as_deref(),
+        Some("false")
+    );
+    for key in ["ingressFrom", "extraEgress"] {
+        assert_eq!(
+            yaml_scalar(&values, &format!("networkPolicy.{key}")).as_deref(),
+            Some("[]"),
+            "values.yaml: networkPolicy.{key}"
+        );
+    }
+    let helm = read("deploy/helm/crabcrop/templates/networkpolicy.yaml");
+    let lines: Vec<&str> = helm.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&"{{- if (.Values.networkPolicy).enabled }}"),
+        "networkpolicy.yaml: renders only when enabled, from values kept by --reuse-values too"
+    );
+    assert_eq!(lines.last(), Some(&"{{- end }}"));
+    let kustomize = read("deploy/kustomize/components/network-policy/networkpolicy.yaml");
+    for (rel, policy) in [("helm", &helm), ("kustomize", &kustomize)] {
+        assert!(policy.contains("kind: NetworkPolicy"), "{rel}");
+        assert_eq!(
+            list_under(policy, "policyTypes"),
+            ["Ingress", "Egress"],
+            "{rel}"
+        );
+        // Ingress: the HTTP port only.
+        assert_eq!(
+            list_under(policy, "ingress").len(),
+            1,
+            "{rel}: one ingress rule"
+        );
+        assert!(
+            policy.contains("- port: http\n"),
+            "{rel}: ingress to the http port"
+        );
+        // Egress: DNS, then public addresses.
+        assert_eq!(policy.matches("- port: 53\n").count(), 2, "{rel}: DNS");
+        for protocol in ["UDP", "TCP"] {
+            assert!(policy.contains(&format!("protocol: {protocol}")), "{rel}");
+        }
+        assert!(policy.contains("cidr: 0.0.0.0/0\n"), "{rel}");
+        assert_eq!(list_under(policy, "except"), PRIVATE_RANGES, "{rel}");
+    }
+    let component = read("deploy/kustomize/components/network-policy/kustomization.yaml");
+    assert!(component.contains("kind: Component"));
+    assert_eq!(list_under(&component, "resources"), ["networkpolicy.yaml"]);
+    let full = read("deploy/kustomize/overlays/full/kustomization.yaml");
+    assert!(full.contains("- ../../components/network-policy\n"));
+    let base = read("deploy/kustomize/base/kustomization.yaml");
+    assert!(!base.contains("network"), "the base leaves the policy out");
 }

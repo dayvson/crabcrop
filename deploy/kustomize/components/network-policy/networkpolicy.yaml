@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: crabcrop
+  labels:
+    app.kubernetes.io/name: crabcrop
+    app.kubernetes.io/instance: crabcrop
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: crabcrop
+      app.kubernetes.io/instance: crabcrop
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # The HTTP port, from anywhere. Add a from: list to
+    # narrow it to your ingress controller or proxy.
+    - ports:
+        - port: http
+          protocol: TCP
+  egress:
+    # DNS, to whichever resolver the pod uses.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Sources and buckets on public IPv4 addresses. The
+    # exceptions are the private ranges, link-local (the
+    # cloud metadata address) and carrier-grade NAT.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10

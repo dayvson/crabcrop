@@ -32,11 +32,29 @@ Container Registry.
 
 ## 1. The signing secret
 
-The shipped YAML carries the secret as a plain value marked
-`REPLACE_ME_signing_secret`, which is for a first boot only.
-For anything real, use a Key Vault reference. Give the app
-a user-assigned managed identity with `Key Vault Secrets
-User` on the vault, then in `containerapp.yaml`:
+The shipped YAML carries the secret as the plain value
+`REPLACE_ME`, which the server refuses at boot: the app
+does not serve until you set a real secret. Use a Key Vault
+reference, or set a generated value directly.
+
+To set it directly, generate a secret and keep it: you
+sign URLs with it. Put it in place of `REPLACE_ME` in
+`containerapp.yaml` before the first deploy, or after it
+set the secret and restart the revision:
+
+```sh
+CRABCROP_SECRET="$(openssl rand -hex 32)"
+az containerapp secret set \
+  --name crabcrop --resource-group <group> \
+  --secrets crabcrop-secret="$CRABCROP_SECRET"
+az containerapp revision restart \
+  --name crabcrop --resource-group <group> \
+  --revision <revision>
+```
+
+For a Key Vault reference, give the app a user-assigned
+managed identity with `Key Vault Secrets User` on the
+vault, then in `containerapp.yaml`:
 
 - add the identity at the resource level:
 

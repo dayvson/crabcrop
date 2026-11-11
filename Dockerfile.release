@@ -11,13 +11,14 @@
 # Dockerfile stays the from-source build for operators.
 #
 # The base is digest-pinned like the repo Dockerfile (audit PL-13);
-# keep the two pins in step.
+# keep the pins in step (Dockerfile.ai's download stage has one too).
 FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-# ca-certificates for HTTPS source fetching, curl for the
-# healthcheck, libgcc-s1 for the binary's libgcc_s dependency. No
-# libdav1d package: the release binary links dav1d statically.
+# ca-certificates for HTTPS source fetching, libgcc-s1 for the
+# binary's libgcc_s dependency. No libdav1d package: the release
+# binary links dav1d statically. No curl: the binary checks its
+# own health.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libgcc-s1 \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 COPY image-bin/${TARGETARCH}/crabcrop /usr/local/bin/crabcrop
@@ -29,7 +30,11 @@ EXPOSE 3000
 # CRABCROP_RESULT_STORAGE_DIR is not writable.
 RUN mkdir -p /var/cache/crabcrop \
     && chown 65534:65534 /var/cache/crabcrop
-USER nobody
+# nobody, by number: Kubernetes can check runAsNonRoot only
+# against a numeric user.
+USER 65534:65534
+# `crabcrop health` asks the server on this container's
+# port for /health and exits 1 unless it answers 200.
 HEALTHCHECK --interval=30s --timeout=3s \
-    CMD curl -f "http://127.0.0.1:${PORT:-3000}/health" || exit 1
+    CMD ["crabcrop", "health"]
 ENTRYPOINT ["crabcrop"]

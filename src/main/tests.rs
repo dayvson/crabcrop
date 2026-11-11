@@ -538,6 +538,40 @@ fn provenance_signer_construction_is_all_or_nothing() {
 }
 
 #[test]
+fn provenance_boot_lines_name_the_algorithm_and_warn_only_for_rsa() {
+    // Issue #600: the boot line names the algorithm the
+    // identity settled on. An RSA key also gets a warning:
+    // every signed output then runs an unblinded RSA
+    // private-key operation in the rsa crate.
+    use c2pa::SigningAlg;
+    let line = |alg: &str| {
+        format!("C2PA provenance signing: crabcrop test signer ({alg}, certificate /id/cert.pem)")
+    };
+    for (alg, name) in [
+        (SigningAlg::Es256, "ES256"),
+        (SigningAlg::Es384, "ES384"),
+        (SigningAlg::Es512, "ES512"),
+        (SigningAlg::Ed25519, "Ed25519"),
+    ] {
+        let (printed, warning) = provenance_boot_lines("crabcrop test signer", alg, "/id/cert.pem");
+        assert_eq!(printed, line(name));
+        assert_eq!(warning, None, "{name}");
+    }
+    for (alg, name) in [
+        (SigningAlg::Ps256, "PS256"),
+        (SigningAlg::Ps384, "PS384"),
+        (SigningAlg::Ps512, "PS512"),
+    ] {
+        let (printed, warning) = provenance_boot_lines("crabcrop test signer", alg, "/id/cert.pem");
+        assert_eq!(printed, line(name));
+        let warning = warning.expect("an RSA key warns");
+        for part in [name, "RSA", "RUSTSEC-2023-0071", "P-256", "Ed25519"] {
+            assert!(warning.contains(part), "{part}: {warning}");
+        }
+    }
+}
+
+#[test]
 fn pdf_renderer_construction_follows_the_decoder_rules() {
     // Unset disables page selection (issue #215).
     assert!(build_pdf_renderer(env_of(&[])).unwrap().is_none());
@@ -1146,6 +1180,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
         ("CRABCROP_SLOW_LANE_PERMITS", "3"),
         ("CRABCROP_META_MODE", "1"),
         ("CRABCROP_CLIENT_HINTS", "0"),
+        ("CRABCROP_EXPLAIN", "0"),
     ]))
     .unwrap();
     let state = build_state(&config, open_stores(&config).unwrap()).unwrap();
@@ -1163,6 +1198,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     assert_eq!(state.metrics_token.as_deref(), Some("metrics-token"));
     assert!(state.meta_enabled);
     assert!(!state.client_hints);
+    assert!(!state.explain_enabled);
     assert_eq!(state.config_fingerprint, config.config_fingerprint);
     assert_eq!(
         state.process_timeout,

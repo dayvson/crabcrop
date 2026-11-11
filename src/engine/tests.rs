@@ -1,5 +1,5 @@
 use super::*;
-use crate::filters::WatermarkImages;
+use crate::filters::{WatermarkImage, WatermarkImages};
 use crate::url::FormatSpec;
 use crate::url::Subsampling;
 use crate::url::{Align, Filter, ImageFormat, Quality};
@@ -933,6 +933,101 @@ fn metadata_is_stripped_by_default_and_preserved_on_policy() {
         u16::from_le_bytes(tiff[8 + 2 + 8..8 + 2 + 10].try_into().unwrap()),
         1
     );
+}
+
+/// An 80x60 JPEG as a camera and Photoshop leave one: EXIF
+/// with the source's size and an IFD1 thumbnail of the
+/// whole frame, and a Photoshop segment with an IPTC record
+/// and the same thumbnail as resource 0x0409.
+fn camera_jpeg(thumbnail: &[u8]) -> Vec<u8> {
+    use crate::color::fixture;
+    let img = image::RgbImage::from_fn(80, 60, |x, y| {
+        if x < 40 && (15..45).contains(&y) {
+            image::Rgb([220, 10, 10])
+        } else {
+            image::Rgb([128, 128, 128])
+        }
+    });
+    let mut base = Vec::new();
+    DynamicImage::ImageRgb8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut base),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    let photoshop = [
+        b"Photoshop 3.0\0".as_slice(),
+        &fixture::irb(0x0404, b"\x1c\x02\x00\x00\x02\x00\x04"),
+        &fixture::irb(0x0409, &fixture::irb_thumbnail(thumbnail)),
+    ]
+    .concat();
+    let meta = crate::color::SourceMeta {
+        exif_tiff: Some(fixture::camera(true, 1, (80, 60), thumbnail).tiff),
+        photoshop: Some(photoshop),
+        ..Default::default()
+    };
+    crate::color::inject_jpeg(&base, None, &meta, true)
+}
+
+#[test]
+fn preserved_metadata_carries_no_thumbnail_and_the_output_size() {
+    // Issue #611: under preserve, a crop or a redaction
+    // carried the source's EXIF and Photoshop thumbnails,
+    // small copies of the whole uncut frame, and EXIF
+    // sizes that named the source's. The outputs now carry
+    // neither thumbnail, and their EXIF sizes are their own.
+    use crate::color::fixture;
+    let thumbnail = fixture::thumbnail_jpeg();
+    let src = camera_jpeg(&thumbnail);
+    assert!(fixture::contains(&src, &thumbnail));
+    let crop = || rect_op(40, 15, 80, 45);
+    let pixelate = || {
+        Operation::Filters(vec![Filter::PixelateRegion {
+            x: 0,
+            y: 15,
+            w: 40,
+            h: 30,
+        }])
+    };
+    let png = || Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Png))]);
+    let cases = [
+        ("crop-rect", vec![crop()], (40, 30)),
+        ("pixelate_region", vec![pixelate()], (80, 60)),
+        ("crop-rect to PNG", vec![crop(), png()], (40, 30)),
+        ("pixelate_region to PNG", vec![pixelate(), png()], (80, 60)),
+    ];
+    let engine = Engine;
+    for (name, ops, size) in cases {
+        let out = engine
+            .process_preferred(
+                &src,
+                &ops,
+                ProcessContext {
+                    preserve_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(decode_dims(&out.bytes), size, "{name}");
+        assert!(
+            !fixture::contains(&out.bytes, &thumbnail),
+            "{name}: the output carries the source's thumbnail"
+        );
+        let tiff = fixture::carried_exif(&out.bytes).expect(name);
+        assert_eq!(fixture::next_ifd(&tiff, 8), Some(0), "{name}: IFD1 kept");
+        assert_eq!(fixture::tag(&tiff, 8, 0x0112), Some(1), "{name}");
+        let exif = fixture::tag(&tiff, 8, 0x8769).expect(name) as usize;
+        let sizes = (
+            fixture::tag(&tiff, exif, 0xA002),
+            fixture::tag(&tiff, exif, 0xA003),
+        );
+        assert_eq!(sizes, (Some(size.0), Some(size.1)), "{name}: EXIF size");
+        if name.ends_with("PNG") {
+            continue;
+        }
+        let photoshop = fixture::carried_photoshop(&out.bytes).expect(name);
+        assert_eq!(fixture::irb_ids(&photoshop), [0x0404], "{name}");
+    }
 }
 
 /// A zlib stream that inflates to `len` zero bytes, at
@@ -3521,7 +3616,7 @@ fn output_pixel_budget_rejects_huge_requests() {
     };
     let err = apply_size(img.clone(), &size, None, 1.0).unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
-    let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, None, None).unwrap_err();
+    let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, None, None, None).unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
 }
 
@@ -6489,6 +6584,14 @@ fn the_video_argv_is_the_pipe_contract_for_each_format() {
         "format=yuv420p",
     ];
     let mp4 = [
+        // Bitexact muxing (issue #612) and a fixed x264
+        // thread count (issue #626): the bytes name no
+        // FFmpeg version and do not depend on the host's
+        // core count.
+        "-fflags",
+        "+bitexact",
+        "-threads",
+        "6",
         "-c:v",
         "libx264",
         "-preset",
@@ -7005,7 +7108,7 @@ fn watermark_map() -> WatermarkImages {
     let mut map = WatermarkImages::new();
     map.insert(
         "wm".to_string(),
-        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255]))),
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255]))).into(),
     );
     map
 }
@@ -7096,7 +7199,8 @@ fn overlay_map() -> WatermarkImages {
             2,
             2,
             image::Rgb([200, 100, 50]),
-        )),
+        ))
+        .into(),
     );
     map
 }
@@ -7207,7 +7311,7 @@ fn overlay_width_scales_relative_to_the_base() {
     let mut map = WatermarkImages::new();
     map.insert(
         "blue".to_string(),
-        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255]))),
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255]))).into(),
     );
     let out = engine
         .process_preferred(
@@ -7246,11 +7350,11 @@ fn overlay_scaling_is_charged_against_the_pixel_budget() {
         10,
         image::Rgb([255, 0, 0]),
     ));
-    let ov = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+    let ov = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
         1,
         16384,
         image::Rgb([0, 0, 255]),
-    ));
+    )));
     let ctx = ProcessContext::default();
     let err = blend_overlay(
         &ctx,
@@ -7266,7 +7370,11 @@ fn overlay_scaling_is_charged_against_the_pixel_budget() {
     assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
     assert!(err.to_string().contains("pixel limit"), "{err}");
     // A scale inside the budget still blends.
-    let small = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255])));
+    let small = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        4,
+        4,
+        image::Rgb([0, 0, 255]),
+    )));
     let out = blend_overlay(
         &ctx,
         &base,
@@ -7288,7 +7396,11 @@ fn overlay_blend_honors_the_deadline() {
     // completion past it.
     let base =
         DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb([255, 0, 0])));
-    let ov = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb([0, 0, 255])));
+    let ov = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        64,
+        64,
+        image::Rgb([0, 0, 255]),
+    )));
     let ctx = ProcessContext {
         deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         ..Default::default()
@@ -7345,6 +7457,644 @@ fn unresolved_watermark_is_an_error() {
         )
         .unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+}
+
+#[test]
+fn a_watermark_past_the_deadline_times_out() {
+    // Issue #604: the overlay filter checked the deadline per
+    // row of its composite, but the watermark filter passed a
+    // no-op check, so its composite always ran to the end.
+    // Both check before they copy anything now, and per row
+    // as they blend, so a filter that starts past the
+    // deadline returns `Timeout` and draws nothing.
+    let map = watermark_map();
+    let ctx = ProcessContext {
+        watermarks: Some(&map),
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let filters = [
+        Filter::Watermark {
+            url: "wm".to_string(),
+            x: 0,
+            y: 0,
+            alpha: 100,
+        },
+        Filter::Overlay {
+            url: "wm".to_string(),
+            x: 0,
+            y: 0,
+            alpha: 100,
+            blend: crate::url::BlendMode::Multiply,
+            width: None,
+        },
+        Filter::Overlay {
+            url: "wm".to_string(),
+            x: 0,
+            y: 0,
+            alpha: 100,
+            blend: crate::url::BlendMode::Normal,
+            width: Some(50),
+        },
+    ];
+    let ops = [Operation::Filters(filters.to_vec())];
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let mut chain = ChainState::new(&ops, None, 1.0, &ctx, &directives, None);
+    let base =
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(20, 20, image::Rgb([255, 0, 0])));
+    for filter in &filters {
+        match chain.apply_filter(base.clone(), filter) {
+            Err(EngineError::Timeout) => {}
+            Ok(_) => panic!("{filter:?} ran past its deadline"),
+            Err(e) => panic!("{filter:?} failed with {e:?}, not Timeout"),
+        }
+    }
+    // Nothing was copied: the deadline is checked before the
+    // copy, not only per row of the blend after it.
+    assert_eq!(map["wm"].conversions(), 0);
+}
+
+#[test]
+fn composite_walks_only_the_rows_that_land_on_the_base() {
+    // Issue #604: the composite visited every row and column
+    // of the top image and skipped a pixel only after placing
+    // it, so a large watermark placed off the canvas paid for
+    // the whole walk. It walks only the rows and columns that
+    // land on the base now. A top image off the canvas walks
+    // none and returns the base as it was, in RGBA as before.
+    let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        20,
+        10,
+        image::Rgb([10, 20, 30]),
+    ));
+    let top = image::RgbaImage::from_pixel(8, 6, image::Rgba([200, 100, 50, 255]));
+    let walk = |at: (i32, i32)| {
+        let mut rows = 0;
+        let Ok(out) = composite(
+            &base,
+            &top,
+            at,
+            100,
+            || {
+                rows += 1;
+                Ok::<(), std::convert::Infallible>(())
+            },
+            |_, o| o,
+        );
+        (rows, out)
+    };
+    let off_canvas = [
+        (20, 0),
+        (0, 10),
+        (-20, 0),
+        (0, -10),
+        (-25, 3),
+        (3, 25),
+        (100_000, 100_000),
+        (-100_000, -100_000),
+        (i32::MAX, i32::MIN),
+        (i32::MIN, i32::MAX),
+    ];
+    for at in off_canvas {
+        let (rows, out) = walk(at);
+        assert_eq!(rows, 0, "rows walked at {at:?}");
+        assert_eq!(out, DynamicImage::ImageRgba8(base.to_rgba8()), "{at:?}");
+    }
+    // Partly on the canvas, only the rows that land are
+    // walked: a negative y anchors the top's bottom edge
+    // that far above the base's bottom edge.
+    for (at, want) in [
+        ((0, 0), 6),
+        ((0, 7), 3),
+        ((0, 9), 1),
+        ((0, -1), 6),
+        ((0, -8), 2),
+        ((0, -9), 1),
+        ((-1, 0), 6),
+        ((19, 4), 6),
+        ((-19, -9), 1),
+    ] {
+        assert_eq!(walk(at).0, want, "rows walked at {at:?}");
+    }
+}
+
+/// The composite as it was before issue #604, kept as the
+/// reference the current one must match byte for byte.
+fn composite_before_604<E>(
+    base: &DynamicImage,
+    top: &image::RgbaImage,
+    (x, y): (i32, i32),
+    alpha: u8,
+    mut each_row: impl FnMut() -> Result<(), E>,
+    blend: impl Fn(f32, f32) -> f32,
+) -> Result<DynamicImage, E> {
+    let mut out = base.to_rgba8();
+    let left = if x >= 0 {
+        x as i64
+    } else {
+        out.width() as i64 - top.width() as i64 + x as i64
+    };
+    let upper = if y >= 0 {
+        y as i64
+    } else {
+        out.height() as i64 - top.height() as i64 + y as i64
+    };
+    let opacity = alpha as f32 / 100.0;
+    let (bw, bh) = (out.width() as i64, out.height() as i64);
+    for ty in 0..top.height() as i64 {
+        each_row()?;
+        for tx in 0..top.width() as i64 {
+            let (bx, by) = (left + tx, upper + ty);
+            if bx < 0 || by < 0 || bx >= bw || by >= bh {
+                continue;
+            }
+            let top_px = top.get_pixel(tx as u32, ty as u32);
+            let a = opacity * (top_px[3] as f32 / 255.0);
+            if a <= 0.0 {
+                continue;
+            }
+            let bot = out.get_pixel_mut(bx as u32, by as u32);
+            for c in 0..3 {
+                let blended = blend(bot[c] as f32, top_px[c] as f32);
+                bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
+            }
+        }
+    }
+    Ok(DynamicImage::ImageRgba8(out))
+}
+
+#[test]
+fn composite_matches_the_composite_before_issue_604() {
+    // Issue #604 changed which pixels the composite visits,
+    // not what it writes: every watermark and overlay that
+    // drew before draws the same bytes. Checked against the
+    // old loop at every offset that puts the top image
+    // inside, across an edge, and past each edge of the base,
+    // for bases with and without alpha, tops smaller and
+    // larger than the base, and every blend mode.
+    use crate::url::BlendMode;
+    let bases = [
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(13, 9, |x, y| {
+            image::Rgb([(x * 19) as u8, (y * 27) as u8, ((x + y) * 7) as u8])
+        })),
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(9, 13, |x, y| {
+            image::Rgba([
+                (x * 29) as u8,
+                (200 - y * 9) as u8,
+                (x * y * 5) as u8,
+                ((x * y * 11) % 256) as u8,
+            ])
+        })),
+        DynamicImage::ImageLuma8(image::GrayImage::from_fn(7, 7, |x, y| {
+            image::Luma([(x * 31 + y * 5) as u8])
+        })),
+    ];
+    let tops = [
+        image::RgbaImage::from_fn(5, 4, |x, y| {
+            image::Rgba([(x * 50) as u8, (y * 60) as u8, 200, ((x + y) * 40) as u8])
+        }),
+        image::RgbaImage::from_fn(15, 11, |x, y| {
+            image::Rgba([(x * 17) as u8, 90, (y * 23) as u8, (255 - x * y) as u8])
+        }),
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255])),
+    ];
+    let looks = [
+        (100, BlendMode::Normal),
+        (37, BlendMode::Multiply),
+        (64, BlendMode::Screen),
+        (81, BlendMode::Overlay),
+        (0, BlendMode::Normal),
+    ];
+    let mut offsets: Vec<(i32, i32)> = Vec::new();
+    for x in -20..=20 {
+        for y in -16..=16 {
+            offsets.push((x, y));
+        }
+    }
+    offsets.extend([
+        (i32::MAX, 0),
+        (0, i32::MAX),
+        (i32::MIN, 0),
+        (0, i32::MIN),
+        (i32::MIN, i32::MIN),
+    ]);
+    let no_check = || Ok::<(), std::convert::Infallible>(());
+    for base in &bases {
+        for top in &tops {
+            for &at in &offsets {
+                for (alpha, mode) in looks {
+                    let blend = |b, o| blend_channel(mode, b, o);
+                    let Ok(want) = composite_before_604(base, top, at, alpha, no_check, blend);
+                    let Ok(got) = composite(base, top, at, alpha, no_check, blend);
+                    assert!(
+                        got == want,
+                        "{:?} base {}x{}, top {}x{}, at {at:?}, alpha {alpha}, {mode:?}",
+                        base.color(),
+                        base.width(),
+                        base.height(),
+                        top.width(),
+                        top.height(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An animated GIF of `n` 40x20 frames, each its own color.
+fn animated_gif_of(n: u32) -> Vec<u8> {
+    let delay = image::Delay::from_numer_denom_ms(100, 1);
+    let frames: Vec<image::Frame> = (0..n)
+        .map(|i| {
+            let color = image::Rgba([(i * 60) as u8, 200 - (i * 40) as u8, 90, 255]);
+            image::Frame::from_parts(image::RgbaImage::from_pixel(40, 20, color), 0, 0, delay)
+        })
+        .collect();
+    let mut out = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut out)
+        .encode_frames(frames)
+        .unwrap();
+    out
+}
+
+#[test]
+fn an_animated_source_converts_its_watermark_once() {
+    // Issue #604: the filter runs once per frame, and every
+    // run copied the whole watermark to RGBA first. Each part
+    // that lands is copied once per request now, when a frame
+    // first draws it there. A watermark that is RGBA already
+    // is read in place, and one that lands off the canvas is
+    // never copied at all.
+    use crate::url::BlendMode;
+    let engine = Engine;
+    let rgb =
+        || DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255])));
+    let mut map = WatermarkImages::new();
+    map.insert("rgb".to_string(), WatermarkImage::new(rgb()));
+    map.insert(
+        "rgba".to_string(),
+        WatermarkImage::new(DynamicImage::ImageRgba8(rgb().to_rgba8())),
+    );
+    map.insert("off".to_string(), WatermarkImage::new(rgb()));
+    map.insert("off-overlay".to_string(), WatermarkImage::new(rgb()));
+    map.insert(
+        "big".to_string(),
+        WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            300,
+            200,
+            image::Rgb([0, 255, 0]),
+        ))),
+    );
+    let watermark = |url: &str, x, y| Filter::Watermark {
+        url: url.to_string(),
+        x,
+        y,
+        alpha: 100,
+    };
+    let overlay = |url: &str, x, y, blend| Filter::Overlay {
+        url: url.to_string(),
+        x,
+        y,
+        alpha: 100,
+        blend,
+        width: None,
+    };
+    let ops = [Operation::Filters(vec![
+        watermark("big", 30, 15),
+        watermark("big", -1, -1),
+        watermark("rgb", 0, 0),
+        watermark("rgb", -1, -1),
+        overlay("rgb", 3, 3, BlendMode::Screen),
+        overlay("rgba", 5, 5, BlendMode::Multiply),
+        watermark("off", 40, 0),
+        overlay("off-overlay", 0, -20, BlendMode::Screen),
+    ])];
+    let out = engine
+        .process_preferred(
+            &animated_gif_of(4),
+            &ops,
+            ProcessContext {
+                watermarks: Some(&map),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(out.format, ImageFormat::Gif);
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(frames.len(), 4);
+    assert_eq!(
+        frames[3].buffer().get_pixel(0, 0),
+        &image::Rgba([0, 0, 255, 255])
+    );
+    assert_eq!(map["rgb"].conversions(), 1);
+    assert_eq!(map["rgba"].conversions(), 0);
+    assert_eq!(map["off"].conversions(), 0);
+    assert_eq!(map["off-overlay"].conversions(), 0);
+    // An image drawn in two places copies the part that lands
+    // at each once, not once per frame.
+    assert_eq!(map["big"].conversions(), 2);
+    assert_eq!(map["big"].copied_pixels(), 10 * 5 + 39 * 19);
+}
+
+#[test]
+fn a_partly_visible_watermark_copies_only_the_part_that_lands() {
+    // Issue #604: a watermark that did not decode as RGBA was
+    // copied whole, on every frame, however little of it
+    // landed on the image. Only the part that lands is copied
+    // now, once, and kept for the frames after it. A part
+    // that no kept copy covers is copied and kept too, and a
+    // kept copy that a new part covers is dropped.
+    let ctx = ProcessContext::default();
+    let base =
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 20, image::Rgb([255, 0, 0])));
+    let wm = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        300,
+        200,
+        image::Rgb([0, 0, 255]),
+    )));
+    // At (30, 15) its 10x5 corner lands.
+    for _ in 0..3 {
+        let out = overlay_watermark(&ctx, &base, &wm, 30, 15, 100)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(out.get_pixel(30, 15), &image::Rgb([0, 0, 255]));
+        assert_eq!(out.get_pixel(39, 19), &image::Rgb([0, 0, 255]));
+        assert_eq!(out.get_pixel(29, 19), &image::Rgb([255, 0, 0]));
+    }
+    assert_eq!(wm.kept_parts(), [((0, 0, 10, 5), (10, 5))]);
+    assert_eq!(wm.conversions(), 1);
+    assert_eq!(wm.copied_pixels(), 10 * 5);
+    // A part inside the kept one is read from it.
+    overlay_watermark(&ctx, &base, &wm, 35, 17, 100).unwrap();
+    assert_eq!(wm.conversions(), 1);
+    // At (-1, -1) a 39x19 part of its bottom-right corner
+    // lands, which the kept copy does not cover. It is copied
+    // once and kept beside the first.
+    for _ in 0..3 {
+        overlay_watermark(&ctx, &base, &wm, -1, -1, 100).unwrap();
+    }
+    assert_eq!(
+        wm.kept_parts(),
+        [((0, 0, 10, 5), (10, 5)), ((261, 181, 39, 19), (39, 19))]
+    );
+    assert_eq!(wm.conversions(), 2);
+    assert_eq!(wm.copied_pixels(), 10 * 5 + 39 * 19);
+    // At (0, 0) a 40x20 part lands, which covers the first
+    // kept copy, so that copy is dropped.
+    overlay_watermark(&ctx, &base, &wm, 0, 0, 100).unwrap();
+    assert_eq!(
+        wm.kept_parts(),
+        [((261, 181, 39, 19), (39, 19)), ((0, 0, 40, 20), (40, 20))]
+    );
+    assert_eq!(wm.conversions(), 3);
+    assert_eq!(wm.copied_pixels(), 10 * 5 + 39 * 19 + 40 * 20);
+    // An RGBA watermark is read in place.
+    let rgba = WatermarkImage::new(DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        300,
+        200,
+        image::Rgba([0, 0, 255, 255]),
+    )));
+    overlay_watermark(&ctx, &base, &rgba, 30, 15, 100).unwrap();
+    assert_eq!(rgba.conversions(), 0);
+}
+
+#[test]
+fn a_watermark_keeps_at_most_one_copy_of_itself() {
+    // Issue #604: the kept copies of one watermark hold at
+    // most as many pixels as the whole image, the RGBA copy
+    // the decode budget charges for it (issue #613). A part
+    // past that is copied each time it is drawn, and draws
+    // the same bytes.
+    let ctx = ProcessContext::default();
+    let base = DynamicImage::ImageRgb8(image::RgbImage::from_fn(40, 20, |x, y| {
+        image::Rgb([(x * 6) as u8, (y * 12) as u8, 77])
+    }));
+    let top = DynamicImage::ImageRgb8(image::RgbImage::from_fn(50, 10, |x, y| {
+        image::Rgb([(x * 5) as u8, 200, (y * 25) as u8])
+    }));
+    let wm = WatermarkImage::new(top.clone());
+    let rgba = top.to_rgba8();
+    let draw = |x, y| {
+        let no_check = || Ok::<(), std::convert::Infallible>(());
+        let Ok(want) = composite_before_604(&base, &rgba, (x, y), 60, no_check, |_, o| o);
+        assert_eq!(
+            overlay_watermark(&ctx, &base, &wm, x, y, 60).unwrap(),
+            want,
+            "at ({x}, {y})"
+        );
+    };
+    // At (0, 0) a 40x10 part lands, 400 of the 500 pixels.
+    draw(0, 0);
+    assert_eq!(wm.kept_parts(), [((0, 0, 40, 10), (40, 10))]);
+    // At (-1, 0) a 39x10 part lands. Kept with the first, the
+    // copies would hold 790 pixels, so it is not kept, and
+    // each draw copies it again.
+    for _ in 0..3 {
+        draw(-1, 0);
+    }
+    assert_eq!(wm.kept_parts(), [((0, 0, 40, 10), (40, 10))]);
+    assert_eq!(wm.conversions(), 4);
+    assert_eq!(wm.copied_pixels(), 400 + 3 * 390);
+    // A part inside the kept one is still read from it.
+    draw(10, 0);
+    assert_eq!(wm.conversions(), 4);
+}
+
+#[test]
+fn landing_does_not_depend_on_the_top_size() {
+    // The overlay skips its resize when nothing would land,
+    // before it knows the scaled size (issue #604). That
+    // holds only because whether anything lands does not
+    // depend on the top's size.
+    for base in [(1, 1), (13, 9), (9, 13)] {
+        for x in -30..=30 {
+            for y in -30..=30 {
+                for top in [(1, 1), (5, 3), (3, 5), (13, 9), (40, 40)] {
+                    assert_eq!(
+                        landing(base, top, (x, y)).is_some(),
+                        lands_on(base, (x, y)),
+                        "base {base:?}, top {top:?}, at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
+    // The filters read only the part of the image that lands
+    // now, from a copy of that part when the image is not
+    // RGBA (issue #604). They must still write the old bytes:
+    // those of the old loop over the whole image converted to
+    // RGBA. Checked for each kind of pixel, at offsets inside,
+    // across and past each edge, with one image kept across
+    // all the offsets as a request keeps it, with a fresh one
+    // each time, and through `overlay(...,width)`.
+    use crate::url::BlendMode;
+    let ctx = ProcessContext::default();
+    let bases = [
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(13, 9, |x, y| {
+            image::Rgb([(x * 19) as u8, (y * 27) as u8, ((x + y) * 7) as u8])
+        })),
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(9, 13, |x, y| {
+            image::Rgba([
+                (x * 29) as u8,
+                (200 - y * 9) as u8,
+                40,
+                ((x * y * 11) % 256) as u8,
+            ])
+        })),
+    ];
+    let tops = [
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(6, 5, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 50) as u8, 120])
+        })),
+        DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_fn(5, 7, |x, y| {
+            image::LumaA([(x * 50) as u8, ((x + y) * 30) as u8])
+        })),
+        DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(7, 4, |x, y| {
+            image::Rgba([
+                (x * 9000) as u16,
+                (y * 15000) as u16,
+                777,
+                ((x + y) * 6000) as u16,
+            ])
+        })),
+        DynamicImage::ImageRgb32F(image::ImageBuffer::from_fn(4, 6, |x, y| {
+            image::Rgb([x as f32 / 4.0, y as f32 / 6.0, 0.7])
+        })),
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(5, 5, |x, y| {
+            image::Rgba([(x * 60) as u8, 30, (y * 60) as u8, ((x * y) * 15) as u8])
+        })),
+    ];
+    let no_check = || Ok::<(), std::convert::Infallible>(());
+    for base in &bases {
+        for top in &tops {
+            let kept = WatermarkImage::new(top.clone());
+            let rgba = top.to_rgba8();
+            let target = (base.width() * 150 / 100).max(1);
+            let scaled = top
+                .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
+            for x in -16..=16 {
+                for y in -16..=16 {
+                    let at = format!("{:?} on {:?} at ({x}, {y})", top.color(), base.color());
+                    let Ok(want) =
+                        composite_before_604(base, &rgba, (x, y), 70, no_check, |_, o| o);
+                    assert_eq!(
+                        overlay_watermark(&ctx, base, &kept, x, y, 70).unwrap(),
+                        want,
+                        "{at}"
+                    );
+                    let fresh = WatermarkImage::new(top.clone());
+                    assert_eq!(
+                        overlay_watermark(&ctx, base, &fresh, x, y, 70).unwrap(),
+                        want,
+                        "{at}"
+                    );
+                    let overlay = |b, o| blend_channel(BlendMode::Overlay, b, o);
+                    let Ok(want) = composite_before_604(base, &rgba, (x, y), 55, no_check, overlay);
+                    let got = blend_overlay(&ctx, base, &kept, x, y, 55, BlendMode::Overlay, None);
+                    assert_eq!(got.unwrap(), want, "{at}");
+                    let screen = |b, o| blend_channel(BlendMode::Screen, b, o);
+                    let Ok(want) =
+                        composite_before_604(base, &scaled, (x, y), 90, no_check, screen);
+                    let got =
+                        blend_overlay(&ctx, base, &kept, x, y, 90, BlendMode::Screen, Some(150));
+                    assert_eq!(got.unwrap(), want, "{at}, scaled");
+                }
+            }
+        }
+    }
+}
+
+/// `png` with its pixel data zeroed: the header still states
+/// the size, but the image no longer decodes.
+fn png_without_pixels(png: &[u8]) -> Vec<u8> {
+    let mut out = png.to_vec();
+    let at = out.windows(4).position(|w| w == b"IDAT").unwrap();
+    let len = u32::from_be_bytes(out[at - 4..at].try_into().unwrap()) as usize;
+    out[at + 4..at + 4 + len].fill(0);
+    out
+}
+
+#[test]
+fn watermark_decoding_holds_to_one_budget() {
+    // Issue #613: every watermark and overlay image a request
+    // names was decoded before the render and held to its
+    // end, with a bound on each image but none on their sum.
+    // They share one budget now. Each image is charged its
+    // decoded bytes plus the RGBA copy the composite reads
+    // when it is not RGBA already. An image that would pass
+    // the budget is refused from the size its header
+    // declares, before it decodes, and the deadline is
+    // checked before each decode.
+    const RGBA: u64 = 32 * 32 * 4;
+    const RGB: u64 = 32 * 32 * 3 + RGBA;
+    let rgba = png_bytes(&DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        32,
+        32,
+        image::Rgba([0, 0, 255, 128]),
+    )));
+    let rgb = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        32,
+        32,
+        image::Rgb([0, 0, 255]),
+    )));
+    let broken = png_without_pixels(&rgba);
+    let sources = |list: &[(&str, &[u8])]| -> Vec<(String, Vec<u8>)> {
+        list.iter()
+            .map(|(url, bytes)| (url.to_string(), bytes.to_vec()))
+            .collect()
+    };
+    let both = sources(&[("a", &rgba), ("b", &rgb)]);
+    let images = decode_watermarks_within(&both, None, RGBA + RGB).unwrap();
+    assert_eq!(images.len(), 2);
+    assert_eq!(images["a"].held_bytes(), RGBA);
+    assert_eq!(images["b"].held_bytes(), RGB);
+    assert_eq!(
+        decode_watermarks_within(&both, None, RGBA + RGB - 1).unwrap_err(),
+        EngineError::Unsupported(format!(
+            "watermark and overlay images would hold {} bytes decoded, over the {} byte limit",
+            RGBA + RGB,
+            RGBA + RGB - 1
+        ))
+    );
+    // These pixels would not decode, so the budget's refusal
+    // shows the image was refused before its decode ran.
+    let err = decode_watermarks_within(
+        &sources(&[("a", &rgba), ("b", &broken)]),
+        None,
+        2 * RGBA - 1,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::Unsupported(format!(
+            "watermark and overlay images would hold {} bytes decoded, over the {} byte limit",
+            2 * RGBA,
+            2 * RGBA - 1
+        ))
+    );
+    let err = decode_watermarks_within(&sources(&[("b", &broken)]), None, u64::MAX).unwrap_err();
+    assert!(matches!(err, EngineError::Decode(_)), "{err:?}");
+    // Every URL is an image of its own, so each `?v=`
+    // variant of one object is charged.
+    let variants = sources(&[("wm.png?v=0", &rgba), ("wm.png?v=1", &rgba)]);
+    assert!(decode_watermarks_within(&variants, None, 2 * RGBA).is_ok());
+    assert!(decode_watermarks_within(&variants, None, 2 * RGBA - 1).is_err());
+    // Past the deadline nothing more decodes.
+    let past = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    assert_eq!(
+        decode_watermarks_within(&sources(&[("b", &broken)]), past, u64::MAX).unwrap_err(),
+        EngineError::Timeout
+    );
+    // The server's budget holds the largest image the decode
+    // limits admit together with its RGBA copy, so a single
+    // watermark that decoded before still does.
+    assert_eq!(MAX_WATERMARK_BYTES, 2 * MAX_DECODE_ALLOC);
+    assert_eq!(decode_watermarks(&both, None).unwrap().len(), 2);
 }
 
 /// A mask provider with a fixed answer: the left half is
@@ -7964,6 +8714,185 @@ fn a_filters_segment_checks_the_deadline_between_filters() {
         .expect_err("the segment must stop at the deadline");
     assert_eq!(err, EngineError::Timeout);
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Run `work` on a thread of its own and wait for it until
+/// `limit`, so a deadline test that overruns fails at the
+/// limit instead of waiting minutes for the work to end.
+fn finished_by<T: Send + 'static>(
+    limit: std::time::Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    let wait = limit.saturating_duration_since(std::time::Instant::now());
+    rx.recv_timeout(wait)
+        .unwrap_or_else(|_| panic!("still running {wait:?} after the test began waiting"))
+}
+
+/// How long past its deadline a render may run: the grace
+/// the server waits before it answers `504` and detaches
+/// the job (`DEADLINE_GRACE`).
+const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[test]
+fn a_blur_past_the_deadline_times_out() {
+    // Issue #614: a blur ran as one call that checked no
+    // deadline, so blur(512) on a large canvas ran for
+    // minutes past it while its lane permit stayed held.
+    // The blur now checks the deadline before each row and
+    // the render answers its own Timeout within the grace.
+    // Six blurs, so the work outlasts the deadline in an
+    // optimized build too, where one blur(512) of this image
+    // takes about 0.6 s.
+    let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Blur(512.0); 6])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+#[test]
+fn a_deep_blur_past_the_deadline_times_out() {
+    // Issue #614: a 16-bit PNG stays 16-bit through decode
+    // and resize, and its blur ran as one call to the image
+    // crate, on one core, that no deadline could stop. It
+    // now takes the banded passes and their row checks too.
+    let src = png_bytes(&DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x * 81) as u16, (y * 81) as u16, ((x + y) * 40) as u16]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Blur(512.0); 6])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+#[test]
+fn a_text_label_past_the_deadline_times_out() {
+    // Issue #606: a label was drawn in one call that checked
+    // no deadline, every glyph rasterized whether it landed
+    // or not. The parser caps the label now, but the engine
+    // takes any filter it is given, so the renderer checks
+    // the deadline between glyphs as well. Two million
+    // glyphs, so the draw outlasts the grace even though it
+    // skips the glyphs that land off this 20x20 image.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let result = finished_by(deadline + GRACE, move || {
+        let font = crate::text::FontRenderer::from_bytes(
+            include_bytes!("../../tests/fixtures/font.ttf").to_vec(),
+        )
+        .unwrap();
+        let ctx = ProcessContext {
+            text_renderer: Some(&font),
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &red_source(),
+            &[Operation::Filters(vec![Filter::Text {
+                text: "W".repeat(2_000_000),
+                size: 1000,
+                color: [255, 255, 255, 255],
+                anchor: crate::url::Anchor::TopLeft,
+            }])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+/// Finds one face over the whole image, after taking longer
+/// than the deadline tests give the render.
+#[derive(Debug)]
+struct SlowWholeFace;
+
+impl crate::ai::FaceProvider for SlowWholeFace {
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Ok(vec![crate::ai::FaceBox {
+            x: 0,
+            y: 0,
+            w: img.width(),
+            h: img.height(),
+            score: 0.9,
+        }])
+    }
+}
+
+#[test]
+fn a_blurred_pad_stops_at_the_deadline() {
+    // Issue #614: the ambient fill of `pad:...:blur` blurs the
+    // whole canvas at a sigma up to 80, through the same
+    // banded passes, so it checks the deadline before each
+    // row too. A deadline still ahead pads as none does.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 32, |x, y| {
+        image::Rgb([(x * 4) as u8, (y * 8) as u8, 1])
+    }));
+    let past = Some(std::time::Instant::now());
+    let err = apply_pad(img.clone(), 400, 400, PadFill::Blur, None, None, past)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err, EngineError::Timeout);
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    let (padded, placed) =
+        apply_pad(img.clone(), 400, 400, PadFill::Blur, None, None, ahead).unwrap();
+    let (unbounded, placed_unbounded) =
+        apply_pad(img, 400, 400, PadFill::Blur, None, None, None).unwrap();
+    assert_eq!(placed, placed_unbounded);
+    assert_eq!(
+        padded.to_rgba8().into_raw(),
+        unbounded.to_rgba8().into_raw()
+    );
+}
+
+#[test]
+fn a_face_blur_past_the_deadline_times_out() {
+    // Issue #614: the face blur's sigma follows the face
+    // (an 800 px face blurs at sigma 133), and nothing
+    // checked the deadline between the detection and the
+    // blur. The detection here ends past the deadline; the
+    // blur stops at its first row.
+    let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 7]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            face_provider: Some(&SlowWholeFace),
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(&src, &[Operation::Filters(vec![Filter::BlurFaces])], ctx)
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
 }
 
 #[test]
@@ -9849,7 +10778,8 @@ impl crate::text::TextRenderer for MarkerRenderer {
         _size: u32,
         _color: [u8; 4],
         _anchor: crate::url::Anchor,
-    ) -> Result<DynamicImage, String> {
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<DynamicImage, crate::text::DrawError> {
         let mut out = img.to_rgba8();
         out.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
         Ok(DynamicImage::ImageRgba8(out))

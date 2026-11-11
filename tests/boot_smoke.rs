@@ -252,6 +252,261 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
     assert!(!stderr.contains("proxy"), "{stderr}");
 }
 
+/// Boot with a minimal environment plus `env` and expect
+/// the boot to fail: the exit code is 1, nothing listens,
+/// and the result is what the server wrote to stderr. A
+/// boot that serves instead fails the test at the deadline.
+fn refused_boot(env: &[(&str, &str)]) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+    command
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+        .env("PORT", "0");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = ServerGuard::new(child);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "booted with {env:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let _ = server.0.stdout.take().unwrap().read_to_string(&mut stdout);
+    let _ = server.0.stderr.take().unwrap().read_to_string(&mut stderr);
+    assert_eq!(status.code(), Some(1), "{env:?}: {stderr}");
+    assert!(!stdout.contains("crabcrop listening"), "{env:?}: {stdout}");
+    stderr
+}
+
+#[test]
+fn placeholder_secrets_from_the_docs_stop_the_boot() {
+    // Issue #588: the README, the VM and Container Apps
+    // recipes and the compose metrics line shipped these
+    // values, and each one booted. Boot now refuses each, and
+    // the error names the variable but never the value.
+    let secret = ("CRABCROP_SECRET", "boot-smoke-secret-0123456789");
+    let cases: [(&str, &str); 6] = [
+        ("CRABCROP_SECRET", "your-secret-change-me"),
+        ("CRABCROP_SECRET", "replace-with-a-long-random-value"),
+        ("CRABCROP_SECRET", "REPLACE_ME_signing_secret"),
+        ("CRABCROP_SECRET", "local-dev-secret"),
+        ("CRABCROP_SECRET_PREVIOUS", "your-secret-change-me"),
+        (
+            "CRABCROP_METRICS_TOKEN",
+            "CHANGE-ME-generate-with-openssl-rand-hex-32",
+        ),
+    ];
+    for (var, value) in cases {
+        let env = if var == "CRABCROP_SECRET" {
+            vec![(var, value)]
+        } else {
+            vec![secret, (var, value)]
+        };
+        let stderr = refused_boot(&env);
+        assert!(
+            stderr.starts_with(&format!("crabcrop: {var} is a placeholder")),
+            "{var}: {stderr}"
+        );
+        assert!(!stderr.contains(value), "{var}: {stderr}");
+    }
+}
+
+#[test]
+fn a_short_metrics_token_warns_at_boot_and_still_serves() {
+    // Issue #588: a metrics token only had to be non-empty.
+    // Under 16 bytes it warns for this release; a later one
+    // refuses it. The warning never quotes the token.
+    let stderr = boot_stderr(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]);
+    assert!(
+        stderr.contains("warning: CRABCROP_METRICS_TOKEN is 15 bytes"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("fifteen-bytes!!"), "{stderr}");
+    let stderr = boot_stderr(&[("CRABCROP_METRICS_TOKEN", "sixteen-bytes!!!")]);
+    assert!(!stderr.contains("CRABCROP_METRICS_TOKEN"), "{stderr}");
+}
+
+#[test]
+fn a_blank_allowed_sources_stops_the_boot_naming_the_variable() {
+    // Issue #590: a set value with no host in it read as no
+    // allowlist, so a template whose host variable was empty
+    // let every public host through without a word.
+    for blank in ["", " ", ",", "."] {
+        let stderr = refused_boot(&[("CRABCROP_ALLOWED_SOURCES", blank)]);
+        assert!(
+            stderr.starts_with("crabcrop: CRABCROP_ALLOWED_SOURCES is set but names no host"),
+            "{blank:?}: {stderr}"
+        );
+    }
+    // The any-source opt-out does not make a blank list fine.
+    refused_boot(&[
+        ("CRABCROP_ALLOWED_SOURCES", ","),
+        ("CRABCROP_ALLOW_ANY_SOURCE", "1"),
+    ]);
+}
+
+/// Boot with a minimal environment plus `env`, and return
+/// the lines it printed to stdout before its listening
+/// line, and what it wrote to stderr while booting.
+fn boot_output(env: &[(&str, &str)]) -> (Vec<String>, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+    command
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let (mut server, _, _, printed) = common::serve_printing(&mut command);
+    let _ = server.0.kill();
+    let _ = server.0.wait();
+    (printed, server.stderr())
+}
+
+#[test]
+fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
+    // Issue #590: boot named no part of the request and
+    // source posture. One line now names the request mode,
+    // the source allowlist and the private-address check,
+    // and unsigned URLs with no allowlist warn on stderr.
+    let dir = common::scratch_dir("boot-posture");
+    let presets = dir.join("presets.conf");
+    std::fs::write(&presets, "thumb = 300x200\n").unwrap();
+    let presets = presets.to_str().unwrap();
+    let unsafe_on = ("CRABCROP_ALLOW_UNSAFE", "1");
+    let only_presets = ("CRABCROP_ONLY_PRESETS", "1");
+    let presets_file = ("CRABCROP_PRESETS_FILE", presets);
+    // The extra environment, the posture line, and the
+    // start of the one warning expected, if any.
+    type Case<'a> = (Vec<(&'a str, &'a str)>, &'a str, Option<&'a str>);
+    let cases: Vec<Case> = vec![
+        (
+            vec![],
+            "request mode: signed; source allowlist: none; private-address check: on",
+            None,
+        ),
+        (
+            vec![unsafe_on],
+            "request mode: unsafe; source allowlist: none; private-address check: on",
+            Some("warning: unsafe mode is on with no CRABCROP_ALLOWED_SOURCES"),
+        ),
+        (
+            vec![
+                unsafe_on,
+                (
+                    "CRABCROP_ALLOWED_SOURCES",
+                    "images.example.com, cdn.example.com",
+                ),
+            ],
+            "request mode: unsafe; source allowlist: 2 hosts; private-address check: on",
+            None,
+        ),
+        (
+            vec![unsafe_on, ("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+            "request mode: unsafe; source allowlist: none; private-address check: off",
+            Some("warning: unsafe mode is on with no CRABCROP_ALLOWED_SOURCES"),
+        ),
+        (
+            vec![unsafe_on, only_presets, presets_file],
+            "request mode: presets-only; source allowlist: none; private-address check: on",
+            Some("warning: presets-only mode takes unsigned URLs with no CRABCROP_ALLOWED_SOURCES"),
+        ),
+        (
+            vec![
+                unsafe_on,
+                only_presets,
+                presets_file,
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+            ],
+            "request mode: presets-only; source allowlist: 1 host; private-address check: on",
+            None,
+        ),
+        (
+            vec![only_presets, presets_file],
+            "request mode: signed presets-only; source allowlist: none; private-address check: on",
+            None,
+        ),
+        (
+            vec![("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+            "request mode: signed; source allowlist: none; private-address check: off",
+            None,
+        ),
+    ];
+    for (env, line, warning) in cases {
+        let (printed, stderr) = boot_output(&env);
+        let posture: Vec<&String> = printed
+            .iter()
+            .filter(|l| l.starts_with("request mode: "))
+            .collect();
+        assert_eq!(posture, [line], "{env:?}: {printed:#?}");
+        match warning {
+            Some(warning) => {
+                let warnings: Vec<&str> = stderr
+                    .lines()
+                    .filter(|l| l.starts_with("warning: "))
+                    .collect();
+                assert_eq!(warnings.len(), 1, "{env:?}: {stderr}");
+                assert!(warnings[0].starts_with(warning), "{env:?}: {stderr}");
+                // The existing proxy warning test reads "proxy"
+                // in stderr as its own warning.
+                assert!(!stderr.contains("proxy"), "{env:?}: {stderr}");
+            }
+            None => assert!(!stderr.contains("warning:"), "{env:?}: {stderr}"),
+        }
+    }
+}
+
+#[test]
+fn explain_off_answers_404_while_images_still_render() {
+    // Issue #591: `/explain` could not be turned off. With
+    // `CRABCROP_EXPLAIN=0` it answers 404, boot says so, and
+    // the image route serves as before. Unset, the report
+    // is served as it always was.
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let image = "/unsafe/40x30/file:///portrait.jpg";
+    let explain = format!("/explain{image}");
+    for (value, explain_status, says_off) in [(None, "200", false), (Some("0"), "404", true)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+        command
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("CRABCROP_ALLOW_UNSAFE", "1")
+            .env("CRABCROP_FILE_ROOT", fixtures);
+        if let Some(value) = value {
+            command.env("CRABCROP_EXPLAIN", value);
+        }
+        let (_server, port, _, printed) = common::serve_printing(&mut command);
+        let status = status_line(port, image, "");
+        assert!(status.contains("200"), "{value:?}: image {status:?}");
+        let status = status_line(port, &explain, "");
+        assert!(
+            status.contains(explain_status),
+            "{value:?}: explain {status:?}"
+        );
+        assert_eq!(
+            printed.iter().any(|l| l == "explain: off"),
+            says_off,
+            "{value:?}: {printed:#?}"
+        );
+    }
+    // A typo stops the boot and names the variable, rather
+    // than leaving the route on.
+    let stderr = refused_boot(&[("CRABCROP_EXPLAIN", "of")]);
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_EXPLAIN"),
+        "{stderr}"
+    );
+}
+
 /// A model file that exists, so a boot failure is about
 /// the runtime, never about a missing model, and the
 /// directory it lives in.
@@ -443,6 +698,68 @@ fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("crabcrop purge"), "{stdout}");
+}
+
+#[test]
+fn the_health_verb_probes_the_server_on_its_port() {
+    // Issue #592: the images' HEALTHCHECK ran curl, the one
+    // reason the runtime images carried it. `crabcrop health`
+    // probes 127.0.0.1 at the server's port and exits 0 for a
+    // 200, 1 otherwise, so the HEALTHCHECK runs it instead.
+    let (_server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789"),
+    );
+    let health = |vars: &[(&str, &str)]| {
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg("health")
+            .env_clear()
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap()
+    };
+    let port = port.to_string();
+    let out = health(&[("PORT", &port)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    // CRABCROP_PORT wins over PORT, as it does for the server.
+    let out = health(&[("CRABCROP_PORT", &port), ("PORT", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // CRABCROP_BIND=:: probes ::1, then 127.0.0.1 when the
+    // connection to ::1 fails. This server listens on IPv4
+    // only, so ::1 fails here as it does on a host with IPv6
+    // off on loopback, and the probe passes at 127.0.0.1.
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "::")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // `::1` named alone gets no second address: a server
+    // bound to it does not answer on 127.0.0.1.
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "::1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
+
+    // A port that never answers: the verb waits out its own
+    // 2 s timeout, then exits 1 with the error on stderr. The
+    // upper bound leaves room for a loaded runner; the cli.rs
+    // tests keep the timeout under the HEALTHCHECK's 3 s.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_port = silent.local_addr().unwrap().port().to_string();
+    let started = Instant::now();
+    let out = health(&[("PORT", &silent_port)]);
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(out.stdout.is_empty());
+    assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(10),
+        "{elapsed:?}"
+    );
+    drop(silent);
 }
 
 /// Boot with an empty CA bundle: on Linux the TLS verifier
@@ -971,6 +1288,22 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or_else(|| panic!("no shared tier error count: {metrics}"));
     assert!((1..=17).contains(&errors), "{metrics}");
+    // Issue #577: /metrics shows that the replica listed all 40
+    // and has read none of them, and when it listed them.
+    assert!(
+        metrics.contains("\ncrabcrop_cache_shared_tombstones_unread 40\n"),
+        "{metrics}"
+    );
+    let listed: f64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("crabcrop_cache_shared_tombstones_listed_timestamp_seconds "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no tombstone listing time: {metrics}"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!((now - listed).abs() < 60.0, "listed at {listed}, now {now}");
     let _ = server.0.kill();
     let _ = server.0.wait();
     let stderr = server.stderr();
@@ -984,4 +1317,424 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
         ),
         "{line}"
     );
+    // Issue #577: the line ends with the three tombstones not
+    // in force that began first, by name.
+    assert!(
+        line.ends_with(
+            "not in force until read: 40; oldest not in force: \
+             purges/1762000000000-0000000000000abc-0, \
+             purges/1762000000001-0000000000000abc-1, \
+             purges/1762000000002-0000000000000abc-2 and 37 more"
+        ),
+        "{line}"
+    );
+}
+
+/// A connection to the server on `port`.
+fn connect(port: u16) -> TcpStream {
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+}
+
+/// Read one response from `stream`, its head and a body of
+/// `Content-Length` bytes, and leave the connection open:
+/// the status line.
+fn read_response(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("closed before a response: {buf:?}"),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => panic!("no response: {e}"),
+        }
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let length: usize = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap())
+        })
+        .expect("a content-length");
+    while buf.len() < head_end + length {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("closed inside a body"),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => panic!("no body: {e}"),
+        }
+    }
+    head.lines().next().unwrap_or("").to_string()
+}
+
+/// One keep-alive `GET /health` on `stream`: the status
+/// line. The connection stays open.
+fn health_on(stream: &mut TcpStream) -> String {
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    read_response(stream)
+}
+
+/// Read from `stream` until the server closes it: how long
+/// that took, or `None` when it is still open after
+/// `within`. Bytes the server sends first are read past.
+fn wait_for_close(stream: &mut TcpStream, within: Duration) -> Option<Duration> {
+    let began = Instant::now();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let left = within.checked_sub(began.elapsed())?;
+        stream
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .unwrap();
+        match stream.read(&mut chunk) {
+            Ok(0) => return Some(began.elapsed()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return None;
+            }
+            // A reset is a close too.
+            Err(_) => return Some(began.elapsed()),
+        }
+    }
+}
+
+/// A server with a minimal environment plus `env`, once it
+/// listens: the server, its port, and its boot lines.
+fn serving(env: &[(&str, &str)]) -> (ServerGuard, u16, Vec<String>) {
+    let (server, port, _, printed) = common::serve_printing(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .envs(env.iter().copied()),
+    );
+    (server, port, printed)
+}
+
+#[test]
+fn a_connection_that_never_finishes_its_request_head_is_closed_at_the_header_timeout() {
+    // Issue #607: the server never set a timer on its
+    // connections, so one that sent nothing, stopped half
+    // way through a request head, or sent the head a byte at
+    // a time was held open for good, and a client could hold
+    // the process's whole file table that way. The header
+    // timeout counts from the connection's start, so bytes
+    // that keep arriving do not extend it.
+    let (_server, port, _) = serving(&[("CRABCROP_HEADER_TIMEOUT_SECS", "1")]);
+    let mut silent = connect(port);
+    let mut partial = connect(port);
+    partial
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .unwrap();
+    let mut drip = connect(port);
+    let mut writer = drip.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for byte in b"GET /health HTTP/1.1\r\nX-Slow: one byte at a time, five a second\r\n" {
+            if writer.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    for (name, stream) in [
+        ("silent", &mut silent),
+        ("partial head", &mut partial),
+        ("byte-at-a-time head", &mut drip),
+    ] {
+        assert!(
+            wait_for_close(stream, Duration::from_secs(10)).is_some(),
+            "the {name} connection is still open 10 s after it started, past a 1 s header timeout"
+        );
+    }
+    // The server still serves.
+    assert!(status_line(port, "/health", "").contains("200"));
+}
+
+#[test]
+fn an_idle_keep_alive_connection_is_closed_at_the_idle_timeout_and_not_before() {
+    // Issue #607: a keep-alive connection that went quiet
+    // after its response was held open for good. It now
+    // closes at the idle timeout, which is apart from the
+    // header timeout: an edge that keeps the connection in
+    // its pool past the header timeout still finds it open.
+    let (_server, port, _) = serving(&[
+        ("CRABCROP_HEADER_TIMEOUT_SECS", "1"),
+        ("CRABCROP_IDLE_TIMEOUT_SECS", "4"),
+    ]);
+    let mut stream = connect(port);
+    assert!(health_on(&mut stream).contains("200"));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        health_on(&mut stream).contains("200"),
+        "a connection idle past the header timeout but inside the idle timeout serves"
+    );
+    let closed = wait_for_close(&mut stream, Duration::from_secs(15));
+    let closed = closed.expect(
+        "the connection is still open 15 s after its last response, past a 4 s idle timeout",
+    );
+    assert!(
+        closed >= Duration::from_secs(3),
+        "closed {closed:?} after its last response, before the 4 s idle timeout"
+    );
+}
+
+#[test]
+fn at_the_connection_cap_a_new_connection_is_served_once_a_slot_frees() {
+    // Issue #607: nothing capped the open connections. At
+    // CRABCROP_MAX_CONNECTIONS the server stops accepting:
+    // a new connection waits in the kernel's queue, and is
+    // served as soon as an open one closes.
+    let (_server, port, _) = serving(&[("CRABCROP_MAX_CONNECTIONS", "2")]);
+    let mut first = connect(port);
+    assert!(health_on(&mut first).contains("200"));
+    let mut second = connect(port);
+    assert!(health_on(&mut second).contains("200"));
+    let mut third = connect(port);
+    third
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    third
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    match third.read(&mut byte) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        other => panic!("a third connection was answered with two open and a cap of 2: {other:?}"),
+    }
+    drop(first);
+    third
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(read_response(&mut third).contains("200"));
+    // The second is still served on its slot.
+    assert!(health_on(&mut second).contains("200"));
+}
+
+#[test]
+#[cfg(unix)]
+fn silent_connections_past_the_open_file_limit_do_not_shut_out_health() {
+    // Issue #607, as reproduced there: under a low open-file
+    // limit, connections that send nothing took every file
+    // descriptor and a fresh /health timed out for as long
+    // as they stayed. The default cap is three quarters of
+    // the limit, so the server keeps descriptors for its own
+    // work, and the header timeout frees the slots.
+    let (_server, port, _, printed) = common::serve_printing(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -n 64 && exec \"$0\"")
+            .arg(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("CRABCROP_HEADER_TIMEOUT_SECS", "2"),
+    );
+    let silent: Vec<TcpStream> = (0..80).map(|_| connect(port)).collect();
+    let mut fresh = connect(port);
+    fresh
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    fresh
+        .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = fresh.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.0 200"),
+        "/health with 80 silent connections open and a limit of 64 files: {response:?}"
+    );
+    drop(silent);
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("connections: ") && l.contains("at most 48 open")),
+        "{printed:#?}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn crabcrop_bind_listens_on_the_named_address_only() {
+    // Issue #592: the server always listened on every
+    // interface, so on a VM the port the proxy fronts was
+    // open to anyone who could reach the host. 127.0.0.2 is
+    // a loopback address on Linux that a listener on every
+    // interface answers on, and one on 127.0.0.1 does not.
+    let (_server, port, _) = serving(&[]);
+    assert!(
+        TcpStream::connect(("127.0.0.2", port)).is_ok(),
+        "by default the server listens on every IPv4 interface"
+    );
+    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+    assert!(status_line(port, "/health", "").contains("200"));
+    let refused = TcpStream::connect(("127.0.0.2", port)).map(|_| ());
+    assert_eq!(
+        refused.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::ConnectionRefused),
+        "CRABCROP_BIND=127.0.0.1 answers on 127.0.0.2"
+    );
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("connections: bind 127.0.0.1, ")),
+        "{printed:#?}"
+    );
+}
+
+#[test]
+fn health_probes_pass_under_the_tightest_connection_bounds() {
+    // Issues #592 and #607: the images' HEALTHCHECK runs
+    // `crabcrop health`, and the Kubernetes and platform
+    // recipes probe `GET /health` over HTTP. A probe sends
+    // its whole head at once and closes after the answer, so
+    // the smallest header and idle timeouts do not cut it
+    // off, and its slot frees when it closes: with a cap of
+    // one connection, probe after probe still passes.
+    let (_server, port, _) = serving(&[
+        ("CRABCROP_HEADER_TIMEOUT_SECS", "1"),
+        ("CRABCROP_IDLE_TIMEOUT_SECS", "1"),
+        ("CRABCROP_MAX_CONNECTIONS", "1"),
+    ]);
+    let started = Instant::now();
+    let port_text = port.to_string();
+    for _ in 0..3 {
+        let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg("health")
+            .env_clear()
+            .env("PORT", &port_text)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+    }
+    // A kubelet probe: HTTP/1.1 with `Connection: close`.
+    for _ in 0..3 {
+        let mut stream = connect(port);
+        stream
+            .write_all(
+                b"GET /health HTTP/1.1\r\nHost: 10.0.0.1:3000\r\nUser-Agent: kube-probe/1.31\r\n\
+                  Accept: */*\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(status_line(port, "/health", "").contains("200"));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_health_verb_probes_the_address_crabcrop_bind_names() {
+    // Issues #592 and #607: `crabcrop health` probed
+    // 127.0.0.1, and a server bound to one other address
+    // does not answer there, so the images' HEALTHCHECK
+    // failed on a healthy server. The verb reads
+    // CRABCROP_BIND as the server does and probes that
+    // address. 127.0.0.2 is a loopback address on Linux.
+    let (_server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+    let health = |vars: &[(&str, &str)]| {
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg("health")
+            .env_clear()
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap()
+    };
+    let port = port.to_string();
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "127.0.0.2")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    // Without the setting the verb probes 127.0.0.1, where
+    // this server does not listen.
+    let out = health(&[("PORT", &port)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
+    // A value the server refuses is an error here too.
+    let out = health(&[("PORT", &port), ("CRABCROP_BIND", "localhost")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_BIND: \"localhost\""),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn bad_connection_settings_stop_the_boot_naming_the_variable() {
+    // Issue #607 and #592: each new setting is checked at
+    // boot like the others. An empty CRABCROP_BIND, as a
+    // template with an unset value writes it, is refused
+    // rather than read as every interface.
+    let cases = [
+        (
+            "CRABCROP_BIND",
+            "localhost",
+            "crabcrop: CRABCROP_BIND must be an IP address",
+        ),
+        (
+            "CRABCROP_BIND",
+            "",
+            "crabcrop: CRABCROP_BIND must be an IP address",
+        ),
+        (
+            "CRABCROP_BIND",
+            "127.0.0.1:3000",
+            "crabcrop: CRABCROP_BIND must be an IP address",
+        ),
+        (
+            "CRABCROP_HEADER_TIMEOUT_SECS",
+            "0",
+            "crabcrop: CRABCROP_HEADER_TIMEOUT_SECS must be between 1 and 600",
+        ),
+        (
+            "CRABCROP_HEADER_TIMEOUT_SECS",
+            "601",
+            "crabcrop: CRABCROP_HEADER_TIMEOUT_SECS must be between 1 and 600",
+        ),
+        (
+            "CRABCROP_IDLE_TIMEOUT_SECS",
+            "0",
+            "crabcrop: CRABCROP_IDLE_TIMEOUT_SECS must be between 1 and 86400",
+        ),
+        (
+            "CRABCROP_MAX_CONNECTIONS",
+            "0",
+            "crabcrop: CRABCROP_MAX_CONNECTIONS must be between 1 and 1000000",
+        ),
+        (
+            "CRABCROP_MAX_CONNECTIONS",
+            "-1",
+            "crabcrop: invalid CRABCROP_MAX_CONNECTIONS",
+        ),
+    ];
+    for (var, value, error) in cases {
+        let stderr = refused_boot(&[(var, value)]);
+        assert!(stderr.starts_with(error), "{var}={value:?}: {stderr}");
+    }
 }

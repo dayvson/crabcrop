@@ -37,6 +37,16 @@ fast_image_resize = { version = "6.1", features = ["image"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 hmac = "0.13"
+# The accept loop (issue #607) serves each connection
+# itself, so it can close idle and half-sent connections
+# and cap how many are open: `axum::serve` sets no timer
+# and no cap. Both crates are already in the tree through
+# axum, and these features add no crate. HTTP/2 stays on:
+# `axum::serve` answered HTTP/2 with prior knowledge,
+# because other crates in the tree turn on its `http2`
+# feature.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 # Platform-independent cosine for thumbhash, so a placeholder is
 # the same bytes on every OS (the system libm differs in the last
 # bit between glibc and Apple). Already in the tree via image deps.

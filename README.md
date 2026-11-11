@@ -29,10 +29,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 ```bash
 docker pull ghcr.io/dayvson/crabcrop:0.11.0
 docker pull ghcr.io/dayvson/crabcrop-ai:0.11.0
-docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.11.0
+docker run -e CRABCROP_SECRET="$(openssl rand -hex 32)" -p 3000:3000 ghcr.io/dayvson/crabcrop:0.11.0
 ```
 
-A secret of at least 16 bytes is the only required configuration; the server will not start without one. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
+A secret of at least 16 bytes is the only required configuration; the server will not start without one, or with a placeholder from these docs. The command above makes a new secret on each run; to sign URLs, generate one once and keep it. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases).
 
@@ -40,10 +40,12 @@ A secret of at least 16 bytes is the only required configuration; the server wil
 
 ## Quickstart
 
-**1. Start the server.** For local development, also allow unsigned URLs:
+**1. Start the server.** Generate a secret, and for local development also allow unsigned URLs:
 
 ```bash
-CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 cargo run --release
+export CRABCROP_SECRET="$(openssl rand -hex 16)"
+echo "$CRABCROP_SECRET"   # keep it: step 3 signs with it
+CRABCROP_ALLOW_UNSAFE=1 cargo run --release
 # crabcrop listening on port 3000
 ```
 
@@ -55,13 +57,13 @@ curl "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg" --outp
 
 Replace `example.com/photo.jpg` with the URL of an image you control. You get back a 300x200 JPEG.
 
-**3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment:
+**3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment. In another shell, export the same `CRABCROP_SECRET` value (step 1 printed it), and `crabcrop sign` prints the signed URL:
 
 ```bash
-curl "http://localhost:3000/9e24ae8bf61c0d40cb6f1ca9f9e1d3e771f6c8bc8b8ab7270e6d15458d4c14ab/300x200/https://example.com/photo.jpg" --output photo.jpg
+curl "$(cargo run --release -q -- sign "300x200/https://example.com/photo.jpg")" --output photo.jpg
 ```
 
-That signature is HMAC-SHA256 of `300x200/https://example.com/photo.jpg` under the secret from step 1. The SDKs and the `crabcrop sign` command compute it for you; the full signing rules are in [URL grammar and signing](docs/url-grammar.md).
+The signature is HMAC-SHA256 of `300x200/https://example.com/photo.jpg` under the secret from step 1. The SDKs compute it too; the full signing rules are in [URL grammar and signing](docs/url-grammar.md).
 
 ## How requests work
 
@@ -127,7 +129,7 @@ This README is the front door. The full reference lives on the website and in th
 
 Build and sign URLs from code: `@crabcrop/url` for TypeScript, `crabcrop_url` for Python, and the `crabcrop-url` Rust crate, all running the same spec test vectors, so client and server cannot drift. Loaders and integrations cover Next.js, Nuxt, Hydrogen, Astro, and SvelteKit, plus a WordPress plugin. For coding agents, a first-party MCP server exposes signing, explaining, meta, and purge over the same surface. Details in [Clients and SDKs](docs/clients.md).
 
-The server binary doubles as its own operator CLI: `crabcrop sign`, `seal`, `unseal`, `explain`, `meta`, `purge`, `purge-group`, `upload`, and `convert-thumbor` run against a server (or offline, for the grammar-only verbs) with the same configuration conventions. Only a bare `crabcrop` starts the server; any argument runs the CLI, and one it does not know is an error. Every verb and flag is in [Command line](docs/endpoints.md#command-line).
+The server binary doubles as its own operator CLI: `crabcrop sign`, `seal`, `unseal`, `explain`, `meta`, `purge`, `purge-group`, `upload`, and `convert-thumbor` run against a server (or offline, for the grammar-only verbs) with the same configuration conventions, and `health` checks the server on this host. Only a bare `crabcrop` starts the server; any argument runs the CLI, and one it does not know is an error. Every verb and flag is in [Command line](docs/endpoints.md#command-line).
 
 Migrating from another service: guides for [Thumbor](docs/migrating-from-thumbor.md), [imgproxy](docs/migrating-from-imgproxy.md), [Cloudinary](docs/migrating-from-cloudinary.md), [imgix](docs/migrating-from-imgix.md), [Cloudflare Images](docs/migrating-from-cloudflare-images.md), [ImageKit](docs/migrating-from-imagekit.md), and [Gumlet](docs/migrating-from-gumlet.md).
 

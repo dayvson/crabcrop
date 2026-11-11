@@ -1,6 +1,7 @@
 # Default values for crabcrop. Anything the server reads from
-# the environment can be set through the free-form `env` map;
-# the structured values below cover the common wiring.
+# the environment can be set through the free-form `env` map,
+# except secrets: those come from Secrets you manage, through
+# the structured values below or extraEnv and envFrom.
 
 replicaCount: 1
 
@@ -32,6 +33,20 @@ metricsToken:
   existingSecret: ""
   secretKey: CRABCROP_METRICS_TOKEN
 
+# -- The outgoing signing secret (CRABCROP_SECRET_PREVIOUS)
+# during a key rotation window, from a key in an existing
+# Secret. Empty leaves it unset. The key IDs are not secret:
+# set CRABCROP_SECRET_KEY_ID and
+# CRABCROP_SECRET_PREVIOUS_KEY_ID in env.
+previousSecret:
+  existingSecret: ""
+  secretKey: CRABCROP_SECRET_PREVIOUS
+
+# -- The HMAC pair for gs:// sources: an existing Secret with
+# the keys CRABCROP_GCS_ACCESS_KEY and CRABCROP_GCS_SECRET_KEY.
+gcsCredentials:
+  existingSecret: ""
+
 # Port the server listens on (the PORT environment variable).
 containerPort: 3000
 
@@ -53,14 +68,46 @@ presets: {}
 onlyPresets: false
 
 # Free-form environment: any CRABCROP_* setting, as strings.
+# Each lands in the Deployment as a plain value, so keep
+# secrets out of it (see refusePlainSecrets below).
 # Example:
 #   env:
 #     CRABCROP_CACHE_MAX_MB: "512"
 #     CRABCROP_METADATA: "preserve"
 # The one default below is the evaluation source posture
-# (see the README's Configuration section).
+# (see docs/configuration.md).
 env:
   CRABCROP_BLOCK_PRIVATE_SOURCES: "1"
+
+# Env entries passed to the container as written, after the
+# env map, so an entry can read a Secret through valueFrom.
+# Use it when your Secret's key names differ from the ones
+# the structured values expect.
+# Example:
+#   extraEnv:
+#     - name: AWS_SECRET_ACCESS_KEY
+#       valueFrom:
+#         secretKeyRef:
+#           name: my-aws-keys
+#           key: secret-access-key
+extraEnv: []
+
+# Whole Secrets (or ConfigMaps) whose keys become variables.
+# A variable set in env or extraEnv wins over one from here.
+# Example:
+#   envFrom:
+#     - secretRef:
+#         name: crabcrop-extra
+envFrom: []
+
+# A secret (CRABCROP_SECRET, CRABCROP_SECRET_PREVIOUS,
+# AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+# CRABCROP_GCS_SECRET_KEY or CRABCROP_METRICS_TOKEN) set in
+# env, in ai.env or as an extraEnv entry's value lands in the
+# Deployment as plain text. This release renders it with a
+# warning; true fails the render instead. A later release
+# will refuse it by default.
+refusePlainSecrets: false
 
 # The disk-backed result cache tier. Off by default: the
 # in-memory tier alone serves a single replica well. See the
@@ -84,8 +131,8 @@ resultStorage:
 # are signed with the environment-provided AWS credentials
 # (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
 # AWS_SESSION_TOKEN, read once at startup); a pod IAM role
-# is not picked up, so provide the keys through the env map
-# below, backed by a Secret.
+# is not picked up, so provide the keys through
+# credentialsSecret below.
 resultBucket:
   name: ""
   # Object prefix for this deployment's entries; empty means
@@ -96,6 +143,12 @@ resultBucket:
   s3Endpoint: ""
   # AWS region; empty means the server default (us-east-1).
   s3Region: ""
+  # An existing Secret with the keys AWS_ACCESS_KEY_ID and
+  # AWS_SECRET_ACCESS_KEY, plus AWS_SESSION_TOKEN for
+  # temporary credentials. The server uses these keys for
+  # s3:// sources and the upload bucket too, so this also
+  # works without name.
+  credentialsSecret: ""
 
 # AI variant (Dockerfile.ai): switch the image, mount the
 # models volume, and point the model env vars at it through
@@ -137,26 +190,82 @@ autoscaling:
   maxReplicas: 5
   targetCPUUtilizationPercentage: 80
 
-resources: {}
-  # requests:
-  #   cpu: 250m
-  #   memory: 256Mi
+# Modest requests, so the pod is not first in line for
+# eviction, and no limits: the evaluation shape. Production
+# sets limits too (values-production.yaml). If you set only
+# limits, Kubernetes no longer sets the requests equal to
+# them; set requests too. The HPA's CPU target is a share
+# of the CPU request.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
   # limits:
   #   cpu: "2"
   #   memory: 1Gi
 
 podAnnotations: {}
+# The pod and container settings below meet the Kubernetes
+# Pod Security "restricted" profile. A custom image that
+# runs as another user or writes outside /tmp and its
+# mounted volumes needs them changed.
 podSecurityContext:
-  # The image runs as nobody (65534). fsGroup makes
-  # mounted volumes group-writable by that group, so the
-  # disk tier can write the result volume it mounts;
-  # without it the mount lands root-owned and the tier
-  # cannot write.
+  # The image runs as nobody (65534), and the kubelet can
+  # check runAsNonRoot only against a numeric user.
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  # fsGroup makes mounted volumes group-writable by that
+  # group, so the disk tier can write the result volume it
+  # mounts; without it the mount lands root-owned and the
+  # tier cannot write.
   fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
 securityContext:
   allowPrivilegeEscalation: false
+  # The server writes only to /tmp (below) and the volumes
+  # it mounts, such as the result volume.
+  readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
+
+# The server never calls the Kubernetes API, so the pod
+# mounts no service account token.
+automountServiceAccountToken: false
+
+# /tmp is an emptyDir, the one place the server writes
+# outside its configured directories: frame: stages the
+# source there, and the video and PDF tools run there, in
+# images that add them. A pod whose /tmp passes the limit
+# is evicted, so raise it if you raise
+# CRABCROP_SOURCE_MAX_MB to serve long clips.
+tmpVolume:
+  sizeLimit: 1Gi
+
+# An optional NetworkPolicy for the pod. Ingress: the HTTP
+# port, from the peers in ingressFrom (empty: from
+# anywhere). Egress: DNS, and every IPv4 address but the
+# private ranges (10.0.0.0/8, 172.16.0.0/12,
+# 192.168.0.0/16), link-local (169.254.0.0/16, the cloud
+# metadata address) and 100.64.0.0/10. Add rules to
+# extraEgress for a source, bucket or endpoint on a private
+# address. It needs a network plugin that enforces
+# NetworkPolicy.
+# Example:
+#   networkPolicy:
+#     enabled: true
+#     extraEgress:
+#       - to:
+#           - ipBlock:
+#               cidr: 10.0.12.5/32
+#         ports:
+#           - port: 9000
+#             protocol: TCP
+networkPolicy:
+  enabled: false
+  ingressFrom: []
+  extraEgress: []
 
 nodeSelector: {}
 tolerations: []

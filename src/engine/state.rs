@@ -309,9 +309,13 @@ pub struct ProcessContext<'a> {
     /// and the chunked encode loops (per frame for
     /// animated GIF and WebP, per attempt for the quality
     /// ladders) check it inside the encode as well (issue
-    /// #322). A single opaque encoder call (one still
-    /// encode, libwebp's animated `try_encode`, one AI
-    /// inference, the external video encoder) has no
+    /// #322). Text checks it between glyphs, and the
+    /// blurs (the `blur` filter, the `pad` blur fill, the
+    /// face, region and class blurs, and the studio
+    /// shadow) before each row, at every sample type
+    /// (issues #606, #614). A single opaque call (one
+    /// still encode, libwebp's animated `try_encode`, one
+    /// AI inference, the external video encoder) has no
     /// checkpoint inside it and is never interrupted
     /// mid-call. `None` means no deadline (tests, library
     /// use).

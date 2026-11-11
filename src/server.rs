@@ -58,6 +58,10 @@ impl std::fmt::Debug for NamedDetector {
 
 mod background;
 pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PUTS_AT_ONCE};
+mod listen;
+pub use listen::{
+    ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, serve_connections,
+};
 mod process;
 pub(in crate::server) use process::{
     AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
@@ -235,6 +239,11 @@ pub struct AppState {
     /// hint header is ignored, image answers vary on
     /// `Accept` alone, and no `Accept-CH` is advertised.
     pub client_hints: bool,
+    /// Whether `/explain/...` is served (`CRABCROP_EXPLAIN`,
+    /// on by default, issue #591). Off, every `GET` or
+    /// `HEAD` to the route answers `404 not_found` before
+    /// anything else.
+    pub explain_enabled: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -400,6 +409,7 @@ impl std::fmt::Debug for AppState {
             jxl_speed,
             width_step,
             client_hints,
+            explain_enabled,
             preserve_metadata,
             brand_color,
             presets,
@@ -691,7 +701,9 @@ fn source_lookup_metrics(state: &AppState) -> String {
 /// stores count their own failures as they log them; the
 /// exposition reads the counters live at scrape time,
 /// one series per configured tier. With a shared tier, its
-/// write-through slots and skips follow (issue #463).
+/// write-through slots and skips follow (issue #463), then
+/// what its last complete listing of the purge tombstones
+/// found unread, and when that was (issue #577).
 fn tier_metrics(state: &AppState) -> String {
     let mut out = String::new();
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
@@ -724,6 +736,22 @@ fn tier_metrics(state: &AppState) -> String {
             background.puts_in_flight(),
             background.put_capacity(),
             background.puts_skipped()
+        ));
+        // The tombstone gap (issue #577): the unread count
+        // stays as of the last complete listing, so a listing
+        // time that stops moving is the sign of a failing
+        // listing.
+        let listed_ms = store.tombstones_listed_ms();
+        out.push_str(&format!(
+            "# HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.\n\
+             # TYPE crabcrop_cache_shared_tombstones_unread gauge\n\
+             crabcrop_cache_shared_tombstones_unread {}\n\
+             # HELP crabcrop_cache_shared_tombstones_listed_timestamp_seconds When this replica last listed the purge tombstones completely, in Unix seconds; 0 before its first complete listing.\n\
+             # TYPE crabcrop_cache_shared_tombstones_listed_timestamp_seconds gauge\n\
+             crabcrop_cache_shared_tombstones_listed_timestamp_seconds {}.{:03}\n",
+            store.tombstones_unread(),
+            listed_ms / 1000,
+            listed_ms % 1000
         ));
     }
     out
@@ -962,6 +990,18 @@ async fn explain_handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // With `CRABCROP_EXPLAIN=0` the route is off (issue #591):
+    // every request answers the router's own `404 not_found`
+    // before the signature is read, so the answer is the
+    // same whatever the URL, and no source is fetched.
+    if !state.explain_enabled {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found".to_string(),
+            accept.as_deref(),
+        );
+    }
     let Some(tail) = uri.path().strip_prefix("/explain/") else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1038,14 +1078,15 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
-    // The operation cap (issue #469), on the list the image
-    // path counts (the defaults merged in) and at the same
-    // point: an over-cap URL answers its 400 here, before the
-    // probe fetch.
-    if let Err(e) = crate::url::check_operation_count(&crate::url::merge_default_ops(
-        &state.default_ops,
-        ops.clone(),
-    )) {
+    // The operation cap (issue #469) and the watermark URL
+    // cap (issue #613), on the list the image path counts
+    // (the defaults merged in) and at the same point: an
+    // over-cap URL answers its 400 here, before the probe
+    // fetch.
+    let counted = crate::url::merge_default_ops(&state.default_ops, ops.clone());
+    if let Err(e) = crate::url::check_operation_count(&counted)
+        .and_then(|()| crate::url::check_watermark_count(&counted))
+    {
         return parse_failure(&e, accept.as_deref());
     }
     // A root source expands for the probe fetch only: the
@@ -2816,6 +2857,9 @@ fn resolve_request(
     // URL (a short one repeating a preset included) costs a
     // parse and nothing more.
     crate::url::check_operation_count(&ops).map_err(grammar)?;
+    // So does the cap on distinct watermark and overlay URLs
+    // (issue #613): each one is a fetch and a decode.
+    crate::url::check_watermark_count(&ops).map_err(grammar)?;
     // A root source expands here (issue #248): after
     // verification and the ops summary (which reads the
     // source as written), before the cache key and the

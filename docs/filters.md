@@ -12,7 +12,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | --- | --- | --- | --- |
 | `grayscale` | none | Desaturate to gray. | `filters:grayscale` |
 | `invert` | none | Invert every channel. | `filters:invert` |
-| `blur` | `blur(2.5)`, sigma, a positive number up to 512 | Gaussian blur. | `filters:blur(2.5)` |
+| `blur` | `blur(2.5)`, sigma, a positive number up to 512 | Gaussian blur. Its work grows with the sigma and the image size, so it checks the processing limit (`CRABCROP_PROCESS_TIMEOUT_SECS`) before each row and stops there; the request answers `504`. | `filters:blur(2.5)` |
 | `brighten` | `brighten(40)`, integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
 | `contrast` | `contrast(25)`, percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
 | `gamma` | `gamma(2.2)`, divisor from above 0 to 10; 1 is unchanged, above 1 brightens midtones, below 1 darkens them | Gamma correction: each channel value `v` becomes `255 * (v / 255)^(1 / g)`, the levels-style midtone gamma. Black and white stay fixed at every setting, and alpha is untouched. Unlike `curve`, no control points need translating: the gamma value from another tool carries over as written. | `filters:gamma(2.2)` |
@@ -105,7 +105,7 @@ filters:watermark(<url>,<x>,<y>,<alpha>)
 | `x`, `y` | Position of the watermark's top-left corner, in pixels. Negative values anchor from the right and bottom edges. |
 | `alpha` | Opacity, 0 (invisible) to 100 (opaque). The watermark's own alpha is honored. |
 
-The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped.
+The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped. A request may name at most 16 distinct watermark and overlay URLs, and their decoded images may hold at most 512 MiB together. Past either limit it answers `400 unsupported_operation` (see [Errors](responses.md#errors)).
 
 ```bash
 # Overlay https://cdn.example.com/logo.png at the bottom right, 80% opaque
@@ -139,12 +139,12 @@ filters:text(<text>,<size>,<color>,<anchor>)
 
 | Parameter | Description |
 | --- | --- |
-| `text` | The label, percent-encoded. It may contain commas and unicode once encoded. |
+| `text` | The label, percent-encoded. It may contain commas and unicode once encoded. Decoded, it holds at most 1000 characters, and its character count times `size` is at most 100000: 100 characters at size 1000, or 1000 at size 100. A longer label answers `400`. |
 | `size` | Font size in pixels, 1 to 1000. |
 | `color` | `rrggbb`, or `rrggbbaa` to include alpha. |
 | `anchor` | One of nine grid points: `top-left`, `top-center`, `top-right`, `center-left`, `center`, `center-right`, `bottom-left`, `bottom-center`, `bottom-right`. The label is padded from the edges by half the font size. |
 
-The text is drawn when the filter runs, at whatever resolution the image has at that point in the path, so put `text` after your resize to keep it sharp. The font comes from `CRABCROP_FONT_PATH` on the server; with no font configured, `text` requests fail with `501`.
+The text is drawn when the filter runs, at whatever resolution the image has at that point in the path, so put `text` after your resize to keep it sharp. The font comes from `CRABCROP_FONT_PATH` on the server; with no font configured, `text` requests fail with `501`. Drawing checks the processing limit (`CRABCROP_PROCESS_TIMEOUT_SECS`) between glyphs. Presets and `CRABCROP_DEFAULT_OPS` are checked at startup, so one with a label past these limits stops the server from starting.
 
 ```bash
 curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ffffff,bottom-right)/https://example.com/photo.jpg"
@@ -169,7 +169,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
 
-Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, in place of the pixels they cover; they never composite it over the original, so the source's alpha cannot let the original through. (With a segmentation model, a silhouette's antialiased edge mixes the redacted and the original pixels by the mask's strength, as it does for an opaque source.) This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color.
+Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, in place of the pixels they cover; they never composite it over the original, so the source's alpha cannot let the original through. (With a segmentation model, a silhouette's antialiased edge mixes the redacted and the original pixels by the mask's strength, as it does for an opaque source.) This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color. Under `CRABCROP_METADATA=preserve`, the metadata copied into a JPEG or PNG output carries no EXIF or Photoshop thumbnail of the source. The XMP packet is copied as is, so a thumbnail in it stays and can still show what a redaction covered: see [Color management and metadata](responses.md#color-management-and-metadata).
 
 ### Studio mode
 
