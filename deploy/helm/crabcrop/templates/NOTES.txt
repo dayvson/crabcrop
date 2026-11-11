@@ -1,7 +1,8 @@
 crabcrop is deployed as {{ include "crabcrop.fullname" . }}.
 
-{{- /* The signing secret can also come from env, extraEnv or envFrom. */}}
-{{- $signing := or .Values.existingSecret .Values.secret .Values.envFrom (hasKey (.Values.env | default dict) "CRABCROP_SECRET") }}
+{{- /* The signing secret can also come from env, ai.env (with
+     ai.enabled), extraEnv or envFrom. */}}
+{{- $signing := or .Values.existingSecret .Values.secret .Values.envFrom (hasKey (.Values.env | default dict) "CRABCROP_SECRET") (and .Values.ai.enabled (hasKey (.Values.ai.env | default dict) "CRABCROP_SECRET")) }}
 {{- range .Values.extraEnv }}
 {{- if eq (get . "name") "CRABCROP_SECRET" }}
 {{- $signing = true }}
