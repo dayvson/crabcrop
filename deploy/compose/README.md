@@ -80,14 +80,14 @@ A fresh or empty volume needs none of this.
    ```
 
    It answers `purged 1` (or more, counting variants), and the next fetch of the signed URL is a miss again.
-5. Metrics auth, from inside. The image carries no curl, so run it from a throwaway container on the app's network:
+5. Metrics auth, from inside. The app image carries no curl, so run the check from the Caddy container, which has `wget` and reaches the app on the compose network:
 
    ```bash
-   docker run --rm --network "container:$(docker compose -f docker-compose.prod.yml ps -q crabcrop)" \
-     curlimages/curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/metrics
+   docker compose -f docker-compose.prod.yml exec caddy \
+     wget -qO- --header "Authorization: Bearer <metrics-token>" http://crabcrop:3000/metrics
    ```
 
-   It returns 401 without a token. With the token from `crabcrop.env` (`-H "Authorization: Bearer <metrics-token>"` in place of `-o /dev/null -w "%{http_code}"`) it returns 200 and the Prometheus counters.
+   With the token from `crabcrop.env` it prints the Prometheus counters. Without the `--header` it fails with `server returned error: HTTP/1.1 401 Unauthorized`.
 
 ## Evaluation
 

@@ -2009,6 +2009,10 @@ mod tests {
         // Nothing listening (port 9, as above).
         let err = probe_health(9).await.unwrap_err();
         assert!(matches!(err, CliError::Request(_)), "{err:?}");
+        // The verb gives up before the images' HEALTHCHECK
+        // (`--timeout=3s`) does, so a slow server fails with
+        // the verb's own message.
+        assert!(HEALTH_TIMEOUT < std::time::Duration::from_secs(3));
     }
 
     #[tokio::test]

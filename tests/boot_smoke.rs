@@ -474,9 +474,10 @@ fn the_health_verb_probes_the_server_on_its_port() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
 
-    // A port that never answers: the verb gives up inside the
-    // HEALTHCHECK's 3 s timeout, so the failure is its own,
-    // with exit 1 and the error on stderr.
+    // A port that never answers: the verb waits out its own
+    // 2 s timeout, then exits 1 with the error on stderr. The
+    // upper bound leaves room for a loaded runner; the cli.rs
+    // tests keep the timeout under the HEALTHCHECK's 3 s.
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();
     let silent_port = silent.local_addr().unwrap().port().to_string();
     let started = Instant::now();
@@ -486,7 +487,10 @@ fn the_health_verb_probes_the_server_on_its_port() {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(out.stdout.is_empty());
     assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(10),
+        "{elapsed:?}"
+    );
     drop(silent);
 }
 

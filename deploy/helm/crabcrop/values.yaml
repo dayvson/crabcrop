@@ -193,8 +193,9 @@ autoscaling:
 # Modest requests, so the pod is not first in line for
 # eviction, and no limits: the evaluation shape. Production
 # sets limits too (values-production.yaml). If you set only
-# limits, keep them at or above these requests, or set
-# requests as well.
+# limits, Kubernetes no longer sets the requests equal to
+# them; set requests too. The HPA's CPU target is a share
+# of the CPU request.
 resources:
   requests:
     cpu: 100m
