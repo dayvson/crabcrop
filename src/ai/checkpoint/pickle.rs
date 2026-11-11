@@ -36,6 +36,18 @@ pub(super) enum PickleValue {
     Map(Vec<(String, PickleValue)>),
 }
 
+/// The deepest a value may nest, counted in tuples and
+/// dicts. A head save nests a few levels. The bound keeps
+/// the recursive drop, clone and compare of `PickleValue`
+/// shallow (issue #609).
+const MAX_DEPTH: usize = 32;
+
+/// The most the machine may build: one per value plus
+/// the bytes of its strings. A memo copy counts at the
+/// size of the tree it copies. A head save builds a few
+/// hundred (issue #609).
+const MAX_BUILT: usize = 1 << 16;
+
 /// A restricted pickle interpreter, sized for the
 /// state dicts `torch.save` writes for a linear head:
 /// an ordered dict of tensor rebuilds over float
@@ -46,13 +58,17 @@ pub(super) enum PickleValue {
 /// merely different save fails at load instead of
 /// being half-parsed. This is a data reader, not a
 /// general unpickler: it cannot construct arbitrary
-/// objects and never touches the filesystem.
+/// objects and never touches the filesystem. What it
+/// builds is bounded too: every value counts against
+/// `MAX_BUILT`, and no value nests past `MAX_DEPTH`.
 struct PickleMachine<'a> {
     bytes: &'a [u8],
     at: usize,
     stack: Vec<PickleValue>,
     marks: Vec<usize>,
     memo: Vec<Option<PickleValue>>,
+    /// The running count against `MAX_BUILT`.
+    built: usize,
 }
 
 impl<'a> PickleMachine<'a> {
@@ -70,7 +86,7 @@ impl<'a> PickleMachine<'a> {
                 b'c' => {
                     let module = self.line()?;
                     let name = self.line()?;
-                    self.stack.push(PickleValue::Global(module, name));
+                    self.push(PickleValue::Global(module, name))?;
                 }
                 // BINUNICODE / SHORT_BINUNICODE /
                 // SHORT_BINSTRING: length-prefixed
@@ -79,39 +95,36 @@ impl<'a> PickleMachine<'a> {
                 b'X' => {
                     let len = self.u32()? as usize;
                     let raw = self.take(len)?;
-                    self.stack
-                        .push(PickleValue::Str(String::from_utf8(raw.to_vec()).map_err(
-                            |_| "a pickle string is not valid UTF-8".to_string(),
-                        )?));
+                    let s = String::from_utf8(raw.to_vec())
+                        .map_err(|_| "a pickle string is not valid UTF-8".to_string())?;
+                    self.push(PickleValue::Str(s))?;
                 }
                 0x8c => {
                     let len = self.byte().ok_or("the pickle ends inside a short string")? as usize;
                     let raw = self.take(len)?;
-                    self.stack
-                        .push(PickleValue::Str(String::from_utf8(raw.to_vec()).map_err(
-                            |_| "a pickle string is not valid UTF-8".to_string(),
-                        )?));
+                    let s = String::from_utf8(raw.to_vec())
+                        .map_err(|_| "a pickle string is not valid UTF-8".to_string())?;
+                    self.push(PickleValue::Str(s))?;
                 }
                 b'U' => {
                     let len = self.byte().ok_or("the pickle ends inside a short string")? as usize;
                     let raw = self.take(len)?;
-                    self.stack
-                        .push(PickleValue::Str(String::from_utf8_lossy(raw).into_owned()));
+                    self.push(PickleValue::Str(String::from_utf8_lossy(raw).into_owned()))?;
                 }
                 // Integers: BININT1, BININT2, BININT,
                 // LONG (a decimal line), LONG1/LONG4
                 // (little-endian two's complement).
                 b'K' => {
                     let v = self.byte().ok_or("the pickle ends inside BININT1")?;
-                    self.stack.push(PickleValue::Int(v as i64));
+                    self.push(PickleValue::Int(v as i64))?;
                 }
                 b'M' => {
                     let v = self.u16()?;
-                    self.stack.push(PickleValue::Int(v as i64));
+                    self.push(PickleValue::Int(v as i64))?;
                 }
                 b'J' => {
                     let v = self.u32()? as i32;
-                    self.stack.push(PickleValue::Int(v as i64));
+                    self.push(PickleValue::Int(v as i64))?;
                 }
                 b'L' => {
                     let raw = self.line()?;
@@ -119,7 +132,7 @@ impl<'a> PickleMachine<'a> {
                     let v: i64 = digits
                         .parse()
                         .map_err(|_| format!("a pickle LONG is not a number: {raw:?}"))?;
-                    self.stack.push(PickleValue::Int(v));
+                    self.push(PickleValue::Int(v))?;
                 }
                 0x8a | 0x8b => {
                     let len = if op == 0x8a {
@@ -138,24 +151,24 @@ impl<'a> PickleMachine<'a> {
                     if len > 0 && len < 8 && raw[len - 1] & 0x80 != 0 {
                         v -= 1i64 << (8 * len);
                     }
-                    self.stack.push(PickleValue::Int(v));
+                    self.push(PickleValue::Int(v))?;
                 }
                 // BINFLOAT: big-endian f64.
                 b'G' => {
                     let raw = self.take(8)?;
                     let mut buf = [0u8; 8];
                     buf.copy_from_slice(raw);
-                    self.stack.push(PickleValue::Float(f64::from_be_bytes(buf)));
+                    self.push(PickleValue::Float(f64::from_be_bytes(buf)))?;
                 }
-                b'N' => self.stack.push(PickleValue::None),
-                0x88 => self.stack.push(PickleValue::Bool(false)),
-                0x89 => self.stack.push(PickleValue::Bool(true)),
-                b')' => self.stack.push(PickleValue::Tuple(Vec::new())),
+                b'N' => self.push(PickleValue::None)?,
+                0x88 => self.push(PickleValue::Bool(false))?,
+                0x89 => self.push(PickleValue::Bool(true))?,
+                b')' => self.push(PickleValue::Tuple(Vec::new()))?,
                 b'(' => self.marks.push(self.stack.len()),
                 b't' => {
                     let from = self.mark()?;
                     let items: Vec<PickleValue> = self.stack.drain(from..).collect();
-                    self.stack.push(PickleValue::Tuple(items));
+                    self.push_tuple(items)?;
                 }
                 0x85..=0x87 => {
                     let n = (op - 0x84) as usize;
@@ -164,7 +177,7 @@ impl<'a> PickleMachine<'a> {
                     }
                     let items: Vec<PickleValue> =
                         self.stack.drain(self.stack.len() - n..).collect();
-                    self.stack.push(PickleValue::Tuple(items));
+                    self.push_tuple(items)?;
                 }
                 // BINPERSID: torch's persistent id for a
                 // storage, a tuple of (the word
@@ -190,7 +203,7 @@ impl<'a> PickleMachine<'a> {
                             "a pickle persistent id names {kind} {class}, not a storage"
                         ));
                     }
-                    self.stack.push(PickleValue::Storage(key.clone()));
+                    self.push(PickleValue::Storage(key.clone()))?;
                 }
                 // REDUCE: call an allowlisted global.
                 b'R' => {
@@ -203,9 +216,9 @@ impl<'a> PickleMachine<'a> {
                         return Err("a pickle REDUCE argument is not a tuple".to_string());
                     };
                     let value = reduce(&module, &name, args)?;
-                    self.stack.push(value);
+                    self.push(value)?;
                 }
-                b'}' => self.stack.push(PickleValue::Map(Vec::new())),
+                b'}' => self.push(PickleValue::Map(Vec::new()))?,
                 // SETITEM: value, then key, onto the map
                 // below them.
                 b's' => {
@@ -214,6 +227,7 @@ impl<'a> PickleMachine<'a> {
                     let PickleValue::Str(key) = key else {
                         return Err("a pickle dict key is not a string".to_string());
                     };
+                    check_nesting(&value)?;
                     let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
                         return Err("a pickle SETITEM has no dict under it".to_string());
                     };
@@ -226,6 +240,9 @@ impl<'a> PickleMachine<'a> {
                     let items: Vec<PickleValue> = self.stack.drain(from..).collect();
                     if !items.len().is_multiple_of(2) {
                         return Err("a pickle SETITEMS holds an odd item count".to_string());
+                    }
+                    for value in items.iter().skip(1).step_by(2) {
+                        check_nesting(value)?;
                     }
                     let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
                         return Err("a pickle SETITEMS has no dict under it".to_string());
@@ -338,15 +355,39 @@ impl<'a> PickleMachine<'a> {
             .ok_or_else(|| "the pickle has a tuple or items opcode with no mark".to_string())
     }
 
+    /// Push a value built from the file's bytes. It
+    /// counts at its size.
+    fn push(&mut self, value: PickleValue) -> Result<(), String> {
+        charge(&mut self.built, measure(&value).0)?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// Push a tuple of values that were on the stack. They
+    /// were counted when they were built, so the tuple
+    /// counts as one.
+    fn push_tuple(&mut self, items: Vec<PickleValue>) -> Result<(), String> {
+        let depth = 1 + items.iter().map(|v| measure(v).1).max().unwrap_or(0);
+        if depth > MAX_DEPTH {
+            return Err(nesting_error());
+        }
+        charge(&mut self.built, 1)?;
+        self.stack.push(PickleValue::Tuple(items));
+        Ok(())
+    }
+
+    /// A memo copy counts at the size of the tree it
+    /// copies, before the copy is made.
     fn put_memo(&mut self, at: usize) -> Result<(), String> {
         if at > 4096 {
             return Err("a pickle memo index is implausibly large".to_string());
         }
-        let value = self
+        let top = self
             .stack
             .last()
-            .cloned()
             .ok_or("a pickle memo stores an empty stack")?;
+        charge(&mut self.built, measure(top).0)?;
+        let value = top.clone();
         if self.memo.len() <= at {
             self.memo.resize(at + 1, None);
         }
@@ -355,15 +396,66 @@ impl<'a> PickleMachine<'a> {
     }
 
     fn get_memo(&mut self, at: usize) -> Result<(), String> {
-        let value = self
+        let stored = self
             .memo
             .get(at)
-            .cloned()
-            .flatten()
+            .and_then(Option::as_ref)
             .ok_or_else(|| format!("a pickle memo reference to {at} was never stored"))?;
+        charge(&mut self.built, measure(stored).0)?;
+        let value = stored.clone();
         self.stack.push(value);
         Ok(())
     }
+}
+
+/// A value's size (one per value, plus the bytes of its
+/// strings) and its depth in tuples and dicts. The
+/// recursion is shallow: every value the machine holds
+/// was checked against `MAX_DEPTH` when it was built.
+fn measure(value: &PickleValue) -> (usize, usize) {
+    match value {
+        PickleValue::None | PickleValue::Bool(_) | PickleValue::Int(_) | PickleValue::Float(_) => {
+            (1, 0)
+        }
+        PickleValue::Str(s) | PickleValue::Storage(s) => (1 + s.len(), 0),
+        PickleValue::Global(module, name) => (1 + module.len() + name.len(), 0),
+        PickleValue::Tensor(t) => (1 + t.storage.len() + t.size.len(), 0),
+        PickleValue::Tuple(items) => items.iter().fold((1, 1), |(size, depth), item| {
+            let (s, d) = measure(item);
+            (size + s, depth.max(d + 1))
+        }),
+        PickleValue::Map(pairs) => pairs.iter().fold((1, 1), |(size, depth), (key, item)| {
+            let (s, d) = measure(item);
+            (size + key.len() + s, depth.max(d + 1))
+        }),
+    }
+}
+
+/// Add `size` to the running count, or refuse once it
+/// passes `MAX_BUILT`.
+fn charge(built: &mut usize, size: usize) -> Result<(), String> {
+    *built = built.saturating_add(size);
+    if *built > MAX_BUILT {
+        return Err(format!(
+            "the pickle builds too much for a head state dict: over {MAX_BUILT} values and string bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a value that would nest too deep once a dict
+/// holds it.
+fn check_nesting(value: &PickleValue) -> Result<(), String> {
+    if measure(value).1 + 1 > MAX_DEPTH {
+        return Err(nesting_error());
+    }
+    Ok(())
+}
+
+fn nesting_error() -> String {
+    format!(
+        "the pickle nests tuples or dicts more than {MAX_DEPTH} levels deep: a head state dict nests a few"
+    )
 }
 
 /// The REDUCE allowlist: build an ordered dict, or
@@ -439,6 +531,7 @@ pub(super) fn unpickle(bytes: &[u8]) -> Result<PickleValue, String> {
         stack: Vec::new(),
         marks: Vec::new(),
         memo: Vec::new(),
+        built: 0,
     }
     .run()
 }

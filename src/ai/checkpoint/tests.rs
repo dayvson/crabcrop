@@ -283,3 +283,35 @@ fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("the tensor size overflows"), "{err}");
 }
+
+#[test]
+fn aesthetic_head_refuses_memo_copies_and_deep_nesting() {
+    // The two shapes from issue #609 are load errors
+    // naming the file, reached in bounded time and
+    // memory. The load runs on a 256 KiB stack, so a
+    // deep recursion anywhere in it would abort the test.
+    let mut memo = b"(\x80\x02)q\x00".to_vec();
+    for _ in 0..40 {
+        memo.extend_from_slice(b"h\x00h\x00\x86q\x00");
+    }
+    memo.extend_from_slice(b"t.");
+    let mut deep = b"\x80\x02)".to_vec();
+    deep.resize(1024 * 1024 - 1, 0x85);
+    deep.push(b'.');
+    for (tag, pkl, want) in [
+        ("head-memo", memo, "values and string bytes"),
+        ("head-deep", deep, "levels deep"),
+    ] {
+        let (_head, path) = temp_file(tag, &head_archive(&pkl, &[]));
+        let err = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || expect_load(AestheticHead::load(&path)))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            err.contains("is not usable") && err.contains(want),
+            "{tag}: {err}"
+        );
+    }
+}
