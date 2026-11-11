@@ -622,6 +622,9 @@ Set `CRABCROP_SECRET` (16+ bytes) and CRABCROP_SECRET.
 /// CONTRIBUTING, everything under `docs/` and `deploy/`, and
 /// the READMEs of the SDKs, framework integrations, plugins
 /// and crates, which an operator copies commands from too.
+/// Helm's `.tpl` files are left out: they hold template code,
+/// where `NAME: value` maps a variable to the chart value
+/// that reads it from a Secret, not to a secret.
 fn documented_files() -> Vec<PathBuf> {
     fn walk(dir: &Path, readmes_only: bool, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -631,6 +634,8 @@ fn documented_files() -> Vec<PathBuf> {
                 if name != "node_modules" && name != "target" && !name.starts_with('.') {
                     walk(&path, readmes_only, out);
                 }
+            } else if name.ends_with(".tpl") {
+                continue;
             } else if !readmes_only || name == "README.md" {
                 out.push(path);
             }

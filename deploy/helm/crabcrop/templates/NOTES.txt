@@ -20,7 +20,7 @@ point existingSecret at it:
 
 Production installs also put a CRABCROP_METRICS_TOKEN key in
 the same Secret and set metricsToken.existingSecret to it, so
-GET /metrics requires the bearer <redacted>; see
+GET /metrics requires the bearer token; see
 values-production.yaml.
 {{- end }}
 {{- $plainSecrets := include "crabcrop.plainSecrets" . | fromYaml }}

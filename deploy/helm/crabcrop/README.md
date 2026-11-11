@@ -16,7 +16,7 @@ Two install shapes ship with the chart:
 
 ### 1. The secrets
 
-One Secret you manage holds both credentials, as two keys: the signing secret (16+ bytes; it signs and verifies every URL) and the metrics token (the bearer <redacted> `GET /metrics` requires):
+One Secret you manage holds both credentials, as two keys: the signing secret (16+ bytes; it signs and verifies every URL) and the metrics token (the bearer token `GET /metrics` requires):
 
 ```bash
 kubectl create secret generic crabcrop-secret \
@@ -36,7 +36,7 @@ helm install crabcrop deploy/helm/crabcrop \
 - The current release image, pinned by tag (set `image.digest` to pin the exact build).
 - Resource requests and limits (500m CPU and 512Mi requested; 2 CPU and 2Gi at the limit).
 - The disk result tier on its own persistent volume (8GiB budget on a 10Gi claim), so renders survive pod restarts.
-- Both credentials wired from the Secret above: the signing secret, and the metrics token through `metricsToken.existingSecret`, so `/metrics` is never answerable without its bearer <redacted>.
+- Both credentials wired from the Secret above: the signing secret, and the metrics token through `metricsToken.existingSecret`, so `/metrics` is never answerable without its bearer token.
 - The production environment: a 512 MB memory result tier sized against the memory limit, the slow lane at one permit (long-running renders, such as animated encodes, never starve stills), the 30-second processing limit stated, and private-address sources refused.
 - Health probes are part of the chart itself: liveness and readiness both read `/health`, and every install gets them.
 
@@ -148,7 +148,7 @@ env:
 
 Keep secrets out of this map: see [Secrets](#secrets).
 
-The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer token, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Smoke checklist
 
