@@ -246,8 +246,9 @@ pub struct S3Store {
     tombstones_unread: std::sync::atomic::AtomicU64,
     /// When this replica last listed the tombstones
     /// completely, in Unix ms; 0 before its first complete
-    /// listing (issue #577). A purge begun after it has not
-    /// reached this replica's guard. Surfaced on /metrics as
+    /// listing (issue #577). A purge another replica began
+    /// after it has not reached this replica's guard.
+    /// Surfaced on /metrics as
     /// `crabcrop_cache_shared_tombstones_listed_timestamp_seconds`.
     tombstones_listed_ms: std::sync::atomic::AtomicU64,
     /// The purge walks running in this process, by target,

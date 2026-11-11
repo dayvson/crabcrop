@@ -15678,12 +15678,12 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     // covers and keeps them in memory. Once it reads the
     // tombstone, its disk lookups apply it, but its memory
     // keeps what it served until the purge is sent to it
-    // again. Fails with 8d6b14f's rule (K1's first lookup
-    // misses), without part 1's `fresh.insert` for a read
-    // tombstone (K2 still hits after the read), or with a
-    // memory check against read tombstones (K1 misses before
-    // the purge is sent again), which the docs would have to
-    // follow.
+    // again. Fails with the unread rule issue #577 describes
+    // (8d6b14f): K1's first lookup misses. Fails too without
+    // part 1's `fresh.insert` for a read tombstone (K2 still
+    // hits after the read), or with a memory check against
+    // read tombstones (K1 misses before the purge is sent
+    // again), which the docs would have to follow.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
@@ -15844,9 +15844,9 @@ enum UnreadProbe {
 /// Issue #577, sequence 1: a hit under an unread tombstone,
 /// here a purge of some other key, adds the request's group
 /// to every tier that holds the copy, and a purge of that
-/// group then reaches every tier. Fails with 8d6b14f's rule:
-/// the hit turns into a render, and the copy's write-back is
-/// dropped.
+/// group then reaches every tier. Fails with the unread rule
+/// issue #577 describes (8d6b14f): the hit turns into a
+/// render, and the copy's write-back is dropped.
 async fn a_hit_under_an_unread_tombstone_teaches_every_tier(probe: UnreadProbe) {
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-hit");
@@ -15919,9 +15919,9 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
     // tombstone, a group-free request is a disk hit, so the
     // groups the disk copy learned stay, and a purge of one
     // of them removes the copy from every tier. Fails with
-    // 8d6b14f's rule: the request renders a copy in no group,
-    // the purge answers `purged 0`, and the bucket copy
-    // serves.
+    // the unread rule issue #577 describes (8d6b14f): the
+    // request renders a copy in no group, the purge answers
+    // `purged 0`, and the bucket copy serves.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-restart");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
@@ -15967,9 +15967,9 @@ async fn an_unread_name_ahead_or_just_behind_does_not_stop_caching() {
     // and one from another writer stamped a second ago, inside
     // the clock margin, leave caching as it is: one render,
     // then hits, and every tier holds the entry. Fails with
-    // 8d6b14f's rule without its listing cutoff (three
-    // renders), or with the name's start and the clock margin
-    // (the render is not stored).
+    // the unread rule issue #577 describes (8d6b14f) without
+    // its listing cutoff (three renders), or with the name's
+    // start and the clock margin (the render is not stored).
     let now = crate::cache::now_ms();
     for (what, start_ms, writer) in [
         ("a day ahead", now + 86_400_000, 0xa_u64),
@@ -16014,8 +16014,9 @@ async fn a_request_under_an_unread_tombstone_teaches_the_bucket_copy_its_group()
     // replica wrote, and the bucket copy learns the request's
     // group, so a purge of that group reaches it. The origin
     // now answers with other bytes, so a render would show.
-    // Fails with 8d6b14f's rule: the request renders, and the
-    // bucket copy keeps [a] and serves after the purge of b.
+    // Fails with the unread rule issue #577 describes
+    // (8d6b14f): the request renders, and the bucket copy
+    // keeps [a] and serves after the purge of b.
     let fake = crate::s3store::test_support::start_fake().await;
     let (src, hits, current) = spawn_swappable_server(test_png()).await;
     let mut writer = tier_test_state(None, &fake.endpoint);
@@ -16050,8 +16051,10 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
     // bucket fails every object read, so it lists a tombstone
     // it cannot read, and every write slot is taken. Its disk
     // copies serve: no render, no write queued, and the write
-    // bound holds. Fails with 8d6b14f's rule (N renders) or
-    // with a write queued per turned-down copy.
+    // bound holds. Fails with the unread rule issue #577
+    // describes (8d6b14f): N renders, or earlier, when the
+    // rule also drops the filler writes that take the slots.
+    // Fails too with a write queued per turned-down copy.
     const N: usize = 16;
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-stall");
@@ -18783,10 +18786,12 @@ async fn a_shared_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
 }
 
 // Issue #577, sequence 6: the same with a tombstone listed
-// that the replica cannot read. Fails with 8d6b14f's rule (a
-// miss, and a render whose write is skipped, so the bucket
-// copy keeps no group) or with a write queued per turned-down
-// copy (more than 64 writes waiting).
+// that the replica cannot read. Fails with the unread rule
+// issue #577 describes (8d6b14f): a miss, and a render whose
+// write is skipped, so the bucket copy keeps no group, or
+// earlier, when the rule also drops the filler writes that
+// take the slots. Fails too with a write queued per
+// turned-down copy (more than 64 writes waiting).
 
 #[tokio::test]
 async fn a_memory_hit_group_write_back_waits_for_a_slot_while_a_tombstone_is_unread() {
