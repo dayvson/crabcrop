@@ -64,6 +64,10 @@ SECTIONS = ("added", "changed", "deprecated", "removed", "fixed", "security")
 HEADINGS = {section: f"### {section.capitalize()}" for section in SECTIONS}
 README = "README.md"
 EPOCH = "This release starts a new cache epoch"
+SECOND_EPOCH = (
+    "a second cache-epoch note: ## [Unreleased] already has one, "
+    "so add this change to that note instead"
+)
 
 STEM = re.compile(r"(?P<issue>[1-9][0-9]*)(?:-(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*))?")
 ISSUE_REF = re.compile(r"\bissues?\s+#\d+(?:\s*(?:,\s*(?:and\s+)?|and\s+)#\d+)*", re.I)
@@ -280,10 +284,7 @@ def load(root):
     for fragment in fragments:
         if opens_epoch(fragment.text):
             if notes:
-                problems.append(
-                    f"{FRAGMENTS}/{fragment.name}: a second cache-epoch note: {UNRELEASED} "
-                    "already has one, so add this change to that note instead"
-                )
+                problems.append(f"{FRAGMENTS}/{fragment.name}: {SECOND_EPOCH}")
             notes += 1
     if problems:
         raise AssembleError(problems)

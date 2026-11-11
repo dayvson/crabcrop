@@ -886,6 +886,94 @@ class ChangelogEntry(unittest.TestCase):
         self.commit("follow-up")
         done = self.entry()
         self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("edits the fragment changelog.d/1.changed.md", done.stdout)
+
+    def test_an_edit_that_keeps_the_entry_is_no_entry(self):
+        # Like a CHANGELOG.md line that only gains trailing spaces: the
+        # entry the release would write is the one already there.
+        self.write("changelog.d/1.changed.md", "The change (issue #1).\n")
+        self.commit("fragment on main")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        path = self.repo / "changelog.d/1.changed.md"
+        for name, change in (
+            ("a trailing newline", lambda: self.write("changelog.d/1.changed.md", "The change (issue #1).\n\n")),
+            ("a rewrap", lambda: self.write("changelog.d/1.changed.md", "- The change\n  (issue #1).\n")),
+            ("the file mode", lambda: path.chmod(0o755)),
+        ):
+            with self.subTest(change=name):
+                self.write("src/lib.rs", "pub fn f() { g() }\n")
+                change()
+                self.commit("change")
+                self.assertIn("changelog.d/1.changed.md", self.git("diff", "--name-only", self.base, "HEAD"))
+                done = self.entry()
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("no changelog.d/ fragment", done.stderr)
+                self.git("reset", "-q", "--hard", self.base)
+
+    def test_a_second_cache_epoch_note_fails(self):
+        # The tree check refuses a second note; the gate says so on the
+        # pull request that adds it, label or not.
+        epoch = "This release starts a new cache epoch"
+        start = self.base
+        for where in ("CHANGELOG.md", "changelog.d/5.changed.md", "changelog.d/9.changed.md"):
+            with self.subTest(main=where):
+                self.git("reset", "-q", "--hard", start)
+                if where == "CHANGELOG.md":
+                    self.add_line("## [Unreleased]\n\n", f"### Changed\n\n- {epoch} (issue #2).\n\n")
+                else:
+                    issue = where.split("/")[1].split(".")[0]
+                    self.write(where, f"{epoch} (issue #{issue}).\n")
+                self.commit("note on main")
+                self.base = self.git("rev-parse", "HEAD").strip()
+                self.write("src/lib.rs", "pub fn f() { g() }\n")
+                self.write("changelog.d/7.changed.md", f"{epoch.lower()}, again (issue #7).\n")
+                self.commit("change")
+                for labels in ((), ("no-changelog",)):
+                    done = self.entry(*labels)
+                    self.assertEqual(done.returncode, 1, done.stdout)
+                    self.assertIn(
+                        "changelog.d/7.changed.md: a second cache-epoch note: ## [Unreleased] already has one",
+                        done.stderr,
+                    )
+
+    def test_one_cache_epoch_note_passes(self):
+        # The first note, and a later change added to it as CONTRIBUTING.md
+        # asks, are no second note.
+        epoch = "This release starts a new cache epoch"
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/7.changed.md", f"{epoch}. Seven (issue #7).\n")
+        self.commit("note")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("src/lib.rs", "pub fn f() { h() }\n")
+        self.write("changelog.d/7.changed.md", f"{epoch}. Seven and eight (issues #7 and #8).\n")
+        self.commit("follow-up")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("edits the fragment changelog.d/7.changed.md", done.stdout)
+
+    def test_a_file_name_that_is_not_utf8(self):
+        def make(rel):
+            try:
+                with open(os.fsencode(self.repo) + b"/" + rel, "wb") as f:
+                    f.write(b"The change (issue #1).\n")
+            except OSError:
+                self.skipTest("this file system refuses names that are not UTF-8")
+
+        make(b"docs/caf\xe9.txt")
+        self.commit("docs")
+        done = self.entry("no-changelog")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the no-changelog label is set", done.stdout)
+        (self.repo / "changelog.d").mkdir()
+        make(b"changelog.d/1.fix\xe9d.md")
+        self.commit("fragment")
+        done = self.entry("no-changelog")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertNotIn("Traceback", done.stderr)
+        self.assertIn("changelog.d/1.fix", done.stderr)
+        self.assertIn("unknown section", done.stderr)
 
     def test_malformed_fragments_fail(self):
         cases = (
