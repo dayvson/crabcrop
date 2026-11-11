@@ -92,7 +92,7 @@ fn seeded_remainders(src: &str) -> Vec<String> {
 /// the same store with its memory cold, holding
 /// `30x20/{src}` in memory. Returns that second state and
 /// its base URL.
-async fn seed_then_go_cold(state: &AppState, src: &str) -> (AppState, String) {
+async fn seed_then_go_cold(state: &Arc<AppState>, src: &str) -> (Arc<AppState>, String) {
     let base = serve_state(state).await;
     let mut remainders = seeded_remainders(src);
     remainders.push(format!("30x20/{src}"));
@@ -101,8 +101,14 @@ async fn seed_then_go_cold(state: &AppState, src: &str) -> (AppState, String) {
         assert_eq!(resp.status(), StatusCode::OK);
     }
     assert_eq!(state.store.as_ref().unwrap().stats().0, remainders.len());
-    let mut cold = state.clone();
-    cold.cache = Arc::new(Cache::new(16 * 1024 * 1024));
+    // The second state is `state`'s settings over its disk
+    // store, with memory, gates and tasks of its own.
+    let mut cold = tier_test_state(None, "http://127.0.0.1:9");
+    cold.store = state.store.clone();
+    cold.shared_store = None;
+    cold.presets = state.presets.clone();
+    cold.metrics_token = state.metrics_token.clone();
+    let cold = Arc::new(cold);
     let cold_base = serve_state(&cold).await;
     let resp = get_within(&cold_base, &format!("30x20/{src}"), "the warming hit").await;
     assert_eq!(
@@ -155,7 +161,7 @@ async fn requests_answer_while_every_disk_read_is_stuck() {
     // build without the fix at the limit below.
     let dir = crate::test_support::scratch_dir("srv-stuck-reads");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
-    let state = disk_only_state(&dir, 16 * 1024 * 1024);
+    let state = Arc::new(disk_only_state(&dir, 16 * 1024 * 1024));
     let (cold, base) = seed_then_go_cold(&state, &src).await;
     let store = cold.store.clone().unwrap();
     let errors = store.errors();
@@ -174,7 +180,7 @@ async fn a_shared_hit_answers_while_the_disk_read_is_stuck() {
     // stuck goes on to the shared tier.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-stuck-shared");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let key = "40x24/example.com/i.png";
     store.put(key, &tier_test_entry());
@@ -205,7 +211,7 @@ async fn requests_answer_while_every_disk_slot_is_held() {
     // for a slot, and a memory hit does not wait on the disk.
     let dir = crate::test_support::scratch_dir("srv-stuck-slots");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
-    let state = disk_only_state(&dir, 16 * 1024 * 1024);
+    let state = Arc::new(disk_only_state(&dir, 16 * 1024 * 1024));
     let (cold, base) = seed_then_go_cold(&state, &src).await;
     let store = cold.store.clone().unwrap();
     let held = DiskSlotsHeld::hold(&store, 32).await;
@@ -256,6 +262,7 @@ async fn purges_and_an_upload_overwrite_answer_while_the_disk_is_stuck() {
         10 * 1024 * 1024,
         true,
     )));
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let upload = format!(
@@ -354,7 +361,7 @@ async fn a_stuck_disk_queues_no_work_per_request() {
     // many requests come.
     let dir = crate::test_support::scratch_dir("srv-stuck-per-request");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
-    let state = disk_only_state(&dir, 0);
+    let state = Arc::new(disk_only_state(&dir, 0));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let resp = get_within(&base, &format!("30x20/{src}"), "the seeding render").await;
@@ -394,7 +401,7 @@ async fn a_lookup_that_answers_late_leaves_no_copy_a_group_purge_misses() {
     // without the fix.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-late-lookup");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -447,6 +454,7 @@ async fn two_disk_hits_at_once_keep_both_groups_in_memory() {
     let dir = crate::test_support::scratch_dir("srv-two-hits");
     let mut state = tier_test_state(Some(&dir), "http://127.0.0.1:9");
     state.shared_store = None;
+    let state = Arc::new(state);
     let store = state.store.clone().unwrap();
     let key = "40x24/example.com/i.png";
     store.put(key, &tier_test_entry());

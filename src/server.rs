@@ -73,8 +73,10 @@ pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
 pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
 
-/// Shared state for the handlers.
-#[derive(Clone)]
+/// Shared state for the handlers: one per server, built at
+/// boot and shared behind an `Arc` (issue #475). The router,
+/// each request, and each task a request starts hold that
+/// `Arc`, never a copy of the state.
 pub struct AppState {
     /// The signing keyring (issue #143), from `CRABCROP_SECRET`:
     /// the current key plus, during a rotation window, the
@@ -349,6 +351,20 @@ pub struct AppState {
     pub config_fingerprint: String,
 }
 
+// `AppState` is not `Clone` (issue #475): the server holds
+// one, behind an `Arc`, and everything that needs it past a
+// borrow clones the `Arc`. A derive would let a whole-state
+// copy back in; with it, the call below names two impls and
+// the build fails as ambiguous.
+const _: fn() = || {
+    trait AmbiguousIfClone<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+    <AppState as AmbiguousIfClone<_>>::check();
+};
+
 impl std::fmt::Debug for AppState {
     /// The fields a derive would print, except that the
     /// `/metrics` token prints as `[redacted]`; the keyring,
@@ -431,8 +447,10 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-/// Build the router.
-pub fn app(state: AppState) -> Router {
+/// Build the router over `state`: an `AppState`, or the
+/// `Arc` a caller that keeps its own handle already holds.
+/// Every route shares that one `Arc`.
+pub fn app(state: impl Into<Arc<AppState>>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -463,7 +481,7 @@ pub fn app(state: AppState) -> Router {
         // (issue #563).
         .fallback(unrouted_path)
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state)
+        .with_state(state.into())
         .layer(axum::middleware::from_fn(security_headers))
 }
 
@@ -582,7 +600,7 @@ fn token_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // The exposition is operational data (issue #270,
     // the PL-5 residual): it serves only to a bearer of
     // the configured token, and an unconfigured server
@@ -1001,7 +1019,7 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// source fetches, and answers with the image path's own
 /// status and body.
 async fn explain_handle(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
@@ -1597,7 +1615,7 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
 /// 403 and purges nothing. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
@@ -1776,7 +1794,7 @@ async fn purge_handle(
 /// removes nothing; an unknown group answers 200 with a
 /// count of 0.
 async fn purge_group_handle(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
@@ -1964,7 +1982,7 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// removed. The upload
 /// overwrite path (audit R2-07) shares this with any
 /// future source-replacement flow.
-async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
+async fn purge_source_everywhere(state: &Arc<AppState>, source: &str) -> usize {
     // The fan-out runs in a spawned task, as in the purge
     // handlers (issue #347): a purge that has started
     // completes and is logged even if the caller is
@@ -2041,7 +2059,10 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
 /// and the `X-Crabcrop-Source` header is the exact
 /// reference: `201` for a new object, `200` when an
 /// allowed overwrite replaced one.
-async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+async fn upload_handle(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> Response {
     let accept = req
         .headers()
         .get(header::ACCEPT)
@@ -2113,7 +2134,11 @@ impl UploadOutcome {
 /// Count and log an upload's outcome (audit PL-8), then
 /// answer it. A stored upload that replaced an object
 /// purges the old one's derivatives before it answers.
-async fn finish_upload(state: &AppState, outcome: UploadOutcome, accept: Option<&str>) -> Response {
+async fn finish_upload(
+    state: &Arc<AppState>,
+    outcome: UploadOutcome,
+    accept: Option<&str>,
+) -> Response {
     match outcome {
         UploadOutcome::Unaudited((status, code, message)) => {
             error_response(status, code, message, accept)
@@ -2571,7 +2596,7 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
 }
 
 async fn handle(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
@@ -2695,7 +2720,7 @@ impl Refusal {
 /// [`cache_key_for`] keys it; and [`run_flight`] serves it
 /// from the tiers or the miss path.
 async fn serve(
-    state: &AppState,
+    state: &Arc<AppState>,
     path: &str,
     accept: Option<&str>,
     if_none_match: Option<&str>,
@@ -3249,7 +3274,7 @@ fn meta_flight_key(work: &MissWork) -> String {
 /// request coalesces through its own flights, and an image
 /// request reads the tiers and coalesces its miss.
 async fn run_flight(
-    state: &AppState,
+    state: &Arc<AppState>,
     path: &str,
     mut work: MissWork,
     if_none_match: Option<&str>,
@@ -4170,7 +4195,7 @@ const DISK_HIT: &str = "crabcrop; hit; detail=\"disk\"";
 /// tier tests drive one lookup.
 #[cfg(test)]
 async fn lookup_tiers(
-    state: &AppState,
+    state: &Arc<AppState>,
     cache_key: &str,
     groups: &[String],
 ) -> Option<(CachedImage, &'static str)> {
@@ -4263,7 +4288,7 @@ fn memory_hit(state: &AppState, snapshot: u64, key: &str, groups: &[String], hit
 /// Returns the image and the `Cache-Status` value for
 /// the tier that served it.
 async fn lookup_tiers_within(
-    state: &AppState,
+    state: &Arc<AppState>,
     cache_key: &str,
     groups: &[String],
     budget: &mut DiskBudget,
@@ -4396,7 +4421,7 @@ async fn lookup_tiers_within(
 /// the answer (issue #572) leaves the task nothing to do.
 /// Returns the image on a hit.
 async fn lookup_disk_tier(
-    state: AppState,
+    state: Arc<AppState>,
     snapshot: u64,
     key: String,
     groups: Vec<String>,

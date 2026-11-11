@@ -142,7 +142,7 @@ async fn a_follower_after_a_long_render_still_reads_a_healthy_disk() {
     // a long render before its next check still reads a healthy
     // disk.
     let dir = crate::test_support::scratch_dir("srv-budget-wall");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     state.store.as_ref().unwrap().put(KEY, &tier_test_entry());
     let mut budget = DiskBudget::with(std::time::Duration::from_millis(200));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -163,6 +163,7 @@ async fn a_write_for_a_key_the_disk_holds_only_teaches_it_groups() {
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut state = disk_only_state(&dir, 0);
     state.presets = presets_named(&["a", "c"]);
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let resp = get_within(&base, &format!("preset:a/{src}"), "the first render").await;
@@ -193,7 +194,7 @@ async fn an_abandoned_lookup_promotes_and_learns_nothing() {
     // Issue #572: a lookup task whose request went on without
     // it promotes nothing and teaches no tier anything.
     let dir = crate::test_support::scratch_dir("srv-abandoned");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     let store = state.store.clone().unwrap();
     store.put(KEY, &tier_test_entry());
     let (gate, _held) = DiskOpGate::hold(&store, &[OpKind::Read]);
@@ -220,7 +221,7 @@ async fn groups_learned_on_memory_hits_during_a_stall_all_land() {
     // Issue #572, race 3, through the server: memory hits that
     // add groups while every disk write is stuck.
     let dir = crate::test_support::scratch_dir("srv-stall-learns");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     let store = state.store.clone().unwrap();
     let keys: Vec<String> = (0..15)
         .map(|i| format!("{i}x24/example.com/i.png"))
@@ -261,6 +262,7 @@ async fn a_fresh_write_that_lands_late_carries_a_group_learned_meanwhile() {
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut state = disk_only_state(&dir, 16 * 1024 * 1024);
     state.presets = presets_named(&["c", "d"]);
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let (gate, _held) = DiskOpGate::hold(&store, &[OpKind::Write]);
@@ -284,7 +286,7 @@ async fn a_fresh_write_that_lands_late_carries_a_group_learned_meanwhile() {
 #[tokio::test]
 async fn groups_learned_during_a_stall_survive_a_reopen() {
     let dir = crate::test_support::scratch_dir("srv-stall-reopen");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     let store = state.store.clone().unwrap();
     store.put(KEY, &in_groups(&["a"]));
     state.cache.put(KEY.to_string(), in_groups(&["a"]));
@@ -311,6 +313,7 @@ async fn a_stuck_disk_and_a_stalled_bucket_queue_the_same_work_however_many_requ
     let dir = crate::test_support::scratch_dir("srv-stuck-bucket");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
     state.cache = Arc::new(Cache::new(0));
+    let state = Arc::new(state);
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     store.put(KEY, &in_groups(&["a"]));
@@ -352,7 +355,7 @@ async fn a_request_dropped_before_its_disk_read_leaves_the_write_back_to_the_nex
     // writes it back to the bucket.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-drop-before-read");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     store.put(KEY, &tier_test_entry());
@@ -371,7 +374,7 @@ async fn a_request_dropped_before_its_disk_read_leaves_the_write_back_to_the_nex
 #[tokio::test]
 async fn metrics_show_the_disk_gauges_while_every_slot_is_held() {
     let dir = crate::test_support::scratch_dir("srv-disk-gauges");
-    let state = disk_only_state(&dir, 16 * 1024 * 1024);
+    let state = Arc::new(disk_only_state(&dir, 16 * 1024 * 1024));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let held = DiskSlotsHeld::hold(&store, 32).await;
@@ -417,7 +420,7 @@ async fn a_follower_does_not_wait_for_its_leaders_disk_write() {
     // finished after they are woken.
     let dir = crate::test_support::scratch_dir("srv-handoff");
     let (src, hits) = spawn_slow_counting_server(test_png(), 300).await;
-    let state = disk_only_state(&dir, 16 * 1024 * 1024);
+    let state = Arc::new(disk_only_state(&dir, 16 * 1024 * 1024));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let (gate, _held) = DiskOpGate::hold(&store, &[OpKind::Write]);
@@ -452,6 +455,7 @@ async fn a_follower_of_another_spelling_reads_the_leaders_disk_write_with_memory
     let (src, hits) = spawn_slow_counting_server(test_png(), 300).await;
     let mut state = disk_only_state(&dir, 0);
     state.presets = presets_named(&["a", "b"]);
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let leader = {
         let base = base.clone();
@@ -501,6 +505,7 @@ async fn a_render_whose_bucket_write_was_skipped_leaves_the_group_to_the_next_di
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
     state.cache = Arc::new(Cache::new(0));
     state.presets = presets_named(&["c"]);
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -540,6 +545,7 @@ async fn a_bucket_stall_queues_no_write_back_per_rendered_key() {
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
     state.cache = Arc::new(Cache::new(0));
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let slots: Vec<_> = (0..crate::server::background::SHARED_PUTS_AT_ONCE)
         .map(|_| state.background.put_slot().unwrap())
@@ -559,7 +565,7 @@ async fn a_bucket_stall_queues_no_write_back_per_rendered_key() {
 #[tokio::test]
 async fn a_group_learned_under_a_live_purge_of_it_removes_the_disk_copy() {
     let dir = crate::test_support::scratch_dir("srv-live-purge-learn");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     let store = state.store.clone().unwrap();
     store.put(KEY, &tier_test_entry());
     state.cache.put(KEY.to_string(), tier_test_entry());
@@ -596,7 +602,7 @@ async fn a_group_only_memory_held_reaches_the_disk_and_the_bucket() {
     // groups memory holds, so a purge of `d` reaches it.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-memory-only-group");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -641,7 +647,7 @@ async fn a_purge_whose_disk_files_are_not_deleted_yet_leaves_its_tombstone_unend
     // until they are gone, so it keeps covering them.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unended-tombstone");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     store.put(KEY, &in_groups(&["g"]));
@@ -677,7 +683,7 @@ async fn a_purge_whose_disk_files_are_not_deleted_yet_leaves_its_tombstone_unend
 async fn a_slow_write_that_has_its_slot_is_not_a_stall() {
     let dir = crate::test_support::scratch_dir("srv-slow-write");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
-    let state = disk_only_state(&dir, 16 * 1024 * 1024);
+    let state = Arc::new(disk_only_state(&dir, 16 * 1024 * 1024));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     store.set_hold(Some(Arc::new(|kind, _| {
@@ -710,7 +716,7 @@ async fn a_bucket_hit_keeps_its_group_when_a_purge_of_a_known_group_begins_durin
     // under the purge.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-known-purged-race");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     shared.put(KEY, &tier_test_entry()).await;
@@ -759,7 +765,7 @@ async fn a_bucket_hit_keeps_its_group_under_a_running_purge_of_a_known_group() {
     // bucket copy. A later purge of `c` must reach it.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-known-purged-running");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -799,7 +805,7 @@ async fn a_late_disk_promotion_keeps_a_group_memory_learned_meanwhile() {
     // that the record lacks. The disk hit's promotion merges
     // into it and must not take `d` back out of memory.
     let dir = crate::test_support::scratch_dir("srv-late-promotion");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     let store = state.store.clone().unwrap();
     store.put(KEY, &in_groups(&["a"]));
     let (gate, mut held) = DiskOpGate::hold(&store, &[OpKind::Read]);
@@ -862,7 +868,7 @@ async fn a_purge_whose_disk_deletion_keeps_failing_still_ends() {
     // target walks the bucket.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unlink-fails");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     store.put(KEY, &in_groups(&["g"]));
@@ -910,7 +916,7 @@ async fn a_purge_after_one_whose_disk_deletion_is_stuck_still_walks_the_bucket()
     // not hold the bucket walk.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unlink-stuck-walk");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&state).await;
     let store = state.store.clone().unwrap();
     store.put(KEY, &in_groups(&["g"]));
@@ -948,7 +954,7 @@ async fn a_disk_hit_that_grows_a_held_copy_into_a_running_purge_drops_it_from_me
     // into that copy and grows it into `g`: like a memory hit
     // that does so, it leaves memory.
     let dir = crate::test_support::scratch_dir("srv-promote-into-purge");
-    let state = disk_tier_state(&dir);
+    let state = Arc::new(disk_tier_state(&dir));
     let store = state.store.clone().unwrap();
     let _running = state
         .purge_guard

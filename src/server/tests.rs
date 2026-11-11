@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 mod disk_hang;
 mod disk_stall;
+mod shared_state;
 
 const SECRET: &[u8] = b"test-secret";
 
@@ -9382,7 +9383,7 @@ fn entry_objects(fake: &crate::s3store::test_support::FakeS3) -> usize {
 /// Poll a lookup future exactly once, then drop it:
 /// the shape of a client disconnecting at the first
 /// await that cannot complete synchronously.
-fn poll_lookup_once(state: &AppState, key: &str, groups: &[String]) {
+fn poll_lookup_once(state: &Arc<AppState>, key: &str, groups: &[String]) {
     let fut = lookup_tiers(state, key, groups);
     let mut fut = Box::pin(fut);
     let waker = std::task::Waker::noop();
@@ -9411,7 +9412,7 @@ async fn shared_learns_group(shared: &crate::s3store::S3Store, key: &str, group:
 async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-drop3");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png";
@@ -9438,7 +9439,7 @@ async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
     // (issues #347, #350).
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-drop4");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png";
@@ -14480,7 +14481,7 @@ fn held_upscale_state(process_permits: usize) -> (AppState, Release, Arc<AtomicU
 /// handler: aborting the task drops the request where it
 /// is, as a client that disconnects does.
 fn start_request(
-    state: &AppState,
+    state: &Arc<AppState>,
     remainder: &str,
     width_hint: Option<u32>,
 ) -> tokio::task::JoinHandle<Response> {
@@ -14512,6 +14513,7 @@ async fn a_render_whose_client_left_is_stored_and_its_replay_is_a_hit() {
     // itself ends.
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(2);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     for (rendering, width) in [(1, 150), (2, 250)] {
@@ -14562,6 +14564,7 @@ async fn followers_of_a_leader_whose_client_left_receive_its_render() {
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (mut state, release, calls) = held_upscale_state(2);
     state.cache = Arc::new(Cache::new(0));
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     let leader = start_request(&state, &remainder, None);
@@ -14601,6 +14604,7 @@ async fn a_request_dropped_before_its_render_starts_starts_none() {
     // not started is never started.
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(1);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release);
     let held = state.process_gate.clone().acquire_owned().await.unwrap();
     let remainder = format!("filters:upscale(2)/{src}");
@@ -14637,6 +14641,7 @@ async fn a_waiter_past_the_wait_cap_finishes_a_render_its_client_left() {
     // client leaves, and the replay is a hit.
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(1);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     // The request's key, read from the flight of a first
@@ -14762,6 +14767,7 @@ async fn a_source_that_did_not_decode_gets_no_fallback_once_its_client_left() {
             .unwrap(),
     ));
     state.fallback = Some(Fallback::Url(fallback));
+    let state = Arc::new(state);
     let remainder = format!("frame:1.5/40x30/{src}");
     let request = start_request(&state, &remainder, None);
     wait_until("the render started", || started.exists()).await;
@@ -14791,6 +14797,7 @@ async fn a_fallback_whose_client_left_while_it_loaded_starts_no_render() {
     // them.
     open_release(&release);
     state.fallback = Some(Fallback::Url(fallback));
+    let state = Arc::new(state);
     let remainder = format!("filters:upscale(2)/{garbage}");
     let request = start_request(&state, &remainder, None);
     wait_until("the fallback is loading", || {
@@ -14825,6 +14832,7 @@ async fn followers_of_a_leader_that_forwent_its_fallback_get_the_fallback() {
     let (mut state, release, calls) = held_upscale_state(2);
     open_release(&release);
     state.fallback = Some(Fallback::Url(fallback));
+    let state = Arc::new(state);
     let remainder = format!("filters:upscale(2)/{garbage}");
     let leader = start_request(&state, &remainder, None);
     wait_until("the leader's fallback is loading", || {
@@ -14869,6 +14877,7 @@ async fn the_shutdown_drain_counts_a_miss_once_its_client_has_left() {
     // it and, cut off, reports it as a render.
     let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
     let (state, release, calls) = held_upscale_state(1);
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let remainder = format!("filters:upscale(2)/{src}");
     let request = start_request(&state, &remainder, None);
@@ -14922,6 +14931,7 @@ async fn the_shutdown_drain_waits_for_the_write_a_left_render_starts() {
         release: release.clone(),
         calls: calls.clone(),
     }));
+    let state = Arc::new(state);
     let _open = OpenOnDrop(release.clone());
     let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
     let request = start_request(&state, &format!("filters:upscale(2)/{src}"), None);
@@ -15350,7 +15360,7 @@ struct WalkFixture {
     fake: crate::s3store::test_support::FakeS3,
     dir: crate::test_support::ScratchDir,
     hits: Arc<AtomicUsize>,
-    probe: AppState,
+    probe: Arc<AppState>,
     server: tokio::task::JoinHandle<()>,
     base: String,
     url: String,
@@ -15366,6 +15376,7 @@ impl WalkFixture {
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
         let mut state = tier_test_state(Some(&dir), &fake.endpoint);
         state.presets = preset_test_map();
+        let state = Arc::new(state);
         let probe = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -15446,10 +15457,10 @@ impl WalkFixture {
     /// A replica over the fixture's bucket that did not
     /// receive the purge, with its own disk tier at `dir`
     /// when given.
-    fn other_replica(&self, dir: Option<&std::path::Path>) -> AppState {
+    fn other_replica(&self, dir: Option<&std::path::Path>) -> Arc<AppState> {
         let mut state = tier_test_state(dir, &self.fake.endpoint);
         state.presets = preset_test_map();
-        state
+        Arc::new(state)
     }
 
     /// Purge group `small` and wait until its background
@@ -15587,7 +15598,7 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     // serves again.
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-active");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png#cfgtest#w300";
@@ -15794,7 +15805,7 @@ async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
     // the shared tier once it knows the purge, or the copy
     // would outlive the walk that removed it.
     let fake = crate::s3store::test_support::start_fake().await;
-    let holder = tier_test_state(None, &fake.endpoint);
+    let holder = Arc::new(tier_test_state(None, &fake.endpoint));
     let purger = tier_test_state(None, &fake.endpoint);
     let key = "40x24/example.com/i.png#cfgtest";
     holder.cache.put(key.to_string(), tier_test_entry());
@@ -15964,6 +15975,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
     state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     let disk = state.store.clone().unwrap();
     let g = vec!["g".to_string()];
@@ -16015,7 +16027,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     assert_eq!(purge_group_call(&base, "g").await, "purged 2\n");
     wait_for_purges_to_end(&state).await;
     assert!(lookup_tiers(&state, k1, &[]).await.is_none());
-    let fresh = tier_test_state(None, &fake.endpoint);
+    let fresh = Arc::new(tier_test_state(None, &fake.endpoint));
     let shared = fresh.shared_store.clone().unwrap();
     assert!(shared.refresh_tombstones(&fresh.purge_guard).await);
     assert!(lookup_tiers(&fresh, k1, &[]).await.is_none());
@@ -16039,6 +16051,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut first = tier_test_state(Some(&dir), &fake.endpoint);
     first.presets = twin_presets();
+    let first = Arc::new(first);
     let base = serve_state(&first).await;
     let resp = get_signed(&base, &format!("preset:a/{src}")).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16049,7 +16062,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
 
     // Another replica purges group a; its walk removes the
     // bucket copy and ends.
-    let purger = tier_test_state(None, &fake.endpoint);
+    let purger = Arc::new(tier_test_state(None, &fake.endpoint));
     let purger_base = serve_state(&purger).await;
     assert_eq!(purge_group_call(&purger_base, "a").await, "purged 1\n");
     wait_for_purges_to_end(&purger).await;
@@ -16066,6 +16079,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
     // read the tombstone.
     let mut restarted = tier_test_state(Some(&dir), &fake.endpoint);
     restarted.presets = twin_presets();
+    let restarted = Arc::new(restarted);
     let base = serve_state(&restarted).await;
     *fake.name_break.unanswered.lock().unwrap() = Some(tombstone);
     refresh_with_one_unread(&restarted).await;
@@ -16086,7 +16100,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
 
     // A replica without the tombstone, as every replica is
     // once it expires, serves the copy.
-    let expired = tier_test_state(None, &fake.endpoint);
+    let expired = Arc::new(tier_test_state(None, &fake.endpoint));
     let (_, status) = lookup_tiers(&expired, &key, &[]).await.unwrap();
     assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
 
@@ -16097,7 +16111,7 @@ async fn a_copy_written_back_during_the_gap_is_removed_by_the_purge_sent_again()
     assert_eq!(purge_group_call(&base, "a").await, "purged 3\n");
     wait_for_purges_to_end(&restarted).await;
     assert_eq!(entry_objects(&fake), 0);
-    let cold = tier_test_state(None, &fake.endpoint);
+    let cold = Arc::new(tier_test_state(None, &fake.endpoint));
     assert!(lookup_tiers(&cold, &key, &[]).await.is_none());
     assert!(lookup_tiers(&restarted, &key, &[]).await.is_none());
 }
@@ -16138,6 +16152,7 @@ async fn a_hit_under_an_unread_tombstone_teaches_every_tier(probe: UnreadProbe) 
         tier_test_state(Some(&dir), &fake.endpoint)
     };
     writer.presets = twin_presets();
+    let writer = Arc::new(writer);
     let writer_base = serve_state(&writer).await;
     let resp = get_signed(&writer_base, &first).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16147,6 +16162,7 @@ async fn a_hit_under_an_unread_tombstone_teaches_every_tier(probe: UnreadProbe) 
     } else {
         let mut state = tier_test_state(Some(&dir), &fake.endpoint);
         state.presets = twin_presets();
+        let state = Arc::new(state);
         let base = serve_state(&state).await;
         (state, base)
     };
@@ -16203,6 +16219,7 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut first = tier_test_state(Some(&dir), &fake.endpoint);
     first.presets = twin_presets();
+    let first = Arc::new(first);
     let base = serve_state(&first).await;
     let plain = format!("30x20/{src}");
     assert_eq!(get_signed(&base, &plain).await.status(), StatusCode::OK);
@@ -16214,6 +16231,7 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
 
     let mut restarted = tier_test_state(Some(&dir), &fake.endpoint);
     restarted.presets = twin_presets();
+    let restarted = Arc::new(restarted);
     let base = serve_state(&restarted).await;
     list_an_unread_tombstone(&restarted, &fake, unrelated_purge()).await;
     let resp = get_signed(&base, &plain).await;
@@ -16229,6 +16247,7 @@ async fn an_unread_tombstone_leaves_the_groups_a_restart_serves_purgeable() {
     assert_eq!(entry_objects(&fake), 0);
     let mut cold = tier_test_state(None, &fake.endpoint);
     cold.presets = twin_presets();
+    let cold = Arc::new(cold);
     let cold_base = serve_state(&cold).await;
     let resp = get_signed(&cold_base, &format!("preset:a/{src}")).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16254,7 +16273,7 @@ async fn an_unread_name_ahead_or_just_behind_does_not_stop_caching() {
         let fake = crate::s3store::test_support::start_fake().await;
         let dir = crate::test_support::scratch_dir("srv-unread-name");
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
-        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let state = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
         let base = serve_state(&state).await;
         let name = format!("purges/{start_ms}-{writer:016x}-1");
         fake.objects
@@ -16297,6 +16316,7 @@ async fn a_request_under_an_unread_tombstone_teaches_the_bucket_copy_its_group()
     let (src, hits, current) = spawn_swappable_server(test_png()).await;
     let mut writer = tier_test_state(None, &fake.endpoint);
     writer.presets = twin_presets();
+    let writer = Arc::new(writer);
     let writer_base = serve_state(&writer).await;
     let resp = get_signed(&writer_base, &format!("preset:a/{src}")).await;
     assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
@@ -16306,6 +16326,7 @@ async fn a_request_under_an_unread_tombstone_teaches_the_bucket_copy_its_group()
 
     let mut state = tier_test_state(None, &fake.endpoint);
     state.presets = twin_presets();
+    let state = Arc::new(state);
     let base = serve_state(&state).await;
     list_an_unread_tombstone(&state, &fake, unrelated_purge()).await;
     let resp = get_signed(&base, &format!("preset:b/{src}")).await;
@@ -16336,7 +16357,7 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
     let dir = crate::test_support::scratch_dir("srv-unread-stall");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let url = |i: usize| format!("{}x20/{src}", 20 + i);
-    let first = tier_test_state(Some(&dir), &fake.endpoint);
+    let first = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&first).await;
     for i in 0..N {
         assert_eq!(get_signed(&base, &url(i)).await.status(), StatusCode::OK);
@@ -16346,7 +16367,7 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
     assert_eq!(entry_objects(&fake), N);
     tombstone_from_another_replica(&fake, unrelated_purge()).await;
 
-    let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+    let restarted = Arc::new(tier_test_state(Some(&dir), &fake.endpoint));
     let base = serve_state(&restarted).await;
     fake.fail.lock().unwrap().get_object = true;
     refresh_with_one_unread(&restarted).await;
@@ -16386,8 +16407,8 @@ async fn an_unread_tombstone_costs_no_render_while_the_bucket_stalls() {
 async fn spawn_walk_app(
     fake: &crate::s3store::test_support::FakeS3,
     objects: usize,
-) -> (String, AppState) {
-    let state = tier_test_state(None, &fake.endpoint);
+) -> (String, Arc<AppState>) {
+    let state = Arc::new(tier_test_state(None, &fake.endpoint));
     let probe = state.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -18722,7 +18743,7 @@ async fn explain_escapes_markup_bearing_strings() {
 
 /// Serve `state` on an ephemeral port: the tests that read
 /// `/metrics` while they drive the state directly.
-async fn serve_state(state: &AppState) -> String {
+async fn serve_state(state: &Arc<AppState>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = state.clone();
@@ -18755,6 +18776,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     fake.hold_puts.store(true, Ordering::SeqCst);
     let mut state = tier_test_state(None, &fake.endpoint);
     state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
     let shared = state.shared_store.clone().unwrap();
     let base = serve_state(&state).await;
     let snapshot = state.purge_guard.snapshot();
@@ -18911,7 +18933,7 @@ async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
     // The request scans the inline budget itself; the
     // background walk parks on its first read past it.
     *fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
-    let state = tier_test_state(None, &fake.endpoint);
+    let state = Arc::new(tier_test_state(None, &fake.endpoint));
     purge_source_everywhere(&state, "example.com/i.png").await;
     wait_until("the background walk parks", || {
         fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
@@ -18981,7 +19003,7 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool, 
     // sent it again; the bucket copy never learned it, the
     // group purge left it, and every replica served it.
     let fake = crate::s3store::test_support::start_fake().await;
-    let state = tier_test_state(None, &fake.endpoint);
+    let state = Arc::new(tier_test_state(None, &fake.endpoint));
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/hero.png";
     let entry = tier_test_entry();
@@ -19048,7 +19070,7 @@ async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool, 
     assert!(lookup_tiers(&state, key, &groups).await.is_none());
     // Another replica, with the bucket's tombstones read,
     // misses as well.
-    let other = tier_test_state(None, &fake.endpoint);
+    let other = Arc::new(tier_test_state(None, &fake.endpoint));
     shared.refresh_tombstones(&other.purge_guard).await;
     assert!(lookup_tiers(&other, key, &groups).await.is_none());
 }
@@ -19361,6 +19383,7 @@ async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     state.loader = loader;
     state.fallback = fallback;
     state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
     serve_state(&state).await
 }
 
