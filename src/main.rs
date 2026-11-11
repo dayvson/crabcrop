@@ -588,9 +588,10 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// bytes change once and then repeat render for render on
 /// one encoder build #567, PR #585; and under
 /// `CRABCROP_METADATA=preserve`, JPEG and PNG output whose
-/// source EXIF or Photoshop segment holds a thumbnail or a
-/// size tag, now copied without the thumbnail and with the
-/// output's size #611).
+/// source EXIF or Photoshop segment holds a thumbnail, a
+/// size tag or another part preserve now removes, now
+/// copied without those parts and with the output's size
+/// #611).
 const RENDERING_VERSION: u32 = 6;
 
 /// Fingerprint the configuration that shapes rendered
