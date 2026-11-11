@@ -466,3 +466,355 @@ fn cdn_recipes_name_the_error_header_the_server_sends() {
         );
     }
 }
+
+/// The variables the server treats as secrets: the names in
+/// `SECRET_VARIABLES` in src/config.rs. That module belongs
+/// to the binary, which an integration test cannot import,
+/// so the list is read from the source.
+fn server_secret_variables() -> Vec<String> {
+    let config = read("src/config.rs");
+    let head = "const SECRET_VARIABLES: [&str; ";
+    let start = config.find(head).expect("src/config.rs: SECRET_VARIABLES");
+    let rest = &config[start + head.len()..];
+    let len: usize = rest[..rest.find(']').unwrap()].parse().unwrap();
+    let body = &rest[rest.find("= [").unwrap()..rest.find("];").unwrap()];
+    let names: Vec<String> = body
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect();
+    assert_eq!(names.len(), len, "SECRET_VARIABLES: {names:?}");
+    names
+}
+
+/// Key IDs the server reads next to a secret: not secret
+/// themselves, but set together with it, so the chart reads
+/// each from the same Secret as its partner.
+const SECRET_PARTNERS: [(&str, &str); 2] = [
+    ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+    ("CRABCROP_GCS_ACCESS_KEY", "CRABCROP_GCS_SECRET_KEY"),
+];
+
+/// The env entries of a chart template that read a Secret
+/// (`- name:` then `valueFrom:` then `secretKeyRef:`), each
+/// with the closest `{{- if ... }}` above it, the condition
+/// that renders it.
+fn secret_ref_entries(template: &str) -> std::collections::BTreeMap<String, String> {
+    let lines: Vec<&str> = template.lines().map(str::trim).collect();
+    let mut found = std::collections::BTreeMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(name) = line.strip_prefix("- name: ") else {
+            continue;
+        };
+        if lines.get(i + 1..i + 3) != Some(&["valueFrom:", "secretKeyRef:"][..]) {
+            continue;
+        }
+        let guard = lines[..i]
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("{{- if "))
+            .map_or(String::new(), |l| l.to_string());
+        found.insert(name.to_string(), guard);
+    }
+    found
+}
+
+/// The lines of a named template, `{{- define "<name>" -}}`
+/// up to the `{{- end }}` that closes it, with each action
+/// on its own line as the chart writes them.
+fn template_define<'a>(text: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let open = format!("{{{{- define \"{name}\" -}}}}");
+    let mut lines = text.lines();
+    lines.find(|l| l.trim() == open)?;
+    let mut depth = 1;
+    let mut body = Vec::new();
+    for line in lines {
+        let t = line.trim();
+        if ["{{- if ", "{{- range ", "{{- with ", "{{- define "]
+            .iter()
+            .any(|p| t.starts_with(p))
+        {
+            depth += 1;
+        } else if t.starts_with("{{- end") {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body);
+            }
+        }
+        body.push(line);
+    }
+    None
+}
+
+/// The scalar at a dotted path of a YAML file, as written
+/// (`a.b` is `b:` nested two spaces under `a:`).
+fn yaml_scalar(text: &str, path: &str) -> Option<String> {
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let mut scope = text.to_string();
+    let mut indent = 0;
+    let mut keys = path.split('.').peekable();
+    while let Some(key) = keys.next() {
+        if keys.peek().is_none() {
+            let head = format!("{key}:");
+            return scope
+                .lines()
+                .find(|l| depth(l) == indent && l.trim_start().starts_with(&head))
+                .map(|l| l.trim_start()[head.len()..].trim().to_string());
+        }
+        scope = yaml_block(&scope, indent, key)?.join("\n");
+        indent += 2;
+    }
+    None
+}
+
+#[test]
+fn the_secret_helpers_read_what_they_claim() {
+    let template = "{{- if .Values.a }}\n- name: A\n  valueFrom:\n    secretKeyRef:\n      \
+                    name: s\n{{- end }}\n- name: B\n  value: x\n- name: C\n  valueFrom:\n    \
+                    configMapKeyRef:\n";
+    let entries = secret_ref_entries(template);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries["A"], "{{- if .Values.a }}");
+    let helpers = "{{- define \"x\" -}}\na: b\n{{- if .c }}\nd\n{{- end }}\n{{- end }}\ne\n";
+    assert_eq!(
+        template_define(helpers, "x").unwrap(),
+        vec!["a: b", "{{- if .c }}", "d", "{{- end }}"]
+    );
+    assert!(template_define(helpers, "y").is_none());
+    let yaml = "a: \"\"\nb:\n  a: 1\n  c:\n    d: []\n";
+    assert_eq!(yaml_scalar(yaml, "a").as_deref(), Some("\"\""));
+    assert_eq!(yaml_scalar(yaml, "b.a").as_deref(), Some("1"));
+    assert_eq!(yaml_scalar(yaml, "b.c.d").as_deref(), Some("[]"));
+    assert!(yaml_scalar(yaml, "c").is_none());
+    let secrets = server_secret_variables();
+    assert!(
+        secrets.contains(&"CRABCROP_SECRET".to_string()),
+        "{secrets:?}"
+    );
+}
+
+#[test]
+fn the_helm_chart_reads_every_secret_variable_from_a_secret() {
+    // Issue #589: the chart read only CRABCROP_SECRET and
+    // CRABCROP_METRICS_TOKEN from a Secret. Every other secret
+    // went through `env`, which writes it into the Deployment
+    // as plain text, readable by anyone who can read the
+    // Deployment or its Pods.
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let entries = secret_ref_entries(&deployment);
+    let secrets = server_secret_variables();
+    let wanted = secrets
+        .iter()
+        .map(String::as_str)
+        .chain(SECRET_PARTNERS.iter().map(|(id, _)| *id));
+    let missing: Vec<&str> = wanted.filter(|n| !entries.contains_key(*n)).collect();
+    assert!(
+        missing.is_empty(),
+        "deployment.yaml: no secretKeyRef entry for {missing:?}"
+    );
+    for (id, secret) in SECRET_PARTNERS {
+        assert_eq!(
+            entries[id], entries[secret],
+            "deployment.yaml: {id} comes from the same Secret as {secret}"
+        );
+    }
+
+    // The chart's route map names, for each secret, the value
+    // that turns its entry on. The plain-value warning points
+    // there, so it must match the server's list and the
+    // template.
+    let helpers = read("deploy/helm/crabcrop/templates/_helpers.tpl");
+    let routes: std::collections::BTreeMap<&str, &str> =
+        template_define(&helpers, "crabcrop.secretRoutes")
+            .expect("_helpers.tpl: defines crabcrop.secretRoutes")
+            .into_iter()
+            .map(|l| l.split_once(": ").expect("NAME: value"))
+            .collect();
+    let mut listed: Vec<&str> = routes.keys().copied().collect();
+    let mut server: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    listed.sort_unstable();
+    server.sort_unstable();
+    assert_eq!(
+        listed, server,
+        "crabcrop.secretRoutes lists SECRET_VARIABLES"
+    );
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    for (name, route) in routes {
+        let guard = entries[name].replace(['(', ')'], "");
+        assert!(
+            guard.contains(&format!(".Values.{route}")),
+            "deployment.yaml: {name} renders under {route}, not {guard:?}"
+        );
+        assert_eq!(
+            yaml_scalar(&values, route).as_deref(),
+            Some("\"\""),
+            "values.yaml: {route} is a value, empty by default"
+        );
+    }
+}
+
+#[test]
+fn the_helm_chart_takes_env_entries_and_whole_secrets() {
+    // Issue #589: the `env` map renders every entry as a plain
+    // string, so a `valueFrom` in it became the literal text
+    // "map[valueFrom:...]". `extraEnv` takes entries as
+    // written and `envFrom` maps whole Secrets.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    for key in ["extraEnv", "envFrom"] {
+        assert_eq!(
+            yaml_scalar(&values, key).as_deref(),
+            Some("[]"),
+            "values.yaml: {key} is a list, empty by default"
+        );
+    }
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let lines: Vec<&str> = deployment.lines().map(str::trim).collect();
+    let extra = lines
+        .iter()
+        .position(|l| *l == "{{- with .Values.extraEnv }}")
+        .expect("deployment.yaml: renders extraEnv");
+    assert_eq!(lines[extra + 1], "{{- toYaml . | nindent 12 }}");
+    let listed = lines
+        .iter()
+        .position(|l| l.contains("range $k := keys $allEnv"))
+        .unwrap();
+    assert!(listed < extra, "extraEnv follows the env map");
+    let from = lines
+        .iter()
+        .position(|l| *l == "{{- with .Values.envFrom }}")
+        .expect("deployment.yaml: renders envFrom");
+    assert_eq!(
+        lines[from + 1..from + 3],
+        ["envFrom:", "{{- toYaml . | nindent 12 }}"]
+    );
+
+    // extraEnv cannot carry the drain grace past its guard
+    // (issue #463) either.
+    let guard = lines
+        .iter()
+        .position(|l| l.contains(r#"eq (get . "name") "CRABCROP_SHUTDOWN_GRACE_SECS""#))
+        .expect("deployment.yaml: refuses CRABCROP_SHUTDOWN_GRACE_SECS in extraEnv");
+    assert!(
+        lines[guard + 1].starts_with("{{- fail "),
+        "{}",
+        lines[guard + 1]
+    );
+    let range = lines[..guard]
+        .iter()
+        .rposition(|l| l.starts_with("{{- range "))
+        .unwrap();
+    assert_eq!(lines[range], "{{- range .Values.extraEnv }}");
+}
+
+#[test]
+fn the_helm_chart_warns_when_a_secret_variable_is_a_plain_value() {
+    // The owner's call on #589: for one release a secret in
+    // `env`, `ai.env` or a plain `extraEnv` value still
+    // renders, with a warning in the install notes and in the
+    // manifest; `refusePlainSecrets` fails the render instead.
+    let helpers = read("deploy/helm/crabcrop/templates/_helpers.tpl");
+    let plain = template_define(&helpers, "crabcrop.plainSecrets")
+        .expect("_helpers.tpl: defines crabcrop.plainSecrets")
+        .join("\n");
+    for read_from in [
+        "include \"crabcrop.secretRoutes\" .",
+        ".Values.env",
+        ".Values.ai.env",
+        ".Values.extraEnv",
+    ] {
+        assert!(
+            plain.contains(read_from),
+            "crabcrop.plainSecrets reads {read_from}"
+        );
+    }
+
+    let include = "{{- $plainSecrets := include \"crabcrop.plainSecrets\" . | fromYaml }}";
+    let notes = read("deploy/helm/crabcrop/templates/NOTES.txt");
+    let notes: Vec<&str> = notes.lines().map(str::trim).collect();
+    let at = notes
+        .iter()
+        .position(|l| *l == include)
+        .expect("NOTES.txt: reads crabcrop.plainSecrets");
+    assert_eq!(notes[at + 1], "{{- if $plainSecrets }}");
+    assert!(
+        notes[at + 2..].iter().any(|l| l.starts_with("WARNING: ")),
+        "NOTES.txt: warns about plain secrets"
+    );
+
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let lines: Vec<&str> = deployment.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|l| *l == include)
+        .expect("deployment.yaml: reads crabcrop.plainSecrets");
+    assert_eq!(
+        lines[at + 1..at + 3],
+        [
+            "{{- if and $plainSecrets .Values.refusePlainSecrets }}",
+            "{{- $refused := list }}"
+        ],
+        "deployment.yaml: fails only behind refusePlainSecrets"
+    );
+    let comment = lines
+        .iter()
+        .position(|l| l.starts_with("# WARNING: {{ $name }} "))
+        .expect("deployment.yaml: a comment names each plain secret");
+    assert!(at < comment, "the comment follows the refusal");
+    assert_eq!(
+        lines[comment - 1],
+        "{{- range $name, $route := $plainSecrets }}"
+    );
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    assert_eq!(
+        yaml_scalar(&values, "refusePlainSecrets").as_deref(),
+        Some("false"),
+        "values.yaml: refusePlainSecrets is off for this release"
+    );
+}
+
+#[test]
+fn the_secret_docs_describe_routes_that_work() {
+    // values.yaml and the chart README said the AWS keys could
+    // go through the `env` map "backed by a Secret", which the
+    // template could not do.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    assert!(
+        !values.contains("through the env map"),
+        "values.yaml: sends the AWS keys through env"
+    );
+    let readme = read("deploy/helm/crabcrop/README.md");
+    assert!(
+        !readme.contains("through the chart's `env` map"),
+        "README.md: sends the AWS keys through env"
+    );
+    for route in [
+        "resultBucket.credentialsSecret",
+        "previousSecret.existingSecret",
+        "gcsCredentials.existingSecret",
+        "extraEnv",
+        "envFrom",
+        "refusePlainSecrets",
+    ] {
+        assert!(readme.contains(&format!("`{route}")), "README.md: {route}");
+    }
+    // The kustomize env patch shows the AWS keys as Secret
+    // references, never as `value:` lines.
+    let patch = read("deploy/kustomize/overlays/multi-replica/env-patch.yaml");
+    let commented: Vec<&str> = patch
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("# "))
+        .map(str::trim)
+        .collect();
+    for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+        let at = commented
+            .iter()
+            .position(|l| *l == format!("- name: {key}"))
+            .unwrap_or_else(|| panic!("env-patch.yaml: a commented {key} entry"));
+        assert_eq!(
+            commented.get(at + 1..at + 3),
+            Some(&["valueFrom:", "secretKeyRef:"][..]),
+            "env-patch.yaml: {key} reads a Secret"
+        );
+    }
+}

@@ -56,6 +56,17 @@ spec:
                   name: {{ include "crabcrop.secretName" . }}
                   key: {{ .Values.secretKey }}
             {{- end }}
+            {{- /* previousSecret and gcsCredentials are read in
+                 parentheses, so values kept from 0.11.0 or earlier
+                 (helm upgrade --reuse-values), which lack them,
+                 still render. */}}
+            {{- if (.Values.previousSecret).existingSecret }}
+            - name: CRABCROP_SECRET_PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.previousSecret.existingSecret }}
+                  key: {{ .Values.previousSecret.secretKey | default "CRABCROP_SECRET_PREVIOUS" }}
+            {{- end }}
             {{- if .Values.metricsToken.existingSecret }}
             - name: CRABCROP_METRICS_TOKEN
               valueFrom:
@@ -93,6 +104,39 @@ spec:
               value: {{ .Values.resultBucket.s3Region | quote }}
             {{- end }}
             {{- end }}
+            {{- /* The AWS keys serve the whole server (s3:// sources and
+                 the upload bucket too), so they render without a
+                 bucket name. */}}
+            {{- if .Values.resultBucket.credentialsSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.resultBucket.credentialsSecret }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.resultBucket.credentialsSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.resultBucket.credentialsSecret }}
+                  key: AWS_SESSION_TOKEN
+                  optional: true
+            {{- end }}
+            {{- if (.Values.gcsCredentials).existingSecret }}
+            - name: CRABCROP_GCS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gcsCredentials.existingSecret }}
+                  key: CRABCROP_GCS_ACCESS_KEY
+            - name: CRABCROP_GCS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gcsCredentials.existingSecret }}
+                  key: CRABCROP_GCS_SECRET_KEY
+            {{- end }}
             {{- $allEnv := dict }}
             {{- range $k, $v := .Values.env }}
             {{- $_ := set $allEnv $k $v }}
@@ -107,10 +151,36 @@ spec:
             {{- if hasKey $allEnv "CRABCROP_SHUTDOWN_GRACE_SECS" }}
             {{- fail "set shutdownGraceSeconds, not CRABCROP_SHUTDOWN_GRACE_SECS in env or ai.env: the pod's terminationGracePeriodSeconds follows shutdownGraceSeconds" }}
             {{- end }}
+            {{- /* A secret in env, ai.env or a plain extraEnv value lands
+                 here as plain text. This release warns; a later one
+                 refuses it by default. */}}
+            {{- $plainSecrets := include "crabcrop.plainSecrets" . | fromYaml }}
+            {{- if and $plainSecrets .Values.refusePlainSecrets }}
+            {{- $refused := list }}
+            {{- range $name, $route := $plainSecrets }}
+            {{- $refused = append $refused (printf "%s (set %s)" $name $route) }}
+            {{- end }}
+            {{- fail (printf "refusePlainSecrets is on, and these secrets are plain values in env, ai.env or extraEnv: %s. Read each from a Secret instead (see the chart README)" (join ", " $refused)) }}
+            {{- end }}
+            {{- range $name, $route := $plainSecrets }}
+            # WARNING: {{ $name }} is a plain value in this spec, readable by anyone who can read the Deployment. Read it from a Secret: set {{ $route }}.
+            {{- end }}
             {{- range $k := keys $allEnv | sortAlpha }}
             - name: {{ $k }}
               value: {{ index $allEnv $k | quote }}
             {{- end }}
+            {{- range .Values.extraEnv }}
+            {{- if eq (get . "name") "CRABCROP_SHUTDOWN_GRACE_SECS" }}
+            {{- fail "set shutdownGraceSeconds, not CRABCROP_SHUTDOWN_GRACE_SECS in extraEnv: the pod's terminationGracePeriodSeconds follows shutdownGraceSeconds" }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /health
