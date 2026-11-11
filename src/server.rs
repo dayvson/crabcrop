@@ -1306,13 +1306,16 @@ async fn begin_purge(
 async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
-    active: crate::cache::ActivePurge,
-    tombstone: Option<String>,
-    disk: Option<crate::storage::DeletionWait>,
+    begun: BegunPurge,
     epoch_base: Option<String>,
     event: &'static str,
     log_target: &str,
 ) -> usize {
+    let BegunPurge {
+        active,
+        tombstone,
+        disk,
+    } = begun;
     let target = active.tombstone().target.clone();
     let cutoff = active.tombstone().cutoff;
     // The walk lists these variants and reads them again, so
@@ -1440,6 +1443,15 @@ async fn end_purge(
         shared.write_tombstone(object, &ended).await;
     }
     drop(purge);
+}
+
+/// A purge that has begun, as its shared-tier half takes it:
+/// the running purge, its bucket tombstone, and the disk
+/// deletions its tombstone waits for (issue #572).
+struct BegunPurge {
+    active: crate::cache::ActivePurge,
+    tombstone: Option<String>,
+    disk: Option<crate::storage::DeletionWait>,
 }
 
 /// The disk tier's half of a purge (issue #572): remove the
@@ -1692,9 +1704,11 @@ async fn purge_handle(
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
-                active,
-                tombstone,
-                disk.clone(),
+                BegunPurge {
+                    active,
+                    tombstone,
+                    disk: disk.clone(),
+                },
                 Some(epoch_form),
                 "purge",
                 &task_target,
@@ -1794,9 +1808,11 @@ async fn purge_group_handle(
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
-                active,
-                tombstone,
-                disk.clone(),
+                BegunPurge {
+                    active,
+                    tombstone,
+                    disk: disk.clone(),
+                },
                 None,
                 "purge-group",
                 &task_target,
@@ -1934,9 +1950,11 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
-                active,
-                tombstone,
-                disk.clone(),
+                BegunPurge {
+                    active,
+                    tombstone,
+                    disk: disk.clone(),
+                },
                 None,
                 "purge-source",
                 &source,
@@ -3696,7 +3714,7 @@ fn bucket_for(sent: Sent, groups: &[String]) -> crate::storage::Bucket<'_> {
     match sent {
         Sent::Spawned => crate::storage::Bucket::Carries(groups),
         Sent::Skipped => crate::storage::Bucket::Skipped,
-        Sent::NotSent => crate::storage::Bucket::Unknown,
+        Sent::Nothing => crate::storage::Bucket::Unknown,
     }
 }
 
@@ -3923,14 +3941,14 @@ fn spawn_shared_put(
     write: SharedWrite,
 ) -> Sent {
     let Some(shared) = &state.shared_store else {
-        return Sent::NotSent;
+        return Sent::Nothing;
     };
     let guard = state.purge_guard.clone();
     // A write a purge already covers would be dropped in the
     // task anyway: checked before it takes a slot, so it is
     // not counted as a skip.
     if guard.write_covered(snapshot, key, &entry.groups, entry.written) {
-        return Sent::NotSent;
+        return Sent::Nothing;
     }
     let (slot, queued) = match write {
         SharedWrite::Render => match state.background.put_slot() {
@@ -3983,7 +4001,7 @@ enum Sent {
     Skipped,
     /// Nothing to write: no shared tier, or a purge covers the
     /// copy.
-    NotSent,
+    Nothing,
 }
 
 /// How long one request waits for the disk tier's lookups,

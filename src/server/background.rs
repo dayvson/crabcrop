@@ -11,8 +11,10 @@
 //! The write-throughs are bounded here too, since every
 //! miss starts one and nothing else limits them; purges
 //! are signed, and their walks wait for a turn (issue
-//! #462); a disk hit's task is one disk read its request
-//! waits for.
+//! #462); a disk hit's task starts only once it holds one of
+//! the disk tier's slots (issue #572), so at most that many
+//! exist, and the disk tier's own background jobs are the
+//! store's, settled apart at shutdown.
 
 use std::collections::HashMap;
 use std::future::Future;
