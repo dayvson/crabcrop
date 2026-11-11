@@ -88,7 +88,9 @@ resultStorage:
 # below, backed by a Secret.
 resultBucket:
   name: ""
-  # Object prefix namespacing this deployment's entries.
+  # Object prefix for this deployment's entries; empty means
+  # the bucket root. Deployments that share a bucket need
+  # different prefixes (one may contain another).
   prefix: ""
   # Base URL of an S3-compatible store; empty means AWS.
   s3Endpoint: ""

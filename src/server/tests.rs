@@ -1,4 +1,5 @@
 use super::*;
+use crate::s3store::test_support::{HEAD_FILLER, TAIL_FILLER, filler_name};
 use image::DynamicImage;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15047,7 +15048,7 @@ impl WalkFixture {
         {
             let mut objects = fake.objects.lock().unwrap();
             for i in 0..SHARED_PURGE_INLINE_SCAN + 40 {
-                let filler = format!("0-filler-{i:04}");
+                let filler = filler_name(HEAD_FILLER, i);
                 assert!(filler < object, "fillers must list ahead of the entry");
                 objects.insert(filler, b"not a cache entry".to_vec());
             }
@@ -15468,13 +15469,13 @@ async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
 
 /// A served app over a shared tier alone for the purge
 /// walk pacing tests (issue #462), its bucket filled to
-/// `objects` objects that are not cache entries: the first
-/// [`SHARED_PURGE_INLINE_SCAN`], named `0-head-NNNN`, list
-/// ahead of every entry object, so a purge's inline scan
-/// reads exactly those; the rest, named `z-tail-NNNN`, list
-/// after every entry object and are left to the background
-/// walk, which a test parks on them with the fake's
-/// `hold_prefix`.
+/// `objects` filler objects that are not cache entries: the
+/// first [`SHARED_PURGE_INLINE_SCAN`], named after
+/// `HEAD_FILLER`, list ahead of every entry object, so a
+/// purge's inline scan reads exactly those; the rest, named
+/// after `TAIL_FILLER`, list after every entry object and are
+/// left to the background walk, which a test parks on them
+/// with the fake's `hold_prefix`.
 async fn spawn_walk_app(
     fake: &crate::s3store::test_support::FakeS3,
     objects: usize,
@@ -15490,9 +15491,9 @@ async fn spawn_walk_app(
     let before = bucket.len();
     for i in 0..objects {
         let name = if i < SHARED_PURGE_INLINE_SCAN {
-            format!("0-head-{i:04}")
+            filler_name(HEAD_FILLER, i)
         } else {
-            format!("z-tail-{i:04}")
+            filler_name(TAIL_FILLER, i)
         };
         bucket.insert(name, b"not a cache entry".to_vec());
     }
@@ -15568,7 +15569,7 @@ async fn identical_group_purges_share_one_walk_and_one_relist() {
         ..tier_test_entry()
     };
     shared.put(stale_key, &member).await;
-    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(TAIL_FILLER.into());
     assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
     wait_until("the first walk parks", || {
         fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
@@ -15629,7 +15630,7 @@ async fn background_purge_walks_take_turns_two_at_a_time() {
     const OBJECTS: usize = SHARED_PURGE_INLINE_SCAN + 100;
     let fake = crate::s3store::test_support::start_fake().await;
     let (base, probe) = spawn_walk_app(&fake, OBJECTS).await;
-    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(TAIL_FILLER.into());
     let calls: Vec<_> = (0..5)
         .map(|i| {
             let base = base.clone();
@@ -15670,10 +15671,10 @@ async fn an_identical_url_purge_joins_the_walk_and_purges_its_variants_inline() 
     {
         let mut objects = fx.fake.objects.lock().unwrap();
         for i in 0..64 {
-            objects.insert(format!("z-tail-{i:04}"), b"not a cache entry".to_vec());
+            objects.insert(filler_name(TAIL_FILLER, i), b"not a cache entry".to_vec());
         }
     }
-    *fx.fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    *fx.fake.walk.hold_prefix.lock().unwrap() = Some(TAIL_FILLER.into());
     let path = fx.url.strip_prefix(&fx.base).unwrap();
     let (_, remainder) = path[1..].split_once('/').unwrap();
     let purge_url = format!(
@@ -15737,7 +15738,7 @@ async fn a_purge_joining_an_inline_walk_still_gets_its_relist() {
     shared
         .put("40x24/example.com/stale.png#cfgtest", &member)
         .await;
-    *fake.walk.hold_prefix.lock().unwrap() = Some("0-head-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(HEAD_FILLER.into());
     let leader_base = base.clone();
     let leader = tokio::spawn(async move { purge_group_call(&leader_base, "small").await });
     wait_until("the leader's inline scan parks", || {
@@ -15774,7 +15775,7 @@ async fn the_relist_judges_copies_by_the_latest_joined_purge() {
         groups: vec!["small".to_string()],
         ..tier_test_entry()
     };
-    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(TAIL_FILLER.into());
     assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
     wait_until("the leader's walk parks", || {
         fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
@@ -15806,7 +15807,7 @@ async fn inline_scans_of_different_purges_share_one_read_budget() {
     use crate::s3store::PURGE_INLINE_READS_AT_ONCE;
     let fake = crate::s3store::test_support::start_fake().await;
     let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN).await;
-    *fake.walk.hold_prefix.lock().unwrap() = Some("0-head-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(HEAD_FILLER.into());
     let calls: Vec<_> = (0..6)
         .map(|i| {
             let base = base.clone();
@@ -15848,7 +15849,7 @@ async fn a_purge_request_scan_does_not_wait_behind_background_walks() {
     use crate::s3store::{PURGE_READS_AT_ONCE, PURGE_WALKS_AT_ONCE};
     let fake = crate::s3store::test_support::start_fake().await;
     let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 20).await;
-    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(TAIL_FILLER.into());
     for i in 0..PURGE_WALKS_AT_ONCE {
         assert_eq!(
             purge_group_call(&base, &format!("g{i}")).await,
@@ -15958,7 +15959,7 @@ async fn a_failed_relist_leaves_the_joined_purges_in_force() {
     let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 50).await;
     let shared = probe.shared_store.clone().unwrap();
     let groups = vec!["small".to_string()];
-    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    *fake.walk.hold_prefix.lock().unwrap() = Some(TAIL_FILLER.into());
     assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
     wait_until("the first walk parks", || {
         fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
@@ -17995,7 +17996,7 @@ async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
     {
         let mut objects = fake.objects.lock().unwrap();
         for i in 0..SHARED_PURGE_INLINE_SCAN + 8 {
-            objects.insert(format!("0-filler-{i:04}"), b"not a cache entry".to_vec());
+            objects.insert(filler_name(HEAD_FILLER, i), b"not a cache entry".to_vec());
         }
     }
     // The request scans the inline budget itself; the

@@ -683,15 +683,22 @@ impl S3Store {
         }
     }
 
-    /// Every object key under the store prefix, following
-    /// continuation tokens, minus the tombstone sub-prefix
-    /// (issue #461): the purge walk's input, and whether the
-    /// listing ran to its end. An error yields what was
-    /// listed so far (possibly nothing), and is counted and
-    /// logged: the walk then cannot have reached every copy
-    /// (issue #462).
+    /// Every entry object under the store prefix, following
+    /// continuation tokens: the purge walk's input, and
+    /// whether the listing ran to its end. An error yields
+    /// what was listed so far (possibly nothing), and is
+    /// counted and logged: the walk then cannot have reached
+    /// every copy (issue #462).
+    ///
+    /// The listing holds every object under the prefix, but
+    /// only names of the entry form are kept (see
+    /// [`S3Store::is_entry_object`]). Tombstones (issue
+    /// #461), raw uploads, and the objects of a deployment
+    /// whose prefix sits inside this one are never read
+    /// (issue #608). The names are filtered here, not with a
+    /// `delimiter` in the request, so this works on every
+    /// S3-compatible store.
     async fn list_objects(&self) -> (Vec<String>, bool) {
-        let tombstones = self.tombstone_prefix();
         let (listed, complete) = self.list_under(&self.prefix).await;
         if !complete {
             self.note_error("purge walk", "listing the bucket failed");
@@ -699,9 +706,23 @@ impl S3Store {
         let objects = listed
             .into_iter()
             .map(|(key, _)| key)
-            .filter(|key| !key.starts_with(&tombstones))
+            .filter(|key| self.is_entry_object(key))
             .collect();
         (objects, complete)
+    }
+
+    /// Whether `object` has the form of an entry object this
+    /// store writes (issue #608): the store prefix, then a key
+    /// stem (64 lowercase hex digits), then `.bin`. An object
+    /// under a nested prefix has a `/` after the store prefix,
+    /// so it fails the form.
+    fn is_entry_object(&self, object: &str) -> bool {
+        object
+            .strip_prefix(&self.prefix)
+            .and_then(|name| name.strip_suffix(".bin"))
+            .is_some_and(|stem| {
+                stem.len() == 64 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
     }
 
     /// Every (object key, ETag) under `prefix`, following
@@ -756,8 +777,10 @@ impl S3Store {
     /// image bytes included). The header is a match hint, not a
     /// serving read: it is parsed without MAC verification,
     /// because verification needs the whole object. A
-    /// forged header can at worst steer a purge; entries
-    /// are only ever SERVED through `get`, which verifies.
+    /// forged header can at worst steer a purge, and only to
+    /// the object stored under its own key's name (issue
+    /// #608); entries are only ever SERVED through `get`,
+    /// which verifies.
     /// Objects past the entry size ceiling are refused
     /// outright, exactly as `get` refuses them.
     ///
@@ -899,6 +922,14 @@ impl S3Store {
     /// stays and is not counted. A read or a delete the
     /// store did not answer leaves the object unjudged
     /// (issue #462).
+    ///
+    /// Only the object this store writes the stored key to
+    /// can be deleted (issue #608). Every entry this store
+    /// wrote is there. Another deployment's entry, or an
+    /// entry copied to another name, is kept whatever its
+    /// header claims, so a header read without its MAC cannot
+    /// steer a purge to it. `get` never serves those objects
+    /// either: it reads only the name of the key it asks for.
     async fn purge_object(
         &self,
         object: &str,
@@ -911,6 +942,9 @@ impl S3Store {
             HeaderRead::Failed => return ObjectPurge::Failed,
         };
         let header = &probed.header;
+        if object != self.object_key(&key_stem(&header.key)) {
+            return ObjectPurge::Kept;
+        }
         if !target.covers(&header.key, &header.groups) || !cutoff.covers(header.written) {
             return ObjectPurge::Kept;
         }
@@ -1884,6 +1918,22 @@ pub(crate) mod test_support {
         pub endpoint: String,
     }
 
+    /// The first 32 hex digits of a filler object that lists
+    /// ahead of every entry object, and of one that lists
+    /// after every entry object. Entry names are SHA-256
+    /// digests, so no real one starts with either.
+    pub const HEAD_FILLER: &str = "00000000000000000000000000000000";
+    pub const TAIL_FILLER: &str = "ffffffffffffffffffffffffffffffff";
+
+    /// Filler object `i` after `lead` (`HEAD_FILLER` or
+    /// `TAIL_FILLER`). It has the form of an entry name,
+    /// `<64 hex>.bin`, so a purge walk lists it and reads its
+    /// header (issue #608), but it holds no entry, so the
+    /// walk leaves it.
+    pub fn filler_name(lead: &str, i: usize) -> String {
+        format!("{lead}{i:032x}.bin")
+    }
+
     /// The ETag the fake reports for an object's bytes:
     /// quoted, and different whenever the bytes differ.
     pub fn etag_of(data: &[u8]) -> String {
@@ -2305,7 +2355,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::start_fake;
+    use super::test_support::{TAIL_FILLER, filler_name, start_fake};
     use super::*;
     use crate::url::ImageFormat;
 
@@ -2542,13 +2592,17 @@ mod tests {
         );
     }
 
-    /// Fill the fake bucket with `count` objects named
-    /// `{name}-NNNN` that are not cache entries: a walk reads
-    /// each one's header and leaves it.
-    fn seed_fillers(fake: &super::test_support::FakeS3, name: &str, count: usize) {
+    /// Fill the fake bucket with `count` filler objects under
+    /// the test store's prefix, `cache/`, each named after
+    /// [`TAIL_FILLER`] (see [`filler_name`]): a walk reads each
+    /// one's header and leaves it.
+    fn seed_fillers(fake: &super::test_support::FakeS3, count: usize) {
         let mut objects = fake.objects.lock().unwrap();
         for i in 0..count {
-            objects.insert(format!("{name}-{i:04}"), b"not a cache entry".to_vec());
+            objects.insert(
+                format!("cache/{}", filler_name(TAIL_FILLER, i)),
+                b"not a cache entry".to_vec(),
+            );
         }
     }
 
@@ -2574,8 +2628,8 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let fake = start_fake().await;
         let s = Arc::new(store(&fake.endpoint));
-        seed_fillers(&fake, "cache/f", 64);
-        *fake.walk.hold_prefix.lock().unwrap() = Some("cache/f-".into());
+        seed_fillers(&fake, 64);
+        *fake.walk.hold_prefix.lock().unwrap() = Some(format!("cache/{TAIL_FILLER}"));
         let walker = s.clone();
         let walk = tokio::spawn(async move { walker.purge_group("hero").await });
         wait_for("the walk parks its reads", || {
@@ -2606,7 +2660,7 @@ mod tests {
         const RTT_MS: u64 = 40;
         let fake = start_fake().await;
         let s = store(&fake.endpoint);
-        seed_fillers(&fake, "cache/f", N as usize);
+        seed_fillers(&fake, N as usize);
         fake.walk.delay_ms.store(RTT_MS, SeqCst);
         let started = std::time::Instant::now();
         assert_eq!(s.purge_group("hero").await, 0);
@@ -2695,7 +2749,7 @@ mod tests {
         // failures.
         let fake = start_fake().await;
         let s = store(&fake.endpoint);
-        seed_fillers(&fake, "cache/f", 4);
+        seed_fillers(&fake, 4);
         s.put("old", &image(b"1", &["hero"])).await;
         let hero = PurgeTarget::Group("hero".into());
         let errors = s.errors();
@@ -3629,13 +3683,20 @@ mod tests {
     }
 
     fn store_with_prefix(endpoint: &str, prefix: &str) -> S3Store {
+        store_with_prefix_and_key(endpoint, prefix, test_entry_key())
+    }
+
+    /// A store under `prefix` whose entries carry MACs under
+    /// `entry_key`: one deployment of several that share a
+    /// bucket, each with its own secret (issue #608).
+    fn store_with_prefix_and_key(endpoint: &str, prefix: &str, entry_key: Vec<u8>) -> S3Store {
         S3Store::new(
             "results".into(),
             prefix.into(),
             Some(endpoint.into()),
             "us-east-1".into(),
             None,
-            test_entry_key(),
+            entry_key,
         )
         .unwrap()
     }
@@ -3801,6 +3862,151 @@ mod tests {
         );
         assert_eq!(b.purge_matching("same-key", "same-key").await, 1);
         assert!(fake.objects.lock().unwrap().is_empty());
+    }
+
+    /// Prefix pairs of two deployments in one bucket where
+    /// the outer prefix contains the inner one (issue #608):
+    /// the bucket root around `prod`, and `img` around
+    /// `img/prod`.
+    const NESTED_PREFIXES: [(&str, &str); 2] = [("", "prod"), ("img", "img/prod")];
+
+    /// The cache key both deployments of a nested pair hold,
+    /// and its source.
+    const NESTED_KEY: &str = "300x200/file:///heroes/cat.jpg";
+    const NESTED_SOURCE: &str = "file:///heroes/cat.jpg";
+
+    /// Two deployments of one bucket under `outer` and
+    /// `inner`, each with its own secret (issue #608). Each
+    /// holds an entry for [`NESTED_KEY`] in group `hero`. The
+    /// inner one's entry is larger than the header probe, so
+    /// a walk can match it on its header alone, without its
+    /// MAC.
+    async fn nested_deployments(endpoint: &str, outer: &str, inner: &str) -> (S3Store, S3Store) {
+        let outer = store_with_prefix_and_key(endpoint, outer, crate::url::entry_key(b"outer"));
+        let inner = store_with_prefix_and_key(endpoint, inner, crate::url::entry_key(b"inner"));
+        let payload = vec![7u8; 2 * S3Store::HEADER_PROBE_BYTES];
+        inner.put(NESTED_KEY, &image(&payload, &["hero"])).await;
+        outer.put(NESTED_KEY, &image(b"outer", &["hero"])).await;
+        (outer, inner)
+    }
+
+    #[tokio::test]
+    async fn outer_prefix_purge_group_leaves_a_nested_deployments_entries() {
+        // Issue #608: the walk of a store whose prefix holds
+        // another deployment's prefix listed that deployment's
+        // entries too, matched the large ones on their headers,
+        // and deleted them. The outer purge now removes its own
+        // entry only, and counts only that one.
+        for (outer, inner) in NESTED_PREFIXES {
+            let fake = start_fake().await;
+            let (outer_store, inner_store) = nested_deployments(&fake.endpoint, outer, inner).await;
+            assert_eq!(
+                outer_store.purge_group("hero").await,
+                1,
+                "{outer:?} around {inner:?}"
+            );
+            assert!(outer_store.get(NESTED_KEY).await.is_none());
+            assert!(
+                inner_store.get(NESTED_KEY).await.is_some(),
+                "{outer:?} around {inner:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_prefix_purge_matching_leaves_a_nested_deployments_entries() {
+        // Issue #608: the same for a per-URL purge. The inner
+        // entry has the same stored key, but it is not where
+        // the outer store keeps that key.
+        for (outer, inner) in NESTED_PREFIXES {
+            let fake = start_fake().await;
+            let (outer_store, inner_store) = nested_deployments(&fake.endpoint, outer, inner).await;
+            assert_eq!(
+                outer_store.purge_matching(NESTED_KEY, NESTED_KEY).await,
+                1,
+                "{outer:?} around {inner:?}"
+            );
+            assert!(outer_store.get(NESTED_KEY).await.is_none());
+            assert!(
+                inner_store.get(NESTED_KEY).await.is_some(),
+                "{outer:?} around {inner:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_prefix_purge_source_leaves_a_nested_deployments_entries() {
+        // Issue #608: the same for the source purge a replacing
+        // upload runs.
+        for (outer, inner) in NESTED_PREFIXES {
+            let fake = start_fake().await;
+            let (outer_store, inner_store) = nested_deployments(&fake.endpoint, outer, inner).await;
+            assert_eq!(
+                outer_store.purge_source(NESTED_SOURCE).await,
+                1,
+                "{outer:?} around {inner:?}"
+            );
+            assert!(outer_store.get(NESTED_KEY).await.is_none());
+            assert!(
+                inner_store.get(NESTED_KEY).await.is_some(),
+                "{outer:?} around {inner:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_walk_ignores_an_entry_stored_under_another_name() {
+        // Issue #608: a valid entry copied to another name of
+        // the entry form, in the store's own prefix, is not
+        // where this store keeps its key, and `get` never
+        // serves it. No purge deletes it or counts it.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put(NESTED_KEY, &image(b"1", &["hero"])).await;
+        let real = format!("cache/{}.bin", key_stem(NESTED_KEY));
+        let copy = format!("cache/{}.bin", key_stem("another key"));
+        let data = fake.objects.lock().unwrap()[&real].clone();
+        fake.objects.lock().unwrap().insert(copy.clone(), data);
+        assert_eq!(s.purge_group("hero").await, 1);
+        assert_eq!(s.purge_matching(NESTED_KEY, NESTED_KEY).await, 0);
+        assert_eq!(s.purge_source(NESTED_SOURCE).await, 0);
+        let objects = fake.objects.lock().unwrap();
+        assert!(!objects.contains_key(&real));
+        assert!(objects.contains_key(&copy));
+    }
+
+    #[tokio::test]
+    async fn the_purge_walk_reads_only_its_own_entry_objects() {
+        // Issue #608: the walk read the first 16 KB of every
+        // object under its prefix except its own tombstones: a
+        // nested deployment's entries and tombstones, uploads,
+        // anything. It now reads only names of the entry form,
+        // `<64 hex>.bin`, directly under its prefix.
+        let fake = start_fake().await;
+        let (outer, inner) = nested_deployments(&fake.endpoint, "", "prod").await;
+        {
+            let mut objects = fake.objects.lock().unwrap();
+            for name in [
+                "purges/1-00000000000000ab-1",
+                "prod/purges/1-00000000000000ab-1",
+                "heroes/cat.jpg",
+            ] {
+                objects.insert(name.to_string(), b"not a cache entry".to_vec());
+            }
+        }
+        fake.requests.lock().unwrap().clear();
+        let purged = outer.purge_group("hero").await;
+        let requests = fake.requests.lock().unwrap().clone();
+        // A listing logs as `GET ` with no object name.
+        let reads: Vec<&str> = requests
+            .iter()
+            .map(String::as_str)
+            .filter(|r| r.starts_with("GET ") && *r != "GET ")
+            .collect();
+        let own = format!("GET {}.bin", key_stem(NESTED_KEY));
+        assert_eq!(reads, [own.as_str()], "{requests:?}");
+        assert_eq!(purged, 1);
+        assert!(inner.get(NESTED_KEY).await.is_some());
     }
 
     #[tokio::test]
