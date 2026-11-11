@@ -696,10 +696,7 @@ impl DiskStore {
     fn note_job_error(&self, what: &str, e: &std::io::Error) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(line) = self
-            .job_log
-            .note(crate::cache::now_ms(), &format!("{what}: {e}"))
-        {
+        if let Some(line) = self.job_log.note(monotonic_ms(), &format!("{what}: {e}")) {
             eprintln!("{line}");
         }
     }
@@ -732,7 +729,7 @@ impl DiskStore {
     pub(crate) fn note_stall(&self, stall: Stall) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(line) = self.stall_log.note(crate::cache::now_ms(), stall.what()) {
+        if let Some(line) = self.stall_log.note(monotonic_ms(), stall.what()) {
             eprintln!("{line}");
         }
     }
@@ -2303,7 +2300,9 @@ impl Stall {
 /// that ran out, or background jobs that failed. The first
 /// line comes at once, then at most one every
 /// [`STALL_LOG_EVERY_MS`], with how many were left out since
-/// the last one.
+/// the last one. Its times are [`monotonic_ms`]: on the wall
+/// clock, a step back silenced it until the clock passed the
+/// old mark.
 #[derive(Debug)]
 pub(crate) struct StallLog {
     next_line_ms: AtomicU64,
