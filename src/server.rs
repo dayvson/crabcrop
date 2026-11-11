@@ -691,7 +691,9 @@ fn source_lookup_metrics(state: &AppState) -> String {
 /// stores count their own failures as they log them; the
 /// exposition reads the counters live at scrape time,
 /// one series per configured tier. With a shared tier, its
-/// write-through slots and skips follow (issue #463).
+/// write-through slots and skips follow (issue #463), then
+/// what its last complete listing of the purge tombstones
+/// found unread, and when that was (issue #577).
 fn tier_metrics(state: &AppState) -> String {
     let mut out = String::new();
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
@@ -724,6 +726,22 @@ fn tier_metrics(state: &AppState) -> String {
             background.puts_in_flight(),
             background.put_capacity(),
             background.puts_skipped()
+        ));
+        // The tombstone gap (issue #577): the unread count
+        // stays as of the last complete listing, so a listing
+        // time that stops moving is the sign of a failing
+        // listing.
+        let listed_ms = store.tombstones_listed_ms();
+        out.push_str(&format!(
+            "# HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.\n\
+             # TYPE crabcrop_cache_shared_tombstones_unread gauge\n\
+             crabcrop_cache_shared_tombstones_unread {}\n\
+             # HELP crabcrop_cache_shared_tombstones_listed_timestamp_seconds When this replica last listed the purge tombstones completely, in Unix seconds; 0 before its first complete listing.\n\
+             # TYPE crabcrop_cache_shared_tombstones_listed_timestamp_seconds gauge\n\
+             crabcrop_cache_shared_tombstones_listed_timestamp_seconds {}.{:03}\n",
+            store.tombstones_unread(),
+            listed_ms / 1000,
+            listed_ms % 1000
         ));
     }
     out

@@ -237,6 +237,19 @@ pub struct S3Store {
     /// a refresh fetches only the objects that are new or
     /// changed since.
     tombstones: std::sync::Mutex<HashMap<String, (String, Tombstone)>>,
+    /// How many purge tombstones the last complete listing
+    /// named that this replica has never read (issue #577):
+    /// their reads failed or did not finish, and no earlier
+    /// version is in force. Their purges do not apply here
+    /// until a refresh reads them. Surfaced on /metrics as
+    /// `crabcrop_cache_shared_tombstones_unread`.
+    tombstones_unread: std::sync::atomic::AtomicU64,
+    /// When this replica last listed the tombstones
+    /// completely, in Unix ms; 0 before its first complete
+    /// listing (issue #577). A purge begun after it has not
+    /// reached this replica's guard. Surfaced on /metrics as
+    /// `crabcrop_cache_shared_tombstones_listed_timestamp_seconds`.
+    tombstones_listed_ms: std::sync::atomic::AtomicU64,
     /// The purge walks running in this process, by target,
     /// each with the identical purges that joined it and
     /// wait for its re-list (issue #462).
@@ -313,6 +326,8 @@ impl S3Store {
             creds,
             entry_key,
             tombstones: std::sync::Mutex::new(HashMap::new()),
+            tombstones_unread: std::sync::atomic::AtomicU64::new(0),
+            tombstones_listed_ms: std::sync::atomic::AtomicU64::new(0),
             walks: std::sync::Mutex::new(HashMap::new()),
             walk_turns: tokio::sync::Semaphore::new(PURGE_WALKS_AT_ONCE),
             inline_reads: tokio::sync::Semaphore::new(PURGE_INLINE_READS_AT_ONCE),
@@ -325,6 +340,22 @@ impl S3Store {
     /// /metrics as `crabcrop_cache_tier_errors_total`.
     pub fn errors(&self) -> u64 {
         self.errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The listed tombstones this replica has never read, as
+    /// of its last complete listing (issue #577; see the
+    /// field). Relaxed: a scrape reads a recent value.
+    pub fn tombstones_unread(&self) -> u64 {
+        self.tombstones_unread
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// When this replica last listed the tombstones
+    /// completely, in Unix ms, or 0 (issue #577; see the
+    /// field).
+    pub fn tombstones_listed_ms(&self) -> u64 {
+        self.tombstones_listed_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Count and log one tier failure. The operation
@@ -1343,7 +1374,10 @@ impl S3Store {
     /// keeps the version read before, under the ETag it was
     /// read with, so the next refresh reads it again. One
     /// never read before stays out of the set, as it always
-    /// has, and every refresh retries it. Each read the
+    /// has, and every refresh retries it (issue #577 keeps it
+    /// so: it is counted in [`S3Store::tombstones_unread`],
+    /// named in the log line, and docs/deployment.md says how
+    /// to close the gap). Each read the
     /// store fails counts as one tier error, the reads left
     /// at the deadline count as one together, and a refresh
     /// that has either logs one line for them. A read that
@@ -1367,6 +1401,7 @@ impl S3Store {
             self.note_error("cannot list purge tombstones", "listing failed");
             return false;
         }
+        let listed_ms = now_ms();
         let mut named: Vec<(u64, u64, String, String)> = listed
             .into_iter()
             .filter_map(|(object, etag)| {
@@ -1414,8 +1449,11 @@ impl S3Store {
         // the requests the store failed.
         let (mut failed, mut unfinished) = (0u64, 0u64);
         let mut kept = Vec::new();
+        // The ones never read, with the start their names
+        // give (issue #577).
+        let mut unread: Vec<(u64, String)> = Vec::new();
         let mut first_failure = None;
-        for (_, _, object, etag) in &to_read {
+        for (start_ms, _, object, etag) in &to_read {
             match done.remove(object) {
                 Some(TombstoneRead::Read(tombstone)) => {
                     fresh.insert(object.clone(), (etag.clone(), tombstone));
@@ -1434,6 +1472,8 @@ impl S3Store {
             if let Some(known) = previous.get(object) {
                 fresh.insert(object.clone(), known.clone());
                 kept.push(object.clone());
+            } else {
+                unread.push((*start_ms, object.clone()));
             }
         }
         let now = now_ms();
@@ -1463,14 +1503,20 @@ impl S3Store {
             if unfinished > 0 {
                 what.push(format!("{unfinished} of {total} {}", late()));
             }
+            // The names come last, so a match on the text
+            // before them still holds.
+            let mut detail = format!(
+                "{}; kept as last read: {kept_in_force}; not in force until read: {}",
+                what.join(", "),
+                unread.len()
+            );
+            if !unread.is_empty() {
+                detail += &format!("; oldest not in force: {}", oldest_unread(&mut unread));
+            }
             self.note_errors(
                 failed + u64::from(unfinished > 0),
                 "cannot read purge tombstones",
-                &format!(
-                    "{}; kept as last read: {kept_in_force}; not in force until read: {}",
-                    what.join(", "),
-                    failed + unfinished - kept.len() as u64
-                ),
+                &detail,
             );
         }
         guard.replace_shared(
@@ -1480,6 +1526,12 @@ impl S3Store {
                 .collect(),
         );
         *self.tombstones.lock().unwrap() = fresh;
+        // Stored once the guard holds every tombstone this
+        // listing read (issue #577).
+        self.tombstones_unread
+            .store(unread.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.tombstones_listed_ms
+            .store(listed_ms, std::sync::atomic::Ordering::Relaxed);
         // Collection can wait: a spent tombstone left in the
         // bucket at the deadline is listed, read and deleted
         // by a later refresh.
@@ -1735,6 +1787,27 @@ fn parse_tombstone_name(name: &str) -> Option<(u64, u64)> {
         return None;
     }
     Some((start.parse().ok()?, u64::from_str_radix(writer, 16).ok()?))
+}
+
+/// The three of `unread`'s objects whose purges began first,
+/// by the start their names give, for the `cannot read purge
+/// tombstones` line (issue #577): "a, b, c and N more". The
+/// names passed [`parse_tombstone_name`] (digits, 16 hex
+/// digits, digits) under the configured prefix, so they are
+/// safe to log.
+fn oldest_unread(unread: &mut [(u64, String)]) -> String {
+    const NAMED: usize = 3;
+    unread.sort();
+    let names: Vec<&str> = unread
+        .iter()
+        .take(NAMED)
+        .map(|(_, object)| object.as_str())
+        .collect();
+    let mut line = names.join(", ");
+    if unread.len() > NAMED {
+        line += &format!(" and {} more", unread.len() - NAMED);
+    }
+    line
 }
 
 /// The unescaped text of the first `<tag>` element in
@@ -3105,12 +3178,16 @@ mod tests {
         );
         assert_eq!(b.errors(), 1, "the failed read was not counted");
         assert!(!refreshed);
+        // Issue #577: a tombstone kept as last read is in
+        // force, so it is not unread.
+        assert_eq!(b.tombstones_unread(), 0, "a kept version counted as unread");
         // It stays until a read succeeds, and every refresh
         // reads it again.
         assert!(!b.refresh_tombstones(&guard).await);
         assert_eq!(count_gets(&fake, &name), gets + 2);
         assert!(guard.running_covers_at(later, "k", &hero, None));
         assert_eq!(b.errors(), 2);
+        assert_eq!(b.tombstones_unread(), 0);
         // Once the store answers, the ended record replaces
         // it, and covers during its grace only.
         fake.fail.lock().unwrap().get_object = false;
@@ -3181,12 +3258,14 @@ mod tests {
     async fn a_tombstone_never_read_is_retried_and_counted_until_a_refresh_reads_it() {
         // Issue #549: a failed read was neither counted nor
         // logged. A tombstone this replica has never read
-        // still does not apply until a refresh reads it (what
-        // it should do meanwhile is left open, issue #577),
-        // but every refresh retries it and counts the
-        // failure. Two tombstones fail in each refresh, so the
-        // count shows that every failed read counts on its
-        // own, not once per refresh.
+        // still does not apply until a refresh reads it (issue
+        // #577 keeps it so; see docs/deployment.md), but every
+        // refresh retries it and counts the failure. Two
+        // tombstones fail in each refresh, so the count shows
+        // that every failed read counts on its own, not once
+        // per refresh. Issue #577: each refresh also records
+        // how many listed tombstones the replica has never
+        // read, and when it listed them, for /metrics.
         let fake = start_fake().await;
         let a = store(&fake.endpoint);
         let b = store(&fake.endpoint);
@@ -3206,6 +3285,8 @@ mod tests {
         ];
         fake.fail.lock().unwrap().get_object = true;
         let guard = PurgeGuard::new();
+        assert_eq!(b.tombstones_listed_ms(), 0);
+        let mut listed = 0;
         for round in 1..=2 {
             let refreshed = b.refresh_tombstones(&guard).await;
             for name in &names {
@@ -3219,12 +3300,21 @@ mod tests {
             assert!(!refreshed);
             assert!(!guard.running_covers("k", &hero, None));
             assert!(!guard.running_covers("k", &logo, None));
+            assert_eq!(b.tombstones_unread(), 2, "round {round}");
+            let now_listed = b.tombstones_listed_ms();
+            assert!(
+                now_listed > 0 && now_listed >= listed,
+                "round {round}: listed at {now_listed}, before at {listed}"
+            );
+            listed = now_listed;
         }
         fake.fail.lock().unwrap().get_object = false;
         assert!(b.refresh_tombstones(&guard).await);
         assert!(guard.running_covers("k", &hero, None));
         assert!(guard.running_covers("k", &logo, None));
         assert_eq!(b.errors(), 4);
+        assert_eq!(b.tombstones_unread(), 0);
+        assert!(b.tombstones_listed_ms() >= listed);
     }
 
     #[tokio::test]
@@ -3285,6 +3375,8 @@ mod tests {
         assert_eq!(b.errors(), 0);
         assert!(!guard.running_covers("k", &["known".to_string()], None));
         assert!(!guard.running_covers("k", &["unknown".to_string()], None));
+        // Issue #577: nor does it count as unread.
+        assert_eq!(b.tombstones_unread(), 0);
     }
 
     #[tokio::test]
@@ -3381,6 +3473,9 @@ mod tests {
             .unwrap();
         let guard = PurgeGuard::new();
         assert!(b.refresh_tombstones(&guard).await);
+        let listed = b.tombstones_listed_ms();
+        assert!(listed > 0);
+        assert_eq!(b.tombstones_unread(), 0);
         *fake.name_hold.lists.lock().unwrap() = Some("cache/purges/".into());
         let began = Instant::now();
         // The outer bound only turns a refresh that waits on
@@ -3403,11 +3498,106 @@ mod tests {
         );
         assert_eq!(b.errors(), 1);
         assert!(guard.running_covers("k", &hero, None));
+        // Issue #577: the listing time stays at the last
+        // complete listing, a second or more ago.
+        assert_eq!(b.tombstones_listed_ms(), listed);
+        assert_eq!(b.tombstones_unread(), 0);
         // Once the store answers, the next refresh lists again.
         *fake.name_hold.lists.lock().unwrap() = None;
         assert!(b.refresh_tombstones(&guard).await);
         assert!(guard.running_covers("k", &hero, None));
         assert_eq!(b.errors(), 1);
+        let listed = b.tombstones_listed_ms();
+        assert!(listed > 0);
+        // Issue #577: a listing that runs out keeps the unread
+        // count of the last complete listing, as well as its
+        // time.
+        let logo = a
+            .put_tombstone(&tombstone_for("logo", cutoff, None), 2)
+            .await
+            .unwrap();
+        *fake.name_break.unanswered.lock().unwrap() = Some(logo);
+        assert!(!b.refresh_tombstones(&guard).await);
+        assert_eq!(b.errors(), 2);
+        assert_eq!(b.tombstones_unread(), 1);
+        assert!(b.tombstones_listed_ms() >= listed);
+        let listed = b.tombstones_listed_ms();
+        *fake.name_hold.lists.lock().unwrap() = Some("cache/purges/".into());
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(8),
+            b.refresh_tombstones_within(&guard, Duration::from_secs(1)),
+        )
+        .await
+        .expect("the listing outlived the refresh's limit");
+        assert!(!refreshed);
+        assert_eq!(b.errors(), 3);
+        assert_eq!(b.tombstones_unread(), 1);
+        assert_eq!(b.tombstones_listed_ms(), listed);
+        *fake.name_hold.lists.lock().unwrap() = None;
+        *fake.name_break.unanswered.lock().unwrap() = None;
+        assert!(b.refresh_tombstones(&guard).await);
+        assert_eq!(b.tombstones_unread(), 0);
+        assert!(guard.running_covers("k", &["logo".to_string()], None));
+    }
+
+    #[tokio::test]
+    async fn a_first_listing_that_fails_reports_no_listing_until_one_completes() {
+        // Issue #577: a replica whose listings of the
+        // tombstones fail from boot on has none of them. Its
+        // listing time stays 0 until a listing completes, so
+        // /metrics shows that it never listed them, and its
+        // unread count stays 0 with it.
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        let cutoff = PurgeCutoff {
+            start_ms: now_ms(),
+            writer: 0xa,
+        };
+        a.put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+            .await
+            .unwrap();
+        let guard = PurgeGuard::new();
+        assert_eq!(b.tombstones_listed_ms(), 0);
+        fake.fail.lock().unwrap().list = true;
+        for _ in 0..2 {
+            assert!(!b.refresh_tombstones(&guard).await);
+            assert_eq!(b.tombstones_listed_ms(), 0);
+            assert_eq!(b.tombstones_unread(), 0);
+        }
+        assert!(!guard.running_covers("k", &["hero".to_string()], None));
+        fake.fail.lock().unwrap().list = false;
+        let before = now_ms();
+        assert!(b.refresh_tombstones(&guard).await);
+        let listed = b.tombstones_listed_ms();
+        assert!(
+            (before..=now_ms()).contains(&listed),
+            "listed at {listed}, the refresh began at {before}"
+        );
+        assert_eq!(b.tombstones_unread(), 0);
+        assert!(guard.running_covers("k", &["hero".to_string()], None));
+    }
+
+    #[test]
+    fn the_unread_line_names_the_oldest_three() {
+        // Issue #577: the `cannot read purge tombstones` line
+        // names the unread tombstones that began first, by the
+        // start in their names, and counts the rest.
+        let unread = |names: &[(u64, &str)]| -> Vec<(u64, String)> {
+            names
+                .iter()
+                .map(|(start_ms, name)| (*start_ms, name.to_string()))
+                .collect()
+        };
+        let mut five = unread(&[(5, "o5"), (2, "o2"), (4, "o4"), (1, "o1"), (3, "o3")]);
+        assert_eq!(oldest_unread(&mut five), "o1, o2, o3 and 2 more");
+        let mut three = unread(&[(3, "o3"), (1, "o1"), (2, "o2")]);
+        assert_eq!(oldest_unread(&mut three), "o1, o2, o3");
+        let mut two = unread(&[(9, "o2"), (1, "o1")]);
+        assert_eq!(oldest_unread(&mut two), "o1, o2");
+        // Two that began in the same millisecond go by name.
+        let mut tied = unread(&[(7, "o9"), (7, "o8")]);
+        assert_eq!(oldest_unread(&mut tied), "o8, o9");
     }
 
     #[tokio::test]

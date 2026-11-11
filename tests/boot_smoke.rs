@@ -971,6 +971,22 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or_else(|| panic!("no shared tier error count: {metrics}"));
     assert!((1..=17).contains(&errors), "{metrics}");
+    // Issue #577: /metrics shows that the replica listed all 40
+    // and has read none of them, and when it listed them.
+    assert!(
+        metrics.contains("\ncrabcrop_cache_shared_tombstones_unread 40\n"),
+        "{metrics}"
+    );
+    let listed: f64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("crabcrop_cache_shared_tombstones_listed_timestamp_seconds "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no tombstone listing time: {metrics}"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!((now - listed).abs() < 60.0, "listed at {listed}, now {now}");
     let _ = server.0.kill();
     let _ = server.0.wait();
     let stderr = server.stderr();
@@ -981,6 +997,17 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
     assert!(
         line.contains(
             "of 40 not done within 10s; kept as last read: 0; not in force until read: 40"
+        ),
+        "{line}"
+    );
+    // Issue #577: the line ends with the three tombstones not
+    // in force that began first, by name.
+    assert!(
+        line.ends_with(
+            "not in force until read: 40; oldest not in force: \
+             purges/1762000000000-0000000000000abc-0, \
+             purges/1762000000001-0000000000000abc-1, \
+             purges/1762000000002-0000000000000abc-2 and 37 more"
         ),
         "{line}"
     );

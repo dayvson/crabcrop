@@ -93,7 +93,7 @@ Requests to the upload bucket (`CRABCROP_UPLOAD_BUCKET`) and the shared result s
 
 A request past its bound fails like any other store error. An upload answers `502 upload_store_unavailable`. A shared-tier lookup that runs out is a miss and a write that runs out is dropped, and both count in `crabcrop_cache_tier_errors_total`, as does a purge scan read that runs out, which keeps the purge's tombstone in force.
 
-Reading the purge tombstones has one more bound on top: one refresh, its listing, its reads (16 at a time) and its deletes of expired or superseded tombstones together, ends within 10 seconds. A replica answers its first request only after its first refresh, so a slow or hanging bucket holds that back by 10 seconds at most. [Deployment](deployment.md#the-cache-tiers-and-what-replicas-change) says what happens to a tombstone a refresh cannot read in time.
+Reading the purge tombstones has one more bound on top: one refresh, its listing, its reads (16 at a time) and its deletes of expired or superseded tombstones together, ends within 10 seconds. A replica answers its first request only after its first refresh, so a slow or hanging bucket holds that back by 10 seconds at most. [Deployment](deployment.md#a-replica-that-cannot-read-the-purge-tombstones) says what happens to a tombstone a refresh cannot read in time.
 
 ### Server-wide default operations
 
