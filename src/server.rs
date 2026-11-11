@@ -706,7 +706,7 @@ fn source_lookup_metrics(state: &AppState) -> String {
 /// found unread, and when that was (issue #577).
 fn tier_metrics(state: &AppState) -> String {
     let mut out = String::new();
-    out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed or that a request stopped waiting for.\n");
+    out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
     out.push_str("# TYPE crabcrop_cache_tier_errors_total counter\n");
     if let Some(store) = &state.store {
         out.push_str(&format!(
