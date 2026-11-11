@@ -34,6 +34,7 @@ import {
   STUDIO_MODES,
   STUDIO_SHADOWS,
   TEXT_ANCHORS,
+  trimLikeServer,
   UPSCALE_FACTORS,
 } from "./explain.ts";
 import { MAX_DIMENSION } from "./limits.ts";
@@ -286,7 +287,7 @@ function encodeArg(text: string): string {
 }
 
 function className(what: string, name: string): string {
-  const trimmed = name.trim();
+  const trimmed = trimLikeServer(name);
   if (!isClassName(trimmed)) {
     fail(what, name, "1 to 64 UTF-8 bytes of letters, digits, space, `_`, `.`, `-`, `/`");
   }
@@ -353,7 +354,7 @@ export const ops = {
     const names: string[] = [];
     for (const name of classes) {
       const encoded = className("crop objects class", name);
-      const key = classFoldKey(name.trim());
+      const key = classFoldKey(trimLikeServer(name));
       if (!seen.has(key)) {
         if (names.length === MAX_OBJECTS_CLASSES) {
           fail("crop objects classes", classes, "an array of 1 to 32 distinct class names");
