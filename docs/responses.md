@@ -38,15 +38,20 @@ Metadata follows an operator policy, `CRABCROP_METADATA`:
 | Value | Behavior |
 | --- | --- |
 | `strip` (default) | Outputs carry no source metadata. |
-| `preserve` | JPEG outputs gain the source's EXIF, XMP, and Photoshop (IPTC) segments; PNG outputs gain EXIF and XMP (the XMP packet compressed if the source stored it compressed, plain text otherwise). Other output formats do not carry preserved metadata. |
+| `preserve` | JPEG outputs gain the source's EXIF, XMP, and Photoshop (IPTC) segments; PNG outputs gain EXIF and XMP (the XMP packet compressed if the source stored it compressed, plain text otherwise). The EXIF and Photoshop thumbnails are removed, as described below. Other output formats do not carry preserved metadata. |
 
 Neither policy copies a source's C2PA manifest store into an output. With output signing configured, the output's own manifest names the source as its parent ingredient and records how the source's manifest validated, and nothing else from it: see [Provenance (C2PA)](meta.md#provenance-c2pa).
 
-Preservation copies the source segments rather than re-serializing them, with one patch: the EXIF orientation is rewritten to 1, because the pixels were already rotated at decode and the original value would double-rotate in viewers. EXIF orientation itself is always honored at decode, under either policy.
+Preservation copies the source segments rather than re-serializing them, with a few edits:
+
+- The EXIF orientation is rewritten to 1, because the pixels were already rotated at decode and the original value would double-rotate in viewers. EXIF orientation itself is always honored at decode, under either policy.
+- The EXIF size tags give the output's size, not the source's: `PixelXDimension` and `PixelYDimension`, and `ImageWidth` and `ImageLength` where a source has them.
+- The thumbnails are removed. Each is a small copy of the whole source, so it would show what a crop cut away or a redaction covered. This covers the EXIF thumbnail (IFD1, any IFD after it, and their image data), any other JPEG inside the EXIF (camera maker notes carry previews), and the Photoshop thumbnail resources (0x0409 and 0x040C). The Photoshop copies of the EXIF (0x0422 and 0x0423) are removed too, since they carry the thumbnail again. EXIF bytes that only a thumbnail used are zeroed, or cut off where they end the stream, and all other bytes keep their place. So EXIF without a thumbnail is copied byte for byte. A Photoshop resource that does not parse is dropped, with every resource after it.
+- The XMP packet is copied as is. It can hold a thumbnail of its own (`xmp:Thumbnails`), Camera Raw crop settings, and the source's size. If a source's XMP must not reach outputs, remove it from the source.
 
 Reading a source's profile and metadata is bounded, because PNG stores the profile, and can store the XMP packet, compressed. Only the first profile (`iCCP`), EXIF (`eXIf`), and XMP packet of a PNG are read; repeats are skipped unread (libpng likewise honors only the first profile). A profile that inflates past 4 MiB, or an XMP packet past 256 KiB, is dropped rather than truncated, and all of one source's metadata inflates within a single 4.25 MiB budget. Under `strip`, the EXIF, XMP, and Photoshop segments of JPEG and PNG sources are not extracted at all (the EXIF orientation is still read and honored at decode); the profile always is, since it drives the color conversion.
 
-Writing metadata back out is bounded too. A PNG output stores the profile compressed, and the XMP packet compressed whenever the source did, so each weighs at most about what it weighed in the source. A JPEG output stores both uncompressed, so the caps set the ceiling there: the profile adds at most 256 KiB, and an XMP packet that does not fit one 64 KiB segment is left out. EXIF and Photoshop segments are copied at the size they had in the source.
+Writing metadata back out is bounded too. A PNG output stores the profile compressed, and the XMP packet compressed whenever the source did, so each weighs at most about what it weighed in the source. A JPEG output stores both uncompressed, so the caps set the ceiling there: the profile adds at most 256 KiB, and an XMP packet that does not fit one 64 KiB segment is left out. EXIF and Photoshop segments are copied at most at the size they had in the source.
 
 ### Fallback image
 

@@ -586,7 +586,11 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// generic `Lavf` and `Lavc` tags instead of a random
 /// track UID and the encoder build's own tags, so WebM
 /// bytes change once and then repeat render for render on
-/// one encoder build #567, PR #585).
+/// one encoder build #567, PR #585; and under
+/// `CRABCROP_METADATA=preserve`, JPEG and PNG output whose
+/// source EXIF or Photoshop segment holds a thumbnail or a
+/// size tag, now copied without the thumbnail and with the
+/// output's size #611).
 const RENDERING_VERSION: u32 = 6;
 
 /// Fingerprint the configuration that shapes rendered

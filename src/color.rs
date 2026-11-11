@@ -11,8 +11,9 @@ use image::DynamicImage;
 /// The metadata a source carries, extracted once per
 /// request: the ICC profile bytes, the EXIF TIFF stream
 /// (orientation already patched to 1, because the pixels
-/// were rotated at decode), the XMP packet, and the JPEG
-/// Photoshop segment (home of IPTC), when present.
+/// were rotated at decode, and its thumbnails removed), the
+/// XMP packet, and the JPEG Photoshop segment (home of
+/// IPTC, its thumbnails removed), when present.
 /// `xmp_compressed` records that the source stored the
 /// packet zlib-compressed (a PNG `iTXt` can), so a PNG
 /// output stores it the same way (issue #445).
@@ -98,7 +99,7 @@ fn extract_jpeg_meta(bytes: &[u8], preserve: bool) -> SourceMeta {
         match marker {
             0xE1 if preserve && payload.starts_with(EXIF_JPEG_HEADER) => {
                 let mut tiff = payload[EXIF_JPEG_HEADER.len()..].to_vec();
-                patch_tiff_orientation(&mut tiff);
+                sanitize_preserved_exif(&mut tiff);
                 meta.exif_tiff = Some(tiff);
             }
             0xE1 if preserve && payload.starts_with(XMP_JPEG_HEADER) => {
@@ -108,7 +109,7 @@ fn extract_jpeg_meta(bytes: &[u8], preserve: bool) -> SourceMeta {
                 icc_chunks.push((payload[12], payload[14..].to_vec()));
             }
             0xED if preserve && payload.starts_with(PHOTOSHOP_JPEG_HEADER) => {
-                meta.photoshop = Some(payload.to_vec());
+                meta.photoshop = strip_photoshop_thumbnails(payload);
             }
             _ => {}
         }
@@ -159,7 +160,7 @@ fn extract_png_meta(bytes: &[u8], preserve: bool, inflate_budget: &mut usize) ->
             b"eXIf" if preserve && !seen_exif => {
                 seen_exif = true;
                 let mut tiff = data.to_vec();
-                patch_tiff_orientation(&mut tiff);
+                sanitize_preserved_exif(&mut tiff);
                 meta.exif_tiff = Some(tiff);
             }
             b"iTXt" if preserve && !seen_xmp && data.starts_with(b"XML:com.adobe.xmp\0") => {
@@ -240,61 +241,493 @@ fn parse_itxt_text(data: &[u8], inflate_budget: &mut usize) -> Option<(Vec<u8>, 
     }
 }
 
+/// Byte-order-aware reads and writes of a TIFF stream, the
+/// container EXIF travels in. Every read and write is
+/// bounds-checked: a read past the stream is `None`, a
+/// write past it does nothing.
+#[derive(Clone, Copy)]
+struct TiffOrder {
+    little: bool,
+}
+
+/// One IFD entry: where it starts, its tag, field type and
+/// value count.
+struct IfdEntry {
+    pos: usize,
+    tag: u16,
+    kind: u16,
+    count: u32,
+}
+
+/// The size of one value of a TIFF field type, or `None` for
+/// a type TIFF and EXIF do not define.
+fn tiff_type_size(kind: u16) -> Option<usize> {
+    match kind {
+        1 | 2 | 6 | 7 => Some(1),   // BYTE, ASCII, SBYTE, UNDEFINED
+        3 | 8 => Some(2),           // SHORT, SSHORT
+        4 | 9 | 11 | 13 => Some(4), // LONG, SLONG, FLOAT, IFD
+        5 | 10 | 12 => Some(8),     // RATIONAL, SRATIONAL, DOUBLE
+        _ => None,
+    }
+}
+
+impl TiffOrder {
+    /// The byte order of a stream that opens with a TIFF
+    /// header (`II` or `MM`, then 42).
+    fn of(tiff: &[u8]) -> Option<Self> {
+        let little = match tiff.get(0..2)? {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let order = TiffOrder { little };
+        (order.u16(tiff, 2) == Some(42)).then_some(order)
+    }
+
+    fn u16(self, tiff: &[u8], off: usize) -> Option<u16> {
+        let raw: [u8; 2] = tiff.get(off..off.checked_add(2)?)?.try_into().ok()?;
+        Some(if self.little {
+            u16::from_le_bytes(raw)
+        } else {
+            u16::from_be_bytes(raw)
+        })
+    }
+
+    fn u32(self, tiff: &[u8], off: usize) -> Option<u32> {
+        let raw: [u8; 4] = tiff.get(off..off.checked_add(4)?)?.try_into().ok()?;
+        Some(if self.little {
+            u32::from_le_bytes(raw)
+        } else {
+            u32::from_be_bytes(raw)
+        })
+    }
+
+    fn put_u16(self, tiff: &mut [u8], off: usize, v: u16) {
+        let bytes = if self.little {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        };
+        if let Some(slot) = off.checked_add(2).and_then(|end| tiff.get_mut(off..end)) {
+            slot.copy_from_slice(&bytes);
+        }
+    }
+
+    fn put_u32(self, tiff: &mut [u8], off: usize, v: u32) {
+        let bytes = if self.little {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        };
+        if let Some(slot) = off.checked_add(4).and_then(|end| tiff.get_mut(off..end)) {
+            slot.copy_from_slice(&bytes);
+        }
+    }
+
+    /// The offset of IFD0, which lies past the header.
+    fn ifd0(self, tiff: &[u8]) -> Option<usize> {
+        self.u32(tiff, 4)
+            .map(|v| v as usize)
+            .filter(|&ifd0| ifd0 >= TIFF_HEADER_BYTES)
+    }
+
+    /// The entries of the IFD at `ifd`, up to the first one
+    /// the stream does not hold whole.
+    fn entries(self, tiff: &[u8], ifd: usize) -> Vec<IfdEntry> {
+        let count = self.u16(tiff, ifd).unwrap_or(0) as usize;
+        (0..count)
+            .map_while(|i| {
+                let pos = ifd.checked_add(2 + 12 * i)?;
+                tiff.get(pos..pos.checked_add(12)?)?;
+                Some(IfdEntry {
+                    pos,
+                    tag: self.u16(tiff, pos)?,
+                    kind: self.u16(tiff, pos + 2)?,
+                    count: self.u32(tiff, pos + 4)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Where the IFD at `ifd` keeps its next-IFD offset, when
+    /// the stream holds its whole table.
+    fn next_field(self, tiff: &[u8], ifd: usize) -> Option<usize> {
+        let count = self.u16(tiff, ifd)? as usize;
+        let field = ifd.checked_add(2 + 12 * count)?;
+        self.u32(tiff, field).map(|_| field)
+    }
+
+    /// Where an entry's values are, when they do not fit in
+    /// the entry itself: the range its value field points
+    /// at. `None` for inline values and unknown types.
+    fn out_of_line(self, tiff: &[u8], e: &IfdEntry) -> Option<std::ops::Range<usize>> {
+        let len = tiff_type_size(e.kind)?.checked_mul(e.count as usize)?;
+        if len <= 4 {
+            return None;
+        }
+        let at = self.u32(tiff, e.pos + 8)? as usize;
+        Some(at..at.saturating_add(len))
+    }
+
+    /// The first `limit` SHORT or LONG values of an entry,
+    /// as far as the stream holds them.
+    fn values(self, tiff: &[u8], e: &IfdEntry, limit: usize) -> Vec<usize> {
+        let size: usize = match e.kind {
+            3 => 2,
+            4 => 4,
+            _ => return Vec::new(),
+        };
+        let at = match size.checked_mul(e.count as usize) {
+            Some(len) if len <= 4 => e.pos + 8,
+            Some(_) => match self.u32(tiff, e.pos + 8) {
+                Some(at) => at as usize,
+                None => return Vec::new(),
+            },
+            None => return Vec::new(),
+        };
+        (0..(e.count as usize).min(limit))
+            .map_while(|i| {
+                let off = at.checked_add(i * size)?;
+                if size == 2 {
+                    self.u16(tiff, off).map(usize::from)
+                } else {
+                    self.u32(tiff, off).map(|v| v as usize)
+                }
+            })
+            .collect()
+    }
+}
+
 /// Rewrite the Orientation tag (0x0112) of a TIFF stream to
 /// 1, in place. The pixels a preserved EXIF describes were
 /// already rotated at decode; copying the original value
 /// would make every viewer rotate them a second time. Any
 /// inconsistency leaves the stream untouched.
 pub fn patch_tiff_orientation(tiff: &mut [u8]) {
-    let little = match tiff.get(0..2) {
-        Some(b"II") => true,
-        Some(b"MM") => false,
-        _ => return,
-    };
-    let u16_at = |b: &[u8], off: usize| -> Option<u16> {
-        let raw: [u8; 2] = b.get(off..off + 2)?.try_into().ok()?;
-        Some(if little {
-            u16::from_le_bytes(raw)
-        } else {
-            u16::from_be_bytes(raw)
-        })
-    };
-    let u32_at = |b: &[u8], off: usize| -> Option<u32> {
-        let raw: [u8; 4] = b.get(off..off + 4)?.try_into().ok()?;
-        Some(if little {
-            u32::from_le_bytes(raw)
-        } else {
-            u32::from_be_bytes(raw)
-        })
-    };
-    if u16_at(tiff, 2) != Some(42) {
+    let Some(order) = TiffOrder::of(tiff) else {
         return;
+    };
+    let Some(ifd0) = order.ifd0(tiff) else {
+        return;
+    };
+    let orientation = order
+        .entries(tiff, ifd0)
+        .into_iter()
+        .find(|e| e.tag == 0x0112 && e.kind == 3 && e.count == 1);
+    // The value sits in the first two bytes of the
+    // four-byte value field, in stream endianness.
+    if let Some(e) = orientation {
+        order.put_u16(tiff, e.pos + 8, 1);
     }
-    let Some(ifd) = u32_at(tiff, 4).map(|v| v as usize) else {
-        return;
-    };
-    let Some(count) = u16_at(tiff, ifd) else {
-        return;
-    };
-    for i in 0..count as usize {
-        let entry = ifd + 2 + i * 12;
-        if u16_at(tiff, entry) == Some(0x0112)
-            && u16_at(tiff, entry + 2) == Some(3) // SHORT
-            && u32_at(tiff, entry + 4) == Some(1)
+}
+
+/// Prepare a source's EXIF for a preserved copy: the
+/// orientation goes to 1 ([`patch_tiff_orientation`]) and
+/// the previews go ([`strip_tiff_thumbnails`]). The JPEG,
+/// PNG and HEIC paths all call this.
+pub fn sanitize_preserved_exif(tiff: &mut Vec<u8>) {
+    patch_tiff_orientation(tiff);
+    strip_tiff_thumbnails(tiff);
+}
+
+/// The most IFDs followed past IFD0. EXIF defines one, IFD1,
+/// the thumbnail's; the bound keeps a long chain cheap.
+const MAX_CHAINED_IFDS: usize = 8;
+
+/// The most strips or tiles read from one IFD. A thumbnail
+/// has one strip or a few; the bound keeps the walk's work
+/// and memory small whatever the counts claim.
+const MAX_IMAGE_PARTS: usize = 1024;
+
+/// The TIFF header, which the sanitizer never blanks or
+/// cuts.
+const TIFF_HEADER_BYTES: usize = 8;
+
+/// Remove the previews a preserved EXIF stream carries
+/// (issue #611): small copies of the whole uncut source,
+/// which a crop or a redaction must not ship. In place, and
+/// without rebuilding the stream, so the offsets that IFD0,
+/// its sub-IFDs and maker notes hold stay valid, and a
+/// stream with no preview comes out byte for byte:
+/// - every IFD chained after IFD0 (IFD1, the thumbnail's)
+///   is zeroed with its values and its image data (a JPEG,
+///   or uncompressed strips or tiles), and IFD0's link to
+///   it is set to 0;
+/// - any JPEG left in the stream is zeroed from its SOI to
+///   its EOI: maker notes carry previews too;
+/// - zeroed bytes at the end of the stream, where cameras
+///   put the thumbnail, are cut off.
+///
+/// A stream that is not TIFF gets the JPEG pass only.
+pub fn strip_tiff_thumbnails(tiff: &mut Vec<u8>) {
+    let mut blanked = Vec::new();
+    if let Some(order) = TiffOrder::of(tiff) {
+        blanked = chained_ifd_ranges(order, tiff);
+        if let Some(link) = order
+            .ifd0(tiff)
+            .and_then(|ifd0| order.next_field(tiff, ifd0))
         {
-            // The value sits in the first two bytes of the
-            // four-byte value field, in stream endianness.
-            let bytes = if little {
-                1u16.to_le_bytes()
-            } else {
-                1u16.to_be_bytes()
-            };
-            if let Some(slot) = tiff.get_mut(entry + 8..entry + 10) {
-                slot.copy_from_slice(&bytes);
-            }
-            return;
+            order.put_u32(tiff, link, 0);
         }
     }
+    for range in &mut blanked {
+        range.end = range.end.min(tiff.len());
+        range.start = range
+            .start
+            .clamp(TIFF_HEADER_BYTES, range.end.max(TIFF_HEADER_BYTES));
+        if let Some(bytes) = tiff.get_mut(range.clone()) {
+            bytes.fill(0);
+        }
+    }
+    blank_embedded_jpegs(tiff, &mut blanked);
+    cut_blanked_tail(tiff, blanked);
+}
+
+/// The bytes of every IFD chained after IFD0: each one's
+/// table, its out-of-line values, and the image data it
+/// points at. The walk stops at a loop, at an IFD the
+/// stream does not hold, and after `MAX_CHAINED_IFDS`.
+fn chained_ifd_ranges(order: TiffOrder, tiff: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let Some(ifd0) = order.ifd0(tiff) else {
+        return ranges;
+    };
+    let mut seen = vec![ifd0];
+    let mut next = order
+        .next_field(tiff, ifd0)
+        .and_then(|link| order.u32(tiff, link))
+        .unwrap_or(0) as usize;
+    while next != 0 && seen.len() <= MAX_CHAINED_IFDS && !seen.contains(&next) {
+        let ifd = next;
+        seen.push(ifd);
+        let Some(count) = order.u16(tiff, ifd) else {
+            break;
+        };
+        ranges.push(ifd..ifd.saturating_add(2 + 12 * count as usize + 4));
+        let entries = order.entries(tiff, ifd);
+        let value = |tag: u16| {
+            entries
+                .iter()
+                .find(|e| e.tag == tag)
+                .map(|e| order.values(tiff, e, MAX_IMAGE_PARTS))
+                .unwrap_or_default()
+        };
+        // JPEGInterchangeFormat and its length; StripOffsets
+        // and StripByteCounts; TileOffsets and TileByteCounts.
+        for (offsets, lengths) in [(0x0201, 0x0202), (0x0111, 0x0117), (0x0144, 0x0145)] {
+            for (at, len) in value(offsets).into_iter().zip(value(lengths)) {
+                ranges.push(at..at.saturating_add(len));
+            }
+        }
+        ranges.extend(entries.iter().filter_map(|e| order.out_of_line(tiff, e)));
+        next = order
+            .next_field(tiff, ifd)
+            .and_then(|link| order.u32(tiff, link))
+            .unwrap_or(0) as usize;
+    }
+    ranges
+}
+
+/// The most ranges the JPEG pass records for the tail cut.
+/// Past it, a JPEG is still zeroed, just not cut; real
+/// streams carry one or two.
+const MAX_RECORDED_JPEGS: usize = 1024;
+
+/// Zero every JPEG embedded in `bytes`, recording the ranges
+/// in `blanked`. A run that opens like a JPEG but reaches no
+/// scan is not an image and stays. The search resumes past
+/// each run it walked, so the pass stays linear in the
+/// stream.
+fn blank_embedded_jpegs(bytes: &mut [u8], blanked: &mut Vec<std::ops::Range<usize>>) {
+    let mut pos = 0;
+    let mut recorded = 0;
+    while let Some(found) = bytes
+        .get(pos..)
+        .and_then(|rest| rest.windows(3).position(|w| w == [0xFF, 0xD8, 0xFF]))
+    {
+        let start = pos + found;
+        let (len, image) = jpeg_extent(&bytes[start..]);
+        if image {
+            bytes[start..start + len].fill(0);
+            if recorded < MAX_RECORDED_JPEGS {
+                blanked.push(start..start + len);
+                recorded += 1;
+            }
+        }
+        pos = start + len.max(2);
+    }
+}
+
+/// How far the JPEG at the start of `b` (at its SOI) runs,
+/// walked the way a decoder walks it: segment by segment,
+/// through the entropy-coded data after each SOS, to the
+/// EOI. Also whether it reached a scan, that is, whether it
+/// is an image. A JPEG cut short runs to the end of `b`; one
+/// whose structure breaks ends there.
+fn jpeg_extent(b: &[u8]) -> (usize, bool) {
+    let mut pos = 2;
+    let mut scanned = false;
+    loop {
+        if b.get(pos) != Some(&0xFF) {
+            return (pos.min(b.len()), scanned);
+        }
+        // A marker: 0xFF, any fill bytes, then its code.
+        while b.get(pos) == Some(&0xFF) {
+            pos += 1;
+        }
+        let Some(&code) = b.get(pos) else {
+            return (b.len(), scanned);
+        };
+        pos += 1;
+        match code {
+            0xD9 => return (pos, scanned), // EOI
+            0x01 | 0xD0..=0xD7 => {}       // no length
+            0x00 | 0xD8 => return (pos, scanned),
+            _ => {
+                let Some(len) = b.get(pos..pos + 2) else {
+                    return (b.len(), scanned);
+                };
+                let len = u16::from_be_bytes([len[0], len[1]]) as usize;
+                if len < 2 {
+                    return (pos, scanned);
+                }
+                pos += len;
+                if pos >= b.len() {
+                    return (b.len(), scanned);
+                }
+                if code == 0xDA {
+                    // Entropy-coded data runs to the next
+                    // marker: an 0xFF not followed by a
+                    // stuffed 0x00 or a restart code.
+                    scanned = true;
+                    loop {
+                        let Some(ff) = b[pos..].iter().position(|&x| x == 0xFF) else {
+                            return (b.len(), true);
+                        };
+                        pos += ff;
+                        match b.get(pos + 1) {
+                            None => return (b.len(), true),
+                            Some(0x00 | 0xD0..=0xD7) => pos += 2,
+                            Some(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cut the stream where its blanked tail starts: the zeros
+/// a removed thumbnail leaves at the end carry nothing. The
+/// header always stays.
+fn cut_blanked_tail(tiff: &mut Vec<u8>, mut blanked: Vec<std::ops::Range<usize>>) {
+    blanked.retain(|r| r.start < r.end);
+    blanked.sort_unstable_by_key(|r| r.start);
+    let mut last: Option<std::ops::Range<usize>> = None;
+    for range in blanked {
+        match &mut last {
+            Some(merged) if range.start <= merged.end => merged.end = merged.end.max(range.end),
+            _ => last = Some(range),
+        }
+    }
+    if let Some(tail) = last
+        && tail.end >= tiff.len()
+    {
+        tiff.truncate(tail.start.max(TIFF_HEADER_BYTES));
+    }
+}
+
+/// Rewrite the size tags of a preserved EXIF stream to the
+/// output's size, in place (issue #611): ImageWidth and
+/// ImageLength in IFD0, PixelXDimension and
+/// PixelYDimension in the Exif IFD. Copied as they were,
+/// they give a crop the source's size. A SHORT too small
+/// for the new value becomes a LONG. Tags of another type
+/// or count, and a malformed stream, are left alone.
+pub fn patch_tiff_dimensions(tiff: &mut [u8], width: u32, height: u32) {
+    let Some(order) = TiffOrder::of(tiff) else {
+        return;
+    };
+    let Some(ifd0) = order.ifd0(tiff) else {
+        return;
+    };
+    let exif = order
+        .entries(tiff, ifd0)
+        .into_iter()
+        .find(|e| e.tag == 0x8769 && matches!(e.kind, 4 | 13) && e.count == 1)
+        .and_then(|e| order.u32(tiff, e.pos + 8));
+    set_size_tags(order, tiff, ifd0, [(0x0100, width), (0x0101, height)]);
+    if let Some(exif) = exif {
+        set_size_tags(
+            order,
+            tiff,
+            exif as usize,
+            [(0xA002, width), (0xA003, height)],
+        );
+    }
+}
+
+fn set_size_tags(order: TiffOrder, tiff: &mut [u8], ifd: usize, tags: [(u16, u32); 2]) {
+    for e in order.entries(tiff, ifd) {
+        let Some(&(_, value)) = tags.iter().find(|(tag, _)| *tag == e.tag) else {
+            continue;
+        };
+        match (e.kind, e.count) {
+            (3, 1) if value <= u32::from(u16::MAX) => {
+                order.put_u16(tiff, e.pos + 8, value as u16);
+            }
+            (3 | 4, 1) => {
+                order.put_u16(tiff, e.pos + 2, 4);
+                order.put_u32(tiff, e.pos + 8, value);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Photoshop image resources a preserved segment drops
+/// (issue #611): the thumbnails (0x0409 from Photoshop 4,
+/// 0x040C from Photoshop 5 on) and the copies of the EXIF
+/// (0x0422, 0x0423), which would bring back its thumbnail
+/// and the source's size.
+const DROPPED_PHOTOSHOP_RESOURCES: [u16; 4] = [0x0409, 0x040C, 0x0422, 0x0423];
+
+/// A Photoshop segment payload without the resources in
+/// `DROPPED_PHOTOSHOP_RESOURCES`. The others are copied as
+/// they were, in order, so a well-formed payload with
+/// nothing to drop comes back byte for byte. The walk stops
+/// at the first resource that does not parse and drops the
+/// rest, since a thumbnail there could not be told apart.
+/// `None` when no resource is left.
+fn strip_photoshop_thumbnails(payload: &[u8]) -> Option<Vec<u8>> {
+    let body = payload.strip_prefix(PHOTOSHOP_JPEG_HEADER)?;
+    let mut kept = PHOTOSHOP_JPEG_HEADER.to_vec();
+    let mut pos = 0;
+    while let Some(len) = photoshop_resource_len(&body[pos..]) {
+        let id = u16::from_be_bytes([body[pos + 4], body[pos + 5]]);
+        if !DROPPED_PHOTOSHOP_RESOURCES.contains(&id) {
+            kept.extend_from_slice(&body[pos..pos + len]);
+        }
+        pos += len;
+    }
+    (kept.len() > PHOTOSHOP_JPEG_HEADER.len()).then_some(kept)
+}
+
+/// The length of the Photoshop image resource at the start
+/// of `b`: a signature, the id, a Pascal name padded to even
+/// length, the data size, and the data padded to even (the
+/// last resource may leave its pad off).
+fn photoshop_resource_len(b: &[u8]) -> Option<usize> {
+    if !matches!(
+        b.get(0..4)?,
+        b"8BIM" | b"MeSa" | b"PHUT" | b"AgHg" | b"DCSR"
+    ) {
+        return None;
+    }
+    let size_at = 6 + (1 + *b.get(6)? as usize).next_multiple_of(2);
+    let size = u32::from_be_bytes(b.get(size_at..size_at + 4)?.try_into().ok()?) as usize;
+    let end = (size_at + 4).checked_add(size)?;
+    (end <= b.len()).then(|| (end + end % 2).min(b.len()))
 }
 
 /// The sRGB profile moxcms ships, encoded once: a source
@@ -577,6 +1010,379 @@ pub fn inject_png(bytes: &[u8], icc: Option<&[u8]>, meta: &SourceMeta, preserve:
     out
 }
 
+/// EXIF and Photoshop fixtures for the color, engine and
+/// HEIC tests (issue #611): TIFF streams laid out the way
+/// camera EXIF is, and readers for what an output carries
+/// that go straight to its segments, around the extractor
+/// under test.
+#[cfg(test)]
+pub(crate) mod fixture {
+    /// A TIFF stream under construction, in one byte order.
+    pub struct Tiff {
+        pub little: bool,
+        pub bytes: Vec<u8>,
+    }
+
+    /// One IFD entry: tag, field type, count, and the value
+    /// bytes in stream order. Up to 4 bytes go in the
+    /// entry; longer values go after the IFD's table.
+    pub struct Entry {
+        pub tag: u16,
+        pub kind: u16,
+        pub count: u32,
+        pub data: Vec<u8>,
+    }
+
+    impl Tiff {
+        /// The 8-byte header, with IFD0 at offset 8.
+        pub fn new(little: bool) -> Self {
+            let mut t = Tiff {
+                little,
+                bytes: if little { b"II" } else { b"MM" }.to_vec(),
+            };
+            let magic = t.u16(42);
+            let ifd0 = t.u32(8);
+            t.bytes.extend_from_slice(&magic);
+            t.bytes.extend_from_slice(&ifd0);
+            t
+        }
+
+        pub fn u16(&self, v: u16) -> [u8; 2] {
+            if self.little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        }
+
+        pub fn u32(&self, v: u32) -> [u8; 4] {
+            if self.little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        }
+
+        pub fn short(&self, tag: u16, v: u16) -> Entry {
+            Entry {
+                tag,
+                kind: 3,
+                count: 1,
+                data: self.u16(v).to_vec(),
+            }
+        }
+
+        pub fn long(&self, tag: u16, v: u32) -> Entry {
+            self.longs(tag, &[v])
+        }
+
+        pub fn longs(&self, tag: u16, vs: &[u32]) -> Entry {
+            Entry {
+                tag,
+                kind: 4,
+                count: vs.len() as u32,
+                data: vs.iter().flat_map(|v| self.u32(*v)).collect(),
+            }
+        }
+
+        pub fn ascii(&self, tag: u16, s: &str) -> Entry {
+            let mut data = s.as_bytes().to_vec();
+            data.push(0);
+            Entry {
+                tag,
+                kind: 2,
+                count: data.len() as u32,
+                data,
+            }
+        }
+
+        pub fn rational(&self, tag: u16, num: u32, den: u32) -> Entry {
+            let mut data = self.u32(num).to_vec();
+            data.extend_from_slice(&self.u32(den));
+            Entry {
+                tag,
+                kind: 5,
+                count: 1,
+                data,
+            }
+        }
+
+        pub fn undefined(&self, tag: u16, data: &[u8]) -> Entry {
+            Entry {
+                tag,
+                kind: 7,
+                count: data.len() as u32,
+                data: data.to_vec(),
+            }
+        }
+
+        /// Append an IFD, word aligned: its table, then the
+        /// values that do not fit in their entries. Returns
+        /// the IFD's offset and the position of each entry's
+        /// value field, for pointers set later.
+        pub fn ifd(&mut self, entries: &[Entry], next: u32) -> (u32, Vec<usize>) {
+            self.align();
+            let start = self.bytes.len();
+            let table = 2 + 12 * entries.len() + 4;
+            let mut values = Vec::new();
+            let mut fields = Vec::new();
+            let count = self.u16(entries.len() as u16);
+            self.bytes.extend_from_slice(&count);
+            for e in entries {
+                let head = [self.u16(e.tag), self.u16(e.kind)].concat();
+                let count = self.u32(e.count);
+                self.bytes.extend_from_slice(&head);
+                self.bytes.extend_from_slice(&count);
+                fields.push(self.bytes.len());
+                if e.data.len() <= 4 {
+                    let mut inline = e.data.clone();
+                    inline.resize(4, 0);
+                    self.bytes.extend_from_slice(&inline);
+                } else {
+                    let at = self.u32((start + table + values.len()) as u32);
+                    self.bytes.extend_from_slice(&at);
+                    values.extend_from_slice(&e.data);
+                    if values.len() % 2 == 1 {
+                        values.push(0);
+                    }
+                }
+            }
+            let next = self.u32(next);
+            self.bytes.extend_from_slice(&next);
+            self.bytes.extend_from_slice(&values);
+            (start as u32, fields)
+        }
+
+        /// Append raw bytes, word aligned; returns their
+        /// offset.
+        pub fn append(&mut self, data: &[u8]) -> u32 {
+            self.align();
+            let at = self.bytes.len();
+            self.bytes.extend_from_slice(data);
+            at as u32
+        }
+
+        pub fn set_u32(&mut self, pos: usize, v: u32) {
+            let v = self.u32(v);
+            self.bytes[pos..pos + 4].copy_from_slice(&v);
+        }
+
+        fn align(&mut self) {
+            if self.bytes.len() % 2 == 1 {
+                self.bytes.push(0);
+            }
+        }
+    }
+
+    /// The position of the next-IFD field of an IFD at
+    /// `ifd` with `entries` entries.
+    pub fn next_field(ifd: u32, entries: usize) -> usize {
+        ifd as usize + 2 + 12 * entries
+    }
+
+    /// A camera-style EXIF stream.
+    pub struct Camera {
+        pub tiff: Vec<u8>,
+        /// Where IFD1 starts. Everything from here to the
+        /// end is IFD1, its values, and the thumbnail.
+        pub ifd1: usize,
+        /// The position of IFD0's next-IFD field.
+        pub ifd0_next: usize,
+    }
+
+    /// IFD0 (Make, Orientation, the Exif IFD pointer), the
+    /// Exif IFD (PixelXDimension as a LONG and
+    /// PixelYDimension as a SHORT, as cameras vary), then
+    /// IFD1 (JPEG compression, a resolution, and the
+    /// thumbnail's offset and length) and the thumbnail
+    /// itself, last, where cameras put it.
+    pub fn camera(little: bool, orientation: u16, size: (u32, u16), thumbnail: &[u8]) -> Camera {
+        let mut t = Tiff::new(little);
+        let ifd0 = [
+            t.ascii(0x010F, "Crabcam"),
+            t.short(0x0112, orientation),
+            t.long(0x8769, 0),
+        ];
+        let (ifd0_at, ifd0_fields) = t.ifd(&ifd0, 0);
+        let exif = [t.long(0xA002, size.0), t.short(0xA003, size.1)];
+        let (exif_at, _) = t.ifd(&exif, 0);
+        t.set_u32(ifd0_fields[2], exif_at);
+        let ifd1 = [
+            t.short(0x0103, 6),
+            t.rational(0x011A, 72, 1),
+            t.long(0x0201, 0),
+            t.long(0x0202, thumbnail.len() as u32),
+        ];
+        let (ifd1_at, ifd1_fields) = t.ifd(&ifd1, 0);
+        let ifd0_next = next_field(ifd0_at, ifd0.len());
+        t.set_u32(ifd0_next, ifd1_at);
+        let thumb_at = t.append(thumbnail);
+        t.set_u32(ifd1_fields[2], thumb_at);
+        Camera {
+            tiff: t.bytes,
+            ifd1: ifd1_at as usize,
+            ifd0_next,
+        }
+    }
+
+    /// A small JPEG to stand in for a thumbnail: a red
+    /// block beside gray, the kind of pixels a crop or a
+    /// redaction takes out.
+    pub fn thumbnail_jpeg() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(16, 12, |x, _| {
+            if x < 8 {
+                image::Rgb([220, 10, 10])
+            } else {
+                image::Rgb([128, 128, 128])
+            }
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut out),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        out
+    }
+
+    fn order_u16(tiff: &[u8], off: usize) -> Option<u16> {
+        let raw: [u8; 2] = tiff.get(off..off + 2)?.try_into().ok()?;
+        Some(if tiff.starts_with(b"II") {
+            u16::from_le_bytes(raw)
+        } else {
+            u16::from_be_bytes(raw)
+        })
+    }
+
+    fn order_u32(tiff: &[u8], off: usize) -> Option<u32> {
+        let raw: [u8; 4] = tiff.get(off..off + 4)?.try_into().ok()?;
+        Some(if tiff.starts_with(b"II") {
+            u32::from_le_bytes(raw)
+        } else {
+            u32::from_be_bytes(raw)
+        })
+    }
+
+    /// The type and the inline SHORT or LONG value of
+    /// `tag` in the IFD at `ifd`.
+    pub fn typed_tag(tiff: &[u8], ifd: usize, tag: u16) -> Option<(u16, u32)> {
+        let count = order_u16(tiff, ifd)? as usize;
+        (0..count).find_map(|i| {
+            let entry = ifd + 2 + 12 * i;
+            if order_u16(tiff, entry)? != tag {
+                return None;
+            }
+            match order_u16(tiff, entry + 2)? {
+                3 => Some((3, u32::from(order_u16(tiff, entry + 8)?))),
+                kind => Some((kind, order_u32(tiff, entry + 8)?)),
+            }
+        })
+    }
+
+    /// The inline SHORT or LONG value of `tag` in the IFD
+    /// at `ifd`.
+    pub fn tag(tiff: &[u8], ifd: usize, tag: u16) -> Option<u32> {
+        typed_tag(tiff, ifd, tag).map(|(_, v)| v)
+    }
+
+    /// The next-IFD offset of the IFD at `ifd`.
+    pub fn next_ifd(tiff: &[u8], ifd: usize) -> Option<u32> {
+        let count = order_u16(tiff, ifd)? as usize;
+        order_u32(tiff, ifd + 2 + 12 * count)
+    }
+
+    pub fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The EXIF TIFF stream an encoded JPEG (APP1) or PNG
+    /// (`eXIf`) carries, read from its segments as is.
+    pub fn carried_exif(bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.starts_with(&[0xFF, 0xD8]) {
+            jpeg_segment_payload(bytes, 0xE1, super::EXIF_JPEG_HEADER)
+                .map(|p| p[super::EXIF_JPEG_HEADER.len()..].to_vec())
+        } else {
+            let mut pos = 8;
+            while pos + 12 <= bytes.len() {
+                let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                if &bytes[pos + 4..pos + 8] == b"eXIf" {
+                    return Some(bytes[pos + 8..pos + 8 + len].to_vec());
+                }
+                pos += 12 + len;
+            }
+            None
+        }
+    }
+
+    /// The Photoshop (APP13) payload an encoded JPEG
+    /// carries, read from its segments as is.
+    pub fn carried_photoshop(bytes: &[u8]) -> Option<Vec<u8>> {
+        jpeg_segment_payload(bytes, 0xED, super::PHOTOSHOP_JPEG_HEADER)
+    }
+
+    fn jpeg_segment_payload(bytes: &[u8], marker: u8, header: &[u8]) -> Option<Vec<u8>> {
+        let mut pos = 2;
+        while pos + 4 <= bytes.len() && bytes[pos] == 0xFF && bytes[pos + 1] != 0xDA {
+            let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+            let payload = &bytes[pos + 4..pos + 2 + len];
+            if bytes[pos + 1] == marker && payload.starts_with(header) {
+                return Some(payload.to_vec());
+            }
+            pos += 2 + len;
+        }
+        None
+    }
+
+    /// A Photoshop image resource: signature, id, a Pascal
+    /// name padded to even, the size, and the data padded
+    /// to even.
+    pub fn irb_named(id: u16, name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = b"8BIM".to_vec();
+        out.extend_from_slice(&id.to_be_bytes());
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
+        if out.len() % 2 == 1 {
+            out.push(0);
+        }
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    pub fn irb(id: u16, data: &[u8]) -> Vec<u8> {
+        irb_named(id, b"", data)
+    }
+
+    /// A Photoshop thumbnail resource's data: the 28-byte
+    /// header (format 1, JPEG), then the JPEG.
+    pub fn irb_thumbnail(jpeg: &[u8]) -> Vec<u8> {
+        let mut data = 1u32.to_be_bytes().to_vec();
+        data.resize(28, 0);
+        data.extend_from_slice(jpeg);
+        data
+    }
+
+    /// The ids of the resources in a Photoshop payload, in
+    /// order, as far as they parse.
+    pub fn irb_ids(payload: &[u8]) -> Vec<u16> {
+        let mut ids = Vec::new();
+        let mut pos = super::PHOTOSHOP_JPEG_HEADER.len();
+        while pos + 12 <= payload.len() && &payload[pos..pos + 4] == b"8BIM" {
+            ids.push(u16::from_be_bytes([payload[pos + 4], payload[pos + 5]]));
+            let name = (1 + payload[pos + 6] as usize).next_multiple_of(2);
+            let size_at = pos + 6 + name;
+            let size =
+                u32::from_be_bytes(payload[size_at..size_at + 4].try_into().unwrap()) as usize;
+            pos = size_at + 4 + size.next_multiple_of(2);
+        }
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +1412,16 @@ mod tests {
             t.extend_from_slice(&0u16.to_be_bytes());
         }
         t
+    }
+
+    /// A Photoshop segment payload holding one IPTC record
+    /// (resource 0x0404).
+    fn iptc_photoshop() -> Vec<u8> {
+        [
+            PHOTOSHOP_JPEG_HEADER,
+            &fixture::irb(0x0404, b"\x1c\x02\x00\x00\x02\x00\x04"),
+        ]
+        .concat()
     }
 
     /// `len` bytes that pass `icc_embeddable`: an ICC header
@@ -650,7 +1466,7 @@ mod tests {
             exif_tiff: Some(tiff),
             xmp: Some(b"<x:xmpmeta/>".to_vec()),
             xmp_compressed: false,
-            photoshop: Some(b"Photoshop 3.0\0rest".to_vec()),
+            photoshop: Some(iptc_photoshop()),
         };
         let out = inject_jpeg(&src, meta_in.icc.as_deref(), &meta_in, true);
         let got = extract_jpeg_meta(&out, true);
@@ -867,10 +1683,20 @@ mod tests {
         let mut truncated_value = tiff_with_orientation(6, true);
         truncated_value.truncate(8 + 2 + 8 + 1);
         cases.push(("value field truncated", truncated_value));
+        // IFD0 inside the header.
+        let mut ifd0_in_header = tiff_with_orientation(6, true);
+        ifd0_in_header[4..8].copy_from_slice(&0u32.to_le_bytes());
+        cases.push(("IFD0 inside the header", ifd0_in_header));
         for (name, mut tiff) in cases {
             let before = tiff.clone();
             patch_tiff_orientation(&mut tiff);
             assert_eq!(tiff, before, "{name}");
+            // The other in-place edits of a preserved EXIF
+            // (issue #611) leave it alone too.
+            patch_tiff_dimensions(&mut tiff, 40, 30);
+            assert_eq!(tiff, before, "{name}: sizes");
+            strip_tiff_thumbnails(&mut tiff);
+            assert_eq!(tiff, before, "{name}: thumbnails");
         }
     }
 
@@ -1068,7 +1894,7 @@ mod tests {
             exif_tiff: Some(tiff_with_orientation(3, true)),
             xmp: Some(b"<x:xmpmeta/>".to_vec()),
             xmp_compressed: false,
-            photoshop: Some(b"Photoshop 3.0\0fixture".to_vec()),
+            photoshop: Some(iptc_photoshop()),
         };
         let png = inject_png(
             &png_with_chunks(&[]),
@@ -1280,5 +2106,391 @@ mod tests {
             };
             assert_eq!(inject_png(&base, None, &meta, true), base);
         }
+    }
+
+    /// A bare JPEG whose only segment is an APP1 EXIF
+    /// carrying `tiff`.
+    fn jpeg_with_exif(tiff: &[u8]) -> Vec<u8> {
+        let mut src = vec![0xFF, 0xD8];
+        src.extend_from_slice(&jpeg_segment(0xE1, &[EXIF_JPEG_HEADER, tiff].concat()).unwrap());
+        src.extend_from_slice(&[0xFF, 0xD9]);
+        src
+    }
+
+    /// The EXIF a preserving JPEG and PNG source yield.
+    fn preserved_exif(tiff: &[u8]) -> [(&'static str, Vec<u8>); 2] {
+        let from_jpeg = extract_source_meta(&jpeg_with_exif(tiff), true);
+        let from_png = extract_source_meta(&png_with_chunks(&[(b"eXIf", tiff)]), true);
+        [
+            ("jpeg", from_jpeg.exif_tiff.expect("jpeg exif")),
+            ("png", from_png.exif_tiff.expect("png exif")),
+        ]
+    }
+
+    #[test]
+    fn exif_thumbnails_are_cut_from_preserved_exif() {
+        // Issue #611: the IFD1 thumbnail, a small copy of
+        // the whole uncut source, rode into every output
+        // under preserve. The preserved copy now ends where
+        // IFD1 began: IFD0 no longer links to it, and IFD1,
+        // its values, and the thumbnail are gone. Everything
+        // before IFD1 is copied as is.
+        let thumbnail = fixture::thumbnail_jpeg();
+        for little in [true, false] {
+            let cam = fixture::camera(little, 6, (4000, 3000), &thumbnail);
+            let mut want = cam.tiff[..cam.ifd1].to_vec();
+            want[cam.ifd0_next..cam.ifd0_next + 4].fill(0);
+            patch_tiff_orientation(&mut want);
+            for (name, tiff) in preserved_exif(&cam.tiff) {
+                assert!(
+                    !fixture::contains(&tiff, &thumbnail),
+                    "{name} little={little}: the thumbnail is still there"
+                );
+                assert_eq!(fixture::next_ifd(&tiff, 8), Some(0), "{name} {little}");
+                assert_eq!(tiff, want, "{name} little={little}");
+            }
+        }
+    }
+
+    #[test]
+    fn exif_without_a_thumbnail_is_copied_byte_for_byte() {
+        // The sanitizer edits in place and never rebuilds
+        // the stream, so a stream with nothing to remove
+        // comes out as it went in, orientation aside. The
+        // upgrade corpus's metadata-preserve entry renders
+        // this fixture, so its bytes must not move.
+        let corpus = include_bytes!("../tests/functional/corpus/exif-orient.jpg");
+        let mut want = fixture::carried_exif(corpus).expect("fixture exif");
+        patch_tiff_orientation(&mut want);
+        let got = extract_source_meta(corpus, true).exif_tiff;
+        assert_eq!(got, Some(want));
+        // A camera stream without IFD1, in both orders.
+        for little in [true, false] {
+            let mut t = fixture::Tiff::new(little);
+            let ifd0 = [t.ascii(0x010F, "Crabcam"), t.short(0x0112, 3)];
+            t.ifd(&ifd0, 0);
+            let mut want = t.bytes.clone();
+            patch_tiff_orientation(&mut want);
+            for (name, tiff) in preserved_exif(&t.bytes) {
+                assert_eq!(tiff, want, "{name} little={little}");
+            }
+        }
+    }
+
+    #[test]
+    fn uncompressed_and_chained_thumbnails_are_blanked() {
+        // IFD1 can hold an uncompressed thumbnail in strips,
+        // and a chain can go on past IFD1. Every IFD after
+        // IFD0 goes with its image data. Data that IFD0
+        // still uses lies after them here, so the removed
+        // bytes are zeroed in place rather than cut.
+        let thumbnail = fixture::thumbnail_jpeg();
+        let strips: [&[u8]; 2] = [&[0xAB; 30], &[0xCD; 20]];
+        for little in [true, false] {
+            let mut t = fixture::Tiff::new(little);
+            let artist = fixture::Entry {
+                tag: 0x013B,
+                kind: 2,
+                count: 18,
+                data: vec![0; 4],
+            };
+            let ifd0 = [t.short(0x0112, 1), artist];
+            let (ifd0_at, ifd0_fields) = t.ifd(&ifd0, 0);
+            let ifd1 = [
+                t.short(0x0103, 1),
+                t.longs(0x0111, &[0, 0]),
+                fixture::Entry {
+                    tag: 0x0117,
+                    kind: 3,
+                    count: 2,
+                    data: [t.u16(30), t.u16(20)].concat(),
+                },
+            ];
+            let (ifd1_at, _) = t.ifd(&ifd1, 0);
+            let link = fixture::next_field(ifd0_at, ifd0.len());
+            t.set_u32(link, ifd1_at);
+            let strip0 = t.append(strips[0]);
+            let strip1 = t.append(strips[1]);
+            // StripOffsets is out of line: its value field
+            // holds where the two values are. Point them at
+            // the strips.
+            let values = fixture::tag(&t.bytes, ifd1_at as usize, 0x0111).unwrap() as usize;
+            t.set_u32(values, strip0);
+            t.set_u32(values + 4, strip1);
+            let ifd2 = [t.long(0x0201, 0), t.long(0x0202, thumbnail.len() as u32)];
+            let (ifd2_at, ifd2_fields) = t.ifd(&ifd2, 0);
+            t.set_u32(fixture::next_field(ifd1_at, ifd1.len()), ifd2_at);
+            let thumb_at = t.append(&thumbnail);
+            t.set_u32(ifd2_fields[0], thumb_at);
+            let artist_at = t.append(b"Crab Photographer\0");
+            t.set_u32(ifd0_fields[1], artist_at);
+            let mut want = t.bytes.clone();
+            want[ifd1_at as usize..artist_at as usize].fill(0);
+            want[link..link + 4].fill(0);
+            for (name, tiff) in preserved_exif(&t.bytes) {
+                for data in [strips[0], strips[1], &thumbnail] {
+                    assert!(!fixture::contains(&tiff, data), "{name} {little}");
+                }
+                assert_eq!(tiff, want, "{name} little={little}");
+            }
+        }
+    }
+
+    #[test]
+    fn maker_note_previews_are_blanked() {
+        // Camera maker notes carry JPEG previews of the
+        // whole frame too (Nikon, Olympus and Pentax among
+        // others). Any JPEG left in the stream is zeroed,
+        // from its SOI to its EOI; the maker note's other
+        // bytes stay.
+        let preview = fixture::thumbnail_jpeg();
+        for little in [true, false] {
+            let mut t = fixture::Tiff::new(little);
+            let ifd0 = [t.short(0x0112, 1), t.long(0x8769, 0)];
+            let (_, ifd0_fields) = t.ifd(&ifd0, 0);
+            let note = [b"Nikon\0\x02\x10\0\0".as_slice(), &preview, b"lens data"].concat();
+            let exif = [t.undefined(0x927C, &note)];
+            let (exif_at, _) = t.ifd(&exif, 0);
+            t.set_u32(ifd0_fields[1], exif_at);
+            let at = t
+                .bytes
+                .windows(preview.len())
+                .position(|w| w == preview)
+                .unwrap();
+            let mut want = t.bytes.clone();
+            want[at..at + preview.len()].fill(0);
+            for (name, tiff) in preserved_exif(&t.bytes) {
+                assert_eq!(tiff, want, "{name} little={little}");
+            }
+        }
+    }
+
+    #[test]
+    fn odd_exif_chains_are_cut_without_harm() {
+        // Edge cases of the IFD walk. Each must end with
+        // IFD0 unlinked, IFD0's own tags intact, the header
+        // in place, and no panic.
+        let thumbnail = fixture::thumbnail_jpeg();
+        let cam = fixture::camera(true, 1, (64, 48), &thumbnail);
+        let ifd1 = cam.ifd1;
+        let ifd1_next = fixture::next_field(ifd1 as u32, 4);
+        let thumb_len_field = ifd1 + 2 + 12 * 3 + 8;
+        let thumb_at_field = ifd1 + 2 + 12 * 2 + 8;
+        let set = |tiff: &mut Vec<u8>, pos: usize, v: u32| {
+            tiff[pos..pos + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut t = cam.tiff.clone();
+        set(&mut t, ifd1_next, 8);
+        cases.push(("IFD1 links back to IFD0", t));
+        let mut t = cam.tiff.clone();
+        set(&mut t, ifd1_next, ifd1 as u32);
+        cases.push(("IFD1 links to itself", t));
+        let mut t = cam.tiff.clone();
+        set(&mut t, thumb_len_field, u32::MAX);
+        cases.push(("thumbnail length past the end", t));
+        let mut t = cam.tiff.clone();
+        set(&mut t, thumb_len_field, 0);
+        t[thumb_len_field - 8..thumb_len_field - 6].copy_from_slice(&0x9999u16.to_le_bytes());
+        cases.push(("no thumbnail length tag", t));
+        let mut t = cam.tiff.clone();
+        t.truncate(ifd1 + 2);
+        cases.push(("IFD1 cut short", t));
+        for (name, tiff) in cases {
+            for (kind, got) in preserved_exif(&tiff) {
+                assert!(got.len() >= 8, "{name} ({kind})");
+                assert_eq!(&got[..8], &tiff[..8], "{name} ({kind}): header");
+                assert_eq!(fixture::next_ifd(&got, 8), Some(0), "{name} ({kind})");
+                assert_eq!(fixture::tag(&got, 8, 0x0112), Some(1), "{name} ({kind})");
+                assert!(
+                    !fixture::contains(&got, &thumbnail[..64]),
+                    "{name} ({kind}): the thumbnail is still there"
+                );
+            }
+        }
+        // A thumbnail range that claims the whole stream:
+        // all of it goes but the header.
+        let mut t = cam.tiff.clone();
+        set(&mut t, thumb_at_field, 0);
+        set(&mut t, thumb_len_field, u32::MAX);
+        for (kind, got) in preserved_exif(&t) {
+            assert_eq!(got, &t[..8], "range over the header ({kind})");
+        }
+        // IFD0 links past the end of the stream: the link
+        // goes, nothing else changes.
+        let mut t = cam.tiff[..cam.ifd1].to_vec();
+        set(&mut t, cam.ifd0_next, 1 << 20);
+        let mut want = t.clone();
+        want[cam.ifd0_next..cam.ifd0_next + 4].fill(0);
+        for (kind, got) in preserved_exif(&t) {
+            assert_eq!(got, want, "dangling link ({kind})");
+        }
+        // Bytes that open like a JPEG but reach no scan are
+        // not one: they stay.
+        let mut t = fixture::Tiff::new(true);
+        let lookalike = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x01, 0x02, 0x55, 0x66];
+        let ifd0 = [t.short(0x0112, 1), t.undefined(0x927C, &lookalike)];
+        t.ifd(&ifd0, 0);
+        for (kind, got) in preserved_exif(&t.bytes) {
+            assert_eq!(got, t.bytes, "lookalike ({kind})");
+        }
+    }
+
+    #[test]
+    fn the_preview_scan_stays_linear() {
+        // A stream packed with JPEG starts whose segments
+        // chain to the end without a scan: walking again
+        // from every start would be quadratic in the
+        // stream. One walk covers them all, and nothing is
+        // an image, so nothing changes.
+        let unit = [0xFF, 0xE0, 0x00, 0x05, 0xFF, 0xD8, 0xFF];
+        // An empty IFD0, then the run.
+        let mut tiff = vec![b'I', b'I', 42, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xD8];
+        while tiff.len() < 2 * 1024 * 1024 {
+            tiff.extend_from_slice(&unit);
+        }
+        let start = std::time::Instant::now();
+        let meta = extract_source_meta(&png_with_chunks(&[(b"eXIf", &tiff)]), true);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(meta.exif_tiff, Some(tiff));
+        // A stream packed with tiny JPEGs: every one is
+        // zeroed. Past the first 1024 their ranges are not
+        // kept for the tail cut, so the zeros stay in.
+        let tiny = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x01, 0xFF, 0xD9];
+        let mut tiff = vec![b'I', b'I', 42, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        for _ in 0..2000 {
+            tiff.extend_from_slice(&tiny);
+        }
+        let got = extract_source_meta(&png_with_chunks(&[(b"eXIf", &tiff)]), true)
+            .exif_tiff
+            .unwrap();
+        assert_eq!(got.len(), tiff.len());
+        assert_eq!(got[..14], tiff[..14]);
+        assert!(got[14..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn photoshop_thumbnail_resources_are_dropped() {
+        // Issue #611: resources 0x0409 and 0x040C hold
+        // Photoshop's thumbnail of the source. They go, and
+        // so do 0x0422 and 0x0423, copies of the EXIF that
+        // carry its thumbnail and size again. IPTC (0x0404)
+        // and every other resource stay, as they were and
+        // in order.
+        let thumbnail = fixture::thumbnail_jpeg();
+        let thumb = fixture::irb_thumbnail(&thumbnail);
+        let cam = fixture::camera(false, 1, (4000, 3000), &thumbnail);
+        let resolution = fixture::irb(0x03ED, &[0, 72, 0, 0, 0, 1, 0, 1]);
+        let iptc = fixture::irb(
+            0x0404,
+            b"\x1c\x02\x00\x00\x02\x00\x04\x1c\x02\x50\x00\x03Ann",
+        );
+        let digest = fixture::irb_named(0x0425, b"ab", &[7; 16]);
+        let odd = fixture::irb(0x0428, &[1, 2, 3]);
+        let segment = [
+            PHOTOSHOP_JPEG_HEADER,
+            &resolution,
+            &fixture::irb(0x0409, &thumb),
+            &iptc,
+            &fixture::irb(0x040C, &thumb),
+            &fixture::irb(0x0422, &cam.tiff),
+            &fixture::irb(0x0423, &cam.tiff),
+            &digest,
+            &odd,
+        ]
+        .concat();
+        let src = |payload: &[u8]| {
+            let mut src = vec![0xFF, 0xD8];
+            src.extend_from_slice(&jpeg_segment(0xED, payload).unwrap());
+            src.extend_from_slice(&[0xFF, 0xD9]);
+            src
+        };
+        let got = extract_source_meta(&src(&segment), true).photoshop;
+        let want = [PHOTOSHOP_JPEG_HEADER, &resolution, &iptc, &digest, &odd].concat();
+        assert_eq!(
+            got.as_deref().map(fixture::irb_ids),
+            Some(vec![0x03ED, 0x0404, 0x0425, 0x0428])
+        );
+        assert_eq!(got, Some(want.clone()));
+        // Nothing to drop: copied byte for byte, the last
+        // resource's missing pad byte included.
+        let unpadded = &want[..want.len() - 1];
+        let got = extract_source_meta(&src(unpadded), true).photoshop;
+        assert_eq!(got.as_deref(), Some(unpadded));
+        // Only thumbnails: no segment at all.
+        let only = [PHOTOSHOP_JPEG_HEADER, &fixture::irb(0x040C, &thumb)].concat();
+        assert_eq!(extract_source_meta(&src(&only), true).photoshop, None);
+        // A tail that does not parse (here the rest of a
+        // thumbnail resource split across segments) could
+        // be anything: it goes, the resources before it
+        // stay.
+        let split = [PHOTOSHOP_JPEG_HEADER, &iptc, &thumb[..40]].concat();
+        let got = extract_source_meta(&src(&split), true).photoshop;
+        assert_eq!(got, Some([PHOTOSHOP_JPEG_HEADER, &iptc].concat()));
+        let tail = [PHOTOSHOP_JPEG_HEADER, &thumb[40..]].concat();
+        assert_eq!(extract_source_meta(&src(&tail), true).photoshop, None);
+    }
+
+    #[test]
+    fn size_tags_follow_the_output() {
+        // Issue #611: the EXIF sizes are rewritten to the
+        // output's, in IFD0 (ImageWidth, ImageLength) and
+        // the Exif IFD (PixelXDimension, PixelYDimension),
+        // as SHORT or LONG as they were. A SHORT that cannot
+        // hold the new value becomes a LONG. Nothing else in
+        // the stream moves.
+        for little in [true, false] {
+            let mut t = fixture::Tiff::new(little);
+            let ifd0 = [
+                t.short(0x0100, 4000),
+                t.long(0x0101, 3000),
+                t.short(0x0112, 1),
+                t.long(0x8769, 0),
+            ];
+            let (_, fields) = t.ifd(&ifd0, 0);
+            let exif = [
+                t.long(0xA002, 4000),
+                t.short(0xA003, 3000),
+                fixture::Entry {
+                    tag: 0xA004,
+                    kind: 3,
+                    count: 1,
+                    data: t.u16(5).to_vec(),
+                },
+            ];
+            let (exif_at, _) = t.ifd(&exif, 0);
+            t.set_u32(fields[3], exif_at);
+            let exif_at = exif_at as usize;
+            let mut tiff = t.bytes.clone();
+            patch_tiff_dimensions(&mut tiff, 40, 70_000);
+            assert_eq!(tiff.len(), t.bytes.len());
+            let tag = |tag| fixture::typed_tag(&tiff, 8, tag);
+            assert_eq!(tag(0x0100), Some((3, 40)), "little={little}");
+            assert_eq!(tag(0x0101), Some((4, 70_000)), "little={little}");
+            assert_eq!(tag(0x0112), Some((3, 1)), "little={little}");
+            let tag = |tag| fixture::typed_tag(&tiff, exif_at, tag);
+            assert_eq!(tag(0xA002), Some((4, 40)), "little={little}");
+            assert_eq!(tag(0xA003), Some((4, 70_000)), "little={little}");
+            assert_eq!(tag(0xA004), Some((3, 5)), "little={little}");
+            // Back within a SHORT, the converted tag stays
+            // a LONG and the others keep their type.
+            patch_tiff_dimensions(&mut tiff, 40, 30);
+            let tag = |tag| fixture::typed_tag(&tiff, exif_at, tag);
+            assert_eq!(tag(0xA003), Some((4, 30)), "little={little}");
+            assert_eq!(tag(0xA002), Some((4, 40)), "little={little}");
+        }
+        // A size tag of another type or count is left as it
+        // is; the stream without size tags is unchanged.
+        let mut t = fixture::Tiff::new(true);
+        let ifd0 = [t.rational(0x0100, 4000, 1), t.longs(0x0101, &[1, 2])];
+        t.ifd(&ifd0, 0);
+        let mut tiff = t.bytes.clone();
+        patch_tiff_dimensions(&mut tiff, 40, 30);
+        assert_eq!(tiff, t.bytes);
+        let corpus = include_bytes!("../tests/functional/corpus/exif-orient.jpg");
+        let mut tiff = extract_source_meta(corpus, true).exif_tiff.unwrap();
+        let before = tiff.clone();
+        patch_tiff_dimensions(&mut tiff, 40, 30);
+        assert_eq!(tiff, before);
     }
 }

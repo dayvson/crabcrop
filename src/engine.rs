@@ -1386,7 +1386,8 @@ impl Engine {
             encoded.bytes,
             still,
             encode_opts.keep_profile,
-            &source_meta,
+            source_meta,
+            (img.width(), img.height()),
             &ctx,
         );
         Ok(ProcessedImage {
@@ -1992,14 +1993,23 @@ impl Engine {
     /// bytes: the ICC goes in when the request kept the
     /// profile (it was not converted away), preserved
     /// metadata when the operator policy allows it. Only
-    /// JPEG and PNG outputs carry either in this pass.
+    /// JPEG and PNG outputs carry either in this pass. A
+    /// preserved EXIF gives the output's size, `size`, not
+    /// the source's (issue #611).
     fn embed_source_meta(
         bytes: Vec<u8>,
         format: StillFormat,
         keep_profile: bool,
-        source_meta: &crate::color::SourceMeta,
+        mut source_meta: crate::color::SourceMeta,
+        size: (u32, u32),
         ctx: &ProcessContext<'_>,
     ) -> Vec<u8> {
+        if ctx.preserve_metadata
+            && let Some(tiff) = &mut source_meta.exif_tiff
+        {
+            crate::color::patch_tiff_dimensions(tiff, size.0, size.1);
+        }
+        let source_meta = &source_meta;
         if (keep_profile && source_meta.icc.is_some()) || ctx.preserve_metadata {
             let embed_icc = if keep_profile {
                 source_meta.icc.as_deref()
