@@ -439,8 +439,8 @@ const MAX_CHAINED_IFDS: usize = 8;
 /// and memory small whatever the counts claim.
 const MAX_IMAGE_PARTS: usize = 1024;
 
-/// The TIFF header, which the sanitizer never blanks or
-/// cuts.
+/// The TIFF header, which the IFD edits never blank and
+/// the tail cut always keeps.
 const TIFF_HEADER_BYTES: usize = 8;
 
 /// Remove the previews a preserved EXIF stream carries
@@ -475,12 +475,30 @@ pub fn strip_tiff_thumbnails(tiff: &mut Vec<u8>) {
         range.start = range
             .start
             .clamp(TIFF_HEADER_BYTES, range.end.max(TIFF_HEADER_BYTES));
-        if let Some(bytes) = tiff.get_mut(range.clone()) {
-            bytes.fill(0);
-        }
+    }
+    // Merged first, so each byte is zeroed once however many
+    // entries claim it: the work stays linear in the stream.
+    let mut blanked = merge_ranges(blanked);
+    for range in &blanked {
+        tiff[range.clone()].fill(0);
     }
     blank_embedded_jpegs(tiff, &mut blanked);
     cut_blanked_tail(tiff, blanked);
+}
+
+/// `ranges` without the empty ones, sorted and merged where
+/// they overlap or touch.
+fn merge_ranges(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    ranges.retain(|r| r.start < r.end);
+    ranges.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// The bytes of every IFD chained after IFD0: each one's
@@ -620,17 +638,8 @@ fn jpeg_extent(b: &[u8]) -> (usize, bool) {
 /// Cut the stream where its blanked tail starts: the zeros
 /// a removed thumbnail leaves at the end carry nothing. The
 /// header always stays.
-fn cut_blanked_tail(tiff: &mut Vec<u8>, mut blanked: Vec<std::ops::Range<usize>>) {
-    blanked.retain(|r| r.start < r.end);
-    blanked.sort_unstable_by_key(|r| r.start);
-    let mut last: Option<std::ops::Range<usize>> = None;
-    for range in blanked {
-        match &mut last {
-            Some(merged) if range.start <= merged.end => merged.end = merged.end.max(range.end),
-            _ => last = Some(range),
-        }
-    }
-    if let Some(tail) = last
+fn cut_blanked_tail(tiff: &mut Vec<u8>, blanked: Vec<std::ops::Range<usize>>) {
+    if let Some(tail) = merge_ranges(blanked).pop()
         && tail.end >= tiff.len()
     {
         tiff.truncate(tail.start.max(TIFF_HEADER_BYTES));
@@ -2367,6 +2376,29 @@ mod tests {
         assert_eq!(got.len(), tiff.len());
         assert_eq!(got[..14], tiff[..14]);
         assert!(got[14..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn overlapping_claims_are_zeroed_once() {
+        // An IFD1 whose 65535 entries each claim the whole
+        // stream: zeroing range by range wrote the stream
+        // 65535 times. Merged, each byte is zeroed once.
+        let mut t = vec![b'I', b'I', 42, 0, 8, 0, 0, 0, 0, 0, 14, 0, 0, 0];
+        t.extend_from_slice(&u16::MAX.to_le_bytes());
+        for i in 0..u16::MAX {
+            t.extend_from_slice(&i.to_le_bytes());
+            t.extend_from_slice(&12u16.to_le_bytes()); // DOUBLE
+            t.extend_from_slice(&0x1000_0000u32.to_le_bytes());
+            t.extend_from_slice(&8u32.to_le_bytes());
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.resize(4 * 1024 * 1024, 0x11);
+        let start = std::time::Instant::now();
+        let got = extract_source_meta(&png_with_chunks(&[(b"eXIf", &t)]), true)
+            .exif_tiff
+            .unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(got, &t[..8]);
     }
 
     #[test]
