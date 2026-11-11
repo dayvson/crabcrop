@@ -182,8 +182,7 @@ fn a_certificate_whose_name_has_nothing_to_show_boots_under_its_organization() {
         BLANK_NAME_KEY.as_bytes().to_vec(),
         None,
     )
-    .err()
-    .expect("an identity with no name to show fails boot");
+    .expect_err("an identity with no name to show fails boot");
     assert!(
         error.contains("named no signer")
             && error.contains("common name and organization are missing"),
