@@ -1435,9 +1435,10 @@ impl DiskStore {
     /// Start background jobs for queued work (issue #572), up
     /// to [`DRAIN_JOBS`] at once, and wake one that waits: a
     /// task for each job that can run and has no task free for
-    /// it. Jobs waiting out a backoff start no task: the last
-    /// one left waits for them. Without a runtime the work
-    /// stays queued.
+    /// it. Jobs waiting out a backoff need one task that runs
+    /// no job to wait for them, since a task running one can be
+    /// stuck in the kernel: one starts when every task runs a
+    /// job. Without a runtime the work stays queued.
     pub fn kick(self: &Arc<Self>) {
         let (spawn, ready) = {
             let mut inner = self.inner.lock().unwrap();
@@ -1445,7 +1446,7 @@ impl DiskStore {
             let running = inner.rewrites.running + inner.deletions.running;
             let later = inner.rewrites.next_due().is_some() || inner.deletions.next_due().is_some();
             let spawn = inner.workers < DRAIN_JOBS
-                && (ready + running > inner.workers || (inner.workers == 0 && later));
+                && (ready + running > inner.workers || (inner.workers == running && later));
             if spawn {
                 inner.workers += 1;
             }
@@ -1495,6 +1496,9 @@ impl DiskStore {
             }
             match next {
                 Next::Job(job) => {
+                    // When this was the task waiting for a retry,
+                    // another one waits for it now.
+                    self.kick();
                     let claim = FileClaim::job(self.clone(), &job.key, job.kind);
                     let _ = self
                         .blocking_with(permit, move |store| store.run_job(claim, &job))
@@ -1624,10 +1628,12 @@ impl DiskStore {
             None => {
                 // A purge or an eviction removed the record
                 // while the file was rewritten: the file is
-                // this job's, under its claim.
-                inner.rewrites.finish(key, false);
+                // this job's, under its claim. The job runs
+                // until it is deleted, so a delete stuck in the
+                // kernel counts as a running job.
                 drop(guard);
                 self.unlink(path);
+                self.inner.lock().unwrap().rewrites.finish(key, false);
             }
         }
         true
@@ -1641,9 +1647,9 @@ impl DiskStore {
             if inner.entries.get(key).is_some_and(|record| record.id == id) {
                 evict_entry(&mut inner, key);
             }
-            inner.rewrites.finish(key, false);
         }
         self.unlink(path);
+        self.inner.lock().unwrap().rewrites.finish(key, false);
     }
 
     /// Delete an entry file under the claim the caller holds,
@@ -4946,6 +4952,156 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(file_groups(&store, "k"), ["a", "g"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_runs_again_when_the_task_waiting_for_it_takes_a_job_that_gets_stuck() {
+        // Issue #572 third review: the one drain task waiting
+        // out a failed job's backoff was woken for a new job,
+        // took it, and that job got stuck in the kernel. No
+        // task was left to wait, and kicks start none for a job
+        // in its backoff while a task runs, so the retry waited
+        // for the stuck job to return.
+        let dir = temp_dir("retry-waiter-stuck");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("flaky", &image(b"f"));
+        store.put("stuck", &image(b"s"));
+        let flaky = store.file_for(&key_stem("flaky"));
+        let stuck = store.file_for(&key_stem("stuck"));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let flaky_path = flaky.clone();
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            if kind == OpKind::Unlink && path == stuck {
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == flaky_path && !failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })));
+        store.purge(&PurgeTarget::Key("flaky".into()));
+        store.kick();
+        // Its first run fails, and the retry is due a second
+        // later.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.inner.lock().unwrap().deletions.failing == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        store.purge(&PurgeTarget::Key("stuck".into()));
+        store.kick();
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while flaky.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(release);
+        store.set_hold(None);
+        assert!(
+            retried.is_ok(),
+            "the failed deletion waited for the stuck one: {:?}",
+            store.backlog()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_runs_again_while_a_rewrite_deletes_the_file_of_a_purged_record() {
+        // Issue #572 third review: a rewrite whose record a
+        // purge removed while it wrote the file ended its job
+        // before deleting that file, so a task stuck in that
+        // delete counted as free, and the task waiting out a
+        // failed job's backoff stopped for it.
+        let dir = temp_dir("retry-rewrite-unlink");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("flaky", &image(b"f"));
+        store.put("k", &grouped_image(b"k", &["a"]));
+        let flaky = store.file_for(&key_stem("flaky"));
+        let k_path = store.file_for(&key_stem("k"));
+        let k_stem = key_stem("k");
+        let (write_go, write_wait) = std::sync::mpsc::channel::<()>();
+        let (unlink_go, unlink_wait) = std::sync::mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<OpKind>();
+        let write_wait = Mutex::new(write_wait);
+        let unlink_wait = Mutex::new(unlink_wait);
+        let seen_tx = Mutex::new(seen_tx);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let flaky_path = flaky.clone();
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if kind == OpKind::Write && name.starts_with(&k_stem) {
+                let _ = seen_tx.lock().unwrap().send(kind);
+                let _ = write_wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == k_path {
+                let _ = seen_tx.lock().unwrap().send(kind);
+                let _ = unlink_wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == flaky_path && !failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })));
+        // A rewrite of k runs and is held in its write.
+        assert!(grew(store.learn_groups(
+            "k",
+            &groups(&["b"]),
+            Bucket::Unknown
+        )));
+        store.kick();
+        let seen = seen_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(seen.unwrap(), OpKind::Write);
+        // flaky's deletion fails once, and another task waits
+        // for its retry.
+        store.purge(&PurgeTarget::Key("flaky".into()));
+        store.kick();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.inner.lock().unwrap().deletions.failing == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // k is purged while its rewrite writes; the rewrite then
+        // finds the record gone and deletes the file, and that
+        // delete is stuck.
+        store.purge(&PurgeTarget::Key("k".into()));
+        store.kick();
+        drop(write_go);
+        let seen = seen_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(seen.unwrap(), OpKind::Unlink);
+        store.kick();
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while flaky.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(unlink_go);
+        store.set_hold(None);
+        assert!(
+            retried.is_ok(),
+            "the failed deletion waited for the stuck rewrite: {:?}",
+            store.backlog()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
