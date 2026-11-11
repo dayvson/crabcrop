@@ -1481,7 +1481,7 @@ impl DiskStore {
             let Some(permit) = self.permit().await else {
                 return;
             };
-            let (next, dropped) = {
+            let (next, dropped, backoff) = {
                 let mut inner = self.inner.lock().unwrap();
                 let mut dropped = false;
                 let next = next_job(&mut inner, false, &mut dropped);
@@ -1489,7 +1489,9 @@ impl DiskStore {
                     inner.workers -= 1;
                     worker.counted = false;
                 }
-                (next, dropped)
+                let backoff =
+                    inner.rewrites.next_due().is_some() || inner.deletions.next_due().is_some();
+                (next, dropped, backoff)
             };
             if dropped {
                 self.progress.send_modify(|n| *n += 1);
@@ -1498,7 +1500,9 @@ impl DiskStore {
                 Next::Job(job) => {
                     // When this was the task waiting for a retry,
                     // another one waits for it now.
-                    self.kick();
+                    if backoff {
+                        self.kick();
+                    }
                     let claim = FileClaim::job(self.clone(), &job.key, job.kind);
                     let _ = self
                         .blocking_with(permit, move |store| store.run_job(claim, &job))
