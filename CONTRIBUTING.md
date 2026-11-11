@@ -134,16 +134,57 @@ script on that branch too.
 
 ## Changelog
 
-Give user-facing changes an entry under `## [Unreleased]` in
-[CHANGELOG.md](CHANGELOG.md). The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Give user-facing changes a changelog entry. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Write the entry as a
+fragment: a file of its own in [`changelog.d/`](changelog.d/), which the
+release moves into [CHANGELOG.md](CHANGELOG.md). Every pull request adds a
+different file, so entries no longer conflict when another pull request
+merges first (issue #539).
+
+- **Name** the file `changelog.d/<issue>.<section>.md`, for example
+  `changelog.d/521.changed.md`. The section is one of `added`, `changed`,
+  `deprecated`, `removed`, `fixed` or `security`. When that name is taken (a
+  second entry for the same issue and section), put a short slug after the
+  number, in lowercase words joined by hyphens:
+  `changelog.d/521-chained-resize.changed.md`. Every fragment names an issue,
+  as every entry in CHANGELOG.md does: open one for a change that has none.
+- **Write** one paragraph in the style of the entries in CHANGELOG.md, naming
+  the issue the same way, `(issue #521)` or `(issues #604 and #613)`. The
+  issue in the file name must be one of those the text names. Leave out the
+  leading `- `: the release adds it. You may wrap the paragraph; its lines are
+  joined with a space. A blank line, a second bullet or a heading is refused,
+  since an entry is one paragraph and a second entry is a second fragment.
+- **Preview** `## [Unreleased]` as the release will write it. Each section
+  lists the entries already written under `## [Unreleased]` first, as they
+  are, then the fragments in issue order:
+
+  ```bash
+  python3 scripts/assemble_changelog.py --check
+  ```
+
+A pull request that raises `RENDERING_VERSION` also says that the release
+starts a new cache epoch (RELEASING.md step 4), in an entry that opens with
+"This release starts a new cache epoch". As a fragment, name it
+`<issue>.changed.md`: the release puts it first under Changed, ahead of the
+other entries, since it describes the changes below it. A release has one
+such note, so a later pull request whose change belongs to the same epoch adds
+its change to that note, the fragment or the CHANGELOG.md line, instead of
+writing a second one.
+
+A line under `## [Unreleased]` in CHANGELOG.md still counts as the entry, so
+a pull request opened before fragments existed needs no change, but such
+lines conflict with each other, so prefer a fragment.
 
 The changelog workflow enforces this: a pull request that touches `src/`,
-`sdks/`, `frameworks/`, or `plugins/` fails until it adds a line under
-`## [Unreleased]`. When nothing user-facing changed (a refactor, a test, a
-dependency bump), a maintainer adds the `no-changelog` label instead, and the
-check passes. To run the same check locally, against the branch point with
-`main`:
+`sdks/`, `frameworks/`, or `plugins/` fails until it adds or edits a fragment,
+or adds a line under `## [Unreleased]`. When nothing user-facing changed (a
+refactor, a test, a dependency bump), a maintainer adds the `no-changelog`
+label instead, and the check passes. A fragment the pull request adds or edits
+must be well formed even then, and a file named like a fragment outside
+`changelog.d/` fails, so a fragment the release could not assemble never
+reaches `main`; `scripts/check_docs.py`, which `scripts/test_all.sh` runs,
+checks every fragment in the tree too. To run the same check locally, against
+the branch point with `main`:
 
 ```bash
 python3 scripts/check_docs.py --changelog-entry origin/main
