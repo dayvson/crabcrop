@@ -8,6 +8,11 @@
 //! binary, so the arc costs one worker and one `502`, a
 //! render past the deadline costs one killed worker and one
 //! `504`, and the server answers everything else throughout.
+//!
+//! The last test covers what a child can reach in the server
+//! (issue #605): the server marks itself non-dumpable, so a
+//! child cannot read its environment through `/proc`, and the
+//! worker still starts and renders.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -80,6 +85,16 @@ fn boot_in(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    boot_command(command, root, extra_env)
+}
+
+/// Boot `command`, which starts the binary, with the
+/// environment every test here gives the server.
+fn boot_command(
+    mut command: Command,
+    root: &Path,
+    extra_env: &[(&str, &str)],
+) -> (common::ServerGuard, u16) {
     command
         .env_clear()
         .env("CRABCROP_SECRET", "svg-isolation-secret-0123456789")
@@ -453,5 +468,113 @@ fn an_svg_draws_no_file_its_hrefs_name_whatever_the_working_directory_holds() {
     assert_eq!(out.get_pixel(25, 40), &image::Rgba([0, 255, 0, 255]));
     assert_eq!(out.get_pixel(75, 40), &image::Rgba([0, 255, 0, 255]));
     assert_eq!(out.get_pixel(50, 20), &image::Rgba([0, 255, 0, 255]));
+    assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
+}
+
+/// Whether this process holds any capability, as a test run
+/// as root does. `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN` and
+/// `CAP_PERFMON` each let a process read another's `/proc`
+/// files, a non-dumpable one's included.
+#[cfg(target_os = "linux")]
+fn holds_capabilities() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        })
+        .is_some_and(|caps| caps != 0)
+}
+
+/// The binary, started as the images start it: with no
+/// capabilities. When this test holds some, `setpriv` drops
+/// them all before the exec.
+#[cfg(target_os = "linux")]
+fn server_without_capabilities() -> Command {
+    let binary = env!("CARGO_BIN_EXE_crabcrop");
+    if !holds_capabilities() {
+        return Command::new(binary);
+    }
+    let setpriv = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("setpriv"))
+        .find(|path| path.is_file())
+        .expect("this test holds capabilities (run as root?) and needs setpriv to drop them");
+    let mut command = Command::new(setpriv);
+    command
+        .args(["--inh-caps", "-all", "--bounding-set", "-all", "--"])
+        .arg(binary);
+    command
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_child_cannot_read_the_servers_environment_and_the_worker_still_renders() {
+    // Issue #605: a child runs as the server's user, so a
+    // compromised decoder could read the server's secrets
+    // from `/proc/<server pid>/environ` while the server was
+    // dumpable. This fake decoder tries that, then reports the
+    // OOM score the server gave it, and fails the probe. It
+    // runs ten times: `spawn` can return before the child's
+    // exec makes it dumpable again, and the server's OOM score
+    // write must still land then.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = source_dir("not-dumpable");
+    std::fs::write(dir.join("clip.mp4"), b"not a real video").unwrap();
+    let (log, seen) = (dir.join("decoder.log"), dir.join("environ"));
+    let decoder = dir.join("decoder.sh");
+    std::fs::write(
+        &decoder,
+        format!(
+            "#!/bin/sh\n\
+             PATH=/usr/bin:/bin\n\
+             echo \"ppid $PPID\" >> '{log}'\n\
+             if cat \"/proc/$PPID/environ\" > '{seen}' 2>/dev/null; then\n\
+             echo 'environ read' >> '{log}'\n\
+             else\n\
+             echo 'environ refused' >> '{log}'\n\
+             fi\n\
+             sleep 0.3\n\
+             echo \"oom_score_adj $(cat /proc/$$/oom_score_adj)\" >> '{log}'\n\
+             exit 1\n",
+            log = log.display(),
+            seen = seen.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&decoder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut server, port) = boot_command(
+        server_without_capabilities(),
+        &dir,
+        &[("CRABCROP_VIDEO_DECODER", decoder.to_str().unwrap())],
+    );
+    const RUNS: usize = 10;
+    for _ in 0..RUNS {
+        let (status, body, _) = get(port, "/unsafe/frame:poster/50x50/file:///clip.mp4");
+        assert_ne!(status, 200, "{}", String::from_utf8_lossy(&body));
+    }
+    let log = std::fs::read_to_string(&log).expect("the decoder ran");
+    let parent = format!("ppid {}", server.0.id());
+    let parents: Vec<&str> = log.lines().filter(|l| l.starts_with("ppid ")).collect();
+    assert_eq!(parents.len(), RUNS, "{log}");
+    assert!(
+        parents.iter().all(|line| *line == parent),
+        "the decoder's parent is not the server: {log}"
+    );
+    let seen = std::fs::read(&seen).unwrap_or_default();
+    assert!(
+        !String::from_utf8_lossy(&seen).contains("CRABCROP_SECRET="),
+        "a child read the server's secret from /proc: {log}"
+    );
+    assert_eq!(log.matches("environ refused\n").count(), RUNS, "{log}");
+    assert!(!log.contains("environ read"), "{log}");
+    // The server still sets the OOM score of every child it
+    // starts.
+    assert_eq!(log.matches("oom_score_adj 1000\n").count(), RUNS, "{log}");
+    // The worker starts from the server's own image and renders.
+    let (status, body, _) = get(port, "/unsafe/32x32/file:///ok.svg");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(body.starts_with(b"\x89PNG"), "an SVG renders to PNG");
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
 }

@@ -81,6 +81,12 @@
 //! included, is bounded by that cap, and the tool is the OOM
 //! killer's first choice.
 //!
+//! These bounds limit what a decode can cost, not what a
+//! compromised tool can reach. The empty environment keeps
+//! the server's secrets out of the tool's environment, but
+//! the tool runs as the server's user (issue #605; see
+//! `toolrun` and SECURITY.md).
+//!
 //! The extracted PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
 //! dimensions and allocation, output pixels) applies to
