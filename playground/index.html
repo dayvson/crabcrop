@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>crabcrop playground</title>
 <style>
@@ -37,9 +38,11 @@
 <p class="note">
   Build, sign, preview, and debug crabcrop URLs entirely in your browser.
   <strong>Your secret never leaves this page:</strong> signing happens locally with
-  WebCrypto, the secret is never stored and never sent to any server, and the only
-  network requests this page makes are to the crabcrop endpoint and image sources
-  you enter. The scheme is the one in <code>spec/url-signing.md</code>.
+  WebCrypto, and the secret is never stored and never sent to any server. Apart from
+  its own files, the page sends requests only to the crabcrop endpoint and the source
+  image in the form. On load it requests only the preview, from the endpoint. The
+  byte-size check also fetches the source, and it waits for your first edit. The
+  scheme is the one in <code>spec/url-signing.md</code>.
 </p>
 
 <div class="card">

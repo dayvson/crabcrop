@@ -109,7 +109,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 This README is the front door. The full reference lives on the website and in this repo's docs folder:
 
 - [Full documentation](https://crabcrop.org/docs): every operation with examples and interactive demos, section by section.
-- [Playground](https://play.crabcrop.org): build, sign, preview, and debug URLs in the browser. The secret never leaves the page.
+- [Playground](https://play.crabcrop.org): a live demo instance for building, signing, previewing, and debugging URLs in the browser. It signs with its own demo key, which is public and works only on that instance, so do not paste a production secret into it. To sign with your own secret, serve the [playground page](playground/README.md) from this repo yourself; the secret never leaves that page.
 - The reference, in this repo:
   - [URL grammar and signing](docs/url-grammar.md): request anatomy, signing, sealed and expiring URLs, source images and source roots.
   - [Operations](docs/operations.md): resize, fit-in, pad, the crop family, focal forms, debug view, presets.
