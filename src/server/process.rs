@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::http::{HeaderMap, StatusCode};
 
-use super::AppState;
+use super::{AppState, Providers};
 use crate::engine::EngineError;
 use crate::url::ImageFormat;
 
@@ -306,21 +306,10 @@ pub(in crate::server) struct ProcessJob {
     /// the job for a run never copies them (issue #403).
     pub(in crate::server) watermark_sources: Arc<WatermarkSources>,
     pub(in crate::server) placeholders: bool,
-    pub(in crate::server) mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
-    pub(in crate::server) upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
-    pub(in crate::server) inpaint_provider: Option<Arc<dyn crate::ai::InpaintProvider>>,
-    pub(in crate::server) segment_provider: Option<Arc<dyn crate::ai::SegmentProvider>>,
-    pub(in crate::server) face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
-    pub(in crate::server) detect_provider: Option<Arc<dyn crate::ai::DetectionProvider>>,
-    pub(in crate::server) declared_detect_providers: Vec<Arc<dyn crate::ai::DetectionProvider>>,
-    pub(in crate::server) focal_provider: Option<Arc<dyn crate::ai::FocalProvider>>,
-    pub(in crate::server) text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
-    pub(in crate::server) video_encoder: Option<Arc<crate::video::VideoEncoder>>,
-    pub(in crate::server) frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
-    pub(in crate::server) pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
-    /// C2PA output signer (issue #173) when the operator
-    /// configured one.
-    pub(in crate::server) provenance_signer: Option<Arc<crate::provenance::ProvenanceSigner>>,
+    /// The server's provider and renderer handles, the
+    /// state's own `Arc` (issue #475): the C2PA output
+    /// signer (issue #173) among them.
+    pub(in crate::server) providers: Arc<Providers>,
     /// Whether this request's operations include an AI
     /// edit (removebg, studio, remove_region, upscale,
     /// class edits, face redactions), recorded on the
@@ -720,10 +709,11 @@ pub(in crate::server) async fn run_process(
         let _video_permit = permits.video;
         let _anim_permit = permits.anim;
         let JobSource { bytes, share } = source;
-        let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
-            .declared_detect_providers
+        let providers = &*job.providers;
+        let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = providers
+            .detectors
             .iter()
-            .map(|p| p.as_ref())
+            .map(|d| d.provider.as_ref())
             .collect();
         // Watermark images decode here, inside the gated
         // blocking job, rather than inline in the async
@@ -741,20 +731,20 @@ pub(in crate::server) async fn run_process(
                 preferred: job.preferred,
                 watermarks: Some(&watermarks),
                 placeholders: job.placeholders,
-                mask_provider: job.mask_provider.as_deref(),
-                upscale_provider: job.upscale_provider.as_deref(),
-                inpaint_provider: job.inpaint_provider.as_deref(),
-                segment_provider: job.segment_provider.as_deref(),
-                face_provider: job.face_provider.as_deref(),
-                detect_provider: job.detect_provider.as_deref(),
+                mask_provider: providers.removebg.as_deref(),
+                upscale_provider: providers.upscale.as_deref(),
+                inpaint_provider: providers.inpaint.as_deref(),
+                segment_provider: providers.segment.as_deref(),
+                face_provider: providers.face.as_deref(),
+                detect_provider: providers.detect.as_deref(),
                 declared_detect_providers: &declared_refs,
-                focal_provider: job.focal_provider.as_deref(),
-                video_encoder: job.video_encoder.as_deref(),
-                frame_extractor: job.frame_extractor.as_deref(),
-                pdf_renderer: job.pdf_renderer.as_deref(),
+                focal_provider: providers.focal.as_deref(),
+                video_encoder: providers.video_encoder.as_deref(),
+                frame_extractor: providers.frame_extractor.as_deref(),
+                pdf_renderer: providers.pdf_renderer.as_deref(),
                 save_data: job.save_data,
                 preserve_metadata: job.preserve_metadata,
-                text_renderer: job.text_renderer.as_deref(),
+                text_renderer: providers.font.as_deref(),
                 dpr: job.dpr,
                 ssim_target: job.ssim_target,
                 brand_color: job.brand_color,
@@ -823,7 +813,7 @@ pub(in crate::server) fn apply_provenance(
     source_bytes: &[u8],
     processed: &mut crate::engine::ProcessedImage,
 ) -> Result<(), EngineError> {
-    let signer = &job.provenance_signer;
+    let signer = &job.providers.provenance_signer;
     if signer.is_none() && !job.want_provenance {
         return Ok(());
     }

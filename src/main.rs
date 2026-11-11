@@ -42,7 +42,7 @@ use crate::config::{
 use crate::engine::Engine;
 use crate::loader::Loader;
 use crate::observe::Metrics;
-use crate::server::{AppState, app};
+use crate::server::{AppState, Providers, app};
 
 fn main() {
     // An SVG worker (issue #447) is this binary started by
@@ -450,21 +450,27 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
             .as_ref()
             .map(|token| token.expose().to_string()),
         cache: Arc::new(Cache::new(config.cache_bytes)),
-        removebg: ai.removebg,
-        upscale: ai.upscale,
-        inpaint: ai.inpaint,
-        segment: ai.segment,
-        face: ai.face,
-        tagger: ai.tagger,
+        providers: Arc::new(Providers {
+            removebg: ai.removebg,
+            upscale: ai.upscale,
+            inpaint: ai.inpaint,
+            segment: ai.segment,
+            face: ai.face,
+            tagger: ai.tagger,
+            moderation: ai.moderation,
+            embeddings: ai.embeddings,
+            aesthetic: ai.aesthetic,
+            ocr: ai.ocr,
+            detect: ai.detect,
+            detectors: ai.detectors,
+            focal: ai.focal,
+            font,
+            video_encoder,
+            frame_extractor,
+            pdf_renderer,
+            provenance_signer,
+        }),
         tag_threshold: ai.tag_threshold,
-        moderation: ai.moderation,
-        embeddings: ai.embeddings,
-        aesthetic: ai.aesthetic,
-        ocr: ai.ocr,
-        detect: ai.detect,
-        detectors: ai.detectors,
-        focal: ai.focal,
-        font,
         fallback,
         store: stores.disk,
         shared_store: stores.shared,
@@ -485,10 +491,6 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         only_presets: config.only_presets,
         source_roots: config.source_roots.clone(),
         default_ops: config.default_ops.clone(),
-        video_encoder,
-        frame_extractor,
-        pdf_renderer,
-        provenance_signer,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(ANIM_GATE_PERMITS)),
         probe_gate: Arc::new(tokio::sync::Semaphore::new(PROBE_GATE_PERMITS)),

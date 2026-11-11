@@ -39,9 +39,9 @@ use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
 /// One declared `boxes` detector (issue #166): the name
 /// its declaration carries in `CRABCROP_DETECTORS_FILE`
-/// and its provider. Kept in declaration order on the
-/// state: meta aggregation and class resolution both walk
-/// the built-in detector first, then these.
+/// and its provider. Kept in declaration order in
+/// [`Providers`]: meta aggregation and class resolution
+/// both walk the built-in detector first, then these.
 #[derive(Clone)]
 pub struct NamedDetector {
     pub name: String,
@@ -104,86 +104,16 @@ pub struct AppState {
     pub metrics_token: Option<String>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
-    /// Background-removal provider, preloaded at boot when
-    /// `CRABCROP_REMOVEBG_MODEL` is configured. `None` means the
-    /// feature is off; `removebg` requests then fail cleanly.
-    pub removebg: Option<Arc<dyn crate::ai::MaskProvider>>,
-    /// Upscale provider, preloaded at boot when
-    /// `CRABCROP_UPSCALE_MODEL` is configured. `None` means the
-    /// feature is off; `upscale` requests then fail cleanly.
-    pub upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
-    /// Inpainting provider, preloaded at boot when
-    /// `CRABCROP_INPAINT_MODEL` is configured. `None` means
-    /// the feature is off; `remove_region` requests then
-    /// fail cleanly.
-    pub inpaint: Option<Arc<dyn crate::ai::InpaintProvider>>,
-    /// Segment provider, preloaded at boot when the
-    /// `CRABCROP_SEGMENT_*_MODEL` pair is configured.
-    /// `None` means class operations use detection
-    /// rectangles; configured, they follow silhouettes.
-    pub segment: Option<Arc<dyn crate::ai::SegmentProvider>>,
-    /// Face provider for smart crops, preloaded at boot when
-    /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
-    /// crops use the saliency estimate.
-    pub face: Option<Arc<dyn crate::ai::FaceProvider>>,
-    /// CLIP tag provider for meta annotations, preloaded at
-    /// boot when the `CRABCROP_CLIP_*` set is configured.
-    /// `None` means meta responses carry no tags or alt text.
-    pub tagger: Option<Arc<dyn crate::ai::TagProvider>>,
+    /// The provider and renderer handles (see
+    /// [`Providers`]): one `Arc`, shared with every
+    /// engine job.
+    pub providers: Arc<Providers>,
     /// Tag threshold for meta annotations, from
     /// `CRABCROP_CLIP_THRESHOLD` (default 0.05): labels whose
     /// composed probability falls below it are omitted from
     /// meta `tags`. The composition itself lives in
     /// `compose_annotation` (issue #152).
     pub tag_threshold: f32,
-    /// Moderation provider for meta responses that opt in
-    /// with `moderation=1` (issue #171), preloaded at boot
-    /// when `CRABCROP_MODERATION_MODEL` or the labels
-    /// fallback is configured. `None` means the opt-in
-    /// reports moderation as unavailable. Verdicts are
-    /// annotations only: nothing here alters serving.
-    pub moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
-    /// Embedding provider for meta responses that opt
-    /// in with `embeddings=1` (issue #172), built from
-    /// the CLIP tagger at boot. `None` means the opt-in
-    /// reports the embedding as unavailable.
-    pub embeddings: Option<Arc<dyn crate::ai::EmbeddingProvider>>,
-    /// Aesthetic head for meta responses (issue #172),
-    /// loaded at boot when `CRABCROP_AESTHETIC_HEAD` is
-    /// configured. `None` means meta carries no
-    /// aesthetic field. The score is descriptive only:
-    /// nothing here alters serving either.
-    pub aesthetic: Option<Arc<crate::ai::AestheticHead>>,
-    /// OCR provider for meta responses that opt in with
-    /// `ocr=1` (issue #177), preloaded at boot when the
-    /// `CRABCROP_OCR_*` set is configured. `None` means
-    /// the opt-in reports OCR as unavailable. The text
-    /// only annotates meta; nothing here alters serving
-    /// either: the image a meta request describes is the
-    /// same entry an image request returns.
-    pub ocr: Option<Arc<dyn crate::ai::OcrProvider>>,
-    /// Detection provider for class redaction and meta
-    /// detections, preloaded at boot when
-    /// `CRABCROP_DETECT_MODEL` is configured. `None` means
-    /// class redaction fails cleanly and meta carries no
-    /// detections.
-    pub detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
-    /// Declared `boxes` detectors from
-    /// `CRABCROP_DETECTORS_FILE` (issue #166), in
-    /// declaration order: class redaction resolves across
-    /// the built-in detector and these, and meta detections
-    /// aggregate all of them, each box attributed by name.
-    pub detectors: Vec<NamedDetector>,
-    /// Declared focal provider for smart crops (issue
-    /// #166): the first `focal` declaration in
-    /// `CRABCROP_DETECTORS_FILE`. Later focal declarations
-    /// are probed at boot and stand by. `None` means smart
-    /// crops fall back to faces, then saliency.
-    pub focal: Option<Arc<dyn crate::ai::FocalProvider>>,
-    /// Text renderer, loaded at boot when `CRABCROP_FONT_PATH`
-    /// is configured. `None` means `text(...)` requests fail
-    /// cleanly.
-    pub font: Option<Arc<dyn crate::text::TextRenderer>>,
     /// Fallback image for source failures, when configured.
     pub fallback: Option<Fallback>,
     /// Disk-backed result storage, the persistent tier under
@@ -274,36 +204,6 @@ pub struct AppState {
     /// request's operations before analysis, processing, and
     /// cache keying.
     pub default_ops: Vec<crate::url::Operation>,
-    /// External video encoder (issue #162), validated at
-    /// boot when `CRABCROP_VIDEO_ENCODER` is configured.
-    /// `None` means video output does not exist on this
-    /// server; `format(mp4)` and `format(webm)` then fail
-    /// with the specific not-configured error.
-    pub video_encoder: Option<Arc<crate::video::VideoEncoder>>,
-    /// Frame extractor for `frame:` segments on video
-    /// sources (issue #214), built at boot when
-    /// `CRABCROP_VIDEO_DECODER` is configured. `None` means
-    /// frame selection does not exist on this server; a
-    /// `frame:` request then fails with the specific
-    /// not-configured error. Extraction shares the video
-    /// gate below: it is the same class of subprocess
-    /// work as an encode.
-    pub frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
-    /// PDF renderer for `page:` segments on PDF sources
-    /// (issue #215), built at boot when
-    /// `CRABCROP_PDF_RENDERER` is configured. `None` means
-    /// page selection does not exist on this server; a
-    /// `page:` request then fails with the specific
-    /// not-configured error. Rendering shares the video
-    /// gate below: it is the same class of subprocess
-    /// work as frame extraction.
-    pub pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
-    /// C2PA output signer (issue #173), built and
-    /// self-validated at boot when `CRABCROP_C2PA_CERT`
-    /// and `CRABCROP_C2PA_KEY` are configured. `None`
-    /// means outputs are served unsigned; meta responses
-    /// still report the provenance a source carries.
-    pub provenance_signer: Option<Arc<crate::provenance::ProvenanceSigner>>,
     /// Bounds concurrent video encodes: the subprocess is
     /// the server's most expensive and least predictable
     /// work, so it gets its own small gate (2 permits, like
@@ -365,6 +265,119 @@ const _: fn() = || {
     <AppState as AmbiguousIfClone<_>>::check();
 };
 
+/// The provider and renderer handles (issue #475): every
+/// model, external tool, font and signer loaded at boot,
+/// each `None` (or empty) when it is not configured. The
+/// state and every engine job share one `Arc` of them,
+/// so a job takes them all with one pointer copy.
+#[derive(Debug, Default)]
+pub struct Providers {
+    /// Background-removal provider, preloaded at boot when
+    /// `CRABCROP_REMOVEBG_MODEL` is configured. `None` means the
+    /// feature is off; `removebg` requests then fail cleanly.
+    pub removebg: Option<Arc<dyn crate::ai::MaskProvider>>,
+    /// Upscale provider, preloaded at boot when
+    /// `CRABCROP_UPSCALE_MODEL` is configured. `None` means the
+    /// feature is off; `upscale` requests then fail cleanly.
+    pub upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
+    /// Inpainting provider, preloaded at boot when
+    /// `CRABCROP_INPAINT_MODEL` is configured. `None` means
+    /// the feature is off; `remove_region` requests then
+    /// fail cleanly.
+    pub inpaint: Option<Arc<dyn crate::ai::InpaintProvider>>,
+    /// Segment provider, preloaded at boot when the
+    /// `CRABCROP_SEGMENT_*_MODEL` pair is configured.
+    /// `None` means class operations use detection
+    /// rectangles; configured, they follow silhouettes.
+    pub segment: Option<Arc<dyn crate::ai::SegmentProvider>>,
+    /// Face provider for smart crops, preloaded at boot when
+    /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
+    /// crops use the saliency estimate.
+    pub face: Option<Arc<dyn crate::ai::FaceProvider>>,
+    /// CLIP tag provider for meta annotations, preloaded at
+    /// boot when the `CRABCROP_CLIP_*` set is configured.
+    /// `None` means meta responses carry no tags or alt text.
+    pub tagger: Option<Arc<dyn crate::ai::TagProvider>>,
+    /// Moderation provider for meta responses that opt in
+    /// with `moderation=1` (issue #171), preloaded at boot
+    /// when `CRABCROP_MODERATION_MODEL` or the labels
+    /// fallback is configured. `None` means the opt-in
+    /// reports moderation as unavailable. Verdicts are
+    /// annotations only: nothing here alters serving.
+    pub moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
+    /// Embedding provider for meta responses that opt
+    /// in with `embeddings=1` (issue #172), built from
+    /// the CLIP tagger at boot. `None` means the opt-in
+    /// reports the embedding as unavailable.
+    pub embeddings: Option<Arc<dyn crate::ai::EmbeddingProvider>>,
+    /// Aesthetic head for meta responses (issue #172),
+    /// loaded at boot when `CRABCROP_AESTHETIC_HEAD` is
+    /// configured. `None` means meta carries no
+    /// aesthetic field. The score is descriptive only:
+    /// nothing here alters serving either.
+    pub aesthetic: Option<Arc<crate::ai::AestheticHead>>,
+    /// OCR provider for meta responses that opt in with
+    /// `ocr=1` (issue #177), preloaded at boot when the
+    /// `CRABCROP_OCR_*` set is configured. `None` means
+    /// the opt-in reports OCR as unavailable. The text
+    /// only annotates meta; nothing here alters serving
+    /// either: the image a meta request describes is the
+    /// same entry an image request returns.
+    pub ocr: Option<Arc<dyn crate::ai::OcrProvider>>,
+    /// Detection provider for class redaction and meta
+    /// detections, preloaded at boot when
+    /// `CRABCROP_DETECT_MODEL` is configured. `None` means
+    /// class redaction fails cleanly and meta carries no
+    /// detections.
+    pub detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
+    /// Declared `boxes` detectors from
+    /// `CRABCROP_DETECTORS_FILE` (issue #166), in
+    /// declaration order: class redaction resolves across
+    /// the built-in detector and these, and meta detections
+    /// aggregate all of them, each box attributed by name.
+    pub detectors: Vec<NamedDetector>,
+    /// Declared focal provider for smart crops (issue
+    /// #166): the first `focal` declaration in
+    /// `CRABCROP_DETECTORS_FILE`. Later focal declarations
+    /// are probed at boot and stand by. `None` means smart
+    /// crops fall back to faces, then saliency.
+    pub focal: Option<Arc<dyn crate::ai::FocalProvider>>,
+    /// Text renderer, loaded at boot when `CRABCROP_FONT_PATH`
+    /// is configured. `None` means `text(...)` requests fail
+    /// cleanly.
+    pub font: Option<Arc<dyn crate::text::TextRenderer>>,
+    /// External video encoder (issue #162), validated at
+    /// boot when `CRABCROP_VIDEO_ENCODER` is configured.
+    /// `None` means video output does not exist on this
+    /// server; `format(mp4)` and `format(webm)` then fail
+    /// with the specific not-configured error.
+    pub video_encoder: Option<Arc<crate::video::VideoEncoder>>,
+    /// Frame extractor for `frame:` segments on video
+    /// sources (issue #214), built at boot when
+    /// `CRABCROP_VIDEO_DECODER` is configured. `None` means
+    /// frame selection does not exist on this server; a
+    /// `frame:` request then fails with the specific
+    /// not-configured error. Extraction shares the state's
+    /// video gate: it is the same class of subprocess work
+    /// as an encode.
+    pub frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
+    /// PDF renderer for `page:` segments on PDF sources
+    /// (issue #215), built at boot when
+    /// `CRABCROP_PDF_RENDERER` is configured. `None` means
+    /// page selection does not exist on this server; a
+    /// `page:` request then fails with the specific
+    /// not-configured error. Rendering shares the state's
+    /// video gate: it is the same class of subprocess work
+    /// as frame extraction.
+    pub pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
+    /// C2PA output signer (issue #173), built and
+    /// self-validated at boot when `CRABCROP_C2PA_CERT`
+    /// and `CRABCROP_C2PA_KEY` are configured. `None`
+    /// means outputs are served unsigned; meta responses
+    /// still report the provenance a source carries.
+    pub provenance_signer: Option<Arc<crate::provenance::ProvenanceSigner>>,
+}
+
 impl std::fmt::Debug for AppState {
     /// The fields a derive would print, except that the
     /// `/metrics` token prints as `[redacted]`; the keyring,
@@ -395,23 +408,21 @@ impl std::fmt::Debug for AppState {
             stringify!(metrics_token),
             &self.metrics_token.as_ref().map(|_| crate::redact::Redacted),
         );
+        // The provider handles print where they printed
+        // before they moved into `Providers` (issue #475),
+        // so the output is what it was.
+        macro_rules! providers {
+            ($($name:ident),* $(,)?) => {
+                $(out.field(stringify!($name), &self.providers.$name);)*
+            };
+        }
+        fields!(cache);
+        providers!(removebg, upscale, inpaint, segment, face, tagger);
+        fields!(tag_threshold);
+        providers!(
+            moderation, embeddings, aesthetic, ocr, detect, detectors, focal, font
+        );
         fields!(
-            cache,
-            removebg,
-            upscale,
-            inpaint,
-            segment,
-            face,
-            tagger,
-            tag_threshold,
-            moderation,
-            embeddings,
-            aesthetic,
-            ocr,
-            detect,
-            detectors,
-            focal,
-            font,
             fallback,
             store,
             shared_store,
@@ -431,11 +442,15 @@ impl std::fmt::Debug for AppState {
             presets,
             only_presets,
             source_roots,
-            default_ops,
+            default_ops
+        );
+        providers!(
             video_encoder,
             frame_extractor,
             pdf_renderer,
-            provenance_signer,
+            provenance_signer
+        );
+        fields!(
             video_gate,
             anim_gate,
             inflight,
@@ -4837,7 +4852,11 @@ async fn render_miss(
     record.process_ran = true;
     let process_start = Instant::now();
     let needs = GateNeeds {
-        ai: ai_gate_applies(directives, state.face.is_some(), state.focal.is_some()),
+        ai: ai_gate_applies(
+            directives,
+            state.providers.face.is_some(),
+            state.providers.focal.is_some(),
+        ),
         video: wants_video || wants_frame || wants_page,
         // The animation decision covers animated GIF
         // sources rendered to WebP as well as animated WebP
@@ -5030,19 +5049,7 @@ fn build_job(
         preferred: work.preferred,
         watermark_sources,
         placeholders: work.placeholders,
-        mask_provider: state.removebg.clone(),
-        upscale_provider: state.upscale.clone(),
-        inpaint_provider: state.inpaint.clone(),
-        segment_provider: state.segment.clone(),
-        face_provider: state.face.clone(),
-        detect_provider: state.detect.clone(),
-        declared_detect_providers: state.detectors.iter().map(|d| d.provider.clone()).collect(),
-        focal_provider: state.focal.clone(),
-        text_renderer: state.font.clone(),
-        video_encoder: state.video_encoder.clone(),
-        frame_extractor: state.frame_extractor.clone(),
-        pdf_renderer: state.pdf_renderer.clone(),
-        provenance_signer: state.provenance_signer.clone(),
+        providers: state.providers.clone(),
         ai_edited: directives.removebg
             || directives.studio
             || directives.remove_region
@@ -5308,7 +5315,7 @@ async fn meta_document(
     // opted in, and the aesthetic score, whenever a
     // head is configured. One run feeds both.
     let want_embedding = wants_embeddings(accept);
-    let embedding_run = if want_embedding || state.aesthetic.is_some() {
+    let embedding_run = if want_embedding || state.providers.aesthetic.is_some() {
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),

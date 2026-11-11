@@ -205,21 +205,8 @@ fn test_state() -> AppState {
         metrics: Arc::new(Metrics::default()),
         metrics_token: None,
         cache: Arc::new(Cache::new(16 * 1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
+        providers: Arc::new(Providers::default()),
         tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
         fallback: None,
         store: None,
         shared_store: None,
@@ -239,9 +226,6 @@ fn test_state() -> AppState {
         only_presets: false,
         source_roots: std::collections::HashMap::new(),
         default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -249,9 +233,14 @@ fn test_state() -> AppState {
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         background: Default::default(),
-        provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
+}
+
+/// `state`'s providers, for a test to set one before it
+/// serves the state: until then nothing else holds them.
+fn providers_mut(state: &mut AppState) -> &mut Providers {
+    Arc::get_mut(&mut state.providers).expect("the providers are not shared yet")
 }
 
 /// The state [`spawn_app`] serves.
@@ -395,7 +384,10 @@ async fn spawn_app_with_video(script: &str) -> String {
         crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
             .unwrap();
     let state = AppState {
-        video_encoder: Some(Arc::new(encoder)),
+        providers: Arc::new(Providers {
+            video_encoder: Some(Arc::new(encoder)),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -428,7 +420,10 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
     let extractor =
         crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap();
     let state = AppState {
-        frame_extractor: Some(Arc::new(extractor)),
+        providers: Arc::new(Providers {
+            frame_extractor: Some(Arc::new(extractor)),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -662,7 +657,10 @@ async fn spawn_app_with_pdf_renderer() -> String {
     let renderer =
         crate::pdf::PdfRenderer::new(program, std::time::Duration::from_secs(30)).unwrap();
     let state = AppState {
-        pdf_renderer: Some(Arc::new(renderer)),
+        providers: Arc::new(Providers {
+            pdf_renderer: Some(Arc::new(renderer)),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4166,7 +4164,10 @@ impl crate::ai::InpaintProvider for FakeInpaint {
 
 async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> String {
     let state = AppState {
-        tagger: Some(tagger),
+        providers: Arc::new(Providers {
+            tagger: Some(tagger),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4298,7 +4299,10 @@ async fn spawn_app_with_moderation(
     provider: Option<Arc<dyn crate::ai::ModerationProvider>>,
 ) -> String {
     let state = AppState {
-        moderation: provider,
+        providers: Arc::new(Providers {
+            moderation: provider,
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4583,7 +4587,10 @@ async fn spawn_app_with_ocr_timeout(
 ) -> String {
     let state = AppState {
         process_timeout,
-        ocr: provider,
+        providers: Arc::new(Providers {
+            ocr: provider,
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4956,8 +4963,11 @@ async fn spawn_app_with_embeddings(
     aesthetic: Option<Arc<crate::ai::AestheticHead>>,
 ) -> String {
     let state = AppState {
-        embeddings: provider,
-        aesthetic,
+        providers: Arc::new(Providers {
+            embeddings: provider,
+            aesthetic,
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5653,9 +5663,12 @@ fn compose_moderation_rounds_and_orders() {
 /// the permit-reuse test below.
 async fn spawn_app_with_ai_and_meta() -> String {
     let state = AppState {
-        removebg: Some(Arc::new(FakeMask)),
-        tagger: Some(Arc::new(FakeTagger)),
-        detect: Some(Arc::new(FakeDetector)),
+        providers: Arc::new(Providers {
+            removebg: Some(Arc::new(FakeMask)),
+            tagger: Some(Arc::new(FakeTagger)),
+            detect: Some(Arc::new(FakeDetector)),
+            ..Providers::default()
+        }),
         ai_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         ..test_state()
     };
@@ -5671,7 +5684,10 @@ async fn spawn_app_with_ai_and_meta() -> String {
 /// configured, for the studio meta test.
 async fn spawn_app_with_studio() -> String {
     let state = AppState {
-        removebg: Some(Arc::new(FakeMask)),
+        providers: Arc::new(Providers {
+            removebg: Some(Arc::new(FakeMask)),
+            ..Providers::default()
+        }),
         brand_color: Some([0xf5, 0xf0, 0xe8]),
         ..test_state()
     };
@@ -5687,7 +5703,10 @@ async fn spawn_app_with_studio() -> String {
 /// the remove_region tests.
 async fn spawn_app_with_inpaint() -> String {
     let state = AppState {
-        inpaint: Some(Arc::new(FakeInpaint)),
+        providers: Arc::new(Providers {
+            inpaint: Some(Arc::new(FakeInpaint)),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5734,8 +5753,11 @@ impl crate::ai::SegmentProvider for FakeSegment {
 /// configured, for the segment tests.
 async fn spawn_app_with_segment() -> String {
     let state = AppState {
-        segment: Some(Arc::new(FakeSegment)),
-        detect: Some(Arc::new(FakeDetector)),
+        providers: Arc::new(Providers {
+            segment: Some(Arc::new(FakeSegment)),
+            detect: Some(Arc::new(FakeDetector)),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6178,8 +6200,11 @@ async fn spawn_app_with_providers(
     detectors: Vec<NamedDetector>,
 ) -> String {
     let state = AppState {
-        detect,
-        detectors,
+        providers: Arc::new(Providers {
+            detect,
+            detectors,
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9416,19 +9441,10 @@ fn provenance_job(
         preferred: None,
         watermark_sources: Default::default(),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: signer,
+        providers: Arc::new(Providers {
+            provenance_signer: signer,
+            ..Providers::default()
+        }),
         ai_edited,
         want_provenance: true,
         dpr: None,
@@ -9654,7 +9670,10 @@ async fn spawn_signing_app(
 ) -> String {
     let state = AppState {
         preserve_metadata,
-        provenance_signer: Some(signer),
+        providers: Arc::new(Providers {
+            provenance_signer: Some(signer),
+            ..Providers::default()
+        }),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10154,19 +10173,7 @@ async fn processing_gate_bounds_concurrency() {
         preferred: None,
         watermark_sources: Default::default(),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: None,
+        providers: Arc::new(Providers::default()),
         ai_edited: false,
         want_provenance: false,
         dpr: None,
@@ -10238,19 +10245,10 @@ async fn timed_out_encode_releases_the_process_gate() {
             preferred: None,
             watermark_sources: Default::default(),
             placeholders: false,
-            mask_provider: None,
-            upscale_provider: None,
-            inpaint_provider: None,
-            segment_provider: None,
-            face_provider: None,
-            detect_provider: None,
-            declared_detect_providers: Vec::new(),
-            focal_provider: None,
-            text_renderer: None,
-            video_encoder,
-            frame_extractor: None,
-            pdf_renderer: None,
-            provenance_signer: None,
+            providers: Arc::new(Providers {
+                video_encoder,
+                ..Providers::default()
+            }),
             ai_edited: false,
             want_provenance: false,
             dpr: None,
@@ -10372,9 +10370,12 @@ async fn an_ai_permit_is_held_until_the_job_actually_finishes() {
     let state = lane_test_state(std::time::Duration::from_millis(300), 1, 1);
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
-    job.upscale_provider = Some(Arc::new(BlockingUpscale {
-        release: release.clone(),
-    }));
+    job.providers = Arc::new(Providers {
+        upscale: Some(Arc::new(BlockingUpscale {
+            release: release.clone(),
+        })),
+        ..Providers::default()
+    });
     let png = test_png();
     let permit = state.ai_gate.clone().acquire_owned().await.unwrap();
     assert_eq!(state.ai_gate.available_permits(), 1);
@@ -10431,9 +10432,12 @@ async fn a_source_budget_share_is_held_until_the_job_actually_finishes() {
     let budget = crate::loader::SourceBudget::new(1 << 20);
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
-    job.upscale_provider = Some(Arc::new(BlockingUpscale {
-        release: release.clone(),
-    }));
+    job.providers = Arc::new(Providers {
+        upscale: Some(Arc::new(BlockingUpscale {
+            release: release.clone(),
+        })),
+        ..Providers::default()
+    });
     let png = test_png();
     let share = budget.charge(std::time::Duration::from_secs(1));
     share.grow_to(png.len()).await.unwrap();
@@ -10800,7 +10804,7 @@ async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.tagger = Some(Arc::new(BlockingTagger {
+    providers_mut(&mut state).tagger = Some(Arc::new(BlockingTagger {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
@@ -10821,7 +10825,7 @@ async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.moderation = Some(Arc::new(BlockingModeration {
+    providers_mut(&mut state).moderation = Some(Arc::new(BlockingModeration {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
@@ -10841,7 +10845,7 @@ async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.detect = Some(Arc::new(BlockingDetector {
+    providers_mut(&mut state).detect = Some(Arc::new(BlockingDetector {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
@@ -10866,11 +10870,11 @@ async fn meta_sections_never_run_inference_without_an_ai_permit() {
     // answer, so the degrade is the gate's doing.
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
     state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
-    state.tagger = Some(Arc::new(FakeTagger));
-    state.detect = Some(Arc::new(FakeDetector));
-    state.moderation = Some(Arc::new(FakeModeration));
-    state.embeddings = Some(Arc::new(FakeEmbedding));
-    state.ocr = Some(Arc::new(FakeOcr));
+    providers_mut(&mut state).tagger = Some(Arc::new(FakeTagger));
+    providers_mut(&mut state).detect = Some(Arc::new(FakeDetector));
+    providers_mut(&mut state).moderation = Some(Arc::new(FakeModeration));
+    providers_mut(&mut state).embeddings = Some(Arc::new(FakeEmbedding));
+    providers_mut(&mut state).ocr = Some(Arc::new(FakeOcr));
     let processed = still_processed(test_png(), ImageFormat::Png);
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     let held = state.ai_gate.clone().acquire_owned().await.unwrap();
@@ -10935,19 +10939,10 @@ fn lane_test_job(
         preferred: None,
         watermark_sources: Default::default(),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: None,
+        providers: Arc::new(Providers {
+            video_encoder,
+            ..Providers::default()
+        }),
         ai_edited: false,
         want_provenance: false,
         dpr: None,
@@ -11278,19 +11273,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
             share: None,
         }),
         placeholders: false,
-        mask_provider: None,
-        upscale_provider: None,
-        inpaint_provider: None,
-        segment_provider: None,
-        face_provider: None,
-        detect_provider: None,
-        declared_detect_providers: Vec::new(),
-        focal_provider: None,
-        text_renderer: None,
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
-        provenance_signer: None,
+        providers: Arc::new(Providers::default()),
         ai_edited: false,
         want_provenance: false,
         dpr: None,
@@ -13000,7 +12983,7 @@ fn held_upscale_state(process_permits: usize) -> (AppState, Release, Arc<AtomicU
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), process_permits, 1);
-    state.upscale = Some(Arc::new(HeldUpscale {
+    providers_mut(&mut state).upscale = Some(Arc::new(HeldUpscale {
         release: release.clone(),
         calls: calls.clone(),
     }));
@@ -13293,7 +13276,7 @@ async fn a_source_that_did_not_decode_gets_no_fallback_once_its_client_left() {
     let (src, _) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
     let (fallback, fallback_hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 1, 1);
-    state.frame_extractor = Some(Arc::new(
+    providers_mut(&mut state).frame_extractor = Some(Arc::new(
         crate::frames::VideoFrameExtractor::new(decoder, std::time::Duration::from_secs(30))
             .unwrap(),
     ));
@@ -13458,7 +13441,7 @@ async fn the_shutdown_drain_waits_for_the_write_a_left_render_starts() {
     let mut state = tier_test_state(None, &fake.endpoint);
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let calls = Arc::new(AtomicUsize::new(0));
-    state.upscale = Some(Arc::new(HeldUpscale {
+    providers_mut(&mut state).upscale = Some(Arc::new(HeldUpscale {
         release: release.clone(),
         calls: calls.clone(),
     }));

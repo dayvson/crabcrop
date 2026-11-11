@@ -14,7 +14,7 @@ use crabcrop::engine::Engine;
 use crabcrop::loader::{Loader, SourceConfig};
 use crabcrop::observe::Metrics;
 use crabcrop::s3store::S3Store;
-use crabcrop::server::{AppState, Gate, Inflight};
+use crabcrop::server::{AppState, Gate, Inflight, Providers};
 use crabcrop::sigv4::Credentials;
 use crabcrop::storage::DiskStore;
 use crabcrop::upload::UploadStore;
@@ -160,21 +160,8 @@ fn state(dir: &std::path::Path) -> AppState {
         metrics: Arc::new(Metrics::default()),
         metrics_token: Some(METRICS_TOKEN.to_string()),
         cache: Arc::new(Cache::new(1024 * 1024)),
-        removebg: None,
-        upscale: None,
-        inpaint: None,
-        segment: None,
-        face: None,
-        tagger: None,
+        providers: Arc::new(Providers::default()),
         tag_threshold: 0.05,
-        moderation: None,
-        embeddings: None,
-        aesthetic: None,
-        ocr: None,
-        detect: None,
-        detectors: Vec::new(),
-        focal: None,
-        font: None,
         fallback: None,
         store: Some(Arc::new(disk_store(dir))),
         shared_store: Some(Arc::new(s3_store())),
@@ -194,9 +181,6 @@ fn state(dir: &std::path::Path) -> AppState {
         only_presets: false,
         source_roots: std::collections::HashMap::new(),
         default_ops: Vec::new(),
-        video_encoder: None,
-        frame_extractor: None,
-        pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -204,7 +188,6 @@ fn state(dir: &std::path::Path) -> AppState {
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(PurgeGuard::new()),
         background: Default::default(),
-        provenance_signer: None,
         config_fingerprint: "debug-redaction".to_string(),
     }
 }

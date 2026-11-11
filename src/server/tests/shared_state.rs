@@ -64,3 +64,31 @@ async fn the_router_hands_each_handler_the_state_it_was_given() {
         "the router kept a handle on the state"
     );
 }
+
+#[test]
+fn an_engine_job_shares_the_states_providers() {
+    // A job used to copy each provider handle out of the
+    // state; it now takes the state's one `Arc` of them.
+    let state = test_state();
+    let work = MissWork {
+        ops: Vec::new(),
+        source_url: "example.com/i.png".to_string(),
+        directives: crate::url::RequestDirectives::analyze(&[]),
+        preferred: None,
+        meta: false,
+        debug: false,
+        placeholders: false,
+        hinted_width: None,
+        dpr_hint: None,
+        save_data: false,
+        accept: None,
+        groups: Vec::new(),
+        cache_key: "key".to_string(),
+        max_age: None,
+        sealed: false,
+        progress: MissProgress::default(),
+        disk_handoff: None,
+    };
+    let job = build_job(&state, &work, Default::default());
+    assert!(Arc::ptr_eq(&job.providers, &state.providers));
+}
