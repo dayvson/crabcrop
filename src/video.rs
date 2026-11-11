@@ -1003,9 +1003,11 @@ mod tests {
     /// different core counts would render one URL to
     /// different bytes (issue #626). Left alone, x264 sizes
     /// its thread pool from the cores it sees, but caps it
-    /// at small heights, so the frames are 320x240. WebM is
-    /// checked too: libvpx's threads do not change its
-    /// bytes. Run it with:
+    /// at small heights, so the frames are 240 px high.
+    /// WebM is checked too: libvpx's threads do not change
+    /// its bytes. VP9's threads work on separate tile
+    /// columns, each at least 256 px wide, so the frames
+    /// are 640 px wide: two columns. Run it with:
     /// `cargo test -- --ignored real_ffmpeg`
     #[cfg(target_os = "linux")]
     #[test]
@@ -1048,7 +1050,7 @@ mod tests {
         let pinned = VideoEncoder::with_defaults(wrapper).unwrap();
         let frames: Vec<VideoFrame> = (0..6u32)
             .map(|i| VideoFrame {
-                pixels: image::RgbaImage::from_fn(320, 240, |x, y| {
+                pixels: image::RgbaImage::from_fn(640, 240, |x, y| {
                     image::Rgba([
                         (x + 9 * i) as u8,
                         (y * 2 + i) as u8,
