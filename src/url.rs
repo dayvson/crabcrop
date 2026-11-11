@@ -1210,9 +1210,9 @@ pub const MAX_BLUR_SIGMA: f32 = 512.0;
 /// #606). Drawing costs about the glyph count times the size
 /// squared: each glyph rasterizes a box about `size` pixels a
 /// side. A label is drawn as one line, and 1000 characters is
-/// about a page of prose; the longest label in the docs and
-/// tests has 25. Below size 100 this cap is the tighter one
-/// (see [`MAX_TEXT_EXTENT`]).
+/// about two short paragraphs; the longest label in the docs
+/// and the functional test cases has 25. Below size 100 this
+/// cap is the tighter one (see [`MAX_TEXT_EXTENT`]).
 pub const MAX_TEXT_GLYPHS: usize = 1000;
 
 /// The most a `text(...)` label's character count times its
@@ -1222,9 +1222,9 @@ pub const MAX_TEXT_GLYPHS: usize = 1000;
 /// many as the largest output image holds, so one label costs
 /// about as much as one pass over that image. Glyphs advance
 /// about half the size, so a label at this cap is still about
-/// three times wider than the widest image. The largest label
-/// in the docs and tests comes to 16000 (16 characters at size
-/// 1000, in the property tests).
+/// three times wider than the widest image. Of the labels the
+/// repo held before this cap, the largest came to 16000 (16
+/// characters at size 1000, in the URL property tests).
 pub const MAX_TEXT_EXTENT: u64 = 100_000;
 
 /// The largest `gamma` divisor the grammar accepts (issue

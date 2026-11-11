@@ -2140,20 +2140,46 @@ fn blur_stops_at_the_deadline() {
             "sigma {sigma}"
         );
     }
-    // A 16-bit image blurs in one call to the image crate,
-    // which has no row to stop at: the deadline is checked
-    // before it.
-    let deep = DynamicImage::ImageRgb16(img.to_rgb16());
-    assert_eq!(
-        blur_fast_within(&deep, 2.0, past).map(|_| ()),
-        Err(DeadlinePassed)
-    );
+    // A 16-bit or float image takes the same banded passes,
+    // and so does the studio shadow's gray blur, which runs
+    // in float.
+    for deep in [
+        DynamicImage::ImageRgb16(img.to_rgb16()),
+        DynamicImage::ImageRgba32F(img.to_rgba32f()),
+    ] {
+        for sigma in [2.0, 8.5, 512.0] {
+            assert_eq!(
+                blur_fast_within(&deep, sigma, past).map(|_| ()),
+                Err(DeadlinePassed),
+                "{:?} sigma {sigma}",
+                deep.color()
+            );
+        }
+    }
+    for sigma in [2.0, 8.5, 512.0] {
+        assert_eq!(
+            blur_gray_within(&img.to_luma8(), sigma, past).map(|_| ()),
+            Err(DeadlinePassed),
+            "gray sigma {sigma}"
+        );
+    }
     // Part way: sigma 512 here takes far longer than 20 ms,
     // and the pass stops within a row of the deadline.
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_millis(20);
     assert_eq!(
         blur_fast_within(&img, 512.0, Some(deadline)).map(|_| ()),
+        Err(DeadlinePassed)
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    // The same for a 16-bit image, which before ran as one
+    // call to the image crate on one core.
+    let deep = DynamicImage::ImageRgb16(img.to_rgb16());
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(20);
+    assert_eq!(
+        blur_fast_within(&deep, 512.0, Some(deadline)).map(|_| ()),
         Err(DeadlinePassed)
     );
     let took = started.elapsed();

@@ -4734,9 +4734,16 @@ impl<'r, 'a> ChainState<'r, 'a> {
         let confidence = provider.confidence(img, &mask);
         crate::studio::timing_mark("inference", t_timing);
         let outcome = match spec.mode {
-            crate::url::StudioMode::Product => {
-                crate::studio::composite(img, &mask, confidence, spec, self.ctx.brand_color)
-            }
+            // The shadow's blur checks the deadline before
+            // each row (issue #614).
+            crate::url::StudioMode::Product => crate::studio::composite_within(
+                img,
+                &mask,
+                confidence,
+                spec,
+                self.ctx.brand_color,
+                self.ctx.deadline,
+            )?,
             crate::url::StudioMode::Scene => crate::studio::scene(img, &mask, confidence, spec),
         };
         self.studio_record = Some(outcome.record);

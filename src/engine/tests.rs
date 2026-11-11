@@ -8641,6 +8641,9 @@ fn a_blur_past_the_deadline_times_out() {
     // minutes past it while its lane permit stayed held.
     // The blur now checks the deadline before each row and
     // the render answers its own Timeout within the grace.
+    // Six blurs, so the work outlasts the deadline in an
+    // optimized build too, where one blur(512) of this image
+    // takes about 0.6 s.
     let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_fn(
         800,
         800,
@@ -8652,7 +8655,37 @@ fn a_blur_past_the_deadline_times_out() {
             deadline: Some(deadline),
             ..Default::default()
         };
-        Engine.process_preferred(&src, &[Operation::Filters(vec![Filter::Blur(512.0)])], ctx)
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Blur(512.0); 6])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+#[test]
+fn a_deep_blur_past_the_deadline_times_out() {
+    // Issue #614: a 16-bit PNG stays 16-bit through decode
+    // and resize, and its blur ran as one call to the image
+    // crate, on one core, that no deadline could stop. It
+    // now takes the banded passes and their row checks too.
+    let src = png_bytes(&DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x * 81) as u16, (y * 81) as u16, ((x + y) * 40) as u16]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Blur(512.0); 6])],
+            ctx,
+        )
     });
     assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
 }
@@ -8663,7 +8696,9 @@ fn a_text_label_past_the_deadline_times_out() {
     // no deadline, every glyph rasterized whether it landed
     // or not. The parser caps the label now, but the engine
     // takes any filter it is given, so the renderer checks
-    // the deadline between glyphs as well.
+    // the deadline between glyphs as well. Two million
+    // glyphs, so the draw outlasts the grace even though it
+    // skips the glyphs that land off this 20x20 image.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     let result = finished_by(deadline + GRACE, move || {
         let font = crate::text::FontRenderer::from_bytes(
@@ -8678,7 +8713,7 @@ fn a_text_label_past_the_deadline_times_out() {
         Engine.process_preferred(
             &red_source(),
             &[Operation::Filters(vec![Filter::Text {
-                text: "W".repeat(200_000),
+                text: "W".repeat(2_000_000),
                 size: 1000,
                 color: [255, 255, 255, 255],
                 anchor: crate::url::Anchor::TopLeft,

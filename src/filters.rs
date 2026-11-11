@@ -782,6 +782,123 @@ fn blur_q15_out(acc: u32) -> u8 {
     ((acc + (1 << 14)) >> 15).min(255) as u8
 }
 
+/// A sample type the banded blur runs on, with the image
+/// crate's arithmetic for it (its `filter_1d.rs`). 8-bit and
+/// 16-bit samples weigh by Q0.15 kernels in `u32` and round
+/// back, clamped to the type's maximum. Float samples weigh
+/// and store in `f32`. Every row of every type is computed in
+/// the same order as the crate's, so the bytes match (issue
+/// #614).
+trait BlurSample: Copy + Default + Send + Sync + 'static {
+    /// The kernel weight and accumulator type.
+    type Acc: Copy
+        + Default
+        + PartialEq
+        + Send
+        + Sync
+        + std::ops::Add<Output = Self::Acc>
+        + std::ops::Mul<Output = Self::Acc>;
+    /// One kernel weight, converted as the crate converts it.
+    fn weight(w: f32) -> Self::Acc;
+    /// The sample as an accumulator value.
+    fn widen(self) -> Self::Acc;
+    /// `acc + a * b`, as the crate's `multiply_accumulate`.
+    fn mac(acc: Self::Acc, a: Self::Acc, b: Self::Acc) -> Self::Acc;
+    /// An accumulated value back as a sample.
+    fn store(acc: Self::Acc) -> Self;
+}
+
+impl BlurSample for u8 {
+    type Acc = u32;
+    #[inline(always)]
+    fn weight(w: f32) -> u32 {
+        blur_q15(w)
+    }
+    #[inline(always)]
+    fn widen(self) -> u32 {
+        self as u32
+    }
+    #[inline(always)]
+    fn mac(acc: u32, a: u32, b: u32) -> u32 {
+        acc + a * b
+    }
+    #[inline(always)]
+    fn store(acc: u32) -> u8 {
+        blur_q15_out(acc)
+    }
+}
+
+impl BlurSample for u16 {
+    type Acc = u32;
+    #[inline(always)]
+    fn weight(w: f32) -> u32 {
+        blur_q15(w)
+    }
+    #[inline(always)]
+    fn widen(self) -> u32 {
+        self as u32
+    }
+    #[inline(always)]
+    fn mac(acc: u32, a: u32, b: u32) -> u32 {
+        acc + a * b
+    }
+    #[inline(always)]
+    fn store(acc: u32) -> u16 {
+        ((acc + (1 << 14)) >> 15).min(u16::MAX as u32) as u16
+    }
+}
+
+impl BlurSample for f32 {
+    type Acc = f32;
+    #[inline(always)]
+    fn weight(w: f32) -> f32 {
+        w
+    }
+    #[inline(always)]
+    fn widen(self) -> f32 {
+        self
+    }
+    #[inline(always)]
+    fn mac(acc: f32, a: f32, b: f32) -> f32 {
+        blur_mac_f32(acc, a, b)
+    }
+    #[inline(always)]
+    fn store(acc: f32) -> f32 {
+        acc
+    }
+}
+
+/// The crate's `multiply_accumulate` for `f32`. The crate
+/// fuses the multiply and the add where it knows at compile
+/// time that the target has a fused multiply-add, and keeps
+/// them apart elsewhere. This uses the same `cfg`, so the
+/// two round alike on every target.
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "fma"
+    ),
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
+#[inline(always)]
+fn blur_mac_f32(acc: f32, a: f32, b: f32) -> f32 {
+    a.mul_add(b, acc)
+}
+
+/// The crate's `multiply_accumulate` for `f32`, on a target
+/// it does not fuse on: see the fused twin above.
+#[cfg(not(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "fma"
+    ),
+    all(target_arch = "aarch64", target_feature = "neon")
+)))]
+#[inline(always)]
+fn blur_mac_f32(acc: f32, a: f32, b: f32) -> f32 {
+    acc + a * b
+}
+
 /// The processing deadline as the banded blur passes check it
 /// (issue #614): each band asks before each of its rows, and
 /// the first band to find the deadline passed raises a flag
@@ -867,7 +984,7 @@ fn blur_clamp_idx(i: isize, len: usize) -> usize {
     i.clamp(0, len as isize - 1) as usize
 }
 
-fn blur_arena_row<const N: usize>(src_row: &[u8], pad: usize, out: &mut Vec<u8>) {
+fn blur_arena_row<T: Copy, const N: usize>(src_row: &[T], pad: usize, out: &mut Vec<T>) {
     let w = src_row.len();
     out.clear();
     out.reserve(w + 2 * pad * N);
@@ -882,7 +999,7 @@ fn blur_arena_row<const N: usize>(src_row: &[u8], pad: usize, out: &mut Vec<u8>)
     }
 }
 
-fn blur_sym_row<const N: usize>(arena: &[u8], dst_row: &mut [u8], kernel: &[u32]) {
+fn blur_sym_row<T: BlurSample, const N: usize>(arena: &[T], dst_row: &mut [T], kernel: &[T::Acc]) {
     let len = kernel.len();
     let half = len / 2;
     let hc = kernel[half];
@@ -890,37 +1007,37 @@ fn blur_sym_row<const N: usize>(arena: &[u8], dst_row: &mut [u8], kernel: &[u32]
     for (x, dst) in chunks.iter_mut().enumerate() {
         let src = &arena[x * 4..];
         let c = &src[half * N..half * N + 4];
-        let mut k0 = c[0] as u32 * hc;
-        let mut k1 = c[1] as u32 * hc;
-        let mut k2 = c[2] as u32 * hc;
-        let mut k3 = c[3] as u32 * hc;
+        let mut k0 = c[0].widen() * hc;
+        let mut k1 = c[1].widen() * hc;
+        let mut k2 = c[2].widen() * hc;
+        let mut k3 = c[3].widen() * hc;
         for i in 0..half {
             let other = len - 1 - i;
             let fw = &src[i * N..i * N + 4];
             let bw = &src[other * N..other * N + 4];
-            k0 += (fw[0] as u32 + bw[0] as u32) * kernel[i];
-            k1 += (fw[1] as u32 + bw[1] as u32) * kernel[i];
-            k2 += (fw[2] as u32 + bw[2] as u32) * kernel[i];
-            k3 += (fw[3] as u32 + bw[3] as u32) * kernel[i];
+            k0 = T::mac(k0, fw[0].widen() + bw[0].widen(), kernel[i]);
+            k1 = T::mac(k1, fw[1].widen() + bw[1].widen(), kernel[i]);
+            k2 = T::mac(k2, fw[2].widen() + bw[2].widen(), kernel[i]);
+            k3 = T::mac(k3, fw[3].widen() + bw[3].widen(), kernel[i]);
         }
-        dst[0] = blur_q15_out(k0);
-        dst[1] = blur_q15_out(k1);
-        dst[2] = blur_q15_out(k2);
-        dst[3] = blur_q15_out(k3);
+        dst[0] = T::store(k0);
+        dst[1] = T::store(k1);
+        dst[2] = T::store(k2);
+        dst[3] = T::store(k3);
     }
     let dz = chunks.len() * 4;
     for (x, dst) in rem.iter_mut().enumerate() {
         let src = &arena[dz + x..];
-        let mut acc = src[half * N] as u32 * hc;
+        let mut acc = src[half * N].widen() * hc;
         for i in 0..half {
             let other = len - 1 - i;
-            acc += (src[i * N] as u32 + src[other * N] as u32) * kernel[i];
+            acc = T::mac(acc, src[i * N].widen() + src[other * N].widen(), kernel[i]);
         }
-        *dst = blur_q15_out(acc);
+        *dst = T::store(acc);
     }
 }
 
-fn blur_sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
+fn blur_sym_col<T: BlurSample>(brows: &[&[T]], dst_row: &mut [T], kernel: &[T::Acc]) {
     let len = kernel.len();
     let half = len / 2;
     let hc = kernel[half];
@@ -931,13 +1048,13 @@ fn blur_sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
     let (head, tail) = dst_row.split_at_mut(n32 * 32);
     for (x, chunk) in head.chunks_mut(32).enumerate() {
         let cx = x * 32;
-        let mut store0 = [0u32; 16];
-        let mut store1 = [0u32; 16];
+        let mut store0 = [T::Acc::default(); 16];
+        let mut store1 = [T::Acc::default(); 16];
         for (dst, src) in store0.iter_mut().zip(&center[cx..cx + 16]) {
-            *dst = *src as u32 * hc;
+            *dst = src.widen() * hc;
         }
         for (dst, src) in store1.iter_mut().zip(&center[cx + 16..cx + 32]) {
-            *dst = *src as u32 * hc;
+            *dst = src.widen() * hc;
         }
         for i in 0..half {
             let other = len - 1 - i;
@@ -946,49 +1063,60 @@ fn blur_sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
             let fw1 = &brows[i][cx + 16..cx + 32];
             let bw1 = &brows[other][cx + 16..cx + 32];
             for ((dst, f), b) in store0.iter_mut().zip(fw0).zip(bw0) {
-                *dst += (*f as u32 + *b as u32) * kernel[i];
+                *dst = T::mac(*dst, f.widen() + b.widen(), kernel[i]);
             }
             for ((dst, f), b) in store1.iter_mut().zip(fw1).zip(bw1) {
-                *dst += (*f as u32 + *b as u32) * kernel[i];
+                *dst = T::mac(*dst, f.widen() + b.widen(), kernel[i]);
             }
         }
         let (lo, hi) = chunk.split_at_mut(16);
         for (src, dst) in store0.iter().zip(lo) {
-            *dst = blur_q15_out(*src);
+            *dst = T::store(*src);
         }
         for (src, dst) in store1.iter().zip(hi) {
-            *dst = blur_q15_out(*src);
+            *dst = T::store(*src);
         }
     }
     let (head16, scalar) = tail.split_at_mut(n16 * 16);
     for (x, chunk) in head16.chunks_mut(16).enumerate() {
         let cx = n32 * 32 + x * 16;
-        let mut store = [0u32; 16];
+        let mut store = [T::Acc::default(); 16];
         for (dst, src) in store.iter_mut().zip(&center[cx..cx + 16]) {
-            *dst = *src as u32 * hc;
+            *dst = src.widen() * hc;
         }
         for i in 0..half {
             let other = len - 1 - i;
             let fw = &brows[i][cx..cx + 16];
             let bw = &brows[other][cx..cx + 16];
             for ((dst, f), b) in store.iter_mut().zip(fw).zip(bw) {
-                *dst += (*f as u32 + *b as u32) * kernel[i];
+                *dst = T::mac(*dst, f.widen() + b.widen(), kernel[i]);
             }
         }
         for (src, dst) in store.iter().zip(chunk.iter_mut()) {
-            *dst = blur_q15_out(*src);
+            *dst = T::store(*src);
         }
     }
     let scalar_start = n32 * 32 + n16 * 16;
     for (j, dst) in scalar.iter_mut().enumerate() {
         let cx = scalar_start + j;
-        let mut acc = center[cx] as u32 * hc;
+        let mut acc = center[cx].widen() * hc;
         for i in 0..half {
             let other = len - 1 - i;
-            acc += (brows[i][cx] as u32 + brows[other][cx] as u32) * kernel[i];
+            acc = T::mac(
+                acc,
+                brows[i][cx].widen() + brows[other][cx].widen(),
+                kernel[i],
+            );
         }
-        *dst = blur_q15_out(acc);
+        *dst = T::store(acc);
     }
+}
+
+/// The crate's kernel for `sigma`, its weights converted for
+/// `T` and its zero tails trimmed.
+fn blur_kernel_for<T: BlurSample>(sigma: f32) -> Vec<T::Acc> {
+    let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
+    blur_prepare_kernel(&f_kernel.iter().map(|&v| T::weight(v)).collect::<Vec<_>>())
 }
 
 /// Ring-buffer variant for small kernels: each band blurs its
@@ -1003,23 +1131,32 @@ pub fn blur_ring<const N: usize>(
     sigma: f32,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, DeadlinePassed> {
+    blur_ring_of::<u8, N>(src, w, h, sigma, deadline)
+}
+
+/// [`blur_ring`] for any [`BlurSample`].
+fn blur_ring_of<T: BlurSample, const N: usize>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<T>, DeadlinePassed> {
     let sigma = if sigma == 0.0 { 0.8 } else { sigma };
     if w == 0 || h == 0 {
         return Ok(src.to_vec());
     }
-    let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
-    let kernel: Vec<u32> =
-        blur_prepare_kernel(&f_kernel.iter().map(|&v| blur_q15(v)).collect::<Vec<_>>());
+    let kernel = blur_kernel_for::<T>(sigma);
     let half = kernel.len() / 2;
     let pad = half.max(1);
     let row_len = w * N;
-    let mut out = vec![0u8; src.len()];
+    let mut out = vec![T::default(); src.len()];
     let gate = RowGate::new(deadline);
     blur_par_bands(&mut out, row_len, h, |y0, band| {
         let perm_band_rows = band.len() / row_len;
         let klen = kernel.len();
-        let mut ring = vec![0u8; klen * row_len];
-        let mut arena: Vec<u8> = Vec::new();
+        let mut ring = vec![T::default(); klen * row_len];
+        let mut arena: Vec<T> = Vec::new();
         let mut next_row = blur_clamp_idx(y0 as isize - half as isize, h);
         for ly in 0..perm_band_rows {
             if gate.stop() {
@@ -1029,19 +1166,19 @@ pub fn blur_ring<const N: usize>(
             let need_hi = blur_clamp_idx(y as isize + half as isize, h);
             while next_row <= need_hi {
                 let slot = next_row % klen;
-                blur_arena_row::<N>(
+                blur_arena_row::<T, N>(
                     &src[next_row * row_len..(next_row + 1) * row_len],
                     pad,
                     &mut arena,
                 );
-                blur_sym_row::<N>(
+                blur_sym_row::<T, N>(
                     &arena,
                     &mut ring[slot * row_len..(slot + 1) * row_len],
                     &kernel,
                 );
                 next_row += 1;
             }
-            let mut brows: Vec<&[u8]> = Vec::with_capacity(klen);
+            let mut brows: Vec<&[T]> = Vec::with_capacity(klen);
             for k in 0..klen {
                 let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
                 brows.push(&ring[(sy % klen) * row_len..(sy % klen + 1) * row_len]);
@@ -1066,38 +1203,47 @@ pub fn blur_transient<const N: usize>(
     sigma: f32,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, DeadlinePassed> {
+    blur_transient_of::<u8, N>(src, w, h, sigma, deadline)
+}
+
+/// [`blur_transient`] for any [`BlurSample`].
+fn blur_transient_of<T: BlurSample, const N: usize>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<T>, DeadlinePassed> {
     let sigma = if sigma == 0.0 { 0.8 } else { sigma };
     if w == 0 || h == 0 {
         return Ok(src.to_vec());
     }
-    let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
-    let kernel: Vec<u32> =
-        blur_prepare_kernel(&f_kernel.iter().map(|&v| blur_q15(v)).collect::<Vec<_>>());
+    let kernel = blur_kernel_for::<T>(sigma);
     let half = kernel.len() / 2;
     let pad = half.max(1);
     let row_len = w * N;
-    let mut transient = vec![0u8; src.len()];
+    let mut transient = vec![T::default(); src.len()];
     let gate = RowGate::new(deadline);
     blur_par_bands(&mut transient, row_len, h, |y0, band| {
-        let mut arena: Vec<u8> = Vec::new();
+        let mut arena: Vec<T> = Vec::new();
         for (ly, dst_row) in band.chunks_mut(row_len).enumerate() {
             if gate.stop() {
                 return;
             }
             let y = y0 + ly;
-            blur_arena_row::<N>(&src[y * row_len..(y + 1) * row_len], pad, &mut arena);
-            blur_sym_row::<N>(&arena, dst_row, &kernel);
+            blur_arena_row::<T, N>(&src[y * row_len..(y + 1) * row_len], pad, &mut arena);
+            blur_sym_row::<T, N>(&arena, dst_row, &kernel);
         }
     });
     gate.finished()?;
-    let mut out = vec![0u8; src.len()];
+    let mut out = vec![T::default(); src.len()];
     blur_par_bands(&mut out, row_len, h, |y0, band| {
         for (ly, dst_row) in band.chunks_mut(row_len).enumerate() {
             if gate.stop() {
                 return;
             }
             let y = y0 + ly;
-            let mut brows: Vec<&[u8]> = Vec::with_capacity(kernel.len());
+            let mut brows: Vec<&[T]> = Vec::with_capacity(kernel.len());
             for k in 0..kernel.len() {
                 let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
                 brows.push(&transient[sy * row_len..(sy + 1) * row_len]);
@@ -1107,6 +1253,23 @@ pub fn blur_transient<const N: usize>(
     });
     gate.finished()?;
     Ok(out)
+}
+
+/// One buffer of `N`-channel samples through the banded
+/// passes: the ring for kernels under 55 taps (the crate's
+/// own cutoff), the transient from 55 up.
+fn blur_samples<T: BlurSample, const N: usize>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<T>, DeadlinePassed> {
+    if (blur_kernel_size(sigma) as usize) < 55 {
+        blur_ring_of::<T, N>(src, w, h, sigma, deadline)
+    } else {
+        blur_transient_of::<T, N>(src, w, h, sigma, deadline)
+    }
 }
 
 /// [`blur_fast_within`] with no deadline: the byte-identical
@@ -1119,48 +1282,84 @@ pub(crate) fn blur_fast(img: &DynamicImage, sigma: f32) -> DynamicImage {
     }
 }
 
-/// Gaussian blur, byte for byte the image crate's, under the
-/// request's processing deadline (issue #614): the 8-bit
-/// paths check it before each row and answer
-/// [`DeadlinePassed`] past it. A 16-bit or float image blurs
-/// in one call to the image crate, which has no row to stop
-/// at, so the deadline is checked before that call only.
+/// Gaussian blur, byte for byte the image crate's
+/// `DynamicImage::blur`, under the request's processing
+/// deadline (issue #614). Every sample type the crate blurs
+/// (8-bit, 16-bit and float, one to four channels) runs
+/// through the banded passes, which check the deadline
+/// before each row and answer [`DeadlinePassed`] past it.
 pub(crate) fn blur_fast_within(
     img: &DynamicImage,
     sigma: f32,
     deadline: Option<std::time::Instant>,
 ) -> Result<DynamicImage, DeadlinePassed> {
-    // Ring for kernel < 55 (the crate's own cutoff), transient
-    // above it: same split as the crate, both banded.
     let sigma = if sigma == 0.0 { 0.8 } else { sigma };
-    let klen = blur_kernel_size(sigma) as usize;
+    // The 16-bit and float arms replace a call to the crate's
+    // blur, which keeps the image's color space, so they keep
+    // it too. The 8-bit arms build a plain buffer, as before.
     macro_rules! arm {
-        ($i:expr, $ch:expr, $ctor:expr) => {{
-            let (w, h) = ($i.width() as usize, $i.height() as usize);
-            let out = if klen < 55 {
-                blur_ring::<$ch>($i.as_raw(), w, h, sigma, deadline)?
-            } else {
-                blur_transient::<$ch>($i.as_raw(), w, h, sigma, deadline)?
-            };
-            Ok($ctor(out))
+        ($i:expr, $t:ty, $ch:expr, $variant:ident) => {{
+            let out = blur_samples::<$t, $ch>(
+                $i.as_raw(),
+                $i.width() as usize,
+                $i.height() as usize,
+                sigma,
+                deadline,
+            )?;
+            DynamicImage::$variant(
+                image::ImageBuffer::from_raw($i.width(), $i.height(), out).expect("blur size"),
+            )
+        }};
+        ($i:expr, $t:ty, $ch:expr, $variant:ident, keep_color_space) => {{
+            let mut out = arm!($i, $t, $ch, $variant);
+            let _ = out.set_color_space(img.color_space());
+            out
         }};
     }
-    match img {
-        DynamicImage::ImageLuma8(i) => arm!(i, 1, |out| DynamicImage::ImageLuma8(
-            image::GrayImage::from_raw(i.width(), i.height(), out).expect("blur size")
-        )),
-        DynamicImage::ImageLumaA8(i) => arm!(i, 2, |out| DynamicImage::ImageLumaA8(
-            image::GrayAlphaImage::from_raw(i.width(), i.height(), out).expect("blur size")
-        )),
-        DynamicImage::ImageRgb8(i) => arm!(i, 3, |out| DynamicImage::ImageRgb8(
-            image::RgbImage::from_raw(i.width(), i.height(), out).expect("blur size")
-        )),
-        DynamicImage::ImageRgba8(i) => arm!(i, 4, |out| DynamicImage::ImageRgba8(
-            image::RgbaImage::from_raw(i.width(), i.height(), out).expect("blur size")
-        )),
-        _ if passed(deadline) => Err(DeadlinePassed),
-        other => Ok(other.blur(sigma)),
-    }
+    Ok(match img {
+        DynamicImage::ImageLuma8(i) => arm!(i, u8, 1, ImageLuma8),
+        DynamicImage::ImageLumaA8(i) => arm!(i, u8, 2, ImageLumaA8),
+        DynamicImage::ImageRgb8(i) => arm!(i, u8, 3, ImageRgb8),
+        DynamicImage::ImageRgba8(i) => arm!(i, u8, 4, ImageRgba8),
+        DynamicImage::ImageLuma16(i) => arm!(i, u16, 1, ImageLuma16, keep_color_space),
+        DynamicImage::ImageLumaA16(i) => arm!(i, u16, 2, ImageLumaA16, keep_color_space),
+        DynamicImage::ImageRgb16(i) => arm!(i, u16, 3, ImageRgb16, keep_color_space),
+        DynamicImage::ImageRgba16(i) => arm!(i, u16, 4, ImageRgba16, keep_color_space),
+        DynamicImage::ImageRgb32F(i) => arm!(i, f32, 3, ImageRgb32F, keep_color_space),
+        DynamicImage::ImageRgba32F(i) => arm!(i, f32, 4, ImageRgba32F, keep_color_space),
+        // `DynamicImage` is non-exhaustive, but image 0.25 has
+        // no other variant. A later one would take the crate's
+        // blur, checked before it starts.
+        _ if passed(deadline) => return Err(DeadlinePassed),
+        other => other.blur(sigma),
+    })
+}
+
+/// `image::imageops::blur` of an 8-bit gray image, byte for
+/// byte, under the request's processing deadline (issue
+/// #614). The crate blurs it in float: it widens each sample
+/// to `f32`, runs its float blur, and rounds each result to
+/// the nearest integer, half away from zero. This does the
+/// same through the banded passes, which check the deadline
+/// before each row and answer [`DeadlinePassed`] past it.
+/// Every result is a weighted mean of samples within 0 to
+/// 255, so the rounding never leaves that range.
+pub(crate) fn blur_gray_within(
+    img: &image::GrayImage,
+    sigma: f32,
+    deadline: Option<std::time::Instant>,
+) -> Result<image::GrayImage, DeadlinePassed> {
+    let sigma = if sigma == 0.0 { 0.8 } else { sigma };
+    let wide: Vec<f32> = img.as_raw().iter().map(|&v| v as f32).collect();
+    let blurred = blur_samples::<f32, 1>(
+        &wide,
+        img.width() as usize,
+        img.height() as usize,
+        sigma,
+        deadline,
+    )?;
+    let narrow: Vec<u8> = blurred.iter().map(|&v| v.round() as u8).collect();
+    Ok(image::GrayImage::from_raw(img.width(), img.height(), narrow).expect("blur size"))
 }
 
 fn band_threads() -> usize {

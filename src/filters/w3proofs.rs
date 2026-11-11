@@ -113,12 +113,172 @@ fn w3_blur_under_a_deadline_matches_crate() {
             "big blur {sigma}"
         );
     }
-    // A 16-bit image takes the crate's own blur either way.
+    // A 16-bit image, through the same checks (the full
+    // sweep of the 16-bit and float types is below).
     let deep = DynamicImage::ImageRgb16(photo(64, 48).to_rgb16());
     assert_eq!(
         bytes(&blur_fast_within(&deep, 4.0, ahead).unwrap()),
         bytes(&deep.blur(4.0))
     );
+}
+
+/// The 16-bit and float types the crate blurs, made from
+/// `img`. The 16-bit samples get low bytes of their own and
+/// the alpha varies, so the rounding sees every bit. The
+/// float samples run from -0.25 to 1.25, as an HDR source's
+/// can.
+fn deep_variants(img: &DynamicImage) -> Vec<DynamicImage> {
+    let rgba = img.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let mut state: u64 = 0x0bad_5eed_1234_5678;
+    let mut low = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) & 0xff) as u16
+    };
+    let mut deep: image::ImageBuffer<image::Rgba<u16>, Vec<u16>> = image::ImageBuffer::new(w, h);
+    for (o, p) in deep.pixels_mut().zip(rgba.pixels()) {
+        for c in 0..3 {
+            o[c] = ((p[c] as u16) << 8) | low();
+        }
+        o[3] = (((p[0] ^ p[2]) as u16) << 8) | low();
+    }
+    let float = |v: u16| v as f32 / 65535.0 * 1.5 - 0.25;
+    let at = |x: u32, y: u32| deep.get_pixel(x, y).0;
+    vec![
+        DynamicImage::ImageLuma16(image::ImageBuffer::from_fn(w, h, |x, y| {
+            image::Luma([at(x, y)[1]])
+        })),
+        DynamicImage::ImageLumaA16(image::ImageBuffer::from_fn(w, h, |x, y| {
+            let p = at(x, y);
+            image::LumaA([p[1], p[3]])
+        })),
+        DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(w, h, |x, y| {
+            let p = at(x, y);
+            image::Rgb([p[0], p[1], p[2]])
+        })),
+        DynamicImage::ImageRgb32F(image::ImageBuffer::from_fn(w, h, |x, y| {
+            let p = at(x, y);
+            image::Rgb([float(p[0]), float(p[1]), float(p[2])])
+        })),
+        DynamicImage::ImageRgba32F(image::ImageBuffer::from_fn(w, h, |x, y| {
+            image::Rgba(at(x, y).map(float))
+        })),
+        DynamicImage::ImageRgba16(deep.clone()),
+    ]
+}
+
+/// Every byte of an image of any type, its type, size and
+/// color space.
+fn raw(
+    img: &DynamicImage,
+) -> (
+    std::mem::Discriminant<DynamicImage>,
+    (u32, u32),
+    image::metadata::Cicp,
+    Vec<u8>,
+) {
+    (
+        std::mem::discriminant(img),
+        (img.width(), img.height()),
+        img.color_space(),
+        img.as_bytes().to_vec(),
+    )
+}
+
+#[test]
+fn w3_deep_blur_matches_crate() {
+    // Issue #614: a 16-bit or float image blurred in one
+    // call to the image crate, which no deadline could stop.
+    // It now takes the banded passes, with the crate's Q0.15
+    // integer arithmetic for 16-bit samples and its float
+    // arithmetic for float ones. The same sweep as the 8-bit
+    // proofs: the photo with no deadline, the checkerboard
+    // and the large image with one far ahead.
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+    for (make, deadline) in [
+        (photo as fn(u32, u32) -> DynamicImage, None),
+        (checker, ahead),
+    ] {
+        for (w, h) in [(333u32, 257u32), (64, 48), (7, 5), (3, 2), (1, 1), (31, 17)] {
+            let base = make(w, h);
+            for v in deep_variants(&base) {
+                for sigma in [0.3f32, 0.5, 1.0, 2.0, 4.0, 8.0, 8.4, 8.5, 12.0, 16.0, 40.0] {
+                    assert_eq!(
+                        raw(&blur_fast_within(&v, sigma, deadline).unwrap()),
+                        raw(&v.blur(sigma)),
+                        "{:?} blur sigma {sigma} at {w}x{h}, deadline {deadline:?}",
+                        v.color()
+                    );
+                }
+            }
+        }
+    }
+    // The large image in two of the types, one of each kind:
+    // the crate blurs these on one core, slowly in a debug
+    // build.
+    let big = photo(1200, 900);
+    for v in deep_variants(&big).into_iter().filter(|v| {
+        matches!(
+            v,
+            DynamicImage::ImageRgba16(_) | DynamicImage::ImageRgb32F(_)
+        )
+    }) {
+        for sigma in [2.0f32, 8.5, 16.0, 0.0] {
+            assert_eq!(
+                raw(&blur_fast_within(&v, sigma, ahead).unwrap()),
+                raw(&v.blur(sigma)),
+                "{:?} big blur {sigma}",
+                v.color()
+            );
+        }
+    }
+}
+
+#[test]
+fn w3_gray_blur_matches_crate() {
+    // Issue #614: the studio shadow blurs the subject's alpha
+    // with `imageops::blur`, which runs a gray image through
+    // the crate's float blur and rounds back. Its sigma grows
+    // with the canvas, so it now runs through the banded
+    // passes as `blur_gray_within`, the same bytes.
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+    for make in [photo as fn(u32, u32) -> DynamicImage, checker] {
+        for (w, h) in [(333u32, 257u32), (64, 48), (7, 5), (3, 2), (1, 1), (31, 17)] {
+            let gray = make(w, h).to_luma8();
+            for sigma in [
+                0.0f32, 0.3, 0.5, 1.0, 2.0, 4.0, 8.0, 8.4, 8.5, 12.0, 16.0, 40.0,
+            ] {
+                let theirs = image::imageops::blur(&gray, sigma);
+                assert_eq!(
+                    blur_gray_within(&gray, sigma, None).unwrap().as_raw(),
+                    theirs.as_raw(),
+                    "gray blur sigma {sigma} at {w}x{h}"
+                );
+                assert_eq!(
+                    blur_gray_within(&gray, sigma, ahead).unwrap().as_raw(),
+                    theirs.as_raw(),
+                    "gray blur sigma {sigma} at {w}x{h} under a deadline"
+                );
+            }
+        }
+    }
+    // A shadow's own input: a soft-edged disc of alpha on a
+    // 600x400 canvas, at the strong and soft shadow sigmas
+    // for that canvas (0.6 and 2 percent of its short side)
+    // and past the ring's cutoff.
+    let disc = image::GrayImage::from_fn(600, 400, |x, y| {
+        let d = ((x as f32 - 300.0).hypot(y as f32 - 200.0) - 150.0).clamp(0.0, 10.0);
+        image::Luma([(255.0 - d * 25.5) as u8])
+    });
+    for sigma in [2.4f32, 8.0, 12.0, 40.0] {
+        assert_eq!(
+            blur_gray_within(&disc, sigma, ahead).unwrap().as_raw(),
+            image::imageops::blur(&disc, sigma).as_raw(),
+            "disc blur sigma {sigma}"
+        );
+    }
 }
 
 #[test]
