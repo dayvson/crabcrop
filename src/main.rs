@@ -161,6 +161,12 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // the kernel picked (issue #536).
     let port = listener.local_addr()?.port();
     let state = build_state(&config, stores)?;
+    // The request and source posture (issue #590), with a
+    // warning when unsigned URLs may fetch from any host.
+    println!("{}", config.posture_line());
+    if let Some(warning) = config.posture_warning() {
+        eprintln!("warning: {warning}");
+    }
     println!(
         "source fetch: cap {} MB, timeout {}s, buffer budget {} MB",
         config.fetch_cap_mb,
@@ -586,7 +592,16 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// generic `Lavf` and `Lavc` tags instead of a random
 /// track UID and the encoder build's own tags, so WebM
 /// bytes change once and then repeat render for render on
-/// one encoder build #567, PR #585).
+/// one encoder build #567, PR #585; MP4 output written
+/// with bitexact muxing, so no tag names the FFmpeg build's
+/// version, and with x264 held to 6 threads, so MP4 bytes
+/// change once and then repeat on every replica of one
+/// encoder build, whatever its core count #612, #626; and
+/// under `CRABCROP_METADATA=preserve`, JPEG and PNG output
+/// whose source EXIF or Photoshop segment holds a
+/// thumbnail or another part preserve now removes, or a
+/// size tag, now copied without those parts and with the
+/// output's size #611).
 const RENDERING_VERSION: u32 = 6;
 
 /// Fingerprint the configuration that shapes rendered
@@ -1016,11 +1031,47 @@ fn build_provenance_signer(
             format!("cannot use the C2PA signing identity: {e}"),
         )
     })?;
-    println!(
-        "C2PA provenance signing: {} (certificate {})",
-        signer.name, config.cert
-    );
+    let (line, warning) = provenance_boot_lines(&signer.name, signer.alg(), &config.cert);
+    println!("{line}");
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
     Ok(Some(Arc::new(signer)))
+}
+
+/// What boot prints for the signing identity (issue #600):
+/// the line that names the signer, the algorithm its key
+/// settled on and the certificate, and a warning for an RSA
+/// key. c2pa signs with the rsa crate, which has a timing
+/// side channel (RUSTSEC-2023-0071), and its PSS signer does
+/// not blind the private-key operation. With an RSA key that
+/// operation runs on every signed output. The fixed rsa 0.10
+/// is not one c2pa can use yet (see `.cargo/audit.toml`), so
+/// RSA keys still work, with the warning.
+fn provenance_boot_lines(
+    name: &str,
+    alg: c2pa::SigningAlg,
+    cert: &str,
+) -> (String, Option<String>) {
+    use c2pa::SigningAlg;
+    let alg_name = match alg {
+        SigningAlg::Ed25519 => "Ed25519".to_string(),
+        other => other.to_string().to_uppercase(),
+    };
+    let line = format!("C2PA provenance signing: {name} ({alg_name}, certificate {cert})");
+    let rsa = matches!(
+        alg,
+        SigningAlg::Ps256 | SigningAlg::Ps384 | SigningAlg::Ps512
+    );
+    let warning = rsa.then(|| {
+        format!(
+            "the C2PA signing key is an RSA key ({alg_name}). Every signed output runs an \
+             RSA private-key operation in the rsa crate, which has a timing side channel \
+             (RUSTSEC-2023-0071) and no fixed release c2pa can use yet. Use an ECDSA P-256 \
+             or Ed25519 key instead (see docs/configuration.md)"
+        )
+    });
+    (line, warning)
 }
 
 /// Build the PDF renderer (issue #215) from

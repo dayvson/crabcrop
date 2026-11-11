@@ -254,7 +254,11 @@ pub struct ManifestSummary {
     pub state: &'static str,
     /// The active manifest's signer, as a validator would
     /// show it: the certificate's common name, or its
-    /// issuer when the name is absent.
+    /// issuer when the name is absent or has nothing left
+    /// to show (see `signer_name`). It is a name the
+    /// certificate claims, so whoever made the asset chose
+    /// it, and `valid` does not vouch for it. It is reported
+    /// as one line of at most 64 characters (issue #595).
     pub signer: Option<String>,
     /// Manifests in the store (an asset edited elsewhere
     /// can carry its ingredients' stores too; an output
@@ -358,13 +362,68 @@ fn summarize(reader: &Reader) -> ManifestSummary {
     let active = reader.active_manifest();
     let signer = active
         .and_then(|m| m.signature_info())
-        .and_then(|info| info.common_name.clone().or_else(|| info.issuer.clone()));
+        .and_then(|info| signer_name(info.common_name.as_deref(), info.issuer.as_deref()));
     ManifestSummary {
         state,
         signer,
         manifests: reader.manifests().len(),
         ingredients: active.map(|m| m.ingredients().len()).unwrap_or(0),
     }
+}
+
+/// The signer a summary reports (issue #595): the
+/// certificate's common name, or its issuer when the name
+/// is absent or has nothing left once
+/// [`display_signer`] has cleaned it. c2pa-rs fills the
+/// issuer from the certificate's organization, and it goes
+/// through the same cleaning. `None` when neither has
+/// anything to show.
+fn signer_name(common_name: Option<&str>, issuer: Option<&str>) -> Option<String> {
+    common_name
+        .and_then(display_signer)
+        .or_else(|| issuer.and_then(display_signer))
+}
+
+/// The longest signer name a summary reports, in
+/// characters: the upper bound RFC 5280 sets for a common
+/// name (issue #595).
+const MAX_SIGNER_CHARS: usize = 64;
+
+/// A certificate's name as a summary reports it (issue
+/// #595): one line of at most [`MAX_SIGNER_CHARS`]
+/// characters. The name is whatever the certificate gives,
+/// so whoever made the asset chose it, and the certificate
+/// parser bounds neither its length nor its characters: it
+/// takes a name of any length, newlines included. Meta
+/// passes the name on, and an agent may read it, so it
+/// stays one short line. Control
+/// characters (C0, DEL and C1), line and paragraph
+/// separators, bidirectional controls, and tag characters
+/// (U+E0000 to U+E007F, which display as nothing but a
+/// model still reads) are dropped. A longer name keeps
+/// its first 63 characters and ends in `…`. `None` when
+/// nothing is left.
+fn display_signer(name: &str) -> Option<String> {
+    let mut kept = name.chars().filter(|&c| {
+        !(c.is_control()
+            || matches!(
+                c,
+                '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{061C}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{E0000}'..='\u{E007F}'
+            ))
+    });
+    let mut shown: String = kept.by_ref().take(MAX_SIGNER_CHARS).collect();
+    if kept.next().is_some() {
+        shown.pop();
+        shown.push('…');
+    }
+    (!shown.is_empty()).then_some(shown)
 }
 
 /// The largest manifest store signing reads from a source
@@ -670,6 +729,12 @@ impl ProvenanceSigner {
         ))
     }
 
+    /// The algorithm the boot probe settled on. Boot names
+    /// it, and warns for an RSA key (issue #600).
+    pub fn alg(&self) -> SigningAlg {
+        self.alg
+    }
+
     /// One candidate signer, not yet probed. Every SDK
     /// HTTP call signing makes goes through an agent with
     /// the authority's bounds (the defaults when there is
@@ -718,9 +783,11 @@ impl ProvenanceSigner {
         if summary.state == "invalid" {
             return Err("self-test signature did not validate".to_string());
         }
-        summary
-            .signer
-            .ok_or_else(|| "self-test manifest named no signer".to_string())
+        summary.signer.ok_or_else(|| {
+            "self-test manifest named no signer: the certificate's common name and \
+             organization are missing or hold only control characters"
+                .to_string()
+        })
     }
 
     /// Sign one output. The returned bytes are the output
@@ -999,6 +1066,17 @@ pub(crate) fn manifest_json(bytes: &[u8], format: &str) -> String {
 
 #[cfg(test)]
 mod state_tests;
+
+#[cfg(test)]
+mod identity_tests;
+
+/// The test identity whose common name runs past 64
+/// characters over two lines, for other modules' suites
+/// (issue #595).
+#[cfg(test)]
+pub(crate) fn test_signer_with_a_long_name() -> std::sync::Arc<ProvenanceSigner> {
+    std::sync::Arc::new(identity_tests::long_name_signer())
+}
 
 #[cfg(test)]
 mod tests {

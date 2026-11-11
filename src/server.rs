@@ -1056,14 +1056,15 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
-    // The operation cap (issue #469), on the list the image
-    // path counts (the defaults merged in) and at the same
-    // point: an over-cap URL answers its 400 here, before the
-    // probe fetch.
-    if let Err(e) = crate::url::check_operation_count(&crate::url::merge_default_ops(
-        &state.default_ops,
-        ops.clone(),
-    )) {
+    // The operation cap (issue #469) and the watermark URL
+    // cap (issue #613), on the list the image path counts
+    // (the defaults merged in) and at the same point: an
+    // over-cap URL answers its 400 here, before the probe
+    // fetch.
+    let counted = crate::url::merge_default_ops(&state.default_ops, ops.clone());
+    if let Err(e) = crate::url::check_operation_count(&counted)
+        .and_then(|()| crate::url::check_watermark_count(&counted))
+    {
         return parse_failure(&e, accept.as_deref());
     }
     // A root source expands for the probe fetch only: the
@@ -2834,6 +2835,9 @@ fn resolve_request(
     // URL (a short one repeating a preset included) costs a
     // parse and nothing more.
     crate::url::check_operation_count(&ops).map_err(grammar)?;
+    // So does the cap on distinct watermark and overlay URLs
+    // (issue #613): each one is a fetch and a decode.
+    crate::url::check_watermark_count(&ops).map_err(grammar)?;
     // A root source expands here (issue #248): after
     // verification and the ops summary (which reads the
     // source as written), before the cache key and the

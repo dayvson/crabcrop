@@ -105,7 +105,7 @@ filters:watermark(<url>,<x>,<y>,<alpha>)
 | `x`, `y` | Position of the watermark's top-left corner, in pixels. Negative values anchor from the right and bottom edges. |
 | `alpha` | Opacity, 0 (invisible) to 100 (opaque). The watermark's own alpha is honored. |
 
-The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped.
+The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped. A request may name at most 16 distinct watermark and overlay URLs, and their decoded images may hold at most 512 MiB together. Past either limit it answers `400 unsupported_operation` (see [Errors](responses.md#errors)).
 
 ```bash
 # Overlay https://cdn.example.com/logo.png at the bottom right, 80% opaque
@@ -169,7 +169,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
 
-Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, in place of the pixels they cover; they never composite it over the original, so the source's alpha cannot let the original through. (With a segmentation model, a silhouette's antialiased edge mixes the redacted and the original pixels by the mask's strength, as it does for an opaque source.) This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color.
+Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, in place of the pixels they cover; they never composite it over the original, so the source's alpha cannot let the original through. (With a segmentation model, a silhouette's antialiased edge mixes the redacted and the original pixels by the mask's strength, as it does for an opaque source.) This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color. Under `CRABCROP_METADATA=preserve`, the metadata copied into a JPEG or PNG output carries no EXIF or Photoshop thumbnail of the source. The XMP packet is copied as is, so a thumbnail in it stays and can still show what a redaction covered: see [Color management and metadata](responses.md#color-management-and-metadata).
 
 ### Studio mode
 

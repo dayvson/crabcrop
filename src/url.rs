@@ -135,6 +135,11 @@ pub enum ParseError {
     /// [`MAX_EXPANDED_LEN`] bytes (see [`expand_presets`]).
     /// Carries the expanded length.
     ExpansionTooLong(usize),
+    /// The operation list a request would execute names more
+    /// than [`MAX_WATERMARK_URLS`] distinct watermark and
+    /// overlay URLs (see [`check_watermark_count`]). Carries
+    /// the count.
+    TooManyWatermarks(usize),
 }
 
 impl ParseError {
@@ -176,6 +181,8 @@ impl ParseError {
             // An over-long expansion is refused for the same
             // reason as an over-long chain, under the same code.
             ParseError::ExpansionTooLong(_) => "unsupported_operation",
+            // So is a request with too many watermark URLs.
+            ParseError::TooManyWatermarks(_) => "unsupported_operation",
         }
     }
 }
@@ -232,6 +239,10 @@ impl std::fmt::Display for ParseError {
             ParseError::ExpansionTooLong(len) => write!(
                 f,
                 "request expands to {len} bytes, over the {MAX_EXPANDED_LEN} byte limit"
+            ),
+            ParseError::TooManyWatermarks(count) => write!(
+                f,
+                "request names {count} distinct watermark and overlay URLs, over the {MAX_WATERMARK_URLS} URL limit"
             ),
         }
     }
@@ -2236,6 +2247,32 @@ pub fn check_operation_count(ops: &[Operation]) -> Result<(), ParseError> {
     let count = operation_count(ops);
     if count > MAX_OPERATIONS {
         return Err(ParseError::TooManyOperations(count));
+    }
+    Ok(())
+}
+
+/// The most distinct watermark and overlay URLs one request
+/// may name (issue #613). The server fetches and decodes each
+/// one before the render and holds it to the end, and the
+/// operation cap alone let one request name up to 100. The
+/// cap sits well above the one or two a watermarked request
+/// names. The decoded images also share a memory budget
+/// (`MAX_WATERMARK_BYTES` in the engine).
+pub const MAX_WATERMARK_URLS: usize = 16;
+
+/// Refuse an operation list that names more than
+/// [`MAX_WATERMARK_URLS`] distinct watermark and overlay URLs
+/// (issue #613). They are counted as the server fetches them,
+/// by exact string ([`RequestDirectives::watermark_urls`]),
+/// so a repeated URL counts once and each `?v=` variant of
+/// one object counts again. The server runs it on the merged
+/// list next to [`check_operation_count`], on the image and
+/// explain routes alike, so the `400` answers before any
+/// fetch.
+pub fn check_watermark_count(ops: &[Operation]) -> Result<(), ParseError> {
+    let count = RequestDirectives::analyze(ops).watermark_urls.len();
+    if count > MAX_WATERMARK_URLS {
+        return Err(ParseError::TooManyWatermarks(count));
     }
     Ok(())
 }

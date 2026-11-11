@@ -15,7 +15,7 @@ Docker with the Compose plugin, and this repo checked out. That is all: no clust
 
 ### 1. The environment file
 
-All of the app's configuration, secrets included, comes from one environment file. Copy the example, set the signing secret and the metrics token (the bearer <redacted> `/metrics` requires), and make the file owner-only:
+All of the app's configuration, secrets included, comes from one environment file. Copy the example, set the signing secret and the metrics token (the bearer token `/metrics` requires), and make the file owner-only:
 
 ```bash
 cd deploy/compose
@@ -25,7 +25,7 @@ cp crabcrop.env.example crabcrop.env
 chmod 600 crabcrop.env
 ```
 
-The server refuses to start without `CRABCROP_SECRET`, so a file with the placeholders still in it fails fast at boot rather than running with a guessable secret. `crabcrop.env` is git-ignored; only the example belongs in the repo.
+The server refuses to start without `CRABCROP_SECRET`, and it refuses `CHANGE-ME` and the other placeholders the docs have shipped, as the secret or as the metrics token. So a file with a placeholder still in it fails fast at boot, with an error that names the variable, rather than running with a value anyone can read here. `crabcrop.env` is git-ignored; only the example belongs in the repo.
 
 The public host name is not a secret, so it is not in that file: it goes in the compose environment instead (step 2), and never reaches the app or shares a file with the credentials.
 

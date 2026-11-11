@@ -1526,14 +1526,18 @@ def mcp_explain_and_meta():
         r2 = m.call("explain_url", {"url": "http://example.com/not/a/url"})
         r3 = m.call("fetch_meta", {"url": url})
         r4 = m.call("fetch_meta", {"url": f"{SRC127}/dog.jpg"})
+        # fetch_meta returns the meta JSON as its first text block
+        # and a fixed note on the signer fields as a second one
+        # (issue #595), so parse the first block alone.
         j = {}
         try:
-            j = json.loads(r3["text"])
+            j = json.loads(r3["raw"]["content"][0]["text"])
         except Exception:
             pass
         ok = (not r1["isError"] and "300x200" in r1["text"]
               and r2["isError"]
-              and not r3["isError"] and j.get("width") == 300
+              and not r3["isError"] and len(r3["raw"]["content"]) == 2
+              and j.get("width") == 300
               and j.get("height") == 200 and j.get("format") == "jpeg"
               and r4["isError"])
         rec("mcp-explain-and-meta", "mcp", "explain_url + fetch_meta", "dog.jpg",

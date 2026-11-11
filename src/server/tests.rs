@@ -9750,6 +9750,61 @@ async fn over_cap_requests_answer_400_before_any_fetch() {
 }
 
 #[tokio::test]
+async fn too_many_watermark_urls_answer_400_before_any_fetch() {
+    // Issue #613: every distinct watermark or overlay URL is
+    // one fetch and one decode held for the whole render, and
+    // a request could name as many as the operation cap
+    // allows. Past 16 the request answers 400, on the image
+    // and explain routes, before anything is fetched. URLs
+    // count as the server fetches them, by exact string, so
+    // each `?v=` variant of one object counts, and watermark
+    // and overlay URLs share the cap.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (wm, wm_hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let encoded = wm.replace(':', "%3A").replace('/', "%2F");
+    let variants = |n: usize| {
+        (0..n)
+            .map(|i| {
+                if i.is_multiple_of(2) {
+                    format!("watermark({encoded}%3Fv%3D{i},0,0,50)")
+                } else {
+                    format!("overlay({encoded}%3Fv%3D{i},0,0,50,normal)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let over = format!("filters:{}/{src}", variants(17));
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(body["error"]["code"], "unsupported_operation", "{route}");
+        assert_eq!(
+            body["error"]["message"],
+            "request names 17 distinct watermark and overlay URLs, over the 16 URL limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the source was fetched");
+    assert_eq!(wm_hits.load(Ordering::SeqCst), 0, "a watermark was fetched");
+    // At the cap the request renders, each variant fetched
+    // once.
+    let at_cap = format!("filters:{}/{src}", variants(16));
+    let resp = get_signed(&base, &at_cap).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(wm_hits.load(Ordering::SeqCst), 16);
+    // A URL named again is not fetched again, so it does not
+    // count again: 40 references to one URL render.
+    let one = format!("watermark({encoded},1,1,50)");
+    let repeated = format!("filters:{}/{src}", vec![one.as_str(); 40].join(":"));
+    let resp = get_signed(&base, &repeated).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(wm_hits.load(Ordering::SeqCst), 17);
+}
+
+#[tokio::test]
 async fn a_width_hint_never_takes_an_accepted_url_over_the_operation_cap() {
     // Issue #615: a width hint puts a size op in front of the
     // URL's operations, plus a `no_upscale` unless the URL
@@ -10718,6 +10773,51 @@ async fn meta_reports_provenance_without_a_signer() {
     assert_eq!(prov["source"]["state"], "valid");
     assert_eq!(prov["source"]["signer"], "crabcrop test signer");
     assert!(prov["output"].is_null());
+}
+
+#[tokio::test]
+async fn meta_reports_signer_names_as_one_bounded_line() {
+    // Issue #595: a signer is the name its certificate
+    // gives, and whoever made the source chose the source's.
+    // A name of 174 characters over two lines reads back as
+    // one line of 64 characters, cut with a marker, on the
+    // source side and on the output side alike.
+    let long_name = crate::provenance::test_signer_with_a_long_name();
+    let signed_source = long_name
+        .sign(
+            &test_png(),
+            "image/png",
+            &crate::provenance::SignRequest {
+                ingredient: None,
+                ai_edited: false,
+            },
+        )
+        .unwrap();
+    let src = spawn_bytes_server(signed_source).await;
+    let remainder = format!("40x24/{src}");
+    let url_path = format!("/{}/{remainder}", sign(&remainder));
+    let reader = spawn_app(false).await;
+    let signing = spawn_app_with_provenance_signer(long_name).await;
+    for (base, side) in [(reader, "source"), (signing, "output")] {
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let summary = &meta["provenance"][side];
+        assert_eq!(summary["state"], "valid", "{side}");
+        let signer = summary["signer"].as_str().expect("a signer is named");
+        assert_eq!(signer.chars().count(), 64, "{side}: {signer:?}");
+        assert!(!signer.chars().any(char::is_control), "{side}: {signer:?}");
+        assert!(
+            signer.starts_with("crabcrop test signer with a long name"),
+            "{side}: {signer:?}"
+        );
+        assert!(signer.ends_with('…'), "{side}: {signer:?}");
+    }
 }
 
 #[tokio::test]

@@ -252,6 +252,219 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
     assert!(!stderr.contains("proxy"), "{stderr}");
 }
 
+/// Boot with a minimal environment plus `env` and expect
+/// the boot to fail: the exit code is 1, nothing listens,
+/// and the result is what the server wrote to stderr. A
+/// boot that serves instead fails the test at the deadline.
+fn refused_boot(env: &[(&str, &str)]) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+    command
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+        .env("PORT", "0");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = ServerGuard::new(child);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "booted with {env:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let _ = server.0.stdout.take().unwrap().read_to_string(&mut stdout);
+    let _ = server.0.stderr.take().unwrap().read_to_string(&mut stderr);
+    assert_eq!(status.code(), Some(1), "{env:?}: {stderr}");
+    assert!(!stdout.contains("crabcrop listening"), "{env:?}: {stdout}");
+    stderr
+}
+
+#[test]
+fn placeholder_secrets_from_the_docs_stop_the_boot() {
+    // Issue #588: the README, the VM and Container Apps
+    // recipes and the compose metrics line shipped these
+    // values, and each one booted. Boot now refuses each, and
+    // the error names the variable but never the value.
+    let secret = ("CRABCROP_SECRET", "boot-smoke-secret-0123456789");
+    let cases: [(&str, &str); 6] = [
+        ("CRABCROP_SECRET", "your-secret-change-me"),
+        ("CRABCROP_SECRET", "replace-with-a-long-random-value"),
+        ("CRABCROP_SECRET", "REPLACE_ME_signing_secret"),
+        ("CRABCROP_SECRET", "local-dev-secret"),
+        ("CRABCROP_SECRET_PREVIOUS", "your-secret-change-me"),
+        (
+            "CRABCROP_METRICS_TOKEN",
+            "CHANGE-ME-generate-with-openssl-rand-hex-32",
+        ),
+    ];
+    for (var, value) in cases {
+        let env = if var == "CRABCROP_SECRET" {
+            vec![(var, value)]
+        } else {
+            vec![secret, (var, value)]
+        };
+        let stderr = refused_boot(&env);
+        assert!(
+            stderr.starts_with(&format!("crabcrop: {var} is a placeholder")),
+            "{var}: {stderr}"
+        );
+        assert!(!stderr.contains(value), "{var}: {stderr}");
+    }
+}
+
+#[test]
+fn a_short_metrics_token_warns_at_boot_and_still_serves() {
+    // Issue #588: a metrics token only had to be non-empty.
+    // Under 16 bytes it warns for this release; a later one
+    // refuses it. The warning never quotes the token.
+    let stderr = boot_stderr(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]);
+    assert!(
+        stderr.contains("warning: CRABCROP_METRICS_TOKEN is 15 bytes"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("fifteen-bytes!!"), "{stderr}");
+    let stderr = boot_stderr(&[("CRABCROP_METRICS_TOKEN", "sixteen-bytes!!!")]);
+    assert!(!stderr.contains("CRABCROP_METRICS_TOKEN"), "{stderr}");
+}
+
+#[test]
+fn a_blank_allowed_sources_stops_the_boot_naming_the_variable() {
+    // Issue #590: a set value with no host in it read as no
+    // allowlist, so a template whose host variable was empty
+    // let every public host through without a word.
+    for blank in ["", " ", ",", "."] {
+        let stderr = refused_boot(&[("CRABCROP_ALLOWED_SOURCES", blank)]);
+        assert!(
+            stderr.starts_with("crabcrop: CRABCROP_ALLOWED_SOURCES is set but names no host"),
+            "{blank:?}: {stderr}"
+        );
+    }
+    // The any-source opt-out does not make a blank list fine.
+    refused_boot(&[
+        ("CRABCROP_ALLOWED_SOURCES", ","),
+        ("CRABCROP_ALLOW_ANY_SOURCE", "1"),
+    ]);
+}
+
+/// Boot with a minimal environment plus `env`, and return
+/// the lines it printed to stdout before its listening
+/// line, and what it wrote to stderr while booting.
+fn boot_output(env: &[(&str, &str)]) -> (Vec<String>, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+    command
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let (mut server, _, _, printed) = common::serve_printing(&mut command);
+    let _ = server.0.kill();
+    let _ = server.0.wait();
+    (printed, server.stderr())
+}
+
+#[test]
+fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
+    // Issue #590: boot named no part of the request and
+    // source posture. One line now names the request mode,
+    // the source allowlist and the private-address check,
+    // and unsigned URLs with no allowlist warn on stderr.
+    let dir = common::scratch_dir("boot-posture");
+    let presets = dir.join("presets.conf");
+    std::fs::write(&presets, "thumb = 300x200\n").unwrap();
+    let presets = presets.to_str().unwrap();
+    let unsafe_on = ("CRABCROP_ALLOW_UNSAFE", "1");
+    let only_presets = ("CRABCROP_ONLY_PRESETS", "1");
+    let presets_file = ("CRABCROP_PRESETS_FILE", presets);
+    // The extra environment, the posture line, and the
+    // start of the one warning expected, if any.
+    type Case<'a> = (Vec<(&'a str, &'a str)>, &'a str, Option<&'a str>);
+    let cases: Vec<Case> = vec![
+        (
+            vec![],
+            "request mode: signed; source allowlist: none; private-address check: on",
+            None,
+        ),
+        (
+            vec![unsafe_on],
+            "request mode: unsafe; source allowlist: none; private-address check: on",
+            Some("warning: unsafe mode is on with no CRABCROP_ALLOWED_SOURCES"),
+        ),
+        (
+            vec![
+                unsafe_on,
+                (
+                    "CRABCROP_ALLOWED_SOURCES",
+                    "images.example.com, cdn.example.com",
+                ),
+            ],
+            "request mode: unsafe; source allowlist: 2 hosts; private-address check: on",
+            None,
+        ),
+        (
+            vec![unsafe_on, ("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+            "request mode: unsafe; source allowlist: none; private-address check: off",
+            Some("warning: unsafe mode is on with no CRABCROP_ALLOWED_SOURCES"),
+        ),
+        (
+            vec![unsafe_on, only_presets, presets_file],
+            "request mode: presets-only; source allowlist: none; private-address check: on",
+            Some("warning: presets-only mode takes unsigned URLs with no CRABCROP_ALLOWED_SOURCES"),
+        ),
+        (
+            vec![
+                unsafe_on,
+                only_presets,
+                presets_file,
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+            ],
+            "request mode: presets-only; source allowlist: 1 host; private-address check: on",
+            None,
+        ),
+        (
+            vec![only_presets, presets_file],
+            "request mode: signed presets-only; source allowlist: none; private-address check: on",
+            None,
+        ),
+        (
+            vec![("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+            "request mode: signed; source allowlist: none; private-address check: off",
+            None,
+        ),
+    ];
+    for (env, line, warning) in cases {
+        let (printed, stderr) = boot_output(&env);
+        let posture: Vec<&String> = printed
+            .iter()
+            .filter(|l| l.starts_with("request mode: "))
+            .collect();
+        assert_eq!(posture, [line], "{env:?}: {printed:#?}");
+        match warning {
+            Some(warning) => {
+                let warnings: Vec<&str> = stderr
+                    .lines()
+                    .filter(|l| l.starts_with("warning: "))
+                    .collect();
+                assert_eq!(warnings.len(), 1, "{env:?}: {stderr}");
+                assert!(warnings[0].starts_with(warning), "{env:?}: {stderr}");
+                // The existing proxy warning test reads "proxy"
+                // in stderr as its own warning.
+                assert!(!stderr.contains("proxy"), "{env:?}: {stderr}");
+            }
+            None => assert!(!stderr.contains("warning:"), "{env:?}: {stderr}"),
+        }
+    }
+}
+
 /// A model file that exists, so a boot failure is about
 /// the runtime, never about a missing model, and the
 /// directory it lives in.
