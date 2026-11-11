@@ -7,7 +7,7 @@
 # counters) are not served on the public face at all. Check
 # health from inside instead:
 #   docker compose -f docker-compose.prod.yml exec crabcrop \
-#     curl -s http://localhost:3000/health
+#     crabcrop health
 # /metrics requires its bearer <redacted> from inside too (see
 # the README smoke checklist).
 {$CRABCROP_HOST} {

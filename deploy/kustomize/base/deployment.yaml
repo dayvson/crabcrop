@@ -17,22 +17,42 @@ spec:
         app.kubernetes.io/name: crabcrop
         app.kubernetes.io/instance: crabcrop
     spec:
-      # The image runs as nobody (65534). fsGroup makes
-      # mounted volumes group-writable by that group, so the
-      # result-storage component's claim is writable by the
-      # disk tier; without it the mount lands root-owned and
-      # the server exits at boot (the chart's
-      # podSecurityContext).
+      # The server never calls the Kubernetes API, so the pod
+      # mounts no service account token.
+      automountServiceAccountToken: false
+      # The pod and container settings meet the Pod Security
+      # "restricted" profile (the chart's podSecurityContext
+      # and securityContext). The image runs as nobody
+      # (65534), and the kubelet can check runAsNonRoot only
+      # against a numeric user. fsGroup makes mounted volumes
+      # group-writable by that group, so the result-storage
+      # component's claim is writable by the disk tier;
+      # without it the mount lands root-owned and the server
+      # exits at boot.
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
         fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: crabcrop
           image: ghcr.io/dayvson/crabcrop:0.11.0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
+            # The server writes only to /tmp (below) and the
+            # volumes it mounts.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # Modest requests and no limits, as the chart's
+          # defaults; the multi-replica overlay sets limits.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
           ports:
             - name: http
               containerPort: 3000
@@ -61,3 +81,16 @@ spec:
               port: http
             initialDelaySeconds: 2
             periodSeconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The server's temporary directory: the root
+        # filesystem is read-only. frame: stages the source
+        # here, and the video and PDF tools run here, in
+        # images that add them. A pod whose /tmp passes the
+        # limit is evicted, so raise it if you raise
+        # CRABCROP_SOURCE_MAX_MB to serve long clips.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

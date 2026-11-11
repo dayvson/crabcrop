@@ -1,13 +1,15 @@
 //! Operator CLI verbs, dispatched from `main` whenever the
 //! binary gets any argument (only a bare `crabcrop` starts
 //! the server): `sign`, `seal`, `unseal`, `explain`,
-//! `meta`, `purge`, `purge-group`, `upload`, and
-//! `convert-thumbor`. Configuration comes from `--base` /
-//! `--secret` / `--key-id` flags over `CRABCROP_BASE` /
-//! `CRABCROP_SECRET` / `CRABCROP_SECRET_KEY_ID`, the same
-//! convention as the MCP server. The verbs use the
-//! server's own URL grammar, so what the CLI validates
-//! is what the server will do.
+//! `meta`, `purge`, `purge-group`, `upload`,
+//! `convert-thumbor`, and `health`. Configuration comes
+//! from `--base` / `--secret` / `--key-id` flags over
+//! `CRABCROP_BASE` / `CRABCROP_SECRET` /
+//! `CRABCROP_SECRET_KEY_ID`, the same convention as the MCP
+//! server. `health` takes no flags: it probes the server on
+//! this host's port. The verbs use the server's own URL
+//! grammar, so what the CLI validates is what the server
+//! will do.
 
 use crate::url::{
     Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, ParseError, Quality,
@@ -42,6 +44,10 @@ CLI verbs (flags go after the verb; see Flags below):
                                       (--expires <unix-seconds> mints an upload token
                                       that stops working at that second.)
   crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.
+  crabcrop health                     Check the server on this host: GET /health on 127.0.0.1 at
+                                      CRABCROP_PORT or PORT (default 3000). Prints the answer and
+                                      exits 0 when it is a 200, 1 otherwise. Takes no flags. The
+                                      images' HEALTHCHECK runs it.
 
 Flags (each value flag also takes the --flag=<value> spelling):
   --base <url>                        Server base URL. Env CRABCROP_BASE; default
@@ -65,7 +71,7 @@ const VALUE_FLAGS: [&str; 4] = ["--base", "--secret", "--key-id", "--expires"];
 const SWITCH_FLAGS: [&str; 2] = ["--placeholders", "--detections"];
 
 /// Every verb `exec` runs, each listed in USAGE.
-const VERBS: [&str; 9] = [
+const VERBS: [&str; 10] = [
     "sign",
     "seal",
     "unseal",
@@ -75,6 +81,7 @@ const VERBS: [&str; 9] = [
     "purge-group",
     "upload",
     "convert-thumbor",
+    "health",
 ];
 
 /// Why a CLI verb failed (issue #477). `Display` is the
@@ -367,6 +374,21 @@ pub async fn exec(args: &[String]) -> Result<String, CliError> {
     // about the flags that follow it.
     if !VERBS.contains(&verb) {
         return Err(CliError::Usage(format!("unknown verb {verb:?}")));
+    }
+    // `health` reads no flags and no CRABCROP_BASE: it probes
+    // the server on this host, the one the HEALTHCHECK runs
+    // beside.
+    if verb == "health" {
+        if args.len() > 1 {
+            return Err(CliError::Usage(
+                "health takes no arguments or flags".to_string(),
+            ));
+        }
+        let port = health_port(
+            std::env::var("CRABCROP_PORT").ok(),
+            std::env::var("PORT").ok(),
+        )?;
+        return probe_health(port).await;
     }
     let (config, positional) = parse_flags(&args[1..])?;
     if verb != "meta" && (config.placeholders || config.detections) {
@@ -900,6 +922,58 @@ fn format_name(format: ImageFormat) -> &'static str {
         ImageFormat::Mp4 => "mp4",
         ImageFormat::WebM => "webm",
     }
+}
+
+/// How long `health` waits for the server's answer: less
+/// than the images' HEALTHCHECK timeout (3 s), so a slow
+/// answer fails with this verb's own message.
+const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The port `health` probes, read as the server reads its
+/// own (issue #592): `crabcrop_port` (`CRABCROP_PORT`) wins
+/// over `port` (`PORT`), and neither means 3000. Port 0
+/// asks the server for a free port, which `health` cannot
+/// know, so it is an error here.
+fn health_port(crabcrop_port: Option<String>, port: Option<String>) -> Result<u16, CliError> {
+    let (name, value) = match (crabcrop_port, port) {
+        (Some(value), _) => ("CRABCROP_PORT", value),
+        (None, Some(value)) => ("PORT", value),
+        (None, None) => return Ok(3000),
+    };
+    match value.parse::<u16>() {
+        Ok(0) => Err(CliError::Invalid(format!(
+            "{name} is 0: the server took a free port at boot, which health cannot know"
+        ))),
+        Ok(port) => Ok(port),
+        Err(_) => Err(CliError::Invalid(format!("invalid {name}: {value:?}"))),
+    }
+}
+
+/// `GET /health` on 127.0.0.1 at `port` (issue #592): the
+/// trimmed body on a 200, else the status error, or the
+/// request error when nothing answers in [`HEALTH_TIMEOUT`].
+/// It uses no proxy, so a proxy set for source fetches never
+/// carries a loopback probe.
+async fn probe_health(port: u16) -> Result<String, CliError> {
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .no_proxy()
+        .build()
+        .map_err(CliError::Client)?;
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .map_err(CliError::Request)?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status != reqwest::StatusCode::OK {
+        return Err(CliError::Status {
+            status,
+            body: body.trim().to_string(),
+        });
+    }
+    Ok(body.trim().to_string())
 }
 
 fn http_client() -> Result<reqwest::Client, CliError> {
@@ -1854,7 +1928,14 @@ mod tests {
             parse_flags(&args(&[flag])).unwrap_or_else(|e| panic!("{flag}: {e}"));
         }
         for verb in VERBS {
-            let err = exec(&args(&[verb])).await.unwrap_err().to_string();
+            // `health` needs no argument, and would probe this
+            // host's port: an extra argument is what it refuses.
+            let call = if verb == "health" {
+                args(&[verb, "extra"])
+            } else {
+                args(&[verb])
+            };
+            let err = exec(&call).await.unwrap_err().to_string();
             assert!(!err.contains("unknown verb"), "{verb}: {err}");
         }
         let err = parse_flags(&args(&["--key-ids", "k2"]))
@@ -1862,6 +1943,72 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.starts_with("unknown flag \"--key-ids\""), "{err}");
+    }
+
+    #[tokio::test]
+    async fn health_takes_no_arguments_or_flags() {
+        // `crabcrop health` (issue #592) probes the server on
+        // this host's own port, whatever CRABCROP_BASE says,
+        // so an argument or a flag is a mistake: it is refused
+        // before any request.
+        let cases: [&[&str]; 4] = [
+            &["health", "extra"],
+            &["health", "--base", "http://img.test"],
+            &["health", "--secret=s"],
+            &["health", "--bogus"],
+        ];
+        for case in cases {
+            let err = exec(&args(case)).await.unwrap_err();
+            assert!(
+                matches!(&err, CliError::Usage(r) if r == "health takes no arguments or flags"),
+                "{case:?}: {err:?}"
+            );
+        }
+        // Help is still help.
+        let out = exec(&args(&["health", "--help"])).await.unwrap();
+        assert!(out.contains("crabcrop health "), "{out}");
+    }
+
+    #[test]
+    fn health_reads_the_port_as_the_server_does() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(health_port(None, None).unwrap(), 3000);
+        assert_eq!(health_port(None, some("8080")).unwrap(), 8080);
+        assert_eq!(health_port(some("9000"), some("8080")).unwrap(), 9000);
+        // An invalid value is an error naming the variable,
+        // as the server's boot error does: no fallback to the
+        // other variable or to 3000.
+        for (crabcrop_port, port, message) in [
+            (some("x"), some("8080"), "invalid CRABCROP_PORT: \"x\""),
+            (None, some(""), "invalid PORT: \"\""),
+            (None, some("70000"), "invalid PORT: \"70000\""),
+            (
+                None,
+                some("0"),
+                "PORT is 0: the server took a free port at boot, which health cannot know",
+            ),
+        ] {
+            let err = health_port(crabcrop_port, port).unwrap_err();
+            assert!(matches!(&err, CliError::Invalid(_)), "{err:?}");
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_passes_a_200_and_fails_anything_else() {
+        let port = |base: &str| base.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        let base = answer_once("200 OK", "ok\n").await;
+        assert_eq!(probe_health(port(&base)).await.unwrap(), "ok");
+        // Another answer is a failure, a success status included.
+        let base = answer_once("503 Service Unavailable", "draining").await;
+        let err = probe_health(port(&base)).await.unwrap_err();
+        assert_eq!(err.to_string(), "HTTP 503 Service Unavailable: draining");
+        let base = answer_once("204 No Content", "").await;
+        let err = probe_health(port(&base)).await.unwrap_err();
+        assert!(matches!(err, CliError::Status { .. }), "{err:?}");
+        // Nothing listening (port 9, as above).
+        let err = probe_health(9).await.unwrap_err();
+        assert!(matches!(err, CliError::Request(_)), "{err:?}");
     }
 
     #[tokio::test]

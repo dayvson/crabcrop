@@ -86,9 +86,9 @@ child can signal the server and read or write any file the server can: the
 presets and source roots files, the C2PA signing key (`CRABCROP_C2PA_KEY`), and
 the disk result tier (`CRABCROP_RESULT_STORAGE_DIR`). It can also read the
 environment of other processes that run as that user with the same
-environment: in the Docker images, the `HEALTHCHECK` (`sh` and `curl`, every
-30 s), and any `docker exec` or `kubectl exec` session. The Kubernetes recipes
-probe over HTTP from outside the container, and the VM unit keeps the env file
-root-only. Running children under a separate user or in a sandbox (seccomp or
+environment, such as any `docker exec` or `kubectl exec` session. The Docker
+images' `HEALTHCHECK` runs `crabcrop health` every 30 s, which marks itself
+non-dumpable at start like the server. The Kubernetes recipes probe over HTTP
+from outside the container, and the VM unit keeps the env file root-only. Running children under a separate user or in a sandbox (seccomp or
 Landlock) is not decided yet; issue #605 tracks it. Until then, configure only
 the tools you need, and give the server's user no files it does not need.

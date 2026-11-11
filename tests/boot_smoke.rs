@@ -445,6 +445,51 @@ fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
     assert!(stdout.contains("crabcrop purge"), "{stdout}");
 }
 
+#[test]
+fn the_health_verb_probes_the_server_on_its_port() {
+    // Issue #592: the images' HEALTHCHECK ran curl, the one
+    // reason the runtime images carried it. `crabcrop health`
+    // probes 127.0.0.1 at the server's port and exits 0 for a
+    // 200, 1 otherwise, so the HEALTHCHECK runs it instead.
+    let (_server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789"),
+    );
+    let health = |vars: &[(&str, &str)]| {
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg("health")
+            .env_clear()
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap()
+    };
+    let port = port.to_string();
+    let out = health(&[("PORT", &port)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    // CRABCROP_PORT wins over PORT, as it does for the server.
+    let out = health(&[("CRABCROP_PORT", &port), ("PORT", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    // A port that never answers: the verb gives up inside the
+    // HEALTHCHECK's 3 s timeout, so the failure is its own,
+    // with exit 1 and the error on stderr.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_port = silent.local_addr().unwrap().port().to_string();
+    let started = Instant::now();
+    let out = health(&[("PORT", &silent_port)]);
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(out.stdout.is_empty());
+    assert!(stderr.starts_with("crabcrop: request failed"), "{stderr}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    drop(silent);
+}
+
 /// Boot with an empty CA bundle: on Linux the TLS verifier
 /// reads only `SSL_CERT_FILE` when it is set, finds no
 /// roots, and refuses to build, so every HTTP client fails

@@ -28,6 +28,11 @@ spec:
       # SIGTERM and then exits; the pod's grace adds a margin
       # so the kubelet never kills it mid-drain.
       terminationGracePeriodSeconds: {{ add .Values.shutdownGraceSeconds 5 }}
+      {{- /* The token setting and the tmp volume are read with
+           defaults, so values kept from an earlier release
+           (helm upgrade --reuse-values), which lack them,
+           still render them. */}}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken | default false }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -195,8 +200,11 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or .Values.presets .Values.resultStorage.enabled (and .Values.ai.enabled .Values.ai.models.existingClaim) }}
           volumeMounts:
+            # The server's temporary directory: the root
+            # filesystem is read-only.
+            - name: tmp
+              mountPath: /tmp
             {{- if .Values.presets }}
             - name: presets
               mountPath: /etc/crabcrop/presets.txt
@@ -212,9 +220,10 @@ spec:
               mountPath: {{ .Values.ai.models.mountPath }}
               readOnly: true
             {{- end }}
-          {{- end }}
-      {{- if or .Values.presets .Values.resultStorage.enabled (and .Values.ai.enabled .Values.ai.models.existingClaim) }}
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ (.Values.tmpVolume).sizeLimit | default "1Gi" }}
         {{- if .Values.presets }}
         - name: presets
           configMap:
@@ -230,7 +239,6 @@ spec:
           persistentVolumeClaim:
             claimName: {{ .Values.ai.models.existingClaim }}
         {{- end }}
-      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -5,7 +5,7 @@ Deploys the crabcrop image service. The chart is deliberately thin: the server i
 Two install shapes ship with the chart:
 
 - **Production**: `values-production.yaml`, the shape to run for real. It is the first recipe below.
-- **Evaluation**: the chart defaults, enough to try the service with one command. It is labelled as such where it appears; do not mistake it for the production shape (no resource limits, no disk tier, no metrics token).
+- **Evaluation**: the chart defaults, enough to try the service with one command. It is labelled as such where it appears; do not mistake it for the production shape (modest resource requests but no limits, no disk tier, no metrics token).
 
 ## Prerequisites
 
@@ -149,6 +149,28 @@ env:
 Keep secrets out of this map: see [Secrets](#secrets).
 
 The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+
+## Security context
+
+The pods pass the Kubernetes Pod Security "restricted" profile. `podSecurityContext` runs them as user and group 65534 (nobody, the image's user) with `runAsNonRoot: true` and the `RuntimeDefault` seccomp profile. `securityContext` allows no privilege escalation, drops every capability and makes the root filesystem read-only. `automountServiceAccountToken: false` keeps the namespace's service account token out of the pod: the server never calls the Kubernetes API.
+
+The server writes only to `/tmp` and to the volumes it mounts, such as the `resultStorage` claim. `/tmp` is an `emptyDir` of `tmpVolume.sizeLimit` (1Gi). `frame:` stages the source there, and the video and PDF tools run there, in images that add them. A pod whose `/tmp` passes the limit is evicted, so raise it if you raise `CRABCROP_SOURCE_MAX_MB` to serve long clips. An upload directory (`CRABCROP_UPLOAD_DIR`) needs a writable mount too: a path under `/tmp` lasts as long as the pod. Otherwise set `securityContext.readOnlyRootFilesystem: false`. A custom image that runs as another user needs `podSecurityContext` changed to match.
+
+`resources` requests 100m of CPU and 128Mi of memory by default and sets no limits. `values-production.yaml` sets both. Without a CPU limit the server sizes its stills lane and its default source buffer budget from the node's cores, so on a large node set a limit, or `CRABCROP_SOURCE_BUFFER_MAX_MB` in `env`. If you set only limits, keep them at or above the default requests, or set requests too.
+
+`networkPolicy.enabled: true` adds a NetworkPolicy for the pods. It allows ingress to the HTTP port, from the peers in `networkPolicy.ingressFrom` or from anywhere when that is empty. It allows egress to DNS and to public IPv4 addresses, but not to the private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, the cloud metadata address) or `100.64.0.0/10`. That covers what `CRABCROP_BLOCK_PRIVATE_SOURCES` does not: hosts in `CRABCROP_ALLOWED_SOURCES` skip the address check, and code running in the pod is not bound by it. A source, a bucket or an S3-compatible endpoint on a private address needs its own rule in `networkPolicy.extraEgress`, and so does any IPv6 destination. The policy needs a network plugin that enforces NetworkPolicy.
+
+```yaml
+networkPolicy:
+  enabled: true
+  extraEgress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.12.5/32
+      ports:
+        - port: 9000
+          protocol: TCP
+```
 
 ## Smoke checklist
 

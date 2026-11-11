@@ -190,26 +190,81 @@ autoscaling:
   maxReplicas: 5
   targetCPUUtilizationPercentage: 80
 
-resources: {}
-  # requests:
-  #   cpu: 250m
-  #   memory: 256Mi
+# Modest requests, so the pod is not first in line for
+# eviction, and no limits: the evaluation shape. Production
+# sets limits too (values-production.yaml). If you set only
+# limits, keep them at or above these requests, or set
+# requests as well.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
   # limits:
   #   cpu: "2"
   #   memory: 1Gi
 
 podAnnotations: {}
+# The pod and container settings below meet the Kubernetes
+# Pod Security "restricted" profile. A custom image that
+# runs as another user or writes outside /tmp and its
+# mounted volumes needs them changed.
 podSecurityContext:
-  # The image runs as nobody (65534). fsGroup makes
-  # mounted volumes group-writable by that group, so the
-  # disk tier can write the result volume it mounts;
-  # without it the mount lands root-owned and the tier
-  # cannot write.
+  # The image runs as nobody (65534), and the kubelet can
+  # check runAsNonRoot only against a numeric user.
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  # fsGroup makes mounted volumes group-writable by that
+  # group, so the disk tier can write the result volume it
+  # mounts; without it the mount lands root-owned and the
+  # tier cannot write.
   fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
 securityContext:
   allowPrivilegeEscalation: false
+  # The server writes only to /tmp (below) and the volumes
+  # it mounts, such as the result volume.
+  readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
+
+# The server never calls the Kubernetes API, so the pod
+# mounts no service account token.
+automountServiceAccountToken: false
+
+# /tmp is an emptyDir, the one place the server writes
+# outside its configured directories: frame: stages the
+# source there, and the video and PDF tools run there, in
+# images that add them. A pod whose /tmp passes the limit
+# is evicted, so raise it if you raise
+# CRABCROP_SOURCE_MAX_MB to serve long clips.
+tmpVolume:
+  sizeLimit: 1Gi
+
+# An optional NetworkPolicy for the pod. Ingress: the HTTP
+# port, from the peers in ingressFrom (empty: from
+# anywhere). Egress: DNS, and every IPv4 address but the
+# private ranges (10.0.0.0/8, 172.16.0.0/12,
+# 192.168.0.0/16), link-local (169.254.0.0/16, the cloud
+# metadata address) and 100.64.0.0/10. Add rules to
+# extraEgress for a source, bucket or endpoint on a private
+# address. It needs a network plugin that enforces
+# NetworkPolicy.
+# Example:
+#   networkPolicy:
+#     enabled: true
+#     extraEgress:
+#       - to:
+#           - ipBlock:
+#               cidr: 10.0.12.5/32
+#         ports:
+#           - port: 9000
+#             protocol: TCP
+networkPolicy:
+  enabled: false
+  ingressFrom: []
+  extraEgress: []
 
 nodeSelector: {}
 tolerations: []
