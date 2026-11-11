@@ -114,22 +114,35 @@ async fn seed_then_go_cold(state: &AppState, src: &str) -> (AppState, String) {
 
 /// Send, all at once, a request for every seeded key, a fresh
 /// render, and a memory hit that adds the `small` group, and
-/// check each answers 200 within [`STUCK_DISK_LIMIT`].
+/// check each answers 200 within [`STUCK_DISK_LIMIT`], and
+/// within what its kind may wait on a stuck disk: a key the
+/// disk holds 5 s for its lookups, a fresh render 1 s for its
+/// write, a memory hit nothing. Each limit leaves 2 s for the
+/// render and the load of a test run, 1 s for the memory hit.
 async fn every_kind_of_request_answers(base: &str, src: &str) {
+    let secs = std::time::Duration::from_secs;
     let mut requests = tokio::task::JoinSet::new();
-    let mut remainders = seeded_remainders(src);
-    remainders.push(format!("31x21/{src}"));
-    remainders.push(format!("preset:small/{src}"));
-    for remainder in remainders {
+    let mut kinds: Vec<(String, std::time::Duration)> = seeded_remainders(src)
+        .into_iter()
+        .map(|remainder| (remainder, secs(5) + secs(2)))
+        .collect();
+    kinds.push((format!("60x21/{src}"), secs(1) + secs(2)));
+    kinds.push((format!("preset:small/{src}"), secs(1)));
+    for (remainder, limit) in kinds {
         let base = base.to_string();
         requests.spawn(async move {
+            let started = std::time::Instant::now();
             let resp = get_within(&base, &remainder, &format!("GET {remainder}")).await;
-            (remainder, resp.status())
+            (remainder, limit, resp.status(), started.elapsed())
         });
     }
     while let Some(answer) = requests.join_next().await {
-        let (remainder, status) = answer.unwrap();
+        let (remainder, limit, status, took) = answer.unwrap();
         assert_eq!(status, StatusCode::OK, "{remainder}");
+        assert!(
+            took <= limit,
+            "GET {remainder} took {took:?}, over {limit:?}"
+        );
     }
 }
 
