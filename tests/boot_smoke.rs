@@ -1321,7 +1321,7 @@ fn a_connection_that_never_finishes_its_request_head_is_closed_at_the_header_tim
     for (name, stream) in [
         ("silent", &mut silent),
         ("partial head", &mut partial),
-        ("byte-a-second head", &mut drip),
+        ("byte-at-a-time head", &mut drip),
     ] {
         assert!(
             wait_for_close(stream, Duration::from_secs(10)).is_some(),

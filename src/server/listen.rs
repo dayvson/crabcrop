@@ -21,7 +21,10 @@
 //! - The idle timeout: a connection with no request running
 //!   and no bytes moving is closed after it. That covers a
 //!   keep-alive connection between requests, and a response
-//!   whose client stopped reading it.
+//!   whose client stopped reading it. On HTTP/2 only the
+//!   bytes of a response body count as moving: pings and
+//!   other frames between requests do not, so the idle
+//!   timeout runs from the end of the last response.
 //!
 //! Neither timer runs while a handler works on a request:
 //! the processing deadline and the fetch timeouts bound
@@ -60,13 +63,14 @@ use tokio_util::task::TaskTracker;
 pub const DEFAULT_HEADER_TIMEOUT_SECS: u64 = 30;
 
 /// The idle timeout when `CRABCROP_IDLE_TIMEOUT_SECS` is
-/// unset: longer than the common edges keep an idle
-/// connection to the origin in their pool (AWS load
-/// balancers 60 s, Caddy 2 minutes, Google Cloud load
-/// balancers 10 minutes). An edge that reuses a connection
-/// the server is closing gets an error, and some answer it
-/// with a `502`, so the edge should be the one to close.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1200;
+/// unset, 65 minutes: longer than the common edges keep an
+/// idle connection to the origin in their pool by default
+/// (AWS load balancers 60 s, Caddy 2 minutes, Google Cloud
+/// load balancers 10 minutes, Envoy 1 hour). An edge that
+/// reuses a connection the server is closing gets an error,
+/// and some answer it with a `502`, so the edge should be
+/// the one to close.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3900;
 
 /// The bounds [`serve_connections`] keeps on each connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +171,7 @@ async fn serve_connection(
     let io = TokioIo::new(Watched {
         stream,
         watch: Arc::clone(&watch),
+        frames: Frames::default(),
     });
     let service = Tracked {
         router: TowerToHyperService::new(router),
@@ -208,9 +213,11 @@ struct Activity {
     /// Responses whose body is still being sent.
     bodies: usize,
     /// Whether the connection speaks HTTP/2, known from its
-    /// first request. HTTP/2 sends frames between requests
-    /// (pings, window updates), so its reads never start a
-    /// request head.
+    /// first request. An HTTP/2 client sends frames between
+    /// requests (pings, settings, window updates), and the
+    /// server answers some of them. So on HTTP/2 no read
+    /// starts a request head or counts as activity, and of
+    /// the writes only a response body's DATA frames count.
     http2: bool,
     /// When the request head being read began: the
     /// connection's start until the first request, then on
@@ -242,26 +249,31 @@ impl Watch {
         self.activity.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Bytes arrived. On an HTTP/1 connection with nothing
-    /// in flight they start the next request head.
+    /// Bytes arrived. On HTTP/1 they are activity, and with
+    /// nothing in flight they start the next request head.
+    /// On HTTP/2 they are neither.
     fn read(&self) {
         let now = Instant::now();
         let mut activity = self.activity();
+        if activity.http2 {
+            return;
+        }
         activity.last_active = now;
-        if !activity.http2
-            && activity.handlers == 0
-            && activity.bodies == 0
-            && activity.head_since.is_none()
-        {
+        if activity.handlers == 0 && activity.bodies == 0 && activity.head_since.is_none() {
             activity.head_since = Some(now);
             drop(activity);
             self.changed.notify_one();
         }
     }
 
-    /// Bytes went out.
-    fn wrote(&self) {
-        self.activity().last_active = Instant::now();
+    /// Bytes went out; `body` says whether some of them were
+    /// an HTTP/2 DATA frame's payload. On HTTP/2 only those
+    /// are activity.
+    fn wrote(&self, body: bool) {
+        let mut activity = self.activity();
+        if body || !activity.http2 {
+            activity.last_active = Instant::now();
+        }
     }
 
     /// A request head arrived, and its handler starts.
@@ -417,6 +429,63 @@ impl HttpBody for TrackedBody {
 struct Watched {
     stream: TcpStream,
     watch: Arc<Watch>,
+    /// Where the bytes written so far stand in HTTP/2 frames.
+    frames: Frames,
+}
+
+/// The length of an HTTP/2 frame header.
+const FRAME_HEADER_LEN: usize = 9;
+
+/// The type of an HTTP/2 DATA frame.
+const DATA_FRAME: u8 = 0;
+
+/// Follows a connection's output as HTTP/2 frames, to tell
+/// the DATA frames of a response body from control frames
+/// such as the answer to a ping. hyper hands HTTP/2 a body
+/// of one chunk, as the server's responses are, all at
+/// once, and HTTP/2 sends it as the client's flow control
+/// allows. So the DATA frames written, not the body, show
+/// that a response is still moving. It reads every
+/// connection's output from the first byte, since whether
+/// one speaks HTTP/2 is known only at its first request; on
+/// HTTP/1 its answer is not used.
+#[derive(Default)]
+struct Frames {
+    /// The next frame header, as far as it has been written.
+    header: [u8; FRAME_HEADER_LEN],
+    header_len: usize,
+    /// The payload bytes of the current frame still to come.
+    payload_left: usize,
+    /// Whether the current frame is a DATA frame.
+    data: bool,
+}
+
+impl Frames {
+    /// Step over `bytes`, just written: whether any of them
+    /// were a DATA frame's payload.
+    fn wrote(&mut self, mut bytes: &[u8]) -> bool {
+        let mut data = false;
+        while !bytes.is_empty() {
+            if self.payload_left > 0 {
+                let n = self.payload_left.min(bytes.len());
+                data |= self.data;
+                self.payload_left -= n;
+                bytes = &bytes[n..];
+                continue;
+            }
+            let n = (FRAME_HEADER_LEN - self.header_len).min(bytes.len());
+            self.header[self.header_len..self.header_len + n].copy_from_slice(&bytes[..n]);
+            self.header_len += n;
+            bytes = &bytes[n..];
+            if self.header_len == FRAME_HEADER_LEN {
+                let [a, b, c, kind, ..] = self.header;
+                self.payload_left = u32::from_be_bytes([0, a, b, c]) as usize;
+                self.data = kind == DATA_FRAME;
+                self.header_len = 0;
+            }
+        }
+        data
+    }
 }
 
 impl AsyncRead for Watched {
@@ -448,7 +517,8 @@ impl AsyncWrite for Watched {
         if let Poll::Ready(Ok(n)) = polled
             && n > 0
         {
-            this.watch.wrote();
+            let body = this.frames.wrote(&data[..n]);
+            this.watch.wrote(body);
         }
         polled
     }
@@ -463,7 +533,17 @@ impl AsyncWrite for Watched {
         if let Poll::Ready(Ok(n)) = polled
             && n > 0
         {
-            this.watch.wrote();
+            let mut left = n;
+            let mut body = false;
+            for slice in data {
+                let step = left.min(slice.len());
+                body |= this.frames.wrote(&slice[..step]);
+                left -= step;
+                if left == 0 {
+                    break;
+                }
+            }
+            this.watch.wrote(body);
         }
         polled
     }

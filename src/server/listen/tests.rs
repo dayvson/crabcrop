@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{ConnectionLimits, serve_connections};
+use super::{ConnectionLimits, Frames, serve_connections};
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -35,6 +35,11 @@ async fn start(
     let served = tokio::spawn(serve_connections(listener, router, limits, stop.clone()));
     (addr, stop, served)
 }
+
+/// The size of the `/big` body: three times the 64 KiB
+/// an HTTP/2 client lets the server send before its first
+/// window update.
+const BIG: usize = 3 * 64 * 1024;
 
 fn router() -> Router {
     Router::new()
@@ -62,6 +67,11 @@ fn router() -> Router {
                 });
                 Body::from_stream(chunks)
             }),
+        )
+        .route(
+            "/big",
+            // One frame, as the server's own responses are.
+            get(|| async { Bytes::from(vec![b'x'; BIG]) }),
         )
         .route(
             "/endless",
@@ -199,6 +209,16 @@ async fn a_partial_head_after_a_keep_alive_request_gets_the_header_timeout() {
     );
 }
 
+const DATA: u8 = 0;
+const HEADERS: u8 = 1;
+const SETTINGS: u8 = 4;
+const PING: u8 = 6;
+const WINDOW_UPDATE: u8 = 8;
+/// The ACK flag on SETTINGS and PING, END_STREAM on DATA
+/// and HEADERS.
+const ACK: u8 = 1;
+const END_STREAM: u8 = 1;
+
 /// An HTTP/2 frame.
 fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
@@ -208,75 +228,192 @@ fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Read one HTTP/2 frame: its type, flags and payload, or
-/// `None` once the server has closed the connection.
+/// Open an HTTP/2 connection with prior knowledge, and ask
+/// for `GET http://x<path>` on stream 1.
+async fn h2_get(addr: SocketAddr, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend(frame(SETTINGS, 0, 0, &[]));
+    // The method and scheme from the static table, the path
+    // and authority as literals; end of stream and end of
+    // headers.
+    let mut block = vec![0x82, 0x86, 0x04, u8::try_from(path.len()).unwrap()];
+    block.extend_from_slice(path.as_bytes());
+    block.extend_from_slice(&[0x41, 0x01, b'x']);
+    hello.extend(frame(HEADERS, 0x4 | END_STREAM, 1, &block));
+    stream.write_all(&hello).await.unwrap();
+    stream
+}
+
+/// Read one HTTP/2 frame, acknowledging the server's
+/// settings: its type, flags and payload, or `None` once
+/// the server has closed the connection.
 async fn read_frame(stream: &mut TcpStream) -> Option<(u8, u8, Vec<u8>)> {
     let mut head = [0u8; 9];
     stream.read_exact(&mut head).await.ok()?;
     let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await.ok()?;
+    if head[3] == SETTINGS && head[4] & ACK == 0 {
+        stream.write_all(&frame(SETTINGS, ACK, 0, &[])).await.ok()?;
+    }
     Some((head[3], head[4], payload))
 }
 
-#[tokio::test]
-async fn an_idle_http2_connection_is_closed_at_the_idle_timeout_not_the_header_timeout() {
-    // The server has always answered HTTP/2 with prior
-    // knowledge. Between requests an HTTP/2 client sends
-    // frames (here a ping) that start no request, so the
-    // header timeout does not end the connection; the idle
-    // timeout does.
-    const SETTINGS: u8 = 4;
-    const PING: u8 = 6;
-    const ACK: u8 = 1;
-    let (addr, _stop, _) = start(router(), ms(300), ms(1500)).await;
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
-    hello.extend(frame(SETTINGS, 0, 0, &[]));
-    // GET http://x/ from the static table, end of stream
-    // and end of headers.
-    hello.extend(frame(1, 0x5, 1, &[0x82, 0x86, 0x84, 0x41, 0x01, b'x']));
-    stream.write_all(&hello).await.unwrap();
-    // Read to the end of the response on stream 1.
+/// Read to the end of the response on stream 1.
+async fn read_h2_response(stream: &mut TcpStream) {
     loop {
-        let (kind, flags, _) = read_frame(&mut stream)
+        let (kind, flags, _) = read_frame(stream)
             .await
             .expect("closed before the response ended");
-        if kind == SETTINGS && flags & ACK == 0 {
-            stream
-                .write_all(&frame(SETTINGS, ACK, 0, &[]))
-                .await
-                .unwrap();
-        }
-        if (kind == 0 || kind == 1) && flags & 0x1 != 0 {
-            break;
+        if (kind == DATA || kind == HEADERS) && flags & END_STREAM != 0 {
+            return;
         }
     }
-    // Past the header timeout, a ping is still answered.
-    sleep(ms(700)).await;
-    stream
+}
+
+/// Send a ping and wait for its answer: whether it came
+/// before the server closed the connection.
+async fn ping(stream: &mut TcpStream) -> bool {
+    if stream
         .write_all(&frame(PING, 0, 0, b"12345678"))
         .await
-        .unwrap();
+        .is_err()
+    {
+        return false;
+    }
     loop {
-        let (kind, flags, _) = read_frame(&mut stream)
-            .await
-            .expect("an idle HTTP/2 connection closed at the header timeout");
-        if kind == PING && flags & ACK != 0 {
-            break;
+        match read_frame(stream).await {
+            None => return false,
+            Some((kind, flags, _)) if kind == PING && flags & ACK != 0 => return true,
+            Some(_) => {}
         }
     }
-    let pinged = Instant::now();
-    while read_frame(&mut stream).await.is_some() {
+}
+
+#[test]
+fn only_a_data_frames_payload_counts_as_a_body_written() {
+    // A ping's answer, then a DATA frame with a 4-byte
+    // body, then a settings acknowledgement.
+    let ping_answer = frame(PING, ACK, 0, b"12345678");
+    let mut out = ping_answer.clone();
+    out.extend(frame(DATA, 0, 1, b"body"));
+    out.extend(frame(SETTINGS, ACK, 0, &[]));
+    // Written a byte at a time, only the body's bytes count.
+    let mut frames = Frames::default();
+    let counted: Vec<bool> = out.iter().map(|b| frames.wrote(&[*b])).collect();
+    let body = ping_answer.len() + 9..ping_answer.len() + 9 + 4;
+    let expected: Vec<bool> = (0..out.len()).map(|i| body.contains(&i)).collect();
+    assert_eq!(counted, expected);
+    // Written at once, the body counts; a ping's answer
+    // alone does not.
+    assert!(Frames::default().wrote(&out));
+    assert!(!Frames::default().wrote(&ping_answer));
+}
+
+#[tokio::test]
+async fn an_http2_connection_that_only_pings_is_closed_at_the_idle_timeout() {
+    // The server has always answered HTTP/2 with prior
+    // knowledge. Between requests an HTTP/2 client sends
+    // frames, such as pings, that start no request: the
+    // header timeout does not end the connection, and they
+    // are not activity, so the idle timeout runs from the
+    // end of the last response.
+    let (addr, _stop, _) = start(router(), ms(300), ms(1500)).await;
+    let mut stream = h2_get(addr, "/").await;
+    read_h2_response(&mut stream).await;
+    let ended = Instant::now();
+    // Past the header timeout, a ping is still answered.
+    sleep(ms(700)).await;
+    assert!(
+        ping(&mut stream).await,
+        "an idle HTTP/2 connection closed at the header timeout"
+    );
+    // Then a ping every 500 ms.
+    loop {
+        sleep(ms(500)).await;
+        if !ping(&mut stream).await {
+            break;
+        }
         assert!(
-            pinged.elapsed() < Duration::from_secs(10),
-            "an idle HTTP/2 connection is still open 10 s on"
+            ended.elapsed() < Duration::from_secs(10),
+            "an HTTP/2 connection that pings is still open 10 s after its last response, \
+             with a 1.5 s idle timeout"
         );
     }
-    let closed = pinged.elapsed();
+    let closed = ended.elapsed();
     assert!(
         closed >= ms(1200) && closed < Duration::from_secs(5),
-        "closed {closed:?} after its last frame, with a 1.5 s idle timeout"
+        "closed {closed:?} after its last response, with a 1.5 s idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn an_http2_response_the_client_stops_reading_is_closed_though_it_pings() {
+    // The client never opens its flow control window past
+    // the first 64 KiB of an endless body, but keeps
+    // pinging. The answers to its pings are not activity,
+    // so the idle timeout closes the connection.
+    let (addr, _stop, _) = start(router(), ms(300), ms(1500)).await;
+    let mut stream = h2_get(addr, "/endless").await;
+    let began = Instant::now();
+    while ping(&mut stream).await {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "a stalled HTTP/2 response whose client pings is still open 10 s on, \
+             with a 1.5 s idle timeout"
+        );
+        sleep(ms(500)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_http2_response_the_client_reads_slowly_is_not_cut_off() {
+    // hyper takes the whole `/big` body at once and sends it
+    // as the client's flow control window allows. The client
+    // opens the window 16 KiB at a time, 400 ms apart, so the
+    // body takes over 3 s, twice the 1.5 s idle timeout. Each
+    // DATA frame sent is activity, though the handler and
+    // its body are done.
+    const STEP: u32 = 16 * 1024;
+    let (addr, _stop, _) = start(router(), ms(300), ms(1500)).await;
+    let mut stream = h2_get(addr, "/big").await;
+    let began = Instant::now();
+    let mut granted: usize = 65_535;
+    let mut received = 0;
+    let closed = |received: usize| -> ! {
+        panic!(
+            "closed {:?} in, after {received} of {BIG} body bytes",
+            began.elapsed()
+        )
+    };
+    loop {
+        let Some((kind, flags, payload)) = read_frame(&mut stream).await else {
+            closed(received)
+        };
+        if kind != DATA {
+            continue;
+        }
+        received += payload.len();
+        if flags & END_STREAM != 0 {
+            break;
+        }
+        if received == granted {
+            sleep(ms(400)).await;
+            for id in [0, 1] {
+                let update = frame(WINDOW_UPDATE, 0, id, &STEP.to_be_bytes());
+                if stream.write_all(&update).await.is_err() {
+                    closed(received);
+                }
+            }
+            granted += STEP as usize;
+        }
+    }
+    assert_eq!(received, BIG);
+    assert!(
+        began.elapsed() > Duration::from_secs(3),
+        "{:?}",
+        began.elapsed()
     );
 }
 

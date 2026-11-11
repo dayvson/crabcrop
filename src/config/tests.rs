@@ -1194,7 +1194,7 @@ fn the_connection_bounds_default_and_check_their_range() {
     // connection cap, each with its own range.
     let limits = connection_limits(&env_of(&[])).unwrap();
     assert_eq!(limits.header_timeout, std::time::Duration::from_secs(30));
-    assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(1200));
+    assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(3900));
     assert_eq!(limits.max_connections, default_max_connections());
     assert!(limits.max_connections >= 1);
     let set = |name: &str, v: &str| connection_limits(&env_of(&[(name, v)]));

@@ -22,9 +22,9 @@ disk tier in a directory the unit owns (step 3).
   internet; only the proxy talks to it. The environment
   file in step 2 binds the server to `127.0.0.1`
   (`CRABCROP_BIND`), so other hosts cannot reach the
-  port. The Production notes in the main README's
-  Deployment section explain why `/health` and `/metrics`
-  need that protection.
+  port. [Lock down the edge](../../docs/deployment.md#lock-down-the-edge)
+  explains why `/health` and `/metrics` need that
+  protection.
 
 ## 1. Install the binary
 
@@ -61,8 +61,8 @@ every URL) in the editor, for example to the output of
 which the server refuses at boot. `crabcrop.env.example`
 in this directory is the starting point: the secret, the
 listen address and port, and the disk tier directory. Any
-variable from the main README's Configuration table can
-go in the same file.
+variable from [docs/configuration.md](../../docs/configuration.md)
+can go in the same file.
 
 The example listens on `127.0.0.1` only. A host firewall
 that lets in only SSH, HTTP and HTTPS is a second layer;
@@ -94,8 +94,9 @@ systemctl status crabcrop
 Pick one. Both examples in this directory proxy
 `images.example.com` to `127.0.0.1:3000` and serve
 `/health` and `/metrics` to localhost only: `/health` is
-unauthenticated, and `/metrics` exposes traffic and
-error counters.
+unauthenticated, and `/metrics` answers `403` while
+`CRABCROP_METRICS_TOKEN` is unset, and `401` without the
+right bearer token once it is set.
 
 **Caddy** (`Caddyfile`): Caddy obtains and renews the
 certificate automatically once the DNS name points at
