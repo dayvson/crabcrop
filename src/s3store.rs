@@ -1339,8 +1339,15 @@ impl S3Store {
     /// Mark `tombstone`, stored at `object`, ended (issue
     /// #461): now when no purge of its target has disk
     /// deletions pending in this process, or else on the
-    /// [`S3Store::end_held_purges`] after they are done.
+    /// [`S3Store::end_held_purges`] after they are done. A
+    /// held tombstone stays in force unended and covers every
+    /// copy the target's earlier held ones do, so those are
+    /// deleted from the bucket: repeated purges of a target
+    /// whose deletion keeps failing would otherwise leave one
+    /// unended tombstone each, none superseding another, and
+    /// push older ones out of what a refresh reads.
     pub async fn end_tombstone(&self, object: &str, tombstone: &Tombstone) {
+        let mut spent = Vec::new();
         let ready = {
             let mut held = self.held_ends.lock().unwrap();
             let entry = (object.to_string(), tombstone.clone());
@@ -1350,16 +1357,34 @@ impl S3Store {
                     waiting
                         .deletions
                         .retain(crate::storage::DeletionWait::pending);
-                    waiting.tombstones.push(entry);
-                    if !waiting.deletions.is_empty() {
-                        return;
+                    if waiting.deletions.is_empty() {
+                        let mut ready = held
+                            .remove(&tombstone.target)
+                            .map(|waiting| waiting.tombstones)
+                            .unwrap_or_default();
+                        ready.push(entry);
+                        ready
+                    } else {
+                        let ended = Tombstone {
+                            ended_ms: Some(0),
+                            ..tombstone.clone()
+                        };
+                        waiting.tombstones.retain(|(earlier, held)| {
+                            let superseded = ended.supersedes(held);
+                            if superseded {
+                                spent.push(earlier.clone());
+                            }
+                            !superseded
+                        });
+                        waiting.tombstones.push(entry);
+                        Vec::new()
                     }
-                    held.remove(&tombstone.target)
-                        .map(|waiting| waiting.tombstones)
-                        .unwrap_or_default()
                 }
             }
         };
+        for object in &spent {
+            self.delete_object(object).await;
+        }
         self.write_ended(ready).await;
     }
 

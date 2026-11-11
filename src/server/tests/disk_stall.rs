@@ -1075,15 +1075,16 @@ async fn a_later_purge_of_the_target_keeps_its_tombstone_while_an_earlier_purges
         wait_for_purges_to_end(&state),
     )
     .await;
+    // The second one, unended, replaced the first.
     assert_eq!(
         tombstones_ended(&fake),
-        [false, false],
+        [false],
         "a tombstone ended with the purged file still there"
     );
     shared.refresh_tombstones(&state.purge_guard).await;
-    assert_eq!(tombstones_ended(&fake), [false, false]);
+    assert_eq!(tombstones_ended(&fake), [false]);
     // Long after, a restart indexes the file again; the
-    // tombstones keep it a miss.
+    // tombstone keeps it a miss.
     age_ended_tombstones(&fake, crate::cache::TOMBSTONE_GRACE_MS + 60_000);
     {
         let restarted = tier_test_state(Some(&dir), &fake.endpoint);
@@ -1094,14 +1095,14 @@ async fn a_later_purge_of_the_target_keeps_its_tombstone_while_an_earlier_purges
         assert!(restarted.store.as_ref().unwrap().contains(KEY));
         assert!(lookup_tiers(&restarted, KEY, &[]).await.is_none());
     }
-    // Once the deletion goes through, both tombstones end.
+    // Once the deletion goes through, the tombstone ends.
     store.set_hold(None);
     let drained = store.clone();
     tokio::task::spawn_blocking(move || drained.drain_now())
         .await
         .unwrap();
     shared.end_held_purges().await;
-    assert_eq!(tombstones_ended(&fake), [true, true]);
+    assert_eq!(tombstones_ended(&fake), [true]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1300,5 +1301,64 @@ async fn a_purge_holds_its_targets_tombstones_from_when_it_queues_its_disk_delet
         assert!(lookup_tiers(&restarted, KEY, &[]).await.is_none());
     }
     store.set_hold(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn repeated_purges_of_a_target_held_by_a_failing_deletion_keep_one_tombstone_of_it() {
+    // Issue #572 third review: each purge of a target whose
+    // earlier purge's disk deletion keeps failing left its
+    // tombstone unended, and an unended tombstone supersedes
+    // none, so they piled up in the bucket, one per purge,
+    // and pushed older tombstones that were still needed out
+    // of the 1,024 a refresh reads. The latest one, unended,
+    // covers every copy the earlier ones do, so they go.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-held-repeats");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    store.put(KEY, &in_groups(&["g"]));
+    fail_unlinks(&store);
+    assert_eq!(purge_group_call(&base, "g").await, "purged 1\n");
+    within(
+        std::time::Duration::from_secs(5),
+        "the first purge to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    for _ in 0..4 {
+        assert_eq!(purge_group_call(&base, "g").await, "purged 0\n");
+    }
+    within(
+        std::time::Duration::from_secs(5),
+        "the purges to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert_eq!(
+        tombstones_ended(&fake),
+        [false],
+        "the held tombstones of the target piled up"
+    );
+    // A restart still finds the purge in force.
+    {
+        let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+        let restarted_shared = restarted.shared_store.clone().unwrap();
+        restarted_shared
+            .refresh_tombstones(&restarted.purge_guard)
+            .await;
+        assert!(restarted.store.as_ref().unwrap().contains(KEY));
+        assert!(lookup_tiers(&restarted, KEY, &[]).await.is_none());
+    }
+    // Once the deletion goes through, the one left ends.
+    store.set_hold(None);
+    let drained = store.clone();
+    tokio::task::spawn_blocking(move || drained.drain_now())
+        .await
+        .unwrap();
+    shared.end_held_purges().await;
+    assert_eq!(tombstones_ended(&fake), [true]);
     let _ = std::fs::remove_dir_all(&dir);
 }
