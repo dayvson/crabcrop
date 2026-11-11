@@ -3,6 +3,13 @@
 
 Usage: python3 scripts/bump_version.py 0.2.0 [--date YYYY-MM-DD] [--dry-run]
 
+The bump also writes the release's CHANGELOG section, with
+scripts/assemble_changelog.py: the ## [Unreleased] entries and every
+changelog.d/ fragment move into ## [X.Y.Z] - YYYY-MM-DD (today unless
+--date says otherwise), an empty ## [Unreleased] stays above it, and the
+fragments are deleted (RELEASING.md step 1). A malformed fragment stops
+the bump before anything is written, as a misplaced site does.
+
 Edits each site listed in scripts/version_sites.py in place, the list
 check_versions.py reads, then runs the check. The sites include the
 lockfiles' own entries (the crabcrop and crabcrop-url packages in
@@ -11,13 +18,6 @@ fields of every package-lock.json), so no lockfile refresh follows, and
 on a minor bump the server's crabcrop-url requirement. A site that is
 not where the list says (a pin count that changed, a field gone) stops
 the bump before anything is written.
-
-It also writes the release's CHANGELOG section with
-scripts/assemble_changelog.py: the ## [Unreleased] entries and every
-changelog.d/ fragment move into ## [X.Y.Z] - YYYY-MM-DD (today unless
---date says otherwise), an empty ## [Unreleased] stays above it, and the
-fragments are deleted (RELEASING.md step 1). A malformed fragment stops
-the bump before anything is written, like a misplaced site.
 """
 import argparse
 import re
