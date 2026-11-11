@@ -14,7 +14,7 @@ python3 -m http.server --directory playground 8910
 
 ## The secret stays in the browser
 
-Signing uses WebCrypto (`crypto.subtle`) in the page. The secret is never stored, never leaves the page, and is only ever used as the HMAC key. Apart from its own files, the page sends requests only to the endpoint and the source in the form. On load it requests only the preview, from the endpoint. The size check also fetches the source, and it waits for your first edit, so a visit contacts no source host until you change a field. This is stated on the page itself, above the form.
+Signing uses WebCrypto (`crypto.subtle`) in the page. The secret is never stored, never leaves the page, and is only ever used as the HMAC key. Apart from its own files, the page sends requests only to the endpoint and the source in the form. On load it requests only the preview, from the endpoint. The size check also fetches the source, and it waits for your first edit, so the browser contacts no source host until you change a field. This is stated on the page itself, above the form.
 
 ## Content-Security-Policy
 
@@ -26,7 +26,7 @@ script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'
 
 Only scripts from the page's own origin run: `app.mjs` and the modules it imports from this directory. An inline script, or a script from another origin, does not run, so it cannot read the secret field. A meta policy covers only the markup after it, so keep it first in `<head>`. `img-src`, `connect-src` and `style-src` stay open, because the endpoint and the sources are whatever you type, and the page uses inline styles. So the policy cannot stop a script that already runs from sending the secret out; its job is to keep other scripts from running at all. It does not help if someone edits the page's own files on the host.
 
-Scripts that a host adds to the page are blocked on purpose when they are inline or come from another origin, such as the analytics tags of a site template. A CDN feature can also serve its script from a path on the page's own origin, and `'self'` lets that run. So turn off the features that inject scripts for the playground's host, such as Cloudflare Rocket Loader, Zaraz and Web Analytics, instead of relying on the policy. Where the host can set response headers, send the same policy as a `Content-Security-Policy` header too.
+Scripts that a host adds after the policy tag are blocked on purpose when they are inline or come from another origin, such as the analytics tags of a site template. A CDN feature can also serve its script from a path on the page's own origin, and `'self'` lets that run. So turn off the features that inject scripts for the playground's host, such as Cloudflare Rocket Loader, Zaraz and Web Analytics, instead of relying on the policy. Where the host can set response headers, send the same policy as a `Content-Security-Policy` header too: a header also covers a script the host puts before the meta tag.
 
 `npm test` fails when the policy is missing, loosened or moved down the page, and when the page gains an inline script, an inline event handler, a `javascript:` URL, a script from another origin, or a use of `eval`.
 
