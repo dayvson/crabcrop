@@ -3,7 +3,10 @@
 
 Each case writes a small repository whose code and docs agree, breaks one
 side, and expects the matching check to name the break; the pull-request
-check runs against a throwaway git history. Run directly:
+check runs against a throwaway git history. The changelog fragment tools
+(scripts/assemble_changelog.py, issue #539) are tested here too, since CI
+runs this file: the assembler against small trees, and fragments from two
+branches merged in either order. Run directly:
 python3 scripts/test_check_docs.py
 """
 
@@ -21,6 +24,7 @@ sys.path.insert(0, str(HERE))
 import check_docs  # noqa: E402
 
 SCRIPT = HERE / "check_docs.py"
+ASSEMBLE = HERE / "assemble_changelog.py"
 
 MAIN_RS = r"""
 use std::env;
@@ -675,6 +679,21 @@ class TreeChecks(unittest.TestCase):
         self.write("CHANGELOG.md", "# Changelog\n")
         self.assertOnly("changelog", "has no ## [Unreleased] section")
 
+    def test_changelog_fragments_that_assemble_pass(self):
+        self.write("changelog.d/README.md", "# Changelog fragments\n")
+        self.write("changelog.d/7.fixed.md", "A fix (issue #7).\n")
+        self.write("changelog.d/7-again.fixed.md", "Another fix (issue #7).\n")
+        self.assertEqual(self.problems(), [])
+
+    def test_changelog_malformed_fragment(self):
+        self.write("changelog.d/7.feature.md", "A thing (issue #7).\n")
+        self.assertOnly("changelog", "changelog.d/7.feature.md", "unknown section 'feature'")
+
+    def test_changelog_second_cache_epoch_note(self):
+        self.write("changelog.d/7.changed.md", "This release starts a new cache epoch (issue #7).\n")
+        self.write("changelog.d/9.changed.md", "This release starts a new cache epoch (issue #9).\n")
+        self.assertOnly("changelog", "changelog.d/9.changed.md", "second cache-epoch note")
+
     # tested
 
     def test_tested_documented_code_no_test_names(self):
@@ -812,6 +831,129 @@ class ChangelogEntry(unittest.TestCase):
         self.commit("change")
         self.assertEqual(self.entry().returncode, 1)
 
+    # Fragments (issue #539): changelog.d/<issue>[-<slug>].<section>.md.
+
+    def test_a_fragment_is_an_entry(self):
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/1.fixed.md", "The change (issue #1).\n")
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("adds the fragment changelog.d/1.fixed.md", done.stdout)
+
+    def test_a_fragment_with_a_slug_is_an_entry(self):
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/1-second-part.security.md", "The change (issues #1 and #2).\n")
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("changelog.d/1-second-part.security.md", done.stdout)
+
+    def test_a_wrapped_fragment_with_its_own_bullet_is_an_entry(self):
+        # The assembler joins the lines and drops the "- ", so the gate
+        # accepts what the assembler can write.
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/1.changed.md", "- The change, wrapped\n  over two lines (issue #1).\n\n\n")
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_an_edited_fragment_is_an_entry(self):
+        self.write("changelog.d/1.changed.md", "The change (issue #1).\n")
+        self.commit("fragment on main")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/1.changed.md", "The change, and its follow-up (issue #1).\n")
+        self.commit("follow-up")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_malformed_fragments_fail(self):
+        cases = (
+            ("changelog.d/fix-1.md", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/1.md", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/01.fixed.md", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/1_x.fixed.md", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/1-Big.fixed.md", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/1.fixed.txt", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/1.fixed.2.md", "The change (issue #1).\n", "is not named <issue>.<section>.md"),
+            ("changelog.d/1.feature.md", "The change (issue #1).\n", "unknown section 'feature'"),
+            ("changelog.d/1.Fixed.md", "The change (issue #1).\n", "unknown section 'Fixed'"),
+            ("changelog.d/1.fixed.md", "The change.\n", "names no issue"),
+            ("changelog.d/1.fixed.md", "The change (see #1).\n", "names no issue"),
+            ("changelog.d/1.fixed.md", "The change (issue #2).\n", "names issue #2, not #1"),
+            ("changelog.d/1.fixed.md", "The change (issues #2 and #3).\n", "names issues #2 and #3, not #1"),
+            ("changelog.d/1.fixed.md", "\n \n", "is empty"),
+            ("changelog.d/1.fixed.md", "", "is empty"),
+            ("changelog.d/1.fixed.md", "One (issue #1).\n\nTwo.\n", "one paragraph"),
+            ("changelog.d/1.fixed.md", "- One (issue #1).\n- Two (issue #1).\n", "one entry"),
+            ("changelog.d/1.fixed.md", "### Fixed\nOne (issue #1).\n", "a heading"),
+            ("changelog.d/1.fixed.md", b"\xff\xfe (issue #1)\n", "not UTF-8"),
+            (
+                "changelog.d/1.fixed.md",
+                "This release starts a new cache epoch (issue #1).\n",
+                "a cache-epoch note belongs under Changed",
+            ),
+            ("changelog.d/sub/1.fixed.md", "The change (issue #1).\n", "directly in changelog.d/"),
+            ("1.fixed.md", "The change (issue #1).\n", "directly in changelog.d/"),
+            ("docs/changelog.d/1.fixed.md", "The change (issue #1).\n", "directly in changelog.d/"),
+        )
+        for rel, text, message in cases:
+            with self.subTest(rel=rel, text=text):
+                self.write("src/lib.rs", "pub fn f() { g() }\n")
+                path = self.repo / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(text if isinstance(text, bytes) else text.encode())
+                self.commit("change")
+                done = self.entry()
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn(rel, done.stderr)
+                self.assertIn(message, done.stderr)
+                self.git("reset", "-q", "--hard", self.base)
+                self.git("clean", "-q", "-fdx")
+
+    def test_a_malformed_fragment_fails_beside_a_changelog_line(self):
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.add_line("- An old entry.\n", "- The change (issue #1).\n")
+        self.write("changelog.d/1.feature.md", "The change (issue #1).\n")
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("unknown section 'feature'", done.stderr)
+
+    def test_a_malformed_fragment_fails_under_the_label_and_outside_the_watched_trees(self):
+        # The label waives the entry, not the release: a fragment that is
+        # there must still assemble.
+        self.write("docs/guide.md", "# Guide\n\nMore.\n")
+        self.write("changelog.d/1.fixed.md", "The change.\n")
+        self.commit("docs")
+        for labels in ((), ("no-changelog",)):
+            with self.subTest(labels=labels):
+                done = self.entry(*labels)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("changelog.d/1.fixed.md: names no issue", done.stderr)
+
+    def test_the_fragment_readme_is_no_entry(self):
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/README.md", "# Changelog fragments\n\nSee CONTRIBUTING.md.\n")
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("adds no line under ## [Unreleased]", done.stderr)
+        self.assertNotIn("README.md:", done.stderr)
+
+    def test_a_deleted_fragment_is_no_entry(self):
+        # A release deletes the fragments it assembled; that adds nothing.
+        self.write("changelog.d/1.fixed.md", "The change (issue #1).\n")
+        self.commit("fragment on main")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        (self.repo / "changelog.d/1.fixed.md").unlink()
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("no changelog.d/ fragment", done.stderr)
+
     def test_reordering_or_a_new_subheading_adds_nothing(self):
         self.write("src/lib.rs", "pub fn f() { g() }\n")
         self.add_line("## [Unreleased]\n\n", "### Added\n\n")
@@ -880,6 +1022,343 @@ class ChangelogEntry(unittest.TestCase):
         )
         self.assertEqual(done.returncode, 1)
         self.assertIn("git merge-base", done.stderr)
+
+
+class FragmentMerge(unittest.TestCase):
+    """Two pull requests that each add a fragment merge in either order
+    without a conflict, and the gate passes on each and on the merge."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.git("init", "-q", "-b", "main")
+        self.write(
+            "CHANGELOG.md",
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- A hand-written fix (issue #3).\n\n"
+            "## [0.1.0] - 2026-01-01\n\n- First.\n",
+        )
+        self.write("changelog.d/README.md", "# Changelog fragments\n")
+        self.write("src/a.rs", "pub fn a() {}\n")
+        self.write("src/b.rs", "pub fn b() {}\n")
+        self.commit("base")
+        for branch, rs, fragment, text in (
+            ("one", "src/a.rs", "12.fixed.md", "Fix twelve (issue #12)."),
+            ("two", "src/b.rs", "9.fixed.md", "Fix nine (issue #9)."),
+        ):
+            self.git("checkout", "-q", "-b", branch, "main")
+            self.write(rs, f"// {branch}\n")
+            self.write(f"changelog.d/{fragment}", text + "\n")
+            self.commit(branch)
+        self.git("checkout", "-q", "main")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, env=GIT_ENV, check=check, capture_output=True, text=True
+        )
+
+    def write(self, rel, text):
+        path = self.repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def gate(self, base):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(self.repo), "--changelog-entry", base],
+            env=GIT_ENV,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_either_merge_order(self):
+        for branch in ("one", "two"):
+            self.git("checkout", "-q", branch)
+            done = self.gate("main")
+            self.assertEqual(done.returncode, 0, done.stderr)
+        trees = []
+        for first, second in (("one", "two"), ("two", "one")):
+            with self.subTest(order=(first, second)):
+                self.git("checkout", "-q", "-B", f"after-{first}", "main")
+                for branch in (first, second):
+                    # The pull request's merge commit, as the workflow
+                    # checks it out: HEAD^1 is the base it merges into.
+                    merged = self.git("merge", "-q", "--no-ff", "-m", f"merge {branch}", branch, check=False)
+                    self.assertEqual(merged.returncode, 0, merged.stdout + merged.stderr)
+                    done = self.gate("HEAD^1")
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertIn("adds the fragment", done.stdout)
+                trees.append(self.git("rev-parse", "HEAD^{tree}").stdout.strip())
+                preview = subprocess.run(
+                    [sys.executable, str(ASSEMBLE), "--root", str(self.repo), "--check"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(preview.returncode, 0, preview.stderr)
+                self.assertEqual(
+                    preview.stdout,
+                    "## [Unreleased]\n\n### Fixed\n\n- A hand-written fix (issue #3).\n\n"
+                    "- Fix nine (issue #9).\n\n- Fix twelve (issue #12).\n",
+                )
+        self.assertEqual(trees[0], trees[1], "the merge order changed the merged tree")
+
+
+ASSEMBLY_CHANGELOG = """# Changelog
+
+Notes on the format.
+
+## [Unreleased]
+
+### Added
+
+- A hand-written addition (issue #20).
+
+### Fixed
+
+- A hand-written fix (issue #30).
+
+- Another hand-written fix (issue #3).
+
+## [0.1.0] - 2026-01-01
+
+### Fixed
+
+- First.
+"""
+
+ASSEMBLY_FRAGMENTS = {
+    "40.fixed.md": "A later fix (issue #40).\n",
+    "5.fixed.md": "An earlier fix\n(issue #5).\n",
+    "5-again.fixed.md": "- A second fix for the same issue (issue #5).\n\n",
+    "7.added.md": "A new thing (issues #7 and #8).\n",
+    "9.changed.md": "A change (issue #9).",
+    "11.security.md": "A security fix (issue #11).\r\n",
+    "README.md": "# Changelog fragments\n\nNot an entry (issue #1).\n",
+}
+
+ASSEMBLED = """### Added
+
+- A hand-written addition (issue #20).
+
+- A new thing (issues #7 and #8).
+
+### Changed
+
+- A change (issue #9).
+
+### Fixed
+
+- A hand-written fix (issue #30).
+
+- Another hand-written fix (issue #3).
+
+- An earlier fix (issue #5).
+
+- A second fix for the same issue (issue #5).
+
+- A later fix (issue #40).
+
+### Security
+
+- A security fix (issue #11).
+"""
+
+
+class AssembleChangelog(unittest.TestCase):
+    """scripts/assemble_changelog.py against a small tree."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.write("CHANGELOG.md", ASSEMBLY_CHANGELOG)
+        for name, text in ASSEMBLY_FRAGMENTS.items():
+            self.write(f"changelog.d/{name}", text)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel, text, root=None):
+        path = (root or self.root) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def run_script(self, *args, root=None):
+        return subprocess.run(
+            [sys.executable, str(ASSEMBLE), "--root", str(root or self.root), *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def snapshot(self, root=None):
+        base = root or self.root
+        return {str(p.relative_to(base)): p.read_bytes() for p in sorted(base.rglob("*")) if p.is_file()}
+
+    def changelog(self):
+        return (self.root / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    def test_check_previews_unreleased_and_writes_nothing(self):
+        before = self.snapshot()
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "## [Unreleased]\n\n" + ASSEMBLED)
+        self.assertIn("6 fragment(s)", done.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_release_writes_the_section_and_deletes_the_fragments(self):
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.changelog(),
+            ASSEMBLY_CHANGELOG.replace(
+                ASSEMBLY_CHANGELOG[ASSEMBLY_CHANGELOG.index("## [Unreleased]") : ASSEMBLY_CHANGELOG.index("## [0.1.0]")],
+                "## [Unreleased]\n\n## [0.2.0] - 2026-02-03\n\n" + ASSEMBLED + "\n",
+            ),
+        )
+        self.assertEqual(sorted(p.name for p in (self.root / "changelog.d").iterdir()), ["README.md"])
+        for name in ASSEMBLY_FRAGMENTS:
+            if name != "README.md":
+                self.assertIn(f"changelog.d/{name}", done.stdout)
+
+    def test_the_same_tree_assembles_to_the_same_bytes(self):
+        copy = tempfile.TemporaryDirectory()
+        self.addCleanup(copy.cleanup)
+        other = Path(copy.name)
+        for rel, data in self.snapshot().items():
+            (other / rel).parent.mkdir(parents=True, exist_ok=True)
+            (other / rel).write_bytes(data)
+        previews = [self.run_script("--check").stdout, self.run_script("--check", root=other).stdout]
+        self.assertEqual(previews[0], previews[1])
+        for root in (self.root, other):
+            done = self.run_script("0.2.0", "--date", "2026-02-03", root=root)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.snapshot(), self.snapshot(other))
+        # A second run of the same release finds nothing left to move.
+        released = self.snapshot()
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("already has ## [0.2.0]", done.stdout)
+        self.assertEqual(self.snapshot(), released)
+
+    def test_without_fragments_the_section_is_moved_as_written(self):
+        for name in ASSEMBLY_FRAGMENTS:
+            if name != "README.md":
+                (self.root / "changelog.d" / name).unlink()
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        start, end = ASSEMBLY_CHANGELOG.index("## [Unreleased]"), ASSEMBLY_CHANGELOG.index("## [0.1.0]")
+        self.assertEqual(done.stdout, ASSEMBLY_CHANGELOG[start:end].rstrip("\n") + "\n")
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.changelog(),
+            ASSEMBLY_CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n## [0.2.0] - 2026-02-03\n", 1),
+        )
+
+    def test_a_missing_heading_is_created_in_changelog_order(self):
+        self.write("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n- First.\n")
+        for name in ASSEMBLY_FRAGMENTS:
+            if name != "README.md":
+                (self.root / "changelog.d" / name).unlink()
+        self.write("changelog.d/4.removed.md", "A removal (issue #4).\n")
+        self.write("changelog.d/2.deprecated.md", "A deprecation (issue #2).\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            done.stdout,
+            "## [Unreleased]\n\n### Deprecated\n\n- A deprecation (issue #2).\n\n"
+            "### Removed\n\n- A removal (issue #4).\n",
+        )
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.changelog(),
+            "# Changelog\n\n## [Unreleased]\n\n## [0.2.0] - 2026-02-03\n\n### Deprecated\n\n"
+            "- A deprecation (issue #2).\n\n### Removed\n\n- A removal (issue #4).\n\n"
+            "## [0.1.0] - 2026-01-01\n\n- First.\n",
+        )
+
+    def test_unreleased_as_the_last_section(self):
+        self.write("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n")
+        done = self.run_script("0.1.0", "--date", "2026-01-01")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            self.changelog(),
+            "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n" + ASSEMBLED.replace(
+                "### Added\n\n- A hand-written addition (issue #20).\n\n", "### Added\n\n"
+            ).replace("- A hand-written fix (issue #30).\n\n- Another hand-written fix (issue #3).\n\n", ""),
+        )
+
+    def test_a_cache_epoch_fragment_leads_changed(self):
+        self.write(
+            "CHANGELOG.md",
+            ASSEMBLY_CHANGELOG.replace("### Fixed\n", "### Changed\n\n- A hand-written change (issue #2).\n\n### Fixed\n", 1),
+        )
+        self.write(
+            "changelog.d/6.changed.md",
+            "This release starts a new cache epoch. Changes below alter the bytes (issue #6).\n",
+        )
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(
+            "### Changed\n\n- This release starts a new cache epoch. Changes below alter the bytes (issue #6).\n\n"
+            "- A hand-written change (issue #2).\n\n- A change (issue #9).\n\n### Fixed",
+            done.stdout,
+        )
+
+    def test_a_second_cache_epoch_note_is_refused(self):
+        self.write(
+            "CHANGELOG.md",
+            ASSEMBLY_CHANGELOG.replace(
+                "### Fixed\n", "### Changed\n\n- This release starts a new cache epoch (issue #2).\n\n### Fixed\n", 1
+            ),
+        )
+        self.write("changelog.d/6.changed.md", "This release starts a new cache epoch (issue #6).\n")
+        before = self.snapshot()
+        for args in (("--check",), ("0.2.0", "--date", "2026-02-03")):
+            with self.subTest(args=args):
+                done = self.run_script(*args)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("changelog.d/6.changed.md: a second cache-epoch note", done.stderr)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_a_malformed_fragment_stops_both_modes_and_writes_nothing(self):
+        self.write("changelog.d/8.feature.md", "A thing (issue #8).\n")
+        self.write("changelog.d/9.fixed.md", "A thing (issue #10).\n")
+        before = self.snapshot()
+        for args in (("--check",), ("0.2.0", "--date", "2026-02-03")):
+            with self.subTest(args=args):
+                done = self.run_script(*args)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("changelog.d/8.feature.md: unknown section 'feature'", done.stderr)
+                self.assertIn("changelog.d/9.fixed.md: names issue #10, not #9", done.stderr)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_a_release_refuses_bad_input(self):
+        before = self.snapshot()
+        for args, message in (
+            (("0.2",), "X.Y.Z"),
+            (("v0.2.0",), "X.Y.Z"),
+            (("0.2.0", "--date", "2026-02-30"), "YYYY-MM-DD"),
+            (("0.1.0", "--date", "2026-02-03"), "already has ## [0.1.0]"),
+            ((), "--check or a version"),
+        ):
+            with self.subTest(args=args):
+                done = self.run_script(*args)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn(message, done.stderr)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_a_changelog_without_unreleased_is_refused(self):
+        self.write("CHANGELOG.md", "# Changelog\n\n## [0.1.0] - 2026-01-01\n\n- First.\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("no ## [Unreleased] section", done.stderr)
 
 
 if __name__ == "__main__":

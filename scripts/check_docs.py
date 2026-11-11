@@ -29,7 +29,9 @@ src/ outside its #[cfg(test)] modules; test code is those modules plus tests/.
              table in src/url/filters.rs) has a row in a Filter or
              Directive table of docs/filters.md, or a `filters:<name>(`
              signature line, and every such row or line names one it accepts.
-  changelog  CHANGELOG.md's first section is ## [Unreleased].
+  changelog  CHANGELOG.md's first section is ## [Unreleased], and every
+             changelog.d/ fragment is well formed and assembles into it
+             (scripts/assemble_changelog.py, issue #539).
   tested     Every documented code is named, quoted, in test code or test
              data, except the codes in UNTESTED. That allowlist only shrinks: a
              listed code that a test names fails until its entry is removed.
@@ -40,9 +42,12 @@ Usage:
 
 The second form checks one pull request instead, from git: when the diff from
 the merge base of BASE and HEAD to HEAD touches src/, sdks/, frameworks/ or
-plugins/, CHANGELOG.md must
+plugins/, it must add or edit a changelog.d/ fragment, or CHANGELOG.md must
 gain a line under ## [Unreleased], unless the labels (a JSON list of names,
-as .github/workflows/changelog.yml passes them) include no-changelog.
+as .github/workflows/changelog.yml passes them) include no-changelog. Every
+fragment the diff adds or edits must be well formed whatever the paths and
+labels, and a file named like a fragment outside changelog.d/ is refused:
+the label waives the entry, not the release that assembles it.
 """
 
 import argparse
@@ -51,6 +56,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+import assemble_changelog
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -671,12 +678,18 @@ def check_changelog(root, sources):
     for line in read(root, CHANGELOG).splitlines():
         if line.startswith("## "):
             if line.rstrip() == UNRELEASED:
-                return []
+                break
             return [
                 f"{CHANGELOG} opens with {line.rstrip()!r}: keep an {UNRELEASED} heading "
                 "above the latest release, empty or not (RELEASING.md step 1)"
             ]
-    return [f"{CHANGELOG} has no {UNRELEASED} section"]
+    else:
+        return [f"{CHANGELOG} has no {UNRELEASED} section"]
+    try:
+        assemble_changelog.load(root)
+    except assemble_changelog.AssembleError as e:
+        return e.problems
+    return []
 
 
 # ---------------------------------------------------------------- tested
@@ -746,10 +759,11 @@ def summary(root):
 # ---------------------------------------------------------------- one PR
 
 
-def git(root, *args):
-    done = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
+def git(root, *args, text=True):
+    done = subprocess.run(["git", *args], cwd=root, capture_output=True, text=text, check=False)
     if done.returncode != 0:
-        raise CheckError(f"git {' '.join(args)} failed: {done.stderr.strip()}")
+        stderr = done.stderr if text else done.stderr.decode("utf-8", "replace")
+        raise CheckError(f"git {' '.join(args)} failed: {stderr.strip()}")
     return done.stdout
 
 
@@ -766,16 +780,38 @@ def unreleased_lines(text):
     return lines
 
 
+def changed_fragments(root, base):
+    """(fragments the diff from `base` to HEAD adds or edits, problems with
+    any file it adds or edits that is, or is named like, a fragment)."""
+    status = git(root, "diff", "--no-renames", "--name-status", "-z", base, "HEAD").split("\0")
+    fragments, problems = [], []
+    for code, path in zip(status[0::2], status[1::2]):
+        if code == "D":
+            continue
+        fragment, found = assemble_changelog.check_changed_file(
+            path, lambda path=path: git(root, "show", f"HEAD:{path}", text=False)
+        )
+        problems += found
+        if fragment is not None:
+            fragments.append(f"{assemble_changelog.FRAGMENTS}/{fragment.name}")
+    return fragments, problems
+
+
 def check_entry(root, base, labels):
     """(problems, note) for the pull request whose diff runs from `base` to HEAD."""
-    if NO_CHANGELOG_LABEL in labels:
-        return [], f"the {NO_CHANGELOG_LABEL} label is set, so no entry is needed"
     # From where HEAD left BASE, so commits BASE gained since do not count.
     base = git(root, "merge-base", base, "HEAD").strip()
+    fragments, problems = changed_fragments(root, base)
+    if problems:
+        return problems, None
+    if NO_CHANGELOG_LABEL in labels:
+        return [], f"the {NO_CHANGELOG_LABEL} label is set, so no entry is needed"
     changed = git(root, "diff", "--no-renames", "--name-only", base, "HEAD").splitlines()
     touched = sorted(p for p in changed if p.startswith(ENTRY_PATHS))
     if not touched:
         return [], "the diff touches none of " + ", ".join(ENTRY_PATHS) + ", so no entry is needed"
+    if fragments:
+        return [], f"adds the fragment{'s' if len(fragments) > 1 else ''} {', '.join(fragments)}"
     added = []
     if CHANGELOG in changed:
         listed = git(root, "ls-tree", "--name-only", base, "--", CHANGELOG).strip()
@@ -788,9 +824,10 @@ def check_entry(root, base, labels):
         return [], f"{CHANGELOG} gains {len(added)} line(s) under {UNRELEASED}"
     shown = ", ".join(touched[:3]) + (f" and {len(touched) - 3} more" if len(touched) > 3 else "")
     return [
-        f"this change touches {shown} but adds no line under {UNRELEASED} in {CHANGELOG}: "
-        f"add one, or, when nothing user-facing changed, ask a maintainer for the "
-        f"{NO_CHANGELOG_LABEL} label"
+        f"this change touches {shown} but adds no line under {UNRELEASED} in {CHANGELOG} "
+        f"and no changelog.d/ fragment: add a fragment, changelog.d/<issue>.<section>.md "
+        f"(CONTRIBUTING.md, Changelog), or, when nothing user-facing changed, ask a "
+        f"maintainer for the {NO_CHANGELOG_LABEL} label"
     ], None
 
 
