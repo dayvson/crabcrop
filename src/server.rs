@@ -3736,8 +3736,22 @@ fn promote_memory_tier(
             }
             Vec::new()
         }
-        crate::cache::Promoted::Merged { groups, took } => {
-            if state.purge_guard.purge_covers(snapshot, key, &groups) {
+        crate::cache::Promoted::Merged {
+            groups,
+            took,
+            grew,
+            written,
+        } => {
+            // A held copy that grows into a group a live purge
+            // covers leaves memory, as on a memory hit.
+            let covered = if grew {
+                state
+                    .purge_guard
+                    .write_covered(snapshot, key, &groups, written)
+            } else {
+                state.purge_guard.purge_covers(snapshot, key, &groups)
+            };
+            if covered {
                 state.cache.remove(key);
             }
             took
@@ -4320,8 +4334,22 @@ async fn lookup_tiers_within(
         // The copy takes the request's groups and every group
         // this process knows for the key (issue #572): it
         // serves instead of the copies that were served under
-        // them.
-        let wanted = crate::cache::union_groups(groups, &known_groups(state, cache_key));
+        // them. When a purge covers one of those known groups,
+        // the write-back would be dropped and the copy would
+        // not learn the request's groups either, so it takes
+        // the request's alone.
+        let mut wanted = crate::cache::union_groups(groups, &known_groups(state, cache_key));
+        let covered = |extra: &[String]| {
+            state.purge_guard.write_covered(
+                snapshot,
+                cache_key,
+                &crate::cache::union_groups(&image.groups, extra),
+                image.written,
+            )
+        };
+        if covered(&wanted) && !covered(groups) {
+            wanted = groups.to_vec();
+        }
         let sent = if adds_groups(&image.groups, &wanted) {
             image.groups = crate::cache::union_groups(&image.groups, &wanted);
             // Off the response path, like the write-through

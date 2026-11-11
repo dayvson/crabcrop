@@ -776,9 +776,13 @@ pub enum Promoted {
     Inserted,
     /// A copy was held and kept, with `groups` now. `took`
     /// are the groups it held that the promoted copy lacked.
+    /// `grew` says whether the held copy gained a group, and
+    /// `written` is its stamp.
     Merged {
         groups: Vec<String>,
         took: Vec<String>,
+        grew: bool,
+        written: Option<WriteStamp>,
     },
     /// Not stored: memory keeps nothing, or the copy is
     /// larger than the whole budget.
@@ -937,11 +941,17 @@ impl Cache {
                 inner.total_bytes = inner.total_bytes - old + cost;
             }
             let groups = entry.image.groups.clone();
+            let written = entry.image.written;
             touch(inner, key);
             if grew {
                 evict_to_fit(inner, self.max_bytes, 0);
             }
-            return Promoted::Merged { groups, took };
+            return Promoted::Merged {
+                groups,
+                took,
+                grew,
+                written,
+            };
         }
         let cost = entry_cost(key, image);
         if cost > self.max_bytes {
@@ -1751,6 +1761,8 @@ mod tests {
             Promoted::Merged {
                 groups: vec!["a".into(), "c".into(), "d".into()],
                 took: vec!["a".into(), "d".into()],
+                grew: true,
+                written: held.written,
             }
         );
         let now = cache.get("k").unwrap();

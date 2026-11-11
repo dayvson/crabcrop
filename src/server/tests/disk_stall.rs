@@ -699,6 +699,135 @@ async fn a_slow_write_that_has_its_slot_is_not_a_stall() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn a_bucket_hit_keeps_its_group_when_a_purge_of_a_known_group_begins_during_the_read() {
+    // The disk record holds `a` and the bucket copy holds no
+    // group, both old. The disk is skipped, as once a stall
+    // spends the budget. A purge of `a` begins while the
+    // bucket read is out, before its disk step. The request
+    // with `c` is served the bucket copy, so that copy has to
+    // learn `c`, though the groups this process knows fall
+    // under the purge.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-known-purged-race");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    shared.put(KEY, &tier_test_entry()).await;
+    store.put(KEY, &in_groups(&["a"]));
+    fake.hold_object_gets.store(true, Ordering::SeqCst);
+    let lookup = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            lookup_tiers_within(
+                &state,
+                KEY,
+                &group_list(&["c"]),
+                &mut DiskBudget::with(std::time::Duration::ZERO),
+            )
+            .await
+        })
+    };
+    wait_until("the bucket read is held", || {
+        fake.held_object_gets.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let _purge = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Group("a".into()));
+    fake.hold_object_gets.store(false, Ordering::SeqCst);
+    let (_, status) = within(STUCK_DISK_LIMIT, "the bucket hit", lookup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
+    writes_settle(&state).await;
+    let (_, copy) = bucket_entry(&fake);
+    assert!(
+        copy.groups.contains(&"c".to_string()),
+        "served under c, the bucket copy holds {:?}",
+        copy.groups
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_bucket_hit_keeps_its_group_under_a_running_purge_of_a_known_group() {
+    // A purge of `a` is running. The disk record in `a` was
+    // written after it began, and the bucket copy before. The
+    // disk is skipped, and the request with `c` is served the
+    // bucket copy. A later purge of `c` must reach it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-known-purged-running");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    shared.put(KEY, &tier_test_entry()).await;
+    let running = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Group("a".into()));
+    let fresh = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..in_groups(&["a"])
+    };
+    store.put(KEY, &fresh);
+    let (_, status) = lookup_tiers_within(
+        &state,
+        KEY,
+        &group_list(&["c"]),
+        &mut DiskBudget::with(std::time::Duration::ZERO),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
+    writes_settle(&state).await;
+    drop(running);
+    assert_eq!(purge_group_call(&base, "c").await, "purged 3\n");
+    wait_for_purges_to_end(&state).await;
+    assert_eq!(
+        entry_objects(&fake),
+        0,
+        "the copy served under c outlives the purge of c"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_late_disk_promotion_keeps_a_group_memory_learned_meanwhile() {
+    // While a disk read is out, memory takes a copy in `d`
+    // that the record lacks. The disk hit's promotion merges
+    // into it and must not take `d` back out of memory.
+    let dir = crate::test_support::scratch_dir("srv-late-promotion");
+    let state = disk_tier_state(&dir);
+    let store = state.store.clone().unwrap();
+    store.put(KEY, &in_groups(&["a"]));
+    let (gate, mut held) = DiskOpGate::hold(&store, &[OpKind::Read]);
+    let lookup = {
+        let state = state.clone();
+        tokio::spawn(async move { lookup_tiers(&state, KEY, &group_list(&["c"])).await })
+    };
+    within(STUCK_DISK_LIMIT, "the read is held", held.recv())
+        .await
+        .unwrap();
+    let other = CachedImage {
+        bytes: bytes::Bytes::from_static(b"another copy"),
+        etag: crate::cache::etag_for_bytes(b"another copy"),
+        ..in_groups(&["d"])
+    };
+    state.cache.put(KEY.to_string(), other);
+    gate.release();
+    let (_, status) = within(STUCK_DISK_LIMIT, "the disk hit", lookup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, DISK_HIT);
+    let memory = state.cache.groups(KEY).unwrap_or_default();
+    assert_eq!(memory, group_list(&["a", "c", "d"]));
+    drop(gate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Make every disk deletion on `store` fail, as on a disk
 /// remounted read-only.
 fn fail_unlinks(store: &Arc<crate::storage::DiskStore>) {
@@ -806,6 +935,53 @@ async fn a_purge_after_one_whose_disk_deletion_is_stuck_still_walks_the_bucket()
         entry_objects(&fake),
         0,
         "the second purge left its bucket copy while the disk was stuck"
+    );
+    drop(gate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_disk_hit_that_grows_a_held_copy_into_a_running_purge_drops_it_from_memory() {
+    // A purge of `g` is running, and the disk copy in `g` was
+    // written after it began. While its read is out, memory
+    // takes an older copy in no group. The promotion merges
+    // into that copy and grows it into `g`: like a memory hit
+    // that does so, it leaves memory.
+    let dir = crate::test_support::scratch_dir("srv-promote-into-purge");
+    let state = disk_tier_state(&dir);
+    let store = state.store.clone().unwrap();
+    let _running = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Group("g".into()));
+    let fresh = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..in_groups(&["g"])
+    };
+    store.put(KEY, &fresh);
+    let (gate, mut held) = DiskOpGate::hold(&store, &[OpKind::Read]);
+    let lookup = {
+        let state = state.clone();
+        tokio::spawn(async move { lookup_tiers(&state, KEY, &[]).await })
+    };
+    within(STUCK_DISK_LIMIT, "the read is held", held.recv())
+        .await
+        .unwrap();
+    let older = CachedImage {
+        bytes: bytes::Bytes::from_static(b"an older copy"),
+        etag: crate::cache::etag_for_bytes(b"an older copy"),
+        written: None,
+        ..in_groups(&[])
+    };
+    state.cache.put(KEY.to_string(), older);
+    gate.release();
+    let (_, status) = within(STUCK_DISK_LIMIT, "the disk hit", lookup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, DISK_HIT);
+    assert!(
+        state.cache.get(KEY).is_none(),
+        "memory keeps an older copy grown into a running purge"
     );
     drop(gate);
     let _ = std::fs::remove_dir_all(&dir);

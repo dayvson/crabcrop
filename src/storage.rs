@@ -985,7 +985,8 @@ impl DiskStore {
     }
 
     /// The groups this process knows for `key`: its record's,
-    /// or those of a write of it in flight.
+    /// or those of a write of it in flight that no purge
+    /// doomed.
     pub fn known_groups(&self, key: &str) -> Option<Vec<String>> {
         if self.max_bytes == 0 {
             return None;
@@ -993,7 +994,15 @@ impl DiskStore {
         let inner = self.inner.lock().unwrap();
         match (inner.entries.get(key), inner.claims.get(key)) {
             (Some(record), _) => Some(record.groups.clone()),
-            (None, Some(Claim::Write { groups, .. })) => Some(groups.clone()),
+            // A doomed write lands nothing: a purge covers its
+            // groups.
+            (
+                None,
+                Some(Claim::Write {
+                    groups,
+                    doomed: false,
+                }),
+            ) => Some(groups.clone()),
             _ => None,
         }
     }
@@ -3887,6 +3896,25 @@ mod tests {
                 WritePlan::Claimed(_)
             ));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_doomed_write_teaches_no_known_groups() {
+        // A copy written below takes the groups this process
+        // knows. Those of a write a purge doomed are under the
+        // purge, and would make that copy one the purge drops.
+        let dir = temp_dir("doomed-known");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let WritePlan::Claimed(claim) =
+            store.begin_write("k", &groups(&["g"]), Bucket::Unknown, true)
+        else {
+            panic!("the key was not claimed");
+        };
+        assert_eq!(store.known_groups("k"), Some(groups(&["g"])));
+        store.purge(&PurgeTarget::Group("g".into()));
+        assert_eq!(store.known_groups("k"), None);
+        drop(claim);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
