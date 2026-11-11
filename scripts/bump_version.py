@@ -10,7 +10,9 @@ Cargo.lock and fuzz/Cargo.lock, the version and linked @crabcrop/url
 fields of every package-lock.json), so no lockfile refresh follows, and
 on a minor bump the server's crabcrop-url requirement. A site that is
 not where the list says (a pin count that changed, a field gone) stops
-the bump before anything is written.
+the bump before anything is written. The dav1d pin in
+scripts/build_dav1d.sh is dav1d's own version, not a release site, so
+the bump leaves it; check_versions.py reads it against the docs.
 """
 import re
 import subprocess

@@ -17,6 +17,10 @@ these rules:
              --require-hashes and names no package on the command line, and
              `python -m build` runs with --no-isolation, so the build
              backend is a hashed one too (issue #598).
+  dav1d      No workflow sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL, which makes
+             dav1d-sys clone dav1d by ref name at build time with no hash
+             check; scripts/build_dav1d.sh builds it from a pinned,
+             checksummed tarball instead (issue #596).
 
 The files are read with a small YAML reader for the part of YAML that
 workflows use: block mappings and sequences, literal block scalars,
@@ -432,6 +436,9 @@ def check_workflow(text, name):
         return [f"{name}: not a YAML mapping"]
     problems = []
     workflow_env = mapping(workflow.get("env"))
+    for key in workflow_env:
+        if key == "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL":
+            problems.append(f"{name}: the workflow env sets {key}; build dav1d with scripts/build_dav1d.sh")
     for job_name, job in mapping(workflow.get("jobs")).items():
         job = mapping(job)
         where = f"{name}: job {job_name}"
@@ -439,6 +446,8 @@ def check_workflow(text, name):
         if isinstance(uses, str) and not (uses.startswith("./") or SHA_PIN.fullmatch(uses)):
             problems.append(f"{where}: uses {uses}, which is not pinned to a full commit SHA")
         job_env = {**workflow_env, **mapping(job.get("env"))}
+        if "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL" in mapping(job.get("env")):
+            problems.append(f"{where}: the job env sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL; build dav1d with scripts/build_dav1d.sh")
         steps = job.get("steps")
         for number, step in enumerate(steps if isinstance(steps, list) else [], 1):
             step = mapping(step)
@@ -449,10 +458,15 @@ def check_workflow(text, name):
                 uses.startswith("./") or SHA_PIN.fullmatch(uses) or DOCKER_PIN.fullmatch(uses)
             ):
                 problems.append(f"{at}: uses {uses}, which is not pinned to a full commit SHA")
-            env = {**job_env, **mapping(step.get("env"))}
+            step_env = mapping(step.get("env"))
+            env = {**job_env, **step_env}
+            if "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL" in step_env:
+                problems.append(f"{at}: sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL; build dav1d with scripts/build_dav1d.sh")
             script = step.get("run")
             if not isinstance(script, str):
                 continue
+            if any("SYSTEM_DEPS_DAV1D_BUILD_INTERNAL" in line for line in shell_lines(script)):
+                problems.append(f"{at}: sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL; build dav1d with scripts/build_dav1d.sh")
             problems += [f"{at}: {problem}" for problem in run_problems(script)]
             problems += [f"{at}: {problem}" for problem in installer_problems(script, env)]
     return problems
@@ -488,7 +502,8 @@ def main(argv=None):
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
-    print(f"{len(files)} workflow files: actions pinned, no download piped into a shell, hashed pip installs")
+    print(f"{len(files)} workflow files: actions pinned, no download piped into a shell, hashed pip installs, "
+          "dav1d from a checked tarball")
     return 0
 
 

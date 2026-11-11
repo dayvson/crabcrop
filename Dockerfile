@@ -10,7 +10,8 @@
 # The bases are Debian trixie, not bookworm, on purpose:
 # the AVIF decode build (below) links the system libdav1d,
 # dav1d-sys requires dav1d >= 1.3, and bookworm ships
-# 1.2.1. Trixie ships 1.5.x (libdav1d7).
+# 1.0.0. Trixie ships 1.5.1 (libdav1d7), the version
+# scripts/build_dav1d.sh pins for the release binaries.
 FROM rust:1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
 WORKDIR /build
 # pkg-config + the dav1d headers for the avif-decode build.

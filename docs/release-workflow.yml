@@ -246,35 +246,26 @@ jobs:
           ${{ matrix.packages_install }}
       # crabcrop addition (re-append after any `cargo dist
       # generate`, like the jobs at the bottom of this file):
-      # the avif-decode feature (dist-workspace.toml) builds
-      # dav1d from vendored sources, which needs meson and
-      # ninja on the PATH.
-      - name: Install meson, ninja, and nasm (vendored dav1d)
+      # the avif-decode feature (dist-workspace.toml) links
+      # dav1d, statically, so the release binaries decode AVIF
+      # with no system dependency (issue #141, option A).
+      # scripts/build_dav1d.sh downloads the pinned dav1d
+      # release tarball, checks its sha256, and builds it with
+      # meson and ninja pinned by hash (issues #596, #598);
+      # dav1d-sys then links that build. nasm assembles
+      # dav1d's and rav1e's x86 code.
+      - name: Install nasm
         run: |
-          # crabcrop (issues #193, #598): meson and ninja
-          # come from a requirements file that pins the hash
-          # of every wheel the runners use, ninja's three
-          # per-platform wheels included. A version pin alone
-          # does not fix the bytes: PyPI takes new files for
-          # an existing version, and pip picks the most
-          # specific wheel for the runner.
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            python3 -m pip install --user --break-system-packages --require-hashes -r scripts/requirements/dav1d-build.txt
-          else
-            python3 -m pip install --user --require-hashes -r scripts/requirements/dav1d-build.txt
-          fi
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install nasm
           elif [ "$(uname -m)" = "x86_64" ]; then
             sudo apt-get update && sudo apt-get install -y nasm || { apt-get update && apt-get install -y nasm; }
           fi
-          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+      - name: Build dav1d from the pinned, checksummed tarball
+        shell: bash
+        run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"
       - name: Build artifacts
         env:
-          # Vendored static dav1d, so the release binaries
-          # decode AVIF with no system dependency (issue
-          # #141, option A).
-          SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
           # The tag reaches the shell only through this
           # environment variable (issue #193).
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
@@ -286,6 +277,18 @@ jobs:
           fi
           dist build "${tag_args[@]}" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # crabcrop (issue #596): the shipped binary carries the
+      # dav1d built above, and needs no libdav1d on the host.
+      - name: Check that dav1d is linked statically
+        shell: bash
+        run: |
+          bins=$(find target -type f -path '*/dist/crabcrop')
+          if [ -z "$bins" ]; then
+            echo "no dist build of crabcrop under target/" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          bash scripts/build_dav1d.sh --check-binary $bins
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

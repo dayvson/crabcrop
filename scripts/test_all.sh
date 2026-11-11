@@ -55,9 +55,10 @@ for mirror in docs/*-workflow.yml; do
   fi
 done
 
-step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs)"
+step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs, dav1d from a checked tarball)"
 python3 scripts/check_workflows.py
 python3 scripts/test_check_workflows.py
+python3 scripts/test_build_dav1d.py
 
 step "Functional tier (a pull request's diff picks smoke or full)"
 python3 scripts/test_functional_tier.py

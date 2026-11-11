@@ -14,10 +14,10 @@ installers = ["shell"]
 # Servers and developer machines: Linux and macOS, both architectures.
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # AVIF decoding ships in the release binaries (issue #141,
-# option A): dav1d is built from vendored sources so the
-# tarballs stay self-contained (the release workflow sets
-# SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always and provides
-# meson + ninja; see docs/release-workflow.yml).
+# option A): dav1d is linked statically, so the tarballs
+# stay self-contained. The release workflow builds it with
+# scripts/build_dav1d.sh from a pinned, checksummed release
+# tarball (issue #596; see docs/release-workflow.yml).
 features = ["avif-decode"]
 # The release workflow carries repo-maintained jobs (container images,
 # registry publishing) beyond what dist generates, so the generated

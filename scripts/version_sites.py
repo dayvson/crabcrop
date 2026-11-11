@@ -264,6 +264,59 @@ SITES = [
 ]
 
 
+# dav1d, the C library the release binaries decode AVIF with (issue
+# #596). It is not a release version site: scripts/build_dav1d.sh pins
+# its own version and tarball hash, and a release bump never moves them.
+# The docs that name the shipped dav1d must name the pinned version, so
+# check() reads them against the pin; DAV1D_MENTIONS lists them.
+DAV1D_PIN = "scripts/build_dav1d.sh"
+DAV1D_MENTIONS = [
+    pattern("docs/deployment.md", "dav1d version the release binaries link", r"release binaries link dav1d (\d+\.\d+\.\d+)\b"),
+    pattern("Dockerfile", "dav1d version Debian trixie ships", r"Trixie ships (\d+\.\d+\.\d+) \(libdav1d7\)"),
+]
+
+
+def dav1d_pin(root=ROOT):
+    """The (version, sha256) scripts/build_dav1d.sh pins; raises SiteError."""
+    text = _read(root, DAV1D_PIN)
+    versions = re.findall(r"^DAV1D_VERSION=(\S*)$", text, re.M)
+    hashes = re.findall(r"^DAV1D_SHA256=(\S*)$", text, re.M)
+    if len(versions) != 1 or len(hashes) != 1:
+        raise SiteError("expected one DAV1D_VERSION= line and one DAV1D_SHA256= line")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", versions[0]):
+        raise SiteError(f"DAV1D_VERSION {versions[0]!r} is not X.Y.Z")
+    if not re.fullmatch(r"[0-9a-f]{64}", hashes[0]):
+        raise SiteError("DAV1D_SHA256 is not 64 lowercase hex digits")
+    return versions[0], hashes[0]
+
+
+def check_dav1d(root=ROOT):
+    """Read the dav1d pin and every doc that names it.
+
+    Returns (version, rows, problems) like check(): the pinned version
+    (None when unreadable), one (values, site) row per mention, and one
+    message per mention that is unreadable or names another version.
+    """
+    try:
+        version, _ = dav1d_pin(root)
+    except SiteError as err:
+        return None, [], [f"{DAV1D_PIN}: {err}"]
+    rows, problems = [], []
+    for site in DAV1D_MENTIONS:
+        try:
+            text = _read(root, site.path)
+            values = [text[start:end] for start, end in site.locate(text)]
+        except SiteError as err:
+            rows.append((None, site))
+            problems.append(f"{site.path}: {err}")
+            continue
+        rows.append((values, site))
+        stale = sorted({value for value in values if value != version})
+        if stale:
+            problems.append(f"{site.path}: {site.what} is {', '.join(stale)}, but {DAV1D_PIN} pins {version}")
+    return version, rows, problems
+
+
 def _read(root, path):
     try:
         return (root / path).read_text(encoding="utf-8")

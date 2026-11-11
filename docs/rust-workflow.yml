@@ -48,7 +48,8 @@ jobs:
       - name: Check lockfiles
         run: python3 scripts/check_locks.py
       # Actions pinned by SHA, no download piped into a shell,
-      # and hashed pip installs (issues #593, #597, #598).
+      # hashed pip installs, dav1d from a checked tarball
+      # (issues #593, #596, #597, #598).
       - name: Check workflows
         run: python3 scripts/check_workflows.py
       - name: Clippy
@@ -76,20 +77,15 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
 
-    env:
-      # Vendored static dav1d, as the release builds it.
-      SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install meson, ninja, and nasm (vendored dav1d)
-        run: |
-          # The release build's tools, pinned by hash (issue
-          # #598): see the step of the same name in
-          # docs/release-workflow.yml.
-          python3 -m pip install --user --break-system-packages --require-hashes -r scripts/requirements/dav1d-build.txt
-          brew install nasm
-          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+      - name: Install nasm
+        run: brew install nasm
+      # The static dav1d the release links, built the same way
+      # (issue #596): see the step of the same name in
+      # docs/release-workflow.yml.
+      - name: Build dav1d from the pinned, checksummed tarball
+        run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"
       - name: Check every target compiles on macOS with the shipped features
         run: cargo check --locked --all-targets --features avif-decode
       - name: Run the library tests on macOS with the shipped features

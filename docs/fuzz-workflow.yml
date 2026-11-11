@@ -32,9 +32,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Vendored static dav1d, as the release binaries build it
-  # (issue #141, option A).
-  SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
 
 jobs:
   fuzz:
@@ -53,17 +50,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install meson, ninja, and nasm (vendored dav1d)
-        run: |
-          # The release build's tools, pinned by hash (issue
-          # #598; see the step of the same name in
-          # docs/release-workflow.yml), in a virtual
-          # environment so the runner's system Python stays
-          # untouched.
-          python3 -m venv "$RUNNER_TEMP/meson-venv"
-          "$RUNNER_TEMP/meson-venv/bin/pip" install --require-hashes -r scripts/requirements/dav1d-build.txt
-          sudo apt-get update && sudo apt-get install -y nasm
-          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+      - name: Install nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      # The static dav1d the release binaries link, built the
+      # same way (issue #596; see the step of the same name in
+      # docs/release-workflow.yml).
+      - name: Build dav1d from the pinned, checksummed tarball
+        run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"
       - name: Install the nightly toolchain and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
@@ -136,12 +129,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install meson, ninja, and nasm (vendored dav1d)
-        run: |
-          python3 -m venv "$RUNNER_TEMP/meson-venv"
-          "$RUNNER_TEMP/meson-venv/bin/pip" install --require-hashes -r scripts/requirements/dav1d-build.txt
-          sudo apt-get update && sudo apt-get install -y nasm
-          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+      - name: Install nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Build dav1d from the pinned, checksummed tarball
+        run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"
       - name: Fuzz smoke with the AVIF decoder
         run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib --test smoke
       - name: Workspace tests with 10000 cases per property

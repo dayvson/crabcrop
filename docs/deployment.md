@@ -76,9 +76,15 @@ Rotation never invalidates a URL that is already in the wild: during a rotation 
 
 ## Building from source
 
-Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries), nasm on x86_64 (the AVIF encoder's assembly; its build script fails without it), and, only for the vendored AVIF decode route (`--features avif-decode`), meson and ninja, or a system libdav1d 1.3 or newer found through pkg-config instead. The prebuilt routes (the installer, the Docker images, the release binaries) need none of this.
+Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries) and nasm on x86_64 (the AVIF encoder's assembly; its build script fails without it). The prebuilt routes (the installer, the Docker images, the release binaries) need none of this.
 
-AVIF source decoding is behind the `avif-decode` cargo feature (off by default, on in the Docker image and the release builds; see [Source images](url-grammar.md#source-images)). Building with it needs dav1d 1.3 or newer reachable through pkg-config, or a vendored build:
+AVIF source decoding is behind the `avif-decode` cargo feature (off by default, on in the Docker image and the release builds; see [Source images](url-grammar.md#source-images)). Building with it needs dav1d 1.3 or newer reachable through pkg-config: the system's libdav1d (`libdav1d-dev` on Debian and Ubuntu), or the static dav1d the release builds, which `scripts/build_dav1d.sh` makes (it needs Python 3 and pkg-config too):
 
 ```bash
-SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always cargo build --features avif-decode
+eval "$(bash scripts/build_dav1d.sh "$HOME/.cache/crabcrop-dav1d")"
+cargo build --features avif-decode
+```
+
+The script downloads the dav1d release tarball for one pinned version, checks it against a pinned SHA-256 before it reads it, and builds a static library with meson and ninja pinned by hash. Its two exports point pkg-config at that build and make the link static. Do not use `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always`: it makes dav1d-sys clone dav1d from code.videolan.org by ref name at build time, with no hash check (issue #596).
+
+Which dav1d each artifact ships: the release binaries link dav1d 1.5.1, built by `scripts/build_dav1d.sh`. That covers the release tarballs, the shell installer, the Homebrew formula, and the `ghcr.io/dayvson/crabcrop` and `crabcrop-ai` images, which package the release binary. The from-source `Dockerfile` links Debian trixie's `libdav1d7` package: the same dav1d release, plus any fixes Debian backports to it. The pin follows trixie's version, so both image routes decode with the same dav1d release; RELEASING.md has the check that keeps them in step.

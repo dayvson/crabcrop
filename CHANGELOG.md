@@ -40,6 +40,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - A new check, `scripts/check_workflows.py`, fails CI on an action that is not pinned by commit SHA, a download piped into a shell, a cargo-dist installer that runs before its checksum check, and a pip install without hashes (issues #593, #597, #598). It runs in `rust.yml` and in `scripts/test_all.sh`.
 
+- The release binaries link a dav1d built from a pinned, checksummed release tarball (issue #596). `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` made dav1d-sys run `git clone -b 1.5.0` against code.videolan.org at build time, with no commit or hash check, so a branch or a moved tag of that name would have been built into every release binary. `scripts/build_dav1d.sh` now downloads the dav1d 1.5.1 tarball, checks its SHA-256 before it reads it, and builds a static library with meson and ninja pinned by hash; dav1d-sys links that build. 1.5.1 is the version Debian trixie ships, so the release binaries and the from-source image decode with the same dav1d release. The release, CI's macOS job and the nightly fuzzing all build it this way, a release build fails when its binary links libdav1d dynamically, and `scripts/check_workflows.py` fails on a workflow that sets the old variable. The pin is checked against the docs by `scripts/check_versions.py`, and RELEASING.md says how to move it. AV1 decoding is bit-exact, so AVIF output does not change.
+
 ## [0.11.0] - 2026-11-10
 
 ### Changed

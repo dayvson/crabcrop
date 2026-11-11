@@ -280,6 +280,37 @@ class Pip(unittest.TestCase):
         self.assertEqual(step_problems("- run: python3 -m build -n --sdist\n"), [])
 
 
+class Dav1d(unittest.TestCase):
+    """Issue #596: no workflow builds dav1d from a ref fetched at build time."""
+
+    def test_the_variable_fails_at_every_level(self):
+        wf = "on: push\npermissions: {}\nenv:\n  SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: \"always\"\njobs: {}\n"
+        (problem,) = problems(wf)
+        self.assertIn("workflow env sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL", problem)
+        job = textwrap.dedent(
+            """\
+            on: push
+            permissions: {}
+            jobs:
+              macos:
+                runs-on: macos-latest
+                env:
+                  SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
+                steps:
+                  - run: cargo check
+            """
+        )
+        (problem,) = problems(job)
+        self.assertIn("job env sets", problem)
+        found = step_problems('- env:\n    SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"\n  run: dist build\n')
+        self.assertEqual(len(found), 1, found)
+        found = step_problems("- run: |\n    export SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always\n    cargo build\n")
+        self.assertEqual(len(found), 1, found)
+
+    def test_the_build_script_passes(self):
+        self.assertEqual(step_problems('- run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"\n'), [])
+
+
 class Repository(unittest.TestCase):
     """The workflows this repository lands pass (their docs/ mirrors)."""
 
