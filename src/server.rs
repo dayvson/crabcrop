@@ -3933,7 +3933,10 @@ async fn finish_disk_write(
         if let Some(landed) = store.land(claim, &entry)
             && guard.write_covered(snapshot, &key, &landed.groups, entry.written)
         {
-            store.remove_copy(&key, landed.id);
+            // Queued, not deleted inline: a failed delete is
+            // retried, and the purge holds its tombstones for it
+            // (see `DiskStore::forget_if`).
+            store.forget_if(&key, landed.id);
         }
     });
     let _ = tokio::time::timeout(DISK_WRITE_WAIT.saturating_sub(started.elapsed()), write).await;
@@ -4426,8 +4429,10 @@ async fn lookup_disk_tier(
             if guard.running_covers(&read_key, &image.groups, image.written) {
                 // A live tombstone covers this copy (issues
                 // #400, #461): drop it rather than serve and
-                // promote it.
-                store.remove_copy(&read_key, id);
+                // promote it. Its deletion is queued, retried
+                // until done, and holds the tombstones of the
+                // purge that covers it (issue #572).
+                store.forget_if(&read_key, id);
                 return None;
             }
             Some((image, id))

@@ -93,6 +93,13 @@ struct Job {
     not_before: Option<std::time::Instant>,
     /// Being run right now, since then.
     running: Option<std::time::Instant>,
+    /// For a deletion queued outside a purge, which no purge
+    /// holds its tombstones for yet (a lookup, a landing or a
+    /// learn that found the copy under a purge, or an
+    /// eviction): the groups of the copy it deletes, until a
+    /// purge that covers the copy takes it over (see
+    /// [`DiskStore::purge_waiting`]).
+    unheld: Option<Vec<String>>,
 }
 
 /// Jobs by key, at most one per key. A job that can run waits
@@ -137,10 +144,23 @@ impl KeyQueue {
                 attempts: 0,
                 not_before: None,
                 running: None,
+                unheld: None,
             },
         );
         self.by_seq.insert(*seq, key.to_string());
         self.order.push_back((key.to_string(), *seq));
+    }
+
+    /// [`KeyQueue::push`] for the deletion of a copy in
+    /// `groups` that no purge holds its tombstones for.
+    fn push_unheld(&mut self, key: &str, stem: &str, groups: &[String], seq: &mut u64) {
+        if self.jobs.contains_key(key) {
+            return;
+        }
+        self.push(key, stem, seq);
+        if let Some(job) = self.jobs.get_mut(key) {
+            job.unheld = Some(groups.to_vec());
+        }
     }
 
     /// Drop `key`'s job. Returns whether there was one.
@@ -1009,8 +1029,8 @@ impl DiskStore {
                 Some((image, id))
             }
             _ => {
-                let stem = evict_entry(&mut inner, key).map(|record| record.stem);
-                let claimed = stem.and_then(|stem| claim_or_queue(&mut inner, key, &stem));
+                let claimed = evict_entry(&mut inner, key)
+                    .and_then(|record| claim_or_queue(&mut inner, key, &record));
                 drop(inner);
                 if let Some(stem) = claimed {
                     let _claim = FileClaim::inline(self, key);
@@ -1080,8 +1100,11 @@ impl DiskStore {
     }
 
     /// Remove `key`'s record if it is still copy `id`, and
-    /// queue its file's deletion. No file I/O; the caller
-    /// kicks the drain. Returns whether it was removed.
+    /// queue its file's deletion, retried until it is done. No
+    /// file I/O; the caller kicks the drain. A purge that
+    /// covers the copy holds its tombstones for the deletion
+    /// (see [`DiskStore::purge_waiting`]). Returns whether it
+    /// was removed.
     pub fn forget_if(&self, key: &str, id: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if !inner.entries.get(key).is_some_and(|record| record.id == id) {
@@ -1089,7 +1112,9 @@ impl DiskStore {
         }
         if let Some(record) = evict_entry(&mut inner, key) {
             let inner = &mut *inner;
-            inner.deletions.push(key, &record.stem, &mut inner.next_seq);
+            inner
+                .deletions
+                .push_unheld(key, &record.stem, &record.groups, &mut inner.next_seq);
         }
         true
     }
@@ -1217,7 +1242,7 @@ impl DiskStore {
                             .map(|(k, _)| k.clone());
                         let Some(oldest) = oldest else { break };
                         if let Some(record) = evict_entry(inner, &oldest)
-                            && let Some(stem) = claim_or_queue(inner, &oldest, &record.stem)
+                            && let Some(stem) = claim_or_queue(inner, &oldest, &record)
                         {
                             evicted.push((oldest, stem));
                         }
@@ -1302,7 +1327,7 @@ impl DiskStore {
                 return false;
             }
             let record = evict_entry(&mut inner, key);
-            record.and_then(|record| claim_or_queue(&mut inner, key, &record.stem))
+            record.and_then(|record| claim_or_queue(&mut inner, key, &record))
         };
         if let Some(stem) = claimed {
             let _claim = FileClaim::inline(self, key);
@@ -1341,8 +1366,14 @@ impl DiskStore {
     }
 
     /// [`DiskStore::purge`], with the deletions its bucket
-    /// tombstones wait for: those it queued, and those queued
-    /// before it for keys whose write it doomed.
+    /// tombstones wait for: those it queued, those queued
+    /// before it for keys whose write it doomed, and those of
+    /// copies it covers that no purge held yet. A lookup or a
+    /// landing that finds a copy under a running purge, while
+    /// that purge's tombstone is still being written or after
+    /// a restart, removes it and queues its deletion before the
+    /// purge gets here; the purge takes that deletion over, so
+    /// its tombstones stay in force until the file is gone.
     pub fn purge_waiting(self: &Arc<Self>, target: &PurgeTarget) -> (usize, DeletionWait) {
         let (removed, seqs, earlier) = self.purge_queued(target);
         (
@@ -1356,10 +1387,12 @@ impl DiskStore {
     }
 
     /// [`DiskStore::purge`], plus the sequence numbers of the
-    /// deletions queued before it for keys whose write it
-    /// doomed. A key has one deletion queued at a time, so when
-    /// it has one already, that one deletes the file the write
-    /// renames into place, and the purge queues none of its own.
+    /// deletions queued before it that it holds its tombstones
+    /// for: for keys whose write it doomed, and of copies it
+    /// covers that no purge held yet, which it takes over. A
+    /// key has one deletion queued at a time, so when it has
+    /// one already, that one deletes the file the write renames
+    /// into place, and the purge queues none of its own.
     fn purge_queued(&self, target: &PurgeTarget) -> (usize, Range<u64>, Vec<u64>) {
         let mut earlier = Vec::new();
         let mut guard = self.inner.lock().unwrap();
@@ -1393,10 +1426,23 @@ impl DiskStore {
                 && target.covers(key, groups)
             {
                 *doomed = true;
-                match deletions.jobs.get(key) {
-                    Some(job) => earlier.push(job.seq),
+                match deletions.jobs.get_mut(key) {
+                    Some(job) => {
+                        job.unheld = None;
+                        earlier.push(job.seq);
+                    }
                     None => deletions.push(key, &key_stem(key), next_seq),
                 }
+            }
+        }
+        for (key, job) in &mut deletions.jobs {
+            if job
+                .unheld
+                .as_ref()
+                .is_some_and(|groups| target.covers(key, groups))
+            {
+                job.unheld = None;
+                earlier.push(job.seq);
             }
         }
         (removed.len(), first..inner.next_seq + 1, earlier)
@@ -1875,15 +1921,18 @@ fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     Some(record)
 }
 
-/// Claim `key`'s file for an inline delete and return its
-/// stem, or, when another job holds it, queue the deletion.
-fn claim_or_queue(inner: &mut Inner, key: &str, stem: &str) -> Option<String> {
+/// Claim the file of `record`, just evicted from `key`, for an
+/// inline delete and return its stem, or, when another job
+/// holds it, queue the deletion.
+fn claim_or_queue(inner: &mut Inner, key: &str, record: &Record) -> Option<String> {
     if inner.claims.contains_key(key) {
-        inner.deletions.push(key, stem, &mut inner.next_seq);
+        inner
+            .deletions
+            .push_unheld(key, &record.stem, &record.groups, &mut inner.next_seq);
         return None;
     }
     inner.claims.insert(key.to_string(), Claim::File);
-    Some(stem.to_string())
+    Some(record.stem.clone())
 }
 
 /// `existing` with `extra` added. Unchanged, order and all,
@@ -2403,9 +2452,10 @@ struct Scanned {
 pub struct DeletionWait {
     pub store: Arc<DiskStore>,
     pub seqs: Range<u64>,
-    /// Deletions queued before the purge for keys whose write
-    /// it doomed: each deletes the file that write renames
-    /// into place.
+    /// Deletions queued before the purge that it holds its
+    /// tombstones for: for keys whose write it doomed, each of
+    /// which deletes the file that write renames into place,
+    /// and of copies it covers that no purge held.
     pub earlier: Vec<u64>,
 }
 
