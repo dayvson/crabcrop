@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import { buildPlaygroundUrl, explainUrl, sign, verifyUrlSignature } from "../lib.mjs";
 
@@ -317,5 +317,164 @@ test("the playground never signs a key label, and a subkey never verifies", asyn
     );
     const subkey = createHmac("sha256", secret).update(label).digest("hex");
     assert.equal(await verifyUrlSignature(secret, `${base}/${subkey}/${label}`), false);
+  }
+});
+
+// Issue #594: the page explains on every edit, so a long digit
+// run in a float argument must cost linear time, and input over
+// 64 KiB is refused before the grammar reads it.
+test("a long float argument explains in linear time, and input over 64 KiB is refused", async () => {
+  const url = (digits) => `https://x/${SIG}/filters:blur(${"1".repeat(digits)}z)/https://e.com/a.jpg`;
+  const cases = [
+    // Under the cap: the grammar reads it all (about 10 s
+    // with the old float pattern).
+    [65_000, /^the server rejects this filter: blur\(1+z\)$/, false],
+    // Over the cap: refused at once, and nothing to verify.
+    [100_000, /longer than 64 KiB/, null],
+  ];
+  for (const [digits, error, verdict] of cases) {
+    const started = performance.now();
+    const out = explainUrl(url(digits));
+    const verified = await verifyUrlSignature("secret", url(digits));
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 2000, `${digits} digits took ${elapsed.toFixed(0)} ms`);
+    assert.equal(out.errors.length, 1, `${digits} digits`);
+    assert.match(out.errors[0], error);
+    assert.equal(verified, verdict, `${digits} digits`);
+  }
+});
+
+// ---------------------------------------------------------------- the page's policy
+//
+// Issue #603: the page takes the signing secret, so it carries a
+// Content-Security-Policy that lets only its own scripts run. A meta
+// policy covers only what follows it, so it comes first in <head>.
+// The page must also need nothing looser: no inline script, no
+// inline event handler, no javascript: URL.
+
+const PAGE = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+const POLICY = "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'";
+
+const TAG = /<([a-zA-Z][\w-]*)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*\/?>/g;
+const ATTR = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+
+function pageProblems(html) {
+  // A commented-out tag does not apply, so it does not count.
+  const text = html.replace(/<!--[\s\S]*?-->/g, "");
+  const tags = [...text.matchAll(TAG)].map((m) => ({
+    name: m[1].toLowerCase(),
+    attrs: new Map(
+      [...m[2].matchAll(ATTR)].map((a) => [a[1].toLowerCase(), a[2] ?? a[3] ?? a[4] ?? ""]),
+    ),
+  }));
+  const problems = [];
+  const at = tags.findIndex(
+    (t) => t.name === "meta" && t.attrs.get("http-equiv")?.toLowerCase() === "content-security-policy",
+  );
+  if (at < 0) {
+    problems.push("no Content-Security-Policy meta tag");
+  } else {
+    const before = tags
+      .slice(0, at)
+      .find((t) => !["html", "head"].includes(t.name) && !(t.name === "meta" && t.attrs.has("charset")));
+    if (before) {
+      problems.push(`the policy follows <${before.name}>: it must come first in <head>, after <meta charset>`);
+    }
+    const policy = tags[at].attrs.get("content") ?? "";
+    const directives = new Map();
+    for (const part of policy.split(";")) {
+      const [name, ...sources] = part.trim().toLowerCase().split(/\s+/);
+      if (name && !directives.has(name)) directives.set(name, sources);
+    }
+    const scripts = directives.get("script-src")?.join(" ");
+    if (scripts !== "'self'") {
+      problems.push(`script-src is ${JSON.stringify(scripts)}: it must be 'self' alone`);
+    }
+    for (const word of policy.match(/'[\w-]*unsafe[\w-]*'/gi) ?? []) {
+      problems.push(`the policy allows ${word}`);
+    }
+    for (const name of directives.keys()) {
+      if (name.startsWith("script-src-")) problems.push(`the policy sets ${name}, which overrides script-src`);
+    }
+    for (const name of ["object-src", "base-uri", "form-action"]) {
+      const sources = directives.get(name)?.join(" ");
+      if (sources !== "'none'") problems.push(`${name} is ${JSON.stringify(sources)}: it must be 'none'`);
+    }
+  }
+  for (const tag of tags) {
+    if (tag.name === "script") {
+      const src = tag.attrs.get("src");
+      if (src === undefined) {
+        problems.push("an inline <script>");
+      } else if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(src.trim())) {
+        problems.push(`a <script> from another origin: ${src}`);
+      }
+    }
+    for (const [name, value] of tag.attrs) {
+      if (/^on[a-z]+$/.test(name)) problems.push(`an inline event handler: <${tag.name} ${name}>`);
+      if (/^\s*javascript:/i.test(value)) problems.push(`a javascript: URL in <${tag.name} ${name}>`);
+    }
+  }
+  return problems;
+}
+
+test("the page carries its CSP first in <head>, and needs nothing looser (issue #603)", () => {
+  assert.deepEqual(pageProblems(PAGE), []);
+  // The policy is the one playground/README.md documents, word for word.
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  assert.ok(PAGE.includes(`content="${POLICY}"`), "index.html does not carry the documented policy");
+  assert.ok(readme.includes(POLICY), "playground/README.md does not document the policy");
+});
+
+test("the CSP check catches a page without the policy or with a looser one (issue #603)", () => {
+  const meta = PAGE.match(/<meta http-equiv="Content-Security-Policy"[^>]*>\n/)?.[0] ?? "";
+  const swap = (from, to) => (p) => p.replace(from, to);
+  const move = (after) => (p) => p.replace(meta, "").replace(after, `${after}${meta}`);
+  const add = (html) => swap("</body>", `${html}\n</body>`);
+  const self = "script-src 'self'";
+  const loosened = [
+    ["policy removed", swap(meta, ""), /no Content-Security-Policy/],
+    ["policy commented out", swap(meta, `<!-- ${meta.trim()} -->\n`), /no Content-Security-Policy/],
+    ["policy after the title", move("</title>\n"), /first in <head>/],
+    ["policy after the script", move("</script>\n"), /first in <head>/],
+    ["'unsafe-inline'", swap(self, `${self} 'unsafe-inline'`), /allows 'unsafe-inline'/],
+    ["'unsafe-eval'", swap(self, `${self} 'unsafe-eval'`), /allows 'unsafe-eval'/],
+    ["another script host", swap(self, `${self} https://cdn.example.com`), /script-src is/],
+    ["a wildcard", swap(self, "script-src *"), /script-src is/],
+    ["script-src dropped", swap(`${self}; `, ""), /script-src is undefined/],
+    ["script-src-elem", swap("object-src", "script-src-elem https://cdn.example.com; object-src"), /sets script-src-elem/],
+    ["object-src dropped", swap(" object-src 'none';", ""), /object-src is undefined/],
+    ["base-uri 'self'", swap("base-uri 'none'", "base-uri 'self'"), /base-uri is "'self'"/],
+    ["form-action dropped", swap("; form-action 'none'", ""), /form-action is undefined/],
+    ["an inline script", add("<script>void 0</script>"), /an inline <script>/],
+    ["a foreign script", add('<script src="https://evil.example/x.js"></script>'), /another origin/],
+    ["a protocol-relative script", add('<script src="//evil.example/x.js"></script>'), /another origin/],
+    ["an onclick", swap('id="copy"', 'id="copy" onclick="copy()"'), /event handler: <button onclick>/],
+    ["an unquoted ONERROR", swap('id="preview"', 'id="preview" ONERROR=x()'), /event handler: <img onerror>/],
+    ["a javascript: link", add('<a href="JavaScript:void 0">x</a>'), /javascript: URL/],
+  ];
+  for (const [name, mutate, expected] of loosened) {
+    const page = mutate(PAGE);
+    assert.ok(page !== PAGE, `the "${name}" edit does not apply to index.html`);
+    const problems = pageProblems(page);
+    assert.ok(problems.some((p) => expected.test(p)), `${name}: ${JSON.stringify(problems)}`);
+  }
+});
+
+test("the page's scripts import only same-origin modules and need no eval (issue #603)", () => {
+  // script-src 'self' blocks a module from another origin and eval,
+  // so neither may be needed for the page to work under its policy.
+  const dir = new URL("../", import.meta.url);
+  const files = ["app.mjs", "lib.mjs", ...readdirSync(new URL("sdk/", dir)).map((f) => `sdk/${f}`)];
+  for (const file of files) {
+    const source = readFileSync(new URL(file, dir), "utf8");
+    const imports = [
+      ...source.matchAll(/^(?:import|export)\s+(?:[\w$*\s{},]*?\s*from\s*)?["']([^"']+)["']/gm),
+      ...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/g),
+    ];
+    for (const [, specifier] of imports) {
+      assert.match(specifier, /^\.{1,2}\//, `${file} imports ${specifier}`);
+    }
+    assert.doesNotMatch(source, /\beval\s*\(|\bFunction\s*\(/, file);
   }
 });

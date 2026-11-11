@@ -466,7 +466,8 @@ import { explainUrl } from "./explain.ts";
 
 /**
  * Verify a URL's signature locally. Returns true or false, or
- * null when the URL is unsigned or malformed.
+ * null when the URL is unsigned or malformed, or longer than
+ * the 64 KiB the explainer reads.
  *
  * With a single secret string, the key ID (when the URL
  * carries one) is ignored: the question is whether this

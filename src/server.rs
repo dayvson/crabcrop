@@ -2919,11 +2919,22 @@ fn negotiate(
 
     // The quantized width a width hint resolves to, when the
     // ops size nothing themselves. It is part of what the
-    // response is, so it joins the cache key below.
+    // response is, so it joins the cache key below. A hint
+    // is advisory (issue #615): when the ops it adds would
+    // take the list past the operation cap the URL passed,
+    // it is dropped, and the request renders and caches as
+    // the hint-less URL does instead of failing in the
+    // engine after the fetch.
     let hinted_width = if directives.has_size_operation {
         None
     } else {
-        width_hint.map(|w| quantize_width(w, state.width_step))
+        width_hint
+            .map(|w| quantize_width(w, state.width_step))
+            .filter(|&w| {
+                let added = width_hint_ops(w, directives.no_upscale);
+                crate::url::operation_count(ops) + crate::url::operation_count(&added)
+                    <= crate::url::MAX_OPERATIONS
+            })
     };
     // Save-Data applies when the hint is present and the URL
     // names no quality directive. This one decision drives
@@ -4331,6 +4342,26 @@ async fn load_watermarks(
     }))
 }
 
+/// The operations a width hint puts in front of the URL's
+/// own: the width-only size op, plus `no_upscale` unless
+/// the request already has it. [`negotiate`] counts them
+/// against the operation cap before it keeps the hint
+/// (issue #615), and [`build_job`] adds them.
+fn width_hint_ops(width: u32, no_upscale: bool) -> Vec<crate::url::Operation> {
+    let mut ops = vec![crate::url::Operation::Size(crate::url::ImageSize {
+        width: crate::url::Dimension::Pixels(width),
+        height: crate::url::Dimension::Proportional,
+        flip_horizontal: false,
+        flip_vertical: false,
+    })];
+    if !no_upscale {
+        ops.push(crate::url::Operation::Filters(vec![
+            crate::url::Filter::NoUpscale,
+        ]));
+    }
+    ops
+}
+
 /// The engine job for a miss: the request's operations and
 /// directives with the server's providers and settings.
 fn build_job(
@@ -4351,17 +4382,7 @@ fn build_job(
     // synthesized op is the only resize it can bound.
     let job_ops = match work.hinted_width {
         Some(w) => {
-            let mut combined = vec![crate::url::Operation::Size(crate::url::ImageSize {
-                width: crate::url::Dimension::Pixels(w),
-                height: crate::url::Dimension::Proportional,
-                flip_horizontal: false,
-                flip_vertical: false,
-            })];
-            if !directives.no_upscale {
-                combined.push(crate::url::Operation::Filters(vec![
-                    crate::url::Filter::NoUpscale,
-                ]));
-            }
+            let mut combined = width_hint_ops(w, directives.no_upscale);
             combined.extend(work.ops.iter().cloned());
             combined
         }

@@ -249,7 +249,12 @@ function isIntIn(s, min, max) {
     // unsigned parsers accept '+' too), then digits.
     return /^[+-]?\d+$/.test(s) && BigInt(s) >= BigInt(min) && BigInt(s) <= BigInt(max);
 }
-const RUST_FLOAT = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+// The fraction digits can only follow a literal dot, so a run
+// of digits has one way to match and a long run costs linear
+// time. The older `\d+\.?\d*` could split one run at any point
+// and took quadratic time when the match failed (issue #594).
+// Both accept the same strings.
+const RUST_FLOAT = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 function isFloat(s) {
     // Rust's f32::from_str syntax (AP-23): plain decimal with
     // an optional exponent; no hex, no surrounding whitespace,
@@ -1015,6 +1020,18 @@ function isSizeShaped(seg) {
     return spelling(left) || spelling(right);
 }
 /**
+ * The most input explainUrl reads, in UTF-8 bytes: 64 KiB. It
+ * bounds the work one call does, and it sits above the URL
+ * limits of common CDNs and proxies.
+ */
+const MAX_EXPLAIN_BYTES = 64 * 1024;
+function utf8Length(text) {
+    // UTF-8 never takes fewer bytes than UTF-16 code units, so
+    // the caller checks .length first and this only runs on
+    // input of at most MAX_EXPLAIN_BYTES code units.
+    return new TextEncoder().encode(text).length;
+}
+/**
  * Parse a crabcrop URL (or bare path) back into its pieces,
  * explaining each segment. Mirrors the server's dispatch:
  * segments are operations until the first segment that is not
@@ -1022,8 +1039,21 @@ function isSizeShaped(seg) {
  *
  * Returns { signature, segments, source, remainder, errors }
  * where segments carry { raw, kind, title, detail?, error? }.
+ *
+ * Input longer than MAX_EXPLAIN_BYTES is not read: the answer
+ * is one error and no signature, so verifyUrlSignature returns
+ * null for it.
  */
 export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
+    if (input.length > MAX_EXPLAIN_BYTES || utf8Length(input) > MAX_EXPLAIN_BYTES) {
+        return {
+            signature: null,
+            segments: [],
+            source: "",
+            remainder: "",
+            errors: [`the URL is longer than 64 KiB (${MAX_EXPLAIN_BYTES} bytes): the explainer does not read it`],
+        };
+    }
     // Extract the path by string surgery, never via the URL
     // parser: WHATWG parsing resolves dot segments (.. and
     // %2e%2e) that the server treats as literal path bytes

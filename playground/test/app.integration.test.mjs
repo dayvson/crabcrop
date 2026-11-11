@@ -9,57 +9,9 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { installDom } from "./dom-stub.mjs";
 
-class StubElement {
-  constructor(tag = "div") {
-    this.tagName = tag;
-    this.children = [];
-    this.listeners = {};
-    this.value = "";
-    this.textContent = "";
-    this.className = "";
-  }
-  addEventListener(name, fn) {
-    (this.listeners[name] ??= []).push(fn);
-  }
-  async dispatch(name) {
-    for (const fn of this.listeners[name] ?? []) await fn();
-  }
-  appendChild(child) {
-    this.children.push(child);
-    return child;
-  }
-  append(...children) {
-    this.children.push(...children);
-  }
-  replaceChildren(...children) {
-    this.children = children;
-  }
-  set src(v) {
-    this._src = v;
-  }
-  get src() {
-    return this._src;
-  }
-  removeAttribute(name) {
-    if (name === "src") this._src = undefined;
-  }
-}
-
-const ids = [
-  "base", "secret", "source", "operations", "preset", "expiry",
-  "built", "preview", "sizes", "chips", "copy",
-  "explain-input", "explain-built", "explanation", "verify-line",
-];
-const elements = Object.fromEntries(ids.map((id) => [id, new StubElement()]));
-globalThis.document = {
-  getElementById: (id) => elements[id],
-  createElement: (tag) => new StubElement(tag),
-};
-Object.defineProperty(globalThis, "navigator", {
-  value: { clipboard: { writeText: async () => {} } },
-  configurable: true,
-});
+const elements = installDom();
 
 elements.base.value = "http://127.0.0.1:3321";
 elements.secret.value = "playground-secret";
@@ -72,8 +24,13 @@ assert.ok(health?.ok, "precondition: crabcrop must be running on 127.0.0.1:3321"
 
 await import("../app.mjs");
 
-// Rebuild + size measurement are async; wait for both to land.
-for (let i = 0; i < 100 && !elements.sizes.textContent; i++) {
+// The build is async; wait for it. The size check waits for the
+// first edit (issue #603), so make one, then wait for the sizes.
+for (let i = 0; i < 100 && !elements.built.value; i++) {
+  await new Promise((r) => setTimeout(r, 100));
+}
+await elements.operations.dispatch("input");
+for (let i = 0; i < 100 && !/Original|unavailable/.test(elements.sizes.textContent); i++) {
   await new Promise((r) => setTimeout(r, 100));
 }
 
