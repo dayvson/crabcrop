@@ -145,8 +145,10 @@ def check(root, strict=False):
         f"({names}), but RENDERING_VERSION is still {now}. A re-baseline means existing "
         "URLs render differently, and without a new rendering version upgraded servers "
         "keep serving the old renders from the persistent tiers. Raise RENDERING_VERSION "
-        "in src/main.rs and say in CHANGELOG.md that the release starts a new cache epoch "
-        "(see RELEASING.md)."
+        "in src/main.rs and say that the release starts a new cache epoch, in a note that "
+        "opens 'This release starts a new cache epoch' and leads Changed: a line under "
+        "## [Unreleased] in CHANGELOG.md or a changelog.d/<issue>.changed.md fragment "
+        "(see RELEASING.md step 4)."
     )
 
 

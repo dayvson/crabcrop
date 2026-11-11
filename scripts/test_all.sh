@@ -92,7 +92,7 @@ step "Release scripts (the preflight checks, and creating or updating the GitHub
 python3 scripts/test_release_preflight.py
 python3 scripts/test_publish_github_release.py
 
-step "Docs sync (env vars, error codes, filters and the CHANGELOG heading match the code)"
+step "Docs sync (env vars, error codes, filters and the CHANGELOG heading match the code, and the changelog fragments assemble)"
 python3 scripts/check_docs.py
 python3 scripts/test_check_docs.py
 
