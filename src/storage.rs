@@ -1683,9 +1683,8 @@ impl DiskStore {
     /// [`Waited`]): a disk that stops answering, a slow one, or
     /// one busy with other jobs that come first. Deletions that
     /// failed are not waited for; they are retried and counted.
-    /// Only
-    /// these deletions wake the wait, and each one counts down
-    /// what it waits for at a constant cost, so other jobs
+    /// Only these deletions wake the wait, and each one counts
+    /// down what it waits for at a constant cost, so other jobs
     /// ending do not restart the idle time, and neither many
     /// waits nor one purge of many files slows the drain.
     pub async fn wait_deletions(
