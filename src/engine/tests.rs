@@ -7406,6 +7406,9 @@ fn a_watermark_past_the_deadline_times_out() {
             Err(e) => panic!("{filter:?} failed with {e:?}, not Timeout"),
         }
     }
+    // Nothing was copied: the deadline is checked before the
+    // copy, not only per row of the blend after it.
+    assert_eq!(map["wm"].conversions(), 0);
 }
 
 #[test]
