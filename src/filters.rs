@@ -66,7 +66,219 @@ impl EncodeOptions {
 /// Watermark images resolved by the server, keyed by the URL
 /// the request referenced. The engine only ever sees pixels;
 /// fetching happens outside it.
-pub type WatermarkImages = std::collections::HashMap<String, DynamicImage>;
+pub type WatermarkImages = std::collections::HashMap<String, WatermarkImage>;
+
+/// One decoded watermark or overlay image (issue #604). The
+/// composite reads RGBA pixels, and only those of the part
+/// that lands on the image below. An image that decoded as
+/// RGBA is read in place. Any other has that part copied to
+/// RGBA the first time a composite draws it there, and the
+/// copy is kept for the rest of the request. So an animated
+/// source, whose frames all place it the same way, copies
+/// each part once, however many frames it has. The kept
+/// copies hold at most as many pixels as the whole image; a
+/// part past that is copied each time it is drawn, and is
+/// never larger than the image below. The decoded image stays
+/// as it is, because `overlay(...,width)` resizes that one.
+#[derive(Debug)]
+pub struct WatermarkImage {
+    image: DynamicImage,
+    /// The kept RGBA copies, each with the part of the image
+    /// it covers.
+    kept: std::sync::Mutex<Vec<(Rect, std::sync::Arc<image::RgbaImage>)>>,
+    /// How many RGBA copies were made, kept or not, and how
+    /// many pixels they held in all.
+    #[cfg(test)]
+    conversions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    copied_pixels: std::sync::atomic::AtomicU64,
+}
+
+/// A part of an image: x, y, width, height.
+pub type Rect = (u32, u32, u32, u32);
+
+/// Whether the part `outer` of an image holds all of the part
+/// `inner`.
+fn covers((ox, oy, ow, oh): Rect, (x, y, w, h): Rect) -> bool {
+    let end = |at: u32, len: u32| at as u64 + len as u64;
+    x >= ox && y >= oy && end(x, w) <= end(ox, ow) && end(y, h) <= end(oy, oh)
+}
+
+/// How many pixels a part holds.
+fn area((_, _, w, h): Rect) -> u64 {
+    w as u64 * h as u64
+}
+
+impl WatermarkImage {
+    pub fn new(image: DynamicImage) -> Self {
+        WatermarkImage {
+            image,
+            kept: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            conversions: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            copied_pixels: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The image as it decoded.
+    pub fn image(&self) -> &DynamicImage {
+        &self.image
+    }
+
+    /// The RGBA pixels of the part `rect` of the image: read
+    /// in place when the image decoded as RGBA, from a kept
+    /// copy when one covers `rect`, and otherwise from a copy
+    /// of `rect` alone. That copy is kept when the kept copies
+    /// still hold no more pixels than the whole image with it.
+    pub fn rgba_part(&self, rect: Rect) -> RgbaPart<'_> {
+        if self.image.as_rgba8().is_some() {
+            return RgbaPart::of(&self.image, rect);
+        }
+        let size = (self.image.width(), self.image.height());
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((part, pixels)) = kept.iter().find(|(part, _)| covers(*part, rect)) {
+            return RgbaPart {
+                pixels: Pixels::Copied(pixels.clone()),
+                origin: (part.0, part.1),
+                size,
+            };
+        }
+        // A kept copy that `rect` covers is not needed any more.
+        kept.retain(|(part, _)| !covers(rect, *part));
+        let pixels = std::sync::Arc::new(self.copy_part(rect));
+        let held: u64 = kept.iter().map(|(part, _)| area(*part)).sum();
+        if held + area(rect) <= area((0, 0, size.0, size.1)) {
+            kept.push((rect, pixels.clone()));
+        }
+        RgbaPart {
+            pixels: Pixels::Copied(pixels),
+            origin: (rect.0, rect.1),
+            size,
+        }
+    }
+
+    fn copy_part(&self, rect: Rect) -> image::RgbaImage {
+        let pixels = copy_part(&self.image, rect);
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.conversions.fetch_add(1, Relaxed);
+            let (w, h) = pixels.dimensions();
+            self.copied_pixels.fetch_add(w as u64 * h as u64, Relaxed);
+        }
+        pixels
+    }
+
+    /// The most memory this image holds (issue #613): its
+    /// decoded pixels, plus an RGBA copy of all of it when it
+    /// did not decode as RGBA. The kept copies hold at most
+    /// that many pixels together, and are counted at the whole
+    /// image's size whether or not they have been made.
+    pub fn held_bytes(&self) -> u64 {
+        let decoded = self.image.as_bytes().len() as u64;
+        if self.image.as_rgba8().is_some() {
+            decoded
+        } else {
+            decoded + self.image.width() as u64 * self.image.height() as u64 * 4
+        }
+    }
+
+    /// How many RGBA copies were made, kept or not.
+    #[cfg(test)]
+    pub(crate) fn conversions(&self) -> usize {
+        self.conversions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many pixels the RGBA copies held in all, kept or
+    /// not.
+    #[cfg(test)]
+    pub(crate) fn copied_pixels(&self) -> u64 {
+        self.copied_pixels
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The parts the kept RGBA copies cover, each with the
+    /// size of its copy.
+    #[cfg(test)]
+    pub(crate) fn kept_parts(&self) -> Vec<(Rect, (u32, u32))> {
+        let kept = self.kept.lock().unwrap();
+        kept.iter()
+            .map(|(part, pixels)| (*part, pixels.dimensions()))
+            .collect()
+    }
+}
+
+/// The part `rect` of `image` in RGBA. Each pixel converts on
+/// its own, so the part converts to the same pixels as the
+/// same part of the whole image does.
+fn copy_part(image: &DynamicImage, (x, y, w, h): Rect) -> image::RgbaImage {
+    image.crop_imm(x, y, w, h).into_rgba8()
+}
+
+/// The RGBA pixels of a part of an image (issue #604), read
+/// in the whole image's coordinates. A composite reads only
+/// the part it asked for; reading a pixel outside it panics.
+pub struct RgbaPart<'a> {
+    pixels: Pixels<'a>,
+    /// Where `pixels` starts in the whole image.
+    origin: (u32, u32),
+    /// The whole image's size.
+    size: (u32, u32),
+}
+
+/// Where the pixels of an [`RgbaPart`] live.
+enum Pixels<'a> {
+    /// The image's own pixels, when it decoded as RGBA.
+    InPlace(&'a image::RgbaImage),
+    /// A copy of the part, which a [`WatermarkImage`] may keep.
+    Copied(std::sync::Arc<image::RgbaImage>),
+}
+
+impl<'a> RgbaPart<'a> {
+    /// The part `rect` of `image`: all of it read in place
+    /// when it is RGBA, otherwise a copy of `rect` alone.
+    pub fn of(image: &'a DynamicImage, rect: Rect) -> Self {
+        let size = (image.width(), image.height());
+        match image.as_rgba8() {
+            Some(pixels) => RgbaPart {
+                pixels: Pixels::InPlace(pixels),
+                origin: (0, 0),
+                size,
+            },
+            None => RgbaPart {
+                pixels: Pixels::Copied(std::sync::Arc::new(copy_part(image, rect))),
+                origin: (rect.0, rect.1),
+                size,
+            },
+        }
+    }
+}
+
+impl image::GenericImageView for RgbaPart<'_> {
+    type Pixel = image::Rgba<u8>;
+
+    fn dimensions(&self) -> (u32, u32) {
+        self.size
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> image::Rgba<u8> {
+        let pixels = match &self.pixels {
+            Pixels::InPlace(pixels) => pixels,
+            Pixels::Copied(pixels) => pixels.as_ref(),
+        };
+        *pixels.get_pixel(x - self.origin.0, y - self.origin.1)
+    }
+}
+
+impl From<DynamicImage> for WatermarkImage {
+    fn from(image: DynamicImage) -> Self {
+        WatermarkImage::new(image)
+    }
+}
 
 /// The sigma a `Filter::Blur` applies with. The parser caps
 /// sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,
