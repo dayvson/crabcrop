@@ -76,14 +76,19 @@ to it. This holds for a child without capabilities, as the images run the
 server: as `nobody`, with none. A privileged process, such as one with
 `CAP_SYS_PTRACE`, can still read them. The mark has two side effects: the
 server leaves no core dump, and unprivileged tools that run as the server's
-user (a debugger, a profiler, a process exporter) can no longer read its
-`/proc` files. If the kernel refuses the mark, the server says so on stderr and
-starts anyway.
+user (a debugger, a profiler, a process exporter) can no longer attach to it or
+read its environment, memory maps, open files or I/O counters in `/proc` (`ps`
+and `top` still work). If the kernel refuses the mark, the server says so on
+stderr and starts anyway.
 
 The children still run as the server's user, with no sandbox. A compromised
 child can signal the server and read or write any file the server can: the
 presets and source roots files, the C2PA signing key (`CRABCROP_C2PA_KEY`), and
-the disk result tier (`CRABCROP_RESULT_STORAGE_DIR`). Running children under a
-separate user or in a sandbox (seccomp or Landlock) is not decided yet; issue
-#605 tracks it. Until then, configure only the tools you need, and give the
-server's user no files it does not need.
+the disk result tier (`CRABCROP_RESULT_STORAGE_DIR`). It can also read the
+environment of other processes that run as that user with the same
+environment: in the Docker images, the `HEALTHCHECK` (`sh` and `curl`, every
+30 s), and any `docker exec` or `kubectl exec` session. The Kubernetes recipes
+probe over HTTP from outside the container, and the VM unit keeps the env file
+root-only. Running children under a separate user or in a sandbox (seccomp or
+Landlock) is not decided yet; issue #605 tracks it. Until then, configure only
+the tools you need, and give the server's user no files it does not need.

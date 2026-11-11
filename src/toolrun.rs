@@ -53,8 +53,9 @@
 //! Linux the server marks itself non-dumpable at startup,
 //! which keeps such a tool out of the server's `/proc`
 //! files (its environment and memory). A tool whose program
-//! the server's user can read is dumpable again after its
-//! exec, so the OOM score write above still works.
+//! the server's user can read is dumpable again once its
+//! exec completes; `spawn` can return just before that, so
+//! the OOM score write retries for up to 2 ms.
 //! SECURITY.md records this.
 
 use std::fs::File;
@@ -529,7 +530,19 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
                 maximum: Some(0),
             },
         );
-        let _ = std::fs::write(format!("/proc/{raw}/oom_score_adj"), "1000");
+        // `spawn` can return a moment before the child's exec makes
+        // it dumpable again (issue #605). Until then its `/proc`
+        // files belong to root, and a non-root server's write is
+        // refused. The window is well under a millisecond.
+        let path = format!("/proc/{raw}/oom_score_adj");
+        for _ in 0..20 {
+            match std::fs::write(&path, "1000") {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                _ => break,
+            }
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

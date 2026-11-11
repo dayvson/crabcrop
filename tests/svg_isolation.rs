@@ -515,7 +515,10 @@ fn a_child_cannot_read_the_servers_environment_and_the_worker_still_renders() {
     // compromised decoder could read the server's secrets
     // from `/proc/<server pid>/environ` while the server was
     // dumpable. This fake decoder tries that, then reports the
-    // OOM score the server gave it, and fails the probe.
+    // OOM score the server gave it, and fails the probe. It
+    // runs ten times: `spawn` can return before the child's
+    // exec makes it dumpable again, and the server's OOM score
+    // write must still land then.
     use std::os::unix::fs::PermissionsExt;
     let dir = source_dir("not-dumpable");
     std::fs::write(dir.join("clip.mp4"), b"not a real video").unwrap();
@@ -546,11 +549,17 @@ fn a_child_cannot_read_the_servers_environment_and_the_worker_still_renders() {
         &dir,
         &[("CRABCROP_VIDEO_DECODER", decoder.to_str().unwrap())],
     );
-    let (status, body, _) = get(port, "/unsafe/frame:poster/50x50/file:///clip.mp4");
-    assert_ne!(status, 200, "{}", String::from_utf8_lossy(&body));
+    const RUNS: usize = 10;
+    for _ in 0..RUNS {
+        let (status, body, _) = get(port, "/unsafe/frame:poster/50x50/file:///clip.mp4");
+        assert_ne!(status, 200, "{}", String::from_utf8_lossy(&body));
+    }
     let log = std::fs::read_to_string(&log).expect("the decoder ran");
+    let parent = format!("ppid {}", server.0.id());
+    let parents: Vec<&str> = log.lines().filter(|l| l.starts_with("ppid ")).collect();
+    assert_eq!(parents.len(), RUNS, "{log}");
     assert!(
-        log.contains(&format!("ppid {}\n", server.0.id())),
+        parents.iter().all(|line| *line == parent),
         "the decoder's parent is not the server: {log}"
     );
     let seen = std::fs::read(&seen).unwrap_or_default();
@@ -558,10 +567,11 @@ fn a_child_cannot_read_the_servers_environment_and_the_worker_still_renders() {
         !String::from_utf8_lossy(&seen).contains("CRABCROP_SECRET="),
         "a child read the server's secret from /proc: {log}"
     );
-    assert!(log.contains("environ refused"), "{log}");
+    assert_eq!(log.matches("environ refused\n").count(), RUNS, "{log}");
     assert!(!log.contains("environ read"), "{log}");
-    // The server still sets the OOM score of a child it starts.
-    assert!(log.contains("oom_score_adj 1000\n"), "{log}");
+    // The server still sets the OOM score of every child it
+    // starts.
+    assert_eq!(log.matches("oom_score_adj 1000\n").count(), RUNS, "{log}");
     // The worker starts from the server's own image and renders.
     let (status, body, _) = get(port, "/unsafe/32x32/file:///ok.svg");
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));

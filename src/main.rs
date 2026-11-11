@@ -84,11 +84,12 @@ fn main() {
 /// secrets from `/proc/<pid>/environ`, read its memory, or
 /// attach to it. Now only a privileged process can, such as
 /// one with `CAP_SYS_PTRACE`, and the server leaves no core
-/// dump. A child is dumpable again after its exec, so the
-/// server can still set a tool's OOM score, and the worker
-/// its own. This does not stop a child from signalling the
-/// server or reading its files: only a separate user or a
-/// sandbox would (see SECURITY.md).
+/// dump. A child is dumpable again once its exec completes,
+/// so the server can still set a tool's OOM score (see
+/// `toolrun::limit_child`), and the worker its own. This
+/// does not stop a child from signalling the server or
+/// reading its files: only a separate user or a sandbox
+/// would (see SECURITY.md).
 fn not_dumpable() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Err(e) =
