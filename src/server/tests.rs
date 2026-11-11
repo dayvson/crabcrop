@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+mod disk_hang;
+
 const SECRET: &[u8] = b"test-secret";
 
 fn sign(remainder: &str) -> String {
