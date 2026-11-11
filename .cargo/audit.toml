@@ -2,20 +2,31 @@
 #
 # One advisory is ignored, with cause:
 #
-# RUSTSEC-2023-0071 (crate: rsa 0.9.10, "Marvin Attack") is a timing
-# sidechannel in RSA PKCS#1 v1.5 decryption. Exploiting it needs a
-# decryption oracle: an attacker who can submit many chosen
-# ciphertexts to a private-key decryption operation and measure the
-# timing. crabcrop has no such surface. The rsa crate enters the tree
-# only through c2pa (content provenance), where it is used to verify
-# signatures and to sign outputs with an operator-supplied key.
-# Signing is not decryption, no RSA private key in this codebase ever
-# decrypts attacker-supplied data, and verification uses public keys.
-# The advisory also has no fixed release ("No fixed upgrade is
-# available"), so there is no version to move to; the crate arrives
-# transitively via c2pa_raw_crypto and cannot be dropped without
-# dropping C2PA support. The ignore is scoped to this single advisory
-# so any other finding still fails the audit job. Revisit when the
-# rsa crate ships a fix or c2pa drops the dependency.
+# RUSTSEC-2023-0071 (crate: rsa 0.9.10, "Marvin Attack"): the rsa
+# crate's big-number code does not run in constant time, so an RSA
+# private-key operation leaks information about the key through its
+# timing. The crate enters the tree only through c2pa (content
+# provenance), via c2pa_raw_crypto: it verifies RSA signatures with
+# public keys, and it signs outputs when the operator's C2PA key is an
+# RSA key.
+#
+# The affected code runs in crabcrop. With an RSA key, every signed
+# output (each cache miss of a still JPEG, PNG, WebP or AVIF) runs an
+# RSA-PSS private-key operation, and c2pa_raw_crypto 0.3.0 signs with
+# rsa::pss::SigningKey, which does not blind it (issue #600). What
+# keeps it hard to exploit: the value signed is the PSS encoding of the
+# manifest hash with a fresh random salt, so a client cannot choose
+# it; the timing sits under a full fetch, decode, render and encode;
+# each sample needs a cache miss; and on a signed-URL deployment a
+# client cannot mint new URLs. ECDSA and Ed25519 keys do not sign with
+# the rsa crate. Boot names the signing algorithm and warns for an RSA
+# key, and docs/configuration.md recommends P-256 or Ed25519.
+#
+# rsa 0.10.0 fixes the advisory, but the tree cannot move to it yet:
+# c2pa 0.91.11, the newest c2pa, requires c2pa_raw_crypto ^0.3.0, and
+# c2pa_raw_crypto 0.3.0, its newest release, requires rsa ^0.9.10. The
+# crate cannot be dropped without dropping C2PA support. The ignore is
+# scoped to this one advisory, so any other finding still fails the
+# audit job. Revisit when c2pa_raw_crypto (or c2pa) accepts rsa 0.10.
 [advisories]
 ignore = ["RUSTSEC-2023-0071"]

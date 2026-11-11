@@ -10721,6 +10721,51 @@ async fn meta_reports_provenance_without_a_signer() {
 }
 
 #[tokio::test]
+async fn meta_reports_signer_names_as_one_bounded_line() {
+    // Issue #595: a signer is the name its certificate
+    // gives, and whoever made the source chose the source's.
+    // A name of 174 characters over two lines reads back as
+    // one line of 64 characters, cut with a marker, on the
+    // source side and on the output side alike.
+    let long_name = crate::provenance::test_signer_with_a_long_name();
+    let signed_source = long_name
+        .sign(
+            &test_png(),
+            "image/png",
+            &crate::provenance::SignRequest {
+                ingredient: None,
+                ai_edited: false,
+            },
+        )
+        .unwrap();
+    let src = spawn_bytes_server(signed_source).await;
+    let remainder = format!("40x24/{src}");
+    let url_path = format!("/{}/{remainder}", sign(&remainder));
+    let reader = spawn_app(false).await;
+    let signing = spawn_app_with_provenance_signer(long_name).await;
+    for (base, side) in [(reader, "source"), (signing, "output")] {
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let summary = &meta["provenance"][side];
+        assert_eq!(summary["state"], "valid", "{side}");
+        let signer = summary["signer"].as_str().expect("a signer is named");
+        assert_eq!(signer.chars().count(), 64, "{side}: {signer:?}");
+        assert!(!signer.chars().any(char::is_control), "{side}: {signer:?}");
+        assert!(
+            signer.starts_with("crabcrop test signer with a long name"),
+            "{side}: {signer:?}"
+        );
+        assert!(signer.ends_with('…'), "{side}: {signer:?}");
+    }
+}
+
+#[tokio::test]
 async fn signing_server_signs_image_responses() {
     let base = spawn_app_with_signer().await;
     let src = spawn_image_server().await;
