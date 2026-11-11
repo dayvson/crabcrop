@@ -35,7 +35,7 @@ Usage:
 
 --check prints ## [Unreleased] as the release will write it, the fragments
 in place, and writes nothing; it exits 1 only when a fragment is malformed
-(or CHANGELOG.md has no ## [Unreleased] to assemble into). Given a version,
+(or CHANGELOG.md has no single ## [Unreleased] to assemble into). Given a version,
 the script moves ## [Unreleased]'s entries and every fragment into a new
 ## [X.Y.Z] - YYYY-MM-DD section (today by default), leaves an empty
 ## [Unreleased] above it, and deletes the fragments it wrote; headings left
@@ -241,11 +241,19 @@ def read_fragments(root):
 
 def locate(lines):
     """(start, end): the ## [Unreleased] heading's index and the next ## heading's."""
-    for start, line in enumerate(lines):
-        if line.rstrip() == UNRELEASED:
-            break
-    else:
+    found = [i for i, line in enumerate(lines) if line.rstrip() == UNRELEASED]
+    if not found:
         raise AssembleError([f"{CHANGELOG} has no {UNRELEASED} section to assemble into"])
+    if len(found) > 1:
+        # A release would take the first and leave the second's entries
+        # below it, where no later release looks.
+        raise AssembleError(
+            [
+                f"{CHANGELOG} has {len(found)} {UNRELEASED} sections, at lines "
+                f"{', '.join(str(i + 1) for i in found)}: merge them into the first"
+            ]
+        )
+    start = found[0]
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
     return start, end
 
@@ -261,7 +269,11 @@ def load(root):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise AssembleError([f"{CHANGELOG} is missing"]) from None
-    lines = text.splitlines()
+    # Lines end at "\n" alone (reading turned CRLF into it); splitlines()
+    # would also break at a form feed or U+2028 inside an entry.
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
     start, end = locate(lines)
     fragments, problems = read_fragments(root)
     notes = sum(1 for line in lines[start + 1 : end] if is_epoch(line))
@@ -392,6 +404,8 @@ def plan(root, version, date=None):
         f"## [{version}] - {date} holds {hand} hand-written entr{'y' if hand == 1 else 'ies'} "
         f"and {len(fragments)} fragment(s)"
     )
+    if not section:
+        note += f"; it is empty, since {UNRELEASED} and {FRAGMENTS}/ held nothing to release"
     return Plan("\n".join(new) + "\n", [f"{FRAGMENTS}/{f.name}" for f in fragments], note)
 
 

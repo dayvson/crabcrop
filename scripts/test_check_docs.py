@@ -689,6 +689,12 @@ class TreeChecks(unittest.TestCase):
         self.write("changelog.d/7.feature.md", "A thing (issue #7).\n")
         self.assertOnly("changelog", "changelog.d/7.feature.md", "unknown section 'feature'")
 
+    def test_changelog_two_unreleased_sections(self):
+        # As a conflict resolution can leave it: a release would take the
+        # first section and strand the second's entries below it.
+        self.edit("CHANGELOG.md", "## [Unreleased]\n\n", "## [Unreleased]\n\n- One (issue #1).\n\n## [Unreleased]\n\n")
+        self.assertOnly("changelog", "has 2 ## [Unreleased] sections")
+
     def test_changelog_second_cache_epoch_note(self):
         self.write("changelog.d/7.changed.md", "This release starts a new cache epoch (issue #7).\n")
         self.write("changelog.d/9.changed.md", "This release starts a new cache epoch (issue #9).\n")
@@ -1407,6 +1413,49 @@ class AssembleChangelog(unittest.TestCase):
                 self.assertNotEqual(done.returncode, 0, done.stdout)
                 self.assertIn(message, done.stderr)
                 self.assertEqual(self.snapshot(), before)
+
+    def test_a_second_unreleased_section_is_refused(self):
+        self.write(
+            "CHANGELOG.md",
+            ASSEMBLY_CHANGELOG.replace("## [0.1.0]", "## [Unreleased]\n\n- Stranded (issue #2).\n\n## [0.1.0]"),
+        )
+        before = self.snapshot()
+        for args in (("--check",), ("0.2.0", "--date", "2026-02-03")):
+            with self.subTest(args=args):
+                done = self.run_script(*args)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("CHANGELOG.md has 2 ## [Unreleased] sections, at lines 5, 17", done.stderr)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_unusual_line_breaks_keep_their_bytes(self):
+        # Only "\n" ends a line: a form feed or U+2028 pasted into an
+        # entry, released or not, is part of the entry and reaches the
+        # release as written.
+        changelog = ASSEMBLY_CHANGELOG.replace(
+            "- A hand-written fix (issue #30).", "- A hand-written fix\u2028### pasted (issue #30)."
+        ).replace("- First.", "- First\x0cone\x85two\u2029three.")
+        self.write("CHANGELOG.md", changelog)
+        for name in ASSEMBLY_FRAGMENTS:
+            if name != "README.md":
+                (self.root / "changelog.d" / name).unlink()
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with open(self.root / "CHANGELOG.md", encoding="utf-8", newline="") as f:
+            self.assertEqual(
+                f.read(), changelog.replace("## [Unreleased]\n", "## [Unreleased]\n\n## [0.2.0] - 2026-02-03\n", 1)
+            )
+
+    def test_an_empty_release_says_so(self):
+        self.write("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n## [0.1.0] - 2026-01-01\n\n- First.\n")
+        for name in ASSEMBLY_FRAGMENTS:
+            if name != "README.md":
+                (self.root / "changelog.d" / name).unlink()
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("it is empty, since ## [Unreleased] and changelog.d/ held nothing to release", done.stdout)
+        self.assertEqual(
+            self.changelog(), "# Changelog\n\n## [Unreleased]\n\n## [0.2.0] - 2026-02-03\n\n## [0.1.0] - 2026-01-01\n\n- First.\n"
+        )
 
     def test_a_changelog_without_unreleased_is_refused(self):
         self.write("CHANGELOG.md", "# Changelog\n\n## [0.1.0] - 2026-01-01\n\n- First.\n")
