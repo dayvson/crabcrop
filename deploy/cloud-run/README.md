@@ -116,8 +116,8 @@ Create the HMAC keys for the runtime service account in
 the Cloud Storage settings, and give that account object
 admin on the one bucket. (`CRABCROP_S3_ENDPOINT` and
 `CRABCROP_S3_REGION` are the same settings the S3 source
-loader uses; the main README's configuration table lists
-them.)
+loader uses; [docs/configuration.md](../../docs/configuration.md)
+lists them.)
 
 ## Smoke checklist
 

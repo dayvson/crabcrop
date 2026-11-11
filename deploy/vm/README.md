@@ -151,8 +151,8 @@ When one host stops being enough, nothing here is
 throwaway: the same environment file drives the
 Kubernetes and cloud recipes, and several hosts behind a
 load balancer can share the third tier by setting
-`CRABCROP_RESULT_BUCKET` (see the main README's
-Configuration table).
+`CRABCROP_RESULT_BUCKET` (see
+[docs/configuration.md](../../docs/configuration.md)).
 
 ## Teardown
 
