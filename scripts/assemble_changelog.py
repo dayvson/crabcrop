@@ -14,18 +14,19 @@ release gathers them.
            added, changed, deprecated, removed, fixed, security.
   Text     One paragraph in CHANGELOG.md's house style, naming its issue the
            way the entries there do, "(issue #N)" or "(issues #N and #M)".
-           Wrapped lines are joined with one space, surrounding blank lines
-           and a leading "- " are dropped (the assembler writes the bullet),
-           and a blank line, a second bullet or a heading line is refused.
+           Wrapped lines are joined with one space, a byte-order mark,
+           surrounding blank lines and a leading "- " are dropped (the
+           assembler writes the bullet), and a blank line, a second bullet
+           or a heading line is refused.
   Order    Sections in CHANGELOG.md's own order, Added, Changed, Deprecated,
            Removed, Fixed, Security, a missing heading created in its place;
            within one, the hand-written entries already under
            ## [Unreleased] first, as written, then the fragments by issue
            number, the plain name before its slugged ones, slugs
            alphabetically. A fragment that opens "This release starts a new
-           cache epoch" (RELEASING.md step 4) leads Changed instead, since
-           it speaks of the changes below it; [Unreleased] holds one such
-           note at most.
+           cache epoch" (RELEASING.md step 4, in any letter case) leads
+           Changed instead, since it speaks of the changes below it;
+           [Unreleased] holds one such note at most.
   Ignored  changelog.d/README.md and dotfiles.
 
 Usage:
@@ -66,7 +67,8 @@ EPOCH = "This release starts a new cache epoch"
 
 STEM = re.compile(r"(?P<issue>[1-9][0-9]*)(?:-(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*))?")
 ISSUE_REF = re.compile(r"\bissues?\s+#\d+(?:\s*(?:,\s*(?:and\s+)?|and\s+)#\d+)*", re.I)
-BULLET = re.compile(r"[-*+]\s+")
+# A list item's marker: a line opening with one starts another entry.
+BULLET = re.compile(r"[-*+](?:\s+|$)")
 # A Markdown heading line; "#612 and #626)" wrapped onto a line of its own is none.
 HEADING = re.compile(r"#{1,6}(?:\s|$)")
 VERSION = re.compile(r"\d+\.\d+\.\d+")
@@ -134,10 +136,17 @@ def describe(issues):
     return f"issues {', '.join(names[:-1])} and {names[-1]}"
 
 
+def opens_epoch(text):
+    """Whether an entry's text is the cache-epoch note (RELEASING.md step 4)."""
+    return text[: len(EPOCH)].lower() == EPOCH.lower()
+
+
 def entry_text(raw, issue, section):
     """The entry a fragment's bytes hold, normalized as the module says."""
     try:
-        text = raw.decode("utf-8")
+        # An editor's byte-order mark is no text: kept, it would hide a
+        # leading "- " or a cache-epoch note.
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise FragmentError("is not UTF-8 text") from None
     lines = [line.strip() for line in text.splitlines()]
@@ -145,6 +154,11 @@ def entry_text(raw, issue, section):
         lines.pop(0)
     while lines and not lines[-1]:
         lines.pop()
+    bullet = BULLET.match(lines[0]) if lines else None
+    if bullet:
+        lines[0] = lines[0][bullet.end() :]
+        if not lines[0]:  # the bullet on a line of its own
+            lines.pop(0)
     if not lines:
         raise FragmentError("is empty: write the entry's paragraph")
     if "" in lines:
@@ -152,23 +166,23 @@ def entry_text(raw, issue, section):
             "holds more than one paragraph: an entry is one paragraph "
             "(a second entry is a second fragment)"
         )
-    bullet = BULLET.match(lines[0])
-    if bullet:
-        lines[0] = lines[0][bullet.end() :]
-    if any(BULLET.match(line) for line in lines[1:]):
+    if any(BULLET.match(line) for line in lines):
         raise FragmentError(
-            "holds more than one entry: a line opening with a bullet starts another "
-            "(a second entry is a second fragment)"
+            "has a line opening with '- ', '* ' or '+ ', which starts another entry: "
+            "a second entry is a second fragment; if the paragraph wrapped there, rewrap it"
         )
     if any(HEADING.match(line) for line in lines):
-        raise FragmentError("holds a heading line ('# '): the assembler writes the headings")
+        raise FragmentError(
+            "has a line opening with '# ', a heading, which the assembler writes: "
+            "if the paragraph wrapped there, rewrap it"
+        )
     text = " ".join(lines)
     named = issues_named(text)
     if not named:
         raise FragmentError(f"names no issue: say (issue #{issue}) as the entries in {CHANGELOG} do")
     if issue not in named:
         raise FragmentError(f"names {describe(named)}, not #{issue} from its file name")
-    if text.startswith(EPOCH) and section != "changed":
+    if opens_epoch(text) and section != "changed":
         raise FragmentError(
             f"a cache-epoch note belongs under Changed: name it {issue}.changed.md"
         )
@@ -237,7 +251,7 @@ def locate(lines):
 
 
 def is_epoch(entry_line):
-    return entry_line.startswith("- " + EPOCH)
+    return entry_line.startswith("- ") and opens_epoch(entry_line[2:])
 
 
 def load(root):
@@ -252,7 +266,7 @@ def load(root):
     fragments, problems = read_fragments(root)
     notes = sum(1 for line in lines[start + 1 : end] if is_epoch(line))
     for fragment in fragments:
-        if fragment.text.startswith(EPOCH):
+        if opens_epoch(fragment.text):
             if notes:
                 problems.append(
                     f"{FRAGMENTS}/{fragment.name}: a second cache-epoch note: {UNRELEASED} "
@@ -308,8 +322,8 @@ def assemble_body(body, fragments):
             later = (j for j, sub in enumerate(subsections) if rank.get(sub[0].rstrip(), -1) > i)
             at = next(later, len(subsections))
             subsections.insert(at, [heading, []])
-        lead = [f.text for f in mine if f.text.startswith(EPOCH)]
-        tail = [f.text for f in mine if not f.text.startswith(EPOCH)]
+        lead = [f.text for f in mine if opens_epoch(f.text)]
+        tail = [f.text for f in mine if not opens_epoch(f.text)]
         subsections[at][1] = place(subsections[at][1], lead, tail)
     out = list(preamble)
     for heading, content in subsections:

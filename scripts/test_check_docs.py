@@ -858,6 +858,19 @@ class ChangelogEntry(unittest.TestCase):
         done = self.entry()
         self.assertEqual(done.returncode, 0, done.stderr)
 
+    def test_a_byte_order_mark_and_a_bullet_line_are_dropped(self):
+        # Some editors save a byte-order mark; some write the bullet on a
+        # line of its own. Neither reaches the entry (see AssembleChangelog).
+        for text in ("\ufeff- The change (issue #1).\n", "- \n  The change (issue #1).\n"):
+            with self.subTest(text=text):
+                self.write("src/lib.rs", "pub fn f() { g() }\n")
+                self.write("changelog.d/1.fixed.md", text)
+                self.commit("change")
+                done = self.entry()
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("adds the fragment changelog.d/1.fixed.md", done.stdout)
+                self.git("reset", "-q", "--hard", self.base)
+
     def test_an_edited_fragment_is_an_entry(self):
         self.write("changelog.d/1.changed.md", "The change (issue #1).\n")
         self.commit("fragment on main")
@@ -886,13 +899,27 @@ class ChangelogEntry(unittest.TestCase):
             ("changelog.d/1.fixed.md", "\n \n", "is empty"),
             ("changelog.d/1.fixed.md", "", "is empty"),
             ("changelog.d/1.fixed.md", "One (issue #1).\n\nTwo.\n", "one paragraph"),
-            ("changelog.d/1.fixed.md", "- One (issue #1).\n- Two (issue #1).\n", "one entry"),
+            ("changelog.d/1.fixed.md", "- One (issue #1).\n- Two (issue #1).\n", "starts another entry"),
+            ("changelog.d/1.fixed.md", "-\n- One (issue #1).\n", "starts another entry"),
+            ("changelog.d/1.fixed.md", "- - One (issue #1).\n", "starts another entry"),
+            ("changelog.d/1.fixed.md", "Scaled by (1\n- Y)^2 (issue #1).\n", "rewrap it"),
+            ("changelog.d/1.fixed.md", "- \n\n", "is empty"),
             ("changelog.d/1.fixed.md", "### Fixed\nOne (issue #1).\n", "a heading"),
             ("changelog.d/1.fixed.md", "One (issue #1),\n# wrapped.\n", "a heading"),
             ("changelog.d/1.fixed.md", b"\xff\xfe (issue #1)\n", "not UTF-8"),
             (
                 "changelog.d/1.fixed.md",
                 "This release starts a new cache epoch (issue #1).\n",
+                "a cache-epoch note belongs under Changed",
+            ),
+            (
+                "changelog.d/1.fixed.md",
+                "\ufeffThis release starts a new cache epoch (issue #1).\n",
+                "a cache-epoch note belongs under Changed",
+            ),
+            (
+                "changelog.d/1.fixed.md",
+                "this release starts a new cache epoch (issue #1).\n",
                 "a cache-epoch note belongs under Changed",
             ),
             ("changelog.d/sub/1.fixed.md", "The change (issue #1).\n", "directly in changelog.d/"),
@@ -1313,20 +1340,46 @@ class AssembleChangelog(unittest.TestCase):
         )
 
     def test_a_second_cache_epoch_note_is_refused(self):
-        self.write(
-            "CHANGELOG.md",
-            ASSEMBLY_CHANGELOG.replace(
-                "### Fixed\n", "### Changed\n\n- This release starts a new cache epoch (issue #2).\n\n### Fixed\n", 1
-            ),
+        # The note is known by its opening words in any letter case, and a
+        # byte-order mark in front of them hides nothing.
+        for hand, fragment in (
+            ("This release starts a new cache epoch", "This release starts a new cache epoch"),
+            ("this release starts a new cache epoch", "This release starts a new cache epoch"),
+            ("This release starts a new cache epoch", "\ufeffThis release starts a new cache epoch"),
+            ("This release starts a new cache epoch", "\ufeff- this Release Starts a New Cache Epoch"),
+        ):
+            self.write(
+                "CHANGELOG.md",
+                ASSEMBLY_CHANGELOG.replace(
+                    "### Fixed\n", f"### Changed\n\n- {hand} (issue #2).\n\n### Fixed\n", 1
+                ),
+            )
+            self.write("changelog.d/6.changed.md", f"{fragment} (issue #6).\n")
+            before = self.snapshot()
+            for args in (("--check",), ("0.2.0", "--date", "2026-02-03")):
+                with self.subTest(hand=hand, fragment=fragment, args=args):
+                    done = self.run_script(*args)
+                    self.assertEqual(done.returncode, 1, done.stdout)
+                    self.assertIn("changelog.d/6.changed.md: a second cache-epoch note", done.stderr)
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_a_byte_order_mark_and_a_bullet_line_are_dropped(self):
+        for name in ASSEMBLY_FRAGMENTS:
+            if name != "README.md":
+                (self.root / "changelog.d" / name).unlink()
+        self.write("changelog.d/12.fixed.md", "\ufeff- Fix twelve (issue #12).\n")
+        self.write("changelog.d/13.fixed.md", "-\nFix thirteen (issue #13).\n")
+        self.write("changelog.d/14.fixed.md", "\ufeff* \r\n  Fix fourteen,\r\n  wrapped (issue #14).\r\n")
+        self.write("changelog.d/15.changed.md", "\ufeffthis release starts a new cache epoch (issue #15).\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("\ufeff", done.stdout)
+        self.assertIn(
+            "### Changed\n\n- this release starts a new cache epoch (issue #15).\n\n### Fixed\n\n"
+            "- A hand-written fix (issue #30).\n\n- Another hand-written fix (issue #3).\n\n"
+            "- Fix twelve (issue #12).\n\n- Fix thirteen (issue #13).\n\n- Fix fourteen, wrapped (issue #14).\n",
+            done.stdout,
         )
-        self.write("changelog.d/6.changed.md", "This release starts a new cache epoch (issue #6).\n")
-        before = self.snapshot()
-        for args in (("--check",), ("0.2.0", "--date", "2026-02-03")):
-            with self.subTest(args=args):
-                done = self.run_script(*args)
-                self.assertEqual(done.returncode, 1, done.stdout)
-                self.assertIn("changelog.d/6.changed.md: a second cache-epoch note", done.stderr)
-                self.assertEqual(self.snapshot(), before)
 
     def test_a_malformed_fragment_stops_both_modes_and_writes_nothing(self):
         self.write("changelog.d/8.feature.md", "A thing (issue #8).\n")
