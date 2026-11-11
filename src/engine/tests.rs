@@ -3616,7 +3616,7 @@ fn output_pixel_budget_rejects_huge_requests() {
     };
     let err = apply_size(img.clone(), &size, None, 1.0).unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
-    let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, None, None).unwrap_err();
+    let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, None, None, None).unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
 }
 
@@ -8716,6 +8716,185 @@ fn a_filters_segment_checks_the_deadline_between_filters() {
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// Run `work` on a thread of its own and wait for it until
+/// `limit`, so a deadline test that overruns fails at the
+/// limit instead of waiting minutes for the work to end.
+fn finished_by<T: Send + 'static>(
+    limit: std::time::Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    let wait = limit.saturating_duration_since(std::time::Instant::now());
+    rx.recv_timeout(wait)
+        .unwrap_or_else(|_| panic!("still running {wait:?} after the test began waiting"))
+}
+
+/// How long past its deadline a render may run: the grace
+/// the server waits before it answers `504` and detaches
+/// the job (`DEADLINE_GRACE`).
+const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[test]
+fn a_blur_past_the_deadline_times_out() {
+    // Issue #614: a blur ran as one call that checked no
+    // deadline, so blur(512) on a large canvas ran for
+    // minutes past it while its lane permit stayed held.
+    // The blur now checks the deadline before each row and
+    // the render answers its own Timeout within the grace.
+    // Six blurs, so the work outlasts the deadline in an
+    // optimized build too, where one blur(512) of this image
+    // takes about 0.6 s.
+    let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Blur(512.0); 6])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+#[test]
+fn a_deep_blur_past_the_deadline_times_out() {
+    // Issue #614: a 16-bit PNG stays 16-bit through decode
+    // and resize, and its blur ran as one call to the image
+    // crate, on one core, that no deadline could stop. It
+    // now takes the banded passes and their row checks too.
+    let src = png_bytes(&DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x * 81) as u16, (y * 81) as u16, ((x + y) * 40) as u16]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Blur(512.0); 6])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+#[test]
+fn a_text_label_past_the_deadline_times_out() {
+    // Issue #606: a label was drawn in one call that checked
+    // no deadline, every glyph rasterized whether it landed
+    // or not. The parser caps the label now, but the engine
+    // takes any filter it is given, so the renderer checks
+    // the deadline between glyphs as well. Two million
+    // glyphs, so the draw outlasts the grace even though it
+    // skips the glyphs that land off this 20x20 image.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let result = finished_by(deadline + GRACE, move || {
+        let font = crate::text::FontRenderer::from_bytes(
+            include_bytes!("../../tests/fixtures/font.ttf").to_vec(),
+        )
+        .unwrap();
+        let ctx = ProcessContext {
+            text_renderer: Some(&font),
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(
+            &red_source(),
+            &[Operation::Filters(vec![Filter::Text {
+                text: "W".repeat(2_000_000),
+                size: 1000,
+                color: [255, 255, 255, 255],
+                anchor: crate::url::Anchor::TopLeft,
+            }])],
+            ctx,
+        )
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
+/// Finds one face over the whole image, after taking longer
+/// than the deadline tests give the render.
+#[derive(Debug)]
+struct SlowWholeFace;
+
+impl crate::ai::FaceProvider for SlowWholeFace {
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Ok(vec![crate::ai::FaceBox {
+            x: 0,
+            y: 0,
+            w: img.width(),
+            h: img.height(),
+            score: 0.9,
+        }])
+    }
+}
+
+#[test]
+fn a_blurred_pad_stops_at_the_deadline() {
+    // Issue #614: the ambient fill of `pad:...:blur` blurs the
+    // whole canvas at a sigma up to 80, through the same
+    // banded passes, so it checks the deadline before each
+    // row too. A deadline still ahead pads as none does.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 32, |x, y| {
+        image::Rgb([(x * 4) as u8, (y * 8) as u8, 1])
+    }));
+    let past = Some(std::time::Instant::now());
+    let err = apply_pad(img.clone(), 400, 400, PadFill::Blur, None, None, past)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err, EngineError::Timeout);
+    let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    let (padded, placed) =
+        apply_pad(img.clone(), 400, 400, PadFill::Blur, None, None, ahead).unwrap();
+    let (unbounded, placed_unbounded) =
+        apply_pad(img, 400, 400, PadFill::Blur, None, None, None).unwrap();
+    assert_eq!(placed, placed_unbounded);
+    assert_eq!(
+        padded.to_rgba8().into_raw(),
+        unbounded.to_rgba8().into_raw()
+    );
+}
+
+#[test]
+fn a_face_blur_past_the_deadline_times_out() {
+    // Issue #614: the face blur's sigma follows the face
+    // (an 800 px face blurs at sigma 133), and nothing
+    // checked the deadline between the detection and the
+    // blur. The detection here ends past the deadline; the
+    // blur stops at its first row.
+    let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        800,
+        800,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 7]),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let result = finished_by(deadline + GRACE, move || {
+        let ctx = ProcessContext {
+            face_provider: Some(&SlowWholeFace),
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        Engine.process_preferred(&src, &[Operation::Filters(vec![Filter::BlurFaces])], ctx)
+    });
+    assert_eq!(result.map(|_| ()), Err(EngineError::Timeout));
+}
+
 #[test]
 fn upscale_doubles_and_quadruples_dimensions() {
     let engine = Engine;
@@ -10599,7 +10778,8 @@ impl crate::text::TextRenderer for MarkerRenderer {
         _size: u32,
         _color: [u8; 4],
         _anchor: crate::url::Anchor,
-    ) -> Result<DynamicImage, String> {
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<DynamicImage, crate::text::DrawError> {
         let mut out = img.to_rgba8();
         out.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
         Ok(DynamicImage::ImageRgba8(out))

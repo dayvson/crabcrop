@@ -182,6 +182,26 @@ export const TEXT_ANCHORS = [
   "bottom-right",
 ] as const;
 
+/** The most characters a `text` label may hold (url.rs MAX_TEXT_GLYPHS, issue #606). */
+export const MAX_TEXT_GLYPHS = 1000;
+
+/** The most a `text` label's character count times its size may come to (url.rs MAX_TEXT_EXTENT). */
+export const MAX_TEXT_EXTENT = 100000;
+
+/**
+ * Whether a decoded `text` label at `size` is within the
+ * server's caps. Characters are Unicode code points, as the
+ * server counts them, not bytes or UTF-16 code units.
+ */
+export function textLabelFits(label: string, size: number): boolean {
+  let glyphs = 0;
+  for (const _ of label) {
+    glyphs += 1;
+    if (glyphs > MAX_TEXT_GLYPHS) return false;
+  }
+  return glyphs * size <= MAX_TEXT_EXTENT;
+}
+
 /** Output formats `format(...)` names; `jpg` is an input alias of `jpeg`. */
 export const IMAGE_FORMATS = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"] as const;
 
@@ -653,7 +673,8 @@ function validateFilter(name: string, args: string | null): string | null {
         /^[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(color) &&
         isIntIn(size, 1, 1000) &&
         text !== null &&
-        text !== ""
+        text !== "" &&
+        textLabelFits(text, Number(size))
         ? null
         : bad;
     }

@@ -37,11 +37,11 @@ use std::str::FromStr;
 
 use super::{
     Anchor, BlendMode, CurveChannel, Filter, FlipDirection, FormatSpec, ImageFormat,
-    MAX_BLUR_SIGMA, MAX_DIMENSION, MAX_EXPOSURE, MAX_GAMMA, MaskShape, ParseError, Quality,
-    QualityValue, StudioMode, StudioSpec, anchor_text, encode_arg, format_angle,
-    format_kernel_value, format_text, hex3, parse_angle, parse_class_name, parse_format_spec,
-    parse_hex6, parse_kernel_value, parse_quality, parse_studio, parse_text_color, percent_decode,
-    quality_value_text,
+    MAX_BLUR_SIGMA, MAX_DIMENSION, MAX_EXPOSURE, MAX_GAMMA, MAX_TEXT_EXTENT, MAX_TEXT_GLYPHS,
+    MaskShape, ParseError, Quality, QualityValue, StudioMode, StudioSpec, anchor_text, encode_arg,
+    format_angle, format_kernel_value, format_text, hex3, parse_angle, parse_class_name,
+    parse_format_spec, parse_hex6, parse_kernel_value, parse_quality, parse_studio,
+    parse_text_color, percent_decode, quality_value_text,
 };
 
 /// How one argument is read from the URL and written in the
@@ -659,7 +659,10 @@ fn overlay_args(
 
 /// `text(<text>,<size>,<color>,<anchor>)`. The text is
 /// percent-encoded and may contain commas, so the split runs
-/// from the right, where the fixed fields are.
+/// from the right, where the fixed fields are. The decoded
+/// label holds at most [`MAX_TEXT_GLYPHS`] characters, and
+/// their count times the size is at most [`MAX_TEXT_EXTENT`]
+/// (issue #606).
 fn read_text(p: &str) -> Option<Filter> {
     let parts: Vec<&str> = p.rsplitn(4, ',').collect();
     let [anchor, color, size, text] = parts[..] else {
@@ -669,7 +672,8 @@ fn read_text(p: &str) -> Option<Filter> {
     let color = parse_text_color(color)?;
     let size = TEXT_SIZE.read(size)?;
     let text = percent_decode(text)?;
-    if text.is_empty() {
+    let glyphs = text.chars().count();
+    if glyphs == 0 || glyphs > MAX_TEXT_GLYPHS || glyphs as u64 * size as u64 > MAX_TEXT_EXTENT {
         return None;
     }
     Some(Filter::Text {

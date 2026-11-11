@@ -12,7 +12,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | --- | --- | --- | --- |
 | `grayscale` | none | Desaturate to gray. | `filters:grayscale` |
 | `invert` | none | Invert every channel. | `filters:invert` |
-| `blur` | `blur(2.5)`, sigma, a positive number up to 512 | Gaussian blur. | `filters:blur(2.5)` |
+| `blur` | `blur(2.5)`, sigma, a positive number up to 512 | Gaussian blur. Its work grows with the sigma and the image size, so it checks the processing limit (`CRABCROP_PROCESS_TIMEOUT_SECS`) before each row and stops there; the request answers `504`. | `filters:blur(2.5)` |
 | `brighten` | `brighten(40)`, integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
 | `contrast` | `contrast(25)`, percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
 | `gamma` | `gamma(2.2)`, divisor from above 0 to 10; 1 is unchanged, above 1 brightens midtones, below 1 darkens them | Gamma correction: each channel value `v` becomes `255 * (v / 255)^(1 / g)`, the levels-style midtone gamma. Black and white stay fixed at every setting, and alpha is untouched. Unlike `curve`, no control points need translating: the gamma value from another tool carries over as written. | `filters:gamma(2.2)` |
@@ -139,12 +139,12 @@ filters:text(<text>,<size>,<color>,<anchor>)
 
 | Parameter | Description |
 | --- | --- |
-| `text` | The label, percent-encoded. It may contain commas and unicode once encoded. |
+| `text` | The label, percent-encoded. It may contain commas and unicode once encoded. Decoded, it holds at most 1000 characters, and its character count times `size` is at most 100000: 100 characters at size 1000, or 1000 at size 100. A longer label answers `400`. |
 | `size` | Font size in pixels, 1 to 1000. |
 | `color` | `rrggbb`, or `rrggbbaa` to include alpha. |
 | `anchor` | One of nine grid points: `top-left`, `top-center`, `top-right`, `center-left`, `center`, `center-right`, `bottom-left`, `bottom-center`, `bottom-right`. The label is padded from the edges by half the font size. |
 
-The text is drawn when the filter runs, at whatever resolution the image has at that point in the path, so put `text` after your resize to keep it sharp. The font comes from `CRABCROP_FONT_PATH` on the server; with no font configured, `text` requests fail with `501`.
+The text is drawn when the filter runs, at whatever resolution the image has at that point in the path, so put `text` after your resize to keep it sharp. The font comes from `CRABCROP_FONT_PATH` on the server; with no font configured, `text` requests fail with `501`. Drawing checks the processing limit (`CRABCROP_PROCESS_TIMEOUT_SECS`) between glyphs. Presets and `CRABCROP_DEFAULT_OPS` are checked at startup, so one with a label past these limits stops the server from starting.
 
 ```bash
 curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ffffff,bottom-right)/https://example.com/photo.jpg"

@@ -1528,6 +1528,54 @@ fn rejects_bad_text_params() {
 }
 
 #[test]
+fn text_labels_past_the_caps_are_refused() {
+    // Issue #606: drawing costs about the glyph count times
+    // the size squared, so a label holds at most 1000
+    // characters, and its character count times its size
+    // is at most 100000. At either cap the label parses;
+    // one past answers `invalid_filters`.
+    let parse = |label: &str, size: u32| {
+        parse_operations(&format!(
+            "filters:text({label},{size},ffffff,top-left)/example.com/i.png"
+        ))
+        .map(|(ops, _)| ops)
+    };
+    let accepted = [
+        ("a".repeat(1000), 100, 1000),
+        ("W".repeat(100), 1000, 100),
+        // Characters count, not bytes: these 1000 are 2000
+        // bytes, 6000 percent-encoded.
+        ("%C3%A9".repeat(1000), 100, 1000),
+    ];
+    for (label, size, chars) in accepted {
+        let ops = parse(&label, size).unwrap_or_else(|e| panic!("{size}: {e}"));
+        let [Operation::Filters(filters)] = &ops[..] else {
+            panic!("not one filters segment: {ops:?}");
+        };
+        let [Filter::Text { text, .. }] = &filters[..] else {
+            panic!("not one text filter: {filters:?}");
+        };
+        assert_eq!(text.chars().count(), chars);
+    }
+    let refused = [
+        ("a".repeat(1001), 1),
+        ("a".repeat(1001), 12),
+        ("W".repeat(101), 1000),
+        ("W".repeat(1001), 100),
+        ("%C3%A9".repeat(1001), 12),
+        // The issue's label: 6000 glyphs at size 1000.
+        ("W".repeat(6000), 1000),
+    ];
+    for (label, size) in refused {
+        assert!(
+            matches!(parse(&label, size), Err(ParseError::InvalidFilters(_))),
+            "{} bytes at size {size}",
+            label.len()
+        );
+    }
+}
+
+#[test]
 fn parses_jxl_format() {
     let (ops, _) = parse_operations("filters:format(jxl)/example.com/img.jpg").unwrap();
     assert_eq!(

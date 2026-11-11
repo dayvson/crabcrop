@@ -543,18 +543,23 @@ pub(in crate::server) fn wants_slow_lane(
 /// it finishes (issue #357). The engine checks the deadline between
 /// stages and inside its chunked encode loops (per frame
 /// for animated GIF and WebP, per attempt for the
-/// quality ladders), so a checkpointed job aborts on its
-/// own within this window and answers with the engine's
-/// own Timeout. A job still running when the grace runs
-/// out is inside a single opaque encoder call (one still
-/// encode, libwebp's animated `try_encode`, one AI
-/// inference, the external video encoder), which no
-/// checkpoint can interrupt: detaching is what bounds
-/// its hold on the server, and it aborts at the first
-/// deadline check after that call returns. The detached
-/// job keeps its permits deliberately (issue #357): the
-/// deadline checks bound the hold (the deadline plus the
-/// longest single opaque call).
+/// quality ladders). It also checks it inside the work
+/// that grows with an argument and not only with the
+/// image: `text` between glyphs, and the blurs (the `blur`
+/// filter, the blurred `pad` fill, the face, region, and
+/// class blurs, and the studio shadow) before each row,
+/// whatever the image's sample type (issues #606, #614).
+/// So a checkpointed job aborts on its own within this
+/// window and answers with the engine's own Timeout. A job
+/// still running when the grace runs out is inside a single
+/// opaque call (one still encode, libwebp's animated
+/// `try_encode`, one AI inference, the external video
+/// encoder), which no checkpoint can interrupt: detaching
+/// is what bounds its hold on the server, and it aborts at
+/// the first deadline check after that call returns. The detached job keeps its permits
+/// deliberately (issue #357): the deadline checks bound
+/// the hold (the deadline plus the longest single opaque
+/// call).
 const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an AI-backed request may wait for an inference
@@ -702,7 +707,8 @@ pub(in crate::server) async fn run_process(
         // capacity that is still busy. The hold a shed
         // run leaves behind is bounded: the job carries
         // the deadline, the engine checks it between
-        // stages and inside its chunked loops, and a job
+        // stages, inside its chunked loops, and inside
+        // text and the blurs (issues #606, #614), and a job
         // inside one opaque call (a still encode,
         // libwebp's animated encode, an inference, the
         // external video encoder) unwinds at the first
