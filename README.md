@@ -27,9 +27,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
-docker pull ghcr.io/dayvson/crabcrop:0.10.1
-docker pull ghcr.io/dayvson/crabcrop-ai:0.10.1
-docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.10.1
+docker pull ghcr.io/dayvson/crabcrop:0.11.0
+docker pull ghcr.io/dayvson/crabcrop-ai:0.11.0
+docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.11.0
 ```
 
 A secret of at least 16 bytes is the only required configuration; the server will not start without one. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
@@ -98,7 +98,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 - **Face detection and redaction.** Blur or pixelate faces, or every detected object of a class, following the object's silhouette when a segmentation model is configured. Redaction never guesses: a detection failure fails the request. It replaces the pixels it covers, so no original color survives under transparency.
 - **Metadata that describes the picture.** JSON meta for every render: dimensions, format, byte size, provenance. Richer answers are opt-ins with their own model sets: CLIP tags and alt text, detections, moderation verdicts, embeddings, an aesthetic score.
 - **Reads the text in the picture.** Opt a meta request in and the answer reads the picture: the text lines in reading order, each with its box and a confidence score. The annotation never touches the image bytes.
-- **Provenance, checked and signed.** Meta reports the C2PA Content Credentials a source carries: manifest present, whether it validates, who signed it. With your own certificate, outputs are signed as served, the source recorded as an ingredient, so the chain survives the transform.
+- **Provenance, checked and signed.** Meta reports the C2PA Content Credentials a source carries: manifest present, whether it validates, who signed it. With your own certificate, outputs are signed as served, the source recorded as the parent ingredient with how its own credentials validated. The source's manifest store, thumbnails and assertions included, never rides into an output, so the manifest carries none of the source's metadata under either `CRABCROP_METADATA` policy.
 - **Sealed URLs.** For links that stay public but unreadable: the whole recipe, operations and source, encrypted into one opaque token in the signature slot. Only the server opens it. The readable form stays the default.
 - **Presets and purge.** Server-side preset names keep templates short. Purge one result, or a whole preset group, with signatures from their own subkey.
 - **URLs that explain themselves.** Put `explain/` in front of any signed URL and the server reports on it instead of serving the image.

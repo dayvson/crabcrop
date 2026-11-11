@@ -1145,6 +1145,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
         ("CRABCROP_METRICS_TOKEN", "metrics-token"),
         ("CRABCROP_SLOW_LANE_PERMITS", "3"),
         ("CRABCROP_META_MODE", "1"),
+        ("CRABCROP_CLIENT_HINTS", "0"),
     ]))
     .unwrap();
     let state = build_state(&config, open_stores(&config).unwrap()).unwrap();
@@ -1161,6 +1162,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     // The settings reach the state as validated.
     assert_eq!(state.metrics_token.as_deref(), Some("metrics-token"));
     assert!(state.meta_enabled);
+    assert!(!state.client_hints);
     assert_eq!(state.config_fingerprint, config.config_fingerprint);
     assert_eq!(
         state.process_timeout,

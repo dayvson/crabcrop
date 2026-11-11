@@ -66,11 +66,11 @@ helm install crabcrop deploy/helm/crabcrop \
 Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. For a quick trial only, `--set secret=<value>` lets the chart create the Secret itself; do not use that route for anything real. To run your own build instead:
 
 ```bash
-docker build -t your-registry/crabcrop:0.10.1 .
-docker push your-registry/crabcrop:0.10.1
+docker build -t your-registry/crabcrop:0.11.0 .
+docker push your-registry/crabcrop:0.11.0
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
-  --set image.tag=0.10.1 \
+  --set image.tag=0.11.0 \
   --set existingSecret=crabcrop-secret
 ```
 

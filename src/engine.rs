@@ -111,6 +111,11 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
             }
         }
     }
+    // JPEG XL decodes with its frames held to the budget too,
+    // which the image crate's hook cannot do (see decode_jxl).
+    if is_jxl(bytes) {
+        return decode_jxl(bytes);
+    }
     // Fast paths for the two hottest source formats, taken only
     // where they are output-identical to the generic decode
     // below (the probe above has already enforced the
@@ -341,14 +346,14 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     }
     let detected = detect_format(bytes);
     if detected == ImageFormat::Gif {
-        decode_gif_frames(bytes)?;
+        decode_gif_frames(bytes, None)?;
         return Ok(PreparedUpload {
             stored: bytes.to_vec(),
             media: UploadMedia::Gif,
         });
     }
     if detected == ImageFormat::WebP && webp_animation_params(bytes).is_some() {
-        decode_webp_frames(bytes)?;
+        decode_webp_frames(bytes, None)?;
         return Ok(PreparedUpload {
             stored: bytes.to_vec(),
             media: UploadMedia::WebP,
@@ -441,6 +446,12 @@ fn check_jxl_dimensions(bytes: &[u8]) -> Result<(), EngineError> {
 /// basic-info event alone: no frame is decoded. `None` when
 /// the header does not parse or announces no size.
 fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    jxl_header(bytes).map(|(width, height, _)| (width, height))
+}
+
+/// A JPEG XL header's size and its number of extra channels,
+/// from the basic-info event alone, as [`jxl_dimensions`].
+fn jxl_header(bytes: &[u8]) -> Option<(u32, u32, usize)> {
     use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
     let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
     let mut input = std::io::BufReader::new(Cursor::new(bytes));
@@ -448,9 +459,217 @@ fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if event != Event::BasicInfo {
         return None;
     }
+    decoder.basic_info().map(|info| {
+        (
+            info.size.0 as u32,
+            info.size.1 as u32,
+            info.extra_channels.len(),
+        )
+    })
+}
+
+/// The most samples a frame of a JPEG XL file with
+/// `extra_channels` may hold: as many pixels as the decode
+/// budget gives a whole image ([`MAX_DECODE_ALLOC`] as RGBA,
+/// the bound every still is held to), each with its three
+/// colour samples and the extra ones. jxl-rs refuses a frame
+/// whose count reaches the limit, hence the one more.
+fn jxl_sample_limit(extra_channels: usize) -> usize {
+    let pixels = usize::try_from(MAX_DECODE_ALLOC / 4).unwrap_or(usize::MAX);
+    pixels.saturating_mul(3 + extra_channels).saturating_add(1)
+}
+
+/// Decode a JPEG XL source with jxl-rs held to the decode
+/// budget.
+///
+/// The image crate's JPEG XL hook (`jxl-image-rs-integration`)
+/// runs jxl-rs with its default options, which set no sample
+/// limit, so every frame header is taken at its word. A frame
+/// may declare a crop size of its own, unrelated to the image
+/// size the header states (the one [`check_jxl_dimensions`]
+/// checks), and the decoder allocates and renders what the
+/// frame declares. Here the decoder carries the limit
+/// ([`jxl_sample_limit`]), so a frame holding more pixels
+/// than a whole image may is refused at its header, before
+/// anything is allocated for it.
+///
+/// Everything else is what the hook does, so a file decodes
+/// to the same pixels: the output format for each bit depth,
+/// colour, and alpha, the oriented size, the first displayed
+/// frame, and the image crate's allocation checks on the way
+/// in, with the same errors. The hook still detects the format
+/// and reads the header for the size probe in [`decode_image`],
+/// which decodes no frame.
+fn decode_jxl(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
+    use image::error::{DecodingError, ImageFormatHint, LimitError, LimitErrorKind};
+    use image::{ColorType, ImageBuffer, ImageError};
+    use jxl::api::{
+        Endianness, Event, ExtraChannel, JxlBitDepth, JxlColorType, JxlDataFormat, JxlDecoder,
+        JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
+    };
+    let fail = |e: ImageError| EngineError::Decode(e.to_string());
+    let decoding = |e: Box<dyn std::error::Error + Send + Sync>| {
+        fail(ImageError::Decoding(DecodingError::new(
+            ImageFormatHint::Name("JPEG XL".to_owned()),
+            e,
+        )))
+    };
+    let truncated = || decoding("truncated JPEG XL image".into());
+    let limit = |kind| fail(ImageError::Limits(LimitError::from_kind(kind)));
+
+    let extra_channels = jxl_header(bytes).map_or(0, |(_, _, n)| n);
+    let mut options = JxlDecoderOptions::default();
+    options.sample_limit = Some(jxl_sample_limit(extra_channels));
+    let mut decoder = JxlDecoder::new(options);
+    let mut input = std::io::BufReader::new(Cursor::new(bytes));
+    if decoder
+        .process(&mut input, None, None)
+        .map_err(|e| decoding(e.into()))?
+        != Event::BasicInfo
+    {
+        return Err(truncated());
+    }
+    let info = decoder.basic_info().ok_or_else(truncated)?.clone();
+    let width = u32::try_from(info.size.0).map_err(|_| limit(LimitErrorKind::DimensionError))?;
+    let height = u32::try_from(info.size.1).map_err(|_| limit(LimitErrorKind::DimensionError))?;
+    let grayscale = decoder
+        .current_pixel_format()
+        .ok_or_else(truncated)?
+        .color_type
+        .is_grayscale();
+    let alpha = info
+        .extra_channels
+        .iter()
+        .any(|channel| channel.ec_type == ExtraChannel::Alpha);
+    let jxl_color = match (grayscale, alpha) {
+        (true, false) => JxlColorType::Grayscale,
+        (true, true) => JxlColorType::GrayscaleAlpha,
+        (false, false) => JxlColorType::Rgb,
+        (false, true) => JxlColorType::Rgba,
+    };
+    let (color, data_format) = match info.bit_depth {
+        JxlBitDepth::Float { .. } => (
+            if alpha {
+                ColorType::Rgba32F
+            } else {
+                ColorType::Rgb32F
+            },
+            JxlDataFormat::F32 {
+                endianness: Endianness::native(),
+            },
+        ),
+        JxlBitDepth::Int { bits_per_sample } if bits_per_sample <= 8 => (
+            match (grayscale, alpha) {
+                (true, false) => ColorType::L8,
+                (true, true) => ColorType::La8,
+                (false, false) => ColorType::Rgb8,
+                (false, true) => ColorType::Rgba8,
+            },
+            JxlDataFormat::U8 { bit_depth: 8 },
+        ),
+        JxlBitDepth::Int { .. } => (
+            match (grayscale, alpha) {
+                (true, false) => ColorType::L16,
+                (true, true) => ColorType::La16,
+                (false, false) => ColorType::Rgb16,
+                (false, true) => ColorType::Rgba16,
+            },
+            JxlDataFormat::U16 {
+                endianness: Endianness::native(),
+                bit_depth: 16,
+            },
+        ),
+    };
+    // A float output is colour only: the hook asks for RGB or
+    // RGBA whatever the colour space, as here.
+    let jxl_color = match data_format {
+        JxlDataFormat::F32 { .. } if alpha => JxlColorType::Rgba,
+        JxlDataFormat::F32 { .. } => JxlColorType::Rgb,
+        _ => jxl_color,
+    };
     decoder
-        .basic_info()
-        .map(|info| (info.size.0 as u32, info.size.1 as u32))
+        .set_pixel_format(JxlPixelFormat {
+            color_type: jxl_color,
+            color_data_format: Some(data_format),
+            extra_channel_format: vec![None; info.extra_channels.len()],
+        })
+        .map_err(|e| decoding(e.into()))?;
+    // The image crate's checks before it reads the pixels:
+    // the reader sets the output buffer aside from the budget,
+    // and the hook holds what is left to the output again,
+    // with a conversion buffer for samples wider than a byte.
+    let output = u64::from(width) * u64::from(height) * color.bytes_per_pixel() as u64;
+    let remaining = MAX_DECODE_ALLOC
+        .checked_sub(output)
+        .ok_or_else(|| limit(LimitErrorKind::InsufficientMemory))?;
+    check_decoded_dimensions(u64::from(width), u64::from(height))?;
+    let wide = color.bytes_per_pixel() / color.channel_count() > 1;
+    let scratch = if wide { output } else { 0 };
+    if output.saturating_add(scratch) > remaining {
+        return Err(limit(LimitErrorKind::InsufficientMemory));
+    }
+    // The decoder writes wider samples in native byte order and
+    // wants each row aligned to the sample size, so the bytes
+    // start at the first aligned offset of a slightly larger
+    // buffer, then become samples.
+    let len = usize::try_from(output).map_err(|_| limit(LimitErrorKind::InsufficientMemory))?;
+    let sample = color.bytes_per_pixel() as usize / color.channel_count() as usize;
+    let mut raw = vec![0u8; len + sample - 1];
+    let start = (sample - raw.as_ptr() as usize % sample) % sample;
+    let bytes = &mut raw[start..start + len];
+    let row = len / (height as usize).max(1);
+    let mut frame = JxlOutputBuffer::new(bytes, height as usize, row);
+    loop {
+        match decoder
+            .process(&mut input, Some(std::slice::from_mut(&mut frame)), None)
+            .map_err(|e| decoding(e.into()))?
+        {
+            Event::FrameHeader => {}
+            Event::FrameComplete { .. } => break,
+            _ => return Err(truncated()),
+        }
+    }
+    let bytes = &raw[start..start + len];
+    let u16s = || -> Vec<u16> {
+        let (pairs, _) = bytes.as_chunks::<2>();
+        pairs.iter().map(|p| u16::from_ne_bytes(*p)).collect()
+    };
+    let f32s = || -> Vec<f32> {
+        let (quads, _) = bytes.as_chunks::<4>();
+        quads.iter().map(|q| f32::from_ne_bytes(*q)).collect()
+    };
+    let image = match color {
+        ColorType::L8 => ImageBuffer::from_raw(width, height, raw).map(DynamicImage::ImageLuma8),
+        ColorType::La8 => ImageBuffer::from_raw(width, height, raw).map(DynamicImage::ImageLumaA8),
+        ColorType::Rgb8 => ImageBuffer::from_raw(width, height, raw).map(DynamicImage::ImageRgb8),
+        ColorType::Rgba8 => ImageBuffer::from_raw(width, height, raw).map(DynamicImage::ImageRgba8),
+        ColorType::L16 => {
+            ImageBuffer::from_raw(width, height, u16s()).map(DynamicImage::ImageLuma16)
+        }
+        ColorType::La16 => {
+            ImageBuffer::from_raw(width, height, u16s()).map(DynamicImage::ImageLumaA16)
+        }
+        ColorType::Rgb16 => {
+            ImageBuffer::from_raw(width, height, u16s()).map(DynamicImage::ImageRgb16)
+        }
+        ColorType::Rgba16 => {
+            ImageBuffer::from_raw(width, height, u16s()).map(DynamicImage::ImageRgba16)
+        }
+        ColorType::Rgb32F => {
+            ImageBuffer::from_raw(width, height, f32s()).map(DynamicImage::ImageRgb32F)
+        }
+        ColorType::Rgba32F => {
+            ImageBuffer::from_raw(width, height, f32s()).map(DynamicImage::ImageRgba32F)
+        }
+        _ => None,
+    };
+    image.ok_or_else(|| {
+        fail(ImageError::Parameter(
+            image::error::ParameterError::from_kind(
+                image::error::ParameterErrorKind::DimensionMismatch,
+            ),
+        ))
+    })
 }
 
 /// The facts the `/explain` report (issue #196) may state
@@ -518,11 +737,13 @@ pub(crate) fn probe_kind(bytes: &[u8]) -> &'static str {
 /// Whether sizing a source of `kind` is more than a header
 /// read: an SVG's intrinsic size takes a parse of the whole
 /// document in the SVG worker (up to [`SVG_PROBE_TIMEOUT`]),
-/// and an AVIF's goes through the decoder. A caller on an
+/// an AVIF's goes through the decoder, and a HEIC's takes a
+/// walk of its item graph, which the file's references drive
+/// (bounded, but up to tens of milliseconds). A caller on an
 /// async runtime runs [`probe_source`] for these on a
 /// blocking thread.
 pub(crate) fn probe_is_heavy(kind: &str) -> bool {
-    matches!(kind, "svg" | "avif")
+    matches!(kind, "svg" | "avif" | "heic")
 }
 
 /// A test hook standing in for an SVG whose size probe is
@@ -1589,8 +1810,8 @@ impl Engine {
         source_meta: crate::color::SourceMeta,
     ) -> Result<Decoded, EngineError> {
         let frames = match source {
-            AnimatedFormat::Gif => decode_gif_frames(bytes)?,
-            AnimatedFormat::WebP => decode_webp_frames(bytes)?,
+            AnimatedFormat::Gif => decode_gif_frames(bytes, ctx.deadline)?,
+            AnimatedFormat::WebP => decode_webp_frames(bytes, ctx.deadline)?,
         };
         if frames.len() > 1 {
             if directives.debug_focal {
@@ -2035,17 +2256,25 @@ fn encode_animated_gif(
 /// of frames. The pixel budget alone is not a memory bound:
 /// at its 100M-pixel cap the retained frames are 400 MiB,
 /// well past the 256 MiB allocation budget every still
-/// decode honors. Errors when the source is malformed, over
-/// budget, or carries no frames. `format` names the source
-/// format in error messages.
+/// decode honors. The request's `deadline` is checked before
+/// each frame decodes, so a long animation stops with
+/// [`EngineError::Timeout`] at the deadline instead of
+/// decoding on to its last frame. Errors when the source is
+/// malformed, over budget, or carries no frames. `format`
+/// names the source format in error messages.
 fn collect_frames(
-    frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
+    mut frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
     format: &str,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Frames, EngineError> {
     let mut collected: Option<Frames> = None;
     let mut total_pixels: u64 = 0;
     let mut total_bytes: u64 = 0;
-    for frame in frames {
+    loop {
+        state::check_deadline(deadline)?;
+        let Some(frame) = frames.next() else {
+            break;
+        };
         let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
         if collected.as_ref().map_or(0, Frames::len) >= MAX_ANIMATED_FRAMES {
             return Err(EngineError::Decode(format!(
@@ -2113,17 +2342,66 @@ impl IntoIterator for Frames {
 }
 
 /// Decode all frames of a GIF source, under the shared limits:
-/// the decoder gets explicit dimension/allocation limits (its
-/// defaults are none) and collection enforces the shared
-/// frame and pixel budgets (see [`collect_frames`]).
-fn decode_gif_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
+/// the frames' declared sizes are charged first (see
+/// [`check_gif_frame_budget`]), the decoder gets explicit
+/// dimension/allocation limits (its defaults are none), and
+/// collection enforces the shared frame and pixel budgets and
+/// the request's deadline (see [`collect_frames`]).
+fn decode_gif_frames(
+    bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> Result<Frames, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
+    check_gif_frame_budget(bytes)?;
     let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
     decoder
         .set_limits(decode_limits())
         .map_err(|e| EngineError::Decode(e.to_string()))?;
-    collect_frames(decoder.into_frames(), "GIF")
+    collect_frames(decoder.into_frames(), "GIF", deadline)
+}
+
+/// Charge a GIF's frames to the animation budgets from their
+/// descriptors, before any frame decodes. The decoder hands
+/// back every frame composited onto the logical screen, so
+/// [`collect_frames`] sees each at the screen's size. Each
+/// frame is decoded at its own declared size first, though,
+/// and a descriptor may declare one far larger than the
+/// screen (the gif crate leaves frames unchecked against it):
+/// a 1x1 screen can carry 64-megapixel frames, each decoded in
+/// full and then cut down to one pixel. So each frame counts
+/// here at the larger of the screen and its own declared size,
+/// against the same frame cap and decoded-pixel budget. A frame
+/// that fits the screen counts as it always has. The walk reads
+/// block structure only, with LZW decoding skipped, as
+/// [`is_animated_gif`] does. A file the walk cannot read to its
+/// end is left to the decoder, which stops at the same point
+/// with its own error, past only frames counted here.
+fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
+    let mut options = gif::DecodeOptions::new();
+    options.skip_frame_decoding(true);
+    let Ok(mut decoder) = options.read_info(bytes) else {
+        return Ok(());
+    };
+    let screen = u64::from(decoder.width()) * u64::from(decoder.height());
+    let mut frames: usize = 0;
+    let mut total_pixels: u64 = 0;
+    while let Ok(Some(frame)) = decoder.next_frame_info() {
+        frames += 1;
+        if frames > MAX_ANIMATED_FRAMES {
+            return Err(EngineError::Decode(format!(
+                "GIF has more than {MAX_ANIMATED_FRAMES} frames"
+            )));
+        }
+        let declared = u64::from(frame.width) * u64::from(frame.height);
+        total_pixels += screen.max(declared);
+        if total_pixels > MAX_ANIMATED_PIXELS {
+            return Err(EngineError::Decode(format!(
+                "GIF frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The ANIM parameters of a WebP source: `(loop count,
@@ -2246,7 +2524,10 @@ impl From<AnimatedFormat> for ImageFormat {
 /// first (the decoder otherwise leaves the disposed rectangle
 /// in place), so the color is read from the container and set
 /// before iterating.
-fn decode_webp_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
+fn decode_webp_frames(
+    bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> Result<Frames, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -2258,7 +2539,7 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
         // disposal behavior; the frames still decode.
         let _ = decoder.set_background_color(image::Rgba(background));
     }
-    collect_frames(decoder.into_frames(), "WebP")
+    collect_frames(decoder.into_frames(), "WebP", deadline)
 }
 
 /// Encode frames as an animated WebP through libwebp's

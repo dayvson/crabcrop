@@ -152,9 +152,10 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     println!("crabcrop listening on port {port}");
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
     // listener closes, idle connections close, and requests
-    // in flight finish; then the background writes they and
-    // earlier requests left (shared-tier write-throughs,
-    // purges whose caller left) finish. One deadline, the
+    // in flight finish; then the background work they and
+    // earlier requests left (renders whose client left
+    // after they started, shared-tier write-throughs,
+    // purges whose caller left) finishes. One deadline, the
     // grace from the signal on, bounds both waits, and the
     // process exits at it with whatever is still running.
     // A second signal ends the drain at once.
@@ -173,7 +174,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + shutdown_grace;
     let signalled_again = shutdown_signal();
     println!(
-        "shutdown: draining requests and background writes for up to {}s",
+        "shutdown: draining requests and background work for up to {}s",
         shutdown_grace.as_secs()
     );
     let drain = async {
@@ -196,6 +197,14 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         eprintln!(
             "shutdown: {} background writes still running {when} are dropped",
             left.writes
+        );
+    }
+    if left.renders > 0 {
+        // A render whose client had gone, cut off before it
+        // was stored: the next request for it renders it.
+        eprintln!(
+            "shutdown: {} renders whose client left, still running {when}, are dropped unstored",
+            left.renders
         );
     }
     if left.walks > 0 {
@@ -226,10 +235,10 @@ const AI_GATE_PERMITS: usize = 2;
 const ANIM_GATE_PERMITS: usize = 1;
 
 /// Permits on the probe gate: heavy `/explain` probes (an
-/// SVG's parse in a worker process, an AVIF's decode) run
-/// on blocking threads, at most two at once, so a burst of
-/// explain requests cannot occupy the async runtime or
-/// start a worker per request.
+/// SVG's parse in a worker process, an AVIF's decode, a
+/// HEIC's item graph walk) run on blocking threads, at most
+/// two at once, so a burst of explain requests cannot
+/// occupy the async runtime or start a worker per request.
 const PROBE_GATE_PERMITS: usize = 2;
 
 /// The result stores a configuration names, opened (see
@@ -345,6 +354,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if config.meta_enabled {
         println!("meta mode: on");
     }
+    if !config.client_hints {
+        println!("client hints: off");
+    }
 
     Ok(AppState {
         keyring: config.keyring.clone(),
@@ -394,6 +406,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         avif_speed: config.avif_speed,
         jxl_speed: config.jxl_speed,
         width_step: config.width_step,
+        client_hints: config.client_hints,
         preserve_metadata: config.preserve_metadata,
         brand_color: config.brand_color,
         presets: config.presets.clone(),
@@ -500,7 +513,55 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// measures, instead of its media box; and a PDF page too
 /// large to fit the raster limits at 1 dpi refused instead
 /// of rendered past them).
-const RENDERING_VERSION: u32 = 4;
+///
+/// 5: the first release after 0.10.1, which changes output
+/// for existing URLs (a signed output records every image
+/// source as its parent ingredient, a container JPEG XL, a
+/// HEIF whose major brand is not `heic` or `heix`, and an
+/// SVG, TIFF, BMP or ICO source included, instead of
+/// starting a fresh chain #564, PR #581, and no longer
+/// carries the source's C2PA manifest store, its parent
+/// ingredient naming only the source's format and the
+/// status codes its store validated with #610, PR #621; a
+/// `Save-Data` request for a URL whose per-format
+/// `quality(...)` list names no value for the output
+/// format, such as `format(webp):quality(jpeg:90)`, encoded
+/// at the format's default quality instead of the stepped
+/// 70, which the release before could also store as the
+/// URL's plain entry #569, PR #618; a `file://` source path
+/// with a `..` segment answered `404` even where it stays
+/// inside the file root, PR #620; an SVG source draws
+/// nothing for an image reference that points outside the
+/// document, PR #623; `frame:` refused with `502` on a
+/// video stream in a codec off the decoder list (WMV and
+/// VC-1, Sorenson H.263 and VP6 in FLV, Microsoft MPEG-4,
+/// lossless, raw and screen-capture codecs) #605, on a
+/// video with any stream past the decode budget, displayed
+/// or coded, and where the decode needs more than the
+/// extractor's 3 GiB address-space cap, 8 GiB before; a PDF
+/// page drawn without an embedded image whose decode needs
+/// more than the PDF tools' 3 GiB cap, a page whose own
+/// surfaces need more refused with `502`, and every page of
+/// a document that stores a JPEG 2000 image past that cap
+/// refused with `502`, PR #624; and an animated GIF whose
+/// frames pass the 100 million pixel budget once each
+/// counts at its declared size where that is larger than
+/// the canvas, a HEIC/HEIF source whose item graph takes
+/// too much work to walk or would hold more than 128 MiB,
+/// or whose `altr` alternative's gain map fails the checks
+/// run before a decode, and a JPEG XL source with a frame
+/// holding more pixels than the decode budget allows a
+/// whole image, all of which rendered before and are now
+/// refused with `502`, PR #623).
+///
+/// 6: the first release after 0.11.0, which changes output
+/// for existing URLs (WebM output written with bitexact
+/// muxing: the Matroska muxer writes track UID 1 and the
+/// generic `Lavf` and `Lavc` tags instead of a random
+/// track UID and the encoder build's own tags, so WebM
+/// bytes change once and then repeat render for render on
+/// one encoder build #567, PR #585).
+const RENDERING_VERSION: u32 = 6;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the

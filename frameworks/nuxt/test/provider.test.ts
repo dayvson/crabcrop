@@ -126,3 +126,17 @@ test("format and quality follow the SDK's grammar (issue #482)", async () => {
     quality: (quality: number) => unsigned({ quality }),
   });
 });
+
+test("a source under the reserved segment is refused, never signed", () => {
+  // With no modifiers the provider forwards src as the whole
+  // remainder, and every derived subkey is the signature of a
+  // label such as crabcrop/upload-key: the SDK refuses it, on
+  // the server and in the browser alike.
+  for (const src of ["crabcrop/upload-key", "crabcrop/purge-key", "crabcrop"]) {
+    assert.throws(() => getImage(src, { modifiers: {}, ...options }, server), /reserved segment "crabcrop"/);
+    assert.throws(() => getImage(src, { modifiers: {}, ...options }, {}), /reserved segment "crabcrop"/);
+  }
+  // A path that only names a label further in still signs.
+  const named = "https://cdn.example.com/crabcrop/upload-key.jpg";
+  assert.equal(getImage(named, { modifiers: {}, ...options }, server).url, url(named));
+});

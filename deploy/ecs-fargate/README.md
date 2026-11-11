@@ -15,7 +15,7 @@ every task reads and writes one S3 bucket.
 Release images are published to GHCR as
 `ghcr.io/dayvson/crabcrop`, tagged with the release
 version. Set the `image` in `task-definition.json` to
-`ghcr.io/dayvson/crabcrop:0.10.1` (or to your own build of
+`ghcr.io/dayvson/crabcrop:0.11.0` (or to your own build of
 the repo Dockerfile, pushed to your ECR repository), then
 replace the remaining `REPLACE_ME` values in
 `task-definition.json`.

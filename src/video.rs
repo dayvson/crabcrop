@@ -69,6 +69,15 @@ pub const GATE_PERMITS: usize = 2;
 /// grid) expresses every delay a real animation carries.
 pub const MAX_FPS: u32 = 100;
 
+/// The encoder's address-space cap on Linux, 8 GiB: room
+/// for an encode at the output budgets, whose frames come
+/// from crabcrop's own pipeline, with the encoder's
+/// lookahead and reference frames and its threads, while a
+/// runaway allocation still ends as an encoder error. The
+/// frame and page tools, which read source bytes, have caps
+/// of their own, sized to their decode budgets.
+const ENCODER_MAX_ADDRESS_SPACE: u64 = 8 << 30;
+
 /// The longest animation video output accepts, in
 /// milliseconds of summed frame delays. The input bounds
 /// (200 frames) cap frame count, not runtime: 200 frames at
@@ -367,6 +376,14 @@ impl VideoEncoder {
             ),
             VideoFormat::WebM => args.extend(
                 [
+                    // Without bitexact the Matroska muxer
+                    // writes a random track UID (and the
+                    // build's own app and encoder tags), so
+                    // no two renders of the same URL ever
+                    // matched and every ETag was new
+                    // (issue #567).
+                    "-fflags",
+                    "+bitexact",
                     "-c:v",
                     "libvpx-vp9",
                     "-b:v",
@@ -431,6 +448,7 @@ impl VideoEncoder {
             max_stderr: 8192,
             deadline: Instant::now() + self.timeout,
             cpu_limit: tool_cpu_limit(self.timeout),
+            max_address_space: ENCODER_MAX_ADDRESS_SPACE,
         })
         .map_err(|e| {
             VideoError::Failed(match e {
@@ -698,6 +716,14 @@ mod tests {
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(argv.contains("libvpx-vp9"), "{argv}");
         assert!(argv.contains("webm"), "{argv}");
+        // Bitexact muxing (issue #567): the flag pair is
+        // what makes two renders of one URL byte-identical.
+        let lines: Vec<&str> = argv.lines().collect();
+        let flags = lines
+            .iter()
+            .position(|arg| *arg == "-fflags")
+            .expect("the WebM argv carries -fflags");
+        assert_eq!(lines[flags + 1], "+bitexact", "{argv}");
     }
 
     #[test]
@@ -853,7 +879,10 @@ mod tests {
 
     /// Encode two frames with the real FFmpeg and check the
     /// containers: an MP4 carries the ftyp box, a WebM the
-    /// EBML header. Run it with:
+    /// EBML header. Each format is encoded twice and the
+    /// two renders must be byte-identical: a render that
+    /// differs run to run gives the same URL a new ETag
+    /// every time (issue #567). Run it with:
     /// `cargo test -- --ignored real_ffmpeg`
     #[test]
     #[ignore = "needs a real encoder binary (ffmpeg) on this machine"]
@@ -868,12 +897,19 @@ mod tests {
         let mp4 = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
         assert!(mp4.len() > 100, "suspiciously small MP4: {}", mp4.len());
         assert_eq!(&mp4[4..8], b"ftyp", "MP4 has no ftyp box");
+        let mp4_again = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        assert_eq!(mp4, mp4_again, "two MP4 renders of the same frames differ");
         let webm = encoder.encode(&frames, VideoFormat::WebM).unwrap();
         assert!(webm.len() > 100, "suspiciously small WebM: {}", webm.len());
         assert_eq!(
             &webm[0..4],
             &[0x1a, 0x45, 0xdf, 0xa3],
             "WebM has no EBML header"
+        );
+        let webm_again = encoder.encode(&frames, VideoFormat::WebM).unwrap();
+        assert_eq!(
+            webm, webm_again,
+            "two WebM renders of the same frames differ"
         );
     }
 }
