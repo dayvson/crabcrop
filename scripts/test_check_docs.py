@@ -853,7 +853,7 @@ class ChangelogEntry(unittest.TestCase):
         # The assembler joins the lines and drops the "- ", so the gate
         # accepts what the assembler can write.
         self.write("src/lib.rs", "pub fn f() { g() }\n")
-        self.write("changelog.d/1.changed.md", "- The change, wrapped\n  over two lines (issue #1).\n\n\n")
+        self.write("changelog.d/1.changed.md", "- The change, wrapped\n  over two lines (issues\n#2 and #1).\n\n\n")
         self.commit("change")
         done = self.entry()
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -888,6 +888,7 @@ class ChangelogEntry(unittest.TestCase):
             ("changelog.d/1.fixed.md", "One (issue #1).\n\nTwo.\n", "one paragraph"),
             ("changelog.d/1.fixed.md", "- One (issue #1).\n- Two (issue #1).\n", "one entry"),
             ("changelog.d/1.fixed.md", "### Fixed\nOne (issue #1).\n", "a heading"),
+            ("changelog.d/1.fixed.md", "One (issue #1),\n# wrapped.\n", "a heading"),
             ("changelog.d/1.fixed.md", b"\xff\xfe (issue #1)\n", "not UTF-8"),
             (
                 "changelog.d/1.fixed.md",
@@ -1133,7 +1134,7 @@ Notes on the format.
 
 ASSEMBLY_FRAGMENTS = {
     "40.fixed.md": "A later fix (issue #40).\n",
-    "5.fixed.md": "An earlier fix\n(issue #5).\n",
+    "5.fixed.md": "An earlier fix (issue\n#5).\n",
     "5-again.fixed.md": "- A second fix for the same issue (issue #5).\n\n",
     "7.added.md": "A new thing (issues #7 and #8).\n",
     "9.changed.md": "A change (issue #9).",

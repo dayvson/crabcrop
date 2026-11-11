@@ -67,6 +67,8 @@ EPOCH = "This release starts a new cache epoch"
 STEM = re.compile(r"(?P<issue>[1-9][0-9]*)(?:-(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*))?")
 ISSUE_REF = re.compile(r"\bissues?\s+#\d+(?:\s*(?:,\s*(?:and\s+)?|and\s+)#\d+)*", re.I)
 BULLET = re.compile(r"[-*+]\s+")
+# A Markdown heading line; "#612 and #626)" wrapped onto a line of its own is none.
+HEADING = re.compile(r"#{1,6}(?:\s|$)")
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -158,8 +160,8 @@ def entry_text(raw, issue, section):
             "holds more than one entry: a line opening with a bullet starts another "
             "(a second entry is a second fragment)"
         )
-    if any(line.startswith("#") for line in lines):
-        raise FragmentError("holds a heading line ('#'): the assembler writes the headings")
+    if any(HEADING.match(line) for line in lines):
+        raise FragmentError("holds a heading line ('# '): the assembler writes the headings")
     text = " ".join(lines)
     named = issues_named(text)
     if not named:
