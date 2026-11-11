@@ -34,8 +34,8 @@ fn keyring_verifies_across_a_rotation_window() {
         previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
     };
     let remainder = "300x200/example.com/img.jpg";
-    let new_sig = Signature::Hmac(crabcrop_url::sign(b"new-secret-value", remainder));
-    let old_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", remainder));
+    let new_sig = Signature::Hmac(crabcrop_url::sign(b"new-secret-value", remainder).unwrap());
+    let old_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", remainder).unwrap());
     // Keyed URLs consult exactly the named key.
     assert!(ring.verify(Some("k-new"), &new_sig, remainder, false));
     assert!(ring.verify(Some("k-old"), &old_sig, remainder, false));
@@ -66,7 +66,7 @@ fn keyring_purge_verification_keeps_domain_separation() {
     assert!(!ring.verify_purge(Some("k-new"), &old_purge, target));
     // An image signature under the old key is not a purge
     // signature under any routing.
-    let image_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", target));
+    let image_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", target).unwrap());
     assert!(!ring.verify_purge(Some("k-old"), &image_sig, target));
 }
 
@@ -406,7 +406,7 @@ fn purge_signatures_are_domain_separated() {
     let purge_sig = purge_signature(secret, target);
     // The replay from audit P-1: an image signature over
     // "purge/<target>" must not verify as a purge signature.
-    let image_sig = crabcrop_url::sign(secret, &format!("purge/{target}"));
+    let image_sig = crabcrop_url::sign(secret, &format!("purge/{target}")).unwrap();
     assert_ne!(purge_sig, image_sig);
     assert!(verify_purge(secret, &Signature::Hmac(purge_sig), target));
     assert!(!verify_purge(secret, &Signature::Hmac(image_sig), target));
@@ -432,7 +432,7 @@ fn upload_signatures_are_domain_separated() {
     // over the same string verifies as an upload
     // signature, and the upload signature verifies in
     // neither other domain.
-    let image_sig = crabcrop_url::sign(secret, name);
+    let image_sig = crabcrop_url::sign(secret, name).unwrap();
     let purge_sig = purge_signature(secret, name);
     assert!(!verify_upload(
         secret,
@@ -630,7 +630,7 @@ fn keyring_upload_verification_keeps_domain_separation() {
     assert!(!ring.verify_upload(Some("k-new"), &old_upload, name));
     // An image signature under the old key is not an
     // upload signature under any routing.
-    let image_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", name));
+    let image_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", name).unwrap());
     assert!(!ring.verify_upload(Some("k-old"), &image_sig, name));
 }
 

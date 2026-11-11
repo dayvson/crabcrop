@@ -69,6 +69,15 @@ pub const GATE_PERMITS: usize = 2;
 /// grid) expresses every delay a real animation carries.
 pub const MAX_FPS: u32 = 100;
 
+/// The encoder's address-space cap on Linux, 8 GiB: room
+/// for an encode at the output budgets, whose frames come
+/// from crabcrop's own pipeline, with the encoder's
+/// lookahead and reference frames and its threads, while a
+/// runaway allocation still ends as an encoder error. The
+/// frame and page tools, which read source bytes, have caps
+/// of their own, sized to their decode budgets.
+const ENCODER_MAX_ADDRESS_SPACE: u64 = 8 << 30;
+
 /// The longest animation video output accepts, in
 /// milliseconds of summed frame delays. The input bounds
 /// (200 frames) cap frame count, not runtime: 200 frames at
@@ -439,6 +448,7 @@ impl VideoEncoder {
             max_stderr: 8192,
             deadline: Instant::now() + self.timeout,
             cpu_limit: tool_cpu_limit(self.timeout),
+            max_address_space: ENCODER_MAX_ADDRESS_SPACE,
         })
         .map_err(|e| {
             VideoError::Failed(match e {

@@ -136,3 +136,16 @@ test("format and quality follow the SDK's grammar (issue #482)", async () => {
     quality: (quality: number) => loader.url(table.SRC, { quality }),
   });
 });
+
+test("a source under the reserved segment is refused, never signed", () => {
+  // With no options there are no operations, so src is the
+  // whole remainder; every derived subkey is the signature of
+  // a label such as crabcrop/upload-key.
+  const signed = createCrabcropLoader({ base: "https://images.example.com", secret: "test-secret" });
+  for (const src of ["crabcrop/upload-key", "crabcrop/seal-key", "crabcrop"]) {
+    assert.throws(() => signed.url(src), /reserved segment "crabcrop"/);
+    assert.throws(() => images.url(src), /reserved segment "crabcrop"/);
+  }
+  const named = "https://cdn.example.com/crabcrop/upload-key.jpg";
+  assert.equal(signed.url(named), `https://images.example.com/${sig(named)}/${named}`);
+});

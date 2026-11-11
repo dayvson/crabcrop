@@ -21,8 +21,14 @@
 //!   URLs.
 //! - **Purge and upload signatures**: the same HMAC under
 //!   domain-separated derived subkeys, so a signature
-//!   minted for one endpoint can never be replayed
-//!   against another.
+//!   minted for one endpoint verifies at no other.
+//!
+//! Each subkey is the HMAC of a fixed label under the
+//! secret, and every label begins with the segment
+//! [`RESERVED_SEGMENT`]. No image URL may begin with that
+//! segment, so every signer here refuses such a remainder
+//! ([`is_reserved_remainder`]): a signature over a label
+//! would be that label's subkey.
 //!
 //! ```
 //! let url = crabcrop_url::build_url(
@@ -73,14 +79,66 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The first remainder segment reserved for key derivation.
+/// Every derived subkey ([`purge_key`], [`purge_group_key`],
+/// [`upload_key`], [`seal_key`], [`entry_key`]) is the HMAC
+/// of a label such as `crabcrop/purge-key` under the secret,
+/// which is the image signature of that label. No image URL
+/// may begin with this segment (the server refuses one with
+/// `400 reserved_segment`), and every signer and builder
+/// refuses a remainder that does, so no image signature is
+/// ever a subkey.
+pub const RESERVED_SEGMENT: &str = "crabcrop";
+
+/// Whether `remainder` begins with [`RESERVED_SEGMENT`]: it is
+/// that segment alone or starts with `crabcrop/`. The test is
+/// on the bytes as written, as the HMAC is: `exp:1/crabcrop/x`
+/// and `CRABCROP/x` are not reserved.
+pub fn is_reserved_remainder(remainder: &str) -> bool {
+    remainder.split('/').next() == Some(RESERVED_SEGMENT)
+}
+
+/// The raw HMAC-SHA256 of `message` under `key`.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+/// A subkey: the raw HMAC-SHA256 of a label under the secret.
+/// Every label begins with [`RESERVED_SEGMENT`], so [`sign`]
+/// refuses to compute the same value as a signature.
+fn derive_subkey(secret: &[u8], label: &str) -> Vec<u8> {
+    debug_assert!(is_reserved_remainder(label));
+    hmac_sha256(secret, label.as_bytes()).to_vec()
+}
+
+/// A signature under a derived subkey: the lowercase hex
+/// HMAC-SHA256 of `message`. The message space is the
+/// subkey's own, so no remainder is reserved here.
+fn sign_under_subkey(subkey: &[u8], message: &str) -> String {
+    hex::encode(hmac_sha256(subkey, message.as_bytes()))
+}
+
 /// Compute the signature segment for a remainder: the
 /// lowercase hex HMAC-SHA256 of `remainder` under `secret`.
 /// `remainder` is everything after the signature segment in
 /// the URL, exactly as it will appear.
-pub fn sign(secret: &[u8], remainder: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(remainder.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+///
+/// A remainder that begins with [`RESERVED_SEGMENT`] is
+/// refused with [`BuildError::ReservedRemainder`]: its
+/// signature could be a derived subkey, and no image URL may
+/// begin with that segment.
+pub fn sign(secret: &[u8], remainder: &str) -> Result<String, BuildError> {
+    refuse_reserved(remainder)?;
+    Ok(hex::encode(hmac_sha256(secret, remainder.as_bytes())))
+}
+
+fn refuse_reserved(remainder: &str) -> Result<(), BuildError> {
+    if is_reserved_remainder(remainder) {
+        return Err(BuildError::ReservedRemainder(remainder.to_string()));
+    }
+    Ok(())
 }
 
 /// Whether `id` is a well-formed key ID: 1 to 32 characters
@@ -106,12 +164,16 @@ pub fn sign_with_key_id(
     if !is_valid_key_id(key_id) {
         return Err(BuildError::InvalidKeyId(key_id.to_string()));
     }
-    Ok(format!("{key_id}:{}", sign(secret, remainder)))
+    Ok(format!("{key_id}:{}", sign(secret, remainder)?))
 }
 
 /// Verify a presented signature segment against a remainder,
 /// in constant time. A segment that is not a 64-character hex
-/// SHA-256 tag fails without panicking.
+/// SHA-256 tag fails without panicking. This is the raw check
+/// the server runs under the secret and under each subkey, so
+/// it does not refuse reserved remainders: the server refuses
+/// an image remainder that begins with [`RESERVED_SEGMENT`]
+/// before it verifies anything.
 pub fn verify(secret: &[u8], signature_hex: &str, remainder: &str) -> bool {
     let Ok(expected) = hex::decode(signature_hex) else {
         return false;
@@ -142,6 +204,21 @@ pub enum BuildError {
     /// A key ID is not 1 to 32 characters of `[A-Za-z0-9_-]`.
     /// Carries the offending ID.
     InvalidKeyId(String),
+    /// The remainder begins with [`RESERVED_SEGMENT`], which
+    /// no image URL may carry: its signature could be a
+    /// derived subkey. Carries the remainder.
+    ReservedRemainder(String),
+}
+
+/// The one message for a reserved remainder, shared by
+/// [`BuildError`] and [`SealError`] and spelled the same way
+/// by every first-party implementation.
+fn write_reserved_remainder(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+        f,
+        "remainder begins with the reserved segment \"{RESERVED_SEGMENT}\": \
+         it is kept for key derivation, and no image URL may begin with it"
+    )
 }
 
 impl std::fmt::Display for BuildError {
@@ -158,6 +235,7 @@ impl std::fmt::Display for BuildError {
                 f,
                 "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
             ),
+            BuildError::ReservedRemainder(_) => write_reserved_remainder(f),
         }
     }
 }
@@ -198,11 +276,11 @@ fn write_invalid_character(
 /// The purge subkey: the raw bytes of the HMAC-SHA256 of
 /// the domain label `crabcrop/purge-key` under the secret.
 /// Purge signatures live under this derived key, so a
-/// signature minted for an image URL can never be replayed
-/// against a purge endpoint.
+/// signature minted for an image URL does not verify at a
+/// purge endpoint. That holds because [`sign`] never signs
+/// the label itself (see [`RESERVED_SEGMENT`]).
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
-    // `sign` returns the hex tag; the key is its raw bytes.
-    hex::decode(sign(secret, "crabcrop/purge-key")).expect("sign returns lowercase hex")
+    derive_subkey(secret, "crabcrop/purge-key")
 }
 
 /// The purge signature for a target path (the request
@@ -210,7 +288,7 @@ pub fn purge_key(secret: &[u8]) -> Vec<u8> {
 /// path under the purge subkey. This is the signature
 /// segment for `POST /purge/<signature>/<path>`.
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
-    sign(&purge_key(secret), target)
+    sign_under_subkey(&purge_key(secret), target)
 }
 
 /// The purge-group subkey: the raw bytes of the
@@ -222,8 +300,7 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
 /// can never be transplanted to `/purge-group`, whatever
 /// target string it was minted over (audit R2-14).
 pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
-    // `sign` returns the hex tag; the key is its raw bytes.
-    hex::decode(sign(secret, "crabcrop/purge-group-key")).expect("sign returns lowercase hex")
+    derive_subkey(secret, "crabcrop/purge-group-key")
 }
 
 /// The purge-group signature for a cache group: HMAC-SHA256
@@ -232,7 +309,7 @@ pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
 /// `POST /purge-group/<signature>/<group>`; the helper
 /// exists so nobody has to know the signed string.
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
-    sign(&purge_group_key(secret), group)
+    sign_under_subkey(&purge_group_key(secret), group)
 }
 
 /// The cache entry subkey: the raw bytes of the
@@ -244,24 +321,24 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
 /// leaves the server: no client signature is ever
 /// computed with it.
 pub fn entry_key(secret: &[u8]) -> Vec<u8> {
-    hex::decode(sign(secret, "crabcrop/entry-key")).expect("sign returns lowercase hex")
+    derive_subkey(secret, "crabcrop/entry-key")
 }
 
 /// The upload subkey: the raw bytes of the HMAC-SHA256 of
 /// the domain label `crabcrop/upload-key` under the secret.
 /// Upload signatures live under this derived key, in their
 /// own domain like purge signatures, so a signature minted
-/// for an image URL (or a purge) can never be replayed
-/// against the upload endpoint (issue #168).
+/// for an image URL (or a purge) does not verify at the
+/// upload endpoint (issue #168).
 pub fn upload_key(secret: &[u8]) -> Vec<u8> {
-    hex::decode(sign(secret, "crabcrop/upload-key")).expect("sign returns lowercase hex")
+    derive_subkey(secret, "crabcrop/upload-key")
 }
 
 /// The upload signature for an object name: HMAC-SHA256 of
 /// the name under the upload subkey. This is the signature
 /// segment for `PUT /upload/<signature>/<name>`.
 pub fn upload_signature(secret: &[u8], name: &str) -> String {
-    sign(&upload_key(secret), name)
+    sign_under_subkey(&upload_key(secret), name)
 }
 
 /// The seal subkey: the raw bytes of the HMAC-SHA256 of
@@ -274,7 +351,7 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
 /// this same derivation, and the rotation window for
 /// signatures is the rotation window for tokens.
 pub fn seal_key(secret: &[u8]) -> Vec<u8> {
-    hex::decode(sign(secret, "crabcrop/seal-key")).expect("sign returns lowercase hex")
+    derive_subkey(secret, "crabcrop/seal-key")
 }
 
 /// The version marker that opens a sealed token segment:
@@ -319,6 +396,11 @@ pub enum SealError {
     /// `unsafe` spelling of a token, the mirror image of how
     /// purge and upload signatures treat a null secret.
     NoSecret,
+    /// [`build_sealed_url`] assembled a remainder that begins
+    /// with [`RESERVED_SEGMENT`], which no image URL may
+    /// carry: the server refuses a token whose remainder
+    /// does. Carries the remainder.
+    ReservedRemainder(String),
     /// The token did not open under the given secret. Every
     /// open failure (malformed body, wrong key, tampered
     /// bytes, unknown version) is this one value, on
@@ -346,6 +428,7 @@ impl std::fmt::Display for SealError {
             SealError::NoSecret => {
                 write!(f, "sealing requires a secret: there is no unsafe token")
             }
+            SealError::ReservedRemainder(_) => write_reserved_remainder(f),
             SealError::OpenFailed => write!(f, "the token did not open under this secret"),
         }
     }
@@ -531,31 +614,17 @@ pub fn build_sealed_url(
     name: Option<&str>,
     key_id: Option<&str>,
 ) -> Result<String, SealError> {
-    validate_url_text(operations, "operations").map_err(|e| match e {
+    let remainder = assemble_remainder(operations, source, expires).map_err(|e| match e {
         BuildError::InvalidCharacter { what, character } => {
             SealError::InvalidCharacter { what, character }
         }
-        _ => SealError::OpenFailed,
-    })?;
-    validate_url_text(source, "source").map_err(|e| match e {
-        BuildError::InvalidCharacter { what, character } => {
-            SealError::InvalidCharacter { what, character }
-        }
+        BuildError::ReservedRemainder(remainder) => SealError::ReservedRemainder(remainder),
         _ => SealError::OpenFailed,
     })?;
     let Some(secret) = secret else {
         return Err(SealError::NoSecret);
     };
     let base = base.trim_end_matches('/');
-    let mut remainder = String::new();
-    if let Some(exp) = expires {
-        remainder.push_str(&format!("exp:{exp}/"));
-    }
-    if !operations.is_empty() {
-        remainder.push_str(operations);
-        remainder.push('/');
-    }
-    remainder.push_str(source);
     let segment = match key_id {
         Some(id) => seal_with_key_id(secret, id, &remainder)?,
         None => seal(secret, &remainder)?,
@@ -591,7 +660,7 @@ pub fn upload_signed_string(name: &str, expires: Option<u64>) -> String {
 /// [`upload_signature`] token replays until the secret
 /// rotates.
 pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
-    sign(
+    sign_under_subkey(
         &upload_key(secret),
         &upload_signed_string(name, Some(expires)),
     )
@@ -618,24 +687,20 @@ pub fn validate_url_text(text: &str, what: &'static str) -> Result<(), BuildErro
     Ok(())
 }
 
-/// Assemble a signed (or `unsafe`) crabcrop URL.
-///
-/// `operations` is the operation string verbatim (it may hold
-/// several `/`-separated segments, `preset:` references
-/// included). `expires` is a unix-seconds expiry, emitted as a
-/// leading `exp:` segment. A `None` secret produces the
-/// literal `unsafe` signature segment, for servers running
-/// with unsafe or presets-only configurations.
-pub fn build_url(
-    base: &str,
-    secret: Option<&[u8]>,
+/// The remainder every builder signs or seals: the expiry
+/// segment, the operations, and the source, joined by `/`.
+/// Inputs that can never verify are refused here, plain or
+/// sealed, with a secret or without: a character
+/// [`validate_url_text`] refuses, and a remainder that
+/// begins with [`RESERVED_SEGMENT`], which the server
+/// refuses whatever the signature.
+fn assemble_remainder(
     operations: &str,
     source: &str,
     expires: Option<u64>,
 ) -> Result<String, BuildError> {
     validate_url_text(operations, "operations")?;
     validate_url_text(source, "source")?;
-    let base = base.trim_end_matches('/');
     let mut remainder = String::new();
     if let Some(exp) = expires {
         remainder.push_str(&format!("exp:{exp}/"));
@@ -645,8 +710,31 @@ pub fn build_url(
         remainder.push('/');
     }
     remainder.push_str(source);
+    refuse_reserved(&remainder)?;
+    Ok(remainder)
+}
+
+/// Assemble a signed (or `unsafe`) crabcrop URL.
+///
+/// `operations` is the operation string verbatim (it may hold
+/// several `/`-separated segments, `preset:` references
+/// included). `expires` is a unix-seconds expiry, emitted as a
+/// leading `exp:` segment. A `None` secret produces the
+/// literal `unsafe` signature segment, for servers running
+/// with unsafe or presets-only configurations. A remainder
+/// that begins with [`RESERVED_SEGMENT`] is refused either
+/// way, with [`BuildError::ReservedRemainder`].
+pub fn build_url(
+    base: &str,
+    secret: Option<&[u8]>,
+    operations: &str,
+    source: &str,
+    expires: Option<u64>,
+) -> Result<String, BuildError> {
+    let remainder = assemble_remainder(operations, source, expires)?;
+    let base = base.trim_end_matches('/');
     let signature = match secret {
-        Some(secret) => sign(secret, &remainder),
+        Some(secret) => sign(secret, &remainder)?,
         None => "unsafe".to_string(),
     };
     Ok(format!("{base}/{signature}/{remainder}"))
@@ -663,18 +751,8 @@ pub fn build_url_with_key_id(
     source: &str,
     expires: Option<u64>,
 ) -> Result<String, BuildError> {
-    validate_url_text(operations, "operations")?;
-    validate_url_text(source, "source")?;
+    let remainder = assemble_remainder(operations, source, expires)?;
     let base = base.trim_end_matches('/');
-    let mut remainder = String::new();
-    if let Some(exp) = expires {
-        remainder.push_str(&format!("exp:{exp}/"));
-    }
-    if !operations.is_empty() {
-        remainder.push_str(operations);
-        remainder.push('/');
-    }
-    remainder.push_str(source);
     let segment = match secret {
         Some((secret, key_id)) => sign_with_key_id(secret, key_id, &remainder)?,
         None => return Err(BuildError::InvalidKeyId(String::new())),
@@ -726,7 +804,11 @@ mod tests {
             let secret = v["secret"].as_str().unwrap();
             let remainder = v["remainder"].as_str().unwrap();
             let signature = v["signature"].as_str().unwrap();
-            assert_eq!(sign(secret.as_bytes(), remainder), signature, "{remainder}");
+            assert_eq!(
+                sign(secret.as_bytes(), remainder).unwrap(),
+                signature,
+                "{remainder}"
+            );
             assert!(verify(secret.as_bytes(), signature, remainder));
             assert!(!verify(secret.as_bytes(), signature, "tampered"));
         }
@@ -830,6 +912,152 @@ mod tests {
                     Err(BuildError::InvalidCharacter { character: c, .. }) if c == character
                 ));
             }
+        }
+    }
+
+    /// The reserved vectors from `spec/test-vectors.json`:
+    /// `sign` and every builder refuse a remainder that
+    /// begins with the reserved segment, signed or not, keyed
+    /// or not, plain or sealed, with the one typed error and
+    /// the one message every implementation spells alike.
+    #[test]
+    fn reserved_test_vectors() {
+        let text = include_str!("../../../spec/test-vectors.json");
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        let reserved: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v["reserved"].as_bool() == Some(true))
+            .collect();
+        assert!(reserved.len() >= 9, "the spec carries reserved vectors");
+        let base = "https://img.example.com";
+        let secret = &b"s3cr3t"[..];
+        let nonce = [7u8; 12];
+        for v in reserved {
+            let operations = v["operations"].as_str().unwrap();
+            let source = v["source"].as_str().unwrap();
+            let remainder = v["remainder"].as_str().unwrap();
+            let description = v["description"].as_str().unwrap();
+            assert!(is_reserved_remainder(remainder), "{description}");
+            let refused = BuildError::ReservedRemainder(remainder.to_string());
+            assert_eq!(
+                sign(secret, remainder),
+                Err(refused.clone()),
+                "{description}"
+            );
+            assert!(
+                refused
+                    .to_string()
+                    .contains("reserved segment \"crabcrop\""),
+                "{refused}"
+            );
+            assert_eq!(
+                sign_with_key_id(secret, "k2", remainder),
+                Err(refused.clone()),
+                "{description}"
+            );
+            for secret in [Some(secret), None] {
+                assert_eq!(
+                    build_url(base, secret, operations, source, None),
+                    Err(refused.clone()),
+                    "{description}"
+                );
+            }
+            assert_eq!(
+                build_url_with_key_id(base, Some((secret, "k2")), operations, source, None),
+                Err(refused.clone()),
+                "{description}"
+            );
+            let sealed = SealError::ReservedRemainder(remainder.to_string());
+            assert_eq!(sealed.to_string(), refused.to_string());
+            for secret in [Some(secret), None] {
+                assert_eq!(
+                    build_sealed_url(base, secret, operations, source, None, None, None),
+                    Err(sealed.clone()),
+                    "{description}"
+                );
+            }
+            assert_eq!(
+                build_sealed_url(
+                    base,
+                    Some(secret),
+                    operations,
+                    source,
+                    None,
+                    None,
+                    Some("k2")
+                ),
+                Err(sealed.clone()),
+                "{description}"
+            );
+            // The sealing primitive encrypts under the seal
+            // subkey and computes no HMAC under the secret, so
+            // it is not where the reserved segment is policed;
+            // like characters, the builders police it.
+            let token = seal_with_nonce(secret, None, &nonce, remainder).unwrap();
+            assert_eq!(unseal(secret, &token).unwrap(), remainder);
+        }
+    }
+
+    /// Each derived subkey is the HMAC of its label under the
+    /// secret, so a signature over a label would be that
+    /// subkey: no signer in this crate computes one, and no
+    /// builder assembles a label from operations and a source,
+    /// with or without an expiry or a key ID.
+    #[test]
+    fn no_signer_returns_a_derived_subkey() {
+        let secret = b"label-test-secret-0123456789";
+        let base = "https://img.example.com";
+        type Derive = fn(&[u8]) -> Vec<u8>;
+        let subkeys: [(&str, Derive); 5] = [
+            ("crabcrop/purge-key", purge_key),
+            ("crabcrop/purge-group-key", purge_group_key),
+            ("crabcrop/upload-key", upload_key),
+            ("crabcrop/seal-key", seal_key),
+            ("crabcrop/entry-key", entry_key),
+        ];
+        for (label, subkey) in subkeys {
+            // The derivation is unchanged: the HMAC of the
+            // label under the secret, as the spec states.
+            let key = subkey(secret);
+            assert_eq!(key, hmac_sha256(secret, label.as_bytes()).to_vec());
+            let refused = Err(BuildError::ReservedRemainder(label.to_string()));
+            assert_eq!(sign(secret, label), refused, "{label}");
+            assert_eq!(build_url(base, Some(secret), "", label, None), refused);
+            let (head, tail) = label.split_once('/').unwrap();
+            assert_eq!(build_url(base, Some(secret), head, tail, None), refused);
+            assert!(build_url_with_key_id(base, Some((secret, "k")), "", label, None).is_err());
+            assert!(build_sealed_url(base, Some(secret), "", label, None, None, None).is_err());
+            // What does sign is never a subkey.
+            for remainder in [
+                format!("exp:1/{label}"),
+                format!("300x200/{label}"),
+                format!("/{label}"),
+                label.to_uppercase(),
+            ] {
+                let signature = sign(secret, &remainder).unwrap();
+                for (_, other) in subkeys {
+                    assert_ne!(hex::decode(&signature).unwrap(), other(secret));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_remainders_are_the_reserved_segment_and_below() {
+        for reserved in ["crabcrop", "crabcrop/", "crabcrop/x", "crabcrop//x"] {
+            assert!(is_reserved_remainder(reserved), "{reserved}");
+        }
+        for open in [
+            "",
+            "crabcro",
+            "crabcropx",
+            "crabcrop-assets/photo.jpg",
+            "Crabcrop/purge-key",
+            "/crabcrop/purge-key",
+            "exp:1/crabcrop/purge-key",
+            "300x200/https://example.com/crabcrop/purge-key",
+        ] {
+            assert!(!is_reserved_remainder(open), "{open}");
         }
     }
 
@@ -1121,7 +1349,7 @@ mod tests {
         // image signature over a related string.
         assert_ne!(
             purge_signature(b"test-secret", "300x200/https://example.com/a.jpg"),
-            sign(b"test-secret", "300x200/https://example.com/a.jpg")
+            sign(b"test-secret", "300x200/https://example.com/a.jpg").unwrap()
         );
         // Purge-group has its own subkey (audit R2-14): no
         // per-target purge signature transplants to it, not
@@ -1171,7 +1399,7 @@ mod tests {
         // related string.
         assert_ne!(
             upload_signature(b"test-secret", "heroes/cat.jpg"),
-            sign(b"test-secret", "heroes/cat.jpg")
+            sign(b"test-secret", "heroes/cat.jpg").unwrap()
         );
         assert_ne!(
             upload_signature(b"test-secret", "heroes/cat.jpg"),
@@ -1372,7 +1600,10 @@ mod tests {
         let segment = sign_with_key_id(b"test-secret", "k2", "300x200/example.com/i.jpg").unwrap();
         assert_eq!(
             segment,
-            format!("k2:{}", sign(b"test-secret", "300x200/example.com/i.jpg"))
+            format!(
+                "k2:{}",
+                sign(b"test-secret", "300x200/example.com/i.jpg").unwrap()
+            )
         );
         for bad in ["", "has space", "has:colon", &"x".repeat(33)] {
             assert!(matches!(
