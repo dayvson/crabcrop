@@ -259,7 +259,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // costs after a restart.
     if disk_left.deletions > 0 {
         eprintln!(
-            "shutdown: {} purged disk entries are not deleted yet; the next boot indexes them again, so send those purges again",
+            "shutdown: {} purged disk entries are not deleted yet; the next boot indexes them again, so send those purges again, by URL for an entry a group purge removed before it had caught up with the group",
             disk_left.deletions
         );
     }

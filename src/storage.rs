@@ -91,8 +91,8 @@ struct Job {
     /// Not run again before this, after a failure: the job
     /// waits in [`KeyQueue::later`].
     not_before: Option<std::time::Instant>,
-    /// Being run right now.
-    running: bool,
+    /// Being run right now, since then.
+    running: Option<std::time::Instant>,
 }
 
 /// Jobs by key, at most one per key. A job that can run waits
@@ -110,13 +110,22 @@ struct KeyQueue {
     /// Every queued job's key by its sequence number, for the
     /// waits on one purge's deletions.
     by_seq: BTreeMap<u64, String>,
+    /// The deletions queued outside a purge, which no purge
+    /// holds its tombstones for yet (a lookup, a landing or a
+    /// learn that found the copy under a purge, or an
+    /// eviction), by key, with the groups of the copy each
+    /// deletes, until a purge that covers the copy takes it
+    /// over (see [`DiskStore::purge_waiting`]). Kept apart so
+    /// a purge looks at these only, not the whole queue.
+    unheld: HashMap<String, Vec<String>>,
     /// Jobs running now.
     running: usize,
     /// Jobs that failed at least once.
     failing: usize,
-    /// The sequence numbers of jobs that ended, failed or went
-    /// since the waits on them last heard, with
-    /// `track_ended` (deletions only).
+    /// The sequence numbers of jobs that stopped counting for
+    /// the waits on them since those last heard: each job once,
+    /// when it ends, goes, or first fails, with `track_ended`
+    /// (deletions only).
     ended: Vec<u64>,
     track_ended: bool,
 }
@@ -135,11 +144,21 @@ impl KeyQueue {
                 stem: stem.to_string(),
                 attempts: 0,
                 not_before: None,
-                running: false,
+                running: None,
             },
         );
         self.by_seq.insert(*seq, key.to_string());
         self.order.push_back((key.to_string(), *seq));
+    }
+
+    /// [`KeyQueue::push`] for the deletion of a copy in
+    /// `groups` that no purge holds its tombstones for.
+    fn push_unheld(&mut self, key: &str, stem: &str, groups: &[String], seq: &mut u64) {
+        if self.jobs.contains_key(key) {
+            return;
+        }
+        self.push(key, stem, seq);
+        self.unheld.insert(key.to_string(), groups.to_vec());
     }
 
     /// Drop `key`'s job. Returns whether there was one.
@@ -148,13 +167,15 @@ impl KeyQueue {
             return false;
         };
         self.by_seq.remove(&job.seq);
-        if self.track_ended {
+        self.unheld.remove(key);
+        // A failed job was counted out when it first failed.
+        if self.track_ended && job.attempts == 0 {
             self.ended.push(job.seq);
         }
         if let Some(at) = job.not_before {
             self.later.remove(&(at, job.seq));
         }
-        if job.running {
+        if job.running.is_some() {
             self.running -= 1;
         }
         if job.attempts > 0 {
@@ -185,7 +206,7 @@ impl KeyQueue {
         while let Some((key, seq)) = self.order.pop_front() {
             if let Some(job) = self.jobs.get(&key)
                 && job.seq == seq
-                && !job.running
+                && job.running.is_none()
                 && job.not_before.is_none()
             {
                 let stem = job.stem.clone();
@@ -198,7 +219,7 @@ impl KeyQueue {
     /// Mark `key`'s job as running.
     fn start(&mut self, key: &str) {
         if let Some(job) = self.jobs.get_mut(key) {
-            job.running = true;
+            job.running = Some(std::time::Instant::now());
             self.running += 1;
         }
     }
@@ -207,8 +228,8 @@ impl KeyQueue {
     /// again at once.
     fn finish(&mut self, key: &str, again: bool) {
         match self.jobs.get_mut(key) {
-            Some(job) if again && job.running => {
-                job.running = false;
+            Some(job) if again && job.running.is_some() => {
+                job.running = None;
                 self.running -= 1;
                 if job.attempts > 0 {
                     job.attempts = 0;
@@ -227,9 +248,9 @@ impl KeyQueue {
     /// again after a backoff.
     fn retry(&mut self, key: &str) {
         if let Some(job) = self.jobs.get_mut(key)
-            && job.running
+            && job.running.is_some()
         {
-            job.running = false;
+            job.running = None;
             self.running -= 1;
             if job.attempts == 0 {
                 self.failing += 1;
@@ -269,13 +290,30 @@ impl KeyQueue {
         self.later.first_key_value().map(|((at, _), _)| *at)
     }
 
-    /// How many jobs in `seqs` are queued or running; failed
-    /// ones count only with `failed`.
-    fn count_in(&self, seqs: &Range<u64>, failed: bool) -> usize {
+    /// How many jobs in `seqs` are queued or running and have
+    /// not failed. Walks the range: once per wait.
+    fn count_in(&self, seqs: &Range<u64>) -> usize {
         self.by_seq
             .range(seqs.clone())
-            .filter(|(_, key)| failed || self.jobs.get(*key).is_some_and(|job| job.attempts == 0))
+            .filter(|(_, key)| self.jobs.get(*key).is_some_and(|job| job.attempts == 0))
             .count()
+    }
+
+    /// Whether a job in `seqs` is queued or running, failed or
+    /// not.
+    fn any_in(&self, seqs: &Range<u64>) -> bool {
+        self.by_seq.range(seqs.clone()).next().is_some()
+    }
+
+    /// Whether a job in `seqs` has been running since `since` or
+    /// before. Walks the range: once per wait that runs out.
+    fn running_since(&self, seqs: &Range<u64>, since: std::time::Instant) -> bool {
+        self.by_seq.range(seqs.clone()).any(|(_, key)| {
+            self.jobs
+                .get(key)
+                .and_then(|job| job.running)
+                .is_some_and(|started| started <= since)
+        })
     }
 }
 
@@ -342,8 +380,18 @@ struct Inner {
     total_bytes: usize,
     /// Waits on one purge's deletions, by the first sequence
     /// number of its range: the range's end and the wait's
-    /// wake. Purge ranges never overlap.
-    deletion_waits: BTreeMap<u64, Vec<(u64, Arc<tokio::sync::Notify>)>>,
+    /// count. Purge ranges never overlap.
+    deletion_waits: BTreeMap<u64, Vec<(u64, Arc<DeletionCount>)>>,
+}
+
+/// One wait on a purge's deletions (issue #572): how many of
+/// them are still queued or running and have not failed, kept
+/// as each one ends, goes or fails, so the wait never counts
+/// them again, and its wake.
+#[derive(Debug, Default)]
+struct DeletionCount {
+    left: std::sync::atomic::AtomicUsize,
+    wake: tokio::sync::Notify,
 }
 
 impl Inner {
@@ -357,15 +405,21 @@ impl Inner {
         }
     }
 
-    /// Wake the waits whose purge had a deletion end, fail or
-    /// go since they last heard (issue #572). Only those wake,
-    /// so many waiting purges cost the drain nothing.
+    /// Count down and wake the waits whose purge had a deletion
+    /// end, fail or go since they last heard (issue #572). Only
+    /// those wake, each at a constant cost, so many waiting
+    /// purges, or one purge of many files, cost the drain
+    /// nothing.
     fn wake_deletion_waits(&mut self) {
         for seq in self.deletions.ended.drain(..) {
             if let Some((_, waits)) = self.deletion_waits.range(..=seq).next_back() {
-                for (end, wake) in waits {
+                for (end, count) in waits {
                     if seq < *end {
-                        wake.notify_one();
+                        // Only this, under the index lock, writes
+                        // the count; the wait only reads it.
+                        let left = count.left.load(Ordering::Relaxed);
+                        count.left.store(left.saturating_sub(1), Ordering::Relaxed);
+                        count.wake.notify_one();
                     }
                 }
             }
@@ -409,6 +463,10 @@ pub struct DiskStore {
     /// Bumped whenever a background job ends or a queued job
     /// goes, for the waits on them.
     progress: tokio::sync::watch::Sender<u64>,
+    /// When a background job last finished its work, on
+    /// [`monotonic_ms`] (0: never): a disk that finishes jobs
+    /// works, even while one purge's deletions wait their turn.
+    last_job_done_ms: AtomicU64,
     /// Rate-limits the log lines for disk waits that ran out.
     stall_log: StallLog,
     /// Rate-limits the log lines for background jobs that
@@ -624,6 +682,7 @@ impl DiskStore {
             permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
             drain_wake: tokio::sync::Notify::new(),
             progress: tokio::sync::watch::Sender::new(0),
+            last_job_done_ms: AtomicU64::new(0),
             stall_log: StallLog::new("disk waits ran out"),
             job_log: StallLog::new("background disk jobs failed"),
             #[cfg(test)]
@@ -654,10 +713,7 @@ impl DiskStore {
     fn note_job_error(&self, what: &str, e: &std::io::Error) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(line) = self
-            .job_log
-            .note(crate::cache::now_ms(), &format!("{what}: {e}"))
-        {
+        if let Some(line) = self.job_log.note(monotonic_ms(), &format!("{what}: {e}")) {
             eprintln!("{line}");
         }
     }
@@ -690,7 +746,7 @@ impl DiskStore {
     pub(crate) fn note_stall(&self, stall: Stall) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(line) = self.stall_log.note(crate::cache::now_ms(), stall.what()) {
+        if let Some(line) = self.stall_log.note(monotonic_ms(), stall.what()) {
             eprintln!("{line}");
         }
     }
@@ -972,8 +1028,8 @@ impl DiskStore {
                 Some((image, id))
             }
             _ => {
-                let stem = evict_entry(&mut inner, key).map(|record| record.stem);
-                let claimed = stem.and_then(|stem| claim_or_queue(&mut inner, key, &stem));
+                let claimed = evict_entry(&mut inner, key)
+                    .and_then(|record| claim_or_queue(&mut inner, key, &record));
                 drop(inner);
                 if let Some(stem) = claimed {
                     let _claim = FileClaim::inline(self, key);
@@ -1043,8 +1099,11 @@ impl DiskStore {
     }
 
     /// Remove `key`'s record if it is still copy `id`, and
-    /// queue its file's deletion. No file I/O; the caller
-    /// kicks the drain. Returns whether it was removed.
+    /// queue its file's deletion, retried until it is done. No
+    /// file I/O; the caller kicks the drain. A purge that
+    /// covers the copy holds its tombstones for the deletion
+    /// (see [`DiskStore::purge_waiting`]). Returns whether it
+    /// was removed.
     pub fn forget_if(&self, key: &str, id: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if !inner.entries.get(key).is_some_and(|record| record.id == id) {
@@ -1052,7 +1111,9 @@ impl DiskStore {
         }
         if let Some(record) = evict_entry(&mut inner, key) {
             let inner = &mut *inner;
-            inner.deletions.push(key, &record.stem, &mut inner.next_seq);
+            inner
+                .deletions
+                .push_unheld(key, &record.stem, &record.groups, &mut inner.next_seq);
         }
         true
     }
@@ -1156,17 +1217,17 @@ impl DiskStore {
         let landed = {
             let mut guard = self.inner.lock().unwrap();
             let inner = &mut *guard;
-            // The rename replaced the file a queued deletion was
-            // for.
-            if inner.deletions.remove(key) {
-                inner.wake_deletion_waits();
-                self.progress.send_modify(|n| *n += 1);
-            }
             match inner.claims.remove(key) {
                 Some(Claim::Write {
                     groups,
                     doomed: false,
                 }) => {
+                    // The rename replaced the file a queued
+                    // deletion was for.
+                    if inner.deletions.remove(key) {
+                        inner.wake_deletion_waits();
+                        self.progress.send_modify(|n| *n += 1);
+                    }
                     let groups = with_groups(&entry.groups, &groups);
                     if groups.len() > entry.groups.len() {
                         inner.rewrites.push(key, &stem, &mut inner.next_seq);
@@ -1180,7 +1241,7 @@ impl DiskStore {
                             .map(|(k, _)| k.clone());
                         let Some(oldest) = oldest else { break };
                         if let Some(record) = evict_entry(inner, &oldest)
-                            && let Some(stem) = claim_or_queue(inner, &oldest, &record.stem)
+                            && let Some(stem) = claim_or_queue(inner, &oldest, &record)
                         {
                             evicted.push((oldest, stem));
                         }
@@ -1207,7 +1268,10 @@ impl DiskStore {
                 }
                 _ => {
                     // Doomed: the file just written goes again,
-                    // under the key's claim.
+                    // under the key's claim. The deletion the
+                    // purge queued for it stays, so a failed
+                    // unlink here is retried, and the purge's
+                    // waits hold until the file is gone.
                     inner.claims.insert(key.to_string(), Claim::File);
                     None
                 }
@@ -1262,7 +1326,7 @@ impl DiskStore {
                 return false;
             }
             let record = evict_entry(&mut inner, key);
-            record.and_then(|record| claim_or_queue(&mut inner, key, &record.stem))
+            record.and_then(|record| claim_or_queue(&mut inner, key, &record))
         };
         if let Some(stem) = claimed {
             let _claim = FileClaim::inline(self, key);
@@ -1288,12 +1352,48 @@ impl DiskStore {
     /// Remove every record `target` covers from the index at
     /// once, with no file I/O (issue #572), and queue their
     /// files' deletion. A write in flight that the purge
-    /// covers is doomed: it lands nothing. Returns how many
+    /// covers is doomed: it lands nothing, and the deletion of
+    /// the file it renames into place is queued with the
+    /// others, so the purge's waits cover it. Returns how many
     /// records were removed, and the sequence numbers of the
     /// deletions this purge queued, for
     /// [`DiskStore::wait_deletions`]. The caller kicks the
     /// drain.
     pub fn purge(&self, target: &PurgeTarget) -> (usize, Range<u64>) {
+        let (removed, seqs, _) = self.purge_queued(target);
+        (removed, seqs)
+    }
+
+    /// [`DiskStore::purge`], with the deletions its bucket
+    /// tombstones wait for: those it queued, those queued
+    /// before it for keys whose write it doomed, and those of
+    /// copies it covers that no purge held yet. A lookup or a
+    /// landing that finds a copy under a running purge, while
+    /// that purge's tombstone is still being written or after
+    /// a restart, removes it and queues its deletion before the
+    /// purge gets here; the purge takes that deletion over, so
+    /// its tombstones stay in force until the file is gone.
+    pub fn purge_waiting(self: &Arc<Self>, target: &PurgeTarget) -> (usize, DeletionWait) {
+        let (removed, seqs, earlier) = self.purge_queued(target);
+        (
+            removed,
+            DeletionWait {
+                store: self.clone(),
+                seqs,
+                earlier,
+            },
+        )
+    }
+
+    /// [`DiskStore::purge`], plus the sequence numbers of the
+    /// deletions queued before it that it holds its tombstones
+    /// for: for keys whose write it doomed, and of copies it
+    /// covers that no purge held yet, which it takes over. A
+    /// key has one deletion queued at a time, so when it has
+    /// one already, that one deletes the file the write renames
+    /// into place, and the purge queues none of its own.
+    fn purge_queued(&self, target: &PurgeTarget) -> (usize, Range<u64>, Vec<u64>) {
+        let mut earlier = Vec::new();
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
         let first = inner.next_seq + 1;
@@ -1304,19 +1404,43 @@ impl DiskStore {
         for (key, record) in &removed {
             inner.total_bytes -= record.charge;
             inner.stamps.remove(key);
-            if inner.rewrites.jobs.get(key).is_some_and(|job| !job.running) {
+            if inner
+                .rewrites
+                .jobs
+                .get(key)
+                .is_some_and(|job| job.running.is_none())
+            {
                 inner.rewrites.remove(key);
             }
             inner.deletions.push(key, &record.stem, &mut inner.next_seq);
         }
-        for (key, claim) in inner.claims.iter_mut() {
+        let Inner {
+            claims,
+            deletions,
+            next_seq,
+            ..
+        } = inner;
+        for (key, claim) in claims.iter_mut() {
             if let Claim::Write { groups, doomed } = claim
                 && target.covers(key, groups)
             {
                 *doomed = true;
+                match deletions.jobs.get(key) {
+                    Some(job) => {
+                        earlier.push(job.seq);
+                        deletions.unheld.remove(key);
+                    }
+                    None => deletions.push(key, &key_stem(key), next_seq),
+                }
             }
         }
-        (removed.len(), first..inner.next_seq + 1)
+        let KeyQueue { jobs, unheld, .. } = deletions;
+        for (key, _) in unheld.extract_if(|key, groups| target.covers(key, groups)) {
+            if let Some(job) = jobs.get(&key) {
+                earlier.push(job.seq);
+            }
+        }
+        (removed.len(), first..inner.next_seq + 1, earlier)
     }
 
     /// Remove every entry for `base`: the bare key plus its
@@ -1352,9 +1476,10 @@ impl DiskStore {
     /// Start background jobs for queued work (issue #572), up
     /// to [`DRAIN_JOBS`] at once, and wake one that waits: a
     /// task for each job that can run and has no task free for
-    /// it. Jobs waiting out a backoff start no task: the last
-    /// one left waits for them. Without a runtime the work
-    /// stays queued.
+    /// it. Jobs waiting out a backoff need one task that runs
+    /// no job to wait for them, since a task running one can be
+    /// stuck in the kernel: one starts when every task runs a
+    /// job. Without a runtime the work stays queued.
     pub fn kick(self: &Arc<Self>) {
         let (spawn, ready) = {
             let mut inner = self.inner.lock().unwrap();
@@ -1362,7 +1487,7 @@ impl DiskStore {
             let running = inner.rewrites.running + inner.deletions.running;
             let later = inner.rewrites.next_due().is_some() || inner.deletions.next_due().is_some();
             let spawn = inner.workers < DRAIN_JOBS
-                && (ready + running > inner.workers || (inner.workers == 0 && later));
+                && (ready + running > inner.workers || (inner.workers == running && later));
             if spawn {
                 inner.workers += 1;
             }
@@ -1386,7 +1511,8 @@ impl DiskStore {
     /// job, run it, and go on until no job is left. The slot
     /// comes first, so a job's claim is held only while its
     /// file operation can run. A job whose retry time has not
-    /// come is waited for by the last task left.
+    /// come is waited for by one task that runs no job: a task
+    /// running one can be stuck in the kernel.
     async fn drain(self: Arc<Self>) {
         let mut worker = Worker {
             store: &self,
@@ -1396,7 +1522,7 @@ impl DiskStore {
             let Some(permit) = self.permit().await else {
                 return;
             };
-            let (next, dropped) = {
+            let (next, dropped, backoff) = {
                 let mut inner = self.inner.lock().unwrap();
                 let mut dropped = false;
                 let next = next_job(&mut inner, false, &mut dropped);
@@ -1404,13 +1530,20 @@ impl DiskStore {
                     inner.workers -= 1;
                     worker.counted = false;
                 }
-                (next, dropped)
+                let backoff =
+                    inner.rewrites.next_due().is_some() || inner.deletions.next_due().is_some();
+                (next, dropped, backoff)
             };
             if dropped {
                 self.progress.send_modify(|n| *n += 1);
             }
             match next {
                 Next::Job(job) => {
+                    // When this was the task waiting for a retry,
+                    // another one waits for it now.
+                    if backoff {
+                        self.kick();
+                    }
                     let claim = FileClaim::job(self.clone(), &job.key, job.kind);
                     let _ = self
                         .blocking_with(permit, move |store| store.run_job(claim, &job))
@@ -1420,9 +1553,15 @@ impl DiskStore {
                     drop(permit);
                     {
                         let mut inner = self.inner.lock().unwrap();
-                        if inner.workers > 1 {
+                        let running = inner.rewrites.running + inner.deletions.running;
+                        if inner.workers > running + 1 {
+                            // Another task that runs no job waits
+                            // instead. Wake it, so it waits for the
+                            // earliest retry, this one's included.
                             inner.workers -= 1;
                             worker.counted = false;
+                            drop(inner);
+                            self.drain_wake.notify_one();
                             return;
                         }
                     }
@@ -1534,10 +1673,12 @@ impl DiskStore {
             None => {
                 // A purge or an eviction removed the record
                 // while the file was rewritten: the file is
-                // this job's, under its claim.
-                inner.rewrites.finish(key, false);
+                // this job's, under its claim. The job runs
+                // until it is deleted, so a delete stuck in the
+                // kernel counts as a running job.
                 drop(guard);
                 self.unlink(path);
+                self.inner.lock().unwrap().rewrites.finish(key, false);
             }
         }
         true
@@ -1551,9 +1692,9 @@ impl DiskStore {
             if inner.entries.get(key).is_some_and(|record| record.id == id) {
                 evict_entry(&mut inner, key);
             }
-            inner.rewrites.finish(key, false);
         }
         self.unlink(path);
+        self.inner.lock().unwrap().rewrites.finish(key, false);
     }
 
     /// Delete an entry file under the claim the caller holds,
@@ -1616,60 +1757,60 @@ impl DiskStore {
         }
     }
 
-    /// How many deletions in `seqs` are queued or running;
-    /// failed ones count only with `failed`. Looks at that
-    /// range only.
-    fn deletions_left(&self, seqs: &Range<u64>, failed: bool) -> usize {
-        self.inner.lock().unwrap().deletions.count_in(seqs, failed)
-    }
-
     /// Wait until the deletions a purge queued (`seqs`) are
-    /// done (issue #572). Returns false when none of them
-    /// finished for `idle`, or `cap` passed in all: a disk that
-    /// stops answering, or a slow one. Deletions that failed
-    /// are not waited for; they are retried and counted. Only
-    /// these deletions wake the wait, so other jobs ending do
-    /// not restart the idle time, and many waits cost the drain
-    /// nothing.
+    /// done (issue #572), or until none of them has finished for
+    /// `idle`, or `cap` has passed in all, and say which (see
+    /// [`Waited`]): a disk that stops answering, a slow one, or
+    /// one busy with other jobs that come first. Deletions that
+    /// failed are not waited for; they are retried and counted.
+    /// Only these deletions wake the wait, and each one counts
+    /// down what it waits for at a constant cost, so other jobs
+    /// ending do not restart the idle time, and neither many
+    /// waits nor one purge of many files slows the drain.
     pub async fn wait_deletions(
         self: &Arc<Self>,
         seqs: Range<u64>,
         idle: std::time::Duration,
         cap: std::time::Duration,
-    ) -> bool {
-        let wake = Arc::new(tokio::sync::Notify::new());
+    ) -> Waited {
+        let count = Arc::new(DeletionCount::default());
         let mut left = {
-            let mut inner = self.inner.lock().unwrap();
-            let left = inner.deletions.count_in(&seqs, false);
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            // What ended before this wait is counted out here,
+            // so it must not reach the new count as well.
+            inner.wake_deletion_waits();
+            let left = inner.deletions.count_in(&seqs);
             if left == 0 {
-                return true;
+                return Waited::Done;
             }
+            count.left.store(left, Ordering::Relaxed);
             inner
                 .deletion_waits
                 .entry(seqs.start)
                 .or_default()
-                .push((seqs.end, wake.clone()));
+                .push((seqs.end, count.clone()));
             left
         };
         let _registered = DeletionWaitEntry {
             store: self,
             start: seqs.start,
-            wake: &wake,
+            count: &count,
         };
         self.kick();
         let started = tokio::time::Instant::now();
         let end = started + cap;
         let mut quiet_until = started + idle;
         loop {
-            if tokio::time::timeout_at(quiet_until.min(end), wake.notified())
+            if tokio::time::timeout_at(quiet_until.min(end), count.wake.notified())
                 .await
                 .is_err()
             {
-                return false;
+                return self.stopped_waiting(&seqs, idle);
             }
-            let now_left = self.deletions_left(&seqs, false);
+            let now_left = count.left.load(Ordering::Relaxed);
             if now_left == 0 {
-                return true;
+                return Waited::Done;
             }
             if now_left < left {
                 left = now_left;
@@ -1678,10 +1819,38 @@ impl DiskStore {
         }
     }
 
+    /// Why a wait on the deletions in `seqs` ran out: the disk
+    /// stalled when no background job finished for `idle`, or
+    /// when one of these deletions has run for half that long,
+    /// which no working disk takes for one deletion. Otherwise
+    /// the disk works, and they wait their turn behind other
+    /// jobs.
+    fn stopped_waiting(&self, seqs: &Range<u64>, idle: std::time::Duration) -> Waited {
+        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        let done_ms = self.last_job_done_ms.load(Ordering::Relaxed);
+        if done_ms == 0 || monotonic_ms().saturating_sub(done_ms) >= idle_ms {
+            return Waited::Stalled;
+        }
+        let stuck = std::time::Instant::now()
+            .checked_sub(idle / 2)
+            .is_some_and(|since| {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .deletions
+                    .running_since(seqs, since)
+            });
+        if stuck {
+            Waited::Stalled
+        } else {
+            Waited::Behind
+        }
+    }
+
     /// Whether a deletion in `seqs` is still queued, failed or
     /// not.
     pub fn deletions_pending(&self, seqs: &Range<u64>) -> bool {
-        self.deletions_left(seqs, true) > 0
+        self.inner.lock().unwrap().deletions.any_in(seqs)
     }
 
     /// What background work is left (issue #572). Scans the
@@ -1736,21 +1905,29 @@ fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     let record = inner.entries.remove(key)?;
     inner.total_bytes -= record.charge;
     inner.stamps.remove(key);
-    if inner.rewrites.jobs.get(key).is_some_and(|job| !job.running) {
+    if inner
+        .rewrites
+        .jobs
+        .get(key)
+        .is_some_and(|job| job.running.is_none())
+    {
         inner.rewrites.remove(key);
     }
     Some(record)
 }
 
-/// Claim `key`'s file for an inline delete and return its
-/// stem, or, when another job holds it, queue the deletion.
-fn claim_or_queue(inner: &mut Inner, key: &str, stem: &str) -> Option<String> {
+/// Claim the file of `record`, just evicted from `key`, for an
+/// inline delete and return its stem, or, when another job
+/// holds it, queue the deletion.
+fn claim_or_queue(inner: &mut Inner, key: &str, record: &Record) -> Option<String> {
     if inner.claims.contains_key(key) {
-        inner.deletions.push(key, stem, &mut inner.next_seq);
+        inner
+            .deletions
+            .push_unheld(key, &record.stem, &record.groups, &mut inner.next_seq);
         return None;
     }
     inner.claims.insert(key.to_string(), Claim::File);
-    Some(stem.to_string())
+    Some(record.stem.clone())
 }
 
 /// `existing` with `extra` added. Unchanged, order and all,
@@ -1952,6 +2129,11 @@ impl<S: std::ops::Deref<Target = DiskStore>> Drop for FileClaim<S> {
             inner.wake_deletion_waits();
         }
         if self.job.is_some() {
+            if self.done {
+                store
+                    .last_job_done_ms
+                    .store(monotonic_ms().max(1), Ordering::Relaxed);
+            }
             store.progress.send_modify(|n| *n += 1);
         }
     }
@@ -1961,7 +2143,7 @@ impl<S: std::ops::Deref<Target = DiskStore>> Drop for FileClaim<S> {
 struct DeletionWaitEntry<'s> {
     store: &'s DiskStore,
     start: u64,
-    wake: &'s Arc<tokio::sync::Notify>,
+    count: &'s Arc<DeletionCount>,
 }
 
 impl Drop for DeletionWaitEntry<'_> {
@@ -1972,7 +2154,7 @@ impl Drop for DeletionWaitEntry<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(waits) = inner.deletion_waits.get_mut(&self.start) {
-            waits.retain(|(_, wake)| !Arc::ptr_eq(wake, self.wake));
+            waits.retain(|(_, count)| !Arc::ptr_eq(count, self.count));
             if waits.is_empty() {
                 inner.deletion_waits.remove(&self.start);
             }
@@ -2141,6 +2323,30 @@ pub struct Backlog {
     pub owed: usize,
 }
 
+/// How a wait on a purge's disk deletions ended (see
+/// [`DiskStore::wait_deletions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waited {
+    /// Every one of them that has not failed is done.
+    Done,
+    /// The wait ran out while other background jobs kept
+    /// finishing: the disk works, and the deletions wait their
+    /// turn behind those jobs.
+    Behind,
+    /// The wait ran out on a stuck disk: no background job
+    /// finished for the idle time, or one of the deletions has
+    /// run for half that long.
+    Stalled,
+}
+
+/// Milliseconds since the first call, on a clock that a step of
+/// the wall clock does not move.
+fn monotonic_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// A disk wait that ran out (issue #572).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stall {
@@ -2151,8 +2357,9 @@ pub(crate) enum Stall {
     /// A write found no free disk slot in time and was
     /// skipped.
     Write,
-    /// A purge's deletions made no progress in time; they go
-    /// on in the background.
+    /// A purge's deletions made no progress in time on a disk
+    /// that finished no job meanwhile, or on which one of them
+    /// is stuck; they go on in the background.
     PurgeDelete,
 }
 
@@ -2163,7 +2370,7 @@ impl Stall {
             Stall::LookupRead => "a disk lookup's read did not answer in time",
             Stall::Write => "a disk write found no free disk slot in time and was skipped",
             Stall::PurgeDelete => {
-                "a purge's disk deletions stopped making progress; they go on in the background"
+                "a purge's disk deletions stopped making progress on a stuck disk; they go on in the background"
             }
         }
     }
@@ -2173,7 +2380,9 @@ impl Stall {
 /// that ran out, or background jobs that failed. The first
 /// line comes at once, then at most one every
 /// [`STALL_LOG_EVERY_MS`], with how many were left out since
-/// the last one.
+/// the last one. Its times are [`monotonic_ms`]: on the wall
+/// clock, a step back silenced it until the clock passed the
+/// old mark.
 #[derive(Debug)]
 pub(crate) struct StallLog {
     next_line_ms: AtomicU64,
@@ -2238,23 +2447,31 @@ struct Scanned {
 pub struct DeletionWait {
     pub store: Arc<DiskStore>,
     pub seqs: Range<u64>,
+    /// Deletions queued before the purge that it holds its
+    /// tombstones for: for keys whose write it doomed, each of
+    /// which deletes the file that write renames into place,
+    /// and of copies it covers that no purge held.
+    pub earlier: Vec<u64>,
 }
 
 impl DeletionWait {
-    /// Whether any of the deletions is still queued, failed or
-    /// not.
+    /// Whether any of the deletions, the earlier ones
+    /// included, is still queued, failed or not.
     pub fn pending(&self) -> bool {
-        self.store.deletions_pending(&self.seqs)
+        let inner = self.store.inner.lock().unwrap();
+        inner.deletions.any_in(&self.seqs)
+            || self
+                .earlier
+                .iter()
+                .any(|seq| inner.deletions.by_seq.contains_key(seq))
     }
 
     /// Wait while the deletions make progress (see
-    /// [`DiskStore::wait_deletions`]), then say whether every
-    /// one of them is done. One that failed is not.
-    pub async fn finished(&self, idle: std::time::Duration, cap: std::time::Duration) -> bool {
+    /// [`DiskStore::wait_deletions`]).
+    pub async fn wait(&self, idle: std::time::Duration, cap: std::time::Duration) -> Waited {
         self.store
             .wait_deletions(self.seqs.clone(), idle, cap)
-            .await;
-        !self.pending()
+            .await
     }
 }
 
@@ -3921,6 +4138,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A hook that fails the next unlink, as a disk with a
+    /// passing fault does, and lets the rest through.
+    fn fail_next_unlink() -> TestHold {
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        Arc::new(move |op, _| {
+            if op == OpKind::Unlink && !failed.swap(true, Ordering::SeqCst) {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })
+    }
+
+    /// Claim `key` for a write of `bytes` in `group` and land it
+    /// on another thread, held in its file write until the
+    /// returned sender sends or drops.
+    fn held_write(
+        store: &Arc<DiskStore>,
+        key: &str,
+        bytes: &'static [u8],
+        group: &str,
+    ) -> (
+        std::thread::JoinHandle<Option<Landed>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let WritePlan::Claimed(claim) =
+            store.begin_write(key, &groups(&[group]), Bucket::Unknown, true)
+        else {
+            panic!("the key was not claimed");
+        };
+        let (hook, held, release) = hold_kind(OpKind::Write);
+        store.set_hold(Some(hook));
+        let writer = {
+            let (store, group) = (store.clone(), group.to_string());
+            std::thread::spawn(move || store.land(claim, &grouped_image(bytes, &[&group])))
+        };
+        held.recv().unwrap();
+        (writer, release)
+    }
+
+    #[test]
+    fn a_purge_deletes_the_file_of_a_write_it_dooms_though_the_first_unlink_fails() {
+        // Issue #572 second review: a doomed write unlinked its
+        // file once when it landed, a failure ignored, and its
+        // purge queued nothing, so the purge's waits and its
+        // bucket tombstone did not wait for the file, and a
+        // restart indexed it in the purged group.
+        let dir = temp_dir("doomed-deletion");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        let (writer, release) = held_write(&store, "k", b"v", "g");
+        let (removed, seqs) = store.purge(&PurgeTarget::Group("g".into()));
+        assert_eq!(removed, 0);
+        assert!(store.deletions_pending(&seqs));
+        store.set_hold(Some(fail_next_unlink()));
+        drop(release);
+        assert_eq!(writer.join().unwrap(), None);
+        assert!(store.file_for(&key_stem("k")).exists());
+        assert!(
+            store.deletions_pending(&seqs),
+            "the failed unlink is not retried"
+        );
+        store.set_hold(None);
+        store.drain_now();
+        assert!(!store.deletions_pending(&seqs));
+        assert!(!store.file_for(&key_stem("k")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_doomed_write_keeps_an_earlier_purges_deletion_of_its_key() {
+        // The first purge queues the deletion of k's file. A
+        // fresh write of k claims it and is doomed by a second
+        // purge, so the key's one deletion job stays the first
+        // purge's. The doomed landing removed that job, as a
+        // landing that stands does, and its own unlink failed:
+        // nothing deleted the file, and a restart served it.
+        let dir = temp_dir("doomed-earlier");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"v1", &["g"]));
+        let (_, first) = store.purge(&PurgeTarget::Group("g".into()));
+        let (writer, release) = held_write(&store, "k", b"v2", "g");
+        store.purge(&PurgeTarget::Group("g".into()));
+        store.set_hold(Some(fail_next_unlink()));
+        drop(release);
+        assert_eq!(writer.join().unwrap(), None);
+        assert!(store.deletions_pending(&first));
+        store.set_hold(None);
+        store.drain_now();
+        assert!(!store.file_for(&key_stem("k")).exists());
+        drop(store);
+        let reopened = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert!(
+            reopened.get("k").is_none(),
+            "a restart serves the doomed copy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deletion_queued_outside_a_purge_is_held_by_the_first_purge_that_covers_it() {
+        // Issue #572 fourth review: a lookup that finds a copy
+        // under a purge removes it and queues its deletion before
+        // the purge's disk step, or after a restart. The first
+        // purge that covers the copy takes that deletion over and
+        // holds its tombstones for it; a purge that does not
+        // cover it, and a repeat purge, record nothing.
+        let dir = temp_dir("unheld-taken-over");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("k", &grouped_image(b"v1", &["g"]));
+        let (_, id) = store.get_with_id("k").unwrap();
+        assert!(store.forget_if("k", id));
+        let (_, other) = store.purge_waiting(&PurgeTarget::Group("h".into()));
+        assert!(other.earlier.is_empty() && !other.pending());
+        let (_, first) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        assert_eq!(first.earlier.len(), 1);
+        assert!(first.pending());
+        let (_, repeat) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        assert!(repeat.earlier.is_empty() && !repeat.pending());
+        store.drain_now();
+        assert!(!store.file_for(&key_stem("k")).exists());
+        assert!(!first.pending());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn purges_remove_records_at_once_and_queue_the_files() {
         let dir = temp_dir("purge-queue");
@@ -4290,14 +4630,14 @@ mod tests {
             let store = store.clone();
             async move {
                 let started = std::time::Instant::now();
-                let done = store
+                let waited = store
                     .wait_deletions(
                         seqs,
                         std::time::Duration::from_secs(1),
                         std::time::Duration::from_secs(30),
                     )
                     .await;
-                (done, started.elapsed())
+                (waited == Waited::Done, started.elapsed())
             }
         };
         let (_, a) = store.purge(&PurgeTarget::Key("a".into()));
@@ -4471,7 +4811,7 @@ mod tests {
         };
         let (_, seqs) = store.purge(&PurgeTarget::Key("stuck".into()));
         let started = std::time::Instant::now();
-        let done = store
+        let waited = store
             .wait_deletions(
                 seqs,
                 std::time::Duration::from_millis(500),
@@ -4483,18 +4823,19 @@ mod tests {
         teacher.await.unwrap();
         drop(release);
         store.set_hold(None);
-        assert!(!done);
+        // Other jobs finish, but this one has hung.
+        assert_eq!(waited, Waited::Stalled);
         assert!(took < std::time::Duration::from_secs(3), "{took:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// How long 4,000 queued deletions from 1,000 purges take to
-    /// drain once a stuck disk answers, with or without a wait
-    /// on each purge's deletions.
-    async fn drain_after_a_stall(waiters: bool) -> std::time::Duration {
-        let dir = temp_dir(&format!("drain-waiters-{waiters}"));
+    /// How long the queued deletions of `purges` purges of
+    /// `files` keys each take to drain once a stuck disk
+    /// answers, with `waits` waits on each purge's deletions.
+    async fn drain_after_a_stall(purges: usize, files: usize, waits: usize) -> std::time::Duration {
+        let dir = temp_dir(&format!("drain-waiters-{purges}-{files}-{waits}"));
         let store = Arc::new(DiskStore::open(&dir, usize::MAX / 4, test_entry_key()).unwrap());
-        index_without_files(&store, 4_000, |i| format!("g{}", i / 4));
+        index_without_files(&store, purges * files, |i| format!("g{}", i / files));
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let hook = gate.clone();
         store.set_hold(Some(Arc::new(move |kind, _| {
@@ -4507,12 +4848,12 @@ mod tests {
             }
             Ok(())
         })));
-        let mut waits = Vec::new();
-        for g in 0..1_000 {
+        let mut tasks = Vec::new();
+        for g in 0..purges {
             let (_, seqs) = store.purge(&PurgeTarget::Group(format!("g{g}")));
-            if waiters {
-                let store = store.clone();
-                waits.push(tokio::spawn(async move {
+            for _ in 0..waits {
+                let (store, seqs) = (store.clone(), seqs.clone());
+                tasks.push(tokio::spawn(async move {
                     store
                         .wait_deletions(
                             seqs,
@@ -4535,8 +4876,8 @@ mod tests {
         })
         .await
         .unwrap();
-        for wait in waits {
-            assert!(wait.await.unwrap());
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), Waited::Done);
         }
         let took = started.elapsed();
         store.set_hold(None);
@@ -4549,11 +4890,27 @@ mod tests {
         // Issue #572 review: each wait scanned every queued
         // deletion whenever any job ended, so 1,000 waiting
         // purges made the drain after a stall 60 times slower.
-        let alone = drain_after_a_stall(false).await;
-        let waited = drain_after_a_stall(true).await;
+        let alone = drain_after_a_stall(1_000, 4, 0).await;
+        let waited = drain_after_a_stall(1_000, 4, 1).await;
         assert!(
             waited < alone * 5 + std::time::Duration::from_secs(1),
             "{alone:?} with no waits, {waited:?} with 1,000"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_purge_waiting_on_its_own_many_deletions_does_not_slow_them() {
+        // Issue #572 second review: each of a purge's deletions
+        // woke its waits, and each wake counted what was left of
+        // the purge's whole range under the index lock, so one
+        // purge of n files cost n²/2 steps there. 10,000 took
+        // 20 s to drain under the request's wait and the bucket
+        // tombstone's, against 0.3 s with no wait.
+        let alone = drain_after_a_stall(1, 10_000, 0).await;
+        let waited = drain_after_a_stall(1, 10_000, 2).await;
+        assert!(
+            waited < alone * 3 + std::time::Duration::from_secs(1),
+            "{alone:?} with no waits, {waited:?} with two"
         );
     }
 
@@ -4576,7 +4933,7 @@ mod tests {
         .await
         .unwrap();
         let (_, seqs) = store.purge(&PurgeTarget::Key("b".into()));
-        let done = store
+        let waited = store
             .wait_deletions(
                 seqs,
                 std::time::Duration::from_secs(2),
@@ -4585,7 +4942,69 @@ mod tests {
             .await;
         store.set_hold(None);
         drop(release);
-        assert!(done, "the deletion waited for the held rewrite");
+        assert_eq!(
+            waited,
+            Waited::Done,
+            "the deletion waited for the held rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_runs_again_when_its_backoff_ends_while_another_job_is_stuck() {
+        // Issue #572 second review: a drain task that found only
+        // a job waiting out its backoff stopped whenever another
+        // task ran, even one stuck in the kernel, and kicks start
+        // no task for such a job, so its retry waited for the
+        // stuck job to return.
+        let dir = temp_dir("retry-beside-stuck");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("stuck", &image(b"s"));
+        store.put("flaky", &image(b"f"));
+        let stuck = store.file_for(&key_stem("stuck"));
+        let flaky = store.file_for(&key_stem("flaky"));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let flaky_path = flaky.clone();
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            if kind == OpKind::Unlink && path == stuck {
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == flaky_path && !failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })));
+        store.purge(&PurgeTarget::Key("stuck".into()));
+        store.kick();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.inner.lock().unwrap().deletions.running == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        store.purge(&PurgeTarget::Key("flaky".into()));
+        store.kick();
+        // Its first run fails, and the retry is due a second later.
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while flaky.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(release);
+        store.set_hold(None);
+        assert!(
+            retried.is_ok(),
+            "the failed deletion waited for the stuck one: {:?}",
+            store.backlog()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4608,6 +5027,156 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(file_groups(&store, "k"), ["a", "g"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_runs_again_when_the_task_waiting_for_it_takes_a_job_that_gets_stuck() {
+        // Issue #572 third review: the one drain task waiting
+        // out a failed job's backoff was woken for a new job,
+        // took it, and that job got stuck in the kernel. No
+        // task was left to wait, and kicks start none for a job
+        // in its backoff while a task runs, so the retry waited
+        // for the stuck job to return.
+        let dir = temp_dir("retry-waiter-stuck");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("flaky", &image(b"f"));
+        store.put("stuck", &image(b"s"));
+        let flaky = store.file_for(&key_stem("flaky"));
+        let stuck = store.file_for(&key_stem("stuck"));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let flaky_path = flaky.clone();
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            if kind == OpKind::Unlink && path == stuck {
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == flaky_path && !failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })));
+        store.purge(&PurgeTarget::Key("flaky".into()));
+        store.kick();
+        // Its first run fails, and the retry is due a second
+        // later.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.inner.lock().unwrap().deletions.failing == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        store.purge(&PurgeTarget::Key("stuck".into()));
+        store.kick();
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while flaky.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(release);
+        store.set_hold(None);
+        assert!(
+            retried.is_ok(),
+            "the failed deletion waited for the stuck one: {:?}",
+            store.backlog()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_runs_again_while_a_rewrite_deletes_the_file_of_a_purged_record() {
+        // Issue #572 third review: a rewrite whose record a
+        // purge removed while it wrote the file ended its job
+        // before deleting that file, so a task stuck in that
+        // delete counted as free, and the task waiting out a
+        // failed job's backoff stopped for it.
+        let dir = temp_dir("retry-rewrite-unlink");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("flaky", &image(b"f"));
+        store.put("k", &grouped_image(b"k", &["a"]));
+        let flaky = store.file_for(&key_stem("flaky"));
+        let k_path = store.file_for(&key_stem("k"));
+        let k_stem = key_stem("k");
+        let (write_go, write_wait) = std::sync::mpsc::channel::<()>();
+        let (unlink_go, unlink_wait) = std::sync::mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<OpKind>();
+        let write_wait = Mutex::new(write_wait);
+        let unlink_wait = Mutex::new(unlink_wait);
+        let seen_tx = Mutex::new(seen_tx);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let flaky_path = flaky.clone();
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if kind == OpKind::Write && name.starts_with(&k_stem) {
+                let _ = seen_tx.lock().unwrap().send(kind);
+                let _ = write_wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == k_path {
+                let _ = seen_tx.lock().unwrap().send(kind);
+                let _ = unlink_wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == flaky_path && !failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })));
+        // A rewrite of k runs and is held in its write.
+        assert!(grew(store.learn_groups(
+            "k",
+            &groups(&["b"]),
+            Bucket::Unknown
+        )));
+        store.kick();
+        let seen = seen_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(seen.unwrap(), OpKind::Write);
+        // flaky's deletion fails once, and another task waits
+        // for its retry.
+        store.purge(&PurgeTarget::Key("flaky".into()));
+        store.kick();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.inner.lock().unwrap().deletions.failing == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // k is purged while its rewrite writes; the rewrite then
+        // finds the record gone and deletes the file, and that
+        // delete is stuck.
+        store.purge(&PurgeTarget::Key("k".into()));
+        store.kick();
+        drop(write_go);
+        let seen = seen_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(seen.unwrap(), OpKind::Unlink);
+        store.kick();
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while flaky.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(unlink_go);
+        store.set_hold(None);
+        assert!(
+            retried.is_ok(),
+            "the failed deletion waited for the stuck rewrite: {:?}",
+            store.backlog()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1495,42 +1495,42 @@ async fn walk_for_joined(
 /// failed to list the bucket or to answer for an object, so
 /// a copy the purge covers may still be there, and it must
 /// stay a miss after the grace. The tombstone is marked
-/// ended only once the purge's disk files are deleted (issue
-/// #572): a restart before then indexes them again, and the
-/// unended tombstone keeps them misses until a later purge of
-/// the target finishes. The wait for them is bounded: when a
-/// deletion fails, or they stop making progress, the purge
-/// ends with its tombstone in force, as for a walk that was
-/// not complete.
+/// ended only once the disk files of every purge of its
+/// target in this process are deleted (issue #572): a
+/// restart before then indexes them again, and the unended
+/// tombstone keeps them misses. The purge waits for its own
+/// while they make progress; when they stop, or one fails,
+/// it ends here, and its tombstone is marked by the
+/// tombstone refresh after they are gone.
 async fn end_purge(
     shared: &crate::s3store::S3Store,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
-    let deleted = match &purge.disk {
-        Some(disk) => disk.finished(PURGE_END_IDLE, PURGE_END_CAP).await,
-        None => true,
-    };
-    if complete
-        && deleted
-        && let Some(object) = &purge.tombstone
-    {
-        let mut ended = purge.active.tombstone().clone();
-        ended.ended_ms = Some(crate::cache::now_ms());
-        shared.write_tombstone(object, &ended).await;
+    if let Some(disk) = &purge.disk {
+        disk.wait(PURGE_END_IDLE, PURGE_END_CAP).await;
+    }
+    if complete && let Some(object) = &purge.tombstone {
+        shared.end_tombstone(object, purge.active.tombstone()).await;
     }
     drop(purge);
 }
 
 /// [`end_purge`], on a task of its own when the purge still
 /// waits for disk deletions (issue #572): the walk lease, and
-/// the purges that joined it, do not wait on the disk.
+/// the purges that joined it, do not wait on the disk. A
+/// purge with no tombstone to mark ended waits for nothing;
+/// its deletions hold the target's tombstones from the moment
+/// they were queued (see [`purge_disk_tier`]).
 async fn end_purge_apart(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
+    if !complete || purge.tombstone.is_none() {
+        return;
+    }
     if purge.disk.as_ref().is_some_and(|disk| disk.pending()) {
         let shared = shared.clone();
         background.spawn_walk(async move { end_purge(&shared, purge, complete).await });
@@ -1551,8 +1551,12 @@ struct BegunPurge {
 /// The disk tier's half of a purge (issue #572): remove the
 /// records `target` covers from the index at once, so they
 /// stop serving and the count is exact, and queue their
-/// files' deletion. No disk slot is waited for. Returns the
-/// count and the deletions queued.
+/// files' deletion. No disk slot is waited for. The deletions
+/// hold the target's bucket tombstones at once: a per-URL
+/// purge awaits the bucket before its walk, and a later purge
+/// of the URL that ends meanwhile, with no deletions of its
+/// own, must not mark its tombstone ended while these files
+/// are there. Returns the count and the deletions queued.
 fn purge_disk_tier(
     state: &AppState,
     target: &crate::cache::PurgeTarget,
@@ -1560,32 +1564,28 @@ fn purge_disk_tier(
     let Some(store) = &state.store else {
         return (0, None);
     };
-    let (removed, seqs) = store.purge(target);
+    let (removed, disk) = store.purge_waiting(target);
     store.kick();
-    (
-        removed,
-        Some(crate::storage::DeletionWait {
-            store: store.clone(),
-            seqs,
-        }),
-    )
+    if let Some(shared) = &state.shared_store {
+        shared.hold_for_deletions(target, &disk);
+    }
+    (removed, Some(disk))
 }
 
 /// Wait for a purge's disk deletions (issue #572) while they
-/// make progress: on a healthy disk the files are gone when
-/// the purge answers, as before. Once none finishes for
-/// [`DISK_WRITE_WAIT`], or after [`PURGE_DELETE_CAP`] in all,
-/// the purge answers and the deletions go on in the
-/// background; that wait counts as a stall.
+/// make progress: on a healthy disk with no deletions queued
+/// before them, the files are gone when the purge answers, as
+/// before. Once none finishes for [`DISK_WRITE_WAIT`], or after
+/// [`PURGE_DELETE_CAP`] in all, the purge answers and the
+/// deletions go on in the background. That counts as a stall
+/// only on a stuck disk, not on one busy with the deletions
+/// queued before these.
 async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
     let Some(disk) = disk else {
         return;
     };
-    if !disk
-        .store
-        .wait_deletions(disk.seqs.clone(), DISK_WRITE_WAIT, PURGE_DELETE_CAP)
-        .await
-    {
+    let waited = disk.wait(DISK_WRITE_WAIT, PURGE_DELETE_CAP).await;
+    if waited == crate::storage::Waited::Stalled {
         disk.store.note_stall(crate::storage::Stall::PurgeDelete);
     }
 }
@@ -1602,7 +1602,9 @@ async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
 /// retries: the tier stays best-effort, like every other
 /// shared read. Serving does not start first: lookups
 /// consult the tombstones, so a request served before them
-/// could hand out a copy a purge removed.
+/// could hand out a copy a purge removed. Each refresh after
+/// boot first marks ended the tombstones that waited for disk
+/// deletions now done (issue #572).
 pub async fn start_purge_tombstones(state: &AppState) {
     let Some(shared) = state.shared_store.clone() else {
         return;
@@ -1619,6 +1621,7 @@ pub async fn start_purge_tombstones(state: &AppState) {
         tick.tick().await;
         loop {
             tick.tick().await;
+            shared.end_held_purges().await;
             shared.refresh_tombstones(&guard).await;
         }
     });
@@ -3992,7 +3995,10 @@ async fn finish_disk_write(
         if let Some(landed) = store.land(claim, &entry)
             && guard.write_covered(snapshot, &key, &landed.groups, entry.written)
         {
-            store.remove_copy(&key, landed.id);
+            // Queued, not deleted inline: a failed delete is
+            // retried, and the purge holds its tombstones for it
+            // (see `DiskStore::forget_if`).
+            store.forget_if(&key, landed.id);
         }
     });
     let _ = tokio::time::timeout(DISK_WRITE_WAIT.saturating_sub(started.elapsed()), write).await;
@@ -4139,8 +4145,9 @@ const PURGE_DELETE_CAP: std::time::Duration = std::time::Duration::from_secs(30)
 
 /// How long the end of a purge, in the background, waits for
 /// one of its disk deletions to finish (issue #572). When none
-/// does for that long, the purge ends with its bucket
-/// tombstone in force.
+/// does for that long, the purge ends, and its bucket
+/// tombstone is marked ended by the tombstone refresh once
+/// they are done.
 const PURGE_END_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the end of a purge waits for its disk deletions
@@ -4399,7 +4406,7 @@ async fn lookup_tiers_within(
         // them. When a purge covers one of those known groups,
         // the write-back would be dropped and the copy would
         // not learn the request's groups either, so it takes
-        // the request's alone.
+        // the request's and the known ones no purge covers.
         let mut wanted = crate::cache::union_groups(groups, &known_groups(state, cache_key));
         let covered = |extra: &[String]| {
             state.purge_guard.write_covered(
@@ -4410,7 +4417,17 @@ async fn lookup_tiers_within(
             )
         };
         if covered(&wanted) && !covered(groups) {
-            wanted = groups.to_vec();
+            let kept: Vec<String> = wanted
+                .iter()
+                .filter(|g| {
+                    !covered(&crate::cache::union_groups(
+                        groups,
+                        std::slice::from_ref(*g),
+                    ))
+                })
+                .cloned()
+                .collect();
+            wanted = crate::cache::union_groups(groups, &kept);
         }
         let sent = if adds_groups(&image.groups, &wanted) {
             image.groups = crate::cache::union_groups(&image.groups, &wanted);
@@ -4474,8 +4491,10 @@ async fn lookup_disk_tier(
             if guard.running_covers(&read_key, &image.groups, image.written) {
                 // A live tombstone covers this copy (issues
                 // #400, #461): drop it rather than serve and
-                // promote it.
-                store.remove_copy(&read_key, id);
+                // promote it. Its deletion is queued, retried
+                // until done, and holds the tombstones of the
+                // purge that covers it (issue #572).
+                store.forget_if(&read_key, id);
                 return None;
             }
             Some((image, id))
