@@ -254,7 +254,8 @@ pub struct ManifestSummary {
     pub state: &'static str,
     /// The active manifest's signer, as a validator would
     /// show it: the certificate's common name, or its
-    /// issuer when the name is absent. It is a name the
+    /// issuer when the name is absent or has nothing left
+    /// to show (see [`signer_name`]). It is a name the
     /// certificate claims, so whoever made the asset chose
     /// it, and `valid` does not vouch for it. It is reported
     /// as one line of at most 64 characters (issue #595).
@@ -361,14 +362,26 @@ fn summarize(reader: &Reader) -> ManifestSummary {
     let active = reader.active_manifest();
     let signer = active
         .and_then(|m| m.signature_info())
-        .and_then(|info| info.common_name.as_deref().or(info.issuer.as_deref()))
-        .and_then(display_signer);
+        .and_then(|info| signer_name(info.common_name.as_deref(), info.issuer.as_deref()));
     ManifestSummary {
         state,
         signer,
         manifests: reader.manifests().len(),
         ingredients: active.map(|m| m.ingredients().len()).unwrap_or(0),
     }
+}
+
+/// The signer a summary reports (issue #595): the
+/// certificate's common name, or its issuer when the name
+/// is absent or has nothing left once
+/// [`display_signer`] has cleaned it. c2pa-rs fills the
+/// issuer from the certificate's organization, and it goes
+/// through the same cleaning. `None` when neither has
+/// anything to show.
+fn signer_name(common_name: Option<&str>, issuer: Option<&str>) -> Option<String> {
+    common_name
+        .and_then(display_signer)
+        .or_else(|| issuer.and_then(display_signer))
 }
 
 /// The longest signer name a summary reports, in
@@ -385,9 +398,11 @@ const MAX_SIGNER_CHARS: usize = 64;
 /// passes the name on, and an agent may read it, so it
 /// stays one short line. Control
 /// characters (C0, DEL and C1), line and paragraph
-/// separators, and bidirectional controls are dropped. A
-/// longer name keeps its first 63 characters and ends in
-/// `…`. `None` when nothing is left.
+/// separators, bidirectional controls, and tag characters
+/// (U+E0000 to U+E007F, which display as nothing but a
+/// model still reads) are dropped. A longer name keeps
+/// its first 63 characters and ends in `…`. `None` when
+/// nothing is left.
 fn display_signer(name: &str) -> Option<String> {
     let mut kept = name.chars().filter(|&c| {
         !(c.is_control()
@@ -400,6 +415,7 @@ fn display_signer(name: &str) -> Option<String> {
                     | '\u{200F}'
                     | '\u{202A}'..='\u{202E}'
                     | '\u{2066}'..='\u{2069}'
+                    | '\u{E0000}'..='\u{E007F}'
             ))
     });
     let mut shown: String = kept.by_ref().take(MAX_SIGNER_CHARS).collect();
@@ -767,9 +783,11 @@ impl ProvenanceSigner {
         if summary.state == "invalid" {
             return Err("self-test signature did not validate".to_string());
         }
-        summary
-            .signer
-            .ok_or_else(|| "self-test manifest named no signer".to_string())
+        summary.signer.ok_or_else(|| {
+            "self-test manifest named no signer: the certificate's common name and \
+             organization are missing or hold only control characters"
+                .to_string()
+        })
     }
 
     /// Sign one output. The returned bytes are the output
