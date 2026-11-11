@@ -217,6 +217,12 @@ test("typed filters match the canonical spellings", () => {
       filter.text("Hello, World!", 32, "FF8800", "center"),
       "text(Hello%2C%20World%21,32,ff8800ff,center)",
     ],
+    // The server's label caps (issue #606): 1000 characters,
+    // and characters times size at most 100000. Characters
+    // count, not bytes or UTF-16 code units.
+    [filter.text("W".repeat(100), 1000, "ffffff", "top-left"), `text(${"W".repeat(100)},1000,ffffffff,top-left)`],
+    [filter.text("é".repeat(1000), 100, "ffffff", "top-left"), `text(${"%C3%A9".repeat(1000)},100,ffffffff,top-left)`],
+    [filter.text("🦀".repeat(1000), 100, "ffffff", "top-left"), `text(${"%F0%9F%A6%80".repeat(1000)},100,ffffffff,top-left)`],
     [filter.blurClass("person"), "blurclass(person)"],
     // 32 two-byte characters are exactly the server's
     // 64-byte bound: accepted, and percent-encoded per byte.
@@ -398,6 +404,9 @@ test("typed builders reject what the server would reject", () => {
     () => ops.maxage(1.5),
     () => filter.text("", 32, "ff8800", "center"),
     () => filter.text("hi", 32, "ff88", "center"),
+    () => filter.text("a".repeat(1001), 12, "ffffff", "top-left"),
+    () => filter.text("W".repeat(101), 1000, "ffffff", "top-left"),
+    () => filter.text("é".repeat(1001), 12, "ffffff", "top-left"),
     () => filter.watermark("", 0, 0, 50),
     () => filter.watermark("https://x/y.png", 0, 0, 101),
     () => filter.blurClass("bad;name"),

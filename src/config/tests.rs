@@ -99,6 +99,38 @@ fn client_hints_default_to_on_and_turn_off_by_the_boolean_spellings() {
 }
 
 #[test]
+fn explain_defaults_to_on_and_turns_off_by_the_boolean_spellings() {
+    // Issue #591: unset is on, so a deployment that relies on
+    // `/explain` keeps it after the upgrade.
+    assert_eq!(
+        explain_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(true)
+    );
+    let set =
+        |v: &str| explain_config(env_of(&[("CRABCROP_EXPLAIN", v)])).map_err(|e| e.to_string());
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    // A typo is a boot error naming the variable, never a
+    // silent default that leaves the route on.
+    for bad in ["", "of", "disabled", "2"] {
+        let err = expect_err(set(bad));
+        assert!(err.contains("CRABCROP_EXPLAIN"), "{bad:?}: {err}");
+    }
+    // The setting reaches the configuration.
+    let config = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRABCROP_SECRET", "a production-grade secret")];
+        env.extend_from_slice(extra);
+        Config::from_env(env_of(&env)).unwrap()
+    };
+    assert!(config(&[]).explain_enabled);
+    assert!(!config(&[("CRABCROP_EXPLAIN", "0")]).explain_enabled);
+}
+
+#[test]
 fn clip_config_needs_all_four_paths_or_none() {
     let get = |pairs: &[(&str, &str)]| {
         let map: std::collections::HashMap<String, String> = pairs
@@ -1156,6 +1188,76 @@ fn the_shutdown_grace_defaults_under_ten_seconds_and_checks_its_range() {
 }
 
 #[test]
+fn the_bind_address_defaults_to_every_ipv4_interface_and_takes_only_an_address() {
+    // Issue #592: unset keeps the listener where it always
+    // was. A host name, a port, brackets, or an empty value
+    // stop the boot instead of falling back to every
+    // interface.
+    let bind = |v: &str| bind_address(&env_of(&[("CRABCROP_BIND", v)]));
+    assert_eq!(
+        bind_address(&env_of(&[])).unwrap(),
+        std::net::IpAddr::from([0, 0, 0, 0])
+    );
+    assert_eq!(
+        bind("127.0.0.1").unwrap(),
+        std::net::IpAddr::from([127, 0, 0, 1])
+    );
+    assert_eq!(bind("::1").unwrap(), std::net::Ipv6Addr::LOCALHOST);
+    assert_eq!(bind("::").unwrap(), std::net::Ipv6Addr::UNSPECIFIED);
+    for bad in [
+        "",
+        "localhost",
+        "[::1]",
+        "127.0.0.1:3000",
+        " 127.0.0.1",
+        "0",
+    ] {
+        let err = expect_err(bind(bad));
+        assert!(
+            err.starts_with("CRABCROP_BIND must be an IP address"),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_connection_bounds_default_and_check_their_range() {
+    // Issue #607: the header and idle timeouts and the
+    // connection cap, each with its own range.
+    let limits = connection_limits(&env_of(&[])).unwrap();
+    assert_eq!(limits.header_timeout, std::time::Duration::from_secs(30));
+    assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(3900));
+    assert_eq!(limits.max_connections, default_max_connections());
+    assert!(limits.max_connections >= 1);
+    let set = |name: &str, v: &str| connection_limits(&env_of(&[(name, v)]));
+    let header = "CRABCROP_HEADER_TIMEOUT_SECS";
+    assert_eq!(set(header, "1").unwrap().header_timeout.as_secs(), 1);
+    assert_eq!(set(header, "600").unwrap().header_timeout.as_secs(), 600);
+    let idle = "CRABCROP_IDLE_TIMEOUT_SECS";
+    assert_eq!(set(idle, "1").unwrap().idle_timeout.as_secs(), 1);
+    assert_eq!(set(idle, "86400").unwrap().idle_timeout.as_secs(), 86_400);
+    let max = "CRABCROP_MAX_CONNECTIONS";
+    assert_eq!(set(max, "1").unwrap().max_connections, 1);
+    assert_eq!(set(max, "1000000").unwrap().max_connections, 1_000_000);
+    for (name, bad) in [
+        (header, "0"),
+        (header, "601"),
+        (header, "30s"),
+        (header, ""),
+        (idle, "0"),
+        (idle, "86401"),
+        (idle, "-1"),
+        (max, "0"),
+        (max, "1000001"),
+        (max, "-1"),
+        (max, "many"),
+    ] {
+        let err = expect_err(set(name, bad));
+        assert!(err.contains(name), "{name}={bad:?}: {err}");
+    }
+}
+
+#[test]
 fn the_source_buffer_budget_follows_the_configured_fetch_cap() {
     const MB: u64 = 1024 * 1024;
     let budget = |pairs: &[(&str, &str)], permits| source_buffer_budget(env_of(pairs), permits);
@@ -1436,6 +1538,26 @@ fn parses_preset_files() {
     assert_eq!(err, "preset big is 262145 bytes, over the 262144 byte cap");
 }
 
+#[test]
+fn a_text_label_past_its_caps_stops_the_boot() {
+    // Issue #606: presets and default operations are parsed
+    // at boot, so a `text` label past the caps (1000
+    // characters; characters times size at most 100000)
+    // stops the server from starting. At the caps it boots.
+    let text = |chars: usize, size: u32| {
+        format!("filters:text({},{size},ffffff,top-left)", "a".repeat(chars))
+    };
+    assert!(parse_presets(&format!("label = {}", text(1000, 100))).is_ok());
+    assert!(parse_presets(&format!("label = {}", text(100, 1000))).is_ok());
+    for (chars, size) in [(1001, 12), (101, 1000)] {
+        let err = expect_err(parse_presets(&format!("label = {}", text(chars, size))));
+        assert!(err.contains("invalid operations for preset label"), "{err}");
+    }
+    config_of(&[("CRABCROP_DEFAULT_OPS", &text(100, 1000))]).unwrap();
+    let err = refusal(&[("CRABCROP_DEFAULT_OPS", &text(101, 1000))]).to_string();
+    assert!(err.contains("invalid CRABCROP_DEFAULT_OPS"), "{err}");
+}
+
 /// The secret every `Config::from_env` test boots with.
 const SECRET: &str = "a production-grade secret";
 
@@ -1472,6 +1594,17 @@ fn from_env_reads_every_default() {
     assert_eq!(
         config.shutdown_grace_secs,
         crate::server::DEFAULT_SHUTDOWN_GRACE_SECS
+    );
+    assert_eq!(config.bind, std::net::IpAddr::from([0, 0, 0, 0]));
+    assert_eq!(
+        config.connections,
+        crate::server::ConnectionLimits {
+            header_timeout: std::time::Duration::from_secs(
+                crate::server::DEFAULT_HEADER_TIMEOUT_SECS
+            ),
+            idle_timeout: std::time::Duration::from_secs(crate::server::DEFAULT_IDLE_TIMEOUT_SECS),
+            max_connections: default_max_connections(),
+        }
     );
     let lanes = (config.process_permits + config.slow_lane_permits) as u64;
     assert_eq!(

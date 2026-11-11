@@ -34,13 +34,20 @@ kubectl create secret generic crabcrop \
 
 - `base/`: the workload as the chart's default values
   render it. Deployment (one replica, `/health` probes,
-  `PORT`, the secret reference, and the pod
-  `securityContext.fsGroup: 65534` that lets the image's
-  `nobody` user write mounted volumes) and Service. The base
-  ships no Secret on purpose (audit R2-40): create the
-  one from The signing secret above before applying;
-  until it exists, the pod cannot start. The Helm
-  chart's equivalent is its `existingSecret` value.
+  `PORT`, the secret reference, modest resource requests
+  and no limits, and the security context) and Service.
+  The pod passes the Pod Security "restricted" profile: it
+  runs as user and group 65534 (`runAsNonRoot`) with the
+  `RuntimeDefault` seccomp profile, no privilege
+  escalation, no capabilities, a read-only root filesystem
+  and no service account token. The server writes only to
+  `/tmp`, a 1Gi `emptyDir`, and to the volumes it mounts.
+  `fsGroup: 65534` lets the image's user write mounted
+  volumes. The base ships no Secret on purpose (audit
+  R2-40): create the one from The signing secret above
+  before applying; until it exists, the pod cannot start.
+  The Helm chart's equivalent is its `existingSecret`
+  value.
 - `components/`: the chart's toggles, as kustomize
   components an overlay composes in:
   - `presets`: the presets ConfigMap plus its mount and
@@ -63,6 +70,13 @@ kubectl create secret generic crabcrop \
     models and runtime library. Point the model env vars
     (`CRABCROP_ORT_DYLIB`, `CRABCROP_REMOVEBG_MODEL`, and
     friends) at the mount from your overlay.
+  - `network-policy`: the chart's `networkPolicy.enabled`.
+    Ingress to the HTTP port; egress to DNS and to public
+    IPv4 addresses, not the private ranges, link-local (the
+    cloud metadata address) or `100.64.0.0/10`. Add a rule
+    from your overlay for a source, bucket or endpoint on a
+    private address. It needs a network plugin that
+    enforces NetworkPolicy.
 - `overlays/single`: the base as it stands.
 - `overlays/multi-replica`: three replicas, resource
   budgets, and pod anti-affinity, mirroring the chart's

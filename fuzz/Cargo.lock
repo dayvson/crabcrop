@@ -1032,6 +1032,8 @@ dependencies = [
  "gif",
  "hex",
  "hmac",
+ "hyper",
+ "hyper-util",
  "image",
  "jixel",
  "jpeg-encoder",

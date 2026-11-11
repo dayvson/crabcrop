@@ -155,7 +155,12 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // the model embedding passes to be paid first (bind
     // early, serve late).
     let stores = open_stores(&config)?;
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
+    // The listen address is `CRABCROP_BIND` (issue #592),
+    // every IPv4 interface by default.
+    let address = std::net::SocketAddr::new(config.bind, config.port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     // The port the listener holds, which the listening line
     // names: the configured one, or for PORT=0 the free port
     // the kernel picked (issue #536).
@@ -173,6 +178,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         config.fetch_timeout_secs,
         config.source_buffer_bytes / (1024 * 1024)
     );
+    println!("{}", config.connections_line());
     println!("configuration fingerprint: {}", state.config_fingerprint);
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461). A slow or hanging
@@ -193,17 +199,19 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // entry files and deletions of purged files). One
     // deadline, the grace from the signal on, bounds every
     // wait, and the process exits at it with whatever is still
-    // running. A second signal ends the drain at once.
+    // running. A second signal ends the drain at once. The
+    // accept loop (issue #607) bounds each connection's header
+    // and idle time and caps how many are open.
     let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     let stop = tokio_util::sync::CancellationToken::new();
-    let mut serve = axum::serve(listener, app(state))
-        .with_graceful_shutdown(stop.clone().cancelled_owned())
-        .into_future();
+    let mut serve = std::pin::pin!(crate::server::serve_connections(
+        listener,
+        app(state),
+        config.connections,
+        stop.clone()
+    ));
     tokio::select! {
-        served = &mut serve => {
-            served?;
-            return Ok(std::time::Instant::now());
-        }
+        () = &mut serve => return Ok(std::time::Instant::now()),
         () = signalled => stop.cancel(),
     }
     let deadline = tokio::time::Instant::now() + shutdown_grace;
@@ -213,21 +221,20 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         shutdown_grace.as_secs()
     );
     let drain = async {
-        match tokio::time::timeout_at(deadline, serve).await {
-            Ok(served) => served?,
-            Err(_) => eprintln!("shutdown: requests still in flight at the deadline are cut off"),
+        if tokio::time::timeout_at(deadline, serve).await.is_err() {
+            eprintln!("shutdown: requests still in flight at the deadline are cut off");
         }
         let left = background.drain(deadline).await;
         let disk_left = match &disk {
             Some(disk) => disk.settle(deadline).await,
             None => Default::default(),
         };
-        Ok::<_, std::io::Error>((left, disk_left))
+        (left, disk_left)
     };
     // The runtime stops by `stop_by`: the deadline after a
     // drain, at once after a second signal.
     let ((left, disk_left), when, stop_by) = tokio::select! {
-        left = drain => (left?, "at the deadline", deadline.into_std()),
+        left = drain => (left, "at the deadline", deadline.into_std()),
         () = signalled_again => {
             eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
             let disk_left = disk.as_ref().map(|disk| disk.backlog()).unwrap_or_default();
@@ -418,6 +425,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if !config.client_hints {
         println!("client hints: off");
     }
+    if !config.explain_enabled {
+        println!("explain: off");
+    }
 
     Ok(AppState {
         keyring: config.keyring.clone(),
@@ -468,6 +478,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         jxl_speed: config.jxl_speed,
         width_step: config.width_step,
         client_hints: config.client_hints,
+        explain_enabled: config.explain_enabled,
         preserve_metadata: config.preserve_metadata,
         brand_color: config.brand_color,
         presets: config.presets.clone(),

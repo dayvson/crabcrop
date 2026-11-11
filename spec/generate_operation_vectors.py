@@ -579,6 +579,15 @@ filter_cases([
     ("text(Hello,12,ff8800,middle)", None, "invalid_filters"),
     ("text(,12,ff8800,center)", None, "invalid_filters"),
     ("text(Hello,12,ff880,center)", None, "invalid_filters"),
+    # The label caps (issue #606): at most 1000 characters,
+    # and characters times size at most 100000. Characters
+    # count, not bytes: 1000 two-byte characters fit.
+    (f"text({'a' * 1000},100,ff8800,center)", f"text({'a' * 1000},100,ff8800ff,center)", None),
+    (f"text({'a' * 1001},12,ff8800,center)", None, "invalid_filters"),
+    (f"text({'W' * 100},1000,ff8800,center)", f"text({'W' * 100},1000,ff8800ff,center)", None),
+    (f"text({'W' * 101},1000,ff8800,center)", None, "invalid_filters"),
+    (f"text({'%C3%A9' * 1000},100,ff8800ff,center)", None, None),
+    (f"text({'%C3%A9' * 1001},12,ff8800ff,center)", None, "invalid_filters"),
     ("trim", "trim(10)", None),
     ("trim()", "trim(10)", None),
     ("trim(20)", None, None),
@@ -941,6 +950,12 @@ builder("filter.watermark", ["https://x/wm.png", 0, 0, 80],
 builder("filter.overlay", ["https://x/ov.png", 0, 0, 80, "multiply"],
         "overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)")
 builder("filter.text", ["Hello", 12, "ff8800", "center"], "text(Hello,12,ff8800ff,center)")
+builder("filter.text", ["\u00e9" * 1000, 100, "ff8800", "center"],
+        f"text({'%C3%A9' * 1000},100,ff8800ff,center)")
+builder("filter.text", ["a" * 1001, 12, "ff8800", "center"],
+        f"text({'a' * 1001},12,ff8800ff,center)", throws=True, code="invalid_filters")
+builder("filter.text", ["W" * 101, 1000, "ff8800", "center"],
+        f"text({'W' * 101},1000,ff8800ff,center)", throws=True, code="invalid_filters")
 builder("filter.blurClass", ["person"], "blurclass(person)")
 builder("filter.blurClass", [" person "], "blurclass(person)")
 builder("filter.blurClass", ["\uFEFFperson\uFEFF"],

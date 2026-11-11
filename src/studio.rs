@@ -16,6 +16,7 @@
 
 use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage, imageops::FilterType};
 
+use crate::filters::DeadlinePassed;
 use crate::url::{StudioBg, StudioMode, StudioShadow, StudioSpec};
 
 /// Whether studio stage timing is printed (issue #220): on
@@ -367,13 +368,16 @@ fn place(
 /// Synthesize the contact shadow (part of pipeline step
 /// 3): the placed subject's alpha, blurred, dimmed by the
 /// strength's peak factor, and offset down. Returned as an
-/// RGBA layer the size of the canvas.
+/// RGBA layer the size of the canvas. The blur's sigma grows
+/// with the canvas, so it checks `deadline` before each row
+/// (issue #614).
 fn shadow_layer(
     alpha: &GrayImage,
     at: (i64, i64),
     canvas: (u32, u32),
     shadow: StudioShadow,
-) -> RgbaImage {
+    deadline: Option<std::time::Instant>,
+) -> Result<RgbaImage, DeadlinePassed> {
     let (w, h) = canvas;
     let min_dim = w.min(h) as f32;
     let (sigma, peak) = match shadow {
@@ -381,7 +385,8 @@ fn shadow_layer(
         StudioShadow::Strong => ((min_dim * 0.006).max(1.0), 0.55),
         StudioShadow::None => unreachable!("shadow layers are only built for soft or strong"),
     };
-    let blurred = image::imageops::blur(alpha, sigma);
+    // `image::imageops::blur`, byte for byte.
+    let blurred = crate::filters::blur_gray_within(alpha, sigma, deadline)?;
     let drop = ((h as f32 * 0.01).round() as i64).max(1);
     let mut layer = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
     for (x, y, px) in blurred.enumerate_pixels() {
@@ -394,7 +399,7 @@ fn shadow_layer(
             layer.put_pixel(tx as u32, ty as u32, Rgba([0, 0, 0, a]));
         }
     }
-    layer
+    Ok(layer)
 }
 
 /// Run the studio expansion over `img` with the provider's
@@ -409,6 +414,24 @@ pub fn composite(
     spec: &StudioSpec,
     brand_color: Option<[u8; 3]>,
 ) -> StudioOutcome {
+    match composite_within(img, mask, confidence, spec, brand_color, None) {
+        Ok(outcome) => outcome,
+        Err(DeadlinePassed) => unreachable!("no deadline never passes"),
+    }
+}
+
+/// [`composite`] under the request's processing deadline
+/// (`None` for none), which the shadow's blur checks before
+/// each row (issue #614). Past it the composite stops and
+/// answers [`DeadlinePassed`].
+pub fn composite_within(
+    img: &DynamicImage,
+    mask: &GrayImage,
+    confidence: Option<f32>,
+    spec: &StudioSpec,
+    brand_color: Option<[u8; 3]>,
+    deadline: Option<std::time::Instant>,
+) -> Result<StudioOutcome, DeadlinePassed> {
     let (w, h) = (img.width(), img.height());
     let resolved = resolve_bg(spec, brand_color);
     let mut fallbacks: Vec<&'static str> = Vec::new();
@@ -482,7 +505,7 @@ pub fn composite(
         let alpha = GrayImage::from_fn(scaled.width(), scaled.height(), |x, y| {
             Luma([scaled.get_pixel(x, y)[3]])
         });
-        let layer = shadow_layer(&alpha, (dx, dy), (w, h), spec.shadow);
+        let layer = shadow_layer(&alpha, (dx, dy), (w, h), spec.shadow, deadline)?;
         image::imageops::overlay(&mut canvas, &layer, 0, 0);
         timing_mark("shadow", t_stage);
         steps.push("shadow");
@@ -504,7 +527,7 @@ pub fn composite(
         }
     }
 
-    StudioOutcome {
+    Ok(StudioOutcome {
         image: DynamicImage::ImageRgba8(canvas),
         record: StudioRecord {
             mode: StudioMode::Product,
@@ -517,7 +540,7 @@ pub fn composite(
             confidence,
             scene: None,
         },
-    }
+    })
 }
 
 /// One connected candidate subject in a mask: its pixel
@@ -1041,6 +1064,40 @@ mod tests {
         );
         assert!(!none.record.steps.contains(&"shadow"));
         assert_eq!(px(&none.image, 50, 72), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn the_shadow_blur_stops_at_the_deadline() {
+        // Issue #614: the shadow's sigma grows with the
+        // canvas (2 percent of its short side for a soft
+        // shadow), and its blur ran as one call that checked
+        // no deadline. It now checks before each row. A
+        // deadline still ahead composites the same bytes as
+        // none, and with no shadow to blur a passed deadline
+        // changes nothing.
+        let (img, mask) = product_photo();
+        let past = Some(std::time::Instant::now());
+        let ahead = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+        for shadow in [StudioShadow::Soft, StudioShadow::Strong] {
+            let spec = spec(StudioBg::White, shadow, 10);
+            assert_eq!(
+                composite_within(&img, &mask, None, &spec, None, past).map(|_| ()),
+                Err(DeadlinePassed),
+                "{shadow:?}"
+            );
+            let bounded = composite_within(&img, &mask, None, &spec, None, ahead).unwrap();
+            let plain = composite(&img, &mask, None, &spec, None);
+            assert_eq!(
+                bounded.image.as_bytes(),
+                plain.image.as_bytes(),
+                "{shadow:?}"
+            );
+            assert_eq!(bounded.record.steps, plain.record.steps);
+        }
+        let spec = spec(StudioBg::White, StudioShadow::None, 10);
+        let unshaded = composite_within(&img, &mask, None, &spec, None, past).unwrap();
+        let plain = composite(&img, &mask, None, &spec, None);
+        assert_eq!(unshaded.image.as_bytes(), plain.image.as_bytes());
     }
 
     #[test]
