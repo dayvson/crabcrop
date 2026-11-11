@@ -1026,6 +1026,26 @@
    "remainder": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,E,e)/https://example.com/a.jpg",
    "error": false,
    "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%EF%BB%BFperson%EF%BB%BF)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%C2%85person%C2%85)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(%EF%BB%BFperson%EF%BB%BF)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(%C2%85person%C2%85)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
   }
  ]
 }

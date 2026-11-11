@@ -173,6 +173,13 @@ CROP = [
     # `É`/`é`, and the Kelvin sign U+212A beside `k`.
     ("crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k)",
      "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k):1", None),
+    # Issue #537: a class name is trimmed with Rust's
+    # White_Space set. U+FEFF is not in it, so a name
+    # wrapped in it is refused; U+0085 is, so a name
+    # wrapped in it trims to the bare name.
+    ("crop:100x100:objects(%EF%BB%BFperson%EF%BB%BF)", None, "invalid_crop"),
+    ("crop:100x100:objects(%C2%85person%C2%85)",
+     "crop:100x100:objects(person):1", None),
     ("crop:300x0", None, "invalid_crop"),
     ("crop:0x200", None, "invalid_crop"),
     ("crop:-300x200", None, "invalid_crop"),
@@ -535,6 +542,8 @@ filter_cases([
     ("blurclass(" + "é" * 32 + ")", "blurclass(" + "%C3%A9" * 32 + ")", None),
     ("recolorclass(person,FF0000)", "recolorclass(person,ff0000)", None),
     ("blurclass()", None, "invalid_filters"),
+    ("blurclass(%EF%BB%BFperson%EF%BB%BF)", None, "invalid_filters"),
+    ("blurclass(%C2%85person%C2%85)", "blurclass(person)", None),
     ("blurclass(per%24on)", None, "invalid_filters"),
     ("blurclass(" + "é" * 40 + ")", None, "invalid_filters"),
     ("recolorclass(person,ff000)", None, "invalid_filters"),
@@ -820,6 +829,13 @@ builder("ops.cropObjects", [100, 100, ["É", "é", "\u212a", "k"]],
 # it, so the builder encodes the trimmed name.
 builder("ops.cropObjects", [100, 100, [" person "]],
         "crop:100x100:objects(person):1")
+# Issue #537: the builder trims with the server's set, so a
+# U+FEFF-wrapped name refuses and a U+0085-wrapped one trims.
+builder("ops.cropObjects", [100, 100, ["\uFEFFperson\uFEFF"]],
+        "crop:100x100:objects(%EF%BB%BFperson%EF%BB%BF):1",
+        throws=True, code="invalid_crop")
+builder("ops.cropObjects", [100, 100, ["\u0085person\u0085"]],
+        "crop:100x100:objects(person):1")
 builder("ops.cropRect", [0, 0, 50, 50], "crop-rect:0x0:50x50")
 builder("ops.cropRect", [50, 50, 0, 0], "crop-rect:50x50:0x0",
         throws=True, code="invalid_crop_rect")
@@ -927,6 +943,10 @@ builder("filter.overlay", ["https://x/ov.png", 0, 0, 80, "multiply"],
 builder("filter.text", ["Hello", 12, "ff8800", "center"], "text(Hello,12,ff8800ff,center)")
 builder("filter.blurClass", ["person"], "blurclass(person)")
 builder("filter.blurClass", [" person "], "blurclass(person)")
+builder("filter.blurClass", ["\uFEFFperson\uFEFF"],
+        "blurclass(%EF%BB%BFperson%EF%BB%BF)",
+        throws=True, code="invalid_filters")
+builder("filter.blurClass", ["\u0085person\u0085"], "blurclass(person)")
 builder("filter.pixelateClass", ["traffic light"], "pixelateclass(traffic%20light)")
 builder("filter.recolorClass", ["person", "FF0000"], "recolorclass(person,ff0000)")
 builder("filter.blurRegion", [1, 2, 30, 40], "blur_region(1,2,30,40)")
