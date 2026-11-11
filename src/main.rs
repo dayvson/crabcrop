@@ -599,8 +599,8 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// encoder build, whatever its core count #612, #626; and
 /// under `CRABCROP_METADATA=preserve`, JPEG and PNG output
 /// whose source EXIF or Photoshop segment holds a
-/// thumbnail, a size tag or another part preserve now
-/// removes, now copied without those parts and with the
+/// thumbnail or another part preserve now removes, or a
+/// size tag, now copied without those parts and with the
 /// output's size #611).
 const RENDERING_VERSION: u32 = 6;
 
