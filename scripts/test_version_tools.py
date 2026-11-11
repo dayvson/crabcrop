@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
@@ -116,30 +117,22 @@ class VersionToolsTest(unittest.TestCase):
         self.assertEqual(self.problems, [], "the working tree's own version sites disagree")
         self.tmp = tempfile.TemporaryDirectory(prefix="crabcrop-version-tools-")
         self.tree = Path(self.tmp.name)
-        self.files = self.copy(carriers(self.version))
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def copy(self, found):
-        """Copy the tracked files `found` (the carriers), the version
-        sites and the tools into the empty self.tree, and return the
-        ones the leftover scan reads, sorted."""
-        files = set(found) | {site.path for site in version_sites.SITES}
+        files = set(carriers(self.version)) | {site.path for site in version_sites.SITES}
         files |= {f"scripts/{tool}" for tool in TOOLS}
         # Release notes name every version, and moving them is the
         # changelog's job (RELEASING.md, step 1): the copy carries the
         # CHANGELOG for the bump to assemble, outside the leftover scan,
-        # and no fragments but the ones a case writes. A tracked fragment
-        # that names the current version is a carrier too; the bump
-        # would assemble and delete it, so it stays out of the copy.
+        # and no fragments but the ones a case writes.
         files = {rel for rel in files if rel != "CHANGELOG.md" and not rel.startswith("changelog.d/")}
         for rel in files | {"CHANGELOG.md"}:
             target = self.tree / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / rel).read_bytes())
         (self.tree / "changelog.d").mkdir()
-        return sorted(files)
+        self.files = sorted(files)
+
+    def tearDown(self):
+        self.tmp.cleanup()
 
     def run_tool(self, name, *args):
         done = subprocess.run(
@@ -242,11 +235,12 @@ class VersionToolsTest(unittest.TestCase):
         # `git grep` lists a tracked changelog.d/ file that names the
         # current version (a fragment saying "a regression from X.Y.Z",
         # or the README) with the carriers. The copy leaves it out, as it
-        # does CHANGELOG.md, and the release notes are no leftover.
-        fresh = tempfile.TemporaryDirectory(prefix="crabcrop-version-tools-")
-        self.addCleanup(fresh.cleanup)
-        self.tree = Path(fresh.name)
-        self.files = self.copy([*carriers(self.version), "changelog.d/README.md"])
+        # does CHANGELOG.md, since the bump assembles and deletes a
+        # fragment, and the release notes are no leftover.
+        found = [*carriers(self.version), "changelog.d/README.md"]
+        self.tmp.cleanup()
+        with mock.patch.object(sys.modules[__name__], "carriers", lambda version: found):
+            self.setUp()
         self.assertFalse([rel for rel in self.files if rel.startswith("changelog.d/")], self.files)
         fragment = f"Fixed a regression from {self.version} (issue #720).\n"
         (self.tree / "changelog.d/720.fixed.md").write_text(fragment, encoding="utf-8")
