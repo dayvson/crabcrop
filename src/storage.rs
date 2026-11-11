@@ -1433,7 +1433,8 @@ impl DiskStore {
     /// job, run it, and go on until no job is left. The slot
     /// comes first, so a job's claim is held only while its
     /// file operation can run. A job whose retry time has not
-    /// come is waited for by the last task left.
+    /// come is waited for by one task that runs no job: a task
+    /// running one can be stuck in the kernel.
     async fn drain(self: Arc<Self>) {
         let mut worker = Worker {
             store: &self,
@@ -1467,9 +1468,15 @@ impl DiskStore {
                     drop(permit);
                     {
                         let mut inner = self.inner.lock().unwrap();
-                        if inner.workers > 1 {
+                        let running = inner.rewrites.running + inner.deletions.running;
+                        if inner.workers > running + 1 {
+                            // Another task that runs no job waits
+                            // instead. Wake it, so it waits for the
+                            // earliest retry, this one's included.
                             inner.workers -= 1;
                             worker.counted = false;
+                            drop(inner);
+                            self.drain_wake.notify_one();
                             return;
                         }
                     }
@@ -4717,6 +4724,64 @@ mod tests {
             waited,
             Waited::Done,
             "the deletion waited for the held rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_job_runs_again_when_its_backoff_ends_while_another_job_is_stuck() {
+        // Issue #572 second review: a drain task that found only
+        // a job waiting out its backoff stopped whenever another
+        // task ran, even one stuck in the kernel, and kicks start
+        // no task for such a job, so its retry waited for the
+        // stuck job to return.
+        let dir = temp_dir("retry-beside-stuck");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        store.put("stuck", &image(b"s"));
+        store.put("flaky", &image(b"f"));
+        let stuck = store.file_for(&key_stem("stuck"));
+        let flaky = store.file_for(&key_stem("flaky"));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let flaky_path = flaky.clone();
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            if kind == OpKind::Unlink && path == stuck {
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20));
+            }
+            if kind == OpKind::Unlink && path == flaky_path && !failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })));
+        store.purge(&PurgeTarget::Key("stuck".into()));
+        store.kick();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.inner.lock().unwrap().deletions.running == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        store.purge(&PurgeTarget::Key("flaky".into()));
+        store.kick();
+        // Its first run fails, and the retry is due a second later.
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while flaky.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(release);
+        store.set_hold(None);
+        assert!(
+            retried.is_ok(),
+            "the failed deletion waited for the stuck one: {:?}",
+            store.backlog()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
