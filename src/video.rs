@@ -376,6 +376,14 @@ impl VideoEncoder {
             ),
             VideoFormat::WebM => args.extend(
                 [
+                    // Without bitexact the Matroska muxer
+                    // writes a random track UID (and the
+                    // build's own app and encoder tags), so
+                    // no two renders of the same URL ever
+                    // matched and every ETag was new
+                    // (issue #567).
+                    "-fflags",
+                    "+bitexact",
                     "-c:v",
                     "libvpx-vp9",
                     "-b:v",
@@ -708,6 +716,14 @@ mod tests {
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(argv.contains("libvpx-vp9"), "{argv}");
         assert!(argv.contains("webm"), "{argv}");
+        // Bitexact muxing (issue #567): the flag pair is
+        // what makes two renders of one URL byte-identical.
+        let lines: Vec<&str> = argv.lines().collect();
+        let flags = lines
+            .iter()
+            .position(|arg| *arg == "-fflags")
+            .expect("the WebM argv carries -fflags");
+        assert_eq!(lines[flags + 1], "+bitexact", "{argv}");
     }
 
     #[test]
@@ -863,7 +879,10 @@ mod tests {
 
     /// Encode two frames with the real FFmpeg and check the
     /// containers: an MP4 carries the ftyp box, a WebM the
-    /// EBML header. Run it with:
+    /// EBML header. Each format is encoded twice and the
+    /// two renders must be byte-identical: a render that
+    /// differs run to run gives the same URL a new ETag
+    /// every time (issue #567). Run it with:
     /// `cargo test -- --ignored real_ffmpeg`
     #[test]
     #[ignore = "needs a real encoder binary (ffmpeg) on this machine"]
@@ -878,12 +897,19 @@ mod tests {
         let mp4 = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
         assert!(mp4.len() > 100, "suspiciously small MP4: {}", mp4.len());
         assert_eq!(&mp4[4..8], b"ftyp", "MP4 has no ftyp box");
+        let mp4_again = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        assert_eq!(mp4, mp4_again, "two MP4 renders of the same frames differ");
         let webm = encoder.encode(&frames, VideoFormat::WebM).unwrap();
         assert!(webm.len() > 100, "suspiciously small WebM: {}", webm.len());
         assert_eq!(
             &webm[0..4],
             &[0x1a, 0x45, 0xdf, 0xa3],
             "WebM has no EBML header"
+        );
+        let webm_again = encoder.encode(&frames, VideoFormat::WebM).unwrap();
+        assert_eq!(
+            webm, webm_again,
+            "two WebM renders of the same frames differ"
         );
     }
 }

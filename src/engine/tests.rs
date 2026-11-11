@@ -6463,9 +6463,10 @@ fn a_failing_encoder_is_a_video_error() {
 #[test]
 fn the_video_argv_is_the_pipe_contract_for_each_format() {
     // Issue #568: the argv takes a video format instead of
-    // any output format. Each one's argv stays exactly what
-    // the encoder was run with before, end to end through the
-    // engine: the 40x20 frames at 100 ms each are 10 fps.
+    // any output format. Each one's argv is exactly the
+    // documented pipe contract (docs/media.md), end to end
+    // through the engine: the 40x20 frames at 100 ms each
+    // are 10 fps.
     let (scripts, encoder) = video_test_encoder(
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/argv.txt\"\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n",
     );
@@ -6500,6 +6501,10 @@ fn the_video_argv_is_the_pipe_contract_for_each_format() {
         "mp4",
     ];
     let webm = [
+        // Bitexact muxing (issue #567): two renders of the
+        // same frames come out byte-identical.
+        "-fflags",
+        "+bitexact",
         "-c:v",
         "libvpx-vp9",
         "-b:v",

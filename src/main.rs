@@ -553,7 +553,15 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// holding more pixels than the decode budget allows a
 /// whole image, all of which rendered before and are now
 /// refused with `502`, PR #623).
-const RENDERING_VERSION: u32 = 5;
+///
+/// 6: the first release after 0.11.0, which changes output
+/// for existing URLs (WebM output written with bitexact
+/// muxing: the Matroska muxer writes track UID 1 and the
+/// generic `Lavf` and `Lavc` tags instead of a random
+/// track UID and the encoder build's own tags, so WebM
+/// bytes change once and then repeat render for render on
+/// one encoder build #567, PR #585).
+const RENDERING_VERSION: u32 = 6;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
