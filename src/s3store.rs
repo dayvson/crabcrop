@@ -75,7 +75,11 @@ const TOMBSTONE_DIR: &str = "purges/";
 /// are operator actions and a tombstone expires a grace
 /// period after its walk ends, so the live set stays small;
 /// the cap bounds the reads a hostile or neglected prefix
-/// can cost a refresh.
+/// can cost a refresh. A tombstone held while a purge's disk
+/// files are not deleted (issue #572) does not expire, so
+/// enough of them, or a fast run of purges, push older ones
+/// past the cap: those are not read and do not apply, and
+/// they count as unread (see [`S3Store::tombstones_unread`]).
 const MAX_SHARED_TOMBSTONES: usize = 1024;
 
 /// How many tombstones a refresh reads at once, and how many
@@ -240,9 +244,10 @@ pub struct S3Store {
     /// How many purge tombstones the last complete listing
     /// named that this replica has never read (issue #577):
     /// their reads failed or did not finish, and no earlier
-    /// version is in force. Their purges do not apply here
-    /// until a refresh reads them. Surfaced on /metrics as
-    /// `crabcrop_cache_shared_tombstones_unread`.
+    /// version is in force, or they were listed past the newest
+    /// [`MAX_SHARED_TOMBSTONES`] (issue #572). Their purges do
+    /// not apply here until a refresh reads them. Surfaced on
+    /// /metrics as `crabcrop_cache_shared_tombstones_unread`.
     tombstones_unread: std::sync::atomic::AtomicU64,
     /// When this replica last listed the tombstones
     /// completely, in Unix ms; 0 before its first complete
@@ -255,6 +260,11 @@ pub struct S3Store {
     /// each with the identical purges that joined it and
     /// wait for its re-list (issue #462).
     walks: std::sync::Mutex<HashMap<PurgeTarget, Vec<SharedPurge>>>,
+    /// The purges in this process whose disk files are not all
+    /// deleted yet, by target, with the tombstones of that
+    /// target waiting for them before they are marked ended
+    /// (issue #572).
+    held_ends: std::sync::Mutex<HashMap<PurgeTarget, HeldEnds>>,
     /// Background walk turns (issue #462):
     /// [`PURGE_WALKS_AT_ONCE`] permits, granted in arrival
     /// order.
@@ -330,6 +340,7 @@ impl S3Store {
             tombstones_unread: std::sync::atomic::AtomicU64::new(0),
             tombstones_listed_ms: std::sync::atomic::AtomicU64::new(0),
             walks: std::sync::Mutex::new(HashMap::new()),
+            held_ends: std::sync::Mutex::new(HashMap::new()),
             walk_turns: tokio::sync::Semaphore::new(PURGE_WALKS_AT_ONCE),
             inline_reads: tokio::sync::Semaphore::new(PURGE_INLINE_READS_AT_ONCE),
             max_entry_bytes: MAX_ENTRY_BYTES,
@@ -1309,6 +1320,129 @@ impl S3Store {
         }
     }
 
+    /// Keep every tombstone of `target` from being marked ended
+    /// while `disk`, one purge's disk deletions, are pending
+    /// (issue #572). A restart before they are done indexes
+    /// those files again, and only an unended tombstone keeps
+    /// them misses. A later purge of the target has no
+    /// deletions of its own for them, and its tombstone, once
+    /// ended, supersedes the earlier ones, so it waits for them
+    /// too. Called as the purge queues them, before it awaits
+    /// anything: a later purge of the target can end first.
+    pub fn hold_for_deletions(&self, target: &PurgeTarget, disk: &crate::storage::DeletionWait) {
+        if disk.pending() {
+            self.held_ends
+                .lock()
+                .unwrap()
+                .entry(target.clone())
+                .or_default()
+                .deletions
+                .push(disk.clone());
+        }
+    }
+
+    /// Mark `tombstone`, stored at `object`, ended (issue
+    /// #461): now when no purge of its target has disk
+    /// deletions pending in this process, or else on the
+    /// [`S3Store::end_held_purges`] after they are done. A
+    /// held tombstone stays in force unended and covers every
+    /// copy the target's earlier held ones do, so those are
+    /// deleted from the bucket: repeated purges of a target
+    /// whose deletion keeps failing would otherwise leave one
+    /// unended tombstone each, none superseding another, and
+    /// push older ones out of what a refresh reads.
+    pub async fn end_tombstone(&self, object: &str, tombstone: &Tombstone) {
+        let mut spent = Vec::new();
+        let ready = {
+            let mut held = self.held_ends.lock().unwrap();
+            let entry = (object.to_string(), tombstone.clone());
+            match held.get_mut(&tombstone.target) {
+                None => vec![entry],
+                Some(waiting) => {
+                    waiting
+                        .deletions
+                        .retain(crate::storage::DeletionWait::pending);
+                    if waiting.deletions.is_empty() {
+                        let mut ready = held
+                            .remove(&tombstone.target)
+                            .map(|waiting| waiting.tombstones)
+                            .unwrap_or_default();
+                        ready.push(entry);
+                        ready
+                    } else {
+                        let ended = Tombstone {
+                            ended_ms: Some(0),
+                            ..tombstone.clone()
+                        };
+                        waiting.tombstones.retain(|(earlier, held)| {
+                            let superseded = ended.supersedes(held);
+                            if superseded {
+                                spent.push(earlier.clone());
+                            }
+                            !superseded
+                        });
+                        waiting.tombstones.push(entry);
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        for object in &spent {
+            self.delete_object(object).await;
+        }
+        self.write_ended(ready).await;
+    }
+
+    /// Mark ended the held tombstones of every target whose
+    /// purges have all their disk files deleted now (issue
+    /// #572), however long that took: run on every tombstone
+    /// refresh. Ends within [`TOMBSTONE_REFRESH_DEADLINE`]; a
+    /// tombstone whose write fails or does not finish by then
+    /// stays in force, as when a walk's end cannot be written.
+    pub async fn end_held_purges(&self) {
+        let ready: Vec<(String, Tombstone)> = {
+            let mut held = self.held_ends.lock().unwrap();
+            let mut ready = Vec::new();
+            held.retain(|_, waiting| {
+                waiting
+                    .deletions
+                    .retain(crate::storage::DeletionWait::pending);
+                if waiting.deletions.is_empty() {
+                    ready.append(&mut waiting.tombstones);
+                    return false;
+                }
+                true
+            });
+            ready
+        };
+        self.write_ended(ready).await;
+    }
+
+    /// Write each tombstone marked ended now, at most
+    /// [`TOMBSTONE_READS_AT_ONCE`] at a time and within
+    /// [`TOMBSTONE_REFRESH_DEADLINE`].
+    async fn write_ended(&self, tombstones: Vec<(String, Tombstone)>) {
+        use futures_util::StreamExt as _;
+        if tombstones.is_empty() {
+            return;
+        }
+        let ended_ms = Some(now_ms());
+        let _ = tokio::time::timeout(
+            TOMBSTONE_REFRESH_DEADLINE,
+            futures_util::stream::iter(tombstones).for_each_concurrent(
+                TOMBSTONE_READS_AT_ONCE,
+                |(object, tombstone)| async move {
+                    let ended = Tombstone {
+                        ended_ms,
+                        ..tombstone
+                    };
+                    self.write_tombstone(&object, &ended).await;
+                },
+            ),
+        )
+        .await;
+    }
+
     /// Read one tombstone object: capped, authenticated, and
     /// consistent with the name it is stored under. Anything
     /// else (a plant, another deployment's record, a copy
@@ -1385,8 +1519,10 @@ impl S3Store {
     /// finds the object gone is no failure: another replica
     /// collected it. Deletes still running at the deadline
     /// are dropped, and a later refresh lists those
-    /// tombstones again. Returns whether the refresh listed
-    /// and read everything.
+    /// tombstones again. Tombstones listed past the newest
+    /// `MAX_SHARED_TOMBSTONES` count as never read (issue
+    /// #572). Returns whether the refresh listed and read
+    /// everything.
     pub async fn refresh_tombstones_within(&self, guard: &PurgeGuard, limit: Duration) -> bool {
         use futures_util::StreamExt as _;
         let deadline = tokio::time::Instant::now() + limit;
@@ -1411,7 +1547,16 @@ impl S3Store {
             })
             .collect();
         named.sort_by_key(|(start_ms, ..)| std::cmp::Reverse(*start_ms));
-        named.truncate(MAX_SHARED_TOMBSTONES);
+        // The ones past the cap are not read and do not apply
+        // (issue #572): they count as unread, and the line below
+        // names them, so a tombstone that newer ones pushed out
+        // does not lapse unseen.
+        let past_cap: Vec<(u64, String)> = named
+            .split_off(MAX_SHARED_TOMBSTONES.min(named.len()))
+            .into_iter()
+            .map(|(start_ms, _, object, _)| (start_ms, object))
+            .collect();
+        let past = past_cap.len();
         let previous = self.tombstones.lock().unwrap().clone();
         let mut fresh: HashMap<String, (String, Tombstone)> = HashMap::new();
         let mut to_read = Vec::new();
@@ -1452,7 +1597,7 @@ impl S3Store {
         let mut kept = Vec::new();
         // The ones never read, with the start their names
         // give (issue #577).
-        let mut unread: Vec<(u64, String)> = Vec::new();
+        let mut unread: Vec<(u64, String)> = past_cap;
         let mut first_failure = None;
         for (start_ms, _, object, etag) in &to_read {
             match done.remove(object) {
@@ -1491,7 +1636,7 @@ impl S3Store {
         for object in &spent {
             fresh.remove(object);
         }
-        if failed + unfinished > 0 {
+        if failed + unfinished > 0 || past > 0 {
             // A kept version that turned out spent was just
             // dropped above and is collected below, so only the
             // kept versions still in force count as kept.
@@ -1503,6 +1648,13 @@ impl S3Store {
             }
             if unfinished > 0 {
                 what.push(format!("{unfinished} of {total} {}", late()));
+            }
+            // Not a failure of the store, so no tier error: the
+            // unread count shows it.
+            if past > 0 {
+                what.push(format!(
+                    "{past} listed past the newest {MAX_SHARED_TOMBSTONES} not read"
+                ));
             }
             // The names come last, so a match on the text
             // before them still holds.
@@ -1546,7 +1698,7 @@ impl S3Store {
             ),
         )
         .await;
-        failed + unfinished == 0
+        failed + unfinished == 0 && past == 0
     }
 }
 
@@ -1643,8 +1795,21 @@ fn store_failed(status: reqwest::StatusCode) -> bool {
 pub struct SharedPurge {
     pub active: ActivePurge,
     pub tombstone: Option<String>,
+    /// The purge's disk deletions (issue #572): its tombstone
+    /// is marked ended only once they are done.
+    pub disk: Option<crate::storage::DeletionWait>,
     pub event: &'static str,
     pub log_target: String,
+}
+
+/// What keeps a target's tombstones from being marked ended
+/// (issue #572): the disk deletions of its purges in this
+/// process not known to be done, and the tombstones to mark
+/// once they are.
+#[derive(Debug, Default)]
+struct HeldEnds {
+    deletions: Vec<crate::storage::DeletionWait>,
+    tombstones: Vec<(String, Tombstone)>,
 }
 
 /// A target's walk, held by the purge that leads it
@@ -2758,6 +2923,7 @@ mod tests {
         SharedPurge {
             active: guard.begin(PurgeTarget::Group(group.into())),
             tombstone: None,
+            disk: None,
             event: "purge-group",
             log_target: format!("purge-group/{group}"),
         }
@@ -3577,6 +3743,43 @@ mod tests {
         );
         assert_eq!(b.tombstones_unread(), 0);
         assert!(guard.running_covers("k", &["hero".to_string()], None));
+    }
+
+    #[tokio::test]
+    async fn tombstones_listed_past_the_newest_the_refresh_reads_count_as_unread() {
+        // Issue #572 fourth review: a refresh reads the newest
+        // tombstones up to the cap and silently dropped the
+        // rest. A tombstone held while a purge's disk files are
+        // not deleted does not expire, so newer ones can push it
+        // past the cap, where it no longer applies on a replica
+        // that has not read it, a restarted one included. Those
+        // count as unread, so /metrics shows them.
+        use futures_util::StreamExt as _;
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        let start_ms = now_ms() - 60_000;
+        let past = 6;
+        futures_util::stream::iter(0..MAX_SHARED_TOMBSTONES + past)
+            .for_each_concurrent(16, |i| {
+                let a = &a;
+                async move {
+                    let cutoff = PurgeCutoff {
+                        start_ms: start_ms + i as u64,
+                        writer: 0xa,
+                    };
+                    a.put_tombstone(&tombstone_for(&format!("g{i}"), cutoff, None), i as u64)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+        let guard = PurgeGuard::new();
+        assert!(!b.refresh_tombstones(&guard).await);
+        assert_eq!(b.tombstones_unread(), past as u64);
+        assert_eq!(b.errors(), 0, "no read failed");
+        assert!(!guard.running_covers("k", &["g0".to_string()], None));
+        assert!(guard.running_covers("k", &[format!("g{past}")], None));
     }
 
     #[test]

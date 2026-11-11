@@ -11,12 +11,15 @@
 //! The write-throughs are bounded here too, since every
 //! miss starts one and nothing else limits them; purges
 //! are signed, and their walks wait for a turn (issue
-//! #462); a disk hit's task is one disk read its request
-//! waits for.
+//! #462); a disk hit's task starts only once it holds one of
+//! the disk tier's slots (issue #572), so at most that many
+//! exist, and the disk tier's own background jobs are the
+//! store's, settled apart at shutdown.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -78,6 +81,44 @@ pub struct Background {
     /// Render write-throughs skipped because every slot was
     /// taken.
     puts_skipped: Arc<AtomicU64>,
+    /// The group write-back queued or in flight for each key
+    /// (issue #572), so a stall does not queue one per request
+    /// for the same copy.
+    groups_writes: Arc<Mutex<HashMap<String, QueuedGroups>>>,
+    /// The last id handed to a queued group write-back.
+    groups_write_ids: Arc<AtomicU64>,
+}
+
+/// A group write-back queued or in flight: which copy, under
+/// which purge snapshot, with which groups.
+#[derive(Debug)]
+struct QueuedGroups {
+    id: u64,
+    snapshot: u64,
+    etag: String,
+    written: Option<crate::cache::WriteStamp>,
+    groups: Vec<String>,
+}
+
+/// Holds a key's entry in [`Background`]'s queued group
+/// write-backs until the write-back ends.
+#[derive(Debug)]
+pub(crate) struct QueuedGroupsWrite {
+    queued: Arc<Mutex<HashMap<String, QueuedGroups>>>,
+    key: String,
+    id: u64,
+}
+
+impl Drop for QueuedGroupsWrite {
+    fn drop(&mut self) {
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queued.get(&self.key).is_some_and(|q| q.id == self.id) {
+            queued.remove(&self.key);
+        }
+    }
 }
 
 impl Default for Background {
@@ -112,7 +153,49 @@ impl Background {
             put_slots: Arc::new(Semaphore::new(put_capacity)),
             put_capacity,
             puts_skipped: Arc::new(AtomicU64::new(0)),
+            groups_writes: Arc::new(Mutex::new(HashMap::new())),
+            groups_write_ids: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Register a group write-back of `entry` for `key`, begun
+    /// under `snapshot` (issue #572), or `None` when one queued
+    /// or in flight already writes the same copy under the
+    /// same snapshot with every one of its groups: that one
+    /// carries them. The write-back holds the returned guard
+    /// until it ends. One entry per key, so the map stays
+    /// within the keys with a write-back pending.
+    pub(crate) fn queue_groups_write(
+        &self,
+        key: &str,
+        snapshot: u64,
+        entry: &crate::cache::CachedImage,
+    ) -> Option<QueuedGroupsWrite> {
+        let mut queued = self.groups_writes.lock().unwrap();
+        if let Some(q) = queued.get(key)
+            && q.snapshot == snapshot
+            && q.etag == entry.etag
+            && q.written == entry.written
+            && entry.groups.iter().all(|g| q.groups.contains(g))
+        {
+            return None;
+        }
+        let id = self.groups_write_ids.fetch_add(1, Ordering::Relaxed) + 1;
+        queued.insert(
+            key.to_string(),
+            QueuedGroups {
+                id,
+                snapshot,
+                etag: entry.etag.clone(),
+                written: entry.written,
+                groups: entry.groups.clone(),
+            },
+        );
+        Some(QueuedGroupsWrite {
+            queued: self.groups_writes.clone(),
+            key: key.to_string(),
+            id,
+        })
     }
 
     /// Run `task` detached, as work a shutdown drain waits

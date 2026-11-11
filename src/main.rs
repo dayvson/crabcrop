@@ -186,6 +186,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // for 10 s at most (issue #549).
     crate::server::start_purge_tombstones(&state).await;
     let background = state.background.clone();
+    let disk = state.store.clone();
     let signalled = shutdown_signal();
     println!("crabcrop listening on port {port}");
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
@@ -193,12 +194,14 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // in flight finish; then the background work they and
     // earlier requests left (renders whose client left
     // after they started, shared-tier write-throughs,
-    // purges whose caller left) finishes. One deadline, the
-    // grace from the signal on, bounds both waits, and the
-    // process exits at it with whatever is still running.
-    // A second signal ends the drain at once. The accept
-    // loop (issue #607) bounds each connection's header and
-    // idle time and caps how many are open.
+    // purges whose caller left) finishes, and then the disk
+    // tier's background work (issue #572: group updates to
+    // entry files and deletions of purged files). One
+    // deadline, the grace from the signal on, bounds every
+    // wait, and the process exits at it with whatever is still
+    // running. A second signal ends the drain at once. The
+    // accept loop (issue #607) bounds each connection's header
+    // and idle time and caps how many are open.
     let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     let stop = tokio_util::sync::CancellationToken::new();
     let mut serve = std::pin::pin!(crate::server::serve_connections(
@@ -221,15 +224,21 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         if tokio::time::timeout_at(deadline, serve).await.is_err() {
             eprintln!("shutdown: requests still in flight at the deadline are cut off");
         }
-        background.drain(deadline).await
+        let left = background.drain(deadline).await;
+        let disk_left = match &disk {
+            Some(disk) => disk.settle(deadline).await,
+            None => Default::default(),
+        };
+        (left, disk_left)
     };
     // The runtime stops by `stop_by`: the deadline after a
     // drain, at once after a second signal.
-    let (left, when, stop_by) = tokio::select! {
+    let ((left, disk_left), when, stop_by) = tokio::select! {
         left = drain => (left, "at the deadline", deadline.into_std()),
         () = signalled_again => {
             eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
-            (background.running(), "at the second signal", std::time::Instant::now())
+            let disk_left = disk.as_ref().map(|disk| disk.backlog()).unwrap_or_default();
+            ((background.running(), disk_left), "at the second signal", std::time::Instant::now())
         }
     };
     if left.writes > 0 {
@@ -244,6 +253,26 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         eprintln!(
             "shutdown: {} renders whose client left, still running {when}, are dropped unstored",
             left.renders
+        );
+    }
+    // Disk work left undone (issue #572), and what each kind
+    // costs after a restart.
+    if disk_left.deletions > 0 {
+        eprintln!(
+            "shutdown: {} purged disk entries are not deleted yet; the next boot indexes them again, so send those purges again, by URL for an entry a group purge removed before it had caught up with the group",
+            disk_left.deletions
+        );
+    }
+    if disk_left.behind > 0 {
+        eprintln!(
+            "shutdown: {} disk entries have not caught up with cache groups learned since they were written; after a restart a purge of those groups does not reach them",
+            disk_left.behind
+        );
+    }
+    if disk_left.owed > 0 {
+        eprintln!(
+            "shutdown: {} bucket copies may lack a cache group whose write was skipped; a restart forgets this",
+            disk_left.owed
         );
     }
     if left.walks > 0 {

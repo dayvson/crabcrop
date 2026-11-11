@@ -719,6 +719,25 @@ fn tier_metrics(state: &AppState) -> String {
             "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}\n",
             store.errors()
         ));
+    }
+    // The disk tier's slots in use and its background work
+    // (issue #572): queue lengths, never an index scan.
+    if let Some(store) = &state.store {
+        let (behind, deletions) = store.queued();
+        out.push_str(&format!(
+            "# HELP crabcrop_cache_disk_ops_in_flight Disk tier operations holding one of its 32 slots.\n\
+             # TYPE crabcrop_cache_disk_ops_in_flight gauge\n\
+             crabcrop_cache_disk_ops_in_flight {}\n\
+             # HELP crabcrop_cache_disk_groups_behind Disk entries whose file has not caught up with the cache groups they were served under.\n\
+             # TYPE crabcrop_cache_disk_groups_behind gauge\n\
+             crabcrop_cache_disk_groups_behind {behind}\n\
+             # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.\n\
+             # TYPE crabcrop_cache_disk_deletions_queued gauge\n\
+             crabcrop_cache_disk_deletions_queued {deletions}\n",
+            store.ops_in_flight()
+        ));
+    }
+    if let Some(store) = &state.shared_store {
         // The write bound (issue #463): in flight against
         // its slots, and the render write-throughs skipped
         // because every slot was taken.
@@ -1309,12 +1328,16 @@ async fn begin_purge(
 async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
-    active: crate::cache::ActivePurge,
-    tombstone: Option<String>,
+    begun: BegunPurge,
     epoch_base: Option<String>,
     event: &'static str,
     log_target: &str,
 ) -> usize {
+    let BegunPurge {
+        active,
+        tombstone,
+        disk,
+    } = begun;
     let target = active.tombstone().target.clone();
     let cutoff = active.tombstone().cutoff;
     // The walk lists these variants and reads them again, so
@@ -1331,6 +1354,7 @@ async fn purge_shared_tier(
     let purge = crate::s3store::SharedPurge {
         active,
         tombstone,
+        disk,
         event,
         log_target: log_target.to_string(),
     };
@@ -1342,6 +1366,7 @@ async fn purge_shared_tier(
         .await;
     removed += inline.removed;
     let shared = shared.clone();
+    let tasks = background.clone();
     match pending {
         Some(pending) => {
             background.spawn_walk(async move {
@@ -1350,17 +1375,19 @@ async fn purge_shared_tier(
                     shared.finish_purge(pending).await
                 };
                 let (event, log_target) = (purge.event, purge.log_target.clone());
-                end_purge(&shared, purge, inline.complete && rest.complete).await;
+                end_purge_apart(&shared, &tasks, purge, inline.complete && rest.complete).await;
                 purge_log(event, &log_target, Some(rest.removed));
                 let joined = lease.take_joined();
-                walk_for_joined(&shared, lease, joined).await;
+                walk_for_joined(&shared, &tasks, lease, joined).await;
             });
         }
         None => {
-            end_purge(&shared, purge, inline.complete).await;
+            end_purge_apart(&shared, background, purge, inline.complete).await;
             let joined = lease.take_joined();
             if !joined.is_empty() {
-                background.spawn_walk(async move { walk_for_joined(&shared, lease, joined).await });
+                background.spawn_walk(async move {
+                    walk_for_joined(&shared, &tasks, lease, joined).await;
+                });
             }
         }
     }
@@ -1377,7 +1404,8 @@ async fn purge_shared_tier(
 /// ones do. Each purge the pass served logs the pass's
 /// count under its own target.
 async fn walk_for_joined(
-    shared: &crate::s3store::S3Store,
+    shared: &Arc<crate::s3store::S3Store>,
+    background: &Background,
     mut lease: crate::s3store::WalkLease,
     mut joined: Vec<crate::s3store::SharedPurge>,
 ) {
@@ -1393,7 +1421,7 @@ async fn walk_for_joined(
         };
         for purge in joined {
             let (event, log_target) = (purge.event, purge.log_target.clone());
-            end_purge(shared, purge, swept.complete).await;
+            end_purge_apart(shared, background, purge, swept.complete).await;
             purge_log(event, &log_target, Some(swept.removed));
         }
         joined = lease.take_joined();
@@ -1411,18 +1439,100 @@ async fn walk_for_joined(
 /// walk that was not `complete` (issue #462): the store
 /// failed to list the bucket or to answer for an object, so
 /// a copy the purge covers may still be there, and it must
-/// stay a miss after the grace.
+/// stay a miss after the grace. The tombstone is marked
+/// ended only once the disk files of every purge of its
+/// target in this process are deleted (issue #572): a
+/// restart before then indexes them again, and the unended
+/// tombstone keeps them misses. The purge waits for its own
+/// while they make progress; when they stop, or one fails,
+/// it ends here, and its tombstone is marked by the
+/// tombstone refresh after they are gone.
 async fn end_purge(
     shared: &crate::s3store::S3Store,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
+    if let Some(disk) = &purge.disk {
+        disk.wait(PURGE_END_IDLE, PURGE_END_CAP).await;
+    }
     if complete && let Some(object) = &purge.tombstone {
-        let mut ended = purge.active.tombstone().clone();
-        ended.ended_ms = Some(crate::cache::now_ms());
-        shared.write_tombstone(object, &ended).await;
+        shared.end_tombstone(object, purge.active.tombstone()).await;
     }
     drop(purge);
+}
+
+/// [`end_purge`], on a task of its own when the purge still
+/// waits for disk deletions (issue #572): the walk lease, and
+/// the purges that joined it, do not wait on the disk. A
+/// purge with no tombstone to mark ended waits for nothing;
+/// its deletions hold the target's tombstones from the moment
+/// they were queued (see [`purge_disk_tier`]).
+async fn end_purge_apart(
+    shared: &Arc<crate::s3store::S3Store>,
+    background: &Background,
+    purge: crate::s3store::SharedPurge,
+    complete: bool,
+) {
+    if !complete || purge.tombstone.is_none() {
+        return;
+    }
+    if purge.disk.as_ref().is_some_and(|disk| disk.pending()) {
+        let shared = shared.clone();
+        background.spawn_walk(async move { end_purge(&shared, purge, complete).await });
+    } else {
+        end_purge(shared, purge, complete).await;
+    }
+}
+
+/// A purge that has begun, as its shared-tier half takes it:
+/// the running purge, its bucket tombstone, and the disk
+/// deletions its tombstone waits for (issue #572).
+struct BegunPurge {
+    active: crate::cache::ActivePurge,
+    tombstone: Option<String>,
+    disk: Option<crate::storage::DeletionWait>,
+}
+
+/// The disk tier's half of a purge (issue #572): remove the
+/// records `target` covers from the index at once, so they
+/// stop serving and the count is exact, and queue their
+/// files' deletion. No disk slot is waited for. The deletions
+/// hold the target's bucket tombstones at once: a per-URL
+/// purge awaits the bucket before its walk, and a later purge
+/// of the URL that ends meanwhile, with no deletions of its
+/// own, must not mark its tombstone ended while these files
+/// are there. Returns the count and the deletions queued.
+fn purge_disk_tier(
+    state: &AppState,
+    target: &crate::cache::PurgeTarget,
+) -> (usize, Option<crate::storage::DeletionWait>) {
+    let Some(store) = &state.store else {
+        return (0, None);
+    };
+    let (removed, disk) = store.purge_waiting(target);
+    store.kick();
+    if let Some(shared) = &state.shared_store {
+        shared.hold_for_deletions(target, &disk);
+    }
+    (removed, Some(disk))
+}
+
+/// Wait for a purge's disk deletions (issue #572) while they
+/// make progress: on a healthy disk with no deletions queued
+/// before them, the files are gone when the purge answers, as
+/// before. Once none finishes for [`DISK_WRITE_WAIT`], or after
+/// [`PURGE_DELETE_CAP`] in all, the purge answers and the
+/// deletions go on in the background. That counts as a stall
+/// only on a stuck disk, not on one busy with the deletions
+/// queued before these.
+async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
+    let Some(disk) = disk else {
+        return;
+    };
+    let waited = disk.wait(DISK_WRITE_WAIT, PURGE_DELETE_CAP).await;
+    if waited == crate::storage::Waited::Stalled {
+        disk.store.note_stall(crate::storage::Stall::PurgeDelete);
+    }
 }
 
 /// Load the shared bucket's purge tombstones before serving
@@ -1437,7 +1547,9 @@ async fn end_purge(
 /// retries: the tier stays best-effort, like every other
 /// shared read. Serving does not start first: lookups
 /// consult the tombstones, so a request served before them
-/// could hand out a copy a purge removed.
+/// could hand out a copy a purge removed. Each refresh after
+/// boot first marks ended the tombstones that waited for disk
+/// deletions now done (issue #572).
 pub async fn start_purge_tombstones(state: &AppState) {
     let Some(shared) = state.shared_store.clone() else {
         return;
@@ -1454,6 +1566,7 @@ pub async fn start_purge_tombstones(state: &AppState) {
         tick.tick().await;
         loop {
             tick.tick().await;
+            shared.end_held_purges().await;
             shared.refresh_tombstones(&guard).await;
         }
     });
@@ -1618,14 +1731,11 @@ async fn purge_handle(
         )
         .await;
         let mut removed = task_state.cache.purge_matching(&key_form);
-        if let Some(store) = &task_state.store {
-            let store = store.clone();
-            let key = key_form.clone();
-            removed += store
-                .blocking(move |store| store.purge_matching(&key))
-                .await
-                .unwrap_or(0);
-        }
+        let (on_disk, disk) = purge_disk_tier(
+            &task_state,
+            &crate::cache::PurgeTarget::Key(key_form.clone()),
+        );
+        removed += on_disk;
         if let Some(shared) = &task_state.shared_store {
             // The shared tier deletes the current epoch's
             // enumerable variants directly by object name
@@ -1636,14 +1746,18 @@ async fn purge_handle(
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
-                active,
-                tombstone,
+                BegunPurge {
+                    active,
+                    tombstone,
+                    disk: disk.clone(),
+                },
                 Some(epoch_form),
                 "purge",
                 &task_target,
             )
             .await;
         }
+        wait_for_disk_purge(disk).await;
         task_state.metrics.record_purge();
         purge_log("purge", &task_target, Some(removed));
         removed
@@ -1727,26 +1841,27 @@ async fn purge_group_handle(
         let (active, tombstone) =
             begin_purge(&task_state, crate::cache::PurgeTarget::Group(group.clone())).await;
         let mut removed = task_state.cache.purge_group(&group);
-        if let Some(store) = &task_state.store {
-            let store = store.clone();
-            let group = group.clone();
-            removed += store
-                .blocking(move |store| store.purge_group(&group))
-                .await
-                .unwrap_or(0);
-        }
+        let (on_disk, disk) = purge_disk_tier(
+            &task_state,
+            &crate::cache::PurgeTarget::Group(group.clone()),
+        );
+        removed += on_disk;
         if let Some(shared) = &task_state.shared_store {
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
-                active,
-                tombstone,
+                BegunPurge {
+                    active,
+                    tombstone,
+                    disk: disk.clone(),
+                },
                 None,
                 "purge-group",
                 &task_target,
             )
             .await;
         }
+        wait_for_disk_purge(disk).await;
         task_state.metrics.record_purge();
         purge_log("purge-group", &task_target, Some(removed));
         removed
@@ -1868,26 +1983,27 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
         )
         .await;
         let mut removed = task_state.cache.purge_source(&source);
-        if let Some(store) = &task_state.store {
-            let store = store.clone();
-            let key = source.clone();
-            removed += store
-                .blocking(move |store| store.purge_source(&key))
-                .await
-                .unwrap_or(0);
-        }
+        let (on_disk, disk) = purge_disk_tier(
+            &task_state,
+            &crate::cache::PurgeTarget::Source(source.clone()),
+        );
+        removed += on_disk;
         if let Some(shared) = &task_state.shared_store {
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
-                active,
-                tombstone,
+                BegunPurge {
+                    active,
+                    tombstone,
+                    disk: disk.clone(),
+                },
                 None,
                 "purge-source",
                 &source,
             )
             .await;
         }
+        wait_for_disk_purge(disk).await;
         purge_log("purge-source", &source, Some(removed));
         removed
     });
@@ -2651,6 +2767,7 @@ async fn serve(
         max_age: resolved.max_age,
         sealed,
         progress: MissProgress::default(),
+        disk_handoff: None,
     };
     let (mut response, record) = run_flight(state, path, work, if_none_match, record).await;
     if hint_shaped {
@@ -3137,7 +3254,7 @@ fn meta_flight_key(work: &MissWork) -> String {
 async fn run_flight(
     state: &AppState,
     path: &str,
-    work: MissWork,
+    mut work: MissWork,
     if_none_match: Option<&str>,
     mut record: RequestRecord,
 ) -> (Response, RequestRecord) {
@@ -3198,8 +3315,13 @@ async fn run_flight(
     let (max_age, sealed) = (work.max_age, work.sealed);
     let mut waits = 0;
     let mut followed: Option<Arc<FlightSlot>> = None;
+    // One disk budget for every tier check this request makes
+    // (issue #572).
+    let mut budget = DiskBudget::new();
     loop {
-        if let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await {
+        if let Some((hit, cache_status)) =
+            lookup_tiers_within(state, &cache_key, &groups, &mut budget).await
+        {
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
             let etag = hit.etag.clone();
@@ -3244,6 +3366,11 @@ async fn run_flight(
                 let progress = work.progress.clone();
                 let task_progress = progress.clone();
                 let task_state = state.clone();
+                // The render's disk write waits until the
+                // followers are woken (issue #572): they read
+                // the render from memory and never wait for it.
+                let handoff = DiskHandoff::default();
+                work.disk_handoff = Some(handoff.clone());
                 // The leader's whole part runs as one miss
                 // (see `finish_started_miss`): a render it
                 // starts is stored and answers the
@@ -3266,6 +3393,17 @@ async fn run_flight(
                         });
                     }
                     drop(guard);
+                    let pending = handoff.lock().unwrap().take();
+                    if let Some(pending) = pending {
+                        finish_disk_write(
+                            &task_state,
+                            pending.snapshot,
+                            &pending.key,
+                            &pending.entry,
+                            pending.claim,
+                        )
+                        .await;
+                    }
                     (response, record, render_etag)
                 };
                 let (mut response, record, render_etag) =
@@ -3551,13 +3689,18 @@ fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImag
 /// wins however the two interleave. The removal matches
 /// on the entry's ETag and stamp, so an entry a fresher
 /// write has already replaced under the same key is left
-/// alone.
-fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
+/// alone. A copy memory held keeps its groups in the new
+/// one (issue #572); returns those the slower tiers still
+/// have to learn.
+fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) -> Vec<String> {
     if write_is_stale(state, snapshot, key, entry) {
-        return;
+        return Vec::new();
     }
-    state.cache.put(key.to_string(), entry.clone());
-    if write_is_stale(state, snapshot, key, entry)
+    let took = state.cache.put(key.to_string(), entry.clone());
+    let stored = crate::cache::union_groups(&entry.groups, &took);
+    if state
+        .purge_guard
+        .write_covered(snapshot, key, &stored, entry.written)
         && state
             .cache
             .get(key)
@@ -3565,56 +3708,252 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
     {
         state.cache.remove(key);
     }
+    took
 }
 
-/// The reconcile every guarded disk write and group
-/// merge runs after landing (issue #350): when a purge
-/// recorded after `snapshot` covers the entry and the
-/// disk tier still holds this exact copy, remove it, so
-/// the copy the write or merge just made is not left
-/// behind for the purge to miss. The ETag and stamp match
-/// leaves alone an entry a fresher write has already
-/// replaced under the same key.
-fn reconcile_disk(
-    store: &crate::storage::DiskStore,
-    guard: &crate::cache::PurgeGuard,
+/// Promote a copy a slower tier served into memory under
+/// the purge guard (issue #350). A copy memory already
+/// holds keeps its bytes and gains the groups (issue
+/// #572), so a promotion that lands late never takes back a
+/// group a hit taught memory meanwhile. Returns the groups
+/// memory held that `entry` lacked, which the slower tiers
+/// still have to learn.
+fn promote_memory_tier(
+    state: &AppState,
     snapshot: u64,
     key: &str,
     entry: &CachedImage,
-) {
-    if guard.write_covered(snapshot, key, &entry.groups, entry.written)
-        && store
-            .get(key)
-            .is_some_and(|held| crate::cache::same_copy(&held, entry))
-    {
-        store.remove(key);
+) -> Vec<String> {
+    if write_is_stale(state, snapshot, key, entry) {
+        return Vec::new();
+    }
+    match state.cache.promote(key, entry) {
+        crate::cache::Promoted::Inserted => {
+            if write_is_stale(state, snapshot, key, entry)
+                && state
+                    .cache
+                    .get(key)
+                    .is_some_and(|held| crate::cache::same_copy(&held, entry))
+            {
+                state.cache.remove(key);
+            }
+            Vec::new()
+        }
+        crate::cache::Promoted::Merged {
+            groups,
+            took,
+            grew,
+            written,
+        } => {
+            // A held copy that grows into a group a live purge
+            // covers leaves memory, as on a memory hit.
+            let covered = if grew {
+                state
+                    .purge_guard
+                    .write_covered(snapshot, key, &groups, written)
+            } else {
+                state.purge_guard.purge_covers(snapshot, key, &groups)
+            };
+            if covered {
+                state.cache.remove(key);
+            }
+            took
+        }
+        crate::cache::Promoted::Skipped => Vec::new(),
     }
 }
 
-/// Store `entry` in the disk tier under the purge guard
-/// (issue #350): the same skip-and-reconcile discipline
-/// as [`put_memory_tier`], run as one blocking operation
-/// (issue #347), so the guard checks and the store calls
-/// stay in one sequence that finishes even if the
-/// request that asked for it is dropped while it waits.
-async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
+/// What a learn tells the disk tier about the bucket copy,
+/// given how its write went (issue #572): only a write that
+/// was spawned, or is queued, carries the groups.
+fn bucket_for(sent: Sent, groups: &[String]) -> crate::storage::Bucket<'_> {
+    match sent {
+        Sent::Spawned => crate::storage::Bucket::Carries(groups),
+        Sent::Skipped => crate::storage::Bucket::Skipped,
+        Sent::Nothing => crate::storage::Bucket::Unknown,
+    }
+}
+
+/// Teach the disk tier that a copy of `key` was served
+/// under `groups` (issue #572): the index records them at
+/// once, with no file I/O, and the drain writes them into
+/// the file. When the record grows into a group a purge
+/// covers, the disk copy goes: the reconcile a disk merge
+/// ran on main, with the record's own stamp and id.
+fn learn_disk_groups(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    groups: &[String],
+    bucket: crate::storage::Bucket<'_>,
+) {
     let Some(store) = &state.store else {
         return;
     };
-    let store = store.clone();
+    if let crate::storage::Learned::Indexed {
+        grew: true,
+        groups,
+        written,
+        id,
+    } = store.learn_groups(key, groups, bucket)
+    {
+        if state
+            .purge_guard
+            .write_covered(snapshot, key, &groups, written)
+        {
+            store.forget_if(key, id);
+        }
+        store.kick();
+    }
+}
+
+/// Teach the disk and shared tiers the groups memory held
+/// for `key` that `entry`, the copy a caller just wrote to
+/// them, lacked (issue #572): memory served the entry under
+/// them, so every copy has to carry them.
+fn teach_slower_tiers(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    entry: &CachedImage,
+    took: Vec<String>,
+) {
+    if took.is_empty() {
+        return;
+    }
+    let copy = CachedImage {
+        groups: crate::cache::union_groups(&entry.groups, &took),
+        ..entry.clone()
+    };
+    let sent = spawn_shared_put(state, snapshot, key, copy.clone(), SharedWrite::Groups);
+    learn_disk_groups(
+        state,
+        snapshot,
+        key,
+        &copy.groups,
+        bucket_for(sent, &copy.groups),
+    );
+}
+
+/// The groups this process knows `key` has been served
+/// under (issue #572): the disk record's, or those of a disk
+/// write in flight, and the memory copy's. A copy that serves
+/// instead of those takes them, so no copy written below
+/// lacks one.
+fn known_groups(state: &AppState, key: &str) -> Vec<String> {
+    let disk = state
+        .store
+        .as_ref()
+        .and_then(|store| store.known_groups(key))
+        .unwrap_or_default();
+    match state.cache.groups(key) {
+        Some(memory) => crate::cache::union_groups(&disk, &memory),
+        None => disk,
+    }
+}
+
+/// Whether `extra` holds a group `existing` lacks.
+fn adds_groups(existing: &[String], extra: &[String]) -> bool {
+    extra.iter().any(|g| !existing.contains(g))
+}
+
+/// Start a disk write of `entry` under the purge guard (issue
+/// #572). A key the disk holds is never written again: its
+/// record learns the groups, and when that grows it into a
+/// group a purge covers, the disk copy goes, as main's merge
+/// and reconcile did. A stale copy is not written. Returns
+/// the claim of a write to finish with
+/// [`finish_disk_write`]. Runs before the copy enters memory,
+/// so a memory hit that learns a group meanwhile reaches the
+/// write.
+fn begin_disk_write(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    entry: &CachedImage,
+    bucket: crate::storage::Bucket<'_>,
+) -> Option<crate::storage::WriteClaim> {
+    let store = state.store.as_ref()?;
+    let may_claim = !write_is_stale(state, snapshot, key, entry);
+    match store.begin_write(key, &entry.groups, bucket, may_claim) {
+        crate::storage::WritePlan::Claimed(claim) => Some(claim),
+        crate::storage::WritePlan::Held(crate::storage::Learned::Indexed {
+            grew: true,
+            groups,
+            written,
+            id,
+        }) => {
+            if state
+                .purge_guard
+                .write_covered(snapshot, key, &groups, written)
+            {
+                store.forget_if(key, id);
+            }
+            store.kick();
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Finish a disk write begun by [`begin_disk_write`] (issue
+/// #572). The request waits at most [`DISK_WRITE_WAIT`] for
+/// it. A write that has no disk slot by then is dropped, with
+/// its claim, and counted as a stall; one that has started
+/// runs to its end on its thread. The write lands with every
+/// group learned meanwhile, and the reconcile after it checks
+/// those under the write's own snapshot: a purge that lands
+/// while the write is in flight wins.
+async fn finish_disk_write(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    entry: &CachedImage,
+    claim: crate::storage::WriteClaim,
+) {
+    let Some(store) = state.store.clone() else {
+        return;
+    };
+    let started = tokio::time::Instant::now();
+    let permit = match tokio::time::timeout(DISK_WRITE_WAIT, store.permit()).await {
+        Ok(Some(permit)) => permit,
+        Ok(None) => return,
+        Err(_) => {
+            store.note_stall(crate::storage::Stall::Write);
+            return;
+        }
+    };
     let guard = state.purge_guard.clone();
     let key = key.to_string();
     let entry = entry.clone();
-    let _ = store
-        .blocking(move |store| {
-            if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
-                return;
-            }
-            store.put(&key, &entry);
-            reconcile_disk(store, &guard, snapshot, &key, &entry);
-        })
-        .await;
+    let write = store.blocking_with(permit, move |store| {
+        if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
+            return;
+        }
+        if let Some(landed) = store.land(claim, &entry)
+            && guard.write_covered(snapshot, &key, &landed.groups, entry.written)
+        {
+            // Queued, not deleted inline: a failed delete is
+            // retried, and the purge holds its tombstones for it
+            // (see `DiskStore::forget_if`).
+            store.forget_if(&key, landed.id);
+        }
+    });
+    let _ = tokio::time::timeout(DISK_WRITE_WAIT.saturating_sub(started.elapsed()), write).await;
 }
+
+/// A render's disk write that its flight leader finishes
+/// after the followers are woken (issue #572).
+struct PendingDiskWrite {
+    snapshot: u64,
+    key: String,
+    entry: CachedImage,
+    claim: crate::storage::WriteClaim,
+}
+
+/// Where [`populate_tiers`] leaves a flight leader's disk
+/// write for the leader to finish once its guard is dropped.
+type DiskHandoff = Arc<std::sync::Mutex<Option<PendingDiskWrite>>>;
 
 /// Why a shared-tier write is made, which decides what it
 /// does when every write slot is taken (issue #463).
@@ -3649,30 +3988,36 @@ enum SharedWrite {
 /// on /metrics: the local tiers hold the entry, so the cost
 /// is a render on the next replica that misses. A
 /// [`SharedWrite::Groups`] write-back is never skipped: it
-/// waits for a slot in its own task.
+/// waits for a slot in its own task. One for the same copy,
+/// snapshot and groups as one already queued is not spawned
+/// again (issue #572): the queued one carries them, so a
+/// stall cannot queue one per request.
 fn spawn_shared_put(
     state: &AppState,
     snapshot: u64,
     key: &str,
     entry: CachedImage,
     write: SharedWrite,
-) {
+) -> Sent {
     let Some(shared) = &state.shared_store else {
-        return;
+        return Sent::Nothing;
     };
     let guard = state.purge_guard.clone();
     // A write a purge already covers would be dropped in the
     // task anyway: checked before it takes a slot, so it is
     // not counted as a skip.
     if guard.write_covered(snapshot, key, &entry.groups, entry.written) {
-        return;
+        return Sent::Nothing;
     }
-    let slot = match write {
+    let (slot, queued) = match write {
         SharedWrite::Render => match state.background.put_slot() {
-            Some(slot) => Some(slot),
-            None => return,
+            Some(slot) => (Some(slot), None),
+            None => return Sent::Skipped,
         },
-        SharedWrite::Groups => None,
+        SharedWrite::Groups => match state.background.queue_groups_write(key, snapshot, &entry) {
+            Some(queued) => (None, Some(queued)),
+            None => return Sent::Spawned,
+        },
     };
     let background = state.background.clone();
     let shared = shared.clone();
@@ -3680,6 +4025,7 @@ fn spawn_shared_put(
     // The handle is dropped: the write is detached, and
     // tracked for the shutdown drain.
     let _detached = state.background.spawn(async move {
+        let _queued = queued;
         let _slot = match slot {
             Some(slot) => slot,
             None => match background.wait_put_slot().await {
@@ -3700,6 +4046,192 @@ fn spawn_shared_put(
             shared.remove_if_match(&key, etag.as_deref()).await;
         }
     });
+    Sent::Spawned
+}
+
+/// How [`spawn_shared_put`] went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    /// A write was spawned, or one already queued carries the
+    /// copy.
+    Spawned,
+    /// A render's write-through found every slot taken (issue
+    /// #463).
+    Skipped,
+    /// Nothing to write: no shared tier, or a purge covers the
+    /// copy.
+    Nothing,
+}
+
+/// How long one request waits for the disk tier's lookups,
+/// in all (issue #572): the waits for a disk slot and for the
+/// reads, across every tier check the request makes. A
+/// lookup that runs out goes on to the shared tier or a
+/// render.
+const DISK_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a request waits for its own disk write, once
+/// (issue #572). A write with no disk slot by then is
+/// skipped.
+const DISK_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a purge waits for its disk deletions in all
+/// while they make progress (issue #572). It stops sooner, at
+/// [`DISK_WRITE_WAIT`], once none of them finishes for that
+/// long.
+const PURGE_DELETE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the end of a purge, in the background, waits for
+/// one of its disk deletions to finish (issue #572). When none
+/// does for that long, the purge ends, and its bucket
+/// tombstone is marked ended by the tombstone refresh once
+/// they are done.
+const PURGE_END_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the end of a purge waits for its disk deletions
+/// in all while they make progress.
+const PURGE_END_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What is left of a request's [`DISK_LOOKUP_BUDGET`]. Only
+/// time spent waiting on the disk is charged: a request that
+/// waited for a long render before its next check still
+/// reads a healthy disk.
+#[derive(Debug)]
+struct DiskBudget {
+    left: std::time::Duration,
+}
+
+impl DiskBudget {
+    fn new() -> Self {
+        DiskBudget {
+            left: DISK_LOOKUP_BUDGET,
+        }
+    }
+
+    #[cfg(test)]
+    fn with(left: std::time::Duration) -> Self {
+        DiskBudget { left }
+    }
+
+    fn spent(&self) -> bool {
+        self.left.is_zero()
+    }
+
+    /// Wait for `wait` within what is left, and charge the
+    /// time it took. `None`, at once once spent, when it ran
+    /// out.
+    async fn spend<F: std::future::Future>(&mut self, wait: F) -> Option<F::Output> {
+        if self.spent() {
+            return None;
+        }
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(self.left, wait).await.ok();
+        self.left = match out {
+            Some(_) => self.left.saturating_sub(started.elapsed()),
+            None => std::time::Duration::ZERO,
+        };
+        out
+    }
+}
+
+/// Who acts on a disk lookup's answer (issue #572): the
+/// request, if it is still waiting, or nobody. A lookup task
+/// whose request went on without it promotes nothing and
+/// writes nothing back.
+#[derive(Debug, Default)]
+struct LookupAnswer(std::sync::atomic::AtomicU8);
+
+impl LookupAnswer {
+    const WAITING: u8 = 0;
+    const TAKEN: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    fn swap_from_waiting(&self, to: u8) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                to,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The lookup task takes its answer. False when the
+    /// request has gone on.
+    fn take(&self) -> bool {
+        self.swap_from_waiting(Self::TAKEN)
+    }
+
+    /// The request goes on without the answer. False when the
+    /// task took it first: it only has memory work left.
+    fn abandon(&self) -> bool {
+        self.swap_from_waiting(Self::ABANDONED)
+    }
+}
+
+/// The `Cache-Status` of a disk hit.
+const DISK_HIT: &str = "crabcrop; hit; detail=\"disk\"";
+
+/// [`lookup_tiers_within`] with a whole disk budget, as the
+/// tier tests drive one lookup.
+#[cfg(test)]
+async fn lookup_tiers(
+    state: &AppState,
+    cache_key: &str,
+    groups: &[String],
+) -> Option<(CachedImage, &'static str)> {
+    lookup_tiers_within(state, cache_key, groups, &mut DiskBudget::new()).await
+}
+
+/// A memory hit's group learn (audit R2-15, issues #350,
+/// #572): the copy memory holds gains the request's groups,
+/// and when its set grows, the bucket copy and the disk
+/// record learn the whole set. None of it waits on the disk:
+/// the record learns in the index, and the drain writes the
+/// file. When the grown set falls under a purge, the copy
+/// leaves memory too, as the slower tiers' copies do.
+fn memory_hit(state: &AppState, snapshot: u64, key: &str, groups: &[String], hit: &CachedImage) {
+    if groups.is_empty() {
+        return;
+    }
+    let held = match state.cache.merge_groups(key, groups) {
+        Some(held) => held,
+        None => {
+            // Memory may have dropped the copy since it was read:
+            // the request is still served under its groups.
+            if !adds_groups(&hit.groups, groups)
+                || state
+                    .cache
+                    .groups(key)
+                    .is_some_and(|memory| !adds_groups(&memory, groups))
+            {
+                return;
+            }
+            CachedImage {
+                groups: crate::cache::union_groups(&hit.groups, groups),
+                ..hit.clone()
+            }
+        }
+    };
+    let sent = spawn_shared_put(state, snapshot, key, held.clone(), SharedWrite::Groups);
+    learn_disk_groups(
+        state,
+        snapshot,
+        key,
+        &held.groups,
+        bucket_for(sent, &held.groups),
+    );
+    if state
+        .purge_guard
+        .write_covered(snapshot, key, &held.groups, held.written)
+        && state
+            .cache
+            .get(key)
+            .is_some_and(|now| crate::cache::same_copy(&now, &held))
+    {
+        state.cache.remove(key);
+    }
 }
 
 /// The tier lookup chain for one key: memory, then disk
@@ -3728,73 +4260,67 @@ fn spawn_shared_put(
 /// such check: a purge empties this process's memory
 /// before any slower tier, and every way back in is a
 /// promotion through this chain or a guarded write.
+///
+/// The disk tier is waited for within `budget` (issue
+/// #572): a lookup that finds no disk slot, or whose read
+/// does not answer, before the budget runs out goes on to
+/// the shared tier, and its task promotes nothing. A
+/// request learns groups only when it is served a copy, so
+/// one dropped while it waits owes no tier anything.
 /// Returns the image and the `Cache-Status` value for
 /// the tier that served it.
-async fn lookup_tiers(
+async fn lookup_tiers_within(
     state: &AppState,
     cache_key: &str,
     groups: &[String],
+    budget: &mut DiskBudget,
 ) -> Option<(CachedImage, &'static str)> {
     let snapshot = state.purge_guard.snapshot();
     if let Some(hit) = state.cache.get(cache_key) {
-        if !groups.is_empty() && state.cache.merge_groups(cache_key, groups) {
-            // The memory set grew: propagate the new
-            // membership to the persistent tiers. A group
-            // the memory entry already carried needs no
-            // propagation; it reached them when it was
-            // first learned.
-            let merged = crate::cache::union_groups(&hit.groups, groups);
-            if merged != hit.groups {
-                // The shared propagation is spawned first,
-                // before any wait (issue #347): it does not
-                // depend on the disk merge, and a request
-                // dropped during that merge must not be
-                // able to strand it.
-                let mut entry = hit.clone();
-                entry.groups = merged.clone();
-                spawn_shared_put(state, snapshot, cache_key, entry, SharedWrite::Groups);
-            }
-            if let Some(store) = &state.store {
-                // The merge and its reconcile run as one
-                // blocking operation (issue #347), so the
-                // sequence finishes even if this request is
-                // dropped while it waits.
-                let store = store.clone();
-                let guard = state.purge_guard.clone();
-                let key = cache_key.to_string();
-                let groups = groups.to_vec();
-                let mut entry = hit.clone();
-                entry.groups = merged;
-                let _ = store
-                    .blocking(move |store| {
-                        store.merge_groups(&key, &groups);
-                        reconcile_disk(store, &guard, snapshot, &key, &entry);
-                    })
-                    .await;
-            }
-        }
+        memory_hit(state, snapshot, cache_key, groups, &hit);
         return Some((hit, "crabcrop; hit"));
     }
     if let Some(store) = &state.store
         && store.contains(cache_key)
+        && !budget.spent()
     {
-        // The disk hit and everything it owes the other
-        // tiers run in a spawned task (issue #347):
-        // dropping this request's JoinHandle detaches the
-        // task instead of cancelling it, so a client that
-        // disconnects while the disk answers cannot leave
-        // the disk entry holding a group the shared tier
-        // never learned (issue #350). Tracked like every
-        // detached task (issue #463).
-        let task_state = state.clone();
-        let key = cache_key.to_string();
-        let lookup_groups = groups.to_vec();
-        let task = state.background.spawn(async move {
-            lookup_disk_tier(&task_state, snapshot, &key, &lookup_groups).await
-        });
-        let joined = task.await;
-        if let Ok(Some(image)) = joined {
-            return Some((image, "crabcrop; hit; detail=\"disk\""));
+        // The slot is taken before the task starts, so no task
+        // is left waiting for one, and at most one per slot
+        // can be stuck in the kernel.
+        match budget.spend(store.permit()).await {
+            None => store.note_stall(crate::storage::Stall::LookupSlot),
+            Some(None) => {}
+            Some(Some(permit)) => {
+                // The disk hit and everything it owes the other
+                // tiers run in a spawned task (issue #347):
+                // dropping this request's JoinHandle detaches
+                // the task instead of cancelling it, so a
+                // client that disconnects while the disk
+                // answers still has its hit's groups learned
+                // (issue #350). Tracked like every detached
+                // task (issue #463).
+                let answer = Arc::new(LookupAnswer::default());
+                let mut task = state.background.spawn(lookup_disk_tier(
+                    state.clone(),
+                    snapshot,
+                    cache_key.to_string(),
+                    groups.to_vec(),
+                    permit,
+                    answer.clone(),
+                ));
+                match budget.spend(&mut task).await {
+                    Some(Ok(Some(image))) => return Some((image, DISK_HIT)),
+                    Some(_) => {}
+                    None if answer.abandon() => store.note_stall(crate::storage::Stall::LookupRead),
+                    // The task took its answer first: only memory
+                    // work is left in it.
+                    None => {
+                        if let Ok(Some(image)) = task.await {
+                            return Some((image, DISK_HIT));
+                        }
+                    }
+                }
+            }
         }
     }
     if let Some(shared) = &state.shared_store
@@ -3812,81 +4338,128 @@ async fn lookup_tiers(
             shared.remove_if_match(cache_key, etag.as_deref()).await;
             return None;
         }
-        if !groups.is_empty() {
-            let merged = crate::cache::union_groups(&image.groups, groups);
-            if merged != image.groups {
-                image.groups = merged;
-                // Off the response path, like the
-                // write-through put, but never skipped.
-                spawn_shared_put(
-                    state,
-                    snapshot,
-                    cache_key,
-                    image.clone(),
-                    SharedWrite::Groups,
-                );
-            }
+        // The copy takes the request's groups and every group
+        // this process knows for the key (issue #572): it
+        // serves instead of the copies that were served under
+        // them. When a purge covers one of those known groups,
+        // the write-back would be dropped and the copy would
+        // not learn the request's groups either, so it takes
+        // the request's and the known ones no purge covers.
+        let mut wanted = crate::cache::union_groups(groups, &known_groups(state, cache_key));
+        let covered = |extra: &[String]| {
+            state.purge_guard.write_covered(
+                snapshot,
+                cache_key,
+                &crate::cache::union_groups(&image.groups, extra),
+                image.written,
+            )
+        };
+        if covered(&wanted) && !covered(groups) {
+            let kept: Vec<String> = wanted
+                .iter()
+                .filter(|g| {
+                    !covered(&crate::cache::union_groups(
+                        groups,
+                        std::slice::from_ref(*g),
+                    ))
+                })
+                .cloned()
+                .collect();
+            wanted = crate::cache::union_groups(groups, &kept);
         }
-        put_memory_tier(state, snapshot, cache_key, &image);
-        put_disk_tier(state, snapshot, cache_key, &image).await;
+        let sent = if adds_groups(&image.groups, &wanted) {
+            image.groups = crate::cache::union_groups(&image.groups, &wanted);
+            // Off the response path, like the write-through
+            // put, but never skipped.
+            spawn_shared_put(
+                state,
+                snapshot,
+                cache_key,
+                image.clone(),
+                SharedWrite::Groups,
+            )
+        } else {
+            // The bucket copy already carries them all.
+            Sent::Spawned
+        };
+        // The disk write is claimed before the copy enters
+        // memory, so a memory hit that learns a group meanwhile
+        // reaches the write (issue #572).
+        let disk = begin_disk_write(
+            state,
+            snapshot,
+            cache_key,
+            &image,
+            bucket_for(sent, &image.groups),
+        );
+        let took = promote_memory_tier(state, snapshot, cache_key, &image);
+        teach_slower_tiers(state, snapshot, cache_key, &image, took);
+        if let Some(claim) = disk {
+            finish_disk_write(state, snapshot, cache_key, &image, claim).await;
+        }
         return Some((image, "crabcrop; hit; detail=\"shared\""));
     }
     None
 }
 
-/// The disk tier's half of [`lookup_tiers`], run as its
-/// own task so a dropped request cannot strand it
-/// mid-chain: read the entry, union the request's groups
-/// into it under the purge guard, then pay what the hit
-/// owes the other tiers: the group propagation to the
-/// shared tier and the promotion into memory, in that
-/// order. Returns the image on a hit.
+/// The disk tier's half of [`lookup_tiers_within`], run as its
+/// own task under the disk slot its request took, so a
+/// dropped request cannot strand it mid-chain: read the
+/// entry, and if the request is still waiting for it, learn
+/// the request's groups in the index under the purge guard,
+/// then pay what the hit owes the other tiers: the group
+/// write-back to the shared tier and the promotion into
+/// memory, in that order. A request that went on without
+/// the answer (issue #572) leaves the task nothing to do.
+/// Returns the image on a hit.
 async fn lookup_disk_tier(
-    state: &AppState,
+    state: AppState,
     snapshot: u64,
-    cache_key: &str,
-    groups: &[String],
+    key: String,
+    groups: Vec<String>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    answer: Arc<LookupAnswer>,
 ) -> Option<CachedImage> {
     let store = state.store.clone()?;
     let guard = state.purge_guard.clone();
-    let key = cache_key.to_string();
-    let lookup_groups = groups.to_vec();
-    // The read, its group merge, and the merge reconcile
-    // run as one blocking operation (issue #347); the
-    // boolean reports whether the merge grew the entry's
-    // group set.
-    let (image, grew) = store
-        .blocking(move |store| {
-            let mut image = store.get(&key)?;
-            if guard.running_covers(&key, &image.groups, image.written) {
+    let read_key = key.clone();
+    let (mut image, id) = store
+        .blocking_with(permit, move |store| {
+            let (image, id) = store.get_with_id(&read_key)?;
+            if guard.running_covers(&read_key, &image.groups, image.written) {
                 // A live tombstone covers this copy (issues
                 // #400, #461): drop it rather than serve and
-                // promote it.
-                store.remove(&key);
+                // promote it. Its deletion is queued, retried
+                // until done, and holds the tombstones of the
+                // purge that covers it (issue #572).
+                store.forget_if(&read_key, id);
                 return None;
             }
-            let mut grew = false;
-            if !lookup_groups.is_empty() && store.merge_groups(&key, &lookup_groups) {
-                image.groups = crate::cache::union_groups(&image.groups, &lookup_groups);
-                reconcile_disk(store, &guard, snapshot, &key, &image);
-                grew = true;
-            }
-            Some((image, grew))
+            Some((image, id))
         })
         .await
         .flatten()?;
-    if grew {
-        // The merge grew the disk entry's set; the
-        // shared tier's copy learns it too (issue #350).
-        spawn_shared_put(
-            state,
-            snapshot,
-            cache_key,
-            image.clone(),
-            SharedWrite::Groups,
-        );
+    if !answer.take() {
+        return None;
     }
-    put_memory_tier(state, snapshot, cache_key, &image);
+    let hit = store.learn_hit(&key, id, &groups)?;
+    image.groups = hit.groups;
+    if hit.grew || hit.owed {
+        // The record grew, or a skipped render write left the
+        // bucket copy without some of its groups: the shared
+        // tier's copy learns them (issue #350).
+        spawn_shared_put(&state, snapshot, &key, image.clone(), SharedWrite::Groups);
+    }
+    if hit.grew
+        && state
+            .purge_guard
+            .write_covered(snapshot, &key, &image.groups, image.written)
+    {
+        store.forget_if(&key, id);
+    }
+    let took = promote_memory_tier(&state, snapshot, &key, &image);
+    teach_slower_tiers(&state, snapshot, &key, &image, took);
+    store.kick();
     Some(image)
 }
 
@@ -3924,6 +4497,10 @@ struct MissWork {
     /// How far this miss has got (see [`MissProgress`]);
     /// its render jobs carry clones.
     progress: MissProgress,
+    /// Where a flight leader's render leaves its disk write,
+    /// to finish once its followers are woken (issue #572).
+    /// `None` everywhere else.
+    disk_handoff: Option<DiskHandoff>,
 }
 
 /// Whether a request runs inference and so takes an AI
@@ -4112,6 +4689,7 @@ async fn serve_miss(
         cache_key,
         max_age,
         sealed,
+        disk_handoff,
         ..
     } = work;
     let Rendered {
@@ -4152,7 +4730,14 @@ async fn serve_miss(
             etag: render_etag.clone(),
             written: Some(write_stamp),
         };
-        populate_tiers(state, write_snapshot, &cache_key, entry).await;
+        populate_tiers(
+            state,
+            write_snapshot,
+            &cache_key,
+            entry,
+            disk_handoff.as_ref(),
+        )
+        .await;
     }
     record.bytes_out = processed.bytes.len();
     let mut response = if meta {
@@ -4601,20 +5186,63 @@ async fn retry_on_fallback(
 /// was running keeps the entry out of every tier, while
 /// the response still serves the render itself. The shared
 /// tier's write stays off the response path.
-async fn populate_tiers(state: &AppState, snapshot: u64, cache_key: &str, entry: CachedImage) {
-    put_memory_tier(state, snapshot, cache_key, &entry);
-    // The shared write is spawned before the disk
-    // write waits (issue #347): it is already off the
-    // response path, and the order means a request
-    // dropped during the disk write cannot strand it.
-    spawn_shared_put(
+///
+/// The stored copy takes every group this process knows for
+/// the key (issue #572): it serves instead of the copies
+/// served under them. The response's own headers still name
+/// the request's groups. A key the disk holds is not written
+/// again; its record learns the groups. With `handoff`, a
+/// flight leader's disk write is left there for the leader
+/// to finish after its followers are woken, but only when
+/// memory holds this copy for them to read.
+async fn populate_tiers(
+    state: &AppState,
+    snapshot: u64,
+    cache_key: &str,
+    mut entry: CachedImage,
+    handoff: Option<&DiskHandoff>,
+) {
+    let known = known_groups(state, cache_key);
+    if adds_groups(&entry.groups, &known) {
+        entry.groups = crate::cache::union_groups(&entry.groups, &known);
+    }
+    // The shared write is spawned before any wait (issue
+    // #347): it is off the response path, and the order means
+    // a request dropped during the disk write cannot strand
+    // it.
+    let sent = spawn_shared_put(
         state,
         snapshot,
         cache_key,
         entry.clone(),
         SharedWrite::Render,
     );
-    put_disk_tier(state, snapshot, cache_key, &entry).await;
+    // Claimed before the copy enters memory, so a memory hit
+    // that learns a group meanwhile reaches the write.
+    let disk = begin_disk_write(
+        state,
+        snapshot,
+        cache_key,
+        &entry,
+        bucket_for(sent, &entry.groups),
+    );
+    let took = put_memory_tier(state, snapshot, cache_key, &entry);
+    teach_slower_tiers(state, snapshot, cache_key, &entry, took);
+    let Some(claim) = disk else {
+        return;
+    };
+    if let Some(handoff) = handoff
+        && state.cache.holds_copy(cache_key, &entry)
+    {
+        *handoff.lock().unwrap() = Some(PendingDiskWrite {
+            snapshot,
+            key: cache_key.to_string(),
+            entry,
+            claim,
+        });
+        return;
+    }
+    finish_disk_write(state, snapshot, cache_key, &entry, claim).await;
 }
 
 /// The meta document for a render: the annotation sections
