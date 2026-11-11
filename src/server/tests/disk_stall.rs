@@ -1236,3 +1236,69 @@ async fn a_disk_hit_that_grows_a_held_copy_into_a_running_purge_drops_it_from_me
     drop(gate);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_purge_holds_its_targets_tombstones_from_when_it_queues_its_disk_deletions() {
+    // Issue #572 third review: a purge's disk deletions held
+    // its target's tombstones only once its walk ended. A
+    // per-URL purge deletes the current epoch's variants
+    // between its disk step and its walk, a round trip that a
+    // later purge of the URL can overtake. That one had no
+    // deletions of its own and marked its tombstone ended at
+    // once, which superseded the earlier one's while the
+    // purged file was still there, and a restart after its
+    // grace served that file. The gap is opened here by hand,
+    // between the first purge's disk step and its walk.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let dir = crate::test_support::scratch_dir("srv-purge-overtaken");
+    let state = tier_test_state(Some(&dir), &fake.endpoint);
+    let base = serve_state(&state).await;
+    let store = state.store.clone().unwrap();
+    let shared = state.shared_store.clone().unwrap();
+    store.put(KEY, &in_groups(&["g"]));
+    fail_unlinks(&store);
+    let target = crate::cache::PurgeTarget::Group("g".into());
+    let (active, tombstone) = begin_purge(&state, target.clone()).await;
+    let (removed, disk) = purge_disk_tier(&state, &target);
+    assert_eq!(removed, 1);
+    // A later purge of the target runs from start to end.
+    assert_eq!(purge_group_call(&base, "g").await, "purged 0\n");
+    purge_shared_tier(
+        &shared,
+        &state.background,
+        BegunPurge {
+            active,
+            tombstone,
+            disk: disk.clone(),
+        },
+        None,
+        "purge-group",
+        "g",
+    )
+    .await;
+    wait_for_disk_purge(disk).await;
+    within(
+        std::time::Duration::from_secs(5),
+        "the purges to end",
+        wait_for_purges_to_end(&state),
+    )
+    .await;
+    assert_eq!(
+        tombstones_ended(&fake),
+        [false, false],
+        "a tombstone ended with the purged file still there"
+    );
+    shared.refresh_tombstones(&state.purge_guard).await;
+    age_ended_tombstones(&fake, crate::cache::TOMBSTONE_GRACE_MS + 60_000);
+    {
+        let restarted = tier_test_state(Some(&dir), &fake.endpoint);
+        let restarted_shared = restarted.shared_store.clone().unwrap();
+        restarted_shared
+            .refresh_tombstones(&restarted.purge_guard)
+            .await;
+        assert!(restarted.store.as_ref().unwrap().contains(KEY));
+        assert!(lookup_tiers(&restarted, KEY, &[]).await.is_none());
+    }
+    store.set_hold(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

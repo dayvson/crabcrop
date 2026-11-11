@@ -1322,8 +1322,8 @@ impl S3Store {
     /// them misses. A later purge of the target has no
     /// deletions of its own for them, and its tombstone, once
     /// ended, supersedes the earlier ones, so it waits for them
-    /// too. Called before the purge's walk lets a later one of
-    /// the target lead its own.
+    /// too. Called as the purge queues them, before it awaits
+    /// anything: a later purge of the target can end first.
     pub fn hold_for_deletions(&self, target: &PurgeTarget, disk: &crate::storage::DeletionWait) {
         if disk.pending() {
             self.held_ends

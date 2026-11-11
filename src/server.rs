@@ -1463,19 +1463,16 @@ async fn end_purge(
 
 /// [`end_purge`], on a task of its own when the purge still
 /// waits for disk deletions (issue #572): the walk lease, and
-/// the purges that joined it, do not wait on the disk. The
-/// deletions hold the target's tombstones first, before a
-/// later purge of the target can lead a walk and end. A purge
-/// with no tombstone to mark ended waits for nothing.
+/// the purges that joined it, do not wait on the disk. A
+/// purge with no tombstone to mark ended waits for nothing;
+/// its deletions hold the target's tombstones from the moment
+/// they were queued (see [`purge_disk_tier`]).
 async fn end_purge_apart(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
     purge: crate::s3store::SharedPurge,
     complete: bool,
 ) {
-    if let Some(disk) = &purge.disk {
-        shared.hold_for_deletions(&purge.active.tombstone().target, disk);
-    }
     if !complete || purge.tombstone.is_none() {
         return;
     }
@@ -1499,8 +1496,12 @@ struct BegunPurge {
 /// The disk tier's half of a purge (issue #572): remove the
 /// records `target` covers from the index at once, so they
 /// stop serving and the count is exact, and queue their
-/// files' deletion. No disk slot is waited for. Returns the
-/// count and the deletions queued.
+/// files' deletion. No disk slot is waited for. The deletions
+/// hold the target's bucket tombstones at once: a per-URL
+/// purge awaits the bucket before its walk, and a later purge
+/// of the URL that ends meanwhile, with no deletions of its
+/// own, must not mark its tombstone ended while these files
+/// are there. Returns the count and the deletions queued.
 fn purge_disk_tier(
     state: &AppState,
     target: &crate::cache::PurgeTarget,
@@ -1510,13 +1511,14 @@ fn purge_disk_tier(
     };
     let (removed, seqs) = store.purge(target);
     store.kick();
-    (
-        removed,
-        Some(crate::storage::DeletionWait {
-            store: store.clone(),
-            seqs,
-        }),
-    )
+    let disk = crate::storage::DeletionWait {
+        store: store.clone(),
+        seqs,
+    };
+    if let Some(shared) = &state.shared_store {
+        shared.hold_for_deletions(target, &disk);
+    }
+    (removed, Some(disk))
 }
 
 /// Wait for a purge's disk deletions (issue #572) while they
