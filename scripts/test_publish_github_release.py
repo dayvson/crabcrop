@@ -129,6 +129,7 @@ class PublishGithubRelease(unittest.TestCase):
         self.assertIn("gh release edit v1.2.3 --draft=true", self.output)
         self.assertIn("re-run only the failed jobs", self.output)
         self.assertIn("ADOPT_PUBLISHED_RELEASE", self.output)
+        self.assertIn("An immutable release takes no new assets", self.output)
 
     def test_the_override_adopts_a_published_release_with_a_warning(self):
         code, calls = self.publish("published", adopt="1")

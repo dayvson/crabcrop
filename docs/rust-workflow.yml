@@ -48,8 +48,9 @@ jobs:
       - name: Check lockfiles
         run: python3 scripts/check_locks.py
       # Actions pinned by SHA, no download piped into a shell,
-      # hashed pip installs, dav1d from a checked tarball
-      # (issues #593, #596, #597, #598).
+      # hashed pip installs, dav1d from a checked tarball, and
+      # publishing behind the release approval (issues #593,
+      # #596, #597, #598, #599).
       - name: Check workflows
         run: python3 scripts/check_workflows.py
       - name: Clippy

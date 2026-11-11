@@ -17,10 +17,17 @@ these rules:
              --require-hashes and names no package on the command line, and
              `python -m build` runs with --no-isolation, so the build
              backend is a hashed one too (issue #598).
+  secrets    A step that can read a registry secret installs and builds no
+             Python package (issue #598).
   dav1d      No workflow sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL, which makes
              dav1d-sys clone dav1d by ref name at build time with no hash
              check; scripts/build_dav1d.sh builds it from a pinned,
              checksummed tarball instead (issue #596).
+  gate       A job that can write contents or packages, mint an OIDC token,
+             or read a secret other than GITHUB_TOKEN waits for the approval
+             of the `release` environment. It names the environment, or it
+             needs a job that does and its `if:` cannot run it after that
+             job failed or was rejected (issue #599).
 
 The files are read with a small YAML reader for the part of YAML that
 workflows use: block mappings and sequences, literal block scalars,
@@ -39,6 +46,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+RELEASE_ENVIRONMENT = "release"
 
 
 # ---------------------------------------------------------------- YAML
@@ -300,6 +308,7 @@ def load(text, name="<workflow>"):
 
 SHA_PIN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 DOCKER_PIN = re.compile(r"docker://[^@\s]+@sha256:[0-9a-f]{64}")
+SECRET = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)")
 SHELLS = r"(?:ba|da|z|k)?sh|pwsh|powershell|iex|Invoke-Expression"
 PIPE_INTO_SHELL = [
     # `curl ... | sh`, `| sudo bash -s --` (a single pipe, not `||`).
@@ -311,9 +320,11 @@ PIPE_INTO_SHELL = [
 ]
 PIP_INSTALL = re.compile(r"\bpip3?(?:\.exe)?[\"']?\s+install\b")
 BUILD_RUN = re.compile(r"\bpython(?:3(?:\.\d+)?)?\s+-m\s+build\b")
+PYTHON_PACKAGE_WORK = re.compile(r"\bpip3?(?:\.exe)?[\"']?\s+(?:install|wheel|download)\b|\bpython(?:3(?:\.\d+)?)?\s+-m\s+build\b|\bsetup\.py\b")
 CHECKSUM = re.compile(r"\bsha256sum\b[^\n]*\s(?:-c|--check)\b|\bshasum\b[^\n]*-a\s*256\b[^\n]*\s(?:-c|--check)\b")
 RUNS_A_SCRIPT = re.compile(r"(?:^|[;&|(]\s*|\b(?:then|do|else)\s+)(?:sudo\s+)?(?:(?:ba|da|z)?sh\s+(?!-c\b)\S|\./\S)")
 HEX64 = re.compile(r"\b[0-9a-f]{64}\b")
+STATUS_FUNCTIONS = re.compile(r"\b(?:always|failure|cancelled)\s*\(")
 
 # pip options a hashed install may use. Anything else (an index, a find
 # link, an editable path, a target) changes what gets installed or where.
@@ -422,8 +433,125 @@ def installer_problems(script, env):
     return ["checks cargo-dist-installer.sh against no pinned sha256 (a literal, or an env value of 64 hex digits)"]
 
 
+def strings(value):
+    """Every string inside a parsed value, keys included."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+    elif isinstance(value, str):
+        yield value
+
+
+def secret_names(value):
+    """The secrets other than GITHUB_TOKEN that a parsed value reads."""
+    return sorted({name for text in strings(value) for name in SECRET.findall(text)} - {"GITHUB_TOKEN"})
+
+
+def as_list(value):
+    if isinstance(value, list):
+        return value
+    return [value] if isinstance(value, str) and value else []
+
+
 def mapping(value):
     return value if isinstance(value, dict) else {}
+
+
+def environment_name(job):
+    value = job.get("environment")
+    if isinstance(value, dict):
+        value = value.get("name")
+    return value if isinstance(value, str) else None
+
+
+def write_scopes(job, workflow):
+    """What the job's token may write that the gate rule covers."""
+    permissions = job["permissions"] if "permissions" in job else workflow.get("permissions")
+    if permissions is None:
+        return ["everything the repository's default token allows (no permissions block)"]
+    if isinstance(permissions, str):
+        return ["everything (write-all)"] if permissions.strip() == "write-all" else []
+    return [
+        f"{scope}: write"
+        for scope in ("contents", "packages", "id-token")
+        if isinstance(permissions, dict) and str(permissions.get(scope, "")).strip() == "write"
+    ]
+
+
+def conjuncts(condition):
+    """The top-level `&&` terms of an `if:` expression."""
+    text = condition.strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    terms, depth, quote, current = [], 0, None, ""
+    at = 0
+    while at < len(text):
+        ch = text[at]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith("&&", at):
+            terms.append(current)
+            current = ""
+            at += 2
+            continue
+        current += ch
+        at += 1
+    terms.append(current)
+    return [re.sub(r"\s+", " ", term.strip().replace('"', "'")) for term in terms]
+
+
+def waits_for(job, need):
+    """Whether `job` runs only after `need` succeeded."""
+    condition = job.get("if")
+    if not isinstance(condition, str) or not STATUS_FUNCTIONS.search(condition):
+        return True
+    wanted = {f"needs.{need}.result == 'success'", f"'success' == needs.{need}.result"}
+    return any(term in wanted for term in conjuncts(condition))
+
+
+def gate_problems(workflow, name):
+    jobs = mapping(workflow.get("jobs"))
+    gated = {}
+
+    def is_gated(job_name, seen=()):
+        if job_name in gated:
+            return gated[job_name]
+        job = mapping(jobs.get(job_name))
+        result = environment_name(job) == RELEASE_ENVIRONMENT
+        if not result:
+            for need in as_list(job.get("needs")):
+                if need in jobs and need not in seen and waits_for(job, need) and is_gated(need, seen + (job_name,)):
+                    result = True
+                    break
+        gated[job_name] = result
+        return result
+
+    problems = []
+    for job_name, job in jobs.items():
+        job = mapping(job)
+        reasons = write_scopes(job, workflow)
+        secrets = secret_names(job)
+        if job.get("secrets") == "inherit":
+            secrets.append("every secret (secrets: inherit)")
+        reasons += [f"reads {secret}" for secret in secrets]
+        if reasons and not is_gated(job_name):
+            problems.append(
+                f"{name}: job {job_name} can write or read secrets ({'; '.join(reasons)}) but does not wait for "
+                f"the `{RELEASE_ENVIRONMENT}` environment's approval: name the environment, or need a job that "
+                "does with an `if:` that runs only after it succeeded"
+            )
+    return problems
 
 
 def check_workflow(text, name):
@@ -469,6 +597,13 @@ def check_workflow(text, name):
                 problems.append(f"{at}: sets SYSTEM_DEPS_DAV1D_BUILD_INTERNAL; build dav1d with scripts/build_dav1d.sh")
             problems += [f"{at}: {problem}" for problem in run_problems(script)]
             problems += [f"{at}: {problem}" for problem in installer_problems(script, env)]
+            secrets = secret_names([env, script])
+            if secrets and PYTHON_PACKAGE_WORK.search("\n".join(shell_lines(script))):
+                problems.append(
+                    f"{at}: installs or builds Python packages while it can read {', '.join(secrets)}; "
+                    "do that in a step or job without the secret"
+                )
+    problems += gate_problems(workflow, name)
     return problems
 
 
@@ -503,7 +638,7 @@ def main(argv=None):
             print(f"  {problem}", file=sys.stderr)
         return 1
     print(f"{len(files)} workflow files: actions pinned, no download piped into a shell, hashed pip installs, "
-          "dav1d from a checked tarball")
+          "dav1d from a checked tarball, and every publishing job behind the release approval")
     return 0
 
 

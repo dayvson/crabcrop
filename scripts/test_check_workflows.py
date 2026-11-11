@@ -9,6 +9,7 @@ last cases run the check on this repository's docs/ mirrors, which hold
 the workflows as they are to be landed. Run directly:
 python3 scripts/test_check_workflows.py
 """
+import re
 import subprocess
 import sys
 import tempfile
@@ -309,6 +310,260 @@ class Dav1d(unittest.TestCase):
 
     def test_the_build_script_passes(self):
         self.assertEqual(step_problems('- run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"\n'), [])
+
+
+class Secrets(unittest.TestCase):
+    """Issue #598: nothing installs or builds Python packages next to a registry secret."""
+
+    def test_the_old_publish_step_fails(self):
+        step = """\
+            - name: Build and upload
+              working-directory: sdks/python
+              run: |
+                python -m pip install --require-hashes -r build-requirements.txt
+                python -m build --no-isolation
+                python -m twine upload dist/*
+              env:
+                TWINE_USERNAME: __token__
+                TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+            """
+        found = [p for p in step_problems(step) if "can read PYPI_TOKEN" in p]
+        self.assertEqual(len(found), 1, step_problems(step))
+
+    def test_the_upload_step_alone_passes(self):
+        step = """\
+            - name: Upload
+              run: python -m twine upload --non-interactive dist/*
+              env:
+                TWINE_USERNAME: __token__
+                TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+            """
+        self.assertEqual([p for p in step_problems(step) if "can read" in p], [])
+
+    def test_a_job_level_secret_reaches_every_step(self):
+        wf = textwrap.dedent(
+            """\
+            on: push
+            permissions: {}
+            jobs:
+              pypi:
+                runs-on: ubuntu-22.04
+                environment: release
+                env:
+                  TOKEN: ${{ secrets.PYPI_TOKEN }}
+                steps:
+                  - run: python -m pip install --require-hashes -r r.txt
+            """
+        )
+        (problem,) = problems(wf)
+        self.assertIn("can read PYPI_TOKEN", problem)
+
+    def test_github_token_is_not_a_registry_secret(self):
+        step = "- run: python -m pip install --require-hashes -r r.txt\n  env:\n    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        self.assertEqual(step_problems(step), [])
+
+
+# The job graph of release.yml before issue #599: the release and the
+# images publish before anyone approves.
+OLD_GATE = """\
+on: push
+permissions:
+  "contents": "read"
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: dist plan
+  ai-models:
+    needs: plan
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ai-models.yml
+  host:
+    needs:
+      - plan
+      - ai-models
+    if: ${{ always() && needs.plan.result == 'success' && needs.ai-models.result == 'success' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      "contents": "write"
+    steps:
+      - run: bash scripts/publish_github_release.sh
+  build-images:
+    needs: host
+    if: ${{ !github.event.pull_request }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - run: docker push
+  publish-crate:
+    needs:
+      - plan
+      - host
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+"""
+
+# The same jobs after the fix: one approval job ahead of everything that
+# publishes.
+NEW_GATE = OLD_GATE.replace(
+    """  host:
+    needs:
+      - plan
+      - ai-models
+    if: ${{ always() && needs.plan.result == 'success' && needs.ai-models.result == 'success' }}
+""",
+    """  release-gate:
+    needs:
+      - plan
+      - ai-models
+    if: ${{ always() && needs.plan.result == 'success' && needs.ai-models.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions: {}
+    steps:
+      - run: echo approved
+  host:
+    needs:
+      - plan
+      - ai-models
+      - release-gate
+    if: ${{ always() && needs.release-gate.result == 'success' && needs.plan.result == 'success' }}
+""",
+)
+
+
+class Gate(unittest.TestCase):
+    """Issue #599: everything that publishes waits for the release approval."""
+
+    def test_the_old_layout_fails_on_host_and_build_images(self):
+        found = problems(OLD_GATE)
+        self.assertEqual([p.split(" can ")[0] for p in found], ["test.yml: job host", "test.yml: job build-images"])
+        self.assertIn("contents: write", found[0])
+        self.assertIn("packages: write", found[1])
+
+    def test_the_gated_layout_passes(self):
+        self.assertEqual(problems(NEW_GATE), [])
+
+    def test_an_if_that_ignores_the_gate_result_fails(self):
+        for condition in (
+            "${{ always() && needs.plan.result == 'success' }}",
+            "${{ !cancelled() && needs.plan.result == 'success' }}",
+            "${{ always() && (needs.release-gate.result == 'success' || github.event_name == 'workflow_dispatch') }}",
+            "${{ failure() || needs.release-gate.result == 'success' }}",
+        ):
+            with self.subTest(condition=condition):
+                text = NEW_GATE.replace(
+                    "if: ${{ always() && needs.release-gate.result == 'success' && needs.plan.result == 'success' }}",
+                    f"if: {condition}",
+                )
+                found = problems(text)
+                self.assertEqual([p.split(" can ")[0] for p in found], ["test.yml: job host", "test.yml: job build-images"])
+
+    def test_a_plain_if_waits_for_success(self):
+        text = NEW_GATE.replace(
+            "if: ${{ always() && needs.release-gate.result == 'success' && needs.plan.result == 'success' }}",
+            "if: ${{ !github.event.pull_request }}",
+        )
+        self.assertEqual(problems(text), [])
+
+    def test_secrets_ids_and_missing_permissions_need_the_gate(self):
+        base = "on: push\npermissions:\n  contents: read\njobs:\n  j:\n    runs-on: ubuntu-22.04\n"
+        cases = {
+            "    steps:\n      - run: npm publish\n        env:\n          T: ${{ secrets.NPM_TOKEN }}\n": "reads NPM_TOKEN",
+            "    permissions:\n      id-token: write\n    steps:\n      - run: true\n": "id-token: write",
+            "    uses: ./.github/workflows/x.yml\n    secrets: inherit\n": "secrets: inherit",
+        }
+        for job, reason in cases.items():
+            with self.subTest(reason=reason):
+                text = base + job
+                if "uses:" in job:
+                    text = text.replace("    runs-on: ubuntu-22.04\n", "")
+                (problem,) = problems(text)
+                self.assertIn(reason, problem)
+                self.assertEqual(problems(text.replace("  j:\n", "  j:\n    environment: release\n")), [])
+        (problem,) = problems("on: push\njobs:\n  j:\n    runs-on: ubuntu-22.04\n    steps:\n      - run: true\n")
+        self.assertIn("no permissions block", problem)
+
+    def test_the_environment_can_be_a_mapping(self):
+        text = OLD_GATE.replace(
+            "    permissions:\n      \"contents\": \"write\"\n",
+            "    environment:\n      name: release\n      url: https://example.com\n    permissions:\n      \"contents\": \"write\"\n",
+        )
+        self.assertEqual(problems(text), [])
+
+
+class ReleaseLayout(unittest.TestCase):
+    """The release workflow as docs/release-workflow.yml lands it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.jobs = cw.load((ROOT / "docs" / "release-workflow.yml").read_text(encoding="utf-8"))["jobs"]
+
+    def step_index(self, job, name):
+        names = [step.get("name") for step in self.jobs[job]["steps"]]
+        self.assertIn(name, names, f"{job} has no step {name!r}")
+        return names.index(name)
+
+    def test_the_approval_comes_before_everything_that_publishes(self):
+        gate = self.jobs["release-gate"]
+        self.assertEqual(gate["environment"], "release")
+        self.assertEqual(gate["permissions"], {})
+        for build in ("build-local-artifacts", "build-global-artifacts", "build-pypi", "ai-models"):
+            self.assertIn(build, gate["needs"])
+        self.assertIn("release-gate", self.jobs["host"]["needs"])
+        self.assertIn("needs.release-gate.result == 'success'", cw.conjuncts(self.jobs["host"]["if"]))
+        self.assertEqual(self.jobs["build-images"]["needs"], "host")
+        for job in ("publish-crate", "publish-npm", "publish-mcp", "publish-pypi"):
+            self.assertIn("host", self.jobs[job]["needs"])
+            self.assertEqual(self.jobs[job]["environment"], "release")
+
+    def test_pull_requests_skip_the_approval(self):
+        self.assertIn("needs.plan.outputs.publishing == 'true'", cw.conjuncts(self.jobs["release-gate"]["if"]))
+
+    def test_the_formula_is_uploaded_before_the_release_is_published(self):
+        self.assertLess(
+            self.step_index("host", "Generate the Homebrew formula"),
+            self.step_index("host", "Create or update GitHub Release"),
+        )
+        self.assertIn("> artifacts/crabcrop.rb", self.jobs["host"]["steps"][self.step_index("host", "Generate the Homebrew formula")]["run"])
+
+    def test_pypi_builds_without_secrets_and_uploads_with_the_token_on_one_step(self):
+        build = self.jobs["build-pypi"]
+        self.assertEqual(cw.secret_names(build), [])
+        upload = [step for step in build["steps"] if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+        self.assertEqual([step["with"]["name"] for step in upload], ["pypi-dist"])
+        publish = self.jobs["publish-pypi"]
+        self.assertIn("build-pypi", publish["needs"])
+        with_token = [step["name"] for step in publish["steps"] if cw.secret_names(step)]
+        self.assertEqual(with_token, ["Upload to PyPI"])
+        self.assertNotIn("build", " ".join(str(step.get("run", "")) for step in publish["steps"]).replace("pypi-dist", ""))
+
+    def test_every_dav1d_build_uses_the_script(self):
+        for path, job in (
+            ("release-workflow.yml", "build-local-artifacts"),
+            ("rust-workflow.yml", "macos"),
+            ("fuzz-workflow.yml", "fuzz"),
+            ("fuzz-workflow.yml", "tests"),
+        ):
+            with self.subTest(job=job):
+                steps = cw.load((ROOT / "docs" / path).read_text(encoding="utf-8"))["jobs"][job]["steps"]
+                runs = [str(step.get("run", "")) for step in steps]
+                built = next(at for at, run in enumerate(runs) if "scripts/build_dav1d.sh" in run and "--check-binary" not in run)
+                cargo = next(
+                    at for at, run in enumerate(runs) if re.search(r"\bcargo (?:\+\S+ )?(?:build|check|test|fuzz)\b|\bdist build\b", run)
+                )
+                self.assertLess(built, cargo, f"{path} {job} builds before it builds dav1d")
+        checked = self.step_index("build-local-artifacts", "Check that dav1d is linked statically")
+        self.assertGreater(checked, self.step_index("build-local-artifacts", "Build artifacts"))
 
 
 class Repository(unittest.TestCase):

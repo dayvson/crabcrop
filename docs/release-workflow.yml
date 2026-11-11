@@ -23,14 +23,18 @@
 # hash-pinned pip tooling (issue #598). If `cargo dist
 # generate` rewrites the dist jobs, re-apply these changes
 # (and the crabcrop jobs at the bottom, as before),
-# including the host job's wait on the ai-models release
-# gate (issue #414) and both "Install dist" steps: plan's
-# and build-local-artifacts', which dist regenerates as
-# `run: ${{ matrix.install_dist.run }}`, a curl piped into
-# sh (issue #597). Both download the installer, check it
-# against CARGO_DIST_INSTALLER_SHA256 below, and only then
-# run it. scripts/check_workflows.py fails CI on a step
-# that does not.
+# including the host job's waits on the ai-models release
+# gate (issue #414) and on the release approval
+# (release-gate, issue #599), host's Homebrew formula step,
+# the dav1d build and linkage steps in
+# build-local-artifacts (issue #596), and both "Install
+# dist" steps: plan's and build-local-artifacts', which dist
+# regenerates as `run: ${{ matrix.install_dist.run }}`, a
+# curl piped into sh (issue #597). Both download the
+# installer, check it against CARGO_DIST_INSTALLER_SHA256
+# below, and only then run it. scripts/check_workflows.py
+# fails CI on a step that does not, and on a job that can
+# publish without waiting for the approval.
 
 name: Release
 # Default to read-only; host, the job that creates the
@@ -374,8 +378,12 @@ jobs:
       # the GitHub Release and every publishing job needs host,
       # so nothing publishes unless the real-model tests pass.
       - ai-models
+      # crabcrop (issue #599): the release approval. host
+      # publishes nothing until a reviewer approves it, and
+      # its `if:` below requires that approval to succeed.
+      - release-gate
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.ai-models.result == 'success' }}
+    if: ${{ always() && needs.release-gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.ai-models.result == 'success' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -433,6 +441,19 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # crabcrop (issue #599): the Homebrew formula goes up with
+      # the other assets, before the release is published: an
+      # immutable release takes no new assets afterwards. A
+      # prerelease gets none; the formula is for plain releases.
+      - name: Generate the Homebrew formula
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          case "$version" in
+            *[!0-9.]*) echo "No Homebrew formula for the prerelease $version" ;;
+            *) python3 scripts/release_formula.py "$version" artifacts/sha256.sum > artifacts/crabcrop.rb ;;
+          esac
       # crabcrop (issue #457): a plain `gh release create`
       # failed whenever a release for the tag already existed,
       # which every tag run from v0.9.8 to v0.9.11 hit on its
@@ -477,15 +498,86 @@ jobs:
 
   # ---------------------------------------------------------------------
   # crabcrop additions (not dist-generated; re-append after any
-  # `cargo dist generate`). Everything below runs on tag pushes only.
+  # `cargo dist generate`). Everything below runs on tag pushes only,
+  # except build-pypi, which pull requests run as a check.
   # ---------------------------------------------------------------------
+
+  # The release approval (issue #599). Nothing is public until a
+  # reviewer approves this job's `release` environment: host (the
+  # GitHub Release and the installer), build-images (GHCR) and the
+  # registry jobs all wait for it. It waits in turn for every build
+  # and the AI gate, so the reviewer can inspect this run's
+  # artifacts first: the artifacts-* files host will publish, and
+  # pypi-dist. The registry jobs name the environment too, for its
+  # secrets, so they ask for a second approval once host has
+  # published (RELEASING.md). Pull request runs skip it.
+  release-gate:
+    name: Release approval (the GitHub Release, the images and the packages)
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+      - build-pypi
+      - ai-models
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.build-pypi.result == 'success' && needs.ai-models.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions: {}
+    steps:
+      - name: Approved
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: echo "The release of $RELEASE_TAG was approved; host publishes it next."
+
+  # The Python SDK's sdist and wheel (issue #598), built in a job
+  # with no secrets from hash-locked tools, with --no-isolation so
+  # the build backend is the hashed setuptools. publish-pypi only
+  # uploads these files, so the reviewer can inspect the exact
+  # files PyPI gets. Pull request runs build and check them too,
+  # which tests both locks before a tag does.
+  build-pypi:
+    name: Build the Python SDK (sdist and wheel)
+    needs:
+      - preflight
+    if: ${{ !cancelled() && (needs.preflight.result == 'success' || (github.event.pull_request && needs.preflight.result == 'skipped')) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Build the sdist and the wheel
+        working-directory: sdks/python
+        run: |
+          python -m pip install --require-hashes -r build-requirements.txt
+          python -m build --no-isolation
+      # twine check reads the metadata and the long description
+      # as PyPI will, with the twine the upload uses.
+      - name: Check the distributions
+        working-directory: sdks/python
+        run: |
+          python -m pip install --require-hashes -r publish-requirements.txt
+          python -m twine check --strict dist/*
+      # Not named artifacts-*: host uploads every artifacts-*
+      # artifact to the GitHub Release.
+      - name: Upload the distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pypi-dist
+          path: sdks/python/dist/
+          if-no-files-found: error
 
   # The release gate (issue #414): the real-model AI tests,
   # run from ai-models.yml in parallel with the builds. The
-  # host job above waits for it, so a tag whose AI code fails
-  # against the real models never creates a release, pushes an
-  # image, or publishes a package. Like plan, it starts only
-  # once the preflight passed (issue #457).
+  # release approval and host wait for it, so a tag whose AI
+  # code fails against the real models never creates a
+  # release, pushes an image, or publishes a package. Like
+  # plan, it starts only once the preflight passed (issue
+  # #457).
   ai-models:
     name: Real-model AI tests (release gate)
     needs: preflight
@@ -665,11 +757,14 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # Uploads the files build-pypi made, and builds nothing (issue
+  # #598): the PyPI token reaches only the upload step.
   publish-pypi:
     name: Publish crabcrop_url to PyPI
     needs:
       - plan
       - host
+      - build-pypi
     if: ${{ !github.event.pull_request }}
     runs-on: ubuntu-22.04
     environment: release
@@ -679,21 +774,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          submodules: recursive
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - name: Build and upload
-        working-directory: sdks/python
-        run: |
-          # Every tool and its dependencies pinned by hash
-          # (issue #598), and the build backend too
-          # (--no-isolation builds with the hashed setuptools):
-          # this step's environment carries the PyPI token.
-          python -m pip install --require-hashes -r build-requirements.txt
-          python -m pip install --require-hashes -r publish-requirements.txt
-          python -m build --no-isolation
-          python -m twine upload dist/*
+      - name: Fetch the distributions build-pypi made
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: pypi-dist
+          path: pypi-dist
+      - name: Install twine (pinned by hash)
+        run: python -m pip install --require-hashes -r sdks/python/publish-requirements.txt
+      - name: Upload to PyPI
+        run: python -m twine upload --non-interactive pypi-dist/*
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
