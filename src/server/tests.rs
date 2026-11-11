@@ -9749,6 +9749,93 @@ async fn over_cap_requests_answer_400_before_any_fetch() {
 }
 
 #[tokio::test]
+async fn a_width_hint_never_takes_an_accepted_url_over_the_operation_cap() {
+    // Issue #615: a width hint puts a size op in front of the
+    // URL's operations, plus a `no_upscale` unless the URL
+    // has one. At 99 or 100 operations those took the list
+    // past the cap after the parse-time check, and the engine
+    // refused it with a 400 after the fetch, for hinted
+    // clients only. The hint is dropped there now, so the
+    // request renders and caches as the hint-less URL does.
+    let (src, hits) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+    let base = spawn_app(false).await;
+    let inverts = |n: usize| vec!["invert"; n].join(":");
+    // Status, Cache-Control and decoded width of a hinted GET.
+    let hinted = |base: String, remainder: String, name: &'static str| async move {
+        let resp = get_with_headers(&base, &remainder, &[(name, "300")]).await;
+        let status = resp.status();
+        let cache_control = header(&resp, "cache-control");
+        let bytes = resp.bytes().await.unwrap();
+        let width = match image::load_from_memory(&bytes) {
+            Ok(img) => img.width().to_string(),
+            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        };
+        (status, cache_control, width)
+    };
+    // No room for the hint's ops: 99 + 2, 100 + 2, and
+    // 100 + 1 when the URL has its own `no_upscale`.
+    let no_room = [
+        format!("filters:{}", inverts(99)),
+        format!("filters:{}", inverts(100)),
+        format!("filters:no_upscale:{}", inverts(99)),
+    ];
+    for (i, ops) in no_room.iter().enumerate() {
+        let remainder = format!("{ops}/{src}");
+        for name in WIDTH_HINT_HEADERS {
+            let label = format!("{name} on no_room[{i}]");
+            let (status, cache_control, width) =
+                hinted(base.clone(), remainder.clone(), name).await;
+            assert_eq!((status, width.as_str()), (StatusCode::OK, "640"), "{label}");
+            assert_eq!(cache_control, YEAR_PUBLIC, "{label}");
+        }
+        // The hinted renders were stored as the hint-less
+        // URL's answer: it hits, and the source was fetched
+        // once for all five requests.
+        let resp = get_signed(&base, &remainder).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), i + 1);
+    }
+    // With room the hint still applies: 98 + 2 and 99 + 1
+    // land exactly on the cap and resize to the hinted width.
+    let room = [
+        format!("filters:{}", inverts(98)),
+        format!("filters:no_upscale:{}", inverts(98)),
+    ];
+    for (i, ops) in room.iter().enumerate() {
+        let remainder = format!("{ops}/{src}");
+        for name in WIDTH_HINT_HEADERS {
+            let label = format!("{name} on room[{i}]");
+            let (status, cache_control, width) =
+                hinted(base.clone(), remainder.clone(), name).await;
+            assert_eq!((status, width.as_str()), (StatusCode::OK, "300"), "{label}");
+            assert_eq!(cache_control, YEAR_PRIVATE, "{label}");
+        }
+    }
+    // Past the cap the hint changes nothing: the parse-time
+    // refusal, with no fetch.
+    let fetched = hits.load(Ordering::SeqCst);
+    let over = format!("filters:{}/{src}", inverts(101));
+    let (status, _, body) = hinted(base.clone(), over, "Sec-CH-Width").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        "request has 101 operations, over the 100 operation limit"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), fetched);
+    // The room is counted on the merged list: 98 of the
+    // URL's own plus a default leave one slot, too few for
+    // the hint's two, and 97 plus the default leave two.
+    let base = spawn_app_with_defaults("filters:format(png)", false).await;
+    let full = format!("filters:{}/{src}", inverts(98));
+    let (status, _, width) = hinted(base.clone(), full, "Sec-CH-Width").await;
+    assert_eq!((status, width.as_str()), (StatusCode::OK, "640"));
+    let fits = format!("filters:{}/{src}", inverts(97));
+    let (status, _, width) = hinted(base.clone(), fits, "Sec-CH-Width").await;
+    assert_eq!((status, width.as_str()), (StatusCode::OK, "300"));
+}
+
+#[tokio::test]
 async fn over_cap_counts_the_default_operations_before_any_fetch() {
     // Issue #469: the cap counts the merged list, defaults
     // included, on both routes, and a default the URL
