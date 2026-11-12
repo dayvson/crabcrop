@@ -87,8 +87,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Pinned with the hashes of its files (issue #598).
       - name: Install Pillow (the harness verifies with PIL)
-        run: python3 -m pip install --quiet pillow
+        run: python3 -m pip install --quiet --require-hashes -r tests/functional/requirements.txt
 
       - name: Install ffmpeg (the frames cells' decoder, issue #214)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
