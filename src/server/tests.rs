@@ -10555,10 +10555,14 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
     // the scenario is real: the encode (6 s) outlasts
     // the first run's deadline plus grace (3.5 + 2 s),
     // so the first run detaches mid-encode, and the
-    // second run, arriving at 3 s with the same 3.5 s
+    // second run, arriving at 4 s with the same 3.5 s
     // budget, still has budget left when the lane
     // drains at 6 s, so it enters its own encode
-    // instead of aborting at its first checkpoint.
+    // instead of aborting at its first checkpoint. It
+    // has 1.5 s to spare there: a slow runner can free
+    // the lane a little after 6 s, and with less slack
+    // the second run reached its first checkpoint past
+    // its deadline and answered the engine's timeout.
     let dir = crate::test_support::scratch_dir("server-lane-bound");
     let log_path = dir.join("runs.log");
     let script_path = dir.join("encoder.sh");
@@ -10594,7 +10598,7 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
         async {
             // Arrive while the first encode is running
             // and queue behind it at the lane gate.
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             run_process(
                 &state,
                 &job,
