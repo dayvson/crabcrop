@@ -20,7 +20,7 @@ name: AI models (real inference)
 # credential cannot push workflow files, so changes land in
 # the mirror and reach the live file through the GitHub web
 # UI. Keep the two identical (scripts/test_all.sh fails when
-# they differ).  
+# they differ).
 
 on:
   workflow_dispatch:
@@ -59,21 +59,21 @@ env:
   # available in a top-level env block, so it cannot be defined here.
 
 jobs:
-ai-models
+  ai-models:
 
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
-    # Every action is pinned by commit SHA, like the release
-    # workflow's: release.yml calls this workflow as its gate
-    # (issues #414, #593), so these actions run inside the
-    # release run.
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Every action is pinned by commit SHA, like the release
+      # workflow's: release.yml calls this workflow as its gate
+      # (issues #414, #593), so these actions run inside the
+      # release run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-          - name: Set the asset directory
+      - name: Set the asset directory
         run: echo "AI_ASSETS=$RUNNER_TEMP/ai-assets" >> "$GITHUB_ENV"
 
       - name: Cache the pinned AI test assets
@@ -174,7 +174,7 @@ ai-models
       # The Python the fixture lock below was resolved for.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-        python-version: "3.12"
+          python-version: "3.12"
 
       - name: Generate the authored fixture models
         run: |
