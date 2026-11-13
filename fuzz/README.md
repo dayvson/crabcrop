@@ -113,11 +113,12 @@ AVIF seed in its corpus) reaches the dav1d decoder that
 the release binaries, the Docker image, and the Homebrew
 install ship. dav1d is a C library: pkg-config finds a
 system libdav1d (`libdav1d-dev` on Debian and Ubuntu), or
-`SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` builds it from
-vendored sources, as the release does (that needs meson,
-ninja, and nasm, and network access to
-code.videolan.org). `--no-default-features` builds
-without it. The opener lives in
+the static dav1d the release links, which
+`scripts/build_dav1d.sh` builds from a pinned, checksummed
+tarball (`eval "$(bash scripts/build_dav1d.sh DIR)"`; it
+needs nasm on x86_64, and network access to
+downloads.videolan.org and PyPI). `--no-default-features`
+builds without it. The opener lives in
 `crabcrop-url`, a direct dependency. This package is
 detached from the main workspace so fuzzing dependencies
 never enter a normal build.
@@ -181,7 +182,8 @@ seed decodes through dav1d.
 `.github/workflows/fuzz.yml` (mirrored at
 `docs/fuzz-workflow.yml`) runs every night and by hand:
 each of the five targets for 15 minutes with the default
-features (dav1d built from vendored sources), the corpus
+features (the release's static dav1d, built by
+`scripts/build_dav1d.sh`), the corpus
 each run grows cached for the next one, and any crashing
 input uploaded as the `fuzz-artifacts-<target>` artifact
 of the failed job. The same workflow runs the smoke with

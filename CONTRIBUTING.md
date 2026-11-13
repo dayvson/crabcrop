@@ -20,11 +20,14 @@ cargo build
 ```
 
 AVIF source decoding is behind the `avif-decode` Cargo feature (off by default).
-Building with it needs dav1d 1.3 or newer reachable through pkg-config, or a
-vendored build:
+Building with it needs dav1d 1.3 or newer reachable through pkg-config: a
+system libdav1d (`libdav1d-dev` on Debian and Ubuntu), or the static dav1d the
+release links, which `scripts/build_dav1d.sh` builds from a pinned and
+checksummed tarball:
 
 ```bash
-SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always cargo build --features avif-decode
+eval "$(bash scripts/build_dav1d.sh "$HOME/.cache/crabcrop-dav1d")"
+cargo build --features avif-decode
 ```
 
 Running the server locally needs only a secret:

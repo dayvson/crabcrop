@@ -31,13 +31,34 @@ fi
 step() { printf '\n=== %s ===\n' "$1"; }
 
 step "Workflow mirrors (docs copies match the live workflows)"
-for pair in "changelog.yml changelog-workflow.yml" "functional.yml functional-workflow.yml" "fuzz.yml fuzz-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
-  set -- $pair
-  if ! cmp -s ".github/workflows/$1" "docs/$2"; then
-    echo "workflow mirror drift: docs/$2 differs from .github/workflows/$1; sync the mirror to the live workflow" >&2
+# Every live workflow has a mirror, docs/<name>-workflow.yml, and the
+# two are identical: the automation credential cannot push workflow
+# files, so changes are made in the mirror and land through the web UI.
+# ai-models.yml had none, so its unpinned cache action went unseen
+# (issue #593).
+for live in .github/workflows/*.yml; do
+  mirror="docs/$(basename "$live" .yml)-workflow.yml"
+  if [ ! -f "$mirror" ]; then
+    echo "workflow mirror missing: $live has no $mirror; add one identical to the live workflow" >&2
+    exit 1
+  fi
+  if ! cmp -s "$live" "$mirror"; then
+    echo "workflow mirror drift: $mirror differs from $live; sync the mirror to the live workflow" >&2
     exit 1
   fi
 done
+for mirror in docs/*-workflow.yml; do
+  live=".github/workflows/$(basename "$mirror" -workflow.yml).yml"
+  if [ ! -f "$live" ]; then
+    echo "workflow mirror without a live workflow: $mirror; land it at $live or delete it" >&2
+    exit 1
+  fi
+done
+
+step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs, dav1d from a checked tarball, publishing behind the release approval)"
+python3 scripts/check_workflows.py
+python3 scripts/test_check_workflows.py
+python3 scripts/test_build_dav1d.py
 
 step "Functional tier (a pull request's diff picks smoke or full)"
 python3 scripts/test_functional_tier.py

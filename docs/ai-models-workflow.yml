@@ -1,0 +1,340 @@
+name: AI models (real inference)
+
+# The real-model AI tests are #[ignore]d in the normal gate: they
+# need the ONNX Runtime and model files, which are deployment
+# artifacts and never committed. This job downloads the pinned
+# artifacts, verifies them against the same sha256 pins as
+# Dockerfile.ai (plus the pins recorded for the test-only models),
+# recreates the tiny authored fixture models, and runs the
+# ignored AI tests for real.
+#
+# When it runs (issue #414): on pull requests and main pushes
+# that touch the AI code (src/ai/, src/tokenizer.rs), the
+# fixture photo the real-model tests read, or this workflow;
+# from release.yml on every release tag, where publishing waits
+# for it to pass; weekly, so drift in the pinned downloads shows
+# up between changes; and by hand.
+#
+# The live workflow is .github/workflows/ai-models.yml and
+# docs/ai-models-workflow.yml is its mirror: the automation
+# credential cannot push workflow files, so changes land in
+# the mirror and reach the live file through the GitHub web
+# UI. Keep the two identical (scripts/test_all.sh fails when
+# they differ).
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "17 5 * * 1"
+  pull_request:
+    paths:
+      - src/ai/**
+      - src/tokenizer.rs
+      - tests/fixtures/portrait.jpg
+      - scripts/requirements/ai-fixtures.txt
+      - .github/workflows/ai-models.yml
+  push:
+    branches: [ "main" ]
+    paths:
+      - src/ai/**
+      - src/tokenizer.rs
+      - tests/fixtures/portrait.jpg
+      - scripts/requirements/ai-fixtures.txt
+      - .github/workflows/ai-models.yml
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes a run that
+# is still downloading or testing; main, tag and scheduled runs
+# always finish.
+concurrency:
+  group: ai-models-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # AI_ASSETS is set by the first step: the runner context is not
+  # available in a top-level env block, so it cannot be defined here.
+
+jobs:
+  ai-models:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # Every action is pinned by commit SHA, like the release
+      # workflow's: release.yml calls this workflow as its gate
+      # (issues #414, #593), so these actions run inside the
+      # release run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set the asset directory
+        run: echo "AI_ASSETS=$RUNNER_TEMP/ai-assets" >> "$GITHUB_ENV"
+
+      - name: Cache the pinned AI test assets
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.AI_ASSETS }}
+          # Bump the trailing version when any pin below changes.
+          key: ai-assets-v2-ort1.31.0-u2netp309c84-yunet8f238-yoloabc0dd-clip583fd1-bus-c02019-mod971a21-lama7df918-samenc51e08-samdec2542b8-ocrdet090f04-ocrrec6f3272-dictb5f2bf-aesb32c7b14c-aesl142cd4e6
+
+      - name: Download the pinned assets
+        run: |
+          set -euo pipefail
+          mkdir -p "$AI_ASSETS"
+          fetch() { # name url
+            if [ ! -s "$AI_ASSETS/$1" ]; then
+              echo "downloading $1"
+              curl -fsSL "$2" -o "$AI_ASSETS/$1"
+            fi
+          }
+          # ONNX Runtime 1.31.0 and u2netp + YuNet: the same URLs
+          # and pins as Dockerfile.ai.
+          fetch onnxruntime.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz
+          fetch u2netp.onnx https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx
+          fetch yunet.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+          # YOLOv8n: the exact export the tests were built against.
+          # It is a Git LFS object, so its sha256 is also its LFS
+          # object id; the official Ultralytics release asset is a
+          # different export and is deliberately not used.
+          fetch yolov8n.onnx https://media.githubusercontent.com/media/donet-org-cn/SimdYolo/main/models/onnx/yolov8n.onnx
+          # CLIP ViT-B/32 (quantized ONNX) and its tokenizer.
+          fetch vision_model_quantized.onnx https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx
+          fetch text_model_quantized.onnx https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/text_model_quantized.onnx
+          fetch tokenizer.json https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/tokenizer.json
+          # Test photo for the live CLIP/detection tests: people
+          # and a bus, the classes the detection test asserts.
+          fetch bus.jpg https://github.com/ultralytics/assets/releases/download/v0.0.0/bus.jpg
+          # Moderation: the d0gr conversion of the Falconsai
+          # nsfw_image_detection classifier (Apache-2.0), an
+          # int8 export; it is the artifact the moderation
+          # tests were built against in the #171 spike.
+          fetch moderation.onnx https://huggingface.co/d0gr/falconsai-nsfw-detector-onnx/resolve/main/nsfw_classifier/model.onnx
+          # Inpainting: the OpenCV zoo export of big-lama,
+          # from the same collection as YuNet above.
+          fetch lama.onnx https://github.com/opencv/opencv_zoo/raw/main/models/inpainting_lama/inpainting_lama_2025jan.onnx
+          # Segmentation: a MobileSAM encoder/decoder pair
+          # in the SamOnnxModel export shape (Apache-2.0),
+          # pinned to a commit of the Kazuhito00 export.
+          # The pair the tests were authored against has no
+          # canonical mirror; this export passes the same
+          # segment tests and is pinned by checksum below.
+          fetch mobile_sam_encoder.onnx https://github.com/Kazuhito00/MobileSAM-ONNX-Sample/raw/9ab69f40447402f4c677b44fae76c6e54ea288bd/onnx_model/vit_t_encoder.onnx
+          fetch mobile_sam_decoder.onnx https://github.com/Kazuhito00/MobileSAM-ONNX-Sample/raw/9ab69f40447402f4c677b44fae76c6e54ea288bd/onnx_model/vit_t_decoder.onnx
+          # OCR: the RapidOCR exports of PP-OCRv6 small
+          # (Apache-2.0) and the dictionary the recognizer
+          # was trained with, from the RapidOCR model
+          # collection on ModelScope.
+          fetch PP-OCRv6_det_small.onnx https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx
+          fetch PP-OCRv6_rec_small.onnx https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx
+          fetch ppocrv6_dict.txt https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt
+          # Aesthetic heads: the LAION sa_0_4 linear heads
+          # for the CLIP ViT-B/32 and ViT-L/14 encoders.
+          fetch sa_0_4_vit_b_32_linear.pth https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_b_32_linear.pth
+          fetch sa_0_4_vit_l_14_linear.pth https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_l_14_linear.pth
+
+      - name: Extract the ONNX Runtime library
+        run: |
+          set -euo pipefail
+          if [ ! -s "$AI_ASSETS/libonnxruntime.so" ]; then
+            tar -xzf "$AI_ASSETS/onnxruntime.tgz" -C "$AI_ASSETS"
+            cp "$AI_ASSETS/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0" "$AI_ASSETS/libonnxruntime.so"
+          fi
+
+      - name: Verify asset checksums
+        run: |
+          set -euo pipefail
+          cd "$AI_ASSETS"
+          sha256sum -c - <<'EOF'
+          cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57  onnxruntime.tgz
+          469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e  libonnxruntime.so
+          309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  u2netp.onnx
+          8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  yunet.onnx
+          abc0ddbab9f194039ff41216a8cc6c8b0b2133f1bdadeb6591d4fee7ad270aa7  yolov8n.onnx
+          583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299  vision_model_quantized.onnx
+          73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a  text_model_quantized.onnx
+          f7f3b7af117d467b58374797691a6438d3e6b9e9cef800dfd5dced7f697a90cd  tokenizer.json
+          c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63  bus.jpg
+          971a219a105edea0f219bcf471d5d14452022d621e0f59e160ef6c9cf2358f1d  moderation.onnx
+          7df918ac3921d3daf0aae1d219776cf0dc4e4935f035af81841b40adcf74fdf2  lama.onnx
+          c51e08124f9ec76a6033251b627dfc930d66016ec5d80a30e2e8015ac3dc517c  mobile_sam_encoder.onnx
+          2542b80880d35c8ed7ea104873b5df0ba15499c325f135eb52d616182039baf8  mobile_sam_decoder.onnx
+          090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f  PP-OCRv6_det_small.onnx
+          6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884  PP-OCRv6_rec_small.onnx
+          b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d  ppocrv6_dict.txt
+          c7b14cead230694acc7b9447974d3cad78003c72da032e402a303b6c2429e85f  sa_0_4_vit_b_32_linear.pth
+          2cd4e60f4f24ae3bcd57b847b13c1f3ba27edc28cc1a7f9ce74ee9f421243cba  sa_0_4_vit_l_14_linear.pth
+          EOF
+
+      # The Python the fixture lock below was resolved for.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Generate the authored fixture models
+        run: |
+          set -euo pipefail
+          # Four fixtures have no upstream download: they
+          # were authored for the load tests (issue #179
+          # item 2) and the focal tests (issue #166), so CI
+          # recreates them. IR 8 / opset 13 throughout: the
+          # current onnx package defaults to an IR that ORT
+          # 1.31 rejects. onnx and its dependencies come
+          # from a hash-locked requirements file (issue #598).
+          python3 -m venv "$RUNNER_TEMP/ai-venv"
+          "$RUNNER_TEMP/ai-venv/bin/pip" install --quiet --require-hashes -r scripts/requirements/ai-fixtures.txt
+          "$RUNNER_TEMP/ai-venv/bin/python" - "$AI_ASSETS" <<'PYEOF'
+          import sys
+          from pathlib import Path
+
+          import numpy as np
+          import onnx
+          from onnx import TensorProto, helper, numpy_helper
+
+          out = Path(sys.argv[1])
+
+          def save(model, name):
+              model.ir_version = 8
+              onnx.checker.check_model(model)
+              onnx.save(model, out / name)
+
+          # Constant-only graph, no inputs: face/mask load must refuse it.
+          const = helper.make_tensor("v", TensorProto.FLOAT, [3], [0.0, 0.0, 0.0])
+          graph = helper.make_graph(
+              [helper.make_node("Constant", [], ["y"], value=const)],
+              "no-inputs",
+              [],
+              [helper.make_tensor_value_info("y", TensorProto.FLOAT, [3])],
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "no_inputs.onnx")
+
+          # Identity: the upscale factor probe measures 1x and refuses it.
+          graph = helper.make_graph(
+              [helper.make_node("Identity", ["x"], ["y"])],
+              "identity",
+              [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["N", "C", "H", "W"])],
+              [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["N", "C", "H", "W"])],
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "identity.onnx")
+
+          # Minimal ESPCN-style x2 net: the probe must measure factor 2.
+          rng = np.random.RandomState(42)
+          inits = [
+              numpy_helper.from_array((rng.randn(12, 3, 3, 3) * 0.05).astype(np.float32), "c1_w"),
+              numpy_helper.from_array(np.zeros(12, dtype=np.float32), "c1_b"),
+              numpy_helper.from_array((rng.randn(12, 12, 3, 3) * 0.05).astype(np.float32), "c2_w"),
+              numpy_helper.from_array(np.zeros(12, dtype=np.float32), "c2_b"),
+          ]
+          nodes = [
+              helper.make_node("Conv", ["input", "c1_w", "c1_b"], ["h1"], pads=[1, 1, 1, 1]),
+              helper.make_node("Relu", ["h1"], ["h2"]),
+              helper.make_node("Conv", ["h2", "c2_w", "c2_b"], ["h3"], pads=[1, 1, 1, 1]),
+              helper.make_node("DepthToSpace", ["h3"], ["output"], blocksize=2, mode="CRD"),
+          ]
+          graph = helper.make_graph(
+              nodes,
+              "sr-x2",
+              [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, "H", "W"])],
+              [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, "H2", "W2"])],
+              inits,
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "sr-x2.onnx")
+
+          # Luma heatmap: the focal provider's test model
+          # (issue #166): a ReduceMean over the channel axis
+          # of a fixed [1, 3, 32, 32] input, so the single
+          # output is the per-pixel luma grid and its argmax
+          # is the brightest input pixel.
+          graph = helper.make_graph(
+              [helper.make_node("ReduceMean", ["image"], ["heatmap"], axes=[1], keepdims=1)],
+              "luma-heatmap",
+              [helper.make_tensor_value_info("image", TensorProto.FLOAT, [1, 3, 32, 32])],
+              [helper.make_tensor_value_info("heatmap", TensorProto.FLOAT, [1, 1, 32, 32])],
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "luma-heatmap.onnx")
+          print("fixtures generated")
+          PYEOF
+
+      - name: Write the CLIP label set
+        run: |
+          cat > "$AI_ASSETS/labels.txt" <<'EOF'
+          # general-purpose label set for the #61 live smoke
+          ocean
+          sea
+          beach
+          sand
+          sky
+          clouds
+          waves
+          surfing
+          kite surfing
+          sailboat
+          boat
+          palm tree
+          sunset
+          sunrise
+          mountains
+          forest
+          meadow
+          desert
+          snow
+          lake
+          river
+          waterfall
+          city skyline
+          buildings
+          street
+          people
+          portrait
+          dog
+          cat
+          bird
+          aerial view
+          underwater
+          food
+          car
+          bicycle
+          flowers
+          night scene
+          EOF
+
+      - name: Install nasm (rav1e SIMD build)
+        run: sudo apt-get install -y -qq nasm
+
+      - name: Run the real-model AI tests
+        env:
+          CRABCROP_TEST_ORT_DYLIB: ${{ env.AI_ASSETS }}/libonnxruntime.so
+          CRABCROP_TEST_FACE_MODEL: ${{ env.AI_ASSETS }}/yunet.onnx
+          CRABCROP_TEST_REMOVEBG_MODEL: ${{ env.AI_ASSETS }}/u2netp.onnx
+          CRABCROP_TEST_UPSCALE_MODEL: ${{ env.AI_ASSETS }}/sr-x2.onnx
+          CRABCROP_TEST_DETECT_MODEL: ${{ env.AI_ASSETS }}/yolov8n.onnx
+          CRABCROP_TEST_NO_INPUT_MODEL: ${{ env.AI_ASSETS }}/no_inputs.onnx
+          CRABCROP_TEST_IDENTITY_MODEL: ${{ env.AI_ASSETS }}/identity.onnx
+          CRABCROP_TEST_CLIP_IMAGE_MODEL: ${{ env.AI_ASSETS }}/vision_model_quantized.onnx
+          CRABCROP_TEST_CLIP_TEXT_MODEL: ${{ env.AI_ASSETS }}/text_model_quantized.onnx
+          CRABCROP_TEST_CLIP_TOKENIZER: ${{ env.AI_ASSETS }}/tokenizer.json
+          CRABCROP_TEST_CLIP_LABELS: ${{ env.AI_ASSETS }}/labels.txt
+          CRABCROP_TEST_IMAGE: ${{ env.AI_ASSETS }}/bus.jpg
+          CRABCROP_TEST_MODERATION_MODEL: ${{ env.AI_ASSETS }}/moderation.onnx
+          CRABCROP_TEST_INPAINT_MODEL: ${{ env.AI_ASSETS }}/lama.onnx
+          CRABCROP_TEST_SEGMENT_ENCODER_MODEL: ${{ env.AI_ASSETS }}/mobile_sam_encoder.onnx
+          CRABCROP_TEST_SEGMENT_DECODER_MODEL: ${{ env.AI_ASSETS }}/mobile_sam_decoder.onnx
+          CRABCROP_TEST_OCR_DETECT_MODEL: ${{ env.AI_ASSETS }}/PP-OCRv6_det_small.onnx
+          CRABCROP_TEST_OCR_RECOGNIZE_MODEL: ${{ env.AI_ASSETS }}/PP-OCRv6_rec_small.onnx
+          CRABCROP_TEST_OCR_DICT: ${{ env.AI_ASSETS }}/ppocrv6_dict.txt
+          CRABCROP_TEST_AESTHETIC_HEAD: ${{ env.AI_ASSETS }}/sa_0_4_vit_b_32_linear.pth
+          CRABCROP_TEST_AESTHETIC_HEAD_L14: ${{ env.AI_ASSETS }}/sa_0_4_vit_l_14_linear.pth
+          CRABCROP_TEST_FOCAL_MODEL: ${{ env.AI_ASSETS }}/luma-heatmap.onnx
+          # CRABCROP_TEST_DETECT_LABELS is deliberately unset: the
+          # detection tests then read the class names embedded in
+          # the YOLO export, which is the production path.
+        run: cargo test --locked -- --ignored --skip avif_encode_bench --skip real_ffmpeg

@@ -27,6 +27,13 @@
 # variable of that name) it adopts the release anyway, with a
 # warning.
 #
+# With immutable releases on (issue #599), a published release takes
+# no new or replaced assets. Both paths here publish only after every
+# asset is up: `gh release create` with assets creates a draft, uploads
+# them, then publishes it, and the draft path uploads before its edit.
+# So every asset, the Homebrew formula included, must be among FILE.
+# Adopting a published immutable release fails at the upload.
+#
 # `gh release view` finds drafts as well as published releases. If
 # it fails for any other reason, the create runs as before and
 # reports the real error.
@@ -83,6 +90,8 @@ if is_draft=$(gh release view --json isDraft --jq .isDraft -- "$tag"); then
           echo "re-run only the failed jobs instead."
           echo "To adopt it as it is, set the repository variable ADOPT_PUBLISHED_RELEASE"
           echo "to 1 for the re-run, and delete it afterwards."
+          echo "An immutable release takes no new assets, so neither works for one that"
+          echo "was published by hand: tag the next patch version instead (RELEASING.md)."
         } >&2
         exit 1
       fi

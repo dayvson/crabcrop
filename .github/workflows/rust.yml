@@ -47,6 +47,12 @@ jobs:
       # matches the root lock (issue #552).
       - name: Check lockfiles
         run: python3 scripts/check_locks.py
+      # Actions pinned by SHA, no download piped into a shell,
+      # hashed pip installs, dav1d from a checked tarball, and
+      # publishing behind the release approval (issues #593,
+      # #596, #597, #598, #599).
+      - name: Check workflows
+        run: python3 scripts/check_workflows.py
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Check doc links
@@ -72,22 +78,15 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
 
-    env:
-      # Vendored static dav1d, as the release builds it.
-      SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install meson, ninja, and nasm (vendored dav1d)
-        run: |
-          # The release build's pinned tools: see the step of
-          # the same name in docs/release-workflow.yml.
-          req="$RUNNER_TEMP/meson-requirements.txt"
-          printf '%s\n' 'meson==1.12.1 --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' > "$req"
-          python3 -m pip install --user --break-system-packages --require-hashes -r "$req"
-          python3 -m pip install --user --break-system-packages "ninja==1.13.2"
-          brew install nasm
-          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+      - name: Install nasm
+        run: brew install nasm
+      # The static dav1d the release links, built the same way
+      # (issue #596): see the step of the same name in
+      # docs/release-workflow.yml.
+      - name: Build dav1d from the pinned, checksummed tarball
+        run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"
       - name: Check every target compiles on macOS with the shipped features
         run: cargo check --locked --all-targets --features avif-decode
       - name: Run the library tests on macOS with the shipped features

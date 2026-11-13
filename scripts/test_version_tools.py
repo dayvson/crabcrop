@@ -96,6 +96,19 @@ def rendering_history(rel, text, pos):
     return pos >= start and HISTORY_ENTRY.search(text[start:pos]) is not None
 
 
+def dav1d_pin(rel, text, pos):
+    """Whether offset `pos` of a file is the dav1d pin, or a doc's mention
+    of it (version_sites.DAV1D_MENTIONS): dav1d's own version, which a
+    crabcrop release that happens to share the number leaves alone."""
+    if rel == version_sites.DAV1D_PIN:
+        start = text.rfind("\n", 0, pos) + 1
+        return text.startswith("DAV1D_VERSION=", start)
+    return any(
+        site.path == rel and any(start <= pos < end for start, end in site.find(text))
+        for site in version_sites.DAV1D_MENTIONS
+    )
+
+
 # The Helm README's own-build snippet builds and pushes an image, then
 # installs it with `--set image.tag=`. A release that moves the first
 # two and not the third leaves the chart pulling a tag the snippet
@@ -119,6 +132,8 @@ class VersionToolsTest(unittest.TestCase):
         self.tree = Path(self.tmp.name)
         files = set(carriers(self.version)) | {site.path for site in version_sites.SITES}
         files |= {f"scripts/{tool}" for tool in TOOLS}
+        # The dav1d pin and the docs that name it: the check reads them.
+        files |= {version_sites.DAV1D_PIN} | {site.path for site in version_sites.DAV1D_MENTIONS}
         # Release notes name every version, and moving them is the
         # changelog's job (RELEASING.md, step 1): the copy carries the
         # CHANGELOG for the bump to assemble, outside the leftover scan,
@@ -155,7 +170,11 @@ class VersionToolsTest(unittest.TestCase):
                 continue
             text = (self.tree / rel).read_text(encoding="utf-8", errors="replace")
             for match in word.finditer(text):
-                if third_party(rel, text, match.start()) or rendering_history(rel, text, match.start()):
+                if (
+                    third_party(rel, text, match.start())
+                    or rendering_history(rel, text, match.start())
+                    or dav1d_pin(rel, text, match.start())
+                ):
                     continue
                 line = text.count("\n", 0, match.start())
                 hits.append(f"{rel}:{line + 1}: {text.splitlines()[line].strip()}")
@@ -341,6 +360,50 @@ class VersionToolsTest(unittest.TestCase):
                 f'pub const PINNED: &str = "{old}";',
             ],
         )
+
+    def test_a_bump_leaves_the_dav1d_pin(self):
+        dav1d, _ = version_sites.dav1d_pin(self.tree)
+        before = (self.tree / version_sites.DAV1D_PIN).read_bytes()
+        self.bump(bumped(self.version, "minor"))
+        self.assertEqual((self.tree / version_sites.DAV1D_PIN).read_bytes(), before)
+        self.assertEqual(version_sites.dav1d_pin(self.tree)[0], dav1d)
+
+    def test_the_scan_skips_only_the_dav1d_pin_and_its_mentions(self):
+        # A crabcrop release that shares dav1d's number leaves the pin
+        # and the docs that name it, and nothing else.
+        dav1d, _ = version_sites.dav1d_pin(self.tree)
+        pin = self.tree / version_sites.DAV1D_PIN
+        pin.write_text(pin.read_text(encoding="utf-8") + f"# built as {dav1d}\n", encoding="utf-8")
+        files = (version_sites.DAV1D_PIN, *(site.path for site in version_sites.DAV1D_MENTIONS))
+        found = [hit for hit in self.leftovers(dav1d) if hit.startswith(files)]
+        self.assertEqual(found, [f"{version_sites.DAV1D_PIN}:{len(pin.read_text().splitlines())}: # built as {dav1d}"])
+
+    def test_the_check_fails_when_a_doc_names_another_dav1d(self):
+        dav1d, _ = version_sites.dav1d_pin(self.tree)
+        doc = self.tree / "docs/deployment.md"
+        doc.write_text(
+            doc.read_text(encoding="utf-8").replace(f"link dav1d {dav1d}", "link dav1d 1.3.0"),
+            encoding="utf-8",
+        )
+        self.assert_reported(
+            *self.run_tool("check_versions.py"),
+            [
+                "docs/deployment.md: dav1d version the release binaries link is 1.3.0, "
+                f"but {version_sites.DAV1D_PIN} pins {dav1d}"
+            ],
+        )
+
+    def test_the_check_fails_on_a_malformed_dav1d_pin(self):
+        pin = self.tree / version_sites.DAV1D_PIN
+        text = pin.read_text(encoding="utf-8")
+        for broken, problem in (
+            (re.sub(r"(?m)^DAV1D_SHA256=.*$", "DAV1D_SHA256=abc", text), "DAV1D_SHA256 is not 64 lowercase hex digits"),
+            (re.sub(r"(?m)^DAV1D_VERSION=.*$", "DAV1D_VERSION=latest", text), "DAV1D_VERSION 'latest' is not X.Y.Z"),
+            (re.sub(r"(?m)^DAV1D_VERSION=.*\n", "", text), "expected one DAV1D_VERSION= line and one DAV1D_SHA256= line"),
+        ):
+            with self.subTest(problem=problem):
+                pin.write_text(broken, encoding="utf-8")
+                self.assert_reported(*self.run_tool("check_versions.py"), [f"{version_sites.DAV1D_PIN}: {problem}"])
 
     def test_a_minor_bump_moves_the_crabcrop_url_requirement(self):
         new = bumped(self.version, "minor")

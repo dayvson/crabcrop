@@ -44,6 +44,25 @@ GUARDED = {
 }
 
 
+# GET /repos/{owner}/{repo}/immutable-releases, the documented shape.
+IMMUTABLE = {"enabled": True, "enforced_by_owner": False}
+
+
+def api(environment=GUARDED, ci=None, immutable=IMMUTABLE):
+    """A fetch that answers each path the preflight reads."""
+
+    def fetch(path):
+        if "/environments/" in path:
+            return environment
+        if path.endswith("/immutable-releases"):
+            if isinstance(immutable, Exception):
+                raise immutable
+            return immutable
+        return runs(run()) if ci is None else ci
+
+    return fetch
+
+
 def run(sha=SHA, event="push", branch="main", status="completed", conclusion="success", created="2026-11-07T23:00:40Z", run_id=1):
     return {
         "id": run_id,
@@ -185,6 +204,38 @@ class CiCheck(unittest.TestCase):
         self.assertLess(len(problem), 400)
 
 
+class ImmutableCheck(unittest.TestCase):
+    def test_enabled_passes(self):
+        self.assertEqual(preflight.immutable_problems(IMMUTABLE), [])
+        self.assertEqual(preflight.immutable_problems({"enabled": True, "enforced_by_owner": True}), [])
+
+    def test_disabled_names_the_setting(self):
+        (problem,) = preflight.immutable_problems({"enabled": False, "enforced_by_owner": False})
+        self.assertIn("immutable releases are off", problem)
+        self.assertIn("Settings, General, Releases", problem)
+
+    def test_hostile_shapes_fail_without_raising(self):
+        for response in (None, [], "enabled", {}, {"enabled": "true"}, {"enabled": 1}, {"enabled": None}, [IMMUTABLE]):
+            with self.subTest(response=response):
+                (problem,) = preflight.immutable_problems(response)
+                self.assertIn("no true or false `enabled` field", problem)
+
+    def test_an_unreadable_setting_warns_and_passes(self):
+        def fetch(path):
+            self.assertEqual(path, "repos/o/r/immutable-releases")
+            raise preflight.ApiError("gh api repos/o/r/immutable-releases failed: HTTP 403")
+
+        problems, (warning,) = preflight.immutable_check("o/r", fetch)
+        self.assertEqual(problems, [])
+        self.assertIn("could not read whether releases are immutable", warning)
+        self.assertIn("RELEASING.md", warning)
+
+    def test_a_readable_setting_decides(self):
+        self.assertEqual(preflight.immutable_check("o/r", api()), ([], []))
+        problems, warnings = preflight.immutable_check("o/r", api(immutable={"enabled": False}))
+        self.assertEqual((len(problems), warnings), (1, []))
+
+
 class Check(unittest.TestCase):
     def fetcher(self, responses):
         self.paths = []
@@ -249,14 +300,25 @@ class Main(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_passing_release(self):
-        fetch = lambda path: GUARDED if "/environments/" in path else runs(run())
-        code, out, _ = self.call(["--repo", "dayvson/crabcrop", "--sha", SHA], fetch)
+        code, out, _ = self.call(["--repo", "dayvson/crabcrop", "--sha", SHA], api())
         self.assertEqual(code, 0)
         self.assertIn("requires a reviewer", out)
 
+    def test_an_unreadable_immutable_setting_only_warns(self):
+        denied = preflight.ApiError("gh api failed: HTTP 403")
+        code, out, _ = self.call(["--repo", "dayvson/crabcrop", "--sha", SHA], api(immutable=denied), actions=True)
+        self.assertEqual(code, 0)
+        (warning,) = [line for line in out.splitlines() if line.startswith("::")]
+        self.assertTrue(warning.startswith("::warning title=Release preflight::"), warning)
+
+    def test_mutable_releases_fail(self):
+        code, out, _ = self.call(["--repo", "dayvson/crabcrop", "--sha", SHA], api(immutable={"enabled": False}))
+        self.assertEqual(code, 1)
+        self.assertIn("immutable releases are off", out)
+
     def test_failing_release_annotates_each_problem_on_one_line(self):
         hostile = runs(run(conclusion="failure\n::warning::forged"))
-        fetch = lambda path: {"protection_rules": []} if "/environments/" in path else hostile
+        fetch = api(environment={"protection_rules": []}, ci=hostile)
         code, out, _ = self.call(["--repo", "dayvson/crabcrop", "--sha", SHA], fetch, actions=True)
         self.assertEqual(code, 1)
         lines = out.splitlines()
@@ -292,8 +354,7 @@ class Main(unittest.TestCase):
                 self.assertNotIn("\n::", "\n" + out + err)
 
     def test_dot_led_repository_names_are_accepted(self):
-        fetch = lambda path: GUARDED if "/environments/" in path else runs(run())
-        code, _, _ = self.call(["--repo", "dayvson/.github", "--sha", SHA], fetch)
+        code, _, _ = self.call(["--repo", "dayvson/.github", "--sha", SHA], api())
         self.assertEqual(code, 0)
 
     def test_missing_arguments_are_a_usage_error(self):

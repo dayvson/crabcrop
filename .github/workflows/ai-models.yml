@@ -14,6 +14,13 @@ name: AI models (real inference)
 # from release.yml on every release tag, where publishing waits
 # for it to pass; weekly, so drift in the pinned downloads shows
 # up between changes; and by hand.
+#
+# The live workflow is .github/workflows/ai-models.yml and
+# docs/ai-models-workflow.yml is its mirror: the automation
+# credential cannot push workflow files, so changes land in
+# the mirror and reach the live file through the GitHub web
+# UI. Keep the two identical (scripts/test_all.sh fails when
+# they differ).
 
 on:
   workflow_dispatch:
@@ -25,6 +32,7 @@ on:
       - src/ai/**
       - src/tokenizer.rs
       - tests/fixtures/portrait.jpg
+      - scripts/requirements/ai-fixtures.txt
       - .github/workflows/ai-models.yml
   push:
     branches: [ "main" ]
@@ -32,6 +40,7 @@ on:
       - src/ai/**
       - src/tokenizer.rs
       - tests/fixtures/portrait.jpg
+      - scripts/requirements/ai-fixtures.txt
       - .github/workflows/ai-models.yml
 
 permissions:
@@ -56,8 +65,10 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      # Pinned like the release workflow's actions: release.yml
-      # calls this workflow as its gate (issue #414).
+      # Every action is pinned by commit SHA, like the release
+      # workflow's: release.yml calls this workflow as its gate
+      # (issues #414, #593), so these actions run inside the
+      # release run.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -66,7 +77,7 @@ jobs:
         run: echo "AI_ASSETS=$RUNNER_TEMP/ai-assets" >> "$GITHUB_ENV"
 
       - name: Cache the pinned AI test assets
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.AI_ASSETS }}
           # Bump the trailing version when any pin below changes.
@@ -160,6 +171,11 @@ jobs:
           2cd4e60f4f24ae3bcd57b847b13c1f3ba27edc28cc1a7f9ce74ee9f421243cba  sa_0_4_vit_l_14_linear.pth
           EOF
 
+      # The Python the fixture lock below was resolved for.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
       - name: Generate the authored fixture models
         run: |
           set -euo pipefail
@@ -168,9 +184,10 @@ jobs:
           # item 2) and the focal tests (issue #166), so CI
           # recreates them. IR 8 / opset 13 throughout: the
           # current onnx package defaults to an IR that ORT
-          # 1.31 rejects.
+          # 1.31 rejects. onnx and its dependencies come
+          # from a hash-locked requirements file (issue #598).
           python3 -m venv "$RUNNER_TEMP/ai-venv"
-          "$RUNNER_TEMP/ai-venv/bin/pip" install --quiet onnx==1.23.2
+          "$RUNNER_TEMP/ai-venv/bin/pip" install --quiet --require-hashes -r scripts/requirements/ai-fixtures.txt
           "$RUNNER_TEMP/ai-venv/bin/python" - "$AI_ASSETS" <<'PYEOF'
           import sys
           from pathlib import Path
@@ -320,4 +337,4 @@ jobs:
           # CRABCROP_TEST_DETECT_LABELS is deliberately unset: the
           # detection tests then read the class names embedded in
           # the YOLO export, which is the production path.
-        run: cargo test --locked -- --ignored --skip avif_encode_bench --skip real_ffmpeg_encodes_mp4_and_webm
+        run: cargo test --locked -- --ignored --skip avif_encode_bench --skip real_ffmpeg

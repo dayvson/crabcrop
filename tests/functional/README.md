@@ -58,7 +58,8 @@ their index.
 
 ## Running it
 
-Prerequisites: Python 3 with Pillow (`pip install pillow`), a Rust
+Prerequisites: Python 3 with Pillow (`pip install pillow`; CI installs
+the hash-pinned version in `tests/functional/requirements.txt`), a Rust
 toolchain, and (full tier only) Node 22.18+ for the parity and MCP
 cells.
 
