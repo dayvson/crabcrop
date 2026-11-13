@@ -337,4 +337,4 @@ jobs:
           # CRABCROP_TEST_DETECT_LABELS is deliberately unset: the
           # detection tests then read the class names embedded in
           # the YOLO export, which is the production path.
-        run: cargo test --locked -- --ignored --skip avif_encode_bench --skip real_ffmpeg_encodes_mp4_and_webm
+        run: cargo test --locked -- --ignored --skip avif_encode_bench --skip real_ffmpeg
