@@ -12594,6 +12594,30 @@ async fn concurrent_misses_share_one_origin_fetch() {
     );
 }
 
+/// The most a request's future may take, in bytes (issue
+/// #638). With the miss path boxed it takes about 5 KB.
+const REQUEST_FUTURE_MAX: usize = 8 * 1024;
+
+#[tokio::test]
+async fn a_request_future_does_not_carry_the_miss_path() {
+    // Issue #638: a future is as large as the largest thing
+    // it may await, and the router allocates and moves one
+    // per request. With the miss path awaited in line the
+    // request's future was 24,496 bytes, the loader's fetch
+    // state and the engine runner's included, for a memory
+    // hit, a 304 and a 403 alike. Whatever a later change
+    // awaits on the hit path, it must not grow back to that.
+    let state = Arc::new(test_state());
+    let uri: axum::http::Uri = "/unsafe/100x0/http://127.0.0.1:9/a.png".parse().unwrap();
+    let request = handle(State(state), uri, HeaderMap::new());
+    let size = std::mem::size_of_val(&request);
+    assert!(
+        size <= REQUEST_FUTURE_MAX,
+        "a request's future is {size} bytes, over {REQUEST_FUTURE_MAX}: \
+         something large is awaited in line on the request path"
+    );
+}
+
 #[test]
 fn ai_gate_counts_a_smart_crop_only_when_a_provider_participates() {
     // Issue #379: the predicate matrix. A smart crop

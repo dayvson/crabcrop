@@ -3320,16 +3320,22 @@ async fn run_flight(
     if_none_match: Option<&str>,
     mut record: RequestRecord,
 ) -> (Response, RequestRecord) {
+    // The miss path is boxed at each of the four places this
+    // function reaches it (issue #638). Its future holds the
+    // loader's and the engine runner's state, about 20 KB.
+    // Awaited in line it made every request's future that
+    // large, and a request allocates and moves its future
+    // once, whether it goes on to miss or not.
     // Debug requests bypass everything, per request.
     if work.debug {
-        let (response, record, _) = serve_miss(state, work, record).await;
+        let (response, record, _) = Box::pin(serve_miss(state, work, record)).await;
         return (response, record);
     }
     // Meta requests coalesce through their own flights
     // (issue #295), keyed by [`meta_flight_key`].
     if work.meta {
         let flight_key = meta_flight_key(&work);
-        return serve_meta_flight(state, work, record, &flight_key).await;
+        return Box::pin(serve_meta_flight(state, work, record, &flight_key)).await;
     }
     // Singleflight (audit R2-09): the first miss for a key
     // leads (one fetch, one encode, under the gates below);
@@ -3443,7 +3449,7 @@ async fn run_flight(
                 // answer, so it shares nothing.
                 let lead = async move {
                     let (response, record, render_etag) =
-                        serve_miss(&task_state, work, record).await;
+                        Box::pin(serve_miss(&task_state, work, record)).await;
                     let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
                     if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
                         *slot.shared.lock().unwrap() = Some(SharedFlight {
@@ -3489,7 +3495,7 @@ async fn run_flight(
                     // has not had its own attempt.
                     let progress = work.progress.clone();
                     let task_state = state.clone();
-                    let miss = async move { serve_miss(&task_state, work, record).await };
+                    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
                     let (mut response, record, render_etag) =
                         finish_started_miss(state, progress, miss).await;
                     if let Some(etag) = &render_etag {
