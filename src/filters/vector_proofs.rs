@@ -460,3 +460,154 @@ fn lanes_split_into_bands_where_the_per_pixel_maps_do() {
         new_grayscale(rgba).as_bytes()
     );
 }
+
+/// An 8-bit sample with the arithmetic of `u8` and the blur
+/// passes as they stood before issue #660: the trait's own
+/// loops, a sample at a time over the kernel.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct PlainU8(u8);
+
+impl BlurSample for PlainU8 {
+    type Acc = u32;
+    fn weight(w: f32) -> u32 {
+        blur_q15(w)
+    }
+    fn widen(self) -> u32 {
+        self.0 as u32
+    }
+    fn mac(acc: u32, a: u32, b: u32) -> u32 {
+        acc + a * b
+    }
+    fn store(acc: u32) -> PlainU8 {
+        PlainU8(blur_q15_out(acc))
+    }
+}
+
+/// `w` by `h` pixels of `N` channels, as bytes and as the
+/// plain samples.
+fn blur_input<const N: usize>(
+    w: usize,
+    h: usize,
+    content: fn(u32, u32, u32) -> u8,
+) -> (Vec<u8>, Vec<PlainU8>) {
+    let mut raw = Vec::with_capacity(w * h * N);
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..N {
+                raw.push(content(x as u32, y as u32, c as u32));
+            }
+        }
+    }
+    let plain = raw.iter().map(|&v| PlainU8(v)).collect();
+    (raw, plain)
+}
+
+/// Both passes of one blur, chunked and plain, on `channels`
+/// channels.
+fn blur_both_ways(w: usize, h: usize, channels: usize, sigma: f32) {
+    fn on<const N: usize>(w: usize, h: usize, sigma: f32) {
+        for content in [smooth as fn(u32, u32, u32) -> u8, harsh] {
+            let (raw, plain) = blur_input::<N>(w, h, content);
+            let old = blur_samples::<PlainU8, N>(&plain, w, h, sigma, None).expect("no deadline");
+            let new = blur_samples::<u8, N>(&raw, w, h, sigma, None).expect("no deadline");
+            assert!(
+                old.iter().map(|sample| sample.0).eq(new.iter().copied()),
+                "{w}x{h} of {N} channels at sigma {sigma}"
+            );
+        }
+    }
+    match channels {
+        1 => on::<1>(w, h, sigma),
+        2 => on::<2>(w, h, sigma),
+        3 => on::<3>(w, h, sigma),
+        _ => on::<4>(w, h, sigma),
+    }
+}
+
+#[test]
+fn chunked_blur_sums_match_the_per_sample_sums() {
+    // Issue #660. Sigmas on both sides of the kernel size
+    // where the ring gives way to the transient (55 taps,
+    // between 8 and 8.7), up to kernels far wider than the
+    // frame; one to four channels; one row and one column;
+    // rows shorter than a chunk, exactly one chunk (64 pixels
+    // of four channels), a chunk and one sample (257 of
+    // one), and several chunks. The widest kernels run on
+    // the smallest frames, for the time a debug build takes.
+    let every = [0.3f32, 0.8, 1.0, 2.5, 5.0, 8.0, 8.7, 9.0, 20.0, 75.0, 300.0];
+    let mut cases = 0;
+    for (w, h, channels, sigmas) in [
+        (1, 1, &[1, 2, 3, 4][..], &every[..]),
+        (1, 9, &[1, 2, 3, 4], &every[..10]),
+        (9, 1, &[1, 2, 3, 4], &every[..10]),
+        (2, 2, &[1, 2, 3, 4], &every[..9]),
+        (5, 3, &[1, 2, 3, 4], &every),
+        (17, 4, &[3, 4], &every[..10]),
+        (64, 5, &[1, 4], &every[..9]),
+        (257, 3, &[1, 3], &[1.0f32, 2.5, 8.0, 8.7]),
+        (513, 2, &[4], &[2.5f32, 9.0]),
+    ] {
+        for &channels in channels {
+            for &sigma in sigmas {
+                blur_both_ways(w, h, channels, sigma);
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cases,
+        4 * (11 + 10 + 10 + 9 + 11) + 2 * 10 + 2 * 9 + 2 * 4 + 2
+    );
+    // The chunked passes sit behind the same row gate: a
+    // deadline that has passed stops them before a row.
+    let (raw, _) = blur_input::<3>(64, 5, harsh);
+    let past = Some(std::time::Instant::now());
+    for sigma in [2.5f32, 20.0] {
+        assert_eq!(
+            blur_samples::<u8, 3>(&raw, 64, 5, sigma, past),
+            Err(DeadlinePassed),
+            "sigma {sigma}"
+        );
+    }
+}
+
+#[test]
+fn chunked_blur_totals_stay_far_inside_u32() {
+    // Issue #660: a chunk's totals are `u32`, and its
+    // multiply takes the weights as 16-bit values. A total
+    // is at most 255 times the sum of the kernel's weights
+    // (255 for the middle sample, 510 for each pair), so for
+    // every sigma a request can name, from the smallest to
+    // `MAX_BLUR_SIGMA`, and for the pad fill's own range,
+    // the weights must fit 15 bits and sum to about 2^15.
+    let mut sigmas: Vec<f32> = (0..=640).map(|step| 0.05 + step as f32 * 0.8).collect();
+    sigmas.extend([
+        f32::MIN_POSITIVE,
+        0.3,
+        0.8,
+        2.0,
+        80.0,
+        crate::url::MAX_BLUR_SIGMA,
+    ]);
+    let mut widest = 0;
+    for sigma in sigmas {
+        let kernel = blur_kernel_for::<u8>(blur_sigma(sigma));
+        assert!(
+            kernel.iter().all(|&weight| weight < 1 << 15),
+            "sigma {sigma}"
+        );
+        let sum: u64 = kernel.iter().map(|&weight| u64::from(weight)).sum();
+        assert!(
+            (1 << 14..=(1 << 15) + 64).contains(&sum),
+            "sigma {sigma}: the weights sum to {sum}"
+        );
+        assert!(255 * sum < u64::from(u32::MAX) / 256, "sigma {sigma}");
+        widest = widest.max(kernel.len());
+    }
+    // The widest kernel of the sweep is the grammar's widest.
+    assert_eq!(
+        widest,
+        blur_kernel_for::<u8>(crate::url::MAX_BLUR_SIGMA).len()
+    );
+    assert!(widest > 2000, "{widest}");
+}

@@ -934,6 +934,20 @@ trait BlurSample: Copy + Default + Send + Sync + 'static {
     fn mac(acc: Self::Acc, a: Self::Acc, b: Self::Acc) -> Self::Acc;
     /// An accumulated value back as a sample.
     fn store(acc: Self::Acc) -> Self;
+    /// One row of the horizontal pass, from the row padded
+    /// into `arena`. The default is the crate's loop shape;
+    /// a sample type may bring a loop of its own that adds
+    /// the same terms.
+    #[inline(always)]
+    fn sym_row<const N: usize>(arena: &[Self], dst_row: &mut [Self], kernel: &[Self::Acc]) {
+        blur_sym_row::<Self, N>(arena, dst_row, kernel);
+    }
+    /// One row of the vertical pass, from the rows under the
+    /// kernel, with the same latitude.
+    #[inline(always)]
+    fn sym_col(brows: &[&[Self]], dst_row: &mut [Self], kernel: &[Self::Acc]) {
+        blur_sym_col::<Self>(brows, dst_row, kernel);
+    }
 }
 
 impl BlurSample for u8 {
@@ -953,6 +967,72 @@ impl BlurSample for u8 {
     #[inline(always)]
     fn store(acc: u32) -> u8 {
         blur_q15_out(acc)
+    }
+    fn sym_row<const N: usize>(arena: &[u8], dst_row: &mut [u8], kernel: &[u32]) {
+        let len = kernel.len();
+        let half = len / 2;
+        let w = dst_row.len();
+        blur_u8_chunks(dst_row, kernel, &arena[half * N..half * N + w], |i| {
+            let other = len - 1 - i;
+            (&arena[i * N..i * N + w], &arena[other * N..other * N + w])
+        });
+    }
+    fn sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
+        let len = kernel.len();
+        blur_u8_chunks(dst_row, kernel, brows[len / 2], |i| {
+            (brows[i], brows[len - 1 - i])
+        });
+    }
+}
+
+/// How many samples one step of the 8-bit blur passes sums:
+/// the running totals stay on the stack and in cache.
+const BLUR_U8_CHUNK: usize = 256;
+
+/// One row of either 8-bit blur pass, a chunk of samples at
+/// a time (issue #660). `center` holds the samples under the
+/// kernel's middle weight and `pair(i)` the two runs of
+/// samples that share weight `i`. Each total is the crate's
+/// own sum (the middle sample times its weight, plus each
+/// pair's sum times its weight, in `u32`, rounded back from
+/// Q0.15), with the terms added one weight at a time over
+/// the chunk instead of one sample at a time over the
+/// weights. Integer addition does not depend on the order,
+/// and no total comes near 2^32: a total is at most 255
+/// times the sum of the weights, and the weights are a
+/// normalized kernel in Q0.15, about 2^15 in all. A weight
+/// is under 2^15 and a pair's sum at most 510, so the
+/// multiply is written on 16-bit operands, which the
+/// compiler turns into vector multiplies.
+#[inline(always)]
+fn blur_u8_chunks<'a>(
+    dst_row: &mut [u8],
+    kernel: &[u32],
+    center: &[u8],
+    pair: impl Fn(usize) -> (&'a [u8], &'a [u8]),
+) {
+    debug_assert!(kernel.iter().all(|&weight| weight < 1 << 15));
+    let half = kernel.len() / 2;
+    let middle = kernel[half] as u16;
+    let mut start = 0usize;
+    for dst in dst_row.chunks_mut(BLUR_U8_CHUNK) {
+        let n = dst.len();
+        let mut totals = [0u32; BLUR_U8_CHUNK];
+        for (total, &c) in totals[..n].iter_mut().zip(&center[start..start + n]) {
+            *total = u32::from(u16::from(c)) * u32::from(middle);
+        }
+        for (i, &weight) in kernel[..half].iter().enumerate() {
+            let weight = weight as u16;
+            let (fw, bw) = pair(i);
+            let (fw, bw) = (&fw[start..start + n], &bw[start..start + n]);
+            for ((total, &f), &b) in totals[..n].iter_mut().zip(fw).zip(bw) {
+                *total += u32::from(u16::from(f) + u16::from(b)) * u32::from(weight);
+            }
+        }
+        for (d, &total) in dst.iter_mut().zip(&totals[..n]) {
+            *d = blur_q15_out(total);
+        }
+        start += n;
     }
 }
 
@@ -1299,7 +1379,7 @@ fn blur_ring_of<T: BlurSample, const N: usize>(
                     pad,
                     &mut arena,
                 );
-                blur_sym_row::<T, N>(
+                T::sym_row::<N>(
                     &arena,
                     &mut ring[slot * row_len..(slot + 1) * row_len],
                     &kernel,
@@ -1311,7 +1391,7 @@ fn blur_ring_of<T: BlurSample, const N: usize>(
                 let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
                 brows.push(&ring[(sy % klen) * row_len..(sy % klen + 1) * row_len]);
             }
-            blur_sym_col(&brows, &mut band[ly * row_len..(ly + 1) * row_len], &kernel);
+            T::sym_col(&brows, &mut band[ly * row_len..(ly + 1) * row_len], &kernel);
         }
     });
     gate.finished()?;
@@ -1360,7 +1440,7 @@ fn blur_transient_of<T: BlurSample, const N: usize>(
             }
             let y = y0 + ly;
             blur_arena_row::<T, N>(&src[y * row_len..(y + 1) * row_len], pad, &mut arena);
-            blur_sym_row::<T, N>(&arena, dst_row, &kernel);
+            T::sym_row::<N>(&arena, dst_row, &kernel);
         }
     });
     gate.finished()?;
@@ -1376,7 +1456,7 @@ fn blur_transient_of<T: BlurSample, const N: usize>(
                 let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
                 brows.push(&transient[sy * row_len..(sy + 1) * row_len]);
             }
-            blur_sym_col(&brows, dst_row, &kernel);
+            T::sym_col(&brows, dst_row, &kernel);
         }
     });
     gate.finished()?;
@@ -3344,7 +3424,8 @@ mod w4proofs;
 
 // The loops reshaped so the compiler can vectorize them, each
 // pinned against a frozen copy of the loop it replaced: the
-// row passes of the 3x3 convolution (issue #658) and the
-// lane mapping behind grayscale and saturation (issue #659).
+// row passes of the 3x3 convolution (issue #658), the lane
+// mapping behind grayscale and saturation (issue #659), and
+// the chunked sums of the 8-bit blur (issue #660).
 #[cfg(test)]
 mod vector_proofs;
