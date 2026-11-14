@@ -595,10 +595,13 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
         "x-content-type-options",
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    let stored_nowhere = headers
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| has_directive(v, "no-store"));
+    // Read only for an error (issue #641): a success keeps
+    // its own caching headers whatever they say.
+    let stored_nowhere = error
+        && headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| has_directive(v, "no-store"));
     if system || (error && !stored_nowhere) {
         headers.insert(
             header::CACHE_CONTROL,
@@ -2590,13 +2593,13 @@ fn sf_quote(value: &str) -> String {
 /// entry, never read back from this header.
 fn attach_cache_headers(
     response: &mut Response,
-    cache_status: &str,
+    cache_status: &'static str,
     groups: &[String],
     sealed: bool,
 ) {
     response.headers_mut().insert(
         axum::http::HeaderName::from_static("cache-status"),
-        axum::http::HeaderValue::from_str(cache_status).unwrap(),
+        axum::http::HeaderValue::from_static(cache_status),
     );
     if !sealed && !groups.is_empty() {
         let list = groups
@@ -2635,11 +2638,14 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
     .then(|| value.to_string())
 }
 
-async fn handle(
-    State(state): State<Arc<AppState>>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-) -> Response {
+async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    // The request's URI and headers are read where they are
+    // (issue #641): the `Uri` and `HeaderMap` extractors
+    // hand a handler a copy of each. The body goes at once,
+    // as it did with them.
+    let (parts, body) = request.into_parts();
+    drop(body);
+    let (uri, headers) = (&parts.uri, &parts.headers);
     // The raw path, exactly as sent: the signature covers it
     // byte-for-byte, so no percent-decoding may happen first
     // (the `Path` extractor decodes, which would rewrite e.g.
@@ -2650,34 +2656,22 @@ async fn handle(
     // content under a second spelling.
     let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
     let started = Instant::now();
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let chosen_id = client_request_id(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
-    let request_id = chosen_id.clone().unwrap_or_else(generate_request_id);
+    let chose_id = chosen_id.is_some();
+    let request_id = chosen_id.unwrap_or_else(generate_request_id);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .and_then(|v| v.to_str().ok());
     // With client hints off, no hint header is read at all:
     // every request for a URL gets the same bytes, the one
     // answer a cache that keys on the URL alone can hold.
     let hints = state.client_hints;
-    let dpr = dpr_hint(&headers).filter(|_| hints);
-    let width = width_hint(&headers).filter(|_| hints);
-    let save_data = hints && save_data_hint(&headers);
-    let (mut response, mut record) = serve(
-        &state,
-        path,
-        accept.as_deref(),
-        if_none_match.as_deref(),
-        dpr,
-        width,
-        save_data,
-    )
-    .await;
-    record.request_id = request_id.clone();
+    let dpr = dpr_hint(headers).filter(|_| hints);
+    let width = width_hint(headers).filter(|_| hints);
+    let save_data = hints && save_data_hint(headers);
+    let (mut response, mut record) =
+        serve(&state, path, accept, if_none_match, dpr, width, save_data).await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     // Every answer on this route, errors and meta included,
@@ -2689,18 +2683,22 @@ async fn handle(
     // viewer of the URL with the headers it was stored with,
     // so it never carries an ID the client chose: that
     // client already has it, and the log line records it.
-    // An ID the server generated is still sent.
-    let shared = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| has_directive(v, "public"));
-    if chosen_id.is_none() || !shared {
+    // An ID the server generated is still sent, so the
+    // answer's caching is read only for one the client
+    // chose.
+    let shared = chose_id
+        && response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| has_directive(v, "public"));
+    if !shared {
         response.headers_mut().insert(
             axum::http::HeaderName::from_static("x-request-id"),
             request_id.parse().unwrap(),
         );
     }
+    record.request_id = request_id;
     state.metrics.record(&record);
     println!("{}", record.to_json());
     response
@@ -3399,8 +3397,18 @@ async fn run_flight(
         work.hinted_width,
         work.save_data,
     );
-    let flight_request = format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
-    let (cache_key, groups) = (work.cache_key.clone(), work.groups.clone());
+    // That identity is built only by a request that leads
+    // or follows a flight (issue #641): a hit compares it
+    // with nothing. A follower builds it before it waits,
+    // and a leader once it holds the flight, never between
+    // a lookup that missed and the claim. Whatever a
+    // request does there widens the window in which the
+    // flight it would have followed can end unseen, and the
+    // request then leads a second flight for a render the
+    // first has just stored.
+    let flight_identity =
+        || format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
+    let mut flight_request: Option<String> = None;
     let (max_age, sealed) = (work.max_age, work.sealed);
     let mut waits = 0;
     let mut followed: Option<Arc<FlightSlot>> = None;
@@ -3408,12 +3416,14 @@ async fn run_flight(
     // (issue #572).
     let mut budget = DiskBudget::new();
     loop {
+        // The key and the groups are read where they are
+        // until the miss path takes the work.
+        let (cache_key, groups) = (work.cache_key.as_str(), work.groups.as_slice());
         if let Some((hit, cache_status)) =
-            lookup_tiers_within(state, &cache_key, &groups, &mut budget).await
+            lookup_tiers_within(state, cache_key, groups, &mut budget).await
         {
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
-            let etag = hit.etag.clone();
             let mut response = respond(
                 hit.format,
                 hit.quality,
@@ -3421,8 +3431,8 @@ async fn run_flight(
                 max_age,
                 state.client_hints,
             );
-            attach_cache_headers(&mut response, cache_status, &groups, sealed);
-            finalize_validators(&mut response, &etag, if_none_match);
+            attach_cache_headers(&mut response, cache_status, groups, sealed);
+            finalize_validators(&mut response, &hit.etag, if_none_match);
             return (response, record);
         }
         let taken = followed
@@ -3432,13 +3442,13 @@ async fn run_flight(
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .filter(|shared| shared.request == flight_request)
+                    .filter(|shared| Some(&shared.request) == flight_request.as_ref())
                     .cloned()
             })
             .filter(|shared| {
                 !state
                     .purge_guard
-                    .purge_covers(shared.snapshot, &cache_key, &groups)
+                    .purge_covers(shared.snapshot, cache_key, groups)
             });
         if let Some(shared) = taken {
             record.bytes_out = shared.response.body.len();
@@ -3449,8 +3459,9 @@ async fn run_flight(
             }
             return (response, record);
         }
-        match state.inflight.lead(&cache_key) {
+        match state.inflight.lead(cache_key) {
             Flight::Leader(guard, slot) => {
+                let flight_request = flight_request.take().unwrap_or_else(flight_identity);
                 let snapshot = state.purge_guard.snapshot();
                 let progress = work.progress.clone();
                 let task_progress = progress.clone();
@@ -3525,6 +3536,7 @@ async fn run_flight(
                     return (response, record);
                 }
                 waits += 1;
+                flight_request.get_or_insert_with(flight_identity);
                 // The leader always signals on drop; the
                 // timeout is only a backstop against a
                 // wedged leader, after which the waiter
@@ -5518,6 +5530,7 @@ fn respond(
     max_age: Option<u32>,
     client_hints: bool,
 ) -> Response {
+    use axum::http::HeaderValue;
     let content_type = match format {
         ImageFormat::Jpeg => "image/jpeg",
         ImageFormat::Png => "image/png",
@@ -5529,16 +5542,13 @@ fn respond(
         ImageFormat::WebM => "video/webm",
     };
     let cache_control = match max_age {
-        None => "public, max-age=31536000, immutable".to_string(),
-        Some(0) => "public, max-age=0".to_string(),
-        Some(n) => format!("public, max-age={n}, immutable"),
+        None => HeaderValue::from_static("public, max-age=31536000, immutable"),
+        Some(0) => HeaderValue::from_static("public, max-age=0"),
+        Some(n) => format!("public, max-age={n}, immutable").parse().unwrap(),
     };
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(content_type),
-    );
-    headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, cache_control);
     // `Vary` is set by `handle`, on every answer of the
     // image route alike. Advertise the client hints the
     // server reads, so browsers send them on later requests;

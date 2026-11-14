@@ -12907,6 +12907,144 @@ async fn concurrent_misses_share_one_origin_fetch() {
     );
 }
 
+/// The value of the counter or gauge `name` in a metrics
+/// exposition.
+fn metric(exposition: &str, name: &str) -> u64 {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in:\n{exposition}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_identical_misses_shares_one_fetch_and_one_render() {
+    // Issue #641: a request builds its flight's identity
+    // only once it leads or follows a flight, and reads its
+    // key and groups in place until then. A burst must
+    // still be one flight: one leader that fetches and
+    // renders, and seven followers that take its render,
+    // from the memory tier, or with the tier off from the
+    // flight, where the leader's identity and a follower's
+    // must be the same text. The origin holds its answer
+    // until all seven are following, so each burst is
+    // exactly one fetch and one render.
+    const BURSTS: usize = 20;
+    for memory in [16 * 1024 * 1024, 0] {
+        let (src, hits, open) = spawn_held_server(test_png()).await;
+        let state = Arc::new(AppState {
+            cache: Arc::new(Cache::new(memory)),
+            ..test_state()
+        });
+        for burst in 0..BURSTS {
+            let _ = open.send(false);
+            // A source of its own for each burst; the origin
+            // answers every path alike.
+            let remainder = format!("20x12/{src}/{burst}");
+            let requests: Vec<_> = (0..8)
+                .map(|_| start_request(&state, &remainder, None))
+                .collect();
+            wait_until("seven requests follow the flight", || {
+                state
+                    .inflight
+                    .image_flights()
+                    .iter()
+                    .any(|(_, following)| *following == 7)
+            })
+            .await;
+            let _ = open.send(true);
+            let mut answers = Vec::new();
+            for request in requests {
+                let response = request.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "burst {burst}");
+                let etag = response.headers()[header::ETAG].clone();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                answers.push((etag, body));
+            }
+            assert!(
+                answers.windows(2).all(|w| w[0] == w[1]),
+                "memory {memory}, burst {burst}: the answers differ"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                burst + 1,
+                "memory {memory}, burst {burst}: one fetch for the burst"
+            );
+        }
+        let metrics = state.metrics.render();
+        let bursts = BURSTS as u64;
+        assert_eq!(
+            metric(&metrics, "crabcrop_process_duration_ms_count"),
+            bursts,
+            "memory {memory}: one render for each burst"
+        );
+        assert_eq!(metric(&metrics, "crabcrop_load_duration_ms_count"), bursts);
+        assert_eq!(
+            metric(&metrics, "crabcrop_requests_total{status_class=\"2xx\"}"),
+            8 * bursts
+        );
+        let followers_hit = if memory == 0 { 0 } else { 7 * bursts };
+        assert_eq!(metric(&metrics, "crabcrop_cache_hits_total"), followers_hit);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bursts_of_identical_misses_under_load_share_their_flights() {
+    // Issue #641, with nothing held back: 400 bursts of
+    // eight identical requests against an origin that
+    // answers at once, on four workers, so requests reach
+    // the lookup and the flight claim in every order the
+    // runtime produces. Every request is answered, and
+    // every fetch is one render.
+    //
+    // A burst is one fetch unless a request is held up
+    // between its lookup's miss and its claim for as long
+    // as the whole flight lasts; it then leads a second
+    // one. That takes a worker thread losing its core at
+    // that moment. With the machine to itself this server
+    // does it in none of 20,000 bursts, before and after the
+    // change; on a busy machine a few in a thousand can.
+    // More than one burst in twenty is a flight that does
+    // not share.
+    const BURSTS: usize = 400;
+    const FAN: usize = 8;
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let state = Arc::new(test_state());
+    for burst in 0..BURSTS {
+        // A source of its own for each burst; the origin
+        // answers every path alike.
+        let remainder = format!("20x12/{src}/{burst}");
+        let requests: Vec<_> = (0..FAN)
+            .map(|_| start_request(&state, &remainder, None))
+            .collect();
+        for request in requests {
+            let response = request.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "burst {burst}");
+        }
+    }
+    let fetched = hits.load(Ordering::SeqCst);
+    assert!(
+        (BURSTS..=BURSTS + BURSTS / 20).contains(&fetched),
+        "{fetched} fetches for {BURSTS} bursts of {FAN}"
+    );
+    let metrics = state.metrics.render();
+    assert_eq!(
+        metric(&metrics, "crabcrop_process_duration_ms_count"),
+        fetched as u64,
+        "a render for each fetch"
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_cache_hits_total")
+            + metric(&metrics, "crabcrop_cache_misses_total"),
+        (BURSTS * FAN) as u64
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_requests_total{status_class=\"2xx\"}"),
+        (BURSTS * FAN) as u64
+    );
+}
+
 /// The most a request's future may take, in bytes (issue
 /// #638). With the miss path boxed it takes about 5 KB.
 const REQUEST_FUTURE_MAX: usize = 8 * 1024;
@@ -12921,8 +13059,11 @@ async fn a_request_future_does_not_carry_the_miss_path() {
     // hit, a 304 and a 403 alike. Whatever a later change
     // awaits on the hit path, it must not grow back to that.
     let state = Arc::new(test_state());
-    let uri: axum::http::Uri = "/unsafe/100x0/http://127.0.0.1:9/a.png".parse().unwrap();
-    let request = handle(State(state), uri, HeaderMap::new());
+    let request = axum::http::Request::builder()
+        .uri("/unsafe/100x0/http://127.0.0.1:9/a.png")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let request = handle(State(state), request);
     let size = std::mem::size_of_val(&request);
     assert!(
         size <= REQUEST_FUTURE_MAX,
@@ -13340,12 +13481,13 @@ fn start_request(
     remainder: &str,
     width_hint: Option<u32>,
 ) -> tokio::task::JoinHandle<Response> {
-    let uri: axum::http::Uri = format!("/{}/{remainder}", sign(remainder)).parse().unwrap();
-    let mut headers = HeaderMap::new();
+    let mut request =
+        axum::http::Request::builder().uri(format!("/{}/{remainder}", sign(remainder)));
     if let Some(width) = width_hint {
-        headers.insert("sec-ch-width", width.into());
+        request = request.header("sec-ch-width", width);
     }
-    tokio::spawn(handle(State(state.clone()), uri, headers))
+    let request = request.body(axum::body::Body::empty()).unwrap();
+    tokio::spawn(handle(State(state.clone()), request))
 }
 
 /// Drop a started request, as its client disconnecting
