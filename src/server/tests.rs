@@ -1086,6 +1086,96 @@ fn a_padded_source_is_keyed_by_a_bounded_digest() {
     assert_ne!(key, other);
 }
 
+/// The cache key as it was put together before issue #640
+/// appended its parts to one buffer: a `format!` for every
+/// suffix.
+fn cache_key_by_formatting(
+    config_fingerprint: &str,
+    ops: &[crate::url::Operation],
+    source_url: &str,
+    negotiated: &Negotiated,
+) -> String {
+    let key_base =
+        crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
+    let key_base = format!("{key_base}#cfg{config_fingerprint}");
+    let mut cache_key = if negotiated.directives.explicit_format.is_some() {
+        key_base
+    } else {
+        let class = match negotiated.preferred {
+            Some(ImageFormat::Avif) => "avif",
+            Some(ImageFormat::Jxl) => "jxl",
+            Some(ImageFormat::WebP) => "webp",
+            _ => "source",
+        };
+        format!("{key_base}#{class}")
+    };
+    if let Some(w) = negotiated.hinted_width {
+        cache_key = format!("{cache_key}#w{w}");
+    }
+    if negotiated.save_data_applies {
+        cache_key = format!("{cache_key}#sd");
+    }
+    let effective_dpr = negotiated.effective_dpr;
+    if effective_dpr != 1.0 {
+        cache_key = format!("{cache_key}#dpr{effective_dpr}");
+    }
+    cache_key
+}
+
+#[test]
+fn every_cache_key_keeps_its_bytes() {
+    // Issue #640: the key is written into one buffer. A key
+    // that changed by a byte would orphan every entry the
+    // disk and shared tiers hold, so each suffix is compared
+    // with the text it was formatted to before: the
+    // negotiated class, the hinted width, Save-Data and the
+    // DPR, alone and together, on a plain form and on one
+    // carried as a digest.
+    let padded = format!("http://origin{}t.png", "/".repeat(5_000));
+    let remainders = [
+        "300x200/filters:grayscale/http://x/heroes/cat.jpg".to_string(),
+        "filters:format(webp):quality(80)/http://x/a.jpg".to_string(),
+        "http://x/a.jpg".to_string(),
+        format!("fit-in:800x600/{padded}"),
+    ];
+    let classes = [
+        None,
+        Some(ImageFormat::Avif),
+        Some(ImageFormat::Jxl),
+        Some(ImageFormat::WebP),
+        Some(ImageFormat::Jpeg),
+        Some(ImageFormat::Png),
+    ];
+    let mut checked = 0;
+    for remainder in &remainders {
+        let (ops, source, _, _) = parse_operations_with_expiry(remainder).unwrap();
+        for preferred in classes {
+            for hinted_width in [None, Some(100), Some(3840)] {
+                for save_data_applies in [false, true] {
+                    for effective_dpr in crate::url::DPR_FACTORS {
+                        let negotiated = Negotiated {
+                            preferred,
+                            hinted_width,
+                            save_data_applies,
+                            effective_dpr,
+                            ..plain_negotiation(&ops)
+                        };
+                        for fingerprint in ["test", "5f1d3c9a7e2b4860"] {
+                            assert_eq!(
+                                cache_key_for(fingerprint, &ops, source, &negotiated),
+                                cache_key_by_formatting(fingerprint, &ops, source, &negotiated),
+                                "{remainder}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 4 * 6 * 3 * 2 * 4 * 2);
+}
+
 /// A source server that reads each whole request head before
 /// it answers, however long the request line, and counts the
 /// requests.
@@ -3206,6 +3296,229 @@ fn preset_spellings_and_their_expansions_share_one_cache_key() {
     assert_eq!(err.code(), "unknown_preset");
     let err = crate::url::expand_presets(&format!("300x200/{src}"), &presets, true).unwrap_err();
     assert_eq!(err.code(), "presets_only");
+}
+
+/// [`resolve_request`] as it read every remainder before
+/// issue #640: the preset names, the expansion, and the
+/// parse of the expanded text, each a walk of its own.
+fn resolve_by_three_walks(
+    state: &AppState,
+    rest: &str,
+    record: &mut RequestRecord,
+) -> Result<Resolved, Refusal> {
+    let grammar = |e: crate::url::ParseError| Refusal::Payload(parse_failure_parts(&e));
+    if matches!(
+        rest.split('/').next(),
+        Some("purge" | "purge-group" | "upload")
+    ) {
+        return Err(Refusal::Payload((
+            StatusCode::BAD_REQUEST,
+            "reserved_segment",
+            "an image URL may not begin with a purge or upload segment".to_string(),
+        )));
+    }
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::Payload(reserved_remainder_parts()));
+    }
+    let groups = crate::url::preset_names(rest);
+    let rest =
+        crate::url::expand_presets(rest, &state.presets, state.only_presets).map_err(grammar)?;
+    let (ops, source_url, expiry, max_age) =
+        parse_operations_with_expiry(&rest).map_err(grammar)?;
+    record.ops = rest[..rest.len() - source_url.len()]
+        .trim_end_matches('/')
+        .to_string();
+    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
+    crate::url::check_operation_count(&ops).map_err(grammar)?;
+    crate::url::check_watermark_count(&ops).map_err(grammar)?;
+    let (source_url, _) =
+        crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
+    if let Some(exp) = expiry
+        && now_unix() >= exp
+    {
+        return Err(Refusal::AsIs((
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired".to_string(),
+        )));
+    }
+    Ok(Resolved {
+        ops,
+        source_url,
+        groups,
+        max_age,
+    })
+}
+
+/// A resolved request: its operations, source, groups and
+/// cache lifetime.
+type ResolvedParts = (Vec<crate::url::Operation>, String, Vec<String>, Option<u32>);
+
+/// A refusal: its kind, and its answer when it has its own.
+type RefusalParts = (&'static str, Option<ErrorParts>);
+
+/// What a resolved request, or its refusal, comes to, in a
+/// form two of them can be compared in.
+fn resolved_parts(resolved: Result<Resolved, Refusal>) -> Result<ResolvedParts, RefusalParts> {
+    match resolved {
+        Ok(resolved) => Ok((
+            resolved.ops,
+            resolved.source_url,
+            resolved.groups,
+            resolved.max_age,
+        )),
+        Err(Refusal::Unopened) => Err(("unopened", None)),
+        Err(Refusal::Payload(parts)) => Err(("payload", Some(parts))),
+        Err(Refusal::MetaDisabled(parts)) => Err(("meta disabled", Some(parts))),
+        Err(Refusal::AsIs(parts)) => Err(("as is", Some(parts))),
+    }
+}
+
+#[test]
+fn a_remainder_resolves_as_the_three_walks_resolved_it() {
+    // Issue #640: a remainder that names no preset is
+    // parsed in one walk. On every server (no presets,
+    // presets, presets only, default operations and source
+    // roots) each remainder must resolve to the request the
+    // three walks resolved it to, with the same groups and
+    // the same operation summary in its log line, or be
+    // refused with the same answer: the grammar's errors,
+    // the caps, an unknown preset, an expired URL.
+    let presets: crate::url::Presets = [
+        ("thumb".to_string(), "150x150".parse().unwrap()),
+        (
+            "card".to_string(),
+            "crop:1200x630:smart/filters:quality(80)".parse().unwrap(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let states = [
+        test_state(),
+        AppState {
+            presets: presets.clone(),
+            ..test_state()
+        },
+        AppState {
+            presets: presets.clone(),
+            only_presets: true,
+            ..test_state()
+        },
+        AppState {
+            presets: presets.clone(),
+            default_ops: crate::url::parse_default_ops(
+                "filters:quality(80):format(webp)/preset:thumb",
+                &presets,
+            )
+            .unwrap(),
+            source_roots: [(
+                "photos".to_string(),
+                "https://cdn.example.com/p".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..test_state()
+        },
+    ];
+    let doc = load_spec("operation-vectors.json");
+    let mut remainders: Vec<String> = Vec::new();
+    for (n, case) in doc["cases"].as_array().unwrap().iter().enumerate() {
+        let rest = case["remainder"].as_str().unwrap();
+        remainders.push(rest.to_string());
+        match n % 6 {
+            0 => remainders.push(format!("preset:thumb/{rest}")),
+            1 => remainders.push(format!("exp:4102444800/maxage:60/{rest}")),
+            2 => remainders.push(format!("exp:1/{rest}")),
+            3 => remainders.push(format!("{rest}/preset:card")),
+            4 => remainders.push(format!("preset:nope/{rest}")),
+            _ => remainders.push(format!("preset:card/preset:thumb/{rest}")),
+        }
+    }
+    let src = "https://example.com/a.jpg";
+    let chain = |operations: usize| format!("{}{src}", "filters:grayscale/".repeat(operations));
+    let watermarks = |count: usize| {
+        let marks: Vec<String> = (0..count)
+            .map(|n| format!("watermark(https%3A%2F%2Fexample.com%2Fw{n}.png,0,0,0)"))
+            .collect();
+        format!("filters:{}/{src}", marks.join(":"))
+    };
+    remainders.extend([
+        chain(98),
+        chain(99),
+        chain(100),
+        chain(101),
+        watermarks(16),
+        watermarks(17),
+        format!("preset:card/{}", chain(98)),
+        format!("preset:card/{}", chain(99)),
+        "purge/300x200/x.jpg".to_string(),
+        "purge-group/hero".to_string(),
+        "upload/x.jpg".to_string(),
+        "crabcrop/purge-key".to_string(),
+        "300x200/root:photos/cat.jpg".to_string(),
+        "300x200/root:nope/cat.jpg".to_string(),
+        "preset:thumb/root:photos/cat.jpg".to_string(),
+        format!(
+            "300x200/https://example.com/preset:thumb/{}",
+            "a".repeat(300_000)
+        ),
+        format!("300x200/https://example.com/{}", "a".repeat(300_000)),
+        "300x200".to_string(),
+        String::new(),
+    ]);
+    let mut bad = Vec::new();
+    let (mut resolved, mut refused) = (0, 0);
+    for (n, state) in states.iter().enumerate() {
+        for rest in &remainders {
+            let (mut record, mut expected_record) = Default::default();
+            let got = resolved_parts(resolve_request(state, rest, &mut record));
+            let expected =
+                resolved_parts(resolve_by_three_walks(state, rest, &mut expected_record));
+            let shown: String = rest.chars().take(120).collect();
+            if got != expected {
+                bad.push(format!(
+                    "state {n}, {shown}: {got:?}, the three walks {expected:?}"
+                ));
+            } else if record.ops != expected_record.ops {
+                bad.push(format!(
+                    "state {n}, {shown}: logs {:?}, the three walks {:?}",
+                    record.ops, expected_record.ops
+                ));
+            }
+            match got {
+                Ok(_) => resolved += 1,
+                Err(_) => refused += 1,
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} mismatches:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+    assert!(
+        resolved > 1000 && refused > 1000,
+        "{resolved} resolved, {refused} refused"
+    );
+    // The reserved first segments are refused before either
+    // parse, with their own code.
+    for rest in [
+        "purge/300x200/x.jpg",
+        "purge-group/hero",
+        "upload/x.jpg",
+        "crabcrop/purge-key",
+    ] {
+        let refused = resolve_request(&states[0], rest, &mut RequestRecord::default());
+        let Err((_, Some((status, code, _)))) = resolved_parts(refused) else {
+            panic!("{rest} is not refused with an answer of its own");
+        };
+        assert_eq!(
+            (status, code),
+            (StatusCode::BAD_REQUEST, "reserved_segment"),
+            "{rest}"
+        );
+    }
 }
 
 #[tokio::test]

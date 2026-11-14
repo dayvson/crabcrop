@@ -3003,21 +3003,39 @@ fn resolve_request(
     if crabcrop_url::is_reserved_remainder(rest) {
         return Err(Refusal::Payload(reserved_remainder_parts()));
     }
-    // The cache groups (RFC 9875) are the presets the signed
-    // remainder references, read before expansion rewrites it.
-    let groups = crate::url::preset_names(rest);
-    // Preset expansion happens after verification (the
-    // signature covers the preset reference, not its expansion)
-    // and before everything else: parsing, the cache key, and
-    // the ops summary all see the expanded remainder, so
-    // editing a preset produces fresh cache entries naturally.
-    // Expansion always runs, even with no presets loaded:
-    // a `preset:` segment is a grammar error
-    // (`unknown_preset`) on every server, never source text.
-    let rest =
-        crate::url::expand_presets(rest, &state.presets, state.only_presets).map_err(grammar)?;
-    let (ops, source_url, expiry, max_age) =
-        parse_operations_with_expiry(&rest).map_err(grammar)?;
+    // A remainder that names no preset, the common request,
+    // is parsed in one walk (issue #640): it has no groups,
+    // and it expands to itself. Every other remainder, one
+    // that fails included, takes the three walks below, so
+    // each error still comes from the walk that owns it.
+    let plain = if state.only_presets {
+        None
+    } else {
+        crate::url::parse_without_presets(rest)
+    };
+    let expanded;
+    let (groups, rest, (ops, source_url, expiry, max_age)) = match plain {
+        Some(parsed) => (Vec::new(), rest, parsed),
+        None => {
+            // The cache groups (RFC 9875) are the presets the
+            // signed remainder references, read before
+            // expansion rewrites it.
+            let groups = crate::url::preset_names(rest);
+            // Preset expansion happens after verification (the
+            // signature covers the preset reference, not its
+            // expansion) and before everything else: parsing,
+            // the cache key, and the ops summary all see the
+            // expanded remainder, so editing a preset produces
+            // fresh cache entries naturally. Expansion always
+            // runs, even with no presets loaded: a `preset:`
+            // segment is a grammar error (`unknown_preset`) on
+            // every server, never source text.
+            expanded = crate::url::expand_presets(rest, &state.presets, state.only_presets)
+                .map_err(grammar)?;
+            let parsed = parse_operations_with_expiry(&expanded).map_err(grammar)?;
+            (groups, expanded.as_str(), parsed)
+        }
+    };
     // The operation summary is everything before the source URL.
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
@@ -3252,6 +3270,7 @@ fn cache_key_for(
     source_url: &str,
     negotiated: &Negotiated,
 ) -> String {
+    use std::fmt::Write as _;
     let key_base =
         crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
     // The key also carries the configuration fingerprint
@@ -3262,28 +3281,30 @@ fn cache_key_for(
     // or font or encoder files) starts a fresh epoch
     // instead of serving the old configuration's renders.
     // The fingerprint sits inside the base, ahead of the
-    // negotiated-class and hint suffixes.
-    let key_base = format!("{key_base}#cfg{config_fingerprint}");
-    let mut cache_key = if negotiated.directives.explicit_format.is_some() {
-        key_base
-    } else {
-        let class = match negotiated.preferred {
-            Some(ImageFormat::Avif) => "avif",
-            Some(ImageFormat::Jxl) => "jxl",
-            Some(ImageFormat::WebP) => "webp",
-            _ => "source",
-        };
-        format!("{key_base}#{class}")
-    };
+    // negotiated-class and hint suffixes. Each part is
+    // appended to the one buffer (issue #640): the key is
+    // built for every request.
+    let mut cache_key = key_base;
+    cache_key.reserve(config_fingerprint.len() + 24);
+    cache_key.push_str("#cfg");
+    cache_key.push_str(config_fingerprint);
+    if negotiated.directives.explicit_format.is_none() {
+        cache_key.push_str(match negotiated.preferred {
+            Some(ImageFormat::Avif) => "#avif",
+            Some(ImageFormat::Jxl) => "#jxl",
+            Some(ImageFormat::WebP) => "#webp",
+            _ => "#source",
+        });
+    }
     if let Some(w) = negotiated.hinted_width {
-        cache_key = format!("{cache_key}#w{w}");
+        let _ = write!(cache_key, "#w{w}");
     }
     if negotiated.save_data_applies {
-        cache_key = format!("{cache_key}#sd");
+        cache_key.push_str("#sd");
     }
     let effective_dpr = negotiated.effective_dpr;
     if effective_dpr != 1.0 {
-        cache_key = format!("{cache_key}#dpr{effective_dpr}");
+        let _ = write!(cache_key, "#dpr{effective_dpr}");
     }
     cache_key
 }

@@ -10,7 +10,9 @@
 //! - canonicalize (`canonical_form`) to text that re-parses
 //!   (`parse_request`) to those same operations, exactly;
 //! - re-canonicalize to the same text, which is also what
-//!   `canonical_key_form` keys the original spelling under.
+//!   `canonical_key_form` keys the original spelling under;
+//! - parse in one walk (`parse_without_presets`, issue #640)
+//!   to what the preset walks and the parse yield together.
 //!
 //! The float arguments compare exactly too: every canonical
 //! float is the shortest text that reads back as the same
@@ -1358,6 +1360,26 @@ fn check(case: &Case) -> Result<(), TestCaseError> {
         (expiry, max_age),
         "the last metadata of each kind wins"
     );
+
+    // The one-walk parse the request path makes of a
+    // remainder that names no preset (issue #640) is the
+    // three walks it stands in for: no preset names, an
+    // expansion that leaves the text as it is, and the
+    // parse of that text.
+    match url::parse_without_presets(&remainder) {
+        Some(one_walk) => {
+            prop_assert!(url::preset_names(&remainder).is_empty());
+            let expanded = url::expand_presets(&remainder, &url::Presets::new(), false)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(&expanded, &remainder);
+            let three_walks = url::parse_operations_with_expiry(&expanded)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(one_walk, three_walks, "{}", path);
+        }
+        // It declines a valid chain only for the text
+        // `preset:`, which an argument may spell.
+        None => prop_assert!(remainder.contains("preset:"), "{}", path),
+    }
 
     let canonical = url::canonical_form(&request.operations, request.source_url);
     let reparsed = format!("/{}/{canonical}", case.signature_text);
