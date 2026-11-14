@@ -11,7 +11,7 @@ image:
   # digest takes precedence over the tag), or point the
   # repository at your own build of the repo Dockerfile.
   repository: ghcr.io/dayvson/crabcrop
-  tag: "0.11.0"
+  tag: "0.12.0"
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -158,7 +158,7 @@ ai:
   enabled: false
   image:
     repository: ghcr.io/dayvson/crabcrop-ai
-    tag: "0.11.0"
+    tag: "0.12.0"
     digest: ""
   models:
     existingClaim: ""
