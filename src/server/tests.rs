@@ -17662,6 +17662,90 @@ async fn scrape(base: &str, token: &str) -> String {
 }
 
 #[tokio::test]
+async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
+    // Issue #643: `/metrics` is written into one buffer,
+    // section after section. With a disk tier and a shared
+    // tier every section is there, and at rest every value
+    // is known: the request counters as `Metrics::render`
+    // gives them, then the lanes, the source buffer, the
+    // lookups and the tiers, each line the text it was when
+    // a string was formatted for it.
+    let dir = crate::test_support::scratch_dir("metrics-one-buffer");
+    let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
+    state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
+    let base = serve_state(&state).await;
+    state.metrics.record(&RequestRecord {
+        status: 200,
+        cache_looked_up: true,
+        bytes_out: 1234,
+        ..Default::default()
+    });
+    state.metrics.record_purge();
+    let scraped = scrape(&base, "metrics-token").await;
+    let requests = state.metrics.render();
+    assert!(requests.contains("crabcrop_bytes_served_total 1234\n"));
+    let sections = scraped
+        .strip_prefix(requests.as_str())
+        .unwrap_or_else(|| panic!("the exposition does not open with the counters:\n{scraped}"));
+    let source_buffer = state.loader.source_budget().capacity();
+    let (_, lookup_slots) = state.loader.lookup_slots();
+    let puts = SHARED_PUTS_AT_ONCE;
+    let expected = format!(
+        r#"# HELP crabcrop_lane_in_use Processing lane permits currently in use.
+# TYPE crabcrop_lane_in_use gauge
+crabcrop_lane_in_use{{lane="process"}} 0
+crabcrop_lane_in_use{{lane="slow"}} 0
+# HELP crabcrop_lane_capacity Processing lane permit capacity.
+# TYPE crabcrop_lane_capacity gauge
+crabcrop_lane_capacity{{lane="process"}} 4
+crabcrop_lane_capacity{{lane="slow"}} 2
+# HELP crabcrop_source_buffer_bytes Source bytes cache misses hold against the source buffer budget.
+# TYPE crabcrop_source_buffer_bytes gauge
+crabcrop_source_buffer_bytes 0
+# HELP crabcrop_source_buffer_capacity_bytes The source buffer budget.
+# TYPE crabcrop_source_buffer_capacity_bytes gauge
+crabcrop_source_buffer_capacity_bytes {source_buffer}
+# HELP crabcrop_source_lookups_in_flight Source host lookups running now.
+# TYPE crabcrop_source_lookups_in_flight gauge
+crabcrop_source_lookups_in_flight 0
+# HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.
+# TYPE crabcrop_source_lookups_capacity gauge
+crabcrop_source_lookups_capacity {lookup_slots}
+# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.
+# TYPE crabcrop_cache_tier_errors_total counter
+crabcrop_cache_tier_errors_total{{tier="disk"}} 0
+crabcrop_cache_tier_errors_total{{tier="shared"}} 0
+# HELP crabcrop_cache_disk_ops_in_flight Disk tier operations holding one of its 32 slots.
+# TYPE crabcrop_cache_disk_ops_in_flight gauge
+crabcrop_cache_disk_ops_in_flight 0
+# HELP crabcrop_cache_disk_groups_behind Disk entries whose file has not caught up with the cache groups they were served under.
+# TYPE crabcrop_cache_disk_groups_behind gauge
+crabcrop_cache_disk_groups_behind 0
+# HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.
+# TYPE crabcrop_cache_disk_deletions_queued gauge
+crabcrop_cache_disk_deletions_queued 0
+# HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.
+# TYPE crabcrop_cache_shared_puts_in_flight gauge
+crabcrop_cache_shared_puts_in_flight 0
+# HELP crabcrop_cache_shared_puts_capacity Shared tier writes allowed in flight.
+# TYPE crabcrop_cache_shared_puts_capacity gauge
+crabcrop_cache_shared_puts_capacity {puts}
+# HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.
+# TYPE crabcrop_cache_shared_puts_skipped_total counter
+crabcrop_cache_shared_puts_skipped_total 0
+# HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.
+# TYPE crabcrop_cache_shared_tombstones_unread gauge
+crabcrop_cache_shared_tombstones_unread 0
+# HELP crabcrop_cache_shared_tombstones_listed_timestamp_seconds When this replica last listed the purge tombstones completely, in Unix seconds; 0 before its first complete listing.
+# TYPE crabcrop_cache_shared_tombstones_listed_timestamp_seconds gauge
+crabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000
+"#
+    );
+    assert_eq!(sections, expected);
+}
+
+#[tokio::test]
 async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     // Issue #463: every shared write-through was a bare
     // spawn, so a stalled bucket let them pile up, one per

@@ -673,18 +673,15 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
             accept.as_deref(),
         );
     }
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        format!(
-            "{}{}{}{}{}",
-            state.metrics.render(),
-            lane_metrics(&state),
-            source_buffer_metrics(&state),
-            source_lookup_metrics(&state),
-            tier_metrics(&state)
-        ),
-    )
-        .into_response()
+    // One buffer for the whole exposition (issue #643):
+    // each section appends its lines to it.
+    let mut out = String::with_capacity(4096);
+    state.metrics.render_into(&mut out);
+    lane_metrics(&state, &mut out);
+    source_buffer_metrics(&state, &mut out);
+    source_lookup_metrics(&state, &mut out);
+    tier_metrics(&state, &mut out);
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
 }
 
 /// Per-lane occupancy for `/metrics` (issue #324): how
@@ -692,29 +689,32 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 /// against the lane's capacity. Read live from the gates
 /// at scrape time, so a lane saturated by long encodes
 /// shows itself here while the stills lane stays free.
-fn lane_metrics(state: &AppState) -> String {
-    let mut out = String::new();
+fn lane_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     out.push_str("# HELP crabcrop_lane_in_use Processing lane permits currently in use.\n");
     out.push_str("# TYPE crabcrop_lane_in_use gauge\n");
-    out.push_str(&format!(
-        "crabcrop_lane_in_use{{lane=\"process\"}} {}\n",
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_in_use{{lane=\"process\"}} {}",
         state.process_gate.in_use()
-    ));
-    out.push_str(&format!(
-        "crabcrop_lane_in_use{{lane=\"slow\"}} {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_in_use{{lane=\"slow\"}} {}",
         state.slow_gate.in_use()
-    ));
+    );
     out.push_str("# HELP crabcrop_lane_capacity Processing lane permit capacity.\n");
     out.push_str("# TYPE crabcrop_lane_capacity gauge\n");
-    out.push_str(&format!(
-        "crabcrop_lane_capacity{{lane=\"process\"}} {}\n",
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_capacity{{lane=\"process\"}} {}",
         state.process_gate.capacity()
-    ));
-    out.push_str(&format!(
-        "crabcrop_lane_capacity{{lane=\"slow\"}} {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_capacity{{lane=\"slow\"}} {}",
         state.slow_gate.capacity()
-    ));
-    out
+    );
 }
 
 /// Source buffer budget occupancy for `/metrics` (issue
@@ -723,9 +723,11 @@ fn lane_metrics(state: &AppState) -> String {
 /// scrape time. In use sitting at capacity while requests
 /// shed with `server_busy` is the signal to raise
 /// `CRABCROP_SOURCE_BUFFER_MAX_MB`.
-fn source_buffer_metrics(state: &AppState) -> String {
+fn source_buffer_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     let budget = state.loader.source_budget();
-    format!(
+    let _ = write!(
+        out,
         "# HELP crabcrop_source_buffer_bytes Source bytes cache misses hold against the source buffer budget.\n\
          # TYPE crabcrop_source_buffer_bytes gauge\n\
          crabcrop_source_buffer_bytes {}\n\
@@ -734,7 +736,7 @@ fn source_buffer_metrics(state: &AppState) -> String {
          crabcrop_source_buffer_capacity_bytes {}\n",
         budget.in_use(),
         budget.capacity()
-    )
+    );
 }
 
 /// Source host lookup slot occupancy for `/metrics`: the
@@ -743,16 +745,18 @@ fn source_buffer_metrics(state: &AppState) -> String {
 /// In flight sitting at capacity while requests shed with
 /// `server_busy` means the resolver is not answering for the
 /// host names requests carry.
-fn source_lookup_metrics(state: &AppState) -> String {
+fn source_lookup_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     let (in_flight, capacity) = state.loader.lookup_slots();
-    format!(
+    let _ = write!(
+        out,
         "# HELP crabcrop_source_lookups_in_flight Source host lookups running now.\n\
          # TYPE crabcrop_source_lookups_in_flight gauge\n\
          crabcrop_source_lookups_in_flight {in_flight}\n\
          # HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.\n\
          # TYPE crabcrop_source_lookups_capacity gauge\n\
          crabcrop_source_lookups_capacity {capacity}\n"
-    )
+    );
 }
 
 /// Cache tier failures for `/metrics` (issue #367): the
@@ -762,27 +766,30 @@ fn source_lookup_metrics(state: &AppState) -> String {
 /// write-through slots and skips follow (issue #463), then
 /// what its last complete listing of the purge tombstones
 /// found unread, and when that was (issue #577).
-fn tier_metrics(state: &AppState) -> String {
-    let mut out = String::new();
+fn tier_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
     out.push_str("# TYPE crabcrop_cache_tier_errors_total counter\n");
     if let Some(store) = &state.store {
-        out.push_str(&format!(
-            "crabcrop_cache_tier_errors_total{{tier=\"disk\"}} {}\n",
+        let _ = writeln!(
+            out,
+            "crabcrop_cache_tier_errors_total{{tier=\"disk\"}} {}",
             store.errors()
-        ));
+        );
     }
     if let Some(store) = &state.shared_store {
-        out.push_str(&format!(
-            "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}\n",
+        let _ = writeln!(
+            out,
+            "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}",
             store.errors()
-        ));
+        );
     }
     // The disk tier's slots in use and its background work
     // (issue #572): queue lengths, never an index scan.
     if let Some(store) = &state.store {
         let (behind, deletions) = store.queued();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "# HELP crabcrop_cache_disk_ops_in_flight Disk tier operations holding one of its 32 slots.\n\
              # TYPE crabcrop_cache_disk_ops_in_flight gauge\n\
              crabcrop_cache_disk_ops_in_flight {}\n\
@@ -793,14 +800,15 @@ fn tier_metrics(state: &AppState) -> String {
              # TYPE crabcrop_cache_disk_deletions_queued gauge\n\
              crabcrop_cache_disk_deletions_queued {deletions}\n",
             store.ops_in_flight()
-        ));
+        );
     }
     if let Some(store) = &state.shared_store {
         // The write bound (issue #463): in flight against
         // its slots, and the render write-throughs skipped
         // because every slot was taken.
         let background = &state.background;
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "# HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.\n\
              # TYPE crabcrop_cache_shared_puts_in_flight gauge\n\
              crabcrop_cache_shared_puts_in_flight {}\n\
@@ -813,13 +821,14 @@ fn tier_metrics(state: &AppState) -> String {
             background.puts_in_flight(),
             background.put_capacity(),
             background.puts_skipped()
-        ));
+        );
         // The tombstone gap (issue #577): the unread count
         // stays as of the last complete listing, so a listing
         // time that stops moving is the sign of a failing
         // listing.
         let listed_ms = store.tombstones_listed_ms();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "# HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.\n\
              # TYPE crabcrop_cache_shared_tombstones_unread gauge\n\
              crabcrop_cache_shared_tombstones_unread {}\n\
@@ -829,9 +838,8 @@ fn tier_metrics(state: &AppState) -> String {
             store.tombstones_unread(),
             listed_ms / 1000,
             listed_ms % 1000
-        ));
+        );
     }
-    out
 }
 
 /// The DPR hint headers [`dpr_hint`] reads, the
