@@ -204,3 +204,259 @@ fn sharpen_through_the_filter_matches_the_per_sample_sums() {
         }
     }
 }
+
+/// Grayscale as it stood before issue #659: a pixel at a
+/// time, rounded by `f32::round`.
+fn old_grayscale(img: DynamicImage) -> DynamicImage {
+    map_rgb(img, |r, g, b| {
+        let y = luma(r, g, b).round().clamp(0.0, 255.0) as u8;
+        [y, y, y]
+    })
+}
+
+fn new_grayscale(img: DynamicImage) -> DynamicImage {
+    apply_filters(img, &[Filter::Grayscale]).0
+}
+
+/// Saturation as it stood before issue #659.
+fn old_saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
+    let w = out.width() as usize;
+    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
+        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        [
+            (luma + (r as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
+            (luma + (g as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
+            (luma + (b as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
+        ]
+    });
+    out
+}
+
+#[test]
+fn lane_rounding_matches_round_then_clamp() {
+    // Issue #659: grayscale rounds without `f32::round`. All
+    // 2^32 bit patterns agree (checked outside the suite);
+    // here, a pattern in every 4099, which crosses every
+    // sign, exponent and NaN payload, then the 64 floats on
+    // each side of every whole and every half from -2 to
+    // 258, where a rounding rule or a clamp bound could
+    // differ, then the values with a rule of their own.
+    let old = |x: f32| x.round().clamp(0.0, 255.0) as u8;
+    let mut cases = 0u32;
+    let mut check = |bits: u32| {
+        let x = f32::from_bits(bits);
+        assert_eq!(round_lane(x) as u8, old(x), "{x:e} ({bits:#010x})");
+        cases += 1;
+    };
+    for bits in (0..=u32::MAX).step_by(4099) {
+        check(bits);
+    }
+    for half in -4..=516 {
+        let center = (half as f32 * 0.5).to_bits();
+        for step in 0..=64 {
+            check(center.wrapping_add(step));
+            check(center.wrapping_sub(step));
+        }
+    }
+    for x in [
+        f32::NAN,
+        -f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MAX,
+        f32::MIN,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::EPSILON,
+        1e-45,
+    ] {
+        check(x.to_bits());
+    }
+    assert_eq!(cases, 1_047_809 + 521 * 130 + 10);
+    // The halves round away from zero and the result stays
+    // inside a byte.
+    assert_eq!(round_lane(0.5), 1.0);
+    assert_eq!(round_lane(1.5), 2.0);
+    assert_eq!(round_lane(2.5), 3.0);
+    assert_eq!(round_lane(254.5), 255.0);
+    assert_eq!(round_lane(0.49999997), 0.0);
+    assert_eq!(round_lane(1e9), 255.0);
+    assert_eq!(round_lane(-1e9), 0.0);
+    assert_eq!(round_lane(f32::NAN), 0.0);
+}
+
+/// Colors a rewrite of the grayscale sum would move. For the
+/// first six, the rounded luma depends on the order the
+/// three products are added in; for the last six the luma
+/// is an exact half, where the rounding rule shows.
+const GRAY_WITNESSES: [u32; 12] = [
+    0x013fe6, 0x513b20, 0x87e97e, 0xb0f420, 0xd73f51, 0xeadc15, 0x0000fa, 0x2a2c01, 0x540a65,
+    0x7e2035, 0xa89625, 0xd2c04f,
+];
+
+/// Colors that `saturation(1.2)` written as a blend of the
+/// sample and the luma (`s * a + luma * (1 - a)`) would move.
+const SATURATION_WITNESSES: [u32; 6] = [0x007828, 0x298949, 0x4f4174, 0x811734, 0xaff148, 0xdd7390];
+
+fn channels(color: u32) -> [u8; 3] {
+    let [_, r, g, b] = color.to_be_bytes();
+    [r, g, b]
+}
+
+/// A lattice of the RGB cube that keeps both ends and the
+/// middle of every channel, then the witnesses, as one image
+/// of an odd width.
+fn sampled_colors() -> image::RgbImage {
+    let levels = [
+        0u8, 1, 2, 3, 7, 15, 16, 17, 31, 63, 64, 65, 85, 100, 127, 128, 129, 150, 191, 200, 223,
+        253, 254, 255,
+    ];
+    let mut colors = Vec::new();
+    for r in levels {
+        for g in levels {
+            for b in levels {
+                colors.push([r, g, b]);
+            }
+        }
+    }
+    colors.extend(GRAY_WITNESSES.map(channels));
+    colors.extend(SATURATION_WITNESSES.map(channels));
+    let width = 173;
+    let height = colors.len().div_ceil(width);
+    image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
+        image::Rgb(colors[(y as usize * width + x as usize) % colors.len()])
+    })
+}
+
+#[test]
+fn the_witness_colors_tell_a_rewrite_apart() {
+    // What makes the sample of the next test worth running:
+    // each witness is a color on which a plausible other
+    // spelling of the arithmetic gives another byte.
+    for color in &GRAY_WITNESSES[..6] {
+        let [r, g, b] = channels(*color).map(f32::from);
+        let regrouped = 0.299 * r + (0.587 * g + 0.114 * b);
+        assert_ne!(luma_of(r, g, b).round(), regrouped.round(), "{color:#08x}");
+    }
+    for color in &GRAY_WITNESSES[6..] {
+        let [r, g, b] = channels(*color).map(f32::from);
+        let luma = luma_of(r, g, b);
+        assert_eq!(luma.fract(), 0.5, "{color:#08x}");
+        assert_ne!(luma.round(), luma.round_ties_even(), "{color:#08x}");
+    }
+    let amount = 1.2f32;
+    for color in SATURATION_WITNESSES {
+        let rgb = channels(color).map(f32::from);
+        let luma = luma_of(rgb[0], rgb[1], rgb[2]);
+        let ours = rgb.map(|s| (luma + (s - luma) * amount).clamp(0.0, 255.0) as u8);
+        let blended = rgb.map(|s| (s * amount + luma * (1.0 - amount)).clamp(0.0, 255.0) as u8);
+        assert_ne!(ours, blended, "{color:#08x}");
+    }
+}
+
+#[test]
+fn grayscale_and_saturation_lanes_match_the_per_pixel_maps() {
+    // Issue #659. A sample of the RGB cube with the colors
+    // above in it (all 16.7 million agree, checked outside
+    // the suite); saturation at amounts across its range and
+    // at the values no request can spell.
+    let colors = sampled_colors();
+    let dynamic = DynamicImage::ImageRgb8(colors.clone());
+    assert_eq!(
+        old_grayscale(dynamic.clone()).as_bytes(),
+        new_grayscale(dynamic).as_bytes()
+    );
+    for amount in [
+        0.0f32,
+        0.3,
+        0.5,
+        1.0,
+        1.1,
+        1.2,
+        1.5,
+        2.0,
+        7.3,
+        255.0,
+        -1.0,
+        f32::INFINITY,
+        f32::NAN,
+    ] {
+        assert_eq!(
+            old_saturate(colors.clone(), amount).as_raw(),
+            saturate(colors.clone(), amount).as_raw(),
+            "saturation {amount}"
+        );
+    }
+    // Every remainder a row can leave against the lanes, with
+    // and without alpha, and a gray source, which is widened
+    // to RGB first. Alpha comes through untouched.
+    for w in 1..=33 {
+        let h = 1 + w % 3;
+        let rgb = DynamicImage::ImageRgb8(rgb(w, h, harsh));
+        let mut rgba = rgb.to_rgba8();
+        for (x, y, p) in rgba.enumerate_pixels_mut() {
+            p[3] = smooth(y, x, 3);
+        }
+        let rgba = DynamicImage::ImageRgba8(rgba);
+        let luma = DynamicImage::ImageLuma8(rgb.to_luma8());
+        for img in [&rgb, &rgba, &luma] {
+            let ours = new_grayscale(img.clone());
+            let old = old_grayscale(img.clone());
+            assert_eq!(old.color(), ours.color(), "{:?} {w}x{h}", img.color());
+            assert_eq!(old.as_bytes(), ours.as_bytes(), "{:?} {w}x{h}", img.color());
+        }
+        let gray = new_grayscale(rgba.clone()).to_rgba8();
+        assert!(
+            gray.pixels()
+                .zip(rgba.to_rgba8().pixels())
+                .all(|(a, b)| a[3] == b[3])
+        );
+        let raw = rgb.to_rgb8();
+        for amount in [0.3f32, 1.2] {
+            assert_eq!(
+                old_saturate(raw.clone(), amount).as_raw(),
+                saturate(raw.clone(), amount).as_raw(),
+                "saturation {amount} {w}x{h}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lanes_split_into_bands_where_the_per_pixel_maps_do() {
+    // Issue #659: the lane mapping bands a frame under the
+    // rule the per-pixel maps follow, read from one place:
+    // the calling thread under 3,000,000 subpixels or 256
+    // rows, else one band per core, four at most.
+    let threads = band_threads();
+    assert!((1..=4).contains(&threads));
+    assert_eq!(pointwise_band_rows(2_999_997, 2_997), None);
+    assert_eq!(pointwise_band_rows(255 * 30_000, 30_000), None);
+    assert_eq!(pointwise_band_rows(0, 0), None);
+    let banded = (threads > 1).then(|| 1001usize.div_ceil(threads));
+    assert_eq!(pointwise_band_rows(1001 * 3_009, 3_009), banded);
+    // Over the threshold the bytes are still the per-pixel
+    // maps', bands or not, with a last band that is short
+    // and rows that do not fill a block.
+    let big = rgb(1003, 1001, harsh);
+    assert!(big.as_raw().len() >= 3_000_000);
+    let dynamic = DynamicImage::ImageRgb8(big.clone());
+    assert_eq!(
+        old_grayscale(dynamic.clone()).as_bytes(),
+        new_grayscale(dynamic).as_bytes()
+    );
+    assert_eq!(
+        old_saturate(big.clone(), 1.2).as_raw(),
+        saturate(big, 1.2).as_raw()
+    );
+    let mut rgba = DynamicImage::ImageRgb8(rgb(867, 869, smooth)).to_rgba8();
+    for (x, y, p) in rgba.enumerate_pixels_mut() {
+        p[3] = harsh(x, y, 3);
+    }
+    assert!(rgba.as_raw().len() >= 3_000_000);
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    assert_eq!(
+        old_grayscale(rgba.clone()).as_bytes(),
+        new_grayscale(rgba).as_bytes()
+    );
+}

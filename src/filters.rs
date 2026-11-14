@@ -336,9 +336,13 @@ pub fn apply_filters_within(
     for filter in filters {
         match filter {
             Filter::Grayscale => {
-                img = map_rgb(img, |r, g, b| {
-                    let y = luma(r, g, b).round().clamp(0.0, 255.0) as u8;
-                    [y, y, y]
+                img = map_rgb_lanes(img, |r, g, b| {
+                    for i in 0..LANES {
+                        let y = round_lane(luma_of(r[i], g[i], b[i]));
+                        r[i] = y;
+                        g[i] = y;
+                        b[i] = y;
+                    }
                 });
             }
             Filter::Invert => img.invert(),
@@ -640,6 +644,13 @@ fn luma(r: u8, g: u8, b: u8) -> f32 {
     0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
 }
 
+/// [`luma`] of samples already widened: the same three
+/// products, added in the same order.
+#[inline(always)]
+fn luma_of(r: f32, g: f32, b: f32) -> f32 {
+    0.299 * r + 0.587 * g + 0.114 * b
+}
+
 /// Map the RGB channels of every pixel through `f`, which
 /// returns the new channels. Alpha survives untouched when
 /// the image carries it; other channel layouts normalize to
@@ -670,12 +681,7 @@ fn map_rgb_bands<const CH: usize>(
     f: &(impl Fn(u8, u8, u8) -> [u8; 3] + Sync),
 ) {
     let row = width * CH;
-    let rows = buf.len() / row.max(1);
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4);
-    if threads < 2 || rows < 256 || buf.len() < 3_000_000 {
+    let Some(band_rows) = pointwise_band_rows(buf.len(), row) else {
         for p in buf.as_chunks_mut::<CH>().0 {
             let [r, g, b] = f(p[0], p[1], p[2]);
             p[0] = r;
@@ -683,8 +689,7 @@ fn map_rgb_bands<const CH: usize>(
             p[2] = b;
         }
         return;
-    }
-    let band_rows = rows.div_ceil(threads);
+    };
     std::thread::scope(|s| {
         for band in buf.chunks_mut(band_rows * row) {
             s.spawn(move || {
@@ -697,6 +702,129 @@ fn map_rgb_bands<const CH: usize>(
             });
         }
     });
+}
+
+/// How a per-pixel map splits a buffer of `len` bytes, in
+/// rows of `row` bytes, into row bands across threads: the
+/// rows of one band, or `None` to map the buffer on the
+/// calling thread. A frame under 3,000,000 subpixels or 256
+/// rows does not repay a spawn, and banding needs a second
+/// core; past that, up to four bands.
+fn pointwise_band_rows(len: usize, row: usize) -> Option<usize> {
+    let rows = len / row.max(1);
+    let threads = band_threads();
+    if threads < 2 || rows < 256 || len < 3_000_000 {
+        None
+    } else {
+        Some(rows.div_ceil(threads))
+    }
+}
+
+/// How many pixels one step of a lane mapping takes.
+const LANES: usize = 16;
+
+/// One channel of [`LANES`] pixels, widened to `f32`.
+type Lane = [f32; LANES];
+
+/// `x.round().clamp(0.0, 255.0)` for every `f32`, without
+/// the call into the C library that `f32::round` compiles to
+/// on baseline x86-64: clamp first, truncate through an
+/// integer, and let the fraction, which that subtraction
+/// gives exactly, decide. NaN comes out as zero, which is
+/// also what it becomes as a byte.
+#[inline(always)]
+fn round_lane(x: f32) -> f32 {
+    let c = x.clamp(0.0, 255.0);
+    let whole = (c as i32) as f32;
+    whole + if c - whole >= 0.5 { 1.0 } else { 0.0 }
+}
+
+/// [`map_rgb`] for a mapping written over lanes (issue
+/// #659): `f` gets the red, green and blue samples of
+/// [`LANES`] pixels as three `f32` arrays and leaves each
+/// result in place, a value in 0 to 255 that is truncated to
+/// the output sample. A lane is one pixel, computed with the
+/// `f32` operations a pixel at a time would use, in the same
+/// order, so the bytes are the same; the arrays let the
+/// compiler turn that arithmetic into vector code, which
+/// interleaved bytes do not.
+fn map_rgb_lanes(
+    img: DynamicImage,
+    f: impl Fn(&mut Lane, &mut Lane, &mut Lane) + Sync,
+) -> DynamicImage {
+    if img.color().has_alpha() {
+        let mut rgba = img.into_rgba8();
+        let w = rgba.width() as usize;
+        lanes_bands::<4>(rgba.as_mut(), w, &f);
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = img.into_rgb8();
+        let w = rgb.width() as usize;
+        lanes_bands::<3>(rgb.as_mut(), w, &f);
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+/// A lane mapping over a raw channel buffer, in the row bands
+/// of [`map_rgb_bands`]. Channels past the third (alpha) are
+/// left as they are.
+fn lanes_bands<const CH: usize>(
+    buf: &mut [u8],
+    width: usize,
+    f: &(impl Fn(&mut Lane, &mut Lane, &mut Lane) + Sync),
+) {
+    let run = |band: &mut [u8]| {
+        let (blocks, rest) = band.as_chunks_mut::<CH>().0.as_chunks_mut::<LANES>();
+        for block in blocks {
+            lanes_block(block, f);
+        }
+        if !rest.is_empty() {
+            // The last pixels ride in a full block; the spare
+            // lanes are computed and dropped.
+            let mut padded = [[0u8; CH]; LANES];
+            padded[..rest.len()].copy_from_slice(rest);
+            lanes_block(&mut padded, f);
+            rest.copy_from_slice(&padded[..rest.len()]);
+        }
+    };
+    let row = width * CH;
+    let Some(band_rows) = pointwise_band_rows(buf.len(), row) else {
+        run(buf);
+        return;
+    };
+    std::thread::scope(|s| {
+        for band in buf.chunks_mut(band_rows * row) {
+            let run = &run;
+            s.spawn(move || run(band));
+        }
+    });
+}
+
+/// One block of [`lanes_bands`]: the pixels' channels out to
+/// lanes, the mapping, and the lanes back to bytes.
+#[inline(always)]
+fn lanes_block<const CH: usize>(
+    block: &mut [[u8; CH]; LANES],
+    f: &impl Fn(&mut Lane, &mut Lane, &mut Lane),
+) {
+    let (mut r, mut g, mut b) = ([0f32; LANES], [0f32; LANES], [0f32; LANES]);
+    for (i, p) in block.iter().enumerate() {
+        r[i] = p[0] as f32;
+        g[i] = p[1] as f32;
+        b[i] = p[2] as f32;
+    }
+    f(&mut r, &mut g, &mut b);
+    let (mut r8, mut g8, mut b8) = ([0u8; LANES], [0u8; LANES], [0u8; LANES]);
+    for i in 0..LANES {
+        r8[i] = r[i] as u8;
+        g8[i] = g[i] as u8;
+        b8[i] = b[i] as u8;
+    }
+    for (i, p) in block.iter_mut().enumerate() {
+        p[0] = r8[i];
+        p[1] = g8[i];
+        p[2] = b8[i];
+    }
 }
 
 fn map_rgb_image(
@@ -2993,13 +3121,13 @@ pub(crate) fn trim_to(
 /// 0 collapses to gray, 1 is the identity.
 fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
     let w = out.width() as usize;
-    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
-        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-        [
-            (luma + (r as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
-            (luma + (g as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
-            (luma + (b as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
-        ]
+    lanes_bands::<3>(out.as_mut(), w, &|r, g, b| {
+        for i in 0..LANES {
+            let luma = luma_of(r[i], g[i], b[i]);
+            r[i] = (luma + (r[i] - luma) * amount).clamp(0.0, 255.0);
+            g[i] = (luma + (g[i] - luma) * amount).clamp(0.0, 255.0);
+            b[i] = (luma + (b[i] - luma) * amount).clamp(0.0, 255.0);
+        }
     });
     out
 }
@@ -3216,6 +3344,7 @@ mod w4proofs;
 
 // The loops reshaped so the compiler can vectorize them, each
 // pinned against a frozen copy of the loop it replaced: the
-// row passes of the 3x3 convolution (issue #658).
+// row passes of the 3x3 convolution (issue #658) and the
+// lane mapping behind grayscale and saturation (issue #659).
 #[cfg(test)]
 mod vector_proofs;
