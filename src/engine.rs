@@ -5514,7 +5514,7 @@ fn apply_size_windowed(
     } else {
         match window {
             Some((x, y, ww, wh)) => resize_lanczos3_cropped(&img, x, y, ww, wh, w, h),
-            None => resize_lanczos3(&img, w, h),
+            None => resize_lanczos3_owned(img, w, h),
         }
     };
     if size.flip_horizontal {
@@ -5545,10 +5545,7 @@ pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImag
             ));
         }
     };
-    let opts = fast_image_resize::ResizeOptions::new().resize_alg(
-        fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3),
-    );
-    match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
+    match fast_image_resize::Resizer::new().resize(img, &mut dst, &lanczos3_options()) {
         Ok(()) => dst,
         Err(_) => DynamicImage::ImageRgba8(image::imageops::resize(
             img,
@@ -5557,6 +5554,102 @@ pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImag
             image::imageops::FilterType::Lanczos3,
         )),
     }
+}
+
+/// The backend's options for the one resample every resize
+/// here runs: the Lanczos3 convolution.
+fn lanczos3_options() -> fast_image_resize::ResizeOptions {
+    fast_image_resize::ResizeOptions::new().resize_alg(fast_image_resize::ResizeAlg::Convolution(
+        fast_image_resize::FilterType::Lanczos3,
+    ))
+}
+
+/// [`resize_lanczos3`] of a frame the caller is done with
+/// (issue #657). The backend resamples a layout with alpha
+/// premultiplied, and it premultiplies a borrowed frame into
+/// a second buffer the size of the frame. An owned frame is
+/// premultiplied where it sits instead (see
+/// [`resample_premultiplying`]): the same three steps on the
+/// same values, so the same bytes, without that buffer. A
+/// layout without alpha takes [`resize_lanczos3`] as it is,
+/// and so does a size that needs no resample: the backend
+/// copies those pixels untouched, which a premultiply and a
+/// divide around the copy would not.
+fn resize_lanczos3_owned(mut img: DynamicImage, w: u32, h: u32) -> DynamicImage {
+    use fast_image_resize::IntoImageView;
+    let has_alpha_step = img
+        .pixel_type()
+        .is_some_and(|layout| fast_image_resize::MulDiv::new().is_supported(layout));
+    let (sw, sh) = (img.width(), img.height());
+    if !has_alpha_step || (w, h) == (sw, sh) || w == 0 || h == 0 || sw == 0 || sh == 0 {
+        return resize_lanczos3(&img, w, h);
+    }
+    let Some(mut dst) = blank_like(&img, w, h) else {
+        return resize_lanczos3(&img, w, h);
+    };
+    if resample_premultiplying(&mut img, &mut dst) {
+        dst
+    } else {
+        resize_lanczos3(&img, w, h)
+    }
+}
+
+/// Resample `src` into `dst` the way the backend resamples a
+/// layout with alpha, but premultiplying `src` where it sits
+/// instead of into a copy: the backend's own premultiply,
+/// its convolution with the alpha step off, and its own
+/// divide of the result. `true` when `dst` holds the result.
+///
+/// On `false` `dst` holds nothing usable and `src` is
+/// straight alpha again, so a premultiplied frame never
+/// leaves this function. The backend refuses layouts, not
+/// pixels, and it refuses the premultiply before it writes
+/// a pixel; the callers hand over only layouts it takes.
+/// Should the convolution or the divide refuse all the same,
+/// `src` is divided back before the caller takes its plain
+/// path with it (a test forces this branch). The divide is
+/// the premultiply's inverse to within its rounding, so that
+/// path, which nothing reaches, can sit a rounding step away
+/// from the plain one.
+fn resample_premultiplying<S, D>(src: &mut S, dst: &mut D) -> bool
+where
+    S: fast_image_resize::IntoImageViewMut,
+    D: fast_image_resize::IntoImageViewMut,
+{
+    let mul_div = fast_image_resize::MulDiv::new();
+    if mul_div.multiply_alpha_inplace(src).is_err() {
+        return false;
+    }
+    if convolve_lanczos3(src, dst) && mul_div.divide_alpha_inplace(dst).is_ok() {
+        return true;
+    }
+    let _ = mul_div.divide_alpha_inplace(src);
+    false
+}
+
+/// The backend's Lanczos3 convolution alone, its alpha step
+/// off: what it runs between its own premultiply and divide.
+/// `false` when it refuses.
+fn convolve_lanczos3<S, D>(src: &S, dst: &mut D) -> bool
+where
+    S: fast_image_resize::IntoImageView,
+    D: fast_image_resize::IntoImageViewMut,
+{
+    #[cfg(test)]
+    if CONVOLVE_REFUSES.get() {
+        return false;
+    }
+    fast_image_resize::Resizer::new()
+        .resize(src, dst, &lanczos3_options().use_alpha(false))
+        .is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`convolve_lanczos3`] refuse on this thread, so
+    /// a test can walk the path behind a backend refusal,
+    /// which no input reaches.
+    static CONVOLVE_REFUSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A blank destination image of `img`'s own variant at
@@ -5603,11 +5696,7 @@ pub(crate) fn resize_lanczos3_cropped(
         Some(dst) => dst,
         None => return two_step(),
     };
-    let opts = fast_image_resize::ResizeOptions::new()
-        .crop(x as f64, y as f64, w as f64, h as f64)
-        .resize_alg(fast_image_resize::ResizeAlg::Convolution(
-            fast_image_resize::FilterType::Lanczos3,
-        ));
+    let opts = lanczos3_options().crop(x as f64, y as f64, w as f64, h as f64);
     match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
         Ok(()) => dst,
         Err(_) => two_step(),
@@ -5761,12 +5850,16 @@ fn apply_fit_in(
     if w == sw && h == sh {
         Ok(img)
     } else {
-        Ok(resize_lanczos3(&img, w, h))
+        Ok(resize_lanczos3_owned(img, w, h))
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+// Fast paths against the code they replaced, byte for byte.
+#[cfg(test)]
+mod identity_proofs;
 
 #[cfg(test)]
 pub(crate) mod test_formats;
