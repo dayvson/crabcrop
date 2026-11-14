@@ -5970,13 +5970,26 @@ fn apply_pad(
     cap: Option<(u32, u32)>,
     deadline: Option<std::time::Instant>,
 ) -> Result<(DynamicImage, Window), EngineError> {
+    /// What fills the canvas around the fitted image.
+    enum Backdrop {
+        Solid([u8; 3]),
+        /// The frame as it came, to scale and blur.
+        Blurred(DynamicImage),
+    }
     if target_w == 0 || target_h == 0 {
         let whole = (0, 0, img.width(), img.height());
         return Ok((img, whole));
     }
     check_output_size(target_w, target_h, (img.width(), img.height()))?;
+    let backdrop = match fill {
+        PadFill::Color(c) => Backdrop::Solid(c),
+        PadFill::Directive => Backdrop::Solid(directive_fill.unwrap_or([0, 0, 0])),
+        // Only the blurred fill reads the frame again after
+        // the fit, so only it keeps a copy (issue #656).
+        PadFill::Blur => Backdrop::Blurred(img.clone()),
+    };
     let fitted = apply_fit_in(
-        img.clone(),
+        img,
         &ImageSize {
             width: Dimension::Pixels(target_w),
             height: Dimension::Pixels(target_h),
@@ -5992,35 +6005,70 @@ fn apply_pad(
     if fitted.width() == target_w && fitted.height() == target_h {
         return Ok((fitted, (0, 0, target_w, target_h)));
     }
-    let color = match fill {
-        PadFill::Color(c) => Some(c),
-        PadFill::Directive => Some(directive_fill.unwrap_or([0, 0, 0])),
-        PadFill::Blur => None,
-    };
-    let canvas = match color {
-        Some(c) => DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+    let mut base = match backdrop {
+        Backdrop::Solid(c) => image::RgbaImage::from_raw(
             target_w,
             target_h,
-            image::Rgba([c[0], c[1], c[2], 255]),
-        )),
-        None => {
+            [c[0], c[1], c[2], 255].repeat(target_w as usize * target_h as usize),
+        )
+        .expect("canvas size"),
+        Backdrop::Blurred(source) => {
             // Ambient bars: the image scaled to cover the whole
             // canvas, then blurred hard enough that only its
             // broad colors survive.
             let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
             crate::filters::blur_fast_within(
-                &img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
+                &source.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
                 sigma,
                 deadline,
             )?
+            .into_rgba8()
         }
     };
-    let mut base = canvas.to_rgba8();
     let x = (target_w - fitted.width()) / 2;
     let y = (target_h - fitted.height()) / 2;
-    image::imageops::overlay(&mut base, &fitted.to_rgba8(), x as i64, y as i64);
     let placed = (x, y, fitted.width(), fitted.height());
+    place_on(&mut base, fitted, x, y);
     Ok((DynamicImage::ImageRgba8(base), placed))
+}
+
+/// Composite `top` over `base` at (x, y): byte for byte
+/// `image::imageops::overlay` of `top` as RGBA8 (issue #656).
+/// A source-over blend with an opaque top pixel is that
+/// pixel, and a layout without an alpha channel converts to
+/// opaque pixels only. So a `top` without alpha that lies
+/// inside `base` is written over it by rows, with no blend
+/// per pixel; one with alpha, or one that would be clipped,
+/// takes the crate's overlay.
+fn place_on(base: &mut image::RgbaImage, top: DynamicImage, x: u32, y: u32) {
+    let (tw, th) = (top.width() as usize, top.height() as usize);
+    let inside =
+        x as u64 + tw as u64 <= base.width() as u64 && y as u64 + th as u64 <= base.height() as u64;
+    if top.color().has_alpha() || !inside || tw == 0 || th == 0 {
+        image::imageops::overlay(base, &top.into_rgba8(), x as i64, y as i64);
+        return;
+    }
+    let stride = base.width() as usize * 4;
+    let span = x as usize * 4..(x as usize + tw) * 4;
+    let rows = base.chunks_exact_mut(stride).skip(y as usize).take(th);
+    match top {
+        DynamicImage::ImageRgb8(rgb) => {
+            for (dst, src) in rows.zip(rgb.as_raw().chunks_exact(tw * 3)) {
+                let dst = dst[span.clone()].as_chunks_mut::<4>().0;
+                for (d, s) in dst.iter_mut().zip(src.as_chunks::<3>().0) {
+                    *d = [s[0], s[1], s[2], 255];
+                }
+            }
+        }
+        // Gray, 16-bit and float: the crate's conversion,
+        // which is what the overlay read.
+        other => {
+            let rgba = other.into_rgba8();
+            for (dst, src) in rows.zip(rgba.as_raw().chunks_exact(tw * 4)) {
+                dst[span.clone()].copy_from_slice(src);
+            }
+        }
+    }
 }
 
 /// The box an adaptive fit-in actually fits into: the declared

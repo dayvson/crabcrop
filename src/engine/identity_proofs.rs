@@ -998,3 +998,174 @@ fn crop_size_checks_see_the_window_the_cut_had() {
         assert_eq!((windowed.width(), windowed.height()), (tw, th));
     }
 }
+
+/// `apply_pad` as it stood before issue #656: the frame
+/// cloned for the fit whatever the fill, the canvas built as
+/// a `DynamicImage` and copied to RGBA8, and the fitted image
+/// blended over it one pixel at a time by the crate.
+fn old_apply_pad(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    fill: PadFill,
+    directive_fill: Option<[u8; 3]>,
+    cap: Option<(u32, u32)>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(DynamicImage, Window), EngineError> {
+    if target_w == 0 || target_h == 0 {
+        let whole = (0, 0, img.width(), img.height());
+        return Ok((img, whole));
+    }
+    check_output_size(target_w, target_h, (img.width(), img.height()))?;
+    let fitted = apply_fit_in(
+        img.clone(),
+        &ImageSize {
+            width: Dimension::Pixels(target_w),
+            height: Dimension::Pixels(target_h),
+            flip_horizontal: false,
+            flip_vertical: false,
+        },
+        false,
+        cap,
+        1.0,
+    )?;
+    if fitted.width() == target_w && fitted.height() == target_h {
+        return Ok((fitted, (0, 0, target_w, target_h)));
+    }
+    let color = match fill {
+        PadFill::Color(c) => Some(c),
+        PadFill::Directive => Some(directive_fill.unwrap_or([0, 0, 0])),
+        PadFill::Blur => None,
+    };
+    let canvas = match color {
+        Some(c) => DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            target_w,
+            target_h,
+            image::Rgba([c[0], c[1], c[2], 255]),
+        )),
+        None => {
+            let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
+            crate::filters::blur_fast_within(
+                &img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
+                sigma,
+                deadline,
+            )?
+        }
+    };
+    let mut base = canvas.to_rgba8();
+    let x = (target_w - fitted.width()) / 2;
+    let y = (target_h - fitted.height()) / 2;
+    image::imageops::overlay(&mut base, &fitted.to_rgba8(), x as i64, y as i64);
+    let placed = (x, y, fitted.width(), fitted.height());
+    Ok((DynamicImage::ImageRgba8(base), placed))
+}
+
+#[test]
+fn pad_matches_the_clone_and_overlay_it_replaced() {
+    // Issue #656: every layout (the ones without alpha are
+    // written over the canvas by rows, the ones with alpha
+    // still blend), frames from one pixel up, canvases that
+    // bar the sides, bar the top, shrink, enlarge and match,
+    // the four fills, with and without the `no_upscale` cap.
+    // The image, and where it reports the fitted frame sits.
+    let far = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (3, 2), (37, 20), (20, 37)] {
+        for (name, img) in layouts(w, h, harsh, mixed_alpha(harsh)) {
+            for (tw, th) in [(50, 50), (30, 50), (50, 30), (7, 3), (37, 20), (1, 1)] {
+                for fill in [
+                    PadFill::Color([255, 255, 255]),
+                    PadFill::Color([17, 34, 51]),
+                    PadFill::Directive,
+                    PadFill::Blur,
+                ] {
+                    for cap in [None, Some((w, h))] {
+                        // The blurred fill is slow in a debug
+                        // build: it runs where its path
+                        // differs, not on every combination.
+                        let blurs = ["rgb8", "rgba8", "luma16"].contains(&name)
+                            && cap.is_none()
+                            && [(30, 50), (50, 30), (1, 1)].contains(&(tw, th));
+                        if fill == PadFill::Blur && !blurs {
+                            continue;
+                        }
+                        let directive = (tw > th).then_some([9, 8, 7]);
+                        let old = old_apply_pad(img.clone(), tw, th, fill, directive, cap, far)
+                            .expect("a pad inside the limits");
+                        let new = apply_pad(img.clone(), tw, th, fill, directive, cap, far)
+                            .expect("a pad inside the limits");
+                        assert!(
+                            same(&old.0, &new.0),
+                            "{name} {w}x{h} to {tw}x{th} {fill:?} {cap:?}"
+                        );
+                        assert_eq!(old.1, new.1, "{name} {w}x{h} to {tw}x{th} {fill:?} {cap:?}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 4 * 10 * 6 * 3 * 2 + 4 * 3 * 3);
+    // A zero side pads nothing, and a canvas past the limit
+    // is refused before the fit, as it was.
+    let img = layouts(37, 20, harsh, mixed_alpha(harsh)).remove(0).1;
+    let (same_img, placed) =
+        apply_pad(img.clone(), 0, 50, PadFill::Blur, None, None, None).expect("no canvas");
+    assert!(same(&img, &same_img));
+    assert_eq!(placed, (0, 0, 37, 20));
+    let over = crate::url::MAX_DIMENSION + 1;
+    let refusal = |pad: Result<(DynamicImage, Window), EngineError>| {
+        pad.expect_err("a canvas past the limit").to_string()
+    };
+    assert_eq!(
+        refusal(old_apply_pad(
+            img.clone(),
+            over,
+            9,
+            PadFill::Directive,
+            None,
+            None,
+            None
+        )),
+        refusal(apply_pad(
+            img.clone(),
+            over,
+            9,
+            PadFill::Directive,
+            None,
+            None,
+            None
+        )),
+    );
+}
+
+#[test]
+fn placing_falls_back_to_the_blend_wherever_a_row_copy_is_not_it() {
+    // Issue #656: the row copy stands for the crate's overlay
+    // only for a top image without alpha that lies inside
+    // the canvas. One with alpha blends, and one the canvas
+    // clips is clipped, both by the crate; all three match
+    // the crate's overlay of the RGBA8 form.
+    let canvas = || {
+        image::RgbaImage::from_fn(40, 30, |x, y| {
+            image::Rgba([
+                smooth(x, y, 0),
+                smooth(x, y, 1),
+                smooth(x, y, 2),
+                smooth(y, x, 3),
+            ])
+        })
+    };
+    let mut cases = 0;
+    for (name, top) in layouts(20, 12, harsh, mixed_alpha(harsh)) {
+        for (x, y) in [(0, 0), (20, 18), (10, 9), (21, 3), (5, 19), (40, 30)] {
+            let mut expected = canvas();
+            image::imageops::overlay(&mut expected, &top.to_rgba8(), x as i64, y as i64);
+            let mut ours = canvas();
+            place_on(&mut ours, top.clone(), x, y);
+            assert_eq!(expected.as_raw(), ours.as_raw(), "{name} at {x},{y}");
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 60);
+}
