@@ -225,7 +225,7 @@ pub fn focal_point(img: &DynamicImage) -> FocalPoint {
         return CENTER;
     }
     let thumb = if w.max(h) > MAX_DIM {
-        img.thumbnail(MAX_DIM, MAX_DIM)
+        thumbnail_fast(img, MAX_DIM, MAX_DIM)
     } else {
         img.clone()
     };
@@ -256,6 +256,141 @@ pub fn focal_point(img: &DynamicImage) -> FocalPoint {
         x: (sum_x / total) as f32 / (tw - 1) as f32,
         y: (sum_y / total) as f32 / (th - 1) as f32,
     }
+}
+
+/// `DynamicImage::thumbnail`, byte for byte, for the two
+/// layouts nearly every source decodes to (issue #655). The
+/// crate's thumbnail is a block mean: every output pixel is
+/// the rounded integer mean of the block of source pixels it
+/// covers, read one pixel at a time. This sums whole source
+/// rows into per-column sums and then sums each block's
+/// columns, which adds the same integers in another order.
+/// Every other layout, and a thumbnail [`thumbnail_plan`]
+/// has no blocks for, takes the crate's path.
+pub(crate) fn thumbnail_fast(img: &DynamicImage, nwidth: u32, nheight: u32) -> DynamicImage {
+    let plan = match img {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => {
+            thumbnail_plan(img.width(), img.height(), nwidth, nheight)
+        }
+        _ => None,
+    };
+    let Some(plan) = plan else {
+        return img.thumbnail(nwidth, nheight);
+    };
+    let (w, h) = plan.size();
+    let mut thumb = match img {
+        DynamicImage::ImageRgb8(src) => {
+            let out = thumbnail_blocks::<3>(src.as_raw(), src.width(), &plan);
+            DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, out).expect("thumbnail size"))
+        }
+        DynamicImage::ImageRgba8(src) => {
+            let out = thumbnail_blocks::<4>(src.as_raw(), src.width(), &plan);
+            DynamicImage::ImageRgba8(image::RgbaImage::from_raw(w, h, out).expect("thumbnail size"))
+        }
+        _ => return img.thumbnail(nwidth, nheight),
+    };
+    // The crate's thumbnail keeps the color space.
+    let _ = thumb.set_color_space(img.color_space());
+    thumb
+}
+
+/// The blocks of a block-mean thumbnail: for each output
+/// column and each output row, the half-open run of source
+/// columns or rows it averages.
+struct ThumbnailPlan {
+    columns: Vec<(u32, u32)>,
+    rows: Vec<(u32, u32)>,
+}
+
+impl ThumbnailPlan {
+    fn size(&self) -> (u32, u32) {
+        (self.columns.len() as u32, self.rows.len() as u32)
+    }
+}
+
+/// The largest block [`thumbnail_plan`] plans: 8-bit samples
+/// summed over this many pixels, plus the rounding term,
+/// still fit the `u32` the crate sums in.
+const THUMBNAIL_BLOCK_MAX: u64 = 1 << 24;
+
+/// The blocks the crate's thumbnail averages when it fits a
+/// `width` by `height` image inside `nwidth` by `nheight`,
+/// from the crate's own formulas. `None` when the crate does
+/// something other than average whole blocks: a block that
+/// holds no whole source pixel on an axis (it interpolates
+/// there, as it does for every upscale), an empty image, or
+/// a block past [`THUMBNAIL_BLOCK_MAX`].
+fn thumbnail_plan(width: u32, height: u32, nwidth: u32, nheight: u32) -> Option<ThumbnailPlan> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // The crate's `resize_dimensions`, fitting inside.
+    let wratio = f64::from(nwidth) / f64::from(width);
+    let hratio = f64::from(nheight) / f64::from(height);
+    let ratio = f64::min(wratio, hratio);
+    let new_w = ((f64::from(width) * ratio).round() as u64).max(1);
+    let new_h = ((f64::from(height) * ratio).round() as u64).max(1);
+    let plan = ThumbnailPlan {
+        columns: thumbnail_bounds(width, u32::try_from(new_w).ok()?)?,
+        rows: thumbnail_bounds(height, u32::try_from(new_h).ok()?)?,
+    };
+    let longest = |blocks: &[(u32, u32)]| blocks.iter().map(|&(low, high)| high - low).max();
+    let block = u64::from(longest(&plan.columns)?) * u64::from(longest(&plan.rows)?);
+    (block <= THUMBNAIL_BLOCK_MAX).then_some(plan)
+}
+
+/// The block bounds the crate's thumbnail computes along one
+/// axis of `len` source pixels for `new_len` output pixels,
+/// in its own `f32` arithmetic. `None` when a block holds no
+/// whole source pixel.
+fn thumbnail_bounds(len: u32, new_len: u32) -> Option<Vec<(u32, u32)>> {
+    let ratio = len as f32 / new_len as f32;
+    let mut bounds = Vec::new();
+    for out in 0..new_len {
+        let lowf = out as f32 * ratio;
+        let highf = lowf + ratio;
+        let low = (lowf.ceil() as u32).clamp(0, len - 1);
+        let high = (highf.ceil() as u32).clamp(low, len);
+        if low == high {
+            return None;
+        }
+        bounds.push((low, high));
+    }
+    Some(bounds)
+}
+
+/// The block means of a raw 8-bit buffer of `CH` channels,
+/// `width` pixels wide, over the blocks of `plan`.
+fn thumbnail_blocks<const CH: usize>(raw: &[u8], width: u32, plan: &ThumbnailPlan) -> Vec<u8> {
+    let stride = width as usize * CH;
+    let mut sums = vec![0u32; stride];
+    let mut out = vec![0u8; plan.columns.len() * plan.rows.len() * CH];
+    let out_rows = out.chunks_exact_mut(plan.columns.len() * CH);
+    for (&(top, bottom), out_row) in plan.rows.iter().zip(out_rows) {
+        sums.fill(0);
+        for line in raw[top as usize * stride..bottom as usize * stride].chunks_exact(stride) {
+            for (sum, &sample) in sums.iter_mut().zip(line) {
+                *sum += u32::from(sample);
+            }
+        }
+        let pixels = out_row.as_chunks_mut::<CH>().0;
+        for (&(left, right), pixel) in plan.columns.iter().zip(pixels) {
+            let n = (right - left) * (bottom - top);
+            let mut block = [n / 2; CH];
+            for column in sums[left as usize * CH..right as usize * CH]
+                .as_chunks::<CH>()
+                .0
+            {
+                for (total, &sum) in block.iter_mut().zip(column) {
+                    *total += sum;
+                }
+            }
+            for (sample, total) in pixel.iter_mut().zip(block) {
+                *sample = (total / n).min(255) as u8;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -302,6 +437,147 @@ mod tests {
     fn uniform_image_is_center() {
         let img = DynamicImage::new_rgb8(50, 50);
         assert_eq!(focal_point(&img), CENTER);
+    }
+
+    /// Hard edges and noise, different in every channel.
+    fn busy(x: u32, y: u32, c: u32) -> u8 {
+        let mut h = x
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add(y.wrapping_mul(0x85EB_CA77))
+            .wrapping_add(c.wrapping_mul(0xC2B2_AE3D));
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2C1B_3C6D);
+        match (x / 3 + y / 2 + c) % 4 {
+            0 => 0,
+            1 => 255,
+            _ => (h >> 12) as u8,
+        }
+    }
+
+    fn busy_rgb(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(w, h, |x, y| {
+            Rgb([busy(x, y, 0), busy(x, y, 1), busy(x, y, 2)])
+        }))
+    }
+
+    fn busy_rgba(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgba8(image::ImageBuffer::from_fn(w, h, |x, y| {
+            image::Rgba([busy(x, y, 0), busy(x, y, 1), busy(x, y, 2), busy(y, x, 3)])
+        }))
+    }
+
+    /// The layout, the size, the color space and every byte.
+    fn whole(img: &DynamicImage) -> (image::ColorType, (u32, u32), image::metadata::Cicp, Vec<u8>) {
+        (
+            img.color(),
+            (img.width(), img.height()),
+            img.color_space(),
+            img.as_bytes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn thumbnail_fast_matches_the_crate_thumbnail() {
+        // Issue #655: the saliency thumbnail is summed by
+        // rows. Against the crate on both layouts it takes:
+        // one pixel on a side, sizes just over the bound,
+        // strips, the longest side a source may have, and
+        // the shape of a typical photo; targets that shrink
+        // to the analysis size and to a pixel, that leave an
+        // axis with blocks of one, and that would enlarge,
+        // where the crate interpolates and so does this.
+        let small = [
+            (128, 128),
+            (100, 100),
+            (16, 16),
+            (1, 1),
+            (128, 7),
+            (160, 160),
+        ];
+        let shrink = [(128, 128), (1, 1)];
+        let mut cases = 0;
+        for (w, h, targets) in [
+            (1, 1, &small[..]),
+            (3, 2, &small),
+            (1, 129, &small),
+            (129, 1, &small),
+            (129, 129, &small),
+            (130, 97, &small),
+            (255, 256, &small),
+            (257, 255, &small),
+            (1000, 3, &small),
+            (3, 1000, &small),
+            (320, 213, &shrink),
+            (16383, 9, &shrink),
+            (9, 16383, &shrink),
+            (4000, 37, &shrink),
+            (1200, 800, &shrink[..1]),
+        ] {
+            for img in [busy_rgb(w, h), busy_rgba(w, h)] {
+                for &(nw, nh) in targets {
+                    assert_eq!(
+                        whole(&img.thumbnail(nw, nh)),
+                        whole(&thumbnail_fast(&img, nw, nh)),
+                        "{:?} {w}x{h} to fit {nw}x{nh}",
+                        img.color()
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 2 * (10 * 6 + 4 * 2 + 1));
+        // The color space travels with the thumbnail, as it
+        // does through the crate's.
+        let mut p3 = busy_rgb(257, 255);
+        p3.set_color_space(image::metadata::Cicp::DISPLAY_P3)
+            .unwrap();
+        let ours = thumbnail_fast(&p3, 128, 128);
+        assert_eq!(ours.color_space(), image::metadata::Cicp::DISPLAY_P3);
+        assert_eq!(whole(&p3.thumbnail(128, 128)), whole(&ours));
+    }
+
+    #[test]
+    fn thumbnail_fast_leaves_the_rest_to_the_crate() {
+        // Issue #655: only RGB8 and RGBA8 block means are
+        // summed here. Every other layout comes back as the
+        // crate makes it.
+        let rgba = busy_rgba(255, 256);
+        for img in [
+            DynamicImage::ImageLuma8(rgba.to_luma8()),
+            DynamicImage::ImageLumaA8(rgba.to_luma_alpha8()),
+            DynamicImage::ImageRgb16(rgba.to_rgb16()),
+            DynamicImage::ImageRgba16(rgba.to_rgba16()),
+            DynamicImage::ImageLuma16(rgba.to_luma16()),
+            DynamicImage::ImageLumaA16(rgba.to_luma_alpha16()),
+            DynamicImage::ImageRgb32F(rgba.to_rgb32f()),
+            DynamicImage::ImageRgba32F(rgba.to_rgba32f()),
+        ] {
+            assert_eq!(
+                whole(&img.thumbnail(128, 128)),
+                whole(&thumbnail_fast(&img, 128, 128)),
+                "{:?}",
+                img.color()
+            );
+        }
+        // No plan where the crate does not average whole
+        // blocks: an enlargement, whose blocks run empty, an
+        // empty image, and a block whose sum could pass the
+        // `u32` the crate adds in (4096 squared is the last
+        // that cannot).
+        assert!(thumbnail_plan(100, 100, 128, 128).is_none());
+        assert!(thumbnail_plan(0, 5, 128, 128).is_none());
+        assert!(thumbnail_plan(4097, 4096, 1, 1).is_none());
+        let plan = thumbnail_plan(4096, 4096, 1, 1).expect("a block of 2^24 pixels");
+        assert_eq!(
+            (plan.columns, plan.rows),
+            (vec![(0, 4096)], vec![(0, 4096)])
+        );
+        // A block is never empty and never leaves the image.
+        let plan = thumbnail_plan(2400, 1600, 128, 128).expect("a photo shrinks in blocks");
+        assert_eq!(plan.size(), (128, 85));
+        for (blocks, len) in [(&plan.columns, 2400), (&plan.rows, 1600)] {
+            assert!(blocks.iter().all(|&(low, high)| low < high && high <= len));
+        }
     }
 
     /// A provider that reports one face at a fixed place.
