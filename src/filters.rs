@@ -1679,6 +1679,10 @@ pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
 /// computed whole. Zero-weight taps are skipped: every
 /// input channel is a non-negative f32, so a zero tap only
 /// ever added +0.0, which cannot change the running sum.
+///
+/// The interior is summed a tap at a time over a whole row
+/// (issue #658), which hands every sample its taps in the
+/// order it always had them; see the comment there.
 fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = image::RgbImage::new(w as u32, h as u32);
@@ -1698,50 +1702,77 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
         .filter(|(_, k)| **k != 0.0)
         .map(|(ki, k)| (ki / 3, (ki % 3) * 3, *k))
         .collect();
-    if w >= 3 && h >= 3 {
+    let interior = w >= 3 && h >= 3;
+    if interior {
+        // Every interior sample is the same sum: its taps in
+        // kernel order, each a source sample times its
+        // weight, added to a total that starts at zero. The
+        // sum runs one tap at a time over a row of totals,
+        // not one sample at a time over the taps. Each total
+        // still takes its taps in kernel order, as plain
+        // `f32` multiplies and adds, so it is the same value;
+        // and each pass is a loop over two slices, which the
+        // compiler turns into vector code. The three source
+        // rows an output row reads are kept as `f32`, each
+        // converted once.
+        let span = stride - 6;
+        let widen = |y: usize, row: &mut Vec<f32>| {
+            row.clear();
+            row.extend(src[y * stride..(y + 1) * stride].iter().map(|&v| v as f32));
+        };
+        let mut rows: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(stride));
+        for (y, row) in rows.iter_mut().enumerate() {
+            widen(y, row);
+        }
+        let mut totals = vec![0f32; span];
         for y in 1..h - 1 {
-            let rows = [
-                &src[(y - 1) * stride..y * stride],
-                &src[y * stride..(y + 1) * stride],
-                &src[(y + 1) * stride..(y + 2) * stride],
-            ];
-            for x in 1..w - 1 {
-                let xb = x * 3;
-                let mut t = [0f32; 3];
-                for &(rd, coff, k) in &taps {
-                    let b = xb + coff - 3;
-                    let row = rows[rd];
-                    t[0] += row[b] as f32 * k;
-                    t[1] += row[b + 1] as f32 * k;
-                    t[2] += row[b + 2] as f32 * k;
+            if y > 1 {
+                rows.rotate_left(1);
+                widen(y + 1, &mut rows[2]);
+            }
+            totals.fill(0.0);
+            for &(rd, coff, k) in &taps {
+                for (total, &sample) in totals.iter_mut().zip(&rows[rd][coff..coff + span]) {
+                    *total += sample * k;
                 }
-                let base = y * stride + xb;
-                for c in 0..3 {
-                    dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
-                }
+            }
+            let out_row = &mut dst[y * stride + 3..(y + 1) * stride - 3];
+            for (d, &total) in out_row.iter_mut().zip(&totals) {
+                *d = (total * inverse_sum).clamp(0.0, 255.0) as u8;
             }
         }
     }
     // The border ring, and every pixel of an image under
-    // 3px on either axis: the same sum, with each tap's
-    // coordinates clamped into the frame.
-    for y in 0..h {
+    // 3px on either axis: the same sum, one pixel at a time,
+    // with each tap's coordinates clamped into the frame.
+    let mut edge = |x: usize, y: usize| {
+        let mut t = [0f32; 3];
+        for &(rd, coff, k) in &taps {
+            let sy = (y + rd).saturating_sub(1).min(h - 1);
+            let sx = (x + coff / 3).saturating_sub(1).min(w - 1);
+            let b = sy * stride + sx * 3;
+            t[0] += src[b] as f32 * k;
+            t[1] += src[b + 1] as f32 * k;
+            t[2] += src[b + 2] as f32 * k;
+        }
+        let base = y * stride + x * 3;
+        for c in 0..3 {
+            dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
+        }
+    };
+    if interior {
         for x in 0..w {
-            if w >= 3 && h >= 3 && (1..w - 1).contains(&x) && (1..h - 1).contains(&y) {
-                continue;
-            }
-            let mut t = [0f32; 3];
-            for &(rd, coff, k) in &taps {
-                let sy = (y + rd).saturating_sub(1).min(h - 1);
-                let sx = (x + coff / 3).saturating_sub(1).min(w - 1);
-                let b = sy * stride + sx * 3;
-                t[0] += src[b] as f32 * k;
-                t[1] += src[b + 1] as f32 * k;
-                t[2] += src[b + 2] as f32 * k;
-            }
-            let base = y * stride + x * 3;
-            for c in 0..3 {
-                dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
+            edge(x, 0);
+            edge(x, h - 1);
+        }
+        for y in 1..h - 1 {
+            edge(0, y);
+            edge(w - 1, y);
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                edge(x, y);
             }
         }
     }
@@ -3182,3 +3213,9 @@ mod w3proofs;
 
 #[cfg(test)]
 mod w4proofs;
+
+// The loops reshaped so the compiler can vectorize them, each
+// pinned against a frozen copy of the loop it replaced: the
+// row passes of the 3x3 convolution (issue #658).
+#[cfg(test)]
+mod vector_proofs;
