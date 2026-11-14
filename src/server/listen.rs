@@ -202,10 +202,16 @@ struct Watch {
     header_timeout: Duration,
     idle_timeout: Duration,
     activity: Mutex<Activity>,
-    /// Woken when the deadline may have moved earlier: a
-    /// request head started, or a handler finished.
+    /// Woken when a request head has started and been left
+    /// incomplete: the one change that can bring the deadline
+    /// ahead of the time [`Watch::expired`] sleeps to.
     changed: Notify,
 }
+
+/// The shortest time [`Watch::expired`] sleeps before it
+/// looks again while nothing is due: the timer's own
+/// resolution, so a timeout of zero cannot make it spin.
+const SHORTEST_SLEEP: Duration = Duration::from_millis(1);
 
 struct Activity {
     /// Requests whose handler is running.
@@ -223,6 +229,13 @@ struct Activity {
     /// connection's start until the first request, then on
     /// HTTP/1 the first byte of each later one.
     head_since: Option<Instant>,
+    /// Whether [`Watch::expired`] has yet to be told of the
+    /// head that began at `head_since`. It is told once that
+    /// head leaves the connection waiting for more bytes
+    /// ([`Watch::read_pending`]); a head that arrives whole
+    /// starts its handler in the same poll and never needs
+    /// its deadline.
+    head_unseen: bool,
     /// When a byte last moved either way, or a request or
     /// response last ended.
     last_active: Instant,
@@ -239,6 +252,7 @@ impl Watch {
                 bodies: 0,
                 http2: false,
                 head_since: Some(now),
+                head_unseen: false,
                 last_active: now,
             }),
             changed: Notify::new(),
@@ -252,6 +266,14 @@ impl Watch {
     /// Bytes arrived. On HTTP/1 they are activity, and with
     /// nothing in flight they start the next request head.
     /// On HTTP/2 they are neither.
+    ///
+    /// A head that starts here wakes nothing (issue #639).
+    /// The task that reads these bytes is the one
+    /// [`Watch::expired`] runs on, and a task that wakes
+    /// itself is run again from the back of the queue, on
+    /// whichever worker takes it first: a second poll, a
+    /// timer re-armed and a parked worker woken, for every
+    /// request.
     fn read(&self) {
         let now = Instant::now();
         let mut activity = self.activity();
@@ -261,6 +283,19 @@ impl Watch {
         activity.last_active = now;
         if activity.handlers == 0 && activity.bodies == 0 && activity.head_since.is_none() {
             activity.head_since = Some(now);
+            activity.head_unseen = true;
+        }
+    }
+
+    /// A read found nothing to take, so the connection now
+    /// waits on its client. If a request head began since
+    /// [`Watch::expired`] last looked, its header deadline
+    /// can be sooner than the time that sleeps to, so it is
+    /// woken: once for a head that arrives in pieces.
+    fn read_pending(&self) {
+        let mut activity = self.activity();
+        if activity.head_unseen {
+            activity.head_unseen = false;
             drop(activity);
             self.changed.notify_one();
         }
@@ -281,6 +316,7 @@ impl Watch {
         let mut activity = self.activity();
         activity.handlers += 1;
         activity.head_since = None;
+        activity.head_unseen = false;
         if version == Version::HTTP_2 {
             activity.http2 = true;
         }
@@ -291,8 +327,7 @@ impl Watch {
 
     /// When the connection is to be closed, as things stand:
     /// none while a handler runs.
-    fn deadline(&self) -> Option<Instant> {
-        let activity = self.activity();
+    fn deadline(&self, activity: &Activity) -> Option<Instant> {
         if activity.handlers > 0 {
             None
         } else if let Some(since) = activity.head_since {
@@ -302,18 +337,47 @@ impl Watch {
         }
     }
 
+    /// `None` once the connection is past its deadline.
+    /// Otherwise the time to look again: never later than
+    /// any deadline the connection can come to have before
+    /// then, unless [`Watch::read_pending`] wakes `changed`
+    /// first. So [`Watch::expired`] need not be told when a
+    /// request starts or ends (issue #639).
+    ///
+    /// - While a handler runs, nothing is due. Once it ends,
+    ///   the deadline is the idle timeout from then, or the
+    ///   header timeout from a later head's first byte:
+    ///   never sooner than the shorter of the two from now.
+    /// - While a head is read, its header deadline stands.
+    ///   The head may still arrive and be answered at once,
+    ///   which leaves the idle timeout from then: never
+    ///   sooner than the idle timeout from now.
+    /// - Between requests the idle deadline stands, and
+    ///   activity only moves it later. A head that starts
+    ///   and is answered leads to the cases above, later
+    ///   still. One that starts and stalls wakes `changed`.
+    fn look_again(&self, now: Instant) -> Option<Instant> {
+        let activity = self.activity();
+        let Some(due) = self.deadline(&activity) else {
+            let step = self.header_timeout.min(self.idle_timeout);
+            return Some(now + step.max(SHORTEST_SLEEP));
+        };
+        if due <= now {
+            return None;
+        }
+        Some(if activity.head_since.is_some() {
+            due.min(now + self.idle_timeout.max(SHORTEST_SLEEP))
+        } else {
+            due
+        })
+    }
+
     /// Resolves once the connection is past its deadline.
     async fn expired(&self) {
-        loop {
-            match self.deadline() {
-                None => self.changed.notified().await,
-                Some(at) if at <= Instant::now() => return,
-                Some(at) => {
-                    tokio::select! {
-                        () = tokio::time::sleep_until(at) => {}
-                        () = self.changed.notified() => {}
-                    }
-                }
+        while let Some(at) = self.look_again(Instant::now()) {
+            tokio::select! {
+                () = tokio::time::sleep_until(at) => {}
+                () = self.changed.notified() => {}
             }
         }
     }
@@ -334,8 +398,6 @@ impl Running {
             activity.handlers -= 1;
             activity.bodies += 1;
             activity.last_active = Instant::now();
-            drop(activity);
-            watch.changed.notify_one();
         }
         Sending { watch }
     }
@@ -347,8 +409,6 @@ impl Drop for Running {
             let mut activity = watch.activity();
             activity.handlers -= 1;
             activity.last_active = Instant::now();
-            drop(activity);
-            watch.changed.notify_one();
         }
     }
 }
@@ -497,10 +557,10 @@ impl AsyncRead for Watched {
         let this = self.get_mut();
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.stream).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = polled
-            && buf.filled().len() > before
-        {
-            this.watch.read();
+        match polled {
+            Poll::Ready(Ok(())) if buf.filled().len() > before => this.watch.read(),
+            Poll::Pending => this.watch.read_pending(),
+            _ => {}
         }
         polled
     }

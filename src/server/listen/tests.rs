@@ -1,17 +1,30 @@
+use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::routing::get;
 use bytes::Bytes;
+use hyper::Version;
+use hyper_util::rt::TokioExecutor;
+use hyper_util::server::conn::auto;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::sync::Semaphore;
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{ConnectionLimits, Frames, serve_connections};
+use super::{
+    ConnectionLimits, Frames, Running, Sending, Watch, serve_connection, serve_connections,
+};
+use crate::test_support::Rng;
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -448,4 +461,707 @@ async fn stopping_closes_idle_connections_and_waits_for_requests_in_flight() {
         .expect("the loop returns once the request in flight is done")
         .unwrap();
     assert!(TcpStream::connect(addr).await.is_err());
+}
+
+/// The whole request head the keep-alive tests send.
+const GET_ROOT: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+/// Send one request on `stream` and read its answer.
+async fn one_request(stream: &mut TcpStream) {
+    stream.write_all(GET_ROOT).await.unwrap();
+    let (head, body) = read_response(stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "ok");
+}
+
+#[tokio::test]
+async fn an_idle_timeout_shorter_than_the_header_timeout_closes_a_connection_after_its_request() {
+    // Issue #639: the watch is no longer woken when a
+    // handler ends. With the idle timeout the shorter one,
+    // the idle deadline after a request comes before the
+    // header deadline of the head the watch was waiting
+    // for, and the connection must still close on it. The
+    // request is sent once the watch has looked at the
+    // connection with nothing read.
+    let (addr, _stop, _) = start(router(), Duration::from_secs(4), ms(300)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    sleep(ms(100)).await;
+    let sent = Instant::now();
+    one_request(&mut stream).await;
+    let closed = closed_within(&mut stream, Duration::from_secs(10)).await;
+    closed.expect("an idle connection is still open 10 s on");
+    let closed = sent.elapsed();
+    assert!(
+        closed >= ms(300) && closed < Duration::from_secs(3),
+        "an idle connection closed {closed:?} after its request, \
+         not at the 300 ms idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_idles_out_after_a_handler_that_ran_past_the_idle_timeout() {
+    // The handler runs for three idle timeouts, and the
+    // watch looks at the connection while it does. It finds
+    // nothing due and must look again in time for the idle
+    // deadline that follows the answer, though the header
+    // timeout is far longer.
+    let (addr, _stop, _) = start(router(), Duration::from_secs(4), ms(300)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    sleep(ms(100)).await;
+    let sent = Instant::now();
+    stream
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, body) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "slow");
+    let closed = closed_within(&mut stream, Duration::from_secs(10)).await;
+    closed.expect("an idle connection is still open 10 s on");
+    let closed = sent.elapsed();
+    assert!(
+        closed >= ms(1200) && closed < Duration::from_secs(3),
+        "closed {closed:?} after a 900 ms request, not at the 300 ms idle timeout after it"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_timeout_shorter_than_the_header_timeout_does_not_cut_the_first_head_short() {
+    // The first request head has the header timeout from
+    // the connection's start, however short the idle
+    // timeout is: a connection that sends nothing closes at
+    // the header timeout, not sooner.
+    let (addr, _stop, _) = start(router(), ms(1200), ms(200)).await;
+    let began = Instant::now();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let closed = closed_within(&mut stream, Duration::from_secs(10)).await;
+    closed.expect("a silent connection is still open 10 s on");
+    let closed = began.elapsed();
+    assert!(
+        closed >= ms(1200) && closed < Duration::from_secs(4),
+        "a silent connection closed after {closed:?}, not at the 1.2 s header timeout"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_head_after_a_long_idle_period_closes_at_the_header_timeout() {
+    // The connection has been idle for five header
+    // timeouts, so the watch sleeps to an idle deadline far
+    // off. The first bytes of a head that then stalls bring
+    // the deadline forward to the header timeout from those
+    // bytes: not before it, and not at the idle deadline.
+    let (addr, _stop, _) = start(router(), ms(300), Duration::from_secs(30)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    one_request(&mut stream).await;
+    sleep(ms(1500)).await;
+    let sent = Instant::now();
+    stream.write_all(b"GET / HTTP/1.1\r\nHo").await.unwrap();
+    let closed = closed_within(&mut stream, Duration::from_secs(10)).await;
+    closed.expect("a partial head is still open 10 s on");
+    let closed = sent.elapsed();
+    assert!(
+        closed >= ms(300) && closed < Duration::from_secs(3),
+        "a partial head closed after {closed:?}, not at the 300 ms header timeout"
+    );
+}
+
+#[tokio::test]
+async fn a_head_sent_a_byte_at_a_time_closes_at_the_header_timeout() {
+    // Bytes that keep coming do not extend the header
+    // timeout, on a connection's first head or a later one.
+    // The head takes 4 s to send at a byte every 150 ms;
+    // the server closes 500 ms after its first byte and
+    // never answers it.
+    let (addr, _stop, _) = start(router(), ms(500), Duration::from_secs(30)).await;
+    for keep_alive in [false, true] {
+        // The first head's timeout runs from the
+        // connection's start, a later one's from its
+        // first byte.
+        let mut began = Instant::now();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        if keep_alive {
+            one_request(&mut stream).await;
+            began = Instant::now();
+        }
+        let mut answer = Vec::new();
+        let mut sent = 0;
+        for byte in GET_ROOT {
+            // A write to a connection the server closed
+            // fails, at the latest on the second try.
+            if stream.write_all(&[*byte]).await.is_err() {
+                break;
+            }
+            sent += 1;
+            if let Ok(Ok(0)) = timeout(ms(150), stream.read_buf(&mut answer)).await {
+                break;
+            }
+        }
+        let closed = began.elapsed();
+        assert!(answer.is_empty(), "keep-alive {keep_alive}: {answer:?}");
+        assert!(
+            sent < GET_ROOT.len(),
+            "keep-alive {keep_alive}: the whole head was sent, over {closed:?}"
+        );
+        assert!(
+            closed >= ms(500) && closed < ms(3000),
+            "keep-alive {keep_alive}: closed after {closed:?} and {sent} bytes, \
+             not at the 500 ms header timeout"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pipelined_requests_are_answered_and_the_connection_then_idles() {
+    // Two requests sent at once are both answered, though
+    // the second head starts no read of its own, and the
+    // connection then has the idle timeout: it is open past
+    // the header timeout and closes at the idle one.
+    let (addr, _stop, _) = start(router(), ms(300), ms(1500)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let sent = Instant::now();
+    stream
+        .write_all(&[GET_ROOT, GET_ROOT].concat())
+        .await
+        .unwrap();
+    // Both answers are read from what arrives.
+    let mut answers = Vec::new();
+    while answers.windows(2).filter(|w| w == b"ok").count() < 2 {
+        let n = stream.read_buf(&mut answers).await.unwrap();
+        assert!(n > 0, "closed before both answers: {answers:?}");
+    }
+    let answers = String::from_utf8_lossy(&answers);
+    assert_eq!(answers.matches("HTTP/1.1 200").count(), 2, "{answers}");
+    let closed = closed_within(&mut stream, Duration::from_secs(10)).await;
+    closed.expect("an idle connection is still open 10 s on");
+    let closed = sent.elapsed();
+    assert!(
+        closed >= ms(1500) && closed < Duration::from_secs(5),
+        "closed {closed:?} after two pipelined requests, with a 1.5 s idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_head_behind_a_pipelined_request_has_the_idle_timeout_until_its_next_byte() {
+    // A partial head that arrives with the request before
+    // it starts no header timeout: its bytes came while that
+    // request was the one being read. The idle timeout
+    // bounds it, until its next byte arrives with nothing in
+    // flight and starts the header timeout.
+    let (addr, _stop, _) = start(router(), ms(300), Duration::from_secs(30)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut sent = GET_ROOT.to_vec();
+    sent.extend_from_slice(b"GET / HTTP/1.1\r\n");
+    stream.write_all(&sent).await.unwrap();
+    let (head, _) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        closed_within(&mut stream, ms(1000)).await.is_none(),
+        "a partial head behind a pipelined request closed at the header timeout"
+    );
+    let sent = Instant::now();
+    stream.write_all(b"Host").await.unwrap();
+    let closed = closed_within(&mut stream, Duration::from_secs(10)).await;
+    closed.expect("a partial head is still open 10 s after its next byte");
+    let closed = sent.elapsed();
+    assert!(
+        closed >= ms(300) && closed < Duration::from_secs(3),
+        "closed {closed:?} after the head's next byte, not at the 300 ms header timeout"
+    );
+}
+
+/// A future that counts how often it is polled.
+struct CountPolls<F> {
+    inner: Pin<Box<F>>,
+    polls: Arc<AtomicUsize>,
+}
+
+impl<F: Future> Future for CountPolls<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+#[tokio::test]
+async fn a_keep_alive_request_polls_its_connection_once() {
+    // Issue #639: the watch used to wake the connection's
+    // task when a request head started and again when its
+    // handler ended. That task is the one doing both, and a
+    // task that wakes itself is polled again: two polls for
+    // every request, the second from the back of the run
+    // queue and on whichever worker takes it first. A
+    // request that arrives whole now wakes nothing.
+    const REQUESTS: usize = 200;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let limits = ConnectionLimits {
+        header_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+        max_connections: 1,
+    };
+    let slot = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let served = tokio::spawn(CountPolls {
+        inner: Box::pin(serve_connection(
+            stream,
+            router(),
+            Arc::new(auto::Builder::new(TokioExecutor::new())),
+            limits,
+            CancellationToken::new(),
+            slot,
+        )),
+        polls: Arc::clone(&polls),
+    });
+    for _ in 0..REQUESTS {
+        one_request(&mut client).await;
+    }
+    let polled = polls.load(Ordering::Relaxed);
+    assert!(
+        polled <= REQUESTS + REQUESTS / 4,
+        "{REQUESTS} keep-alive requests polled their connection {polled} times"
+    );
+    drop(client);
+    timeout(Duration::from_secs(5), served)
+        .await
+        .expect("the connection ends when its client leaves")
+        .unwrap();
+}
+
+/// One thing a connection does that its watch hears of, in
+/// the calls hyper and the socket make for it.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    /// Bytes arrive and the connection goes on waiting for
+    /// more: `read`, then a read that finds nothing.
+    Bytes,
+    /// Bytes arrive that complete a request head, and its
+    /// handler starts in the same poll: `read`, `request`.
+    Request,
+    /// A head is complete in bytes that arrived earlier (a
+    /// pipelined request): `request` alone.
+    Buffered,
+    /// The oldest running handler answers.
+    Answer,
+    /// The oldest running handler is dropped unanswered.
+    Abandon,
+    /// Bytes go out; whether they are a response body's.
+    Write(bool),
+    /// The oldest response body ends.
+    BodyEnd,
+    /// A read finds nothing.
+    Pending,
+}
+
+/// A connection's activity and deadline as they were kept
+/// before issue #639, when the watch was woken at the start
+/// and the end of every request: the three bounds, stated
+/// as code. The connection is to close at the first moment
+/// this deadline has passed.
+struct Reference {
+    header_timeout: Duration,
+    idle_timeout: Duration,
+    handlers: usize,
+    bodies: usize,
+    http2: bool,
+    head_since: Option<Instant>,
+    last_active: Instant,
+}
+
+impl Reference {
+    fn apply(&mut self, step: Step, version: Version, now: Instant) {
+        let read = |r: &mut Reference| {
+            if r.http2 {
+                return;
+            }
+            r.last_active = now;
+            if r.handlers == 0 && r.bodies == 0 && r.head_since.is_none() {
+                r.head_since = Some(now);
+            }
+        };
+        let request = |r: &mut Reference| {
+            r.handlers += 1;
+            r.head_since = None;
+            if version == Version::HTTP_2 {
+                r.http2 = true;
+            }
+        };
+        match step {
+            Step::Bytes => read(self),
+            Step::Request => {
+                read(self);
+                request(self);
+            }
+            Step::Buffered => request(self),
+            Step::Answer => {
+                self.handlers -= 1;
+                self.bodies += 1;
+                self.last_active = now;
+            }
+            Step::Abandon => {
+                self.handlers -= 1;
+                self.last_active = now;
+            }
+            Step::Write(body) => {
+                if body || !self.http2 {
+                    self.last_active = now;
+                }
+            }
+            Step::BodyEnd => {
+                self.bodies -= 1;
+                self.last_active = now;
+            }
+            Step::Pending => {}
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        if self.handlers > 0 {
+            None
+        } else if let Some(since) = self.head_since {
+            Some(since + self.header_timeout)
+        } else {
+            Some(self.last_active + self.idle_timeout)
+        }
+    }
+}
+
+/// A connection's [`Watch`], driven by the calls a
+/// connection makes, with its `expired` running as a task.
+struct Driven {
+    watch: Arc<Watch>,
+    running: VecDeque<Running>,
+    sending: VecDeque<Sending>,
+    /// When `expired` resolved.
+    closed: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Driven {
+    fn new(header_timeout: Duration, idle_timeout: Duration) -> Self {
+        let watch = Arc::new(Watch::new(ConnectionLimits {
+            header_timeout,
+            idle_timeout,
+            max_connections: 1,
+        }));
+        let closed = Arc::new(Mutex::new(None));
+        let (watching, closing) = (Arc::clone(&watch), Arc::clone(&closed));
+        tokio::spawn(async move {
+            watching.expired().await;
+            *closing.lock().unwrap() = Some(Instant::now());
+        });
+        Driven {
+            watch,
+            running: VecDeque::new(),
+            sending: VecDeque::new(),
+            closed,
+        }
+    }
+
+    fn apply(&mut self, step: Step, version: Version) {
+        match step {
+            Step::Bytes => {
+                self.watch.read();
+                self.watch.read_pending();
+            }
+            Step::Request => {
+                self.watch.read();
+                self.running.push_back(self.watch.request(version));
+            }
+            Step::Buffered => self.running.push_back(self.watch.request(version)),
+            Step::Answer => {
+                let running = self.running.pop_front().unwrap();
+                self.sending.push_back(running.answered());
+            }
+            Step::Abandon => drop(self.running.pop_front().unwrap()),
+            Step::Write(body) => self.watch.wrote(body),
+            Step::BodyEnd => drop(self.sending.pop_front().unwrap()),
+            Step::Pending => self.watch.read_pending(),
+        }
+    }
+
+    fn closed(&self) -> Option<Instant> {
+        *self.closed.lock().unwrap()
+    }
+}
+
+/// Run one generated connection against the watch and the
+/// reference: at every step, and at the end, the watch has
+/// closed the connection exactly when the reference
+/// deadline first passed, and not otherwise. Steps fall on
+/// even milliseconds and both timeouts are odd, so no
+/// deadline falls on a step.
+async fn run_script(
+    header_ms: u64,
+    idle_ms: u64,
+    version: Version,
+    seed: u64,
+) -> Result<usize, String> {
+    let (header_timeout, idle_timeout) = (ms(header_ms), ms(idle_ms));
+    let began = Instant::now();
+    let at = |t: Instant| t.duration_since(began).as_millis();
+    let mut rng = Rng::new(seed);
+    let mut watched = Driven::new(header_timeout, idle_timeout);
+    let mut reference = Reference {
+        header_timeout,
+        idle_timeout,
+        handlers: 0,
+        bodies: 0,
+        http2: false,
+        head_since: Some(began),
+        last_active: began,
+    };
+    // Short waits, and waits around both timeouts.
+    let short = header_ms.min(idle_ms);
+    let brief = [0, 0, 0, 2, 2, 4, 10];
+    let long = [
+        short - 1,
+        short + 1,
+        header_ms - 1,
+        header_ms + 1,
+        idle_ms - 1,
+        idle_ms + 1,
+        2 * short,
+        header_ms + idle_ms,
+    ];
+    let steps = 6 + rng.below(40);
+    let mut log: Vec<(u128, Step)> = Vec::new();
+    let mut taken = 0;
+    loop {
+        // Once the script is over, what is in flight ends,
+        // so the connection comes to have a deadline.
+        let step = if taken < steps {
+            let mut choices = vec![Step::Bytes, Step::Bytes, Step::Pending, Step::Write(false)];
+            let (handlers, bodies) = (reference.handlers, reference.bodies);
+            if handlers > 0 {
+                choices.extend([Step::Answer, Step::Answer, Step::Answer, Step::Abandon]);
+            }
+            if bodies > 0 {
+                choices.extend([Step::Write(true), Step::Write(true), Step::BodyEnd]);
+                choices.push(Step::BodyEnd);
+            }
+            // HTTP/1 serves one request at a time; HTTP/2
+            // starts them side by side.
+            let free = handlers == 0 && bodies == 0;
+            if free || (version == Version::HTTP_2 && handlers < 3) {
+                choices.extend([Step::Request, Step::Request, Step::Request, Step::Buffered]);
+            }
+            *rng.pick(&choices)
+        } else if reference.handlers > 0 {
+            Step::Answer
+        } else if reference.bodies > 0 {
+            Step::BodyEnd
+        } else {
+            break;
+        };
+        let wait = *if rng.below(4) == 0 {
+            rng.pick(&long)
+        } else {
+            rng.pick(&brief)
+        };
+        let now = Instant::now() + ms(wait);
+        sleep_until(now).await;
+        if Instant::now() != now {
+            return Err(format!(
+                "the clock stands at {}, not {}",
+                at(Instant::now()),
+                at(now)
+            ));
+        }
+        let due = reference.deadline().filter(|due| *due < now);
+        match (due, watched.closed()) {
+            (None, None) => {}
+            (Some(due), Some(closed)) if due == closed => return Ok(taken),
+            (due, closed) => {
+                return Err(format!(
+                    "at {} ms: due at {:?} ms, closed at {:?} ms, after {log:?}",
+                    at(now),
+                    due.map(at),
+                    closed.map(at)
+                ));
+            }
+        }
+        reference.apply(step, version, now);
+        watched.apply(step, version);
+        log.push((at(now), step));
+        taken += 1;
+    }
+    let due = reference.deadline().expect("nothing is in flight");
+    // Past the deadline, so a watch that sleeps too long
+    // shows as late and not as a test that never ends.
+    sleep_until(due + ms(2 * (header_ms + idle_ms))).await;
+    match watched.closed() {
+        Some(closed) if closed == due => Ok(taken),
+        closed => Err(format!(
+            "due at {} ms, closed at {:?} ms, after {log:?}",
+            at(due),
+            closed.map(at)
+        )),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_watch_closes_a_connection_exactly_when_its_deadline_passes() {
+    // Issue #639: the watch is no longer woken when a
+    // request starts or ends; it sleeps to a time no later
+    // than any deadline the connection can come to have.
+    // So every order of reads, requests, answers, bodies
+    // and writes has to leave it closing the connection at
+    // the moment the deadline of issue #607 passes: the
+    // header timeout from the connection's start and from
+    // the first byte of a later head, the idle timeout
+    // otherwise, neither while a handler runs, and on
+    // HTTP/2 no read and no write but a body's counting.
+    // The clock is tokio's paused one, so the comparison is
+    // exact, to the millisecond.
+    let limits = [
+        (31, 301),
+        (301, 31),
+        (31, 31),
+        (5, 1001),
+        (1001, 5),
+        (101, 151),
+        (151, 101),
+    ];
+    let mut steps = 0;
+    for (header_ms, idle_ms) in limits {
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            for seed in 0..300 {
+                match run_script(header_ms, idle_ms, version, seed).await {
+                    Ok(taken) => steps += taken,
+                    Err(e) => panic!(
+                        "header timeout {header_ms} ms, idle timeout {idle_ms} ms, \
+                         {version:?}, seed {seed}: {e}"
+                    ),
+                }
+            }
+        }
+    }
+    // The scripts are long enough to mean something.
+    assert!(steps > 40_000, "{steps} steps");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_watch_follows_the_named_orders_of_events() {
+    // The orders issue #639 names, each as its own script
+    // on the paused clock: (header timeout, idle timeout,
+    // the steps with the wait before each, when the
+    // connection is to close), in milliseconds.
+    use Step::*;
+    type Script = (u64, u64, &'static [(u64, Step)], u64);
+    let scripts: &[Script] = &[
+        // Nothing is ever sent: the header timeout from
+        // the connection's start, though the idle one is
+        // shorter.
+        (301, 31, &[], 301),
+        (31, 301, &[], 31),
+        // A request, answered: the idle timeout from the
+        // end of its body, shorter or longer than the
+        // header timeout.
+        (
+            301,
+            31,
+            &[(10, Request), (2, Answer), (2, Write(true)), (2, BodyEnd)],
+            47,
+        ),
+        (
+            31,
+            301,
+            &[(10, Request), (2, Answer), (2, Write(true)), (2, BodyEnd)],
+            317,
+        ),
+        // A handler that runs past both timeouts.
+        (31, 51, &[(10, Request), (500, Answer), (0, BodyEnd)], 561),
+        // A partial head after a long idle period: the
+        // header timeout from its first byte.
+        (
+            31,
+            5001,
+            &[(10, Request), (0, Answer), (0, BodyEnd), (2000, Bytes)],
+            2041,
+        ),
+        // A head a byte at a time: the header timeout from
+        // its first byte, whatever arrives later.
+        (
+            31,
+            5001,
+            &[
+                (10, Request),
+                (0, Answer),
+                (0, BodyEnd),
+                (100, Bytes),
+                (10, Bytes),
+                (10, Bytes),
+                (10, Bytes),
+            ],
+            141,
+        ),
+        // The same for the connection's first head.
+        (31, 5001, &[(10, Bytes), (10, Bytes), (10, Bytes)], 31),
+        // Pipelined requests: the second head starts no
+        // read, and the connection then idles.
+        (
+            31,
+            301,
+            &[
+                (10, Request),
+                (0, Answer),
+                (0, BodyEnd),
+                (0, Buffered),
+                (2, Answer),
+                (0, BodyEnd),
+            ],
+            313,
+        ),
+        // A partial head behind a pipelined request: the
+        // idle timeout, then the header timeout from its
+        // next byte.
+        (
+            31,
+            301,
+            &[(10, Request), (0, Answer), (0, BodyEnd), (0, Pending)],
+            311,
+        ),
+        (
+            31,
+            301,
+            &[
+                (10, Request),
+                (0, Answer),
+                (0, BodyEnd),
+                (0, Pending),
+                (100, Bytes),
+            ],
+            141,
+        ),
+        // A head that starts while a response is still
+        // being sent starts no header timeout either.
+        (
+            31,
+            301,
+            &[(10, Request), (0, Answer), (2, Bytes), (2, BodyEnd)],
+            315,
+        ),
+        // A request dropped unanswered: idle from then.
+        (301, 31, &[(10, Request), (100, Abandon)], 141),
+    ];
+    for (n, (header_ms, idle_ms, steps, closes)) in scripts.iter().enumerate() {
+        let began = Instant::now();
+        let mut watched = Driven::new(ms(*header_ms), ms(*idle_ms));
+        for (wait, step) in *steps {
+            sleep(ms(*wait)).await;
+            assert_eq!(watched.closed(), None, "script {n}: closed before {step:?}");
+            watched.apply(*step, Version::HTTP_11);
+        }
+        sleep_until(began + ms(*closes - 1)).await;
+        assert_eq!(watched.closed(), None, "script {n}: closed early");
+        sleep(ms(2 * (header_ms + idle_ms))).await;
+        assert_eq!(
+            watched.closed().map(|at| at.duration_since(began)),
+            Some(ms(*closes)),
+            "script {n}"
+        );
+    }
 }

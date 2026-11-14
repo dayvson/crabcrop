@@ -161,6 +161,13 @@ rustix = { version = "1", features = ["process", "fs"] }
 # PROPTEST_* environment overrides. A test-only dependency:
 # it never enters a normal build.
 proptest = { version = "1.12", default-features = false, features = ["std"] }
+# The connection watch's deadline tests (issue #639) run on
+# tokio's paused clock, which `test-util` provides: every
+# order of a connection's events is compared with its
+# deadline to the millisecond, and no test waits for one.
+# A test-only feature of a crate already in the tree: it
+# adds no crate and never enters a normal build.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 # AVIF source decoding, through the image crate's avif-native
