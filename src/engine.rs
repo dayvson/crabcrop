@@ -3388,7 +3388,10 @@ struct FusionPlan {
 /// - G1: exactly one crop in the chain, and it is a
 ///   `crop-rect`. Its window is static in the operation; an
 ///   aspect crop's window depends on focal and detection
-///   state decided at run time, so it never fuses.
+///   state decided at run time, so it never fuses. (An
+///   aspect crop's own resize reads its window from the
+///   frame too, by a route that keeps the two-step bytes:
+///   see [`resize_lanczos3_cut`].)
 /// - G2: exactly one resize (`Operation::Size`) in the
 ///   chain.
 /// - G3: the crop precedes the resize, and only decode-time
@@ -3515,7 +3518,9 @@ impl SmartWindows {
     /// window the crop used) and later frames replay that
     /// window verbatim, so the analysis runs once and the
     /// framing cannot jitter. `op_index` is the crop's
-    /// position in the chain.
+    /// position in the chain. A replayed window is handed
+    /// back uncut, for the resize that closes the crop to
+    /// read from the frame (issue #654).
     fn crop(
         &mut self,
         img: DynamicImage,
@@ -3523,10 +3528,13 @@ impl SmartWindows {
         op_index: usize,
         align: &Align,
         ctx: &ProcessContext<'_>,
-    ) -> DynamicImage {
+    ) -> crate::crop::Uncut {
         let key = (op_index, img.width(), img.height());
-        if let Some((x, y, cw, ch)) = self.get(key) {
-            DynamicImage::ImageRgba8(image::imageops::crop_imm(&img, x, y, cw, ch).to_image())
+        if let Some(window) = self.get(key) {
+            crate::crop::Uncut {
+                img,
+                window: Some(window),
+            }
         } else {
             let (cropped, trace) = crate::crop::crop_to_aspect_traced(
                 img,
@@ -3539,7 +3547,7 @@ impl SmartWindows {
             if let Some(trace) = trace {
                 self.set(key, trace.window);
             }
-            cropped
+            crate::crop::Uncut::whole(cropped)
         }
     }
 
@@ -4293,7 +4301,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // which report the decision they actually made.
         let want_trace = self.debug_armed && self.debug_capture.is_none();
         let canvas = want_trace.then(|| img.clone());
-        let img = if let Some(Focal::Rect(rect)) = focal {
+        // Every arm hands back the frame and the window it
+        // decided on. The traced arms, which the debug view
+        // and an animation's first frame take, hand back the
+        // window already cut.
+        let uncut = if let Some(Focal::Rect(rect)) = focal {
             self.focal_rect_crop(img, (tw, th), rect, canvas)
         } else if let Some(Focal::Point(pt)) = focal {
             self.focal_point_crop(img, (tw, th), pt, canvas)
@@ -4313,7 +4325,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
             if let Some(trace) = trace {
                 self.debug_capture = Some(capture_from_trace(canvas, trace));
             }
-            cropped
+            crate::crop::Uncut::whole(cropped)
         } else if *align == Align::Smart
             && let Some(windows) = self
                 .share
@@ -4322,7 +4334,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         {
             windows.crop(img, (tw, th), op_index, align, self.ctx)
         } else {
-            crate::crop::crop_to_aspect_with(
+            crate::crop::crop_to_aspect_uncut(
                 img,
                 tw,
                 th,
@@ -4331,8 +4343,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 self.ctx.focal_provider,
             )
         };
-        apply_size(
-            img,
+        // The resize that closes the crop reads the window
+        // straight from the frame (issue #654). It sizes
+        // and checks against the window's dimensions, as it
+        // did against the cut window's.
+        apply_size_windowed(
+            uncut.img,
             &ImageSize {
                 width: Dimension::Pixels(tw),
                 height: Dimension::Pixels(th),
@@ -4341,6 +4357,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
             },
             self.cap.map(|(cw, ch)| SizeCap::Fit(cw, ch)),
             1.0,
+            match uncut.window {
+                Some(window) => SourceWindow::Cut(window),
+                None => SourceWindow::Whole,
+            },
         )
     }
 
@@ -4353,7 +4373,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         (tw, th): (u32, u32),
         rect: (u32, u32, u32, u32),
         canvas: Option<DynamicImage>,
-    ) -> DynamicImage {
+    ) -> crate::crop::Uncut {
         if let Some(canvas) = canvas {
             let (cropped, window) = crate::crop::crop_to_aspect_focal_traced(img, tw, th, rect);
             let (cw, ch) = (canvas.width(), canvas.height());
@@ -4368,9 +4388,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 faces: Vec::new(),
                 objects: Vec::new(),
             });
-            cropped
+            crate::crop::Uncut::whole(cropped)
         } else {
-            crate::crop::crop_to_aspect_focal(img, tw, th, rect)
+            crate::crop::crop_to_aspect_focal_uncut(img, tw, th, rect).0
         }
     }
 
@@ -4383,7 +4403,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         (tw, th): (u32, u32),
         pt: (f32, f32, f32),
         canvas: Option<DynamicImage>,
-    ) -> DynamicImage {
+    ) -> crate::crop::Uncut {
         if let Some(canvas) = canvas {
             let (cropped, window) = crate::crop::crop_to_aspect_point_traced(img, tw, th, pt);
             let (cw, ch) = (canvas.width(), canvas.height());
@@ -4398,9 +4418,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 faces: Vec::new(),
                 objects: Vec::new(),
             });
-            cropped
+            crate::crop::Uncut::whole(cropped)
         } else {
-            crate::crop::crop_to_aspect_point(img, tw, th, pt)
+            crate::crop::crop_to_aspect_point_uncut(img, tw, th, pt).0
         }
     }
 
@@ -4414,7 +4434,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         img: DynamicImage,
         (tw, th): (u32, u32),
         canvas: Option<DynamicImage>,
-    ) -> Result<DynamicImage, EngineError> {
+    ) -> Result<crate::crop::Uncut, EngineError> {
         let faces = match detect_faces(&mut self.face_memo, &img, self.ctx) {
             Ok(faces) => faces,
             Err(EngineError::Inference(_)) => Vec::new(),
@@ -4442,9 +4462,16 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         faces,
                         objects: Vec::new(),
                     });
-                    cropped
+                    crate::crop::Uncut::whole(cropped)
                 } else {
-                    crate::crop::crop_around_face(img, tw, th, &face, self.directives.face_padding)
+                    crate::crop::crop_around_face_uncut(
+                        img,
+                        tw,
+                        th,
+                        &face,
+                        self.directives.face_padding,
+                    )
+                    .0
                 }
             }
             None => {
@@ -4460,9 +4487,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     if let Some(trace) = trace {
                         self.debug_capture = Some(capture_from_trace(canvas, trace));
                     }
-                    cropped
+                    crate::crop::Uncut::whole(cropped)
                 } else {
-                    crate::crop::crop_to_aspect_with(
+                    crate::crop::crop_to_aspect_uncut(
                         img,
                         tw,
                         th,
@@ -4493,7 +4520,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         classes: &[String],
         scale: f32,
         canvas: Option<DynamicImage>,
-    ) -> Result<DynamicImage, EngineError> {
+    ) -> Result<crate::crop::Uncut, EngineError> {
         let mut used: Vec<crate::ai::Detection> = Vec::new();
         let mut answered = true;
         for class in classes {
@@ -4536,9 +4563,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         faces: Vec::new(),
                         objects: used,
                     });
-                    cropped
+                    crate::crop::Uncut::whole(cropped)
                 } else {
-                    crate::crop::crop_around_objects(img, tw, th, union, scale)
+                    crate::crop::crop_around_objects_uncut(img, tw, th, union, scale).0
                 }
             }
             None => {
@@ -4555,9 +4582,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     if let Some(trace) = trace {
                         self.debug_capture = Some(capture_from_trace(canvas, trace));
                     }
-                    cropped
+                    crate::crop::Uncut::whole(cropped)
                 } else {
-                    crate::crop::crop_to_aspect_with(img, tw, th, Align::Center, None, None)
+                    crate::crop::crop_to_aspect_uncut(img, tw, th, Align::Center, None, None)
                 }
             }
         };
@@ -5409,7 +5436,22 @@ fn apply_size(
     cap: Option<SizeCap>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
-    apply_size_windowed(img, size, cap, dpr, None)
+    apply_size_windowed(img, size, cap, dpr, SourceWindow::Whole)
+}
+
+/// What part of the frame in hand a resize reads.
+#[derive(Clone, Copy)]
+enum SourceWindow {
+    /// All of it.
+    Whole,
+    /// The rectangle a `crop-rect` named, resampled through
+    /// the backend's crop box (issue #287).
+    Fused(Window),
+    /// The window an aspect crop decided on (issue #654).
+    /// The result is RGBA8 and byte for byte the two-step
+    /// chain's: the window cut to RGBA8, then resized (see
+    /// [`resize_lanczos3_cut`]).
+    Cut(Window),
 }
 
 /// [`apply_size`] for the crop+resize fusion (issue #287):
@@ -5426,7 +5468,7 @@ fn apply_size_cropped(
     cap: Option<SizeCap>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
-    apply_size_windowed(img, size, cap, dpr, Some(window))
+    apply_size_windowed(img, size, cap, dpr, SourceWindow::Fused(window))
 }
 
 /// Whether a resize or fit-in box asks for a zero pixel side
@@ -5468,7 +5510,7 @@ fn apply_size_windowed(
     size: &ImageSize,
     cap: Option<SizeCap>,
     dpr: f32,
-    window: Option<(u32, u32, u32, u32)>,
+    window: SourceWindow,
 ) -> Result<DynamicImage, EngineError> {
     check_nonzero_size(size)?;
     let size = &ImageSize {
@@ -5477,9 +5519,20 @@ fn apply_size_windowed(
         flip_horizontal: size.flip_horizontal,
         flip_vertical: size.flip_vertical,
     };
+    // A cut window is clamped into the frame first, as the
+    // cut itself clamps it, so the size resolves and is
+    // checked against the dimensions a materialized cut
+    // would have.
+    let window = match window {
+        SourceWindow::Cut(window) => SourceWindow::Cut(crate::crop::clamp_window(
+            window,
+            (img.width(), img.height()),
+        )),
+        other => other,
+    };
     let (sw, sh) = match window {
-        Some((_, _, w, h)) => (w, h),
-        None => (img.width(), img.height()),
+        SourceWindow::Fused((_, _, w, h)) | SourceWindow::Cut((_, _, w, h)) => (w, h),
+        SourceWindow::Whole => (img.width(), img.height()),
     };
     let w = match size.width {
         Dimension::Pixels(n) => n,
@@ -5508,13 +5561,19 @@ fn apply_size_windowed(
             // No resample runs: the two-step path returns
             // the materialized window itself, so the fused
             // path materializes it here.
-            Some((x, y, ww, wh)) => img.crop_imm(x, y, ww, wh),
-            None => img,
+            SourceWindow::Fused((x, y, ww, wh)) => img.crop_imm(x, y, ww, wh),
+            SourceWindow::Cut(window) => {
+                DynamicImage::ImageRgba8(crate::crop::cut_rgba(&img, window))
+            }
+            SourceWindow::Whole => img,
         }
     } else {
         match window {
-            Some((x, y, ww, wh)) => resize_lanczos3_cropped(&img, x, y, ww, wh, w, h),
-            None => resize_lanczos3(&img, w, h),
+            SourceWindow::Fused((x, y, ww, wh)) => {
+                resize_lanczos3_cropped(&img, x, y, ww, wh, w, h)
+            }
+            SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
+            SourceWindow::Whole => resize_lanczos3_owned(img, w, h),
         }
     };
     if size.flip_horizontal {
@@ -5545,10 +5604,7 @@ pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImag
             ));
         }
     };
-    let opts = fast_image_resize::ResizeOptions::new().resize_alg(
-        fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3),
-    );
-    match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
+    match fast_image_resize::Resizer::new().resize(img, &mut dst, &lanczos3_options()) {
         Ok(()) => dst,
         Err(_) => DynamicImage::ImageRgba8(image::imageops::resize(
             img,
@@ -5557,6 +5613,102 @@ pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImag
             image::imageops::FilterType::Lanczos3,
         )),
     }
+}
+
+/// The backend's options for the one resample every resize
+/// here runs: the Lanczos3 convolution.
+fn lanczos3_options() -> fast_image_resize::ResizeOptions {
+    fast_image_resize::ResizeOptions::new().resize_alg(fast_image_resize::ResizeAlg::Convolution(
+        fast_image_resize::FilterType::Lanczos3,
+    ))
+}
+
+/// [`resize_lanczos3`] of a frame the caller is done with
+/// (issue #657). The backend resamples a layout with alpha
+/// premultiplied, and it premultiplies a borrowed frame into
+/// a second buffer the size of the frame. An owned frame is
+/// premultiplied where it sits instead (see
+/// [`resample_premultiplying`]): the same three steps on the
+/// same values, so the same bytes, without that buffer. A
+/// layout without alpha takes [`resize_lanczos3`] as it is,
+/// and so does a size that needs no resample: the backend
+/// copies those pixels untouched, which a premultiply and a
+/// divide around the copy would not.
+fn resize_lanczos3_owned(mut img: DynamicImage, w: u32, h: u32) -> DynamicImage {
+    use fast_image_resize::IntoImageView;
+    let has_alpha_step = img
+        .pixel_type()
+        .is_some_and(|layout| fast_image_resize::MulDiv::new().is_supported(layout));
+    let (sw, sh) = (img.width(), img.height());
+    if !has_alpha_step || (w, h) == (sw, sh) || w == 0 || h == 0 || sw == 0 || sh == 0 {
+        return resize_lanczos3(&img, w, h);
+    }
+    let Some(mut dst) = blank_like(&img, w, h) else {
+        return resize_lanczos3(&img, w, h);
+    };
+    if resample_premultiplying(&mut img, &mut dst) {
+        dst
+    } else {
+        resize_lanczos3(&img, w, h)
+    }
+}
+
+/// Resample `src` into `dst` the way the backend resamples a
+/// layout with alpha, but premultiplying `src` where it sits
+/// instead of into a copy: the backend's own premultiply,
+/// its convolution with the alpha step off, and its own
+/// divide of the result. `true` when `dst` holds the result.
+///
+/// On `false` `dst` holds nothing usable and `src` is
+/// straight alpha again, so a premultiplied frame never
+/// leaves this function. The backend refuses layouts, not
+/// pixels, and it refuses the premultiply before it writes
+/// a pixel; the callers hand over only layouts it takes.
+/// Should the convolution or the divide refuse all the same,
+/// `src` is divided back before the caller takes its plain
+/// path with it (a test forces this branch). The divide is
+/// the premultiply's inverse to within its rounding, so that
+/// path, which nothing reaches, can sit a rounding step away
+/// from the plain one.
+fn resample_premultiplying<S, D>(src: &mut S, dst: &mut D) -> bool
+where
+    S: fast_image_resize::IntoImageViewMut,
+    D: fast_image_resize::IntoImageViewMut,
+{
+    let mul_div = fast_image_resize::MulDiv::new();
+    if mul_div.multiply_alpha_inplace(src).is_err() {
+        return false;
+    }
+    if convolve_lanczos3(src, dst) && mul_div.divide_alpha_inplace(dst).is_ok() {
+        return true;
+    }
+    let _ = mul_div.divide_alpha_inplace(src);
+    false
+}
+
+/// The backend's Lanczos3 convolution alone, its alpha step
+/// off: what it runs between its own premultiply and divide.
+/// `false` when it refuses.
+fn convolve_lanczos3<S, D>(src: &S, dst: &mut D) -> bool
+where
+    S: fast_image_resize::IntoImageView,
+    D: fast_image_resize::IntoImageViewMut,
+{
+    #[cfg(test)]
+    if CONVOLVE_REFUSES.get() {
+        return false;
+    }
+    fast_image_resize::Resizer::new()
+        .resize(src, dst, &lanczos3_options().use_alpha(false))
+        .is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`convolve_lanczos3`] refuse on this thread, so
+    /// a test can walk the path behind a backend refusal,
+    /// which no input reaches.
+    static CONVOLVE_REFUSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A blank destination image of `img`'s own variant at
@@ -5577,6 +5729,196 @@ fn blank_like(img: &DynamicImage, w: u32, h: u32) -> Option<DynamicImage> {
         DynamicImage::ImageRgba32F(_) => Some(DynamicImage::new_rgba32f(w, h)),
         _ => None,
     }
+}
+
+/// An aspect crop's window resized to (w, h), as RGBA8
+/// (issue #654): byte for byte [`resize_lanczos3`] of the
+/// window cut to RGBA8 ([`crate::crop::cut_rgba`]), which is
+/// what a crop has always produced.
+///
+/// Where it can, the resample reads the window straight from
+/// the frame, without making that cut (see
+/// [`resample_window`]). Everywhere else the window is cut
+/// first, as it always was, the frame is released, and the
+/// cut is resized: a layout other than RGB8 and RGBA8, a
+/// window that needs no resample, a case
+/// [`opaque_stays_opaque`] or [`view_holds_no_more`] turns
+/// away, and a backend refusal.
+fn resize_lanczos3_cut(img: DynamicImage, window: Window, w: u32, h: u32) -> DynamicImage {
+    let (x, y, ww, wh) = window;
+    let inside =
+        x as u64 + ww as u64 <= img.width() as u64 && y as u64 + wh as u64 <= img.height() as u64;
+    let resamples = inside && ww > 0 && wh > 0 && w > 0 && h > 0 && (ww, wh) != (w, h);
+    let img = if resamples {
+        match resample_window(img, window, w, h) {
+            Ok(resized) => return resized,
+            Err(img) => img,
+        }
+    } else {
+        img
+    };
+    let cut = crate::crop::cut_rgba(&img, window);
+    drop(img);
+    resize_lanczos3_owned(DynamicImage::ImageRgba8(cut), w, h)
+}
+
+/// The window of an RGB8 or RGBA8 frame resampled to (w, h)
+/// through a view of the frame, as RGBA8; or the frame handed
+/// back, for the caller to cut the window first.
+///
+/// A view ends at the window's edges, so the resample sees
+/// exactly the pixels a cut would hold. The backend's crop
+/// box is not that: its kernel reads past the box into the
+/// frame around it, which is why
+/// [`resize_lanczos3_cropped`] (issue #287) differs from the
+/// two-step chain and this does not. A test pins both.
+///
+/// An RGB8 frame is resampled as RGB8 and gains its opaque
+/// alpha afterwards. The RGBA8 resample of the same pixels
+/// under an alpha of 255 computes the same color channels
+/// (premultiplying by 255 and dividing by 255 change
+/// nothing, and the convolution runs per channel) provided
+/// its alpha comes out 255 everywhere, which
+/// [`opaque_stays_opaque`] answers. The resample writes its
+/// RGB8 rows into the front of the result's own buffer,
+/// which [`spread_rgb_to_rgba`] then widens in place, so
+/// the result is the only buffer of the output's size. An
+/// RGBA8 frame has its window premultiplied where it sits
+/// (see [`resample_premultiplying`]): the crop owns the frame
+/// and nothing reads it afterwards.
+///
+/// `Err` hands the frame back as it came: another layout, a
+/// case [`opaque_stays_opaque`] or [`view_holds_no_more`]
+/// turns away, and a backend refusal, which no input reaches
+/// and which leaves an RGBA8 window straight again.
+fn resample_window(
+    img: DynamicImage,
+    (x, y, ww, wh): Window,
+    w: u32,
+    h: u32,
+) -> Result<DynamicImage, DynamicImage> {
+    let frame_bytes = img.as_bytes().len() as u64;
+    match img {
+        DynamicImage::ImageRgb8(rgb)
+            if opaque_stays_opaque((ww, wh), (w, h))
+                && view_holds_no_more(frame_bytes, 3, (ww, wh), (w, h)) =>
+        {
+            let pixels = w as usize * h as usize;
+            let mut out = vec![0u8; pixels * 4];
+            let done = fast_image_resize::images::Image::from_slice_u8(
+                w,
+                h,
+                &mut out[..pixels * 3],
+                fast_image_resize::PixelType::U8x3,
+            )
+            .is_ok_and(|mut packed| {
+                fast_image_resize::images::CroppedImage::new(&rgb, x, y, ww, wh)
+                    .is_ok_and(|view| convolve_lanczos3(&view, &mut packed))
+            });
+            if !done {
+                return Err(DynamicImage::ImageRgb8(rgb));
+            }
+            spread_rgb_to_rgba(&mut out, pixels);
+            Ok(DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(w, h, out).expect("resize size"),
+            ))
+        }
+        DynamicImage::ImageRgba8(mut rgba)
+            if view_holds_no_more(frame_bytes, 4, (ww, wh), (w, h)) =>
+        {
+            let mut resized = image::RgbaImage::new(w, h);
+            let done = fast_image_resize::images::CroppedImageMut::new(&mut rgba, x, y, ww, wh)
+                .is_ok_and(|mut view| resample_premultiplying(&mut view, &mut resized));
+            if done {
+                Ok(DynamicImage::ImageRgba8(resized))
+            } else {
+                Err(DynamicImage::ImageRgba8(rgba))
+            }
+        }
+        other => Err(other),
+    }
+}
+
+/// Widen `pixels` RGB8 pixels packed at the front of `buf`
+/// to RGBA8 over the first `4 * pixels` bytes of it, alpha
+/// 255, in place. Pixel `i` moves from byte `3 * i` to byte
+/// `4 * i`, so the pixels move from the last one back: a
+/// run of them is copied whole where its new place lies
+/// past its old one (every run but the first few), and one
+/// pixel at a time where the two overlap.
+fn spread_rgb_to_rgba(buf: &mut [u8], pixels: usize) {
+    const RUN: usize = 256;
+    let mut end = pixels;
+    while end > 0 {
+        let start = end.saturating_sub(RUN);
+        if 4 * start >= 3 * end {
+            let (packed, spread) = buf.split_at_mut(4 * start);
+            let packed = packed[3 * start..3 * end].as_chunks::<3>().0;
+            let spread = spread[..4 * (end - start)].as_chunks_mut::<4>().0;
+            for (d, s) in spread.iter_mut().zip(packed) {
+                *d = [s[0], s[1], s[2], 255];
+            }
+        } else {
+            for i in (start..end).rev() {
+                let (r, g, b) = (buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]);
+                buf[4 * i..4 * i + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+        end = start;
+    }
+}
+
+/// Whether resampling a window straight from the frame holds
+/// no more memory at its peak than the cut-first chain did
+/// before issue #654. That chain peaked at the larger of two
+/// moments: the frame beside the RGBA8 cut; and, with the
+/// frame released, the cut, the backend's premultiplied copy
+/// of it, the backend's working rows and the output. Read
+/// from the frame, a crop holds the frame, the working rows
+/// and the output at once. That is no more than the second
+/// moment when the frame is no larger than the cut and its
+/// copy, and no more than the first when the working rows
+/// and the output fit in the size of the cut. So an aspect
+/// crop, whose window is most of the frame, reads from the
+/// frame, and so does a small window reduced well; a small
+/// window enlarged, or barely reduced, is cut first and the
+/// frame released, as before.
+///
+/// `frame_bytes` is the frame's buffer and `channels` its
+/// bytes per pixel; a cut and the output have four. The
+/// backend convolves down the columns first, into working
+/// rows no wider than the window and as tall as the output.
+fn view_holds_no_more(
+    frame_bytes: u64,
+    channels: u64,
+    (ww, wh): (u32, u32),
+    (w, h): (u32, u32),
+) -> bool {
+    let cut = 4 * ww as u64 * wh as u64;
+    let output = 4 * w as u64 * h as u64;
+    let working = channels * ww as u64 * h as u64;
+    frame_bytes <= 2 * cut || working + output <= cut
+}
+
+/// The largest reduction, per axis, at which
+/// [`opaque_stays_opaque`] holds by arithmetic alone.
+const MAX_OPAQUE_REDUCTION: u64 = 1024;
+
+/// Whether the backend's RGBA8 resample of a fully opaque
+/// `from` window to `to` pixels leaves every alpha at 255.
+/// The backend rounds each kernel weight to fixed point, so
+/// the weights of one output pixel sum to one give or take
+/// half a unit per tap, and 255 times that sum rounds back
+/// to 255 while the error stays under 1/510 of the scale.
+/// The scale has at most 21 bits and a Lanczos3 pixel reads
+/// six taps per unit of reduction, so the error is under
+/// 3 * 1024 + 1 units of 2^-21 for reductions up to 1024,
+/// against the 4112 that would move alpha; with fewer bits
+/// the weights are larger and the taps fewer, and the margin
+/// only grows. Past that reduction nothing is claimed.
+fn opaque_stays_opaque((ww, wh): (u32, u32), (w, h): (u32, u32)) -> bool {
+    let within = |from: u32, to: u32| from as u64 <= to as u64 * MAX_OPAQUE_REDUCTION;
+    within(ww, w) && within(wh, h)
 }
 
 /// [`resize_lanczos3`] fused with the crop that precedes it
@@ -5603,11 +5945,7 @@ pub(crate) fn resize_lanczos3_cropped(
         Some(dst) => dst,
         None => return two_step(),
     };
-    let opts = fast_image_resize::ResizeOptions::new()
-        .crop(x as f64, y as f64, w as f64, h as f64)
-        .resize_alg(fast_image_resize::ResizeAlg::Convolution(
-            fast_image_resize::FilterType::Lanczos3,
-        ));
+    let opts = lanczos3_options().crop(x as f64, y as f64, w as f64, h as f64);
     match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
         Ok(()) => dst,
         Err(_) => two_step(),
@@ -5632,13 +5970,26 @@ fn apply_pad(
     cap: Option<(u32, u32)>,
     deadline: Option<std::time::Instant>,
 ) -> Result<(DynamicImage, Window), EngineError> {
+    /// What fills the canvas around the fitted image.
+    enum Backdrop {
+        Solid([u8; 3]),
+        /// The frame as it came, to scale and blur.
+        Blurred(DynamicImage),
+    }
     if target_w == 0 || target_h == 0 {
         let whole = (0, 0, img.width(), img.height());
         return Ok((img, whole));
     }
     check_output_size(target_w, target_h, (img.width(), img.height()))?;
+    let backdrop = match fill {
+        PadFill::Color(c) => Backdrop::Solid(c),
+        PadFill::Directive => Backdrop::Solid(directive_fill.unwrap_or([0, 0, 0])),
+        // Only the blurred fill reads the frame again after
+        // the fit, so only it keeps a copy (issue #656).
+        PadFill::Blur => Backdrop::Blurred(img.clone()),
+    };
     let fitted = apply_fit_in(
-        img.clone(),
+        img,
         &ImageSize {
             width: Dimension::Pixels(target_w),
             height: Dimension::Pixels(target_h),
@@ -5654,35 +6005,70 @@ fn apply_pad(
     if fitted.width() == target_w && fitted.height() == target_h {
         return Ok((fitted, (0, 0, target_w, target_h)));
     }
-    let color = match fill {
-        PadFill::Color(c) => Some(c),
-        PadFill::Directive => Some(directive_fill.unwrap_or([0, 0, 0])),
-        PadFill::Blur => None,
-    };
-    let canvas = match color {
-        Some(c) => DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+    let mut base = match backdrop {
+        Backdrop::Solid(c) => image::RgbaImage::from_raw(
             target_w,
             target_h,
-            image::Rgba([c[0], c[1], c[2], 255]),
-        )),
-        None => {
+            [c[0], c[1], c[2], 255].repeat(target_w as usize * target_h as usize),
+        )
+        .expect("canvas size"),
+        Backdrop::Blurred(source) => {
             // Ambient bars: the image scaled to cover the whole
             // canvas, then blurred hard enough that only its
             // broad colors survive.
             let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
             crate::filters::blur_fast_within(
-                &img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
+                &source.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
                 sigma,
                 deadline,
             )?
+            .into_rgba8()
         }
     };
-    let mut base = canvas.to_rgba8();
     let x = (target_w - fitted.width()) / 2;
     let y = (target_h - fitted.height()) / 2;
-    image::imageops::overlay(&mut base, &fitted.to_rgba8(), x as i64, y as i64);
     let placed = (x, y, fitted.width(), fitted.height());
+    place_on(&mut base, fitted, x, y);
     Ok((DynamicImage::ImageRgba8(base), placed))
+}
+
+/// Composite `top` over `base` at (x, y): byte for byte
+/// `image::imageops::overlay` of `top` as RGBA8 (issue #656).
+/// A source-over blend with an opaque top pixel is that
+/// pixel, and a layout without an alpha channel converts to
+/// opaque pixels only. So a `top` without alpha that lies
+/// inside `base` is written over it by rows, with no blend
+/// per pixel; one with alpha, or one that would be clipped,
+/// takes the crate's overlay.
+fn place_on(base: &mut image::RgbaImage, top: DynamicImage, x: u32, y: u32) {
+    let (tw, th) = (top.width() as usize, top.height() as usize);
+    let inside =
+        x as u64 + tw as u64 <= base.width() as u64 && y as u64 + th as u64 <= base.height() as u64;
+    if top.color().has_alpha() || !inside || tw == 0 || th == 0 {
+        image::imageops::overlay(base, &top.into_rgba8(), x as i64, y as i64);
+        return;
+    }
+    let stride = base.width() as usize * 4;
+    let span = x as usize * 4..(x as usize + tw) * 4;
+    let rows = base.chunks_exact_mut(stride).skip(y as usize).take(th);
+    match top {
+        DynamicImage::ImageRgb8(rgb) => {
+            for (dst, src) in rows.zip(rgb.as_raw().chunks_exact(tw * 3)) {
+                let dst = dst[span.clone()].as_chunks_mut::<4>().0;
+                for (d, s) in dst.iter_mut().zip(src.as_chunks::<3>().0) {
+                    *d = [s[0], s[1], s[2], 255];
+                }
+            }
+        }
+        // Gray, 16-bit and float: the crate's conversion,
+        // which is what the overlay read.
+        other => {
+            let rgba = other.into_rgba8();
+            for (dst, src) in rows.zip(rgba.as_raw().chunks_exact(tw * 4)) {
+                dst[span.clone()].copy_from_slice(src);
+            }
+        }
+    }
 }
 
 /// The box an adaptive fit-in actually fits into: the declared
@@ -5761,12 +6147,16 @@ fn apply_fit_in(
     if w == sw && h == sh {
         Ok(img)
     } else {
-        Ok(resize_lanczos3(&img, w, h))
+        Ok(resize_lanczos3_owned(img, w, h))
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+// Fast paths against the code they replaced, byte for byte.
+#[cfg(test)]
+mod identity_proofs;
 
 #[cfg(test)]
 pub(crate) mod test_formats;
