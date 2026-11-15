@@ -117,11 +117,16 @@ fn rgb8_view_borrows_an_rgb8_frame_and_converts_every_other_layout() {
 fn the_view_feeds_the_resizer_the_bytes_the_copies_did() {
     // The two steps together, as every preprocessor runs
     // them, against the pre-#672 form (a `to_rgb8` copy,
-    // then a copy for the resizer): every layout, at one
-    // pixel, upscaled and downscaled.
+    // then a copy for the resizer), at one pixel, upscaled
+    // and downscaled: every layout where the target is
+    // small, and where it is a model's whole input, which
+    // is most of a tenth of a second in a debug build, a
+    // frame that is borrowed and one that is converted.
     for ((sw, sh), (dw, dh)) in RESIZES {
         let rgb = noise_rgb(sw, sh, sw * 17 + sh);
-        for (layout, img) in layouts(&rgb) {
+        let layouts = layouts(&rgb);
+        let count = if dw * dh > 100_000 { 2 } else { layouts.len() };
+        for (layout, img) in layouts.into_iter().take(count) {
             assert_eq!(
                 fir_resize(&*rgb8_view(&img), dw, dh).into_raw(),
                 fir_resize_from_a_copy(&img.to_rgb8(), dw, dh).into_raw(),

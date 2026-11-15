@@ -91,46 +91,58 @@ fn crop224_preprocess_by_the_crate(img: &DynamicImage, (means, stds): ChannelSta
 #[test]
 fn crop224_preprocess_matches_the_whole_frame_resize_bit_for_bit() {
     // Issue #673: only the crop's window is resampled. The
-    // tensor is the one the whole-frame resize gave, for
-    // every layout: RGB8 and RGBA8 take the window, the
-    // others the crate's path. Wide, tall, square at the
+    // tensor is the one the whole-frame resize gave. RGB8
+    // and RGBA8 take the window: wide, tall, square at the
     // model's size (a copy), smaller than the crop
-    // (upscaled), and one pixel.
+    // (upscaled), and one pixel. Every other layout takes
+    // the crate's path, as before, and one size shows it:
+    // the crate's resize is most of a tenth of a second in
+    // a debug build whatever the frame, because the target
+    // is never smaller than the crop.
+    let same = |img: &DynamicImage, stats: ChannelStats, what: &str| {
+        assert!(
+            same_bits(
+                &crop224_preprocess(img, stats),
+                &crop224_preprocess_by_the_crate(img, stats)
+            ),
+            "{what}"
+        );
+    };
     for (w, h) in [(400, 267), (131, 300), (224, 224), (90, 60), (1, 1)] {
         let rgb = noise_rgb(w, h, w * 13 + h);
-        for (layout, img) in layouts(&rgb) {
-            for stats in [CLIP_STATS, VIT_STATS] {
-                assert!(
-                    same_bits(
-                        &crop224_preprocess(&img, stats),
-                        &crop224_preprocess_by_the_crate(&img, stats)
-                    ),
-                    "{layout} {w}x{h}"
-                );
-            }
+        for (layout, img) in layouts(&rgb).into_iter().take(2) {
+            same(&img, CLIP_STATS, &format!("{layout} {w}x{h}"));
         }
     }
+    let rgb = noise_rgb(90, 60, 77);
+    for (layout, img) in layouts(&rgb).into_iter().skip(2) {
+        same(&img, CLIP_STATS, &format!("{layout} 90x60"));
+    }
+    // The other model's statistics are applied to the same
+    // crop.
+    let tall = DynamicImage::ImageRgb8(noise_rgb(131, 300, 78));
+    same(&tall, VIT_STATS, "the classifier's statistics");
 }
 
 #[test]
 fn crop224_takes_its_window_from_the_capped_size() {
     // Issue #359's cap comes first: a frame whose long side
     // would pass 4096 is resized to the capped size, and the
-    // window is the center of that. Both orientations, RGB8
-    // and RGBA8, against the whole-frame resize.
-    for (w, h) in [(2400, 100), (100, 2400)] {
+    // window is the center of that. Both orientations, one
+    // as RGB8 and one as RGBA8, against the whole-frame
+    // resize.
+    for ((w, h), layout) in [((2400, 100), 0), ((100, 2400), 1)] {
         let (nw, nh) = crop224_resize_dims(w, h);
         assert_eq!(nw.max(nh), 4096, "{w}x{h}");
         let rgb = noise_rgb(w, h, w * 13 + h);
-        for (layout, img) in layouts(&rgb).into_iter().take(2) {
-            assert!(
-                same_bits(
-                    &crop224_preprocess(&img, CLIP_STATS),
-                    &crop224_preprocess_by_the_crate(&img, CLIP_STATS)
-                ),
-                "{layout} {w}x{h}"
-            );
-        }
+        let (layout, img) = layouts(&rgb).swap_remove(layout);
+        assert!(
+            same_bits(
+                &crop224_preprocess(&img, CLIP_STATS),
+                &crop224_preprocess_by_the_crate(&img, CLIP_STATS)
+            ),
+            "{layout} {w}x{h}"
+        );
     }
 }
 
