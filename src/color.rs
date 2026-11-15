@@ -755,7 +755,10 @@ fn srgb_profile_bytes() -> &'static [u8] {
 /// sRGB, for RGB(A) images at 8 or 16 bits. Profiles of
 /// other color families, and unparseable profiles, leave
 /// the image unchanged (the CMYK route is the decoder's,
-/// and a broken profile must not fail the request).
+/// and a broken profile must not fail the request). So does
+/// a profile that is sRGB in effect, whatever its bytes, on
+/// an 8-bit frame (issue #662, see `is_srgb_in_effect`):
+/// its pixels are in sRGB already.
 pub fn convert_to_srgb(img: DynamicImage, icc: &[u8]) -> DynamicImage {
     if icc == srgb_profile_bytes() {
         return img;
@@ -769,12 +772,39 @@ pub fn convert_to_srgb(img: DynamicImage, icc: &[u8]) -> DynamicImage {
     let srgb = moxcms::ColorProfile::new_srgb();
     use moxcms::Layout;
     match img {
+        // The conversion an RGB8 frame takes is the one that
+        // says whether the profile is sRGB in effect, so it is
+        // built once and does both.
         DynamicImage::ImageRgb8(buf) => {
-            DynamicImage::ImageRgb8(to_srgb(buf, Layout::Rgb, &source, &srgb))
+            DynamicImage::ImageRgb8(match Conversion::new(&source, Layout::Rgb, &srgb) {
+                Some(conversion) if !is_srgb_in_effect(&source, &conversion) => {
+                    conversion.apply(buf)
+                }
+                _ => buf,
+            })
         }
+        // An RGBA8 frame is asked the same question of the
+        // same RGB conversion, so a profile gets one answer
+        // whatever the frame's layout. That is one transform
+        // more to build than the frame's own, about 0.6 ms.
+        // A profile with a table is never taken for sRGB, so
+        // nothing is built to ask it.
         DynamicImage::ImageRgba8(buf) => {
-            DynamicImage::ImageRgba8(to_srgb(buf, Layout::Rgba, &source, &srgb))
+            let in_srgb = !has_lookup_table(&source)
+                && Conversion::<u8>::new(&source, Layout::Rgb, &srgb)
+                    .is_some_and(|rgb| is_srgb_in_effect(&source, &rgb));
+            DynamicImage::ImageRgba8(if in_srgb {
+                buf
+            } else {
+                to_srgb(buf, Layout::Rgba, &source, &srgb)
+            })
         }
+        // A 16-bit frame converts whatever the answer. The
+        // 16-bit transform of a profile that is sRGB in effect
+        // moves a sample by more than the 8-bit one does (by up
+        // to a level and a third of the 8-bit scale for the
+        // profile lcms writes), so leaving the frame alone
+        // could move an 8-bit render of it by two levels.
         DynamicImage::ImageRgb16(buf) => {
             DynamicImage::ImageRgb16(to_srgb(buf, Layout::Rgb, &source, &srgb))
         }
@@ -785,17 +815,11 @@ pub fn convert_to_srgb(img: DynamicImage, icc: &[u8]) -> DynamicImage {
     }
 }
 
-/// One frame's samples from `source` to `srgb`. Where moxcms
-/// can rewrite the frame's own buffer with the bytes its
-/// two-buffer transform would write (see [`Sample::in_place`]),
-/// it does: that saves a frame-sized allocation, the pass that
-/// copied the result back, and the page faults of a buffer the
-/// allocator had just given back (issue #649). Every other
-/// profile goes through the two-buffer transform, whose output
-/// becomes the image. A transform moxcms cannot build, or one
-/// it refuses to run, leaves the frame as it was.
+/// One frame's samples from `source` to `srgb`. A transform
+/// moxcms cannot build, or one it refuses to run, leaves the
+/// frame as it was.
 fn to_srgb<P>(
-    mut buf: image::ImageBuffer<P, Vec<P::Subpixel>>,
+    buf: image::ImageBuffer<P, Vec<P::Subpixel>>,
     layout: moxcms::Layout,
     source: &moxcms::ColorProfile,
     srgb: &moxcms::ColorProfile,
@@ -804,19 +828,147 @@ where
     P: image::Pixel,
     P::Subpixel: Sample,
 {
-    if let Some(transform) = P::Subpixel::in_place(source, layout, srgb) {
-        let _ = transform.transform(&mut buf);
-        return buf;
+    match Conversion::new(source, layout, srgb) {
+        Some(conversion) => conversion.apply(buf),
+        None => buf,
     }
-    let Ok(transform) = P::Subpixel::two_buffer(source, layout, srgb) else {
-        return buf;
-    };
-    let (width, height) = buf.dimensions();
-    let mut out = vec![P::Subpixel::default(); buf.len()];
-    if transform.transform(buf.as_raw(), &mut out).is_err() {
-        return buf;
+}
+
+/// How one layout's samples get from a source profile to
+/// sRGB. Where moxcms can rewrite a frame's own buffer with
+/// the bytes its two-buffer transform would write (see
+/// [`Sample::in_place`]), it does: that saves a frame-sized
+/// allocation, the pass that copied the result back, and the
+/// page faults of a buffer the allocator had just given back
+/// (issue #649). Every other profile goes through the
+/// two-buffer transform, whose output becomes the image.
+enum Conversion<S> {
+    InPlace(std::sync::Arc<dyn moxcms::InPlaceTransformExecutor<S> + Send + Sync>),
+    TwoBuffer(std::sync::Arc<dyn moxcms::TransformExecutor<S> + Send + Sync>),
+}
+
+impl<S: Sample> Conversion<S> {
+    /// The conversion of `layout` samples from `source` to
+    /// `srgb`, or `None` when moxcms cannot build a transform
+    /// from the profile.
+    fn new(
+        source: &moxcms::ColorProfile,
+        layout: moxcms::Layout,
+        srgb: &moxcms::ColorProfile,
+    ) -> Option<Self> {
+        if let Some(transform) = S::in_place(source, layout, srgb) {
+            return Some(Self::InPlace(transform));
+        }
+        S::two_buffer(source, layout, srgb)
+            .ok()
+            .map(Self::TwoBuffer)
     }
-    image::ImageBuffer::from_raw(width, height, out).expect("the transform keeps the frame's size")
+
+    /// Convert one frame. A transform moxcms refuses to run
+    /// leaves the frame as it was.
+    fn apply<P>(&self, mut buf: image::ImageBuffer<P, Vec<S>>) -> image::ImageBuffer<P, Vec<S>>
+    where
+        P: image::Pixel<Subpixel = S>,
+    {
+        match self {
+            Self::InPlace(transform) => {
+                let _ = transform.transform(&mut buf);
+                buf
+            }
+            Self::TwoBuffer(transform) => {
+                let (width, height) = buf.dimensions();
+                let mut out = vec![S::default(); buf.len()];
+                if transform.transform(buf.as_raw(), &mut out).is_err() {
+                    return buf;
+                }
+                image::ImageBuffer::from_raw(width, height, out)
+                    .expect("the transform keeps the frame's size")
+            }
+        }
+    }
+}
+
+/// The steps of the probe's grid along each side of the RGB
+/// cube: every sixteenth level, the ends included.
+const PROBE_GRID: u32 = 17;
+
+/// The colors [`is_srgb_in_effect`] converts, as RGB8
+/// samples: the grid of the RGB cube (4,913 colors: its
+/// corners, the primaries and their mixes at every sixteenth
+/// level), then the 256 grays, which run every level through
+/// the profile's tone curves. 5,169 colors, built once.
+fn probe_colors() -> &'static [u8] {
+    static COLORS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    COLORS.get_or_init(|| {
+        let level = |step: u32| (step * 255 / (PROBE_GRID - 1)) as u8;
+        let mut colors = Vec::with_capacity((PROBE_GRID.pow(3) as usize + 256) * 3);
+        for r in 0..PROBE_GRID {
+            for g in 0..PROBE_GRID {
+                for b in 0..PROBE_GRID {
+                    colors.extend_from_slice(&[level(r), level(g), level(b)]);
+                }
+            }
+        }
+        for gray in 0..=255u8 {
+            colors.extend_from_slice(&[gray; 3]);
+        }
+        colors
+    })
+}
+
+/// Whether `source` is sRGB in effect (issue #662): `rgb8`,
+/// the conversion of 8-bit RGB samples from it to sRGB,
+/// moves none of the probe colors by more than one level.
+/// An 8-bit frame of such a source is in sRGB already, and
+/// converting it would only move some of its colors by one
+/// level of rounding, at the cost of a pass over the frame.
+///
+/// The bytes cannot answer this: every vendor writes the
+/// sRGB primaries and curve with its own rounding, in its
+/// own tag layout (HP's sRGB IEC61966-2.1 is 3,144 bytes,
+/// the one lcms writes 588), so the conversion itself is
+/// asked. A matrix profile's conversion is a tone curve per
+/// channel, a 3x3 matrix, and sRGB's own curve back: the
+/// grays hold the curves to sRGB's at every level and the
+/// grid holds the matrix to the identity, so no color in
+/// between can stray far. One level is what the rounding of
+/// the real sRGB profiles moves (1.7% and 2.7% of all 8-bit
+/// colors for the two above, none of them by two and none
+/// of the probe colors at all), and a profile that is
+/// another space moves the probe by far more: a gamma 2.2
+/// curve on sRGB's primaries moves dark grays by up to 9
+/// levels.
+///
+/// A profile with a lookup table is never taken for sRGB: a
+/// table can hold anything between the colors the probe
+/// samples. It converts, as it always has.
+fn is_srgb_in_effect(source: &moxcms::ColorProfile, rgb8: &Conversion<u8>) -> bool {
+    !has_lookup_table(source) && rgb8.moves_no_probe_color()
+}
+
+impl Conversion<u8> {
+    /// Whether this conversion of RGB samples leaves every
+    /// probe color within one level of where it was. A
+    /// transform that refuses the probe has shown nothing.
+    fn moves_no_probe_color(&self) -> bool {
+        let probe = probe_colors();
+        let converted = match self {
+            Self::InPlace(transform) => {
+                let mut samples = probe.to_vec();
+                transform.transform(&mut samples).map(|()| samples)
+            }
+            Self::TwoBuffer(transform) => {
+                let mut samples = vec![0u8; probe.len()];
+                transform.transform(probe, &mut samples).map(|()| samples)
+            }
+        };
+        converted.is_ok_and(|converted| {
+            probe
+                .iter()
+                .zip(&converted)
+                .all(|(from, to)| from.abs_diff(*to) <= 1)
+        })
+    }
 }
 
 /// A sample depth moxcms converts.
@@ -912,13 +1064,18 @@ impl Sample for u16 {
 /// The proof tests below hold each of these to moxcms, on the
 /// CPU that runs them.
 fn in_place_is_two_buffer(source: &moxcms::ColorProfile) -> bool {
-    let has_table = source.lut_a_to_b_perceptual.is_some()
-        || source.lut_a_to_b_colorimetric.is_some()
-        || source.lut_a_to_b_saturation.is_some();
     let one_curve = source.red_trc.is_some()
         && source.red_trc == source.green_trc
         && source.green_trc == source.blue_trc;
-    !has_table && one_curve && paired_fixed_point_kernels()
+    !has_lookup_table(source) && one_curve && paired_fixed_point_kernels()
+}
+
+/// Whether `source` carries a lookup table from its colors to
+/// the connection space, for any rendering intent.
+fn has_lookup_table(source: &moxcms::ColorProfile) -> bool {
+    source.lut_a_to_b_perceptual.is_some()
+        || source.lut_a_to_b_colorimetric.is_some()
+        || source.lut_a_to_b_saturation.is_some()
 }
 
 /// Whether this CPU runs moxcms's 8-bit fixed-point kernel in
@@ -1897,6 +2054,98 @@ mod tests {
         sizes.len()
     }
 
+    /// The conversion step alone: what [`convert_to_srgb`] runs
+    /// once it has found that the profile is not sRGB in
+    /// effect, and all it ran before issue #662.
+    fn convert_step(img: DynamicImage, icc: &[u8]) -> DynamicImage {
+        fn step<P>(
+            buf: image::ImageBuffer<P, Vec<P::Subpixel>>,
+            layout: moxcms::Layout,
+            source: &moxcms::ColorProfile,
+        ) -> image::ImageBuffer<P, Vec<P::Subpixel>>
+        where
+            P: image::Pixel,
+            P::Subpixel: Sample,
+        {
+            match Conversion::new(source, layout, &moxcms::ColorProfile::new_srgb()) {
+                Some(conversion) => conversion.apply(buf),
+                None => buf,
+            }
+        }
+        let source = moxcms::ColorProfile::new_from_slice(icc).unwrap();
+        use moxcms::Layout;
+        match img {
+            DynamicImage::ImageRgb8(buf) => {
+                DynamicImage::ImageRgb8(step(buf, Layout::Rgb, &source))
+            }
+            DynamicImage::ImageRgba8(buf) => {
+                DynamicImage::ImageRgba8(step(buf, Layout::Rgba, &source))
+            }
+            DynamicImage::ImageRgb16(buf) => {
+                DynamicImage::ImageRgb16(step(buf, Layout::Rgb, &source))
+            }
+            DynamicImage::ImageRgba16(buf) => {
+                DynamicImage::ImageRgba16(step(buf, Layout::Rgba, &source))
+            }
+            other => other,
+        }
+    }
+
+    /// The most any sample moved between two frames of one
+    /// layout, in that layout's own levels.
+    fn most_moved(a: &DynamicImage, b: &DynamicImage) -> u32 {
+        fn most<T: Copy + Into<u32>>(a: &[T], b: &[T]) -> u32 {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(&from, &to)| from.into().abs_diff(to.into()))
+                .max()
+                .unwrap_or(0)
+        }
+        match (a, b) {
+            (DynamicImage::ImageRgb8(a), DynamicImage::ImageRgb8(b)) => {
+                most(a.as_raw().as_slice(), b.as_raw().as_slice())
+            }
+            (DynamicImage::ImageRgba8(a), DynamicImage::ImageRgba8(b)) => {
+                most(a.as_raw().as_slice(), b.as_raw().as_slice())
+            }
+            (DynamicImage::ImageRgb16(a), DynamicImage::ImageRgb16(b)) => {
+                most(a.as_raw().as_slice(), b.as_raw().as_slice())
+            }
+            (DynamicImage::ImageRgba16(a), DynamicImage::ImageRgba16(b)) => {
+                most(a.as_raw().as_slice(), b.as_raw().as_slice())
+            }
+            (a, b) => panic!("{:?} against {:?}", a.color(), b.color()),
+        }
+    }
+
+    /// `convert_to_srgb` leaves an 8-bit frame alone for a
+    /// profile that is sRGB in effect (issue #662), in one
+    /// 8-bit layout of [`noise`] at each of `sizes`. The
+    /// conversion it no longer runs is still the one it was
+    /// (issue #649), and would have moved no sample by more
+    /// than a level. Returns the number of frames compared.
+    fn assert_left_alone(name: &str, icc: &[u8], layout: usize, sizes: &[(u32, u32)]) -> usize {
+        assert!(layout == RGB8 || layout == RGBA8, "an 8-bit layout");
+        for &(w, h) in sizes {
+            let img = noise(layout, w, h);
+            let what = format!("{name}, {:?} at {w}x{h}", img.color());
+            let got = convert_to_srgb(img.clone(), icc);
+            assert_eq!(
+                (got.color(), got.width(), got.height()),
+                (img.color(), w, h),
+                "{what}"
+            );
+            assert!(got.as_bytes() == img.as_bytes(), "{what}: converted");
+            let before = convert_through_two_buffers(img.clone(), icc);
+            let step = convert_step(img.clone(), icc);
+            assert!(step.as_bytes() == before.as_bytes(), "{what}");
+            let moved = most_moved(&img, &before);
+            assert!(moved <= 1, "{what}: a sample moved by {moved}");
+        }
+        sizes.len()
+    }
+
     /// The profile a corpus file embeds, as the image crate
     /// reads it (the engine reads profiles from JPEG and PNG
     /// sources only, and one of these is a WebP).
@@ -1921,7 +2170,10 @@ mod tests {
         // sRGB IEC61966-2.1 with a sampled curve, and Adobe RGB
         // (1998)). Each is a matrix profile with one tone curve
         // and no table, so where this CPU has the paired
-        // kernels its 8-bit frames convert in place.
+        // kernels its 8-bit frames convert in place. The two
+        // sRGB profiles no longer convert at all (issue #662):
+        // for them the conversion step is held to the
+        // two-buffer transform by itself.
         let profiles: [(&str, Vec<u8>); 7] = [
             (
                 "Display P3",
@@ -1973,10 +2225,22 @@ mod tests {
                 );
                 assert!(<u16 as Sample>::in_place(&profile, layout, &srgb).is_none());
             }
-            compared += assert_converts_as_before(name, icc, RGB8, &sizes);
-            compared += assert_converts_as_before(name, icc, RGBA8, &sizes);
+            for layout in [RGB8, RGBA8] {
+                compared += if name.contains("sRGB") {
+                    assert_left_alone(name, icc, layout, &sizes)
+                } else {
+                    assert_converts_as_before(name, icc, layout, &sizes)
+                };
+            }
         }
         assert_eq!(compared, 7 * 2 * 19);
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|(name, _)| name.contains("sRGB"))
+                .count(),
+            2
+        );
         // 16-bit frames take the two-buffer transform for every
         // profile, the transform they always took; one profile
         // shows the result is the same without the copy back.
@@ -2101,6 +2365,485 @@ mod tests {
         assert_eq!(compared, 2 * 7);
         let table = moxcms::ColorProfile::new_from_slice(&matrix_and_table_profile()).unwrap();
         assert!(table.lut_a_to_b_perceptual.is_some(), "the table survives");
+    }
+
+    /// The built-in sRGB profile as another day would write
+    /// it: the same tags under another creation date, so not
+    /// the bytes of [`srgb_profile_bytes`].
+    fn srgb_written_another_day() -> Vec<u8> {
+        let mut icc = srgb_profile_bytes().to_vec();
+        icc[24..36].copy_from_slice(&[0x07, 0xD0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+        icc
+    }
+
+    /// sRGB's tone curve as a table of `len` samples.
+    fn srgb_curve_samples(len: u16) -> Vec<u16> {
+        (0..len)
+            .map(|i| {
+                let v = f64::from(i) / f64::from(len - 1);
+                let linear = if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                };
+                (linear * 65535.0).round() as u16
+            })
+            .collect()
+    }
+
+    /// The built-in sRGB profile's primaries and white point
+    /// under a sampled tone curve.
+    fn srgb_under_a_sampled_curve(samples: Vec<u16>) -> Vec<u8> {
+        let mut profile = moxcms::ColorProfile::new_srgb();
+        profile.cicp = None;
+        let curve = moxcms::ToneReprCurve::Lut(samples);
+        profile.red_trc = Some(curve.clone());
+        profile.green_trc = Some(curve.clone());
+        profile.blue_trc = Some(curve);
+        profile.encode().unwrap()
+    }
+
+    /// sRGB as version 2 profiles carry it: the primaries and
+    /// white point of the built-in profile, and its curve as
+    /// a table of 1024 samples in place of the formula.
+    fn srgb_with_a_sampled_curve() -> Vec<u8> {
+        srgb_under_a_sampled_curve(srgb_curve_samples(1024))
+    }
+
+    /// sRGB with a dent in its curve: a table of 256 samples,
+    /// one for each 8-bit level, of which levels 100 to 106
+    /// are 8% brighter than sRGB's. Those seven lie between
+    /// two steps of the probe's grid (95 and 111), so no grid
+    /// color passes through the dent.
+    fn dented_srgb_profile() -> Vec<u8> {
+        let mut samples = srgb_curve_samples(256);
+        for sample in &mut samples[100..=106] {
+            *sample = (f64::from(*sample) * 1.08).round() as u16;
+        }
+        srgb_under_a_sampled_curve(samples)
+    }
+
+    /// sRGB's primaries and white point under a plain gamma
+    /// 2.2 curve: what "sRGB" means to some software, and not
+    /// sRGB, whose curve has a linear toe.
+    fn gamma_22_profile() -> Vec<u8> {
+        let mut profile = moxcms::ColorProfile::new_srgb();
+        profile.cicp = None;
+        let curve = moxcms::ToneReprCurve::Parametric(vec![2.2]);
+        profile.red_trc = Some(curve.clone());
+        profile.green_trc = Some(curve.clone());
+        profile.blue_trc = Some(curve);
+        profile.encode().unwrap()
+    }
+
+    /// sRGB's primaries and curve around a D50 white point
+    /// in place of D65.
+    fn d50_white_profile() -> Vec<u8> {
+        let mut profile = moxcms::ColorProfile::new_srgb();
+        profile.update_rgb_colorimetry(
+            moxcms::Chromaticity::D50.to_xyyb(),
+            moxcms::ColorPrimaries::BT_709,
+        );
+        profile.encode().unwrap()
+    }
+
+    /// The built-in sRGB profile with a lookup table beside its
+    /// matrix. What the table holds does not matter here.
+    fn srgb_with_a_table_profile() -> Vec<u8> {
+        let table = moxcms::ColorProfile::new_from_slice(&matrix_and_table_profile()).unwrap();
+        let mut profile = moxcms::ColorProfile::new_srgb();
+        profile.lut_a_to_b_perceptual = table.lut_a_to_b_perceptual;
+        profile.encode().unwrap()
+    }
+
+    /// Whether [`convert_to_srgb`] takes the profile for sRGB.
+    fn taken_for_srgb(icc: &[u8]) -> bool {
+        let source = moxcms::ColorProfile::new_from_slice(icc).unwrap();
+        let srgb = moxcms::ColorProfile::new_srgb();
+        let rgb8 = Conversion::<u8>::new(&source, moxcms::Layout::Rgb, &srgb)
+            .expect("an 8-bit RGB conversion");
+        is_srgb_in_effect(&source, &rgb8)
+    }
+
+    #[test]
+    fn a_source_tagged_srgb_keeps_the_pixels_it_decoded_to() {
+        // Issue #662. The sRGB profiles sources carry are not
+        // the bytes of the built-in one: HP's sRGB
+        // IEC61966-2.1 (3,144 bytes, what cameras, phones and
+        // Photoshop embed) and the one lcms writes (588
+        // bytes) are the two in the corpus, and any profile
+        // differs in its creation date at least. Each is sRGB
+        // in effect, so an 8-bit frame tagged with it comes
+        // back as it was, with or without alpha, where the
+        // conversion moved some of its samples by one level.
+        let hp = embedded_profile(include_bytes!(
+            "../tests/functional/corpus/person-fullbody.jpg"
+        ));
+        let lcms = embedded_profile(include_bytes!("../tests/functional/corpus/icc.jpg"));
+        assert_eq!((hp.len(), lcms.len()), (3144, 588));
+        let profiles = [
+            ("sRGB IEC61966-2.1, 3,144 bytes", hp),
+            ("lcms sRGB, 588 bytes", lcms),
+            ("the built-in sRGB", srgb_profile_bytes().to_vec()),
+            (
+                "the built-in sRGB of another day",
+                srgb_written_another_day(),
+            ),
+            ("sRGB with a sampled curve", srgb_with_a_sampled_curve()),
+        ];
+        let sizes = [(1, 1), (5, 1), (37, 3), (211, 97)];
+        let mut compared = 0;
+        for (name, icc) in &profiles {
+            // Only the built-in profile is known by its bytes;
+            // the others are found by what they do.
+            assert_eq!(
+                icc.as_slice() == srgb_profile_bytes(),
+                *name == "the built-in sRGB",
+                "{name}"
+            );
+            assert!(taken_for_srgb(icc), "{name}");
+            compared += assert_left_alone(name, icc, RGB8, &sizes);
+            compared += assert_left_alone(name, icc, RGBA8, &sizes);
+        }
+        assert_eq!(compared, 5 * 2 * 4);
+        // The frames above are noise, so the conversion they
+        // were spared did move some of them: it was not a
+        // no-op that got skipped.
+        let (name, icc) = &profiles[0];
+        let frame = noise(RGB8, 211, 97);
+        let before = convert_through_two_buffers(frame.clone(), icc);
+        assert_eq!(most_moved(&frame, &before), 1, "{name}");
+    }
+
+    #[test]
+    fn a_16_bit_frame_tagged_srgb_converts_as_it_always_has() {
+        // Issue #662 leaves 16-bit frames out. The 16-bit
+        // transform of a profile that is sRGB in effect moves
+        // a sample further than the 8-bit one does: for the
+        // profile lcms writes, past one level of the 8-bit
+        // scale on a saturated green, so a frame left alone
+        // could render two levels away from where it does
+        // today. A 16-bit frame converts to the bytes it
+        // always has, whatever its profile.
+        let hp = embedded_profile(include_bytes!(
+            "../tests/functional/corpus/person-fullbody.jpg"
+        ));
+        let lcms = embedded_profile(include_bytes!("../tests/functional/corpus/icc.jpg"));
+        let mut compared = 0;
+        for (name, icc) in [("sRGB IEC61966-2.1", &hp), ("lcms sRGB", &lcms)] {
+            assert!(taken_for_srgb(icc), "{name}");
+            compared += assert_converts_as_before(name, icc, RGB16, &[(37, 3)]);
+            compared += assert_converts_as_before(name, icc, RGBA16, &[(5, 1), (37, 3)]);
+        }
+        assert_eq!(compared, 6);
+        let greens = DynamicImage::ImageRgb16(
+            image::ImageBuffer::from_raw(2, 1, vec![1023, 65535, 0, 2047, 65535, 0]).unwrap(),
+        );
+        let converted = convert_to_srgb(greens.clone(), &lcms);
+        let moved = most_moved(&greens, &converted);
+        assert!(moved > 257, "the greens moved by {moved}");
+        // The same two colors at 8 bits are left alone, and
+        // their conversion would have kept them.
+        let greens = DynamicImage::ImageRgb8(
+            image::ImageBuffer::from_raw(2, 1, vec![4, 255, 0, 8, 255, 0]).unwrap(),
+        );
+        assert!(convert_to_srgb(greens.clone(), &lcms).as_bytes() == greens.as_bytes());
+        let converted = convert_through_two_buffers(greens.clone(), &lcms);
+        assert!(most_moved(&greens, &converted) <= 1);
+    }
+
+    #[test]
+    fn a_source_in_another_space_converts_as_it_always_has() {
+        // The other side of issue #662: a profile is taken
+        // for sRGB only when its conversion says so. The
+        // wide-gamut spaces, sRGB's primaries under another
+        // curve or around another white point, and a profile
+        // with a table are not, and their frames convert to
+        // the bytes they always have.
+        let profiles: [(&str, Vec<u8>); 11] = [
+            (
+                "Display P3",
+                moxcms::ColorProfile::new_display_p3().encode().unwrap(),
+            ),
+            (
+                "Adobe RGB",
+                moxcms::ColorProfile::new_adobe_rgb().encode().unwrap(),
+            ),
+            (
+                "Adobe RGB (1998) (night.webp)",
+                embedded_profile(include_bytes!("../tests/functional/corpus/night.webp")),
+            ),
+            (
+                "Rec. 2020",
+                moxcms::ColorProfile::new_bt2020().encode().unwrap(),
+            ),
+            (
+                "ProPhoto",
+                moxcms::ColorProfile::new_pro_photo_rgb().encode().unwrap(),
+            ),
+            ("sRGB's primaries at gamma 2.2", gamma_22_profile()),
+            ("sRGB's primaries around D50", d50_white_profile()),
+            ("sRGB with a dent in its curve", dented_srgb_profile()),
+            ("a curve per channel", curve_per_channel_profile()),
+            ("Display P3 with a table", matrix_and_table_profile()),
+            ("sRGB with a table", srgb_with_a_table_profile()),
+        ];
+        let mut compared = 0;
+        for (name, icc) in &profiles {
+            assert!(!taken_for_srgb(icc), "{name}");
+            // A transform from a table takes a debug build a
+            // tenth of a second to build, and a 16-bit one
+            // half that: those frames are few. A 16-bit frame
+            // converts whatever its profile, so the two
+            // profiles nearest sRGB stand for the rest.
+            let sizes: &[(u32, u32)] = if name.ends_with("a table") {
+                &[(37, 3)]
+            } else {
+                &[(1, 1), (5, 1), (37, 3), (211, 97)]
+            };
+            compared += assert_converts_as_before(name, icc, RGB8, sizes);
+            compared += assert_converts_as_before(name, icc, RGBA8, sizes);
+            if name.ends_with("gamma 2.2") || name.ends_with("its curve") {
+                compared += assert_converts_as_before(name, icc, RGB16, &[(37, 3)]);
+            }
+        }
+        assert_eq!(compared, 9 * 2 * 4 + 2 * 2 + 2);
+        // What each part of the probe is there for. Display
+        // P3 and sRGB's primaries around D50 have sRGB's own
+        // curve and a gray axis that maps onto sRGB's, so
+        // their conversions move no gray: the grid sees them.
+        // The dent lies between two grid levels, so its
+        // conversion moves no grid color: the grays see it.
+        for (name, grid_sees_it) in [
+            ("Display P3", true),
+            ("sRGB's primaries around D50", true),
+            ("sRGB with a dent in its curve", false),
+        ] {
+            let (_, icc) = profiles
+                .iter()
+                .find(|(listed, _)| *listed == name)
+                .expect("a listed profile");
+            let (grid, grays) = probe_parts_moved(icc);
+            assert_eq!(grid > 1, grid_sees_it, "{name}: the grid moves by {grid}");
+            assert_eq!(grays > 1, !grid_sees_it, "{name}: the grays by {grays}");
+        }
+    }
+
+    /// The most a profile's 8-bit conversion moves a sample of
+    /// the probe's grid, and of its grays.
+    fn probe_parts_moved(icc: &[u8]) -> (u8, u8) {
+        let source = moxcms::ColorProfile::new_from_slice(icc).unwrap();
+        let transform = source
+            .create_transform_8bit(
+                moxcms::Layout::Rgb,
+                &moxcms::ColorProfile::new_srgb(),
+                moxcms::Layout::Rgb,
+                moxcms::TransformOptions::default(),
+            )
+            .unwrap();
+        let (grid, grays) = probe_colors().split_at(17 * 17 * 17 * 3);
+        assert_eq!(grays.len(), 256 * 3);
+        let most = |colors: &[u8]| {
+            let mut converted = vec![0u8; colors.len()];
+            transform.transform(colors, &mut converted).unwrap();
+            colors
+                .iter()
+                .zip(&converted)
+                .map(|(from, to)| from.abs_diff(*to))
+                .max()
+                .unwrap()
+        };
+        (most(grid), most(grays))
+    }
+
+    /// A stand-in for a moxcms transform that rewrites samples
+    /// with `rewrite`, or refuses them when it says `false`.
+    struct Rewrite<F>(F);
+
+    impl<F: Fn(&mut [u8]) -> bool> moxcms::InPlaceTransformExecutor<u8> for Rewrite<F> {
+        fn transform(&self, samples: &mut [u8]) -> Result<(), moxcms::CmsError> {
+            if (self.0)(samples) {
+                Ok(())
+            } else {
+                Err(moxcms::CmsError::LaneSizeMismatch)
+            }
+        }
+    }
+
+    impl<F: Fn(&mut [u8]) -> bool> moxcms::TransformExecutor<u8> for Rewrite<F> {
+        fn transform(&self, from: &[u8], to: &mut [u8]) -> Result<(), moxcms::CmsError> {
+            let mut samples = from.to_vec();
+            if !(self.0)(&mut samples) {
+                return Err(moxcms::CmsError::LaneSizeMismatch);
+            }
+            to.copy_from_slice(&samples);
+            Ok(())
+        }
+    }
+
+    /// A stand-in for a two-buffer transform that reports
+    /// success and writes nothing.
+    struct Silent;
+
+    impl moxcms::TransformExecutor<u8> for Silent {
+        fn transform(&self, _: &[u8], _: &mut [u8]) -> Result<(), moxcms::CmsError> {
+            Ok(())
+        }
+    }
+
+    /// Both forms of a conversion that runs `rewrite`.
+    fn rewriting(
+        rewrite: impl Fn(&mut [u8]) -> bool + Clone + Send + Sync + 'static,
+    ) -> [Conversion<u8>; 2] {
+        [
+            Conversion::InPlace(std::sync::Arc::new(Rewrite(rewrite.clone()))),
+            Conversion::TwoBuffer(std::sync::Arc::new(Rewrite(rewrite))),
+        ]
+    }
+
+    #[test]
+    fn the_probe_takes_one_level_for_rounding_and_no_more() {
+        // The probe is 17 levels of each channel in every
+        // combination, then every gray: 5,169 colors, the
+        // corners of the cube and both ends of the gray axis
+        // among them.
+        let probe = probe_colors();
+        assert_eq!(probe.len(), (17 * 17 * 17 + 256) * 3);
+        let colors = probe.as_chunks::<3>().0;
+        let (grid, grays) = colors.split_at(17 * 17 * 17);
+        for channel in 0..3 {
+            let mut levels: Vec<u8> = grid.iter().map(|color| color[channel]).collect();
+            levels.sort_unstable();
+            levels.dedup();
+            assert_eq!(levels.len(), 17);
+            assert_eq!((levels[0], levels[1], levels[16]), (0, 15, 255));
+        }
+        for corner in [
+            [0, 0, 0],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 255],
+        ] {
+            assert!(grid.contains(&corner), "{corner:?}");
+        }
+        assert!(grays.iter().copied().eq((0..=255u8).map(|gray| [gray; 3])));
+
+        let srgb = moxcms::ColorProfile::new_srgb();
+        let verdicts = |rewrite: fn(&mut [u8]) -> bool| {
+            rewriting(rewrite).map(|conversion| {
+                (
+                    conversion.moves_no_probe_color(),
+                    is_srgb_in_effect(&srgb, &conversion),
+                )
+            })
+        };
+        // A conversion that moves nothing, and one that moves
+        // every sample it can by one level, are sRGB in effect.
+        assert_eq!(verdicts(|_| true), [(true, true); 2]);
+        assert_eq!(
+            verdicts(|samples| {
+                for sample in samples.iter_mut() {
+                    *sample = if *sample < 128 {
+                        *sample + 1
+                    } else {
+                        *sample - 1
+                    };
+                }
+                true
+            }),
+            [(true, true); 2]
+        );
+        // Two levels on one sample of one color are not:
+        // first, last, or in the middle of the grid.
+        assert_eq!(
+            verdicts(|samples| {
+                samples[0] += 2;
+                true
+            }),
+            [(false, false); 2]
+        );
+        assert_eq!(
+            verdicts(|samples| {
+                let last = samples.len() - 1;
+                samples[last] -= 2;
+                true
+            }),
+            [(false, false); 2]
+        );
+        assert_eq!(
+            verdicts(|samples| {
+                samples[3 * 2456 + 1] ^= 2;
+                true
+            }),
+            [(false, false); 2]
+        );
+        // A transform that refuses the probe has shown nothing.
+        assert_eq!(verdicts(|_| false), [(false, false); 2]);
+        // Neither has one that reports success and writes
+        // nothing: what its target held is not the answer.
+        let silent = Conversion::TwoBuffer(std::sync::Arc::new(Silent));
+        assert!(!silent.moves_no_probe_color());
+        assert!(!is_srgb_in_effect(&srgb, &silent));
+
+        // And a profile with a table is not sRGB in effect
+        // even behind a conversion that moves nothing.
+        let table = moxcms::ColorProfile::new_from_slice(&srgb_with_a_table_profile()).unwrap();
+        assert!(has_lookup_table(&table) && !has_lookup_table(&srgb));
+        for conversion in rewriting(|_| true) {
+            assert!(conversion.moves_no_probe_color());
+            assert!(!is_srgb_in_effect(&table, &conversion));
+        }
+    }
+
+    #[test]
+    fn a_transform_that_refuses_to_run_leaves_the_frame_as_it_was() {
+        // moxcms refuses a buffer before it writes to it (a
+        // length that is no whole number of pixels). Either
+        // form of the conversion then hands the frame back as
+        // it came, as it did before the probe ran first.
+        let frame = noise(RGB8, 37, 3).into_rgb8();
+        for conversion in rewriting(|_| false) {
+            assert!(!conversion.moves_no_probe_color());
+            assert!(conversion.apply(frame.clone()) == frame);
+        }
+        // And one that runs still converts: the probe did not
+        // use the conversion up.
+        for conversion in rewriting(|samples| {
+            samples.fill(7);
+            true
+        }) {
+            assert!(!conversion.moves_no_probe_color());
+            let converted = conversion.apply(frame.clone());
+            assert!(converted.as_raw().iter().all(|&sample| sample == 7));
+        }
+    }
+
+    #[test]
+    fn a_profile_no_transform_can_be_built_from_leaves_the_frame_as_it_was() {
+        // An RGB profile with no tone curves parses, and
+        // moxcms builds no transform from it: neither the one
+        // the question is asked of nor the frame's own. The
+        // frame comes back as it was, in every layout, as it
+        // did before the question existed.
+        let mut profile = moxcms::ColorProfile::new_display_p3();
+        profile.cicp = None;
+        profile.red_trc = None;
+        profile.green_trc = None;
+        profile.blue_trc = None;
+        let icc = profile.encode().unwrap();
+        let source = moxcms::ColorProfile::new_from_slice(&icc).unwrap();
+        assert_eq!(source.color_space, moxcms::DataColorSpace::Rgb);
+        let srgb = moxcms::ColorProfile::new_srgb();
+        assert!(Conversion::<u8>::new(&source, moxcms::Layout::Rgb, &srgb).is_none());
+        for layout in [RGB8, RGBA8, RGB16, RGBA16] {
+            let frame = noise(layout, 37, 3);
+            let out = convert_to_srgb(frame.clone(), &icc);
+            assert_eq!(out.color(), frame.color());
+            assert!(out.as_bytes() == frame.as_bytes(), "{:?}", frame.color());
+            let before = convert_through_two_buffers(frame.clone(), &icc);
+            assert!(before.as_bytes() == frame.as_bytes(), "{:?}", frame.color());
+        }
     }
 
     #[test]
