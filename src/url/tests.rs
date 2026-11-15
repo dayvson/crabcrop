@@ -4055,3 +4055,325 @@ fn operation_queries_find_directives() {
         Some(ImageFormat::WebP)
     );
 }
+
+/// The canonical form as it was built before issue #640
+/// wrote it into one buffer: a string per segment and per
+/// filter, joined at the end.
+fn canonical_form_by_segments(ops: &[Operation], source: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut filters: Vec<String> = Vec::new();
+    for op in ops {
+        match op {
+            Operation::Filters(list) => filters.extend(list.iter().map(filter_text)),
+            other => {
+                if !filters.is_empty() {
+                    segments.push(format!("filters:{}", filters.join(":")));
+                    filters.clear();
+                }
+                segments.push(operation_text(other));
+            }
+        }
+    }
+    if !filters.is_empty() {
+        segments.push(format!("filters:{}", filters.join(":")));
+    }
+    if segments.is_empty() {
+        source.to_string()
+    } else {
+        format!("{}/{source}", segments.join("/"))
+    }
+}
+
+/// The three walks the request path made over every
+/// remainder before issue #640, and still makes over one
+/// the one-walk parse declines: the preset names, the
+/// expansion, and the parse of the expanded text.
+type ThreeWalks = (
+    Vec<String>,
+    String,
+    Vec<Operation>,
+    String,
+    Option<u64>,
+    Option<u32>,
+);
+
+fn three_walks(rest: &str, presets: &Presets) -> Result<ThreeWalks, ParseError> {
+    let groups = preset_names(rest);
+    let expanded = expand_presets(rest, presets, false)?;
+    let (ops, source, expiry, max_age) = parse_operations_with_expiry(&expanded)?;
+    let source = source.to_string();
+    Ok((groups, expanded, ops, source, expiry, max_age))
+}
+
+/// The preset table the one-walk tests expand against.
+fn one_walk_presets() -> Presets {
+    Presets::from([(
+        "thumb".to_string(),
+        Preset::parse("150x150/filters:quality(70)").unwrap(),
+    )])
+}
+
+/// Compare the one-walk parse of `rest` with the three
+/// walks, adding what differs to `bad`: whether the one walk
+/// took the remainder.
+fn one_walk_agrees(rest: &str, presets: &Presets, bad: &mut Vec<String>) -> bool {
+    let general = three_walks(rest, presets);
+    match (parse_without_presets(rest), general) {
+        (Some((ops, source, expiry, max_age)), Ok(general)) => {
+            let (groups, expanded, g_ops, g_source, g_expiry, g_max_age) = general;
+            if !groups.is_empty() {
+                bad.push(format!("{rest:?}: taken, though it names {groups:?}"));
+            }
+            if expanded != rest {
+                bad.push(format!(
+                    "{rest:?}: taken, though it expands to {expanded:?}"
+                ));
+            }
+            if ops != g_ops || source != g_source {
+                bad.push(format!("{rest:?}: parses to another request"));
+            }
+            if (expiry, max_age) != (g_expiry, g_max_age) {
+                bad.push(format!("{rest:?}: parses to other metadata"));
+            }
+            true
+        }
+        (Some(_), Err(e)) => {
+            bad.push(format!(
+                "{rest:?}: taken, though the three walks refuse it: {e}"
+            ));
+            true
+        }
+        (None, general) => {
+            // It declines only what the three walks refuse,
+            // and a remainder that holds the text `preset:`.
+            if general.is_ok() && !rest.contains("preset:") {
+                bad.push(format!("{rest:?}: declined, though it is a plain parse"));
+            }
+            false
+        }
+    }
+}
+
+/// The `remainder` of every case in a spec file that has
+/// one.
+fn spec_remainders(text: &str) -> Vec<String> {
+    let doc: serde_json::Value = serde_json::from_str(text).unwrap();
+    let cases = match &doc {
+        serde_json::Value::Array(cases) => cases,
+        doc => doc["cases"].as_array().unwrap(),
+    };
+    cases
+        .iter()
+        .filter_map(|case| case["remainder"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Chains put together from the segments of the operation
+/// vectors: operations that parse and ones that do not,
+/// metadata good and bad, preset references known, unknown
+/// and empty, empty segments, filter runs long enough to
+/// pass the operation cap, and sources of every shape,
+/// `preset:` inside one and none at all included.
+fn generated_chains(vectors: &[String], count: usize) -> Vec<String> {
+    let corpus_source = "/https://example.com/a.jpg";
+    let (mut good, mut broken) = (Vec::new(), Vec::new());
+    for rest in vectors {
+        let Some(ops) = rest.strip_suffix(corpus_source) else {
+            continue;
+        };
+        let pool = if parse_operations_with_expiry(rest).is_ok() {
+            &mut good
+        } else {
+            &mut broken
+        };
+        pool.extend(ops.split('/').map(str::to_string));
+    }
+    assert!(good.len() > 300 && broken.len() > 100);
+    let text = |all: &[&str]| all.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let metadata = text(&["exp:4102444800", "maxage:60", "maxage:0", "exp:0"]);
+    let bad_metadata = text(&["exp:", "exp:soon", "maxage:31536001", "maxage:x", "exp:-1"]);
+    let references = text(&["preset:thumb", "preset:thumb", "preset:nope", "preset:"]);
+    let long_run = format!("filters:{}", ["grayscale"; 60].join(":"));
+    let sources = text(&[
+        "https://example.com/a.jpg",
+        "https://example.com/a.jpg",
+        "example.com/img.jpg",
+        "s3://bucket/key.png",
+        "root:photos/cat.jpg",
+        "100x200.jpg",
+        "https://example.com/300x200/filters:blur(2)/a.jpg",
+        "https://example.com/preset:thumb/a.jpg",
+        "https://example.com/exp:1/a.jpg",
+        "",
+    ]);
+    let mut rng = crate::test_support::Rng::new(640);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut chain = String::new();
+        for _ in 0..rng.below(15) {
+            let segment = match rng.below(100) {
+                0..80 => rng.pick(&good).as_str(),
+                80..88 => rng.pick(&metadata).as_str(),
+                88..90 => rng.pick(&bad_metadata).as_str(),
+                90..94 => rng.pick(&references).as_str(),
+                94..97 => rng.pick(&broken).as_str(),
+                97..98 => "",
+                _ => long_run.as_str(),
+            };
+            chain.push_str(segment);
+            chain.push('/');
+        }
+        chain.push_str(rng.pick(&sources));
+        out.push(chain);
+    }
+    out
+}
+
+/// Every remainder the one-walk tests read: the two spec
+/// files' own, shapes the files do not hold, and generated
+/// chains.
+fn one_walk_corpus() -> Vec<String> {
+    let vectors = spec_remainders(include_str!("../../spec/operation-vectors.json"));
+    assert!(vectors.len() > 700, "{}", vectors.len());
+    let signed = spec_remainders(include_str!("../../spec/test-vectors.json"));
+    assert!(signed.len() >= 40, "{}", signed.len());
+    let mut out = vectors.clone();
+    out.extend(signed);
+    for rest in vectors.iter().step_by(7) {
+        out.push(format!("exp:4102444800/{rest}"));
+        out.push(format!("maxage:60/{rest}"));
+        out.push(format!("exp:soon/{rest}"));
+        out.push(format!("preset:thumb/{rest}"));
+        out.push(format!("preset:nope/{rest}"));
+        out.push(format!("{rest}/preset:thumb"));
+        out.push(format!("300x200/{rest}"));
+    }
+    out.extend(
+        [
+            "300x200",
+            "300x200/",
+            "",
+            "/",
+            "//example.com/a.jpg",
+            "preset:thumb",
+            "preset:thumb/",
+            "https://example.com/preset:thumb/a.jpg",
+            "filters:watermark(https%3A%2F%2Fexample.com%2Fpreset:w.png,0,0,0)/example.com/a.jpg",
+        ]
+        .map(str::to_string),
+    );
+    out.extend(generated_chains(&vectors, 6000));
+    out
+}
+
+#[test]
+fn the_one_walk_parse_agrees_with_the_three_walks() {
+    // Issue #640: a remainder that names no preset is
+    // parsed once. Whatever the one walk takes, the three
+    // walks parse to the same request with no groups and
+    // the text unchanged; whatever it declines, they refuse
+    // or expand.
+    let presets = one_walk_presets();
+    let mut bad = Vec::new();
+    let (mut taken, mut declined) = (0, 0);
+    for rest in one_walk_corpus() {
+        if one_walk_agrees(&rest, &presets, &mut bad) {
+            taken += 1;
+        } else {
+            declined += 1;
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} mismatches:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+    assert!(
+        taken > 1000 && declined > 1000,
+        "{taken} taken, {declined} declined"
+    );
+}
+
+#[test]
+fn the_one_walk_parse_declines_at_the_caps_the_expansion_enforces() {
+    // The operation cap: the hundredth operation is the
+    // last one the expansion accepts, so it is the last one
+    // the one walk takes; the next is refused by the three
+    // walks, with their error.
+    let presets = one_walk_presets();
+    let source = "https://example.com/a.jpg";
+    let chain = |operations: usize| format!("{}{source}", "filters:grayscale/".repeat(operations));
+    let (at, past) = (chain(MAX_OPERATIONS), chain(MAX_OPERATIONS + 1));
+    let (ops, parsed_source, _, _) = parse_without_presets(&at).expect("a chain at the cap");
+    assert_eq!(operation_count(&ops), MAX_OPERATIONS);
+    assert_eq!(parsed_source, source);
+    assert!(parse_without_presets(&past).is_none());
+    assert_eq!(
+        three_walks(&past, &presets).unwrap_err(),
+        ParseError::TooManyOperations(MAX_OPERATIONS + 1)
+    );
+    // One long `filters:` segment counts each filter.
+    let run = |filters: usize| format!("filters:{}/{source}", vec!["grayscale"; filters].join(":"));
+    assert!(parse_without_presets(&run(MAX_OPERATIONS)).is_some());
+    assert!(parse_without_presets(&run(MAX_OPERATIONS + 1)).is_none());
+    // The length cap: a remainder of exactly the longest
+    // text the expansion writes, and one byte more.
+    let padded = |len: usize| format!("300x200/{source}{}", "a".repeat(len - 8 - source.len()));
+    let (at, past) = (padded(MAX_EXPANDED_LEN), padded(MAX_EXPANDED_LEN + 1));
+    assert_eq!(at.len(), MAX_EXPANDED_LEN);
+    assert!(parse_without_presets(&at).is_some());
+    assert!(parse_without_presets(&past).is_none());
+    assert_eq!(
+        three_walks(&past, &presets).unwrap_err(),
+        ParseError::ExpansionTooLong(MAX_EXPANDED_LEN + 1)
+    );
+    let mut bad = Vec::new();
+    for rest in [chain(MAX_OPERATIONS), chain(MAX_OPERATIONS + 1), at, past] {
+        one_walk_agrees(&rest, &presets, &mut bad);
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn the_canonical_form_is_the_segment_wise_form() {
+    // Issue #640: the canonical form, and with it every
+    // cache key, is written into one buffer. Its text is
+    // what the segments joined to before.
+    let mut checked = 0;
+    for rest in one_walk_corpus() {
+        let Ok((ops, source, _, _)) = parse_operations_with_expiry(&rest) else {
+            continue;
+        };
+        assert_eq!(
+            canonical_form(&ops, source),
+            canonical_form_by_segments(&ops, source),
+            "{rest:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 1000, "{checked}");
+    // Shapes the parser never yields: empty filter lists
+    // alone, first, last, and between operations.
+    let size = || Operation::Size(parse_size("300x200").unwrap());
+    let gray = || Operation::Filters(vec![Filter::Grayscale]);
+    let empty = || Operation::Filters(Vec::new());
+    for ops in [
+        vec![],
+        vec![empty()],
+        vec![empty(), size()],
+        vec![size(), empty()],
+        vec![gray(), empty(), gray()],
+        vec![size(), empty(), gray(), empty(), size(), gray(), gray()],
+        vec![empty(), empty(), size(), empty(), empty()],
+    ] {
+        for source in ["", "a.jpg", "https://example.com/a.jpg"] {
+            assert_eq!(
+                canonical_form(&ops, source),
+                canonical_form_by_segments(&ops, source),
+                "{ops:?} {source:?}"
+            );
+        }
+    }
+}

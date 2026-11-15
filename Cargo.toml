@@ -110,6 +110,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 # ICO; AVIF through the avif-decode feature) plus the AVIF
 # encoder (avif, nasm) and its threading (rayon).
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "nasm", "png", "rayon", "tiff", "webp"] }
+# The AVIF encoder the image crate wraps, named here at the
+# version the image crate brings into the tree (issue #663):
+# opaque 8-bit RGB goes to it directly, with the color
+# conversion done in the engine (engine/encode.rs). Default
+# features off: the image crate's `nasm` and `rayon` features
+# switch on its assembly and its threading, as before. It
+# adds no crate.
+ravif = { version = "0.13", default-features = false }
 # Direct decoder bindings for the two hottest source formats
 # (perf wave 3): zune-jpeg is the same decoder the image crate
 # wraps for JPEG (already in the tree transitively); calling it
@@ -186,6 +194,13 @@ turbojpeg = { version = "1.5", default-features = false, features = ["require-si
 # PROPTEST_* environment overrides. A test-only dependency:
 # it never enters a normal build.
 proptest = { version = "1.12", default-features = false, features = ["std"] }
+# The connection watch's deadline tests (issue #639) run on
+# tokio's paused clock, which `test-util` provides: every
+# order of a connection's events is compared with its
+# deadline to the millisecond, and no test waits for one.
+# A test-only feature of a crate already in the tree: it
+# adds no crate and never enters a normal build.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 # AVIF source decoding, through the image crate's avif-native

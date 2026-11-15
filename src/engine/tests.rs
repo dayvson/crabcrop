@@ -1456,6 +1456,114 @@ fn auto_quality_webp_keeps_the_one_shot_pick() {
     assert_eq!(out.ssimulacra2, None);
 }
 
+#[test]
+fn a_quality_search_prepares_one_reference_and_drops_it() {
+    // Issue #664: every candidate of a search is scored
+    // against one prepared reference, the re-score after a
+    // `max_bytes` ladder included, and the reference goes when
+    // the encode returns.
+    let engine = Engine;
+    let references = crate::quality::counters::snapshot;
+    let src = photo_like_png();
+    let auto_jpeg = |extra: Option<Filter>| {
+        let mut filters = vec![
+            Filter::Quality(Quality::Auto),
+            Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
+        ];
+        filters.extend(extra);
+        [Operation::Filters(filters)]
+    };
+
+    // A target no quality reaches: the search bisects upward
+    // from its first guess and scores every attempt.
+    let (prepared, released) = references();
+    let out = engine
+        .process_preferred(
+            &src,
+            &auto_jpeg(None),
+            ProcessContext {
+                ssim_target: 99.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let first_guess = crate::quality::auto_quality(&image::load_from_memory(&src).unwrap());
+    assert!(out.ssimulacra2.is_some());
+    assert!(
+        out.quality.is_some_and(|q| q > first_guess),
+        "the search stopped at its first guess ({first_guess}): {:?}",
+        out.quality
+    );
+    assert_eq!(references(), (prepared + 1, released + 1));
+
+    // A byte budget one under the verified encode: the ladder
+    // steps down and the served bytes are scored again, against
+    // the same reference.
+    let verified = engine.process(&src, &auto_jpeg(None)).unwrap();
+    let (prepared, released) = references();
+    let budget = verified.bytes.len() as u64 - 1;
+    let squeezed = engine
+        .process(&src, &auto_jpeg(Some(Filter::MaxBytes(budget))))
+        .unwrap();
+    assert!(squeezed.bytes.len() as u64 <= budget);
+    assert!(squeezed.quality < verified.quality);
+    let rescored = squeezed.ssimulacra2.expect("the final encode is scored");
+    assert!(
+        rescored < verified.ssimulacra2.unwrap(),
+        "{rescored} against {:?}",
+        verified.ssimulacra2
+    );
+    assert_eq!(references(), (prepared + 1, released + 1));
+}
+
+#[test]
+fn an_encode_that_scores_nothing_prepares_no_reference() {
+    // Issue #664: an explicit quality, a format outside the
+    // verified loop and a format with no quality at all never
+    // build the metric's reference.
+    let engine = Engine;
+    let references = crate::quality::counters::snapshot;
+    let before = references();
+    for filters in [
+        vec![
+            Filter::Quality(Quality::Value(70)),
+            Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
+        ],
+        vec![
+            Filter::Quality(Quality::Auto),
+            Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
+        ],
+        vec![
+            Filter::Quality(Quality::Auto),
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+        ],
+    ] {
+        let out = engine
+            .process(&gradient_png(), &[Operation::Filters(filters)])
+            .unwrap();
+        assert_eq!(out.ssimulacra2, None);
+    }
+    assert_eq!(references(), before);
+
+    // The deadline is checked before each candidate, the first
+    // included: a search past its deadline encodes nothing and
+    // scores nothing.
+    let img = image::load_from_memory(&gradient_png()).unwrap();
+    let opts = EncodeOptions {
+        quality: Some(Quality::Auto),
+        ..Default::default()
+    };
+    let past = ProcessContext {
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let err = Engine::encode_still(&img, StillFormat::Jpeg, &opts, &past)
+        .err()
+        .expect("a passed deadline stops the search");
+    assert_eq!(err, EngineError::Timeout);
+    assert_eq!(references(), before);
+}
+
 /// 8x4 pattern with only the top-left quadrant white.
 fn quadrant_pattern() -> DynamicImage {
     let mut img = DynamicImage::new_rgb8(8, 4);
