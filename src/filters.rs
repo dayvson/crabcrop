@@ -336,9 +336,13 @@ pub fn apply_filters_within(
     for filter in filters {
         match filter {
             Filter::Grayscale => {
-                img = map_rgb(img, |r, g, b| {
-                    let y = luma(r, g, b).round().clamp(0.0, 255.0) as u8;
-                    [y, y, y]
+                img = map_rgb_lanes(img, |r, g, b| {
+                    for i in 0..LANES {
+                        let y = round_lane(luma_of(r[i], g[i], b[i]));
+                        r[i] = y;
+                        g[i] = y;
+                        b[i] = y;
+                    }
                 });
             }
             Filter::Invert => img.invert(),
@@ -397,7 +401,7 @@ pub fn apply_filters_within(
             Filter::Rotate(degrees) => {
                 let normalized = fold_degrees(*degrees);
                 img = if normalized == 90.0 {
-                    img.rotate90()
+                    rotate90_fast(&img)
                 } else if normalized == 180.0 {
                     rotate180_fast(&img)
                 } else if normalized == 270.0 {
@@ -640,6 +644,13 @@ fn luma(r: u8, g: u8, b: u8) -> f32 {
     0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
 }
 
+/// [`luma`] of samples already widened: the same three
+/// products, added in the same order.
+#[inline(always)]
+fn luma_of(r: f32, g: f32, b: f32) -> f32 {
+    0.299 * r + 0.587 * g + 0.114 * b
+}
+
 /// Map the RGB channels of every pixel through `f`, which
 /// returns the new channels. Alpha survives untouched when
 /// the image carries it; other channel layouts normalize to
@@ -670,12 +681,7 @@ fn map_rgb_bands<const CH: usize>(
     f: &(impl Fn(u8, u8, u8) -> [u8; 3] + Sync),
 ) {
     let row = width * CH;
-    let rows = buf.len() / row.max(1);
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4);
-    if threads < 2 || rows < 256 || buf.len() < 3_000_000 {
+    let Some(band_rows) = pointwise_band_rows(buf.len(), row) else {
         for p in buf.as_chunks_mut::<CH>().0 {
             let [r, g, b] = f(p[0], p[1], p[2]);
             p[0] = r;
@@ -683,8 +689,7 @@ fn map_rgb_bands<const CH: usize>(
             p[2] = b;
         }
         return;
-    }
-    let band_rows = rows.div_ceil(threads);
+    };
     std::thread::scope(|s| {
         for band in buf.chunks_mut(band_rows * row) {
             s.spawn(move || {
@@ -697,6 +702,129 @@ fn map_rgb_bands<const CH: usize>(
             });
         }
     });
+}
+
+/// How a per-pixel map splits a buffer of `len` bytes, in
+/// rows of `row` bytes, into row bands across threads: the
+/// rows of one band, or `None` to map the buffer on the
+/// calling thread. A frame under 3,000,000 subpixels or 256
+/// rows does not repay a spawn, and banding needs a second
+/// core; past that, up to four bands.
+fn pointwise_band_rows(len: usize, row: usize) -> Option<usize> {
+    let rows = len / row.max(1);
+    let threads = band_threads();
+    if threads < 2 || rows < 256 || len < 3_000_000 {
+        None
+    } else {
+        Some(rows.div_ceil(threads))
+    }
+}
+
+/// How many pixels one step of a lane mapping takes.
+const LANES: usize = 16;
+
+/// One channel of [`LANES`] pixels, widened to `f32`.
+type Lane = [f32; LANES];
+
+/// `x.round().clamp(0.0, 255.0)` for every `f32`, without
+/// the call into the C library that `f32::round` compiles to
+/// on baseline x86-64: clamp first, truncate through an
+/// integer, and let the fraction, which that subtraction
+/// gives exactly, decide. NaN comes out as zero, which is
+/// also what it becomes as a byte.
+#[inline(always)]
+fn round_lane(x: f32) -> f32 {
+    let c = x.clamp(0.0, 255.0);
+    let whole = (c as i32) as f32;
+    whole + if c - whole >= 0.5 { 1.0 } else { 0.0 }
+}
+
+/// [`map_rgb`] for a mapping written over lanes (issue
+/// #659): `f` gets the red, green and blue samples of
+/// [`LANES`] pixels as three `f32` arrays and leaves each
+/// result in place, a value in 0 to 255 that is truncated to
+/// the output sample. A lane is one pixel, computed with the
+/// `f32` operations a pixel at a time would use, in the same
+/// order, so the bytes are the same; the arrays let the
+/// compiler turn that arithmetic into vector code, which
+/// interleaved bytes do not.
+fn map_rgb_lanes(
+    img: DynamicImage,
+    f: impl Fn(&mut Lane, &mut Lane, &mut Lane) + Sync,
+) -> DynamicImage {
+    if img.color().has_alpha() {
+        let mut rgba = img.into_rgba8();
+        let w = rgba.width() as usize;
+        lanes_bands::<4>(rgba.as_mut(), w, &f);
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = img.into_rgb8();
+        let w = rgb.width() as usize;
+        lanes_bands::<3>(rgb.as_mut(), w, &f);
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+/// A lane mapping over a raw channel buffer, in the row bands
+/// of [`map_rgb_bands`]. Channels past the third (alpha) are
+/// left as they are.
+fn lanes_bands<const CH: usize>(
+    buf: &mut [u8],
+    width: usize,
+    f: &(impl Fn(&mut Lane, &mut Lane, &mut Lane) + Sync),
+) {
+    let run = |band: &mut [u8]| {
+        let (blocks, rest) = band.as_chunks_mut::<CH>().0.as_chunks_mut::<LANES>();
+        for block in blocks {
+            lanes_block(block, f);
+        }
+        if !rest.is_empty() {
+            // The last pixels ride in a full block; the spare
+            // lanes are computed and dropped.
+            let mut padded = [[0u8; CH]; LANES];
+            padded[..rest.len()].copy_from_slice(rest);
+            lanes_block(&mut padded, f);
+            rest.copy_from_slice(&padded[..rest.len()]);
+        }
+    };
+    let row = width * CH;
+    let Some(band_rows) = pointwise_band_rows(buf.len(), row) else {
+        run(buf);
+        return;
+    };
+    std::thread::scope(|s| {
+        for band in buf.chunks_mut(band_rows * row) {
+            let run = &run;
+            s.spawn(move || run(band));
+        }
+    });
+}
+
+/// One block of [`lanes_bands`]: the pixels' channels out to
+/// lanes, the mapping, and the lanes back to bytes.
+#[inline(always)]
+fn lanes_block<const CH: usize>(
+    block: &mut [[u8; CH]; LANES],
+    f: &impl Fn(&mut Lane, &mut Lane, &mut Lane),
+) {
+    let (mut r, mut g, mut b) = ([0f32; LANES], [0f32; LANES], [0f32; LANES]);
+    for (i, p) in block.iter().enumerate() {
+        r[i] = p[0] as f32;
+        g[i] = p[1] as f32;
+        b[i] = p[2] as f32;
+    }
+    f(&mut r, &mut g, &mut b);
+    let (mut r8, mut g8, mut b8) = ([0u8; LANES], [0u8; LANES], [0u8; LANES]);
+    for i in 0..LANES {
+        r8[i] = r[i] as u8;
+        g8[i] = g[i] as u8;
+        b8[i] = b[i] as u8;
+    }
+    for (i, p) in block.iter_mut().enumerate() {
+        p[0] = r8[i];
+        p[1] = g8[i];
+        p[2] = b8[i];
+    }
 }
 
 fn map_rgb_image(
@@ -806,6 +934,20 @@ trait BlurSample: Copy + Default + Send + Sync + 'static {
     fn mac(acc: Self::Acc, a: Self::Acc, b: Self::Acc) -> Self::Acc;
     /// An accumulated value back as a sample.
     fn store(acc: Self::Acc) -> Self;
+    /// One row of the horizontal pass, from the row padded
+    /// into `arena`. The default is the crate's loop shape;
+    /// a sample type may bring a loop of its own that adds
+    /// the same terms.
+    #[inline(always)]
+    fn sym_row<const N: usize>(arena: &[Self], dst_row: &mut [Self], kernel: &[Self::Acc]) {
+        blur_sym_row::<Self, N>(arena, dst_row, kernel);
+    }
+    /// One row of the vertical pass, from the rows under the
+    /// kernel, with the same latitude.
+    #[inline(always)]
+    fn sym_col(brows: &[&[Self]], dst_row: &mut [Self], kernel: &[Self::Acc]) {
+        blur_sym_col::<Self>(brows, dst_row, kernel);
+    }
 }
 
 impl BlurSample for u8 {
@@ -825,6 +967,72 @@ impl BlurSample for u8 {
     #[inline(always)]
     fn store(acc: u32) -> u8 {
         blur_q15_out(acc)
+    }
+    fn sym_row<const N: usize>(arena: &[u8], dst_row: &mut [u8], kernel: &[u32]) {
+        let len = kernel.len();
+        let half = len / 2;
+        let w = dst_row.len();
+        blur_u8_chunks(dst_row, kernel, &arena[half * N..half * N + w], |i| {
+            let other = len - 1 - i;
+            (&arena[i * N..i * N + w], &arena[other * N..other * N + w])
+        });
+    }
+    fn sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
+        let len = kernel.len();
+        blur_u8_chunks(dst_row, kernel, brows[len / 2], |i| {
+            (brows[i], brows[len - 1 - i])
+        });
+    }
+}
+
+/// How many samples one step of the 8-bit blur passes sums:
+/// the running totals stay on the stack and in cache.
+const BLUR_U8_CHUNK: usize = 256;
+
+/// One row of either 8-bit blur pass, a chunk of samples at
+/// a time (issue #660). `center` holds the samples under the
+/// kernel's middle weight and `pair(i)` the two runs of
+/// samples that share weight `i`. Each total is the crate's
+/// own sum (the middle sample times its weight, plus each
+/// pair's sum times its weight, in `u32`, rounded back from
+/// Q0.15), with the terms added one weight at a time over
+/// the chunk instead of one sample at a time over the
+/// weights. Integer addition does not depend on the order,
+/// and no total comes near 2^32: a total is at most 255
+/// times the sum of the weights, and the weights are a
+/// normalized kernel in Q0.15, about 2^15 in all. A weight
+/// is under 2^15 and a pair's sum at most 510, so the
+/// multiply is written on 16-bit operands, which the
+/// compiler turns into vector multiplies.
+#[inline(always)]
+fn blur_u8_chunks<'a>(
+    dst_row: &mut [u8],
+    kernel: &[u32],
+    center: &[u8],
+    pair: impl Fn(usize) -> (&'a [u8], &'a [u8]),
+) {
+    debug_assert!(kernel.iter().all(|&weight| weight < 1 << 15));
+    let half = kernel.len() / 2;
+    let middle = kernel[half] as u16;
+    let mut start = 0usize;
+    for dst in dst_row.chunks_mut(BLUR_U8_CHUNK) {
+        let n = dst.len();
+        let mut totals = [0u32; BLUR_U8_CHUNK];
+        for (total, &c) in totals[..n].iter_mut().zip(&center[start..start + n]) {
+            *total = u32::from(u16::from(c)) * u32::from(middle);
+        }
+        for (i, &weight) in kernel[..half].iter().enumerate() {
+            let weight = weight as u16;
+            let (fw, bw) = pair(i);
+            let (fw, bw) = (&fw[start..start + n], &bw[start..start + n]);
+            for ((total, &f), &b) in totals[..n].iter_mut().zip(fw).zip(bw) {
+                *total += u32::from(u16::from(f) + u16::from(b)) * u32::from(weight);
+            }
+        }
+        for (d, &total) in dst.iter_mut().zip(&totals[..n]) {
+            *d = blur_q15_out(total);
+        }
+        start += n;
     }
 }
 
@@ -1171,7 +1379,7 @@ fn blur_ring_of<T: BlurSample, const N: usize>(
                     pad,
                     &mut arena,
                 );
-                blur_sym_row::<T, N>(
+                T::sym_row::<N>(
                     &arena,
                     &mut ring[slot * row_len..(slot + 1) * row_len],
                     &kernel,
@@ -1183,7 +1391,7 @@ fn blur_ring_of<T: BlurSample, const N: usize>(
                 let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
                 brows.push(&ring[(sy % klen) * row_len..(sy % klen + 1) * row_len]);
             }
-            blur_sym_col(&brows, &mut band[ly * row_len..(ly + 1) * row_len], &kernel);
+            T::sym_col(&brows, &mut band[ly * row_len..(ly + 1) * row_len], &kernel);
         }
     });
     gate.finished()?;
@@ -1232,7 +1440,7 @@ fn blur_transient_of<T: BlurSample, const N: usize>(
             }
             let y = y0 + ly;
             blur_arena_row::<T, N>(&src[y * row_len..(y + 1) * row_len], pad, &mut arena);
-            blur_sym_row::<T, N>(&arena, dst_row, &kernel);
+            T::sym_row::<N>(&arena, dst_row, &kernel);
         }
     });
     gate.finished()?;
@@ -1248,7 +1456,7 @@ fn blur_transient_of<T: BlurSample, const N: usize>(
                 let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
                 brows.push(&transient[sy * row_len..(sy + 1) * row_len]);
             }
-            blur_sym_col(&brows, dst_row, &kernel);
+            T::sym_col(&brows, dst_row, &kernel);
         }
     });
     gate.finished()?;
@@ -1431,6 +1639,14 @@ fn rot270_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[
 /// 4.7 ms, 64 rows 7.1 ms (issue #648).
 const ROT90_BLOCK_ROWS: usize = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// How many frames [`rot90_px`] has turned on this thread.
+    /// The turn and the image crate's write the same bytes, so
+    /// the tests count the calls to tell which one a frame took.
+    static ROT90_BLOCK_TURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rotate 90 degrees clockwise: output row `c` is input column
 /// `c` read bottom to top. The output is written a block of
 /// rows at a time: each input row hands a run of pixels to the
@@ -1442,6 +1658,8 @@ const ROT90_BLOCK_ROWS: usize = 16;
 /// their single-frame time, which banding it over threads did
 /// not (issue #648).
 fn rot90_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
+    #[cfg(test)]
+    ROT90_BLOCK_TURNS.with(|turns| turns.set(turns.get() + 1));
     for (block, rows) in dst.chunks_mut(ROT90_BLOCK_ROWS * h).enumerate() {
         let c = block * ROT90_BLOCK_ROWS;
         let n = rows.len() / h;
@@ -1708,6 +1926,10 @@ pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
 /// computed whole. Zero-weight taps are skipped: every
 /// input channel is a non-negative f32, so a zero tap only
 /// ever added +0.0, which cannot change the running sum.
+///
+/// The interior is summed a tap at a time over a whole row
+/// (issue #658), which hands every sample its taps in the
+/// order it always had them; see the comment there.
 fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = image::RgbImage::new(w as u32, h as u32);
@@ -1727,50 +1949,77 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
         .filter(|(_, k)| **k != 0.0)
         .map(|(ki, k)| (ki / 3, (ki % 3) * 3, *k))
         .collect();
-    if w >= 3 && h >= 3 {
+    let interior = w >= 3 && h >= 3;
+    if interior {
+        // Every interior sample is the same sum: its taps in
+        // kernel order, each a source sample times its
+        // weight, added to a total that starts at zero. The
+        // sum runs one tap at a time over a row of totals,
+        // not one sample at a time over the taps. Each total
+        // still takes its taps in kernel order, as plain
+        // `f32` multiplies and adds, so it is the same value;
+        // and each pass is a loop over two slices, which the
+        // compiler turns into vector code. The three source
+        // rows an output row reads are kept as `f32`, each
+        // converted once.
+        let span = stride - 6;
+        let widen = |y: usize, row: &mut Vec<f32>| {
+            row.clear();
+            row.extend(src[y * stride..(y + 1) * stride].iter().map(|&v| v as f32));
+        };
+        let mut rows: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(stride));
+        for (y, row) in rows.iter_mut().enumerate() {
+            widen(y, row);
+        }
+        let mut totals = vec![0f32; span];
         for y in 1..h - 1 {
-            let rows = [
-                &src[(y - 1) * stride..y * stride],
-                &src[y * stride..(y + 1) * stride],
-                &src[(y + 1) * stride..(y + 2) * stride],
-            ];
-            for x in 1..w - 1 {
-                let xb = x * 3;
-                let mut t = [0f32; 3];
-                for &(rd, coff, k) in &taps {
-                    let b = xb + coff - 3;
-                    let row = rows[rd];
-                    t[0] += row[b] as f32 * k;
-                    t[1] += row[b + 1] as f32 * k;
-                    t[2] += row[b + 2] as f32 * k;
+            if y > 1 {
+                rows.rotate_left(1);
+                widen(y + 1, &mut rows[2]);
+            }
+            totals.fill(0.0);
+            for &(rd, coff, k) in &taps {
+                for (total, &sample) in totals.iter_mut().zip(&rows[rd][coff..coff + span]) {
+                    *total += sample * k;
                 }
-                let base = y * stride + xb;
-                for c in 0..3 {
-                    dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
-                }
+            }
+            let out_row = &mut dst[y * stride + 3..(y + 1) * stride - 3];
+            for (d, &total) in out_row.iter_mut().zip(&totals) {
+                *d = (total * inverse_sum).clamp(0.0, 255.0) as u8;
             }
         }
     }
     // The border ring, and every pixel of an image under
-    // 3px on either axis: the same sum, with each tap's
-    // coordinates clamped into the frame.
-    for y in 0..h {
+    // 3px on either axis: the same sum, one pixel at a time,
+    // with each tap's coordinates clamped into the frame.
+    let mut edge = |x: usize, y: usize| {
+        let mut t = [0f32; 3];
+        for &(rd, coff, k) in &taps {
+            let sy = (y + rd).saturating_sub(1).min(h - 1);
+            let sx = (x + coff / 3).saturating_sub(1).min(w - 1);
+            let b = sy * stride + sx * 3;
+            t[0] += src[b] as f32 * k;
+            t[1] += src[b + 1] as f32 * k;
+            t[2] += src[b + 2] as f32 * k;
+        }
+        let base = y * stride + x * 3;
+        for c in 0..3 {
+            dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
+        }
+    };
+    if interior {
         for x in 0..w {
-            if w >= 3 && h >= 3 && (1..w - 1).contains(&x) && (1..h - 1).contains(&y) {
-                continue;
-            }
-            let mut t = [0f32; 3];
-            for &(rd, coff, k) in &taps {
-                let sy = (y + rd).saturating_sub(1).min(h - 1);
-                let sx = (x + coff / 3).saturating_sub(1).min(w - 1);
-                let b = sy * stride + sx * 3;
-                t[0] += src[b] as f32 * k;
-                t[1] += src[b + 1] as f32 * k;
-                t[2] += src[b + 2] as f32 * k;
-            }
-            let base = y * stride + x * 3;
-            for c in 0..3 {
-                dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
+            edge(x, 0);
+            edge(x, h - 1);
+        }
+        for y in 1..h - 1 {
+            edge(0, y);
+            edge(w - 1, y);
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                edge(x, y);
             }
         }
     }
@@ -2991,13 +3240,13 @@ pub(crate) fn trim_to(
 /// 0 collapses to gray, 1 is the identity.
 fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
     let w = out.width() as usize;
-    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
-        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-        [
-            (luma + (r as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
-            (luma + (g as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
-            (luma + (b as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
-        ]
+    lanes_bands::<3>(out.as_mut(), w, &|r, g, b| {
+        for i in 0..LANES {
+            let luma = luma_of(r[i], g[i], b[i]);
+            r[i] = (luma + (r[i] - luma) * amount).clamp(0.0, 255.0);
+            g[i] = (luma + (g[i] - luma) * amount).clamp(0.0, 255.0);
+            b[i] = (luma + (b[i] - luma) * amount).clamp(0.0, 255.0);
+        }
     });
     out
 }
@@ -3211,3 +3460,11 @@ mod w3proofs;
 
 #[cfg(test)]
 mod w4proofs;
+
+// The loops reshaped so the compiler can vectorize them, each
+// pinned against a frozen copy of the loop it replaced: the
+// row passes of the 3x3 convolution (issue #658), the lane
+// mapping behind grayscale and saturation (issue #659), and
+// the chunked sums of the 8-bit blur (issue #660).
+#[cfg(test)]
+mod vector_proofs;

@@ -158,10 +158,15 @@ const WORKER_PIPE_BYTES: usize = 256 * 1024;
 /// effort: where the kernel refuses (the user's pipe budget is
 /// spent, a lower `pipe-max-size`), and on a system with no
 /// such call, the pipe keeps its capacity and the exchange
-/// runs as it always has.
+/// runs as it always has. A pipe that already holds as much
+/// is left alone: the call sets a capacity, and a host whose
+/// pipes start larger than [`DEFAULT_PIPE_BYTES`] must not
+/// have one narrowed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn widen_pipe(pipe: &impl std::os::fd::AsFd, bytes: usize) {
-    let _ = rustix::pipe::fcntl_setpipe_size(pipe, bytes);
+    if rustix::pipe::fcntl_getpipe_size(pipe).is_ok_and(|held| held < bytes) {
+        let _ = rustix::pipe::fcntl_setpipe_size(pipe, bytes);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1621,11 +1626,18 @@ mod tests {
         widen_pipe(&writer, WORKER_PIPE_BYTES);
         let after = capacity(&writer);
         // Granted, or refused where this user's pipe budget is
-        // spent: never an error, never a smaller pipe.
+        // spent, or not needed where pipes start as large:
+        // never an error, never a smaller pipe.
         assert!(
-            after == WORKER_PIPE_BYTES || after == before,
+            after == before || (before < WORKER_PIPE_BYTES && after == WORKER_PIPE_BYTES),
             "{before} bytes became {after}"
         );
+        // A pipe that holds more is not narrowed to the size
+        // asked for.
+        if after == WORKER_PIPE_BYTES {
+            widen_pipe(&writer, DEFAULT_PIPE_BYTES);
+            assert_eq!(capacity(&writer), after);
+        }
         // A size the kernel refuses outright leaves the pipe as
         // it was, and so does a descriptor that is no pipe.
         widen_pipe(&writer, usize::MAX);
@@ -1642,11 +1654,17 @@ mod tests {
         assert_eq!(carried, "still a pipe");
     }
 
-    /// Whether the kernel widens a pipe for this user (it stops
-    /// once the user's pipe budget is spent).
+    /// Whether a pipe starts at [`DEFAULT_PIPE_BYTES`] here and
+    /// the kernel widens it for this user. Some hosts start
+    /// their pipes larger, and the kernel stops widening once
+    /// the user's pipe budget is spent; the test below can
+    /// tell a wide pipe from a default one in neither case.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn pipes_can_be_widened() -> bool {
         let (_reader, writer) = std::io::pipe().unwrap();
+        if rustix::pipe::fcntl_getpipe_size(&writer).unwrap() != DEFAULT_PIPE_BYTES {
+            return false;
+        }
         widen_pipe(&writer, WORKER_PIPE_BYTES);
         rustix::pipe::fcntl_getpipe_size(&writer).unwrap() == WORKER_PIPE_BYTES
     }
@@ -1659,15 +1677,20 @@ mod tests {
         }
         let timeout = Duration::from_secs(20);
         let dir = crate::test_support::scratch_dir("worker-pipe-test");
-        // The answer: the stand-in writes 200,000 bytes, past
+        // The answer: the stand-in writes 200,704 bytes, past
         // the 64 KiB a pipe starts with, and only then leaves
         // its mark, while the parent reads nothing. Through an
         // AVIF job's pipe that goes through; an SVG job's holds
-        // 64 KiB of it and the write waits.
+        // 64 KiB of it and the write waits. The bytes come
+        // from the shell's own `printf`, a page at a time,
+        // and not from `head -c`: the `head` of the Rust
+        // coreutils (Ubuntu 26.04) widens the pipe it writes
+        // to, and then an SVG job's pipe takes all of it.
         for (job, wide) in [(JOB_AVIF, true), (JOB_SVG, false)] {
             let written = dir.join(format!("written-{job}"));
             let script = format!(
-                "head -c 200000 /dev/zero; : > '{}'; exec sleep 30",
+                "i=0; while [ $i -lt 49 ]; do printf '%04096d' 0; i=$((i+1)); done; \
+                 : > '{}'; exec sleep 30",
                 written.display()
             );
             let mut worker = spawn(&shell_worker(&script), timeout, job).unwrap();

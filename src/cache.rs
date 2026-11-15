@@ -14,7 +14,7 @@
 //! holds. Only successful responses are stored; errors are
 //! never cached.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -728,6 +728,9 @@ fn trim_tombstones(map: &mut HashMap<String, u64>) {
 struct Entry {
     image: CachedImage,
     cost: usize,
+    /// When the entry was last used: where its key stands in
+    /// [`Inner::order`].
+    stamp: u64,
 }
 
 /// The allocator's bookkeeping charged for each separate heap
@@ -735,15 +738,22 @@ struct Entry {
 const ALLOCATION_OVERHEAD: usize = 16;
 
 /// What an entry costs besides its strings and its payload:
-/// its slot in each of the two maps, doubled for the spare
-/// slots a hash map keeps as it grows, and the allocations
-/// behind its two key copies, its ETag, and its payload.
-const ENTRY_OVERHEAD: usize =
-    2 * (size_of::<(String, Entry)>() + size_of::<(String, u64)>()) + 4 * ALLOCATION_OVERHEAD;
+/// its slot in the entry map and its place in the recency
+/// order, each doubled for the room a map keeps spare, and
+/// the allocations behind its two key copies, its ETag, and
+/// its payload. The two are counted as they were when the
+/// order was a second hash map (issue #645): a key with an
+/// image and its charge, and a key with a stamp. The stamp
+/// an entry now carries is not added, so an entry is charged
+/// what it always was and a budget holds the entries it
+/// held.
+const ENTRY_OVERHEAD: usize = 2
+    * (size_of::<(String, (CachedImage, usize))>() + size_of::<(String, u64)>())
+    + 4 * ALLOCATION_OVERHEAD;
 
 /// What one entry keeps resident, charged against the budget:
-/// the payload, the key twice (it keys both the entry map and
-/// the recency map), the ETag, every group name with its own
+/// the payload, the key twice (the entry map and the recency
+/// order each hold it), the ETag, every group name with its own
 /// string and allocation, and [`ENTRY_OVERHEAD`]. Charging only
 /// the payload let entries with tiny bodies under long keys
 /// hold many times the budget without ever being evicted.
@@ -759,11 +769,13 @@ fn entry_cost(key: &str, image: &CachedImage) -> usize {
 #[derive(Debug, Default)]
 struct Inner {
     entries: HashMap<String, Entry>,
-    /// Last-access stamp per key (monotonic clock). Eviction
-    /// removes the smallest stamp, which is the least recently
-    /// used entry: the same order the VecDeque kept, at O(1)
-    /// per access instead of a linear scan per hit.
-    stamps: HashMap<String, u64>,
+    /// The keys in the order they were last used: each under
+    /// its entry's stamp, a reading of `clock`, so no two are
+    /// equal. Eviction takes the smallest stamp, the least
+    /// recently used entry, from the front (issue #645). While
+    /// the stamps sat in a hash map, every eviction read every
+    /// entry's stamp to find it, under the cache's lock.
+    order: BTreeMap<u64, String>,
     clock: u64,
     /// The sum of the stored entries' charges.
     total_bytes: usize,
@@ -826,12 +838,12 @@ impl Cache {
         // Built once, not per key examined.
         let prefix = format!("{base}#");
         let mut removed = 0;
-        for (key, old) in inner
+        for (_, old) in inner
             .entries
             .extract_if(|k, _| k.as_str() == base || k.starts_with(&prefix))
         {
             inner.total_bytes -= old.cost;
-            inner.stamps.remove(&key);
+            inner.order.remove(&old.stamp);
             removed += 1;
         }
         removed
@@ -845,7 +857,7 @@ impl Cache {
             return false;
         };
         inner.total_bytes -= old.cost;
-        inner.stamps.remove(key);
+        inner.order.remove(&old.stamp);
         true
     }
 
@@ -856,12 +868,12 @@ impl Cache {
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
         let mut removed = 0;
-        for (key, old) in inner
+        for (_, old) in inner
             .entries
             .extract_if(|_, entry| entry.image.groups.iter().any(|g| g == group))
         {
             inner.total_bytes -= old.cost;
-            inner.stamps.remove(&key);
+            inner.order.remove(&old.stamp);
             removed += 1;
         }
         removed
@@ -961,12 +973,13 @@ impl Cache {
         inner.total_bytes += cost;
         inner.clock += 1;
         let stamp = inner.clock;
-        inner.stamps.insert(key.to_string(), stamp);
+        inner.order.insert(stamp, key.to_string());
         inner.entries.insert(
             key.to_string(),
             Entry {
                 image: image.clone(),
                 cost,
+                stamp,
             },
         );
         Promoted::Inserted
@@ -983,12 +996,12 @@ impl Cache {
         // Built once, not per key examined.
         let suffix = format!("/{source}");
         let mut removed = 0;
-        for (key, old) in inner.entries.extract_if(|k, _| {
+        for (_, old) in inner.entries.extract_if(|k, _| {
             let base = k.split('#').next().unwrap_or(k);
             base == source || base.ends_with(&suffix)
         }) {
             inner.total_bytes -= old.cost;
-            inner.stamps.remove(&key);
+            inner.order.remove(&old.stamp);
             removed += 1;
         }
         removed
@@ -1027,14 +1040,14 @@ impl Cache {
         }
         if let Some(old) = inner.entries.remove(&key) {
             inner.total_bytes -= old.cost;
-            inner.stamps.remove(&key);
+            inner.order.remove(&old.stamp);
         }
         evict_to_fit(&mut inner, self.max_bytes, cost);
         inner.total_bytes += cost;
         inner.clock += 1;
         let stamp = inner.clock;
-        inner.stamps.insert(key.clone(), stamp);
-        inner.entries.insert(key, Entry { image, cost });
+        inner.order.insert(stamp, key.clone());
+        inner.entries.insert(key, Entry { image, cost, stamp });
         took
     }
 
@@ -1049,24 +1062,25 @@ impl Cache {
 /// bytes of charge fit within `max_bytes`.
 fn evict_to_fit(inner: &mut Inner, max_bytes: usize, incoming: usize) {
     while inner.total_bytes + incoming > max_bytes {
-        let oldest = inner
-            .stamps
-            .iter()
-            .min_by_key(|(_, stamp)| *stamp)
-            .map(|(k, _)| k.clone());
-        let Some(oldest) = oldest else { break };
+        let Some((_, oldest)) = inner.order.pop_first() else {
+            break;
+        };
         if let Some(evicted) = inner.entries.remove(&oldest) {
             inner.total_bytes -= evicted.cost;
         }
-        inner.stamps.remove(&oldest);
     }
 }
 
+/// Mark `key`'s entry, if there is one, as used now: its key
+/// moves to a new stamp at the back of the order.
 fn touch(inner: &mut Inner, key: &str) {
     inner.clock += 1;
     let stamp = inner.clock;
-    if let Some(s) = inner.stamps.get_mut(key) {
-        *s = stamp;
+    if let Some(entry) = inner.entries.get_mut(key) {
+        let before = std::mem::replace(&mut entry.stamp, stamp);
+        if let Some(key) = inner.order.remove(&before) {
+            inner.order.insert(stamp, key);
+        }
     }
 }
 
@@ -1806,5 +1820,413 @@ mod tests {
         let merged = cache.merge_groups("k", &["a".to_string()]).unwrap();
         assert_eq!(merged.groups, ["a", "hero", "thumb"]);
         assert_eq!(cache.groups("k").unwrap(), merged.groups);
+    }
+
+    /// The memory tier's bookkeeping as it was before issue
+    /// #645: each entry's stamp in a second hash map, and the
+    /// least recently used entry found by reading them all.
+    /// The tier is compared with it, operation by operation.
+    mod scan {
+        use super::super::{ALLOCATION_OVERHEAD, CachedImage, Promoted, union_groups};
+        use std::collections::HashMap;
+
+        pub struct Entry {
+            pub image: CachedImage,
+            pub cost: usize,
+        }
+
+        const ENTRY_OVERHEAD: usize = 2
+            * (size_of::<(String, Entry)>() + size_of::<(String, u64)>())
+            + 4 * ALLOCATION_OVERHEAD;
+
+        pub fn entry_cost(key: &str, image: &CachedImage) -> usize {
+            let groups: usize = image
+                .groups
+                .iter()
+                .map(|group| group.len() + size_of::<String>() + ALLOCATION_OVERHEAD)
+                .sum();
+            image.bytes.len() + 2 * key.len() + image.etag.len() + groups + ENTRY_OVERHEAD
+        }
+
+        #[derive(Default)]
+        pub struct Cache {
+            max_bytes: usize,
+            pub entries: HashMap<String, Entry>,
+            stamps: HashMap<String, u64>,
+            clock: u64,
+            pub total_bytes: usize,
+        }
+
+        impl Cache {
+            pub fn new(max_bytes: usize) -> Self {
+                Cache {
+                    max_bytes,
+                    ..Default::default()
+                }
+            }
+
+            /// The keys, from the least recently used.
+            pub fn order(&self) -> Vec<String> {
+                let mut stamped: Vec<(u64, &String)> = self
+                    .stamps
+                    .iter()
+                    .map(|(key, stamp)| (*stamp, key))
+                    .collect();
+                stamped.sort();
+                stamped.into_iter().map(|(_, key)| key.clone()).collect()
+            }
+
+            pub fn get(&mut self, key: &str) -> Option<CachedImage> {
+                if self.max_bytes == 0 {
+                    return None;
+                }
+                let image = self.entries.get(key)?.image.clone();
+                self.touch(key);
+                Some(image)
+            }
+
+            pub fn purge_matching(&mut self, base: &str) -> usize {
+                let prefix = format!("{base}#");
+                let mut removed = 0;
+                for (key, old) in self
+                    .entries
+                    .extract_if(|k, _| k.as_str() == base || k.starts_with(&prefix))
+                {
+                    self.total_bytes -= old.cost;
+                    self.stamps.remove(&key);
+                    removed += 1;
+                }
+                removed
+            }
+
+            pub fn remove(&mut self, key: &str) -> bool {
+                let Some(old) = self.entries.remove(key) else {
+                    return false;
+                };
+                self.total_bytes -= old.cost;
+                self.stamps.remove(key);
+                true
+            }
+
+            pub fn purge_group(&mut self, group: &str) -> usize {
+                let mut removed = 0;
+                for (key, old) in self
+                    .entries
+                    .extract_if(|_, entry| entry.image.groups.iter().any(|g| g == group))
+                {
+                    self.total_bytes -= old.cost;
+                    self.stamps.remove(&key);
+                    removed += 1;
+                }
+                removed
+            }
+
+            pub fn merge_groups(&mut self, key: &str, groups: &[String]) -> Option<CachedImage> {
+                let entry = self.entries.get_mut(key)?;
+                if groups.iter().all(|g| entry.image.groups.contains(g)) {
+                    return None;
+                }
+                entry.image.groups = union_groups(&entry.image.groups, groups);
+                let held = entry.image.clone();
+                let cost = entry_cost(key, &entry.image);
+                let old = std::mem::replace(&mut entry.cost, cost);
+                self.total_bytes = self.total_bytes - old + cost;
+                self.evict_to_fit(0);
+                Some(held)
+            }
+
+            pub fn promote(&mut self, key: &str, image: &CachedImage) -> Promoted {
+                if self.max_bytes == 0 {
+                    return Promoted::Skipped;
+                }
+                if let Some(entry) = self.entries.get_mut(key) {
+                    let took: Vec<String> = entry
+                        .image
+                        .groups
+                        .iter()
+                        .filter(|g| !image.groups.contains(g))
+                        .cloned()
+                        .collect();
+                    let grew = !image.groups.iter().all(|g| entry.image.groups.contains(g));
+                    if grew {
+                        entry.image.groups = union_groups(&entry.image.groups, &image.groups);
+                        let cost = entry_cost(key, &entry.image);
+                        let old = std::mem::replace(&mut entry.cost, cost);
+                        self.total_bytes = self.total_bytes - old + cost;
+                    }
+                    let groups = entry.image.groups.clone();
+                    let written = entry.image.written;
+                    self.touch(key);
+                    if grew {
+                        self.evict_to_fit(0);
+                    }
+                    return Promoted::Merged {
+                        groups,
+                        took,
+                        grew,
+                        written,
+                    };
+                }
+                let cost = entry_cost(key, image);
+                if cost > self.max_bytes {
+                    return Promoted::Skipped;
+                }
+                self.evict_to_fit(cost);
+                self.total_bytes += cost;
+                self.clock += 1;
+                let stamp = self.clock;
+                self.stamps.insert(key.to_string(), stamp);
+                self.entries.insert(
+                    key.to_string(),
+                    Entry {
+                        image: image.clone(),
+                        cost,
+                    },
+                );
+                Promoted::Inserted
+            }
+
+            pub fn purge_source(&mut self, source: &str) -> usize {
+                let suffix = format!("/{source}");
+                let mut removed = 0;
+                for (key, old) in self.entries.extract_if(|k, _| {
+                    let base = k.split('#').next().unwrap_or(k);
+                    base == source || base.ends_with(&suffix)
+                }) {
+                    self.total_bytes -= old.cost;
+                    self.stamps.remove(&key);
+                    removed += 1;
+                }
+                removed
+            }
+
+            pub fn put(&mut self, key: String, mut image: CachedImage) -> Vec<String> {
+                if self.max_bytes == 0 {
+                    return Vec::new();
+                }
+                let took: Vec<String> = self
+                    .entries
+                    .get(&key)
+                    .map(|old| {
+                        old.image
+                            .groups
+                            .iter()
+                            .filter(|g| !image.groups.contains(g))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !took.is_empty() {
+                    image.groups = union_groups(&image.groups, &took);
+                }
+                let cost = entry_cost(&key, &image);
+                if cost > self.max_bytes {
+                    return Vec::new();
+                }
+                if let Some(old) = self.entries.remove(&key) {
+                    self.total_bytes -= old.cost;
+                    self.stamps.remove(&key);
+                }
+                self.evict_to_fit(cost);
+                self.total_bytes += cost;
+                self.clock += 1;
+                let stamp = self.clock;
+                self.stamps.insert(key.clone(), stamp);
+                self.entries.insert(key, Entry { image, cost });
+                took
+            }
+
+            fn evict_to_fit(&mut self, incoming: usize) {
+                while self.total_bytes + incoming > self.max_bytes {
+                    let oldest = self
+                        .stamps
+                        .iter()
+                        .min_by_key(|(_, stamp)| *stamp)
+                        .map(|(k, _)| k.clone());
+                    let Some(oldest) = oldest else { break };
+                    if let Some(evicted) = self.entries.remove(&oldest) {
+                        self.total_bytes -= evicted.cost;
+                    }
+                    self.stamps.remove(&oldest);
+                }
+            }
+
+            fn touch(&mut self, key: &str) {
+                self.clock += 1;
+                let stamp = self.clock;
+                if let Some(s) = self.stamps.get_mut(key) {
+                    *s = stamp;
+                }
+            }
+        }
+    }
+
+    /// What the tier holds, from the least recently used
+    /// entry: each key with its copy and its charge. Checks on
+    /// the way that the order and the entries name each other
+    /// and that the total is the sum of the charges.
+    fn resident(cache: &Cache) -> Vec<(String, CachedImage, usize)> {
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.order.len(), inner.entries.len());
+        let held: Vec<(String, CachedImage, usize)> = inner
+            .order
+            .iter()
+            .map(|(stamp, key)| {
+                let entry = &inner.entries[key];
+                assert_eq!(entry.stamp, *stamp, "{key}");
+                (key.clone(), entry.image.clone(), entry.cost)
+            })
+            .collect();
+        assert_eq!(
+            inner.total_bytes,
+            held.iter().map(|(_, _, cost)| cost).sum::<usize>()
+        );
+        held
+    }
+
+    #[test]
+    fn an_entry_is_charged_what_it_was_before_the_order_was_a_map() {
+        // Issue #645: the entry gained a stamp, and the charge
+        // did not move with it. A budget holds the entries it
+        // held, whatever their keys, groups and bodies.
+        for (key, image) in [
+            ("k", img(0)),
+            ("300x200/http://x/a.png#cfgtest#avif", img(20_000)),
+            ("k", grouped(7, &["hero", "thumbnails"])),
+        ] {
+            assert_eq!(entry_cost(key, &image), scan::entry_cost(key, &image));
+        }
+    }
+
+    #[test]
+    fn the_tier_evicts_what_the_scan_evicted_in_every_order_of_operations() {
+        // Issue #645: eviction takes its victim from the
+        // front of an ordered map and no longer reads every
+        // stamp to find it. Whatever is done to the tier
+        // (puts that replace and puts that evict, hits,
+        // misses, promotions that insert and that merge, group
+        // merges that grow an entry past the budget, removals
+        // and the three purges), it must hold the same
+        // entries, in the same order of use, under the same
+        // charges, and give every call the same answer, as
+        // the bookkeeping that scanned.
+        let ops = ["100x100", "200x0", "filters:blur(2)"];
+        let sources = ["http://x/a.png", "http://x/b.png", "http://y/a.png"];
+        let variants = ["", "#avif", "#webp#w300"];
+        let mut keys = Vec::new();
+        for op in ops {
+            for source in sources {
+                for variant in variants {
+                    keys.push(format!("{op}/{source}{variant}"));
+                }
+            }
+        }
+        let groups = ["thumb", "card", "hero"];
+        let some_groups = |rng: &mut crate::test_support::Rng| -> Vec<String> {
+            let mut some = Vec::new();
+            for group in groups {
+                if rng.below(4) == 0 {
+                    some.push(group.to_string());
+                }
+            }
+            some
+        };
+        let mut steps = 0;
+        let mut evictions = 0;
+        // A budget of about six entries, one of sixty, one
+        // that holds everything, and none.
+        for budget in [6_000, 60_000, 10_000_000, 0] {
+            for seed in 0..40 {
+                let mut rng = crate::test_support::Rng::new(seed);
+                let cache = Cache::new(budget);
+                let mut scan = scan::Cache::new(budget);
+                let mut written = 0;
+                for step in 0..600 {
+                    let key = rng.pick(&keys).clone();
+                    // A copy of its own render: no two alike.
+                    let mut copy = |len: usize, groups: Vec<String>| {
+                        written += 1;
+                        CachedImage {
+                            groups,
+                            written: Some(WriteStamp {
+                                at_ms: written,
+                                writer: seed,
+                            }),
+                            ..img(len)
+                        }
+                    };
+                    let before = scan.order();
+                    let what = match rng.below(100) {
+                        0..30 => {
+                            let len = [10, 300, 900, 2_500, 7_000][rng.below(5)];
+                            let image = copy(len, some_groups(&mut rng));
+                            assert_eq!(
+                                cache.put(key.clone(), image.clone()),
+                                scan.put(key.clone(), image)
+                            );
+                            "put"
+                        }
+                        30..60 => {
+                            assert_eq!(cache.get(&key), scan.get(&key));
+                            "get"
+                        }
+                        60..72 => {
+                            let len = [10, 300, 900][rng.below(3)];
+                            let image = copy(len, some_groups(&mut rng));
+                            assert_eq!(cache.promote(&key, &image), scan.promote(&key, &image));
+                            "promote"
+                        }
+                        72..82 => {
+                            let more = some_groups(&mut rng);
+                            assert_eq!(
+                                cache.merge_groups(&key, &more),
+                                scan.merge_groups(&key, &more)
+                            );
+                            "merge_groups"
+                        }
+                        82..87 => {
+                            assert_eq!(cache.remove(&key), scan.remove(&key));
+                            "remove"
+                        }
+                        87..91 => {
+                            let base = key.split('#').next().unwrap();
+                            assert_eq!(cache.purge_matching(base), scan.purge_matching(base));
+                            "purge_matching"
+                        }
+                        91..95 => {
+                            let group = *rng.pick(&groups);
+                            assert_eq!(cache.purge_group(group), scan.purge_group(group));
+                            "purge_group"
+                        }
+                        _ => {
+                            let source = *rng.pick(&sources);
+                            assert_eq!(cache.purge_source(source), scan.purge_source(source));
+                            "purge_source"
+                        }
+                    };
+                    let at = format!("budget {budget}, seed {seed}, step {step}: {what} {key}");
+                    let held = resident(&cache);
+                    let keys_in_order: Vec<String> =
+                        held.iter().map(|(key, ..)| key.clone()).collect();
+                    assert_eq!(keys_in_order, scan.order(), "{at}");
+                    for (key, image, cost) in &held {
+                        let entry = &scan.entries[key];
+                        assert_eq!((image, cost), (&entry.image, &entry.cost), "{at}");
+                    }
+                    assert_eq!(cache.charged_bytes(), scan.total_bytes, "{at}");
+                    assert!(cache.charged_bytes() <= budget, "{at}");
+                    // What a store made room by dropping.
+                    if matches!(what, "put" | "promote" | "merge_groups") {
+                        evictions += before
+                            .iter()
+                            .filter(|held| **held != key && !scan.entries.contains_key(*held))
+                            .count();
+                    }
+                    steps += 1;
+                }
+            }
+        }
+        assert_eq!(steps, 4 * 40 * 600);
+        assert!(evictions > 2_000, "{evictions} evictions");
     }
 }

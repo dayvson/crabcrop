@@ -80,6 +80,116 @@ pub fn ssimulacra2(reference: &DynamicImage, distorted: &DynamicImage) -> Option
     fast_ssim2::compute_ssimulacra2(&source, &distorted).ok()
 }
 
+/// One image as the reference of several SSIMULACRA2 scores
+/// (issue #664). The quality search scores up to four
+/// candidates against the same processed image, and the
+/// metric's work on the reference (linear light, XYB, the
+/// pyramid, and two of the five blurs at each scale) depends
+/// on the reference alone. It is done once, at the first
+/// candidate that can be scored, and every
+/// [`SsimReference::score`] after that pays for the
+/// candidate's side only. A reference that scores nothing
+/// prepares nothing.
+///
+/// The scores are those of [`ssimulacra2`], bit for bit, so a
+/// search takes the same steps and serves the same bytes
+/// either way: fast-ssim2 documents the prepared comparison
+/// as identical to the one-shot call, and
+/// `prepared_reference_scores_like_the_one_shot_call` holds
+/// the two together. The prepared planes take 48 bytes a
+/// pixel, held until the reference is dropped; one
+/// [`ssimulacra2`] call builds and frees the same planes.
+pub struct SsimReference<'a> {
+    image: &'a DynamicImage,
+    /// The metric's side of `image`, once a candidate has
+    /// asked for it; `None` inside when the metric refused
+    /// the image.
+    prepared: std::cell::OnceCell<Option<fast_ssim2::Ssimulacra2Reference>>,
+}
+
+impl<'a> SsimReference<'a> {
+    /// A reference over `image`. Nothing is prepared yet.
+    pub fn new(image: &'a DynamicImage) -> Self {
+        Self {
+            image,
+            prepared: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Score `distorted` against the reference: what
+    /// [`ssimulacra2`] returns for the pair, `None` under the
+    /// same conditions.
+    pub fn score(&self, distorted: &DynamicImage) -> Option<f64> {
+        let (w, h) = (self.image.width(), self.image.height());
+        if w != distorted.width() || h != distorted.height() {
+            return None;
+        }
+        if w == 0 || h == 0 || (w as u64 * h as u64) > fast_ssim2::MAX_IMAGE_PIXELS as u64 {
+            return None;
+        }
+        let prepared = self
+            .prepared
+            .get_or_init(|| {
+                #[cfg(test)]
+                counters::PREPARED.with(|count| count.set(count.get() + 1));
+                let reference = rgb8(self.image);
+                fast_ssim2::Ssimulacra2Reference::new(&srgb_slice(&reference)?).ok()
+            })
+            .as_ref()?;
+        let distorted = rgb8(distorted);
+        prepared.compare(&srgb_slice(&distorted)?).ok()
+    }
+}
+
+#[cfg(test)]
+impl Drop for SsimReference<'_> {
+    fn drop(&mut self) {
+        if self.prepared.get().is_some() {
+            counters::RELEASED.with(|count| count.set(count.get() + 1));
+        }
+    }
+}
+
+/// How many references the current thread has prepared and
+/// released, for the tests that hold a search to one
+/// reference that does not outlive its encode.
+#[cfg(test)]
+pub(crate) mod counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(crate) static PREPARED: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static RELEASED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// (prepared, released) on this thread so far.
+    pub(crate) fn snapshot() -> (usize, usize) {
+        (PREPARED.with(Cell::get), RELEASED.with(Cell::get))
+    }
+}
+
+/// `img` as 8-bit RGB: its own buffer when it has that layout,
+/// a converted copy otherwise.
+fn rgb8(img: &DynamicImage) -> std::borrow::Cow<'_, image::RgbImage> {
+    match img {
+        DynamicImage::ImageRgb8(rgb) => std::borrow::Cow::Borrowed(rgb),
+        other => std::borrow::Cow::Owned(other.to_rgb8()),
+    }
+}
+
+/// `rgb` as the metric reads it: packed 8-bit sRGB.
+fn srgb_slice(rgb: &image::RgbImage) -> Option<fast_ssim2::PixelSlice<'_>> {
+    let stride = rgb.width() as usize * 3;
+    fast_ssim2::PixelSlice::new(
+        &rgb.as_raw()[..stride * rgb.height() as usize],
+        rgb.width(),
+        rgb.height(),
+        stride,
+        fast_ssim2::PixelDescriptor::RGB8_SRGB,
+    )
+    .ok()
+}
+
 /// Encode toward a SSIMULACRA2 `target` by bisection on quality,
 /// starting from `first_guess`. `attempt` encodes at a quality
 /// and returns the bytes plus their measured score (`None` when
@@ -288,6 +398,98 @@ mod tests {
     #[test]
     fn mismatched_sizes_do_not_score() {
         assert!(ssimulacra2(&solid(10), &DynamicImage::new_rgb8(10, 10)).is_none());
+    }
+
+    #[test]
+    fn prepared_reference_scores_like_the_one_shot_call() {
+        // The search branches on the score, so a prepared
+        // reference must score every candidate exactly as the
+        // one-shot call does, bit for bit, and score nothing
+        // where it scores nothing.
+        let same = |image: &DynamicImage, candidates: &[DynamicImage]| {
+            let reference = SsimReference::new(image);
+            for candidate in candidates {
+                let one_shot = ssimulacra2(image, candidate);
+                let prepared = reference.score(candidate);
+                assert_eq!(
+                    one_shot.map(f64::to_bits),
+                    prepared.map(f64::to_bits),
+                    "{}x{} {:?} against {}x{} {:?}: {one_shot:?} and {prepared:?}",
+                    image.width(),
+                    image.height(),
+                    image.color(),
+                    candidate.width(),
+                    candidate.height(),
+                    candidate.color(),
+                );
+            }
+        };
+        // Sizes down to one pixel (the metric pads below 8),
+        // with candidates in the layouts a decoder returns.
+        for (w, h) in [(64, 64), (65, 33), (9, 9), (8, 8), (7, 5), (1, 1)] {
+            let image = noise().resize_exact(w, h, image::imageops::FilterType::Triangle);
+            let candidates = [
+                image.clone(),
+                image.blur(0.7),
+                image.blur(2.0),
+                image.brighten(9),
+                DynamicImage::ImageRgba8(image.blur(1.1).to_rgba8()),
+                DynamicImage::ImageLuma8(image.to_luma8()),
+                DynamicImage::ImageRgb16(image.blur(0.9).to_rgb16()),
+                // A size mismatch, then a candidate that scores
+                // again: the mismatch leaves the reference whole.
+                DynamicImage::new_rgb8(w + 1, h),
+                DynamicImage::new_rgb8(w, h + 1),
+                image.blur(1.5),
+            ];
+            let scored = candidates
+                .iter()
+                .filter(|candidate| ssimulacra2(&image, candidate).is_some())
+                .count();
+            assert_eq!(scored, candidates.len() - 2, "{w}x{h}");
+            same(&image, &candidates);
+        }
+        // References in other layouts than 8-bit RGB.
+        let rgb = noise();
+        let candidates = [rgb.blur(1.0), DynamicImage::ImageLuma8(rgb.to_luma8())];
+        for image in [
+            DynamicImage::ImageRgba8(rgb.to_rgba8()),
+            DynamicImage::ImageLuma8(rgb.to_luma8()),
+            DynamicImage::ImageRgb16(rgb.to_rgb16()),
+            DynamicImage::ImageRgb32F(rgb.to_rgb32f()),
+        ] {
+            assert!(ssimulacra2(&image, &candidates[0]).is_some());
+            same(&image, &candidates);
+        }
+        // An empty image scores nothing either way.
+        for (w, h) in [(0, 0), (0, 4), (4, 0)] {
+            let empty = DynamicImage::new_rgb8(w, h);
+            assert_eq!(ssimulacra2(&empty, &empty), None);
+            same(&empty, &[empty.clone(), noise()]);
+        }
+    }
+
+    #[test]
+    fn a_reference_prepares_at_its_first_score_and_once() {
+        let image = noise();
+        let (prepared, released) = counters::snapshot();
+        {
+            let reference = SsimReference::new(&image);
+            // A candidate of another size cannot be scored:
+            // nothing is prepared for it.
+            assert_eq!(reference.score(&DynamicImage::new_rgb8(3, 3)), None);
+            assert_eq!(counters::snapshot(), (prepared, released));
+            assert!(reference.score(&image.blur(1.0)).is_some());
+            assert!(reference.score(&image.blur(2.0)).is_some());
+            assert!(reference.score(&image).is_some());
+            assert_eq!(counters::snapshot(), (prepared + 1, released));
+        }
+        assert_eq!(counters::snapshot(), (prepared + 1, released + 1));
+        // A reference that scored nothing never prepared.
+        drop(SsimReference::new(&image));
+        let empty = DynamicImage::new_rgb8(0, 0);
+        assert_eq!(SsimReference::new(&empty).score(&empty), None);
+        assert_eq!(counters::snapshot(), (prepared + 1, released + 1));
     }
 
     /// Run the loop against a fake `score = f(quality)` encoder and

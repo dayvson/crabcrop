@@ -579,9 +579,25 @@ pub(crate) const MAX_ENTRY_BYTES: usize = 512 * 1024 * 1024;
 /// file, or a path that is not a regular file; all read as
 /// a corrupt entry upstream.
 fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
+    let (file, len) = open_regular(path)?;
+    read_open_capped(file, len, cap)
+}
+
+/// [`read_capped`]'s read of the open `file`, which was `len`
+/// bytes long when it was opened (issue #644). A file already
+/// past `cap` is refused unread. Otherwise the buffer is sized
+/// for the file once: grown from empty, it took a dozen reads
+/// and as many reallocations for a 20 KB entry. The read is
+/// still capped, so a file that grows past `cap` while it is
+/// read is refused as before, and a buffer that cannot be had
+/// is a refusal, as it was an error in the read.
+fn read_open_capped(mut file: std::fs::File, len: u64, cap: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut file = open_regular(path)?;
+    if len > cap as u64 {
+        return None;
+    }
     let mut data = Vec::new();
+    data.try_reserve_exact(len as usize).ok()?;
     file.by_ref()
         .take(cap.saturating_add(1) as u64)
         .read_to_end(&mut data)
@@ -605,8 +621,10 @@ fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
 /// of a regular file behave as they always did. The open
 /// does not follow a symlink either: the check would then
 /// see the target, and the boot scan skips symlinks.
+///
+/// Returns the file with the length that check read.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> Option<std::fs::File> {
+fn open_regular(path: &Path) -> Option<(std::fs::File, u64)> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
@@ -615,20 +633,25 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
     )
     .ok()?;
     let file = std::fs::File::from(fd);
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
         return None;
     }
     let flags = rustix::fs::fcntl_getfl(&file).ok()?;
     rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK).ok()?;
-    Some(file)
+    Some((file, meta.len()))
 }
 
 /// Elsewhere there are no FIFOs whose open waits; the type
 /// check still keeps reads to regular files.
 #[cfg(not(unix))]
-fn open_regular(path: &Path) -> Option<std::fs::File> {
+fn open_regular(path: &Path) -> Option<(std::fs::File, u64)> {
     let file = std::fs::File::open(path).ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some((file, meta.len()))
 }
 
 /// The temp file a `put` writes before renaming into place.
@@ -3586,6 +3609,100 @@ mod tests {
         assert_eq!(store.get("k"), None);
         assert!(!file.exists(), "the oversized file was cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_capped_read_takes_a_file_up_to_the_cap_and_no_further() {
+        // Issue #644: the read sizes its buffer from the
+        // file's length. A file within the cap is read whole,
+        // the cap's last byte included, and one past it is
+        // refused, as before.
+        let dir = temp_dir("read-cap");
+        let path = dir.join("entry.bin");
+        const CAP: usize = 20_000;
+        let bytes: Vec<u8> = (0..CAP + 1).map(|n| (n % 251) as u8).collect();
+        for len in [0, 1, 4_096, 8_192, CAP - 1, CAP] {
+            std::fs::write(&path, &bytes[..len]).unwrap();
+            assert_eq!(
+                read_capped(&path, CAP).as_deref(),
+                Some(&bytes[..len]),
+                "{len} bytes"
+            );
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_capped(&path, CAP), None, "a byte past the cap");
+        assert_eq!(read_capped(&path, CAP + 1), Some(bytes));
+        assert_eq!(read_capped(&dir.join("absent.bin"), CAP), None);
+    }
+
+    #[test]
+    fn a_capped_read_sizes_its_buffer_once() {
+        // Issue #644: a buffer that starts empty doubles its
+        // way up, a dozen reads and as many reallocations for
+        // a 20 KB entry, and ends up to twice the entry's
+        // size. Sized from the file's length it is filled as
+        // it stands.
+        let dir = temp_dir("read-sized");
+        let path = dir.join("entry.bin");
+        let bytes = vec![7u8; 20_000];
+        std::fs::write(&path, &bytes).unwrap();
+        let data = read_capped(&path, 1_000_000).unwrap();
+        assert_eq!(data, bytes);
+        assert!(
+            data.capacity() < bytes.len() + bytes.len() / 4,
+            "a {}-byte entry was read into a buffer of {}",
+            bytes.len(),
+            data.capacity()
+        );
+    }
+
+    #[test]
+    fn a_file_that_changes_under_a_capped_read_is_read_within_the_cap_or_refused() {
+        // Issue #644: the length is read when the file is
+        // opened, and the file can change before it is read.
+        // The read stays capped whatever that length said:
+        // a file that has grown past the cap since is refused,
+        // one that has grown within it or shrunk is read as
+        // it now stands (and fails its MAC upstream).
+        use std::io::Write;
+        let dir = temp_dir("read-grown");
+        let path = dir.join("entry.bin");
+        const CAP: usize = 10_000;
+        let append = |more: usize| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&vec![9u8; more]).unwrap();
+        };
+        // Grown past the cap.
+        std::fs::write(&path, vec![1u8; CAP - 100]).unwrap();
+        let (file, len) = open_regular(&path).unwrap();
+        assert_eq!(len, (CAP - 100) as u64);
+        append(101);
+        assert_eq!(read_open_capped(file, len, CAP), None);
+        // Grown, but within the cap.
+        std::fs::write(&path, vec![1u8; 4_000]).unwrap();
+        let (file, len) = open_regular(&path).unwrap();
+        append(5_000);
+        let data = read_open_capped(file, len, CAP).unwrap();
+        assert_eq!(data.len(), 9_000);
+        assert_eq!(data, std::fs::read(&path).unwrap());
+        // Shrunk.
+        std::fs::write(&path, vec![1u8; 4_000]).unwrap();
+        let (file, len) = open_regular(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1_000)
+            .unwrap();
+        assert_eq!(read_open_capped(file, len, CAP), Some(vec![1u8; 1_000]));
+        // A length past the cap is refused before any read,
+        // whatever the file now holds.
+        std::fs::write(&path, vec![1u8; 10]).unwrap();
+        let (file, _) = open_regular(&path).unwrap();
+        assert_eq!(read_open_capped(file, CAP as u64 + 1, CAP), None);
     }
 
     #[test]

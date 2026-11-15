@@ -5,6 +5,35 @@ use std::path::Path;
 mod scratch;
 pub(crate) use scratch::{ScratchDir, scratch_dir};
 
+/// A small deterministic generator (xorshift64*) for the
+/// tests that take random steps: a seed gives the same steps
+/// on every run, so a failure is named by its seed.
+pub(crate) struct Rng(u64);
+
+impl Rng {
+    pub(crate) fn new(seed: u64) -> Self {
+        // Spread the seed's bits; the state is never zero.
+        Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+
+    fn step(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A number below `n`.
+    pub(crate) fn below(&mut self, n: usize) -> usize {
+        (self.step() % n as u64) as usize
+    }
+
+    /// One of `of`.
+    pub(crate) fn pick<'a, T>(&mut self, of: &'a [T]) -> &'a T {
+        &of[self.below(of.len())]
+    }
+}
+
 /// Write `body` to `path` as an executable script, for the
 /// tests that stand a fake tool in for FFmpeg, pdftocairo
 /// or pdfinfo.
