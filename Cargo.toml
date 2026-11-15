@@ -70,7 +70,9 @@ jxl = "0.8"
 flate2 = "1"
 fdeflate = "0.3"
 kamadak-exif = "0.6"
-moxcms = "0.9"
+# `in_place` is the transform that rewrites a buffer where it
+# lies (issue #649): a feature of the crate, no new crate.
+moxcms = { version = "0.9", features = ["in_place"] }
 # Default features off: the crate's `deflate` feature would let a
 # crafted HEIC inflate embedded metadata toward a 1 GiB cap on
 # every decode (issue #184); `registry` is the decode path itself.
@@ -157,9 +159,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # a raw libc call. `fs` is for the disk tier's entry open
 # (issue #545), which must not wait on a FIFO at an entry
 # path, and for the tests that open such a FIFO's write end
-# without blocking. It adds no crate.
+# without blocking. `pipe` is for the capacity of the pipes
+# to the SVG and AVIF worker (issue #650). Neither adds a
+# crate.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process", "fs"] }
+rustix = { version = "1", features = ["process", "fs", "pipe"] }
 
 [dev-dependencies]
 # Property tests (issue #478): tests/proptest_url.rs and
