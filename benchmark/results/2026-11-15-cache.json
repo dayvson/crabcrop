@@ -1,0 +1,808 @@
+{
+  "meta": {
+    "about": "Raw runs of benchmark/bench_cache.py against crabcrop 0.13.0 (tag v0.13.0, commit 06af7c7e7656c6877d8e3c6b2d74e9ab1ff1ca61). Two complete runs are preserved.",
+    "runs_included": 2
+  },
+  "runs": [
+    {
+      "meta": {
+        "binary": "/home/hatch/workspace/spikes/bench-0130/repo/benchmark/.work/crabcrop-v0.13.0/target/release/crabcrop",
+        "origin_port": 8911
+      },
+      "churn": {
+        "distinct_urls": 1200,
+        "working_set_payload_bytes": 9782830,
+        "fill": {
+          "requests": 1200,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 9.2,
+            "p50_ms": 8.8,
+            "p95_ms": 11.4,
+            "min_ms": 7.8,
+            "max_ms": 26.4
+          }
+        },
+        "probe_first50_after_fill": {
+          "requests": 50,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 9.8,
+            "p50_ms": 9.4,
+            "p95_ms": 13.4,
+            "min_ms": 8.2,
+            "max_ms": 15.6
+          }
+        },
+        "probe_last50_after_fill": {
+          "requests": 50,
+          "hits": 50,
+          "hit_rate": 1.0,
+          "hit_latency": {
+            "mean_ms": 0.4,
+            "p50_ms": 0.3,
+            "p95_ms": 0.8,
+            "min_ms": 0.2,
+            "max_ms": 1.2
+          }
+        },
+        "rotation_sequential": [
+          {
+            "requests": 1200,
+            "hits": 50,
+            "hit_rate": 0.042,
+            "hit_latency": {
+              "mean_ms": 0.4,
+              "p50_ms": 0.3,
+              "p95_ms": 0.6,
+              "min_ms": 0.2,
+              "max_ms": 1.6
+            },
+            "miss_latency": {
+              "mean_ms": 9.2,
+              "p50_ms": 8.8,
+              "p95_ms": 11.3,
+              "min_ms": 7.5,
+              "max_ms": 34.2
+            }
+          },
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 14.0,
+              "p50_ms": 9.8,
+              "p95_ms": 39.3,
+              "min_ms": 7.9,
+              "max_ms": 85.3
+            }
+          },
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 13.7,
+              "p50_ms": 9.2,
+              "p95_ms": 40.2,
+              "min_ms": 7.8,
+              "max_ms": 102.6
+            }
+          }
+        ],
+        "rotation_8_workers": [
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 64.8,
+              "p50_ms": 81.0,
+              "p95_ms": 97.4,
+              "min_ms": 13.0,
+              "max_ms": 178.0
+            },
+            "req_per_s": 122.2
+          },
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 68.6,
+              "p50_ms": 83.8,
+              "p95_ms": 101.9,
+              "min_ms": 12.2,
+              "max_ms": 189.9
+            },
+            "req_per_s": 115.6
+          }
+        ],
+        "purge_50_keys": {
+          "latency": {
+            "mean_ms": 0.3,
+            "p50_ms": 0.3,
+            "p95_ms": 0.5,
+            "min_ms": 0.2,
+            "max_ms": 0.8
+          },
+          "removed_total": 50
+        },
+        "purged_keys_recheck": {
+          "requests": 50,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 15.9,
+            "p50_ms": 9.8,
+            "p95_ms": 41.3,
+            "min_ms": 8.3,
+            "max_ms": 57.4
+          }
+        },
+        "control_keys_recheck": {
+          "requests": 50,
+          "hits": 50,
+          "hit_rate": 1.0,
+          "hit_latency": {
+            "mean_ms": 0.2,
+            "p50_ms": 0.2,
+            "p95_ms": 0.4,
+            "min_ms": 0.2,
+            "max_ms": 0.5
+          }
+        },
+        "metrics_crosscheck": {
+          "crabcrop_cache_hits_total": 150,
+          "crabcrop_cache_misses_total": 7353
+        },
+        "cache_disabled_baseline": {
+          "requests": 1200,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 14.9,
+            "p50_ms": 9.8,
+            "p95_ms": 42.3,
+            "min_ms": 7.9,
+            "max_ms": 132.8
+          }
+        }
+      },
+      "memory": {
+        "small_no_groups": {
+          "entries": 3000,
+          "payload_bytes": 10723389,
+          "rss_idle_kib": 19072,
+          "rss_after_kib": 35264,
+          "rss_delta_kib": 16192,
+          "overhead_bytes_per_entry": 1952,
+          "fill_summary": {
+            "requests": 3000,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 9.5,
+              "p50_ms": 7.6,
+              "p95_ms": 32.1,
+              "min_ms": 6.5,
+              "max_ms": 69.7
+            }
+          }
+        },
+        "small_one_group": {
+          "entries": 3000,
+          "payload_bytes": 10456944,
+          "rss_idle_kib": 19228,
+          "rss_after_kib": 34744,
+          "rss_delta_kib": 15516,
+          "overhead_bytes_per_entry": 1810,
+          "fill_summary": {
+            "requests": 3000,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 8.5,
+              "p50_ms": 7.5,
+              "p95_ms": 16.4,
+              "min_ms": 6.4,
+              "max_ms": 95.7
+            }
+          }
+        },
+        "group_purge_3000": {
+          "latency_ms": 3.8,
+          "body": "purged 3000",
+          "rss_after_purge_kib": 34808
+        },
+        "large": {
+          "rss_idle_kib": 44424,
+          "batches": [
+            {
+              "entries": 100,
+              "payload_bytes": 3348412,
+              "rss_delta_kib": 3916,
+              "overhead_bytes_per_entry": 6616,
+              "fill_summary": {
+                "requests": 100,
+                "hits": 0,
+                "hit_rate": 0.0,
+                "miss_latency": {
+                  "mean_ms": 189.9,
+                  "p50_ms": 188.0,
+                  "p95_ms": 205.7,
+                  "min_ms": 180.0,
+                  "max_ms": 218.6
+                }
+              }
+            },
+            {
+              "entries": 100,
+              "payload_bytes": 3341894,
+              "rss_delta_kib": 3284,
+              "overhead_bytes_per_entry": 209,
+              "fill_summary": {
+                "requests": 100,
+                "hits": 0,
+                "hit_rate": 0.0,
+                "miss_latency": {
+                  "mean_ms": 190.8,
+                  "p50_ms": 188.5,
+                  "p95_ms": 214.6,
+                  "min_ms": 179.2,
+                  "max_ms": 234.0
+                }
+              }
+            }
+          ]
+        },
+        "budget_plateau_4mb": {
+          "budget_bytes": 4194304,
+          "payload_presented_bytes": 10723389,
+          "rss_idle_kib": 18316,
+          "rss_samples": [
+            {
+              "after_requests": 250,
+              "rss_kib": 20532
+            },
+            {
+              "after_requests": 500,
+              "rss_kib": 21264
+            },
+            {
+              "after_requests": 750,
+              "rss_kib": 22004
+            },
+            {
+              "after_requests": 1000,
+              "rss_kib": 23132
+            },
+            {
+              "after_requests": 1250,
+              "rss_kib": 23876
+            },
+            {
+              "after_requests": 1500,
+              "rss_kib": 24812
+            },
+            {
+              "after_requests": 1750,
+              "rss_kib": 26148
+            },
+            {
+              "after_requests": 2000,
+              "rss_kib": 26648
+            },
+            {
+              "after_requests": 2250,
+              "rss_kib": 27080
+            },
+            {
+              "after_requests": 2500,
+              "rss_kib": 27096
+            },
+            {
+              "after_requests": 2750,
+              "rss_kib": 28216
+            },
+            {
+              "after_requests": 3000,
+              "rss_kib": 28468
+            }
+          ],
+          "rss_samples_second_rotation": [
+            {
+              "after_requests": 250,
+              "rss_kib": 28800
+            },
+            {
+              "after_requests": 500,
+              "rss_kib": 28824
+            },
+            {
+              "after_requests": 750,
+              "rss_kib": 28944
+            },
+            {
+              "after_requests": 1000,
+              "rss_kib": 29288
+            },
+            {
+              "after_requests": 1250,
+              "rss_kib": 29288
+            },
+            {
+              "after_requests": 1500,
+              "rss_kib": 29496
+            },
+            {
+              "after_requests": 1750,
+              "rss_kib": 29500
+            },
+            {
+              "after_requests": 2000,
+              "rss_kib": 29508
+            },
+            {
+              "after_requests": 2250,
+              "rss_kib": 29704
+            },
+            {
+              "after_requests": 2500,
+              "rss_kib": 29792
+            },
+            {
+              "after_requests": 2750,
+              "rss_kib": 29828
+            },
+            {
+              "after_requests": 3000,
+              "rss_kib": 29992
+            }
+          ],
+          "rss_final_kib": 29992,
+          "first100_recheck": {
+            "requests": 100,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 7.1,
+              "p50_ms": 7.0,
+              "p95_ms": 8.4,
+              "min_ms": 6.5,
+              "max_ms": 10.0
+            }
+          },
+          "last100_recheck": {
+            "requests": 100,
+            "hits": 100,
+            "hit_rate": 1.0,
+            "hit_latency": {
+              "mean_ms": 0.2,
+              "p50_ms": 0.2,
+              "p95_ms": 0.3,
+              "min_ms": 0.1,
+              "max_ms": 0.4
+            }
+          }
+        },
+        "purge_tombstones": {
+          "purges": 4500,
+          "latency": {
+            "mean_ms": 0.3,
+            "p50_ms": 0.2,
+            "p95_ms": 0.6,
+            "min_ms": 0.2,
+            "max_ms": 3.6
+          },
+          "rss_idle_kib": 19572,
+          "rss_after_kib": 19636,
+          "rss_delta_kib": 64
+        }
+      }
+    },
+    {
+      "meta": {
+        "binary": "/home/hatch/workspace/spikes/bench-0130/repo/benchmark/.work/crabcrop-v0.13.0/target/release/crabcrop",
+        "origin_port": 8911
+      },
+      "churn": {
+        "distinct_urls": 1200,
+        "working_set_payload_bytes": 9782830,
+        "fill": {
+          "requests": 1200,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 9.0,
+            "p50_ms": 8.7,
+            "p95_ms": 10.5,
+            "min_ms": 7.8,
+            "max_ms": 25.2
+          }
+        },
+        "probe_first50_after_fill": {
+          "requests": 50,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 8.5,
+            "p50_ms": 8.4,
+            "p95_ms": 9.1,
+            "min_ms": 7.8,
+            "max_ms": 10.6
+          }
+        },
+        "probe_last50_after_fill": {
+          "requests": 50,
+          "hits": 50,
+          "hit_rate": 1.0,
+          "hit_latency": {
+            "mean_ms": 0.2,
+            "p50_ms": 0.2,
+            "p95_ms": 0.3,
+            "min_ms": 0.2,
+            "max_ms": 0.5
+          }
+        },
+        "rotation_sequential": [
+          {
+            "requests": 1200,
+            "hits": 50,
+            "hit_rate": 0.042,
+            "hit_latency": {
+              "mean_ms": 0.2,
+              "p50_ms": 0.2,
+              "p95_ms": 0.3,
+              "min_ms": 0.2,
+              "max_ms": 0.3
+            },
+            "miss_latency": {
+              "mean_ms": 9.1,
+              "p50_ms": 8.8,
+              "p95_ms": 11.3,
+              "min_ms": 7.8,
+              "max_ms": 25.3
+            }
+          },
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 8.9,
+              "p50_ms": 8.6,
+              "p95_ms": 10.5,
+              "min_ms": 7.8,
+              "max_ms": 24.9
+            }
+          },
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 9.0,
+              "p50_ms": 8.6,
+              "p95_ms": 10.8,
+              "min_ms": 7.7,
+              "max_ms": 36.8
+            }
+          }
+        ],
+        "rotation_8_workers": [
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 55.0,
+              "p50_ms": 74.3,
+              "p95_ms": 89.9,
+              "min_ms": 12.1,
+              "max_ms": 108.1
+            },
+            "req_per_s": 144.1
+          },
+          {
+            "requests": 1200,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 53.8,
+              "p50_ms": 73.8,
+              "p95_ms": 89.2,
+              "min_ms": 10.7,
+              "max_ms": 105.9
+            },
+            "req_per_s": 145.2
+          }
+        ],
+        "purge_50_keys": {
+          "latency": {
+            "mean_ms": 0.3,
+            "p50_ms": 0.3,
+            "p95_ms": 0.4,
+            "min_ms": 0.2,
+            "max_ms": 0.5
+          },
+          "removed_total": 50
+        },
+        "purged_keys_recheck": {
+          "requests": 50,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 10.1,
+            "p50_ms": 8.8,
+            "p95_ms": 11.9,
+            "min_ms": 8.2,
+            "max_ms": 58.7
+          }
+        },
+        "control_keys_recheck": {
+          "requests": 50,
+          "hits": 50,
+          "hit_rate": 1.0,
+          "hit_latency": {
+            "mean_ms": 0.3,
+            "p50_ms": 0.3,
+            "p95_ms": 0.4,
+            "min_ms": 0.2,
+            "max_ms": 0.7
+          }
+        },
+        "metrics_crosscheck": {
+          "crabcrop_cache_hits_total": 150,
+          "crabcrop_cache_misses_total": 7353
+        },
+        "cache_disabled_baseline": {
+          "requests": 1200,
+          "hits": 0,
+          "hit_rate": 0.0,
+          "miss_latency": {
+            "mean_ms": 9.0,
+            "p50_ms": 8.7,
+            "p95_ms": 10.4,
+            "min_ms": 7.8,
+            "max_ms": 29.6
+          }
+        }
+      },
+      "memory": {
+        "small_no_groups": {
+          "entries": 3000,
+          "payload_bytes": 10723389,
+          "rss_idle_kib": 18528,
+          "rss_after_kib": 34472,
+          "rss_delta_kib": 15944,
+          "overhead_bytes_per_entry": 1868,
+          "fill_summary": {
+            "requests": 3000,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 7.5,
+              "p50_ms": 7.1,
+              "p95_ms": 9.0,
+              "min_ms": 6.1,
+              "max_ms": 21.6
+            }
+          }
+        },
+        "small_one_group": {
+          "entries": 3000,
+          "payload_bytes": 10456944,
+          "rss_idle_kib": 17812,
+          "rss_after_kib": 31748,
+          "rss_delta_kib": 13936,
+          "overhead_bytes_per_entry": 1271,
+          "fill_summary": {
+            "requests": 3000,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 7.7,
+              "p50_ms": 7.3,
+              "p95_ms": 9.6,
+              "min_ms": 6.5,
+              "max_ms": 61.3
+            }
+          }
+        },
+        "group_purge_3000": {
+          "latency_ms": 4.6,
+          "body": "purged 3000",
+          "rss_after_purge_kib": 31800
+        },
+        "large": {
+          "rss_idle_kib": 43604,
+          "batches": [
+            {
+              "entries": 100,
+              "payload_bytes": 3348412,
+              "rss_delta_kib": 3776,
+              "overhead_bytes_per_entry": 5182,
+              "fill_summary": {
+                "requests": 100,
+                "hits": 0,
+                "hit_rate": 0.0,
+                "miss_latency": {
+                  "mean_ms": 197.5,
+                  "p50_ms": 197.5,
+                  "p95_ms": 211.7,
+                  "min_ms": 180.6,
+                  "max_ms": 239.8
+                }
+              }
+            },
+            {
+              "entries": 100,
+              "payload_bytes": 3341894,
+              "rss_delta_kib": 3032,
+              "overhead_bytes_per_entry": -2371,
+              "fill_summary": {
+                "requests": 100,
+                "hits": 0,
+                "hit_rate": 0.0,
+                "miss_latency": {
+                  "mean_ms": 192.1,
+                  "p50_ms": 188.3,
+                  "p95_ms": 224.1,
+                  "min_ms": 180.3,
+                  "max_ms": 259.7
+                }
+              }
+            }
+          ]
+        },
+        "budget_plateau_4mb": {
+          "budget_bytes": 4194304,
+          "payload_presented_bytes": 10723389,
+          "rss_idle_kib": 18144,
+          "rss_samples": [
+            {
+              "after_requests": 250,
+              "rss_kib": 20400
+            },
+            {
+              "after_requests": 500,
+              "rss_kib": 21108
+            },
+            {
+              "after_requests": 750,
+              "rss_kib": 21860
+            },
+            {
+              "after_requests": 1000,
+              "rss_kib": 22740
+            },
+            {
+              "after_requests": 1250,
+              "rss_kib": 24040
+            },
+            {
+              "after_requests": 1500,
+              "rss_kib": 26040
+            },
+            {
+              "after_requests": 1750,
+              "rss_kib": 26492
+            },
+            {
+              "after_requests": 2000,
+              "rss_kib": 26944
+            },
+            {
+              "after_requests": 2250,
+              "rss_kib": 27476
+            },
+            {
+              "after_requests": 2500,
+              "rss_kib": 27716
+            },
+            {
+              "after_requests": 2750,
+              "rss_kib": 28624
+            },
+            {
+              "after_requests": 3000,
+              "rss_kib": 29032
+            }
+          ],
+          "rss_samples_second_rotation": [
+            {
+              "after_requests": 250,
+              "rss_kib": 29048
+            },
+            {
+              "after_requests": 500,
+              "rss_kib": 29096
+            },
+            {
+              "after_requests": 750,
+              "rss_kib": 29116
+            },
+            {
+              "after_requests": 1000,
+              "rss_kib": 29124
+            },
+            {
+              "after_requests": 1250,
+              "rss_kib": 29132
+            },
+            {
+              "after_requests": 1500,
+              "rss_kib": 29212
+            },
+            {
+              "after_requests": 1750,
+              "rss_kib": 29284
+            },
+            {
+              "after_requests": 2000,
+              "rss_kib": 29288
+            },
+            {
+              "after_requests": 2250,
+              "rss_kib": 29360
+            },
+            {
+              "after_requests": 2500,
+              "rss_kib": 29464
+            },
+            {
+              "after_requests": 2750,
+              "rss_kib": 29580
+            },
+            {
+              "after_requests": 3000,
+              "rss_kib": 29724
+            }
+          ],
+          "rss_final_kib": 29724,
+          "first100_recheck": {
+            "requests": 100,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "miss_latency": {
+              "mean_ms": 7.5,
+              "p50_ms": 7.3,
+              "p95_ms": 8.9,
+              "min_ms": 6.6,
+              "max_ms": 13.3
+            }
+          },
+          "last100_recheck": {
+            "requests": 100,
+            "hits": 100,
+            "hit_rate": 1.0,
+            "hit_latency": {
+              "mean_ms": 0.2,
+              "p50_ms": 0.2,
+              "p95_ms": 0.4,
+              "min_ms": 0.2,
+              "max_ms": 0.5
+            }
+          }
+        },
+        "purge_tombstones": {
+          "purges": 4500,
+          "latency": {
+            "mean_ms": 0.3,
+            "p50_ms": 0.2,
+            "p95_ms": 0.5,
+            "min_ms": 0.2,
+            "max_ms": 10.7
+          },
+          "rss_idle_kib": 18576,
+          "rss_after_kib": 18596,
+          "rss_delta_kib": 20
+        }
+      }
+    }
+  ]
+}

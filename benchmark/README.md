@@ -3,7 +3,7 @@
 A reproducible comparison of three self-hosted image servers on the
 same host, the same origin, and the same operations:
 
-- crabcrop 0.9.9 (release build from the `v0.9.9` tag)
+- crabcrop 0.13.0 (release build from the `v0.13.0` tag)
 - Thumbor 7.8.0 (pip, venv)
 - imgproxy 3.31.4 (official source build, see the version notes)
 
@@ -30,7 +30,7 @@ and prepares `benchmark/.work/` with the three servers. It installs
 system packages with apt (libvips and build tools), installs a Go
 toolchain under `~/.local`, builds imgproxy from its release tag,
 creates the Thumbor venv, and builds crabcrop in release mode from
-the `v0.9.9` tag in a detached worktree.
+the `v0.13.0` tag in a detached worktree.
 
 `bench.py` then starts a local origin server for the fixtures,
 starts each service in turn, measures it alone, stops it, and
@@ -180,8 +180,8 @@ tier that the budget configures. Results are written up in
 
 ## Version notes
 
-- crabcrop 0.9.9, tag `v0.9.9`, commit
-  37761360c33a4c1b21004152a779963e396c0d13. Built with
+- crabcrop 0.13.0, tag `v0.13.0`, commit
+  06af7c7e7656c6877d8e3c6b2d74e9ab1ff1ca61. Built with
   `cargo build --release --locked` from the tag.
 - Thumbor 7.8.0, pip package `thumbor==7.8.0`, Python venv.
 - imgproxy 3.31.4, tag `v3.31.4`, commit
