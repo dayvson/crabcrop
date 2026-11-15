@@ -19,6 +19,10 @@ test, and propose changes.
 cargo build
 ```
 
+The build compiles the C libraries the tree vendors, so it needs a C compiler,
+cmake and make, and nasm on x86_64; see
+[Building from source](docs/deployment.md#building-from-source).
+
 AVIF source decoding is behind the `avif-decode` Cargo feature (off by default).
 Building with it needs dav1d 1.3 or newer reachable through pkg-config: a
 system libdav1d (`libdav1d-dev` on Debian and Ubuntu), or the static dav1d the

@@ -4525,8 +4525,7 @@ fn jpeg_segments(bytes: &[u8]) -> Vec<(u8, &[u8])> {
         if marker == 0xDA {
             // Entropy-coded data runs to the next marker
             // that is neither a stuffed zero nor a restart.
-            while !(bytes[i] == 0xFF && bytes[i + 1] != 0 && !(0xD0..=0xD7).contains(&bytes[i + 1]))
-            {
+            while bytes[i] != 0xFF || bytes[i + 1] == 0 || (0xD0..=0xD7).contains(&bytes[i + 1]) {
                 i += 1;
             }
         }
@@ -4791,7 +4790,7 @@ fn jpeg_round_trips_tiny_and_flat_images() {
                             jpeg_decodes(&bytes, width, height).iter().enumerate()
                         {
                             for (i, pixel) in pixels.chunks_exact(3).enumerate() {
-                                let off = (0..3).map(|c| pixel[c].abs_diff(color[c])).max();
+                                let off = pixel.iter().zip(color).map(|(a, b)| a.abs_diff(b)).max();
                                 assert!(
                                     off <= Some(tolerance),
                                     "{width}x{height} of {color:?}, {case}: decoder {decoder} \
@@ -4965,7 +4964,7 @@ fn jpeg_bytes_are_the_same_with_and_without_vector_code() {
 }
 
 #[test]
-fn jpeg_refuses_a_side_past_what_the_format_and_libjpeg_take() {
+fn jpeg_refuses_the_sizes_the_format_and_libjpeg_do_not_take() {
     let encode_sized = |width: u32, height: u32| {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             width,
@@ -5013,6 +5012,12 @@ fn jpeg_refuses_a_side_past_what_the_format_and_libjpeg_take() {
             refusal(width, height),
             "jpeg: dimension exceeds the 65535 format limit"
         );
+    }
+    // A frame with no pixels is refused as well, not
+    // written as an empty file.
+    for (width, height) in [(0, 4), (4, 0)] {
+        let message = refusal(width, height);
+        assert!(message.starts_with("jpeg: "), "{width}x{height}: {message}");
     }
 }
 

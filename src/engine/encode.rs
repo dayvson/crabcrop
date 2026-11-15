@@ -764,5 +764,13 @@ fn encode_jpeg(
         height,
         format: turbojpeg::PixelFormat::RGB,
     };
+    // The library grows its own output buffer, from 4 KiB by
+    // doubling, and the file is copied out of it at the end:
+    // for a moment the encoder holds the file twice, and
+    // never a buffer sized for the worst case, which the
+    // library puts at 3 to 6 bytes a pixel, as much as the
+    // frame or twice it. Handing in a buffer to start from
+    // would skip the first doublings, but libjpeg-turbo
+    // 3.1.0 leaks such a buffer once the file outgrows it.
     compressor.compress_to_vec(image).map_err(failed)
 }
