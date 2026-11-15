@@ -111,6 +111,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 # ICO; AVIF through the avif-decode feature) plus the AVIF
 # encoder (avif, nasm) and its threading (rayon).
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "nasm", "png", "rayon", "tiff", "webp"] }
+# The AVIF encoder the image crate wraps, named here at the
+# version the image crate brings into the tree (issue #663):
+# opaque 8-bit RGB goes to it directly, with the color
+# conversion done in the engine (engine/encode.rs). Default
+# features off: the image crate's `nasm` and `rayon` features
+# switch on its assembly and its threading, as before. It
+# adds no crate.
+ravif = { version = "0.13", default-features = false }
 # Direct decoder bindings for the two hottest source formats
 # (perf wave 3): zune-jpeg is the same decoder the image crate
 # wraps for JPEG (already in the tree transitively); calling it
