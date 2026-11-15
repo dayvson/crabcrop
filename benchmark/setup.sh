@@ -41,7 +41,8 @@ echo "== 1/5 system packages (libvips ${LIBVIPS_APT_VERSION}, build tools) =="
 # the libvips development package for 8.15.x the same way.
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  libvips-dev libdav1d-dev pkg-config gcc git curl python3 python3-venv nasm
+  libvips-dev libdav1d-dev pkg-config gcc git curl python3 python3-venv nasm \
+  cmake make
 pkg-config --modversion vips
 
 echo "== 2/5 Go ${GO_VERSION} =="

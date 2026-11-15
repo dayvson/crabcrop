@@ -225,8 +225,13 @@ prefix-only, truncated, keyed, wrong-version, bad base64, and
 non-sealed segments. `corpus/decode/` and
 `corpus/source_meta/` seed real bodies from the functional
 corpus and the fixtures (small images per format, an SVG,
-EXIF and ICC carriers, and truncated prefixes of the
-animated formats); `corpus/decode/` also seeds shapes
+EXIF and ICC carriers, truncated prefixes of the
+animated formats, and three whole animated WebP files of a
+few hundred bytes, so the frame walk of issue #646 is
+reached from its first input: one-pixel frames on a 3x3
+canvas, blended frames with alpha on part of the canvas,
+and lossy and lossless frames side by side);
+`corpus/decode/` also seeds shapes
 the server refuses: an OpenEXR file, whose
 decoder is not compiled in, and an AV1 still under a
 generic HEIF brand, which the HEIC path refuses before

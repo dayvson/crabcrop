@@ -682,7 +682,17 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// thumbnail or another part preserve now removes, or a
 /// size tag, now copied without those parts and with the
 /// output's size #611).
-const RENDERING_VERSION: u32 = 6;
+///
+/// 7: the first release after 0.12.0, which changes output
+/// for existing URLs (JPEG output written by libjpeg-turbo
+/// instead of the jpeg-encoder crate, so every JPEG's
+/// bytes change: at the same quality the quantization
+/// tables are the same, chroma is averaged where it is
+/// subsampled instead of one sample kept and the rest
+/// dropped, progressive files carry Huffman tables built
+/// from the image, and `quality(auto)` settles on a lower
+/// quality and a smaller file for the same target #668).
+const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the

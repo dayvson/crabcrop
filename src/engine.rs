@@ -1989,6 +1989,12 @@ impl Engine {
             )
         };
         let mut encode_budget = MAX_REQUEST_ENCODES;
+        // Every candidate of a verified search is scored
+        // against this image: the metric's work on it is done
+        // once, at the first score, and dropped with this call
+        // (issue #664). An encode that scores nothing prepares
+        // nothing.
+        let reference = crate::quality::SsimReference::new(img);
         let mut bytes = if let Some(first_guess) = perceptual {
             let scored = crate::quality::encode_to_target(
                 first_guess,
@@ -2003,7 +2009,7 @@ impl Engine {
                     let candidate = encode_at(Some(q))?;
                     let score = decode_image(&candidate)
                         .ok()
-                        .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
+                        .and_then(|decoded| reference.score(&decoded));
                     Ok::<_, EngineError>((candidate, score))
                 },
             )?;
@@ -2059,7 +2065,7 @@ impl Engine {
             // served: re-score the final encode once.
             ssim = decode_image(&bytes)
                 .ok()
-                .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
+                .and_then(|decoded| reference.score(&decoded));
         }
         Ok(StillEncode {
             bytes,
@@ -2216,7 +2222,7 @@ impl Engine {
                 pixels: frame.into_buffer(),
             })
             .collect();
-        let bytes = encoder.encode(&out_frames, format).map_err(|e| match e {
+        let bytes = encoder.encode(out_frames, format).map_err(|e| match e {
             crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
             crate::video::VideoError::Failed(what) => EngineError::Video(what),
         })?;
@@ -2605,30 +2611,87 @@ impl From<AnimatedFormat> for ImageFormat {
 }
 
 /// Decode all frames of an animated WebP source, under the
-/// same limits as GIF. The in-tree decoder (image-webp)
-/// composites every frame onto the full canvas, honoring
-/// sub-rectangle frames and the blending flag; disposal of
-/// a frame to the background color is honored only when the
-/// file's ANIM background color has been set on the decoder
-/// first (the decoder otherwise leaves the disposed rectangle
-/// in place), so the color is read from the container and set
-/// before iterating.
+/// same limits as GIF. Every frame comes back composited onto
+/// the full canvas the way the image crate's decoder
+/// (image-webp) composites it, honoring sub-rectangle frames
+/// and the blending flag; disposal of a frame to the
+/// background color is honored only when the file's ANIM
+/// background color has been set on that decoder first (it
+/// otherwise leaves the disposed rectangle in place), so the
+/// color is read from the container and set before any frame
+/// decodes (see [`open_webp_animation`]).
+///
+/// The frames' bitstreams go through libwebp, which decodes
+/// them to the same pixels about twice as fast (issue #646,
+/// see [`webp_anim`]). The image crate's iterator still takes,
+/// from the start, any file that walk does not handle, so an
+/// unusual or broken file gets the frames or the error it
+/// always got.
 fn decode_webp_frames(
     bytes: &[u8],
     deadline: Option<std::time::Instant>,
 ) -> Result<Frames, EngineError> {
-    use image::{AnimationDecoder, ImageDecoder};
+    use image::AnimationDecoder;
+    let (decoder, background) = open_webp_animation(bytes)?;
+    if let Some(frames) = webp_frames_through_libwebp(bytes, background, deadline) {
+        return frames;
+    }
+    collect_frames(decoder.into_frames(), "WebP", deadline)
+}
+
+/// An animated WebP the image crate's decoder has opened, and
+/// the ANIM background color set on that decoder, if any.
+type OpenedWebp<'a> = (
+    image::codecs::webp::WebPDecoder<Cursor<&'a [u8]>>,
+    Option<[u8; 4]>,
+);
+
+/// Open an animated WebP with the image crate's decoder: the
+/// container checks and their errors, the decode limits, and
+/// the ANIM background color. Returns the decoder and the
+/// color it took, if any.
+fn open_webp_animation(bytes: &[u8]) -> Result<OpenedWebp<'_>, EngineError> {
+    use image::ImageDecoder;
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
     decoder
         .set_limits(decode_limits())
         .map_err(|e| EngineError::Decode(e.to_string()))?;
-    if let Some((_, background)) = webp_animation_params(bytes) {
+    let mut background = None;
+    if let Some((_, color)) = webp_animation_params(bytes) {
         // Losing the fill on a decoder refusal only costs the
         // disposal behavior; the frames still decode.
-        let _ = decoder.set_background_color(image::Rgba(background));
+        if decoder.set_background_color(image::Rgba(color)).is_ok() {
+            background = Some(color);
+        }
     }
-    collect_frames(decoder.into_frames(), "WebP", deadline)
+    Ok((decoder, background))
+}
+
+/// The frames of an animated WebP that [`open_webp_animation`]
+/// has opened, each bitstream decoded by libwebp and composited
+/// by [`webp_anim`], under the limits and the deadline
+/// [`collect_frames`] holds every animation to. `None` when the
+/// walk met something it does not handle, at any frame: the
+/// frames it had are dropped and the image crate's iterator
+/// decides.
+fn webp_frames_through_libwebp(
+    bytes: &[u8],
+    background: Option<[u8; 4]>,
+    deadline: Option<std::time::Instant>,
+) -> Option<Result<Frames, EngineError>> {
+    let mut animation = webp_anim::Animation::open(bytes, background)?;
+    let mut unsupported = false;
+    let frames = std::iter::from_fn(|| match animation.next_frame() {
+        Ok(frame) => Some(Ok(frame)),
+        Err(webp_anim::Stop::Done) => None,
+        Err(webp_anim::Stop::Unsupported) => {
+            unsupported = true;
+            None
+        }
+    });
+    let collected = collect_frames(frames, "WebP", deadline);
+    (!unsupported).then_some(collected)
 }
 
 /// Encode frames as an animated WebP through libwebp's
@@ -4956,8 +5019,8 @@ pub(crate) fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicI
         3 => crate::filters::rotate180_fast(&img),
         4 => crate::filters::flipv_fast(&img),
         // Transpose and anti-transpose: a rotation plus a mirror.
-        5 => crate::filters::fliph_fast(&img.rotate90()),
-        6 => img.rotate90(),
+        5 => crate::filters::fliph_fast(&crate::filters::rotate90_fast(&img)),
+        6 => crate::filters::rotate90_fast(&img),
         7 => crate::filters::fliph_fast(&crate::filters::rotate270_fast(&img)),
         8 => crate::filters::rotate270_fast(&img),
         _ => img,
@@ -5134,6 +5197,7 @@ fn is_video_container(bytes: &[u8]) -> bool {
 }
 
 mod encode;
+mod webp_anim;
 /// Names the test module uses from encode: re-exported
 /// only for test builds, where they are used.
 #[cfg(test)]
