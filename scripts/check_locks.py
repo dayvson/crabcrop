@@ -56,6 +56,10 @@ DECODERS = {
     "weezl": "LZW for GIF and TIFF",
     "zune-jpeg": "JPEG",
     "zune-core": "JPEG",
+    # libjpeg-turbo writes JPEG output (issue #668) and decodes a JPEG
+    # source at reduced scale (issue #653), in the server process.
+    "turbojpeg": "JPEG at reduced scale, through libjpeg-turbo",
+    "turbojpeg-sys": "JPEG at reduced scale, through libjpeg-turbo",
     "image-webp": "WebP",
     "webp": "WebP, through libwebp",
     "libwebp-sys": "WebP, through libwebp",
