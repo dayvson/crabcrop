@@ -8449,6 +8449,44 @@ async fn meta_reports_the_verified_score_for_auto_quality() {
 }
 
 #[tokio::test]
+async fn auto_quality_past_the_verified_size_reports_the_pick_and_no_score() {
+    // An output one pixel past the largest whose
+    // `quality(auto)` pick is verified: the image is served
+    // at the pick, which the header reports as it does for a
+    // format with no search, and meta reports no score.
+    let (width, height) = (1985u32, 2113u32);
+    assert_eq!(
+        u64::from(width) * u64::from(height),
+        crate::quality::MAX_VERIFIED_PIXELS + 1
+    );
+    let mut png = Vec::new();
+    DynamicImage::new_rgb8(width, height)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let src = spawn_bytes_server(png).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:quality(auto):format(jpeg)/{src}");
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The source is flat, so the pick is the lowest.
+    assert_eq!(resp.headers().get("x-crabcrop-quality").unwrap(), "50");
+    let out = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!((out.width(), out.height()), (width, height));
+    let resp = client()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(meta["format"], "jpeg", "{meta}");
+    assert_eq!(meta["width"].as_u64(), Some(u64::from(width)), "{meta}");
+    assert!(meta.get("ssimulacra2").is_none(), "{meta}");
+}
+
+#[tokio::test]
 async fn serves_watermarked_image() {
     let src = spawn_image_server().await;
     let wm = spawn_watermark_server().await;

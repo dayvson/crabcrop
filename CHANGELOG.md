@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+
+- `quality(auto)` now verifies its pick for JPEG and JPEG XL outputs of up to 4 megapixels (4,194,304 pixels, a 2048x2048 image), as before, and encodes a larger output once at the first pick, as it does for AVIF and WebP output. For such an output `X-Crabcrop-Quality` reports that quality and meta reports no `ssimulacra2` score. The first pick can differ from the quality the search settles on: for a 4000x2667 photograph it is 56 where the search settled on 76. Its bytes change, which the cache epoch above covers. A `max_bytes` budget is pursued from the first pick in the same way.
+
 ## [0.12.0] - 2026-11-13
 
 ### Added
