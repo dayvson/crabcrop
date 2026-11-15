@@ -6,6 +6,7 @@ use image::imageops::FilterType;
 use ort::session::Session;
 use std::sync::Mutex;
 
+use super::resample;
 use super::session::{ModelOutput, build_session, collect_outputs};
 use super::{AiError, TagProvider, TagScore};
 
@@ -318,12 +319,7 @@ const CLIP_STATS: ChannelStats = (
 /// center crop 224x224, normalize with the model's own
 /// statistics. Output is planar CHW.
 pub(super) fn crop224_preprocess(img: &DynamicImage, (means, stds): ChannelStats) -> Vec<f32> {
-    let (w, h) = (img.width(), img.height());
-    let (nw, nh) = crop224_resize_dims(w, h);
-    let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
-    let cropped = resized
-        .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
-        .to_rgb8();
+    let cropped = crop224(img);
     let plane = 224 * 224;
     let mut out = vec![0f32; 3 * plane];
     for (i, px) in cropped.pixels().enumerate() {
@@ -332,6 +328,42 @@ pub(super) fn crop224_preprocess(img: &DynamicImage, (means, stds): ChannelStats
         }
     }
     out
+}
+
+/// The center 224x224 of the frame after the bicubic resize
+/// to [`crop224_resize_dims`], as RGB8. Only that window of
+/// the resized frame is ever read, so for RGB8 and RGBA8
+/// frames only that window is resampled, with the image
+/// crate's arithmetic (issue #673, see [`resample`]): the
+/// crate resized the whole frame, 32 ms of a 2400x1600 one,
+/// to drop all of it but the crop. The long side's cap is
+/// in the dimensions the window is taken from. Every other
+/// layout takes the crate's path.
+fn crop224(img: &DynamicImage) -> image::RgbImage {
+    let (nw, nh) = crop224_resize_dims(img.width(), img.height());
+    let window = ((nw - 224) / 2, (nh - 224) / 2, 224, 224);
+    let kernel = resample::Kernel::CatmullRom;
+    let fast = match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            resample::resize_window::<3>(rgb.as_raw(), rgb.dimensions(), (nw, nh), kernel, window)
+        }
+        // The crate resamples the four channels alike, and
+        // the conversion to RGB drops the fourth.
+        DynamicImage::ImageRgba8(rgba) => {
+            resample::resize_window::<4>(rgba.as_raw(), rgba.dimensions(), (nw, nh), kernel, window)
+                .map(|wide| {
+                    let (pixels, _) = wide.as_chunks::<4>();
+                    pixels.iter().flat_map(|px| [px[0], px[1], px[2]]).collect()
+                })
+        }
+        _ => None,
+    };
+    fast.and_then(|raw| image::RgbImage::from_raw(224, 224, raw))
+        .unwrap_or_else(|| {
+            img.resize_exact(nw, nh, FilterType::CatmullRom)
+                .crop_imm(window.0, window.1, 224, 224)
+                .to_rgb8()
+        })
 }
 
 #[cfg(test)]

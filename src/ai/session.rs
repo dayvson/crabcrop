@@ -127,17 +127,19 @@ impl FirPixel for Luma<u8> {
 /// functional corpus and confirmed visually; the issue
 /// carries the bounds. Falls back to the Triangle path if
 /// the SIMD resizer rejects the geometry. One body serves
-/// RGB model inputs and grayscale mask fields.
+/// RGB model inputs and grayscale mask fields. The resizer
+/// only reads its source, so it borrows the pixels (issue
+/// #672): a copy of a 2400x1600 frame is 11.5 MB in front
+/// of a model that answers in 5 ms.
 pub(super) fn fir_resize<P: FirPixel>(
     img: &ImageBuffer<P, Vec<u8>>,
     w: u32,
     h: u32,
 ) -> ImageBuffer<P, Vec<u8>> {
-    use fast_image_resize::images::Image as FirImage;
+    use fast_image_resize::images::{Image as FirImage, ImageRef as FirImageRef};
     use fast_image_resize::{ResizeAlg, ResizeOptions, Resizer};
     let fallback = || image::imageops::resize(img, w, h, FilterType::Triangle);
-    let Ok(src) = FirImage::from_vec_u8(img.width(), img.height(), img.as_raw().clone(), P::LAYOUT)
-    else {
+    let Ok(src) = FirImageRef::new(img.width(), img.height(), img.as_raw(), P::LAYOUT) else {
         return fallback();
     };
     let mut dst = FirImage::new(w, h, P::LAYOUT);
@@ -147,6 +149,18 @@ pub(super) fn fir_resize<P: FirPixel>(
     match Resizer::new().resize(&src, &mut dst, &opts) {
         Ok(()) => ImageBuffer::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback),
         Err(_) => fallback(),
+    }
+}
+
+/// The frame's RGB8 pixels for a model's preprocessing:
+/// borrowed when the frame already is RGB8, as every decoded
+/// JPEG is, and converted otherwise. `to_rgb8` copies the
+/// whole frame even when there is nothing to convert (issue
+/// #672).
+pub(super) fn rgb8_view(img: &image::DynamicImage) -> std::borrow::Cow<'_, image::RgbImage> {
+    match img.as_rgb8() {
+        Some(rgb) => std::borrow::Cow::Borrowed(rgb),
+        None => std::borrow::Cow::Owned(img.to_rgb8()),
     }
 }
 
@@ -169,7 +183,8 @@ pub(super) fn collect_outputs(
 }
 
 /// A session's first output, owned: the single-output models
-/// (upscale, inpainting) read their result from it.
+/// (upscale, inpainting) and the detector read their result
+/// from it.
 pub(super) fn first_output(
     outputs: ort::session::SessionOutputs<'_>,
 ) -> Result<ort::value::DynValue, AiError> {

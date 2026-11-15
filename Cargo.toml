@@ -100,6 +100,10 @@ roxmltree = "0.21"
 # references usvg's cascade resolves. Keep it on usvg's line.
 simplecss = "0.2"
 sha2 = "0.11"
+# The detection memo's keyed digest (issue #677): SipHash-2-4
+# with a 128-bit output, the same cost on every CPU. Already
+# in the tree through usvg and svgtypes: it adds no crate.
+siphasher = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Default features off (issue #466): the defaults compile
