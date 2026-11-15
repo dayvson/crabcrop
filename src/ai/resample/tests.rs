@@ -17,20 +17,20 @@ fn noise(len: usize, seed: u32) -> Vec<u8> {
 
 fn crate_filter(kernel: Kernel) -> FilterType {
     match kernel {
+        Kernel::Triangle => FilterType::Triangle,
         Kernel::CatmullRom => FilterType::CatmullRom,
     }
 }
 
-const KERNELS: [Kernel; 1] = [Kernel::CatmullRom];
+const KERNELS: [Kernel; 2] = [Kernel::Triangle, Kernel::CatmullRom];
 
-/// The whole output as one window.
-fn resize<const CH: usize>(
-    src: &[u8],
-    src_dims: (u32, u32),
-    (dw, dh): (u32, u32),
-    kernel: Kernel,
-) -> Option<Vec<u8>> {
-    resize_window::<CH>(src, src_dims, (dw, dh), kernel, (0, 0, dw, dh))
+/// Whether a case runs with `kernel`. The two kernels differ
+/// in their weights and nothing else, so the largest frames,
+/// which are most of the suite's time in a debug build, run
+/// with the kernel whose caller reaches them: the 224-crop's
+/// CatmullRom.
+fn in_scope(kernel: Kernel, (sw, sh): (u32, u32), (dw, dh): (u32, u32)) -> bool {
+    kernel == Kernel::CatmullRom || (sw * sh).max(dw * dh) <= 100_000
 }
 
 /// Source and target sizes: one pixel either way, upscales,
@@ -64,6 +64,9 @@ fn resize_matches_the_image_crate_byte_for_byte() {
     // back `None`: none does.
     for kernel in KERNELS {
         for ((sw, sh), (dw, dh)) in SIZES {
+            if !in_scope(kernel, (sw, sh), (dw, dh)) {
+                continue;
+            }
             let filter = crate_filter(kernel);
             let rgb = noise((sw * sh * 3) as usize, sw * 31 + sh);
             let img = image::RgbImage::from_raw(sw, sh, rgb.clone()).unwrap();
@@ -108,6 +111,9 @@ fn a_window_is_the_crop_of_the_full_resize() {
     ];
     for kernel in KERNELS {
         for ((sw, sh), (dw, dh), window) in cases {
+            if !in_scope(kernel, (sw, sh), (dw, dh)) {
+                continue;
+            }
             let (wx, wy, ww, wh) = window;
             let rgb = noise((sw * sh * 3) as usize, sw + sh);
             let img = image::RgbImage::from_raw(sw, sh, rgb.clone()).unwrap();
@@ -133,6 +139,33 @@ fn a_window_is_the_crop_of_the_full_resize() {
                 ),
                 "RGBA {sw}x{sh} to {dw}x{dh}, window {window:?}, {kernel:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn sums_on_a_half_round_as_the_crate_rounds_them() {
+    // Doubling two samples two apart: with the Triangle
+    // kernel the second output is three quarters of one and
+    // a quarter of the other, a half exactly, where the two
+    // ways of rounding could part. Up from a low sample and
+    // down from a high one.
+    for low in [0u8, 1, 126, 127, 252, 253] {
+        for gray in [[low, low + 2], [low + 2, low]] {
+            let img = image::GrayImage::from_raw(2, 1, gray.to_vec()).unwrap();
+            for kernel in KERNELS {
+                let want = image::imageops::resize(&img, 4, 1, crate_filter(kernel)).into_raw();
+                assert_eq!(
+                    resize::<1>(&gray, (2, 1), (4, 1), kernel),
+                    Some(want.clone()),
+                    "{gray:?} with {kernel:?}"
+                );
+                if kernel == Kernel::Triangle {
+                    // The half goes away from zero.
+                    let half = gray[0].min(gray[1]) + 1;
+                    assert!(want[1] == half || want[2] == half, "{want:?}");
+                }
+            }
         }
     }
 }

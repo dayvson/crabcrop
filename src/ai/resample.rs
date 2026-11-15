@@ -3,14 +3,15 @@
 //!
 //! A few frames are still resampled with the image crate's
 //! own resize: the 224-crop of the CLIP and ViT preprocessing
-//! is one. What they produce feeds a model, so the kernel
-//! cannot change without changing the model's input. The
-//! crate reads one pixel at a time through `get_pixel`,
-//! column by column, into a four-channel float image. This
-//! module does the same arithmetic on rows: the same weights
-//! from the same expressions, the same accumulation order
-//! for every sample, the same clamp and rounding. The tests
-//! compare it with the crate.
+//! and the studio composite's subject (issue #674). What they
+//! produce feeds a model or is the response, so the kernel
+//! cannot change without changing bytes. The crate reads one
+//! pixel at a time through `get_pixel`, column by column,
+//! into a four-channel float image. This module does the
+//! same arithmetic on rows: the same weights from the same
+//! expressions, the same accumulation order for every
+//! sample, the same clamp and rounding. The tests compare it
+//! with the crate.
 //!
 //! It can compute a window of the output alone, for a
 //! caller that crops right after it resizes.
@@ -18,6 +19,7 @@
 /// The sampling filters the callers use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kernel {
+    Triangle,
     CatmullRom,
 }
 
@@ -25,6 +27,7 @@ impl Kernel {
     /// The filter's support, as the crate's `resize` sets it.
     fn support(self) -> f32 {
         match self {
+            Kernel::Triangle => 1.0,
             Kernel::CatmullRom => 2.0,
         }
     }
@@ -32,6 +35,13 @@ impl Kernel {
     /// The crate's kernel function, verbatim.
     fn weight(self, x: f32) -> f32 {
         match self {
+            Kernel::Triangle => {
+                if x.abs() < 1.0 {
+                    1.0 - x.abs()
+                } else {
+                    0.0
+                }
+            }
             Kernel::CatmullRom => {
                 let (b, c) = (0.0f32, 0.5f32);
                 let a = x.abs();
@@ -218,6 +228,18 @@ pub(crate) fn resize_window<const CH: usize>(
         }
     }
     Some(out)
+}
+
+/// `image::imageops::resize(src, dw, dh, kernel)` for an
+/// 8-bit buffer of `CH` interleaved channels: every byte of
+/// the output. `None` as [`resize_window`] answers it.
+pub(crate) fn resize<const CH: usize>(
+    src: &[u8],
+    src_dims: (u32, u32),
+    (dw, dh): (u32, u32),
+    kernel: Kernel,
+) -> Option<Vec<u8>> {
+    resize_window::<CH>(src, src_dims, (dw, dh), kernel, (0, 0, dw, dh))
 }
 
 #[cfg(test)]
