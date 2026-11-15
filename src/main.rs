@@ -702,13 +702,16 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// a conversion to sRGB that moved some of them by one
 /// level of rounding, so a render of such a source can
 /// differ from the release before by that level, carried
-/// through its operations and its encoder #662; and
+/// through its operations and its encoder #662;
 /// JPEG XL output written by jixel 0.5.7 where 0.5.5
 /// wrote it: the small frames with an alpha channel that
 /// 0.5.5 failed on are encoded, a few other small frames
 /// with alpha get other bytes at the default speed tier,
 /// and every JPEG XL output does at
-/// `CRABCROP_JXL_SPEED=fast` and slower #670).
+/// `CRABCROP_JXL_SPEED=fast` and slower #670; and
+/// `quality(auto)` JPEG and JPEG XL output too large for
+/// its pick to be verified, now encoded once at the first
+/// pick instead of at the quality the search ended on).
 const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered

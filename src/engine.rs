@@ -1946,7 +1946,9 @@ impl Engine {
         // against (JPEG, JXL) closes the loop: encode, decode,
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
-        // the first guess. Other formats keep the one-shot pick.
+        // the first guess. Other formats keep the one-shot pick,
+        // and so does an output too large to verify (see
+        // `encode_still_within`).
         let perceptual = encode_quality.filter(|_| {
             matches!(resolved_quality, Some(ResolvedQuality::Auto))
                 && matches!(format, StillFormat::Jpeg | StillFormat::Jxl)
@@ -1968,11 +1970,52 @@ impl Engine {
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> Result<StillEncode, EngineError> {
+        // Every candidate of a verified search is scored
+        // against this image: the metric's work on it is done
+        // once, at the first score, and dropped with this call
+        // (issue #664). An encode that scores nothing prepares
+        // nothing.
+        let reference = crate::quality::SsimReference::new(img);
+        Self::encode_still_within(
+            img,
+            format,
+            encode_opts,
+            ctx,
+            crate::quality::MAX_VERIFIED_PIXELS,
+            |candidate| {
+                decode_image(candidate)
+                    .ok()
+                    .and_then(|decoded| reference.score(&decoded))
+            },
+        )
+    }
+
+    /// [`Engine::encode_still`] with the two things a test
+    /// stands in for: `max_verified_pixels`, the largest
+    /// output whose `quality(auto)` pick is verified (always
+    /// [`crate::quality::MAX_VERIFIED_PIXELS`]), and `score`,
+    /// which decodes a candidate's bytes and scores them
+    /// against `img`.
+    fn encode_still_within(
+        img: &DynamicImage,
+        format: StillFormat,
+        encode_opts: &EncodeOptions,
+        ctx: &ProcessContext<'_>,
+        max_verified_pixels: u64,
+        score: impl Fn(&[u8]) -> Option<f64>,
+    ) -> Result<StillEncode, EngineError> {
         let StillQuality {
             encode_quality,
             mut chosen_quality,
             perceptual,
         } = Self::resolve_still_quality(img, format, encode_opts, ctx);
+        // `quality(auto)` verifies its pick for an output of
+        // up to `max_verified_pixels`. A larger output is
+        // encoded once at the pick and reports it, as the
+        // formats with no search do. That is settled here,
+        // before any candidate is encoded.
+        let perceptual = perceptual
+            .filter(|_| u64::from(img.width()) * u64::from(img.height()) <= max_verified_pixels);
         let mut ssim: Option<f64> = None;
         let enc_src = EncodeBuffers::new(img);
         // Every encode of this image differs only in its quality.
@@ -1989,12 +2032,6 @@ impl Engine {
             )
         };
         let mut encode_budget = MAX_REQUEST_ENCODES;
-        // Every candidate of a verified search is scored
-        // against this image: the metric's work on it is done
-        // once, at the first score, and dropped with this call
-        // (issue #664). An encode that scores nothing prepares
-        // nothing.
-        let reference = crate::quality::SsimReference::new(img);
         let mut bytes = if let Some(first_guess) = perceptual {
             let scored = crate::quality::encode_to_target(
                 first_guess,
@@ -2007,9 +2044,7 @@ impl Engine {
                     // encoding long past it.
                     ctx.check_deadline()?;
                     let candidate = encode_at(Some(q))?;
-                    let score = decode_image(&candidate)
-                        .ok()
-                        .and_then(|decoded| reference.score(&decoded));
+                    let score = score(&candidate);
                     Ok::<_, EngineError>((candidate, score))
                 },
             )?;
@@ -2063,9 +2098,7 @@ impl Engine {
             // The budget overruled the verified quality, so the
             // reported score must describe the bytes actually
             // served: re-score the final encode once.
-            ssim = decode_image(&bytes)
-                .ok()
-                .and_then(|decoded| reference.score(&decoded));
+            ssim = score(&bytes);
         }
         Ok(StillEncode {
             bytes,
@@ -6369,6 +6402,10 @@ mod small_frame_tests;
 // Animated GIF frames prepared on several threads.
 #[cfg(test)]
 mod gif_frame_tests;
+
+// The largest output whose `quality(auto)` pick is verified.
+#[cfg(test)]
+mod quality_bound_tests;
 
 #[cfg(test)]
 pub(crate) mod test_formats;
