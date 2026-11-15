@@ -691,7 +691,11 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// subsampled instead of one sample kept and the rest
 /// dropped, progressive files carry Huffman tables built
 /// from the image, and `quality(auto)` settles on a lower
-/// quality and a smaller file for the same target #668).
+/// quality and a smaller file for the same target #668;
+/// and AVIF output written in four tiles on every host,
+/// where the tile count was the host's core count, so AVIF
+/// bytes change on a host with another core count and then
+/// repeat on every replica of one build #671).
 const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered
