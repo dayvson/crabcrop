@@ -819,8 +819,8 @@ fn extraction_runs(record: &Path) -> Vec<String> {
 /// defaults, the whole PNG encoder section before issue #647.
 const DEFAULT_PNG_TAIL: &str = " -f image2pipe -vcodec png pipe:1";
 
-/// The same section with the light PNG settings.
-const LIGHT_PNG_TAIL: &str = " -f image2pipe -vcodec png -compression_level 1 -pred up pipe:1";
+/// The same section with the stored PNG setting.
+const STORED_PNG_TAIL: &str = " -f image2pipe -vcodec png -compression_level 0 pipe:1";
 
 /// A PNG signature and header for a `width` by `height`
 /// frame, followed by `rest`, as a `printf` format string.
@@ -834,12 +834,12 @@ fn png_printf(width: u32, height: u32, rest: &str) -> String {
 }
 
 #[test]
-fn the_extraction_asks_for_a_light_png() {
-    // Issue #647: the PNG only carries the frame to this
-    // process, so the run asks the encoder for its fastest
-    // lossless settings, right before the output target.
-    // One run does it: the answer stands.
-    let records = temp_dir("light-png");
+fn the_extraction_asks_for_a_stored_png() {
+    // Issues #647 and #651: the PNG only carries the frame to
+    // this process, so the run asks the encoder to store the
+    // rows instead of deflating them, right before the output
+    // target. One run does it: the answer stands.
+    let records = temp_dir("stored-png");
     let record = records.join("argv.log");
     let script = recording_tool(
         &record,
@@ -847,38 +847,45 @@ fn the_extraction_asks_for_a_light_png() {
         "",
         EXTRACT_PNG,
     );
-    let (_tool, program) = fake_tool("light-png", &script);
+    let (_tool, program) = fake_tool("stored-png", &script);
     let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
     extractor
         .extract_frame(b"video bytes", FrameSelection::Poster)
         .unwrap();
     let runs = extraction_runs(&record);
     assert_eq!(runs.len(), 1, "{runs:?}");
-    assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+    assert!(runs[0].ends_with(STORED_PNG_TAIL), "{}", runs[0]);
+    // The level is the only PNG encoder setting: no row
+    // filter is named, since nothing is deflated.
+    assert_eq!(runs[0].matches("-compression_level").count(), 1);
+    assert!(!runs[0].contains("-pred"), "{}", runs[0]);
     // A real header for a frame of the probed size is read
     // and passes too.
-    let records = temp_dir("light-png-header");
+    let records = temp_dir("stored-png-header");
     let record = records.join("argv.log");
-    let extract = format!("printf '{}'\nexit 0", png_printf(1920, 1080, "light"));
+    let extract = format!("printf '{}'\nexit 0", png_printf(1920, 1080, "stored"));
     let script = recording_tool(&record, "yuv420p, 1920x1080, 25 fps, 25 tbr", "", &extract);
-    let (_tool, program) = fake_tool("light-png-header", &script);
+    let (_tool, program) = fake_tool("stored-png-header", &script);
     let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
     let frame = extractor
         .extract_frame(b"video bytes", FrameSelection::Poster)
         .unwrap();
     assert_eq!(png_size(&frame.png), Some((1920, 1080)));
-    assert!(frame.png.ends_with(b"light"));
+    assert!(frame.png.ends_with(b"stored"));
     assert_eq!(extraction_runs(&record).len(), 1);
 }
 
 #[test]
-fn the_cap_admits_any_png_of_a_frame_or_the_light_one_is_not_asked_for() {
+fn a_frame_travels_stored_exactly_where_the_cap_admits_its_pixels_uncompressed() {
     // The 256 MiB cap on the PNG must admit the frames it
-    // always has. A frame's PNG is within it at any settings
-    // up to 8K at 16-bit RGBA; past that, how well the frame
-    // compresses decides, so the run keeps the encoder's
-    // defaults and its arguments are the ones before issue
-    // #647, to the letter.
+    // always has. Stored, a frame's PNG is its pixels and a
+    // little framing, so a frame is asked for stored only
+    // where that fits the cap at the deepest pixels the
+    // encoder writes (16-bit RGBA): up to 8K. Past that, how
+    // well the frame compresses decides, so the run keeps
+    // the encoder's defaults, which deflate, and its
+    // arguments are the ones before issue #647, to the
+    // letter.
     let fits = |width, height| any_png_fits(width, height, MAX_FRAME_PNG_BYTES);
     assert!(fits(1920, 1080));
     assert!(fits(7680, 4320));
@@ -894,9 +901,23 @@ fn the_cap_admits_any_png_of_a_frame_or_the_light_one_is_not_asked_for() {
     assert!(any_png_fits(1, 1, 65_536 + 9));
     assert!(!any_png_fits(1, 1, 65_536 + 8));
     assert!(!any_png_fits(u32::MAX, u32::MAX, usize::MAX));
+    // The boundary, to the row: an 8192 px wide frame fits
+    // with 4063 rows and not with 4064, whichever side is
+    // the row.
+    assert!(fits(8192, 4063) && fits(4063, 8192));
+    assert!(!fits(8192, 4064) && !fits(4064, 8192));
+    assert!(stored(8192, 4063) + stored(8192, 4063) / 128 + 65_536 <= 256 << 20);
+    assert!(stored(8192, 4064) + stored(8192, 4064) / 128 + 65_536 > 256 << 20);
 
+    // The probed size decides, before the extraction: the
+    // one run each frame gets already carries the answer.
     for (size, tail) in [
-        ("7680x4320", LIGHT_PNG_TAIL),
+        ("1920x1080", STORED_PNG_TAIL),
+        ("7680x4320", STORED_PNG_TAIL),
+        ("8192x4063", STORED_PNG_TAIL),
+        ("4063x8192", STORED_PNG_TAIL),
+        ("8192x4064", DEFAULT_PNG_TAIL),
+        ("4064x8192", DEFAULT_PNG_TAIL),
         ("8192x4320", DEFAULT_PNG_TAIL),
         ("8192x8192", DEFAULT_PNG_TAIL),
     ] {
@@ -915,11 +936,12 @@ fn the_cap_admits_any_png_of_a_frame_or_the_light_one_is_not_asked_for() {
         assert_eq!(runs.len(), 1, "{size}: {runs:?}");
         assert!(runs[0].ends_with(tail), "{size}: {}", runs[0]);
         assert_eq!(
-            runs[0].contains("-compression_level") || runs[0].contains("-pred"),
-            tail == LIGHT_PNG_TAIL,
+            runs[0].contains("-compression_level"),
+            tail == STORED_PNG_TAIL,
             "{size}: {}",
             runs[0]
         );
+        assert!(!runs[0].contains("-pred"), "{size}: {}", runs[0]);
     }
     // A second video stream past the bound keeps the
     // defaults too: the tool may decode either.
@@ -946,32 +968,32 @@ printf '%s\\n' 'Input #0, matroska,webm, from fd:' \
     assert!(runs[0].ends_with(DEFAULT_PNG_TAIL), "{}", runs[0]);
 }
 
-/// A stand-in decoder whose extraction does `light` when the
-/// run asks for the light PNG and `default` when it does not
+/// A stand-in decoder whose extraction does `stored` when the
+/// run asks for the stored PNG and `default` when it does not
 /// (shell lines each).
-fn settings_tool(record: &Path, stream: &str, light: &str, default: &str) -> String {
+fn settings_tool(record: &Path, stream: &str, stored: &str, default: &str) -> String {
     let extract = format!(
-        "    case \" $* \" in\n      *' -compression_level 1 -pred up '*)\n{light}\n      ;;\n      *)\n{default}\n      ;;\n    esac"
+        "    case \" $* \" in\n      *' -compression_level 0 '*)\n{stored}\n      ;;\n      *)\n{default}\n      ;;\n    esac"
     );
     recording_tool(record, stream, "", &extract)
 }
 
 #[test]
-fn a_run_the_light_png_fails_is_settled_by_the_encoder_defaults() {
-    // A decoder that does not take the two settings (a
-    // stand-in with the old contract, an encoder build
-    // without them) fails the first run. The run before
-    // issue #647 follows, and its answer is the request's:
-    // the frame, or its own failure, word for word.
-    let records = temp_dir("light-refused");
+fn a_run_the_stored_png_fails_is_settled_by_the_encoder_defaults() {
+    // A decoder that does not take the setting (a stand-in
+    // with the old contract, an encoder build without it)
+    // fails the first run. The run before issue #647
+    // follows, and its answer is the request's: the frame,
+    // or its own failure, word for word.
+    let records = temp_dir("stored-refused");
     let record = records.join("argv.log");
     let script = settings_tool(
         &record,
         "yuv420p, 64x48, 10 fps, 10 tbr",
-        "echo \"Unrecognized option 'pred'.\" >&2\nexit 1",
+        "echo \"Unrecognized option 'compression_level'.\" >&2\nexit 1",
         EXTRACT_PNG,
     );
-    let (_tool, program) = fake_tool("light-refused", &script);
+    let (_tool, program) = fake_tool("stored-refused", &script);
     let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
     let frame = extractor
         .extract_frame(b"video bytes", FrameSelection::Poster)
@@ -979,12 +1001,12 @@ fn a_run_the_light_png_fails_is_settled_by_the_encoder_defaults() {
     assert!(frame.png.ends_with(b"fakepng"));
     let runs = extraction_runs(&record);
     assert_eq!(runs.len(), 2, "{runs:?}");
-    assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+    assert!(runs[0].ends_with(STORED_PNG_TAIL), "{}", runs[0]);
     assert!(runs[1].ends_with(DEFAULT_PNG_TAIL), "{}", runs[1]);
     assert_eq!(
         runs[1],
-        runs[0].replace(LIGHT_PNG_TAIL, DEFAULT_PNG_TAIL),
-        "the second run differs in the PNG settings alone"
+        runs[0].replace(STORED_PNG_TAIL, DEFAULT_PNG_TAIL),
+        "the second run differs in the PNG setting alone"
     );
 
     // Both runs fail: the failure reported is the second
@@ -994,7 +1016,7 @@ fn a_run_the_light_png_fails_is_settled_by_the_encoder_defaults() {
     let script = settings_tool(
         &record,
         "yuv420p, 64x48, 10 fps, 10 tbr",
-        "echo 'the light run failed' >&2\nexit 4",
+        "echo 'the stored run failed' >&2\nexit 4",
         "echo 'the default run failed' >&2\nexit 3",
     );
     let (_tool, program) = fake_tool("both-fail", &script);
@@ -1004,22 +1026,22 @@ fn a_run_the_light_png_fails_is_settled_by_the_encoder_defaults() {
         .unwrap_err();
     assert!(matches!(err, FrameError::Failed(_)), "{err}");
     assert!(err.to_string().contains("the default run failed"), "{err}");
-    assert!(!err.to_string().contains("the light run failed"), "{err}");
+    assert!(!err.to_string().contains("the stored run failed"), "{err}");
     assert_eq!(extraction_runs(&record).len(), 2);
 }
 
 #[test]
 fn a_frame_larger_than_the_probe_reported_is_settled_by_the_encoder_defaults() {
     // A stream can change size after the frames the probe
-    // reads. If the light PNG that comes back is of a frame
+    // reads. If the stored PNG that comes back is of a frame
     // the cap might refuse at the encoder's defaults, the
     // defaults decide, as they did before issue #647: their
     // PNG is the frame, or their run's refusal the answer.
     let records = temp_dir("grown");
     let record = records.join("argv.log");
-    let light = format!("printf '{}'\nexit 0", png_printf(8192, 8192, "light"));
+    let stored = format!("printf '{}'\nexit 0", png_printf(8192, 8192, "stored"));
     let default = format!("printf '{}'\nexit 0", png_printf(8192, 8192, "default"));
-    let script = settings_tool(&record, "yuv420p, 64x48, 10 fps, 10 tbr", &light, &default);
+    let script = settings_tool(&record, "yuv420p, 64x48, 10 fps, 10 tbr", &stored, &default);
     let (_tool, program) = fake_tool("grown", &script);
     let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
     let frame = extractor
@@ -1029,18 +1051,19 @@ fn a_frame_larger_than_the_probe_reported_is_settled_by_the_encoder_defaults() {
     assert_eq!(png_size(&frame.png), Some((8192, 8192)));
     let runs = extraction_runs(&record);
     assert_eq!(runs.len(), 2, "{runs:?}");
-    assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+    assert!(runs[0].ends_with(STORED_PNG_TAIL), "{}", runs[0]);
     assert!(runs[1].ends_with(DEFAULT_PNG_TAIL), "{}", runs[1]);
 }
 
 #[test]
 fn an_output_past_the_cap_is_settled_by_the_encoder_defaults() {
     // With the cap lowered to 70,000 bytes, a 1x1 frame's PNG
-    // fits at any settings, so the light one is asked for. A
-    // tool that answers with more than the cap anyway gets
-    // the run before issue #647: what that hands back within
-    // the cap is the frame, and past it, the refusal it
-    // always was.
+    // fits at any settings, so the stored one is asked for. A
+    // tool that answers with more than the cap anyway (a
+    // frame that grew, a profile chunk of megabytes stored
+    // beside the pixels) gets the run before issue #647: what
+    // that hands back within the cap is the frame, and past
+    // it, the refusal it always was.
     let cap = 70_000;
     assert!(any_png_fits(1, 1, cap));
     let over = "head -c 80000 /dev/zero\nexit 0";
@@ -1065,15 +1088,15 @@ fn an_output_past_the_cap_is_settled_by_the_encoder_defaults() {
         }
         let runs = extraction_runs(&record);
         assert_eq!(runs.len(), 2, "{runs:?}");
-        assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+        assert!(runs[0].ends_with(STORED_PNG_TAIL), "{}", runs[0]);
         assert!(runs[1].ends_with(DEFAULT_PNG_TAIL), "{}", runs[1]);
     }
 }
 
 #[test]
-fn a_refusal_or_a_timeout_at_the_light_settings_is_not_run_again() {
+fn a_refusal_or_a_timeout_of_the_stored_run_is_not_run_again() {
     // The decoder's refusal of a frame past the pixel budget
-    // does not depend on the PNG settings, and a run that
+    // does not depend on the PNG setting, and a run that
     // met the deadline leaves no time for another: neither
     // gets a second run.
     let records = temp_dir("no-second-run");
@@ -1927,20 +1950,34 @@ fn png_chunks_around_the_pixels(png: &[u8]) -> Vec<(String, Vec<u8>)> {
     chunks
 }
 
+/// The FFmpeg an ignored real-tool test runs:
+/// `CRABCROP_TEST_FFMPEG`, or the one on the `PATH`.
+fn real_ffmpeg() -> PathBuf {
+    std::env::var_os("CRABCROP_TEST_FFMPEG")
+        .map(PathBuf::from)
+        .or_else(ffmpeg_path)
+        .expect("an FFmpeg to run: CRABCROP_TEST_FFMPEG, or ffmpeg on the PATH")
+}
+
+/// The settings issue #647 first asked the PNG encoder for,
+/// which the stored PNG replaced (issue #651).
+const LEVEL_1_UP: [&str; 4] = ["-compression_level", "1", "-pred", "up"];
+
+/// Run it with: `cargo test -- --ignored real_ffmpeg`
 #[test]
-fn real_tool_hands_over_the_same_frame_at_the_light_settings() {
-    // Issue #647: PNG is lossless at every setting, so the
-    // frame in the light PNG is the frame in a PNG at the
-    // encoder's defaults: the same pixels in the same layout,
-    // with the same chunks around them. Held to the real
-    // tool for every layout its PNG encoder writes from the
-    // codecs the extraction allows: 8-bit RGB (H.264, Motion
-    // JPEG), 16-bit RGB (10-bit H.264) and 16-bit RGBA
-    // (ProRes 4444 with alpha).
-    let Some(ffmpeg) = ffmpeg_path() else {
-        return;
-    };
-    let dir = temp_dir("real-light");
+#[ignore = "needs a real decoder binary (ffmpeg) on this machine"]
+fn real_ffmpeg_hands_over_the_same_frame_stored_as_deflated() {
+    // Issues #647 and #651: PNG is lossless at every level,
+    // so the frame in the stored PNG is the frame in a PNG at
+    // the encoder's defaults, and in one at level 1 with the
+    // up filter: the same pixels in the same layout, with the
+    // same chunks around them. Held to the real tool for
+    // every layout its PNG encoder writes from the codecs the
+    // extraction allows: 8-bit RGB (H.264, Motion JPEG),
+    // 16-bit RGB (10-bit H.264) and 16-bit RGBA (ProRes 4444
+    // with alpha).
+    let ffmpeg = real_ffmpeg();
+    let dir = temp_dir("real-stored");
     let opaque = [
         "-f",
         "lavfi",
@@ -2034,53 +2071,73 @@ fn real_tool_hands_over_the_same_frame_at_the_light_settings() {
         };
         for &timestamp in timestamps {
             let what = format!("{file} at {timestamp}s");
-            let light = extractor
+            let stored = extractor
                 .extract_at(&input, timestamp, threads, deadline, true)
-                .unwrap_or_else(|e| panic!("{what}, light: {e}"));
+                .unwrap_or_else(|e| panic!("{what}, stored: {e}"));
             let default = extractor
                 .extract_at(&input, timestamp, threads, deadline, false)
                 .unwrap_or_else(|e| panic!("{what}, defaults: {e}"));
-            // Two different files: the settings reached the
-            // encoder.
-            assert!(light != default, "{what}: one PNG at both settings");
-            assert_eq!(
-                png_chunks_around_the_pixels(&light),
-                png_chunks_around_the_pixels(&default),
-                "{what}"
+            let level_1 = extractor
+                .extraction_run(&input, timestamp, threads, deadline, &LEVEL_1_UP)
+                .map_err(|e| extractor.run_failure(e))
+                .and_then(frame_of)
+                .unwrap_or_else(|e| panic!("{what}, level 1: {e}"));
+            // The setting reached the encoder: the stored PNG
+            // holds every row uncompressed, a filter byte and
+            // the pixels, and the deflated ones do not.
+            let raw = 320 * 240 * usize::from(color.bytes_per_pixel()) + 240;
+            assert!(stored.len() > raw, "{what}: {} bytes", stored.len());
+            assert!(default.len() < raw / 2, "{what}: {} bytes", default.len());
+            assert!(level_1.len() < raw / 2, "{what}: {} bytes", level_1.len());
+            // And it is no larger than the size rule counts
+            // on: the rows, one part in 128 for the framing,
+            // 64 KiB for the other chunks.
+            assert!(
+                stored.len() <= raw + raw / 128 + 65_536,
+                "{what}: {} bytes stored for {raw} of rows",
+                stored.len()
             );
-            let (a, b) = (
-                image::load_from_memory(&light).unwrap(),
-                image::load_from_memory(&default).unwrap(),
-            );
-            assert_eq!(a.color(), color, "{what}");
-            assert_eq!(
-                (a.color(), a.width(), a.height()),
-                (b.color(), 320, 240),
-                "{what}"
-            );
-            assert!(a.as_bytes() == b.as_bytes(), "{what}: other pixels");
-            // And what the engine decodes from each, the frame
-            // a `frame:` request goes on with.
-            let (a, b) = (
-                crate::engine::decode_image(&light).unwrap(),
-                crate::engine::decode_image(&default).unwrap(),
-            );
-            assert_eq!(a.color(), b.color(), "{what}");
-            assert!(a.as_bytes() == b.as_bytes(), "{what}: other pixels");
-            compared += 1;
+            for (other, name) in [(&default, "the defaults"), (&level_1, "level 1")] {
+                let what = format!("{what}, against {name}");
+                assert_eq!(
+                    png_chunks_around_the_pixels(&stored),
+                    png_chunks_around_the_pixels(other),
+                    "{what}"
+                );
+                let (a, b) = (
+                    image::load_from_memory(&stored).unwrap(),
+                    image::load_from_memory(other).unwrap(),
+                );
+                assert_eq!(a.color(), color, "{what}");
+                assert_eq!(
+                    (a.color(), a.width(), a.height()),
+                    (b.color(), 320, 240),
+                    "{what}"
+                );
+                assert!(a.as_bytes() == b.as_bytes(), "{what}: other pixels");
+                // And what the engine decodes from each, the
+                // frame a `frame:` request goes on with.
+                let (a, b) = (
+                    crate::engine::decode_image(&stored).unwrap(),
+                    crate::engine::decode_image(other).unwrap(),
+                );
+                assert_eq!(a.color(), b.color(), "{what}");
+                assert!(a.as_bytes() == b.as_bytes(), "{what}: other pixels");
+                compared += 1;
+            }
         }
-        // The request path hands over the light one.
+        // The request path hands over the stored one.
         if file == "h264.mp4" {
             let frame = extractor
                 .extract_frame(&bytes, FrameSelection::Seconds(0.6))
                 .unwrap();
-            let light = extractor
+            let stored = extractor
                 .extract_at(&input, 0.6, threads, deadline, true)
                 .unwrap();
-            assert!(frame.png == light, "{file}: the request's PNG");
+            assert!(frame.png == stored, "{file}: the request's PNG");
         }
     }
-    assert!(compared >= 4, "{compared} frames compared");
+    assert!(compared >= 8, "{compared} comparisons");
 }
 
 #[test]
