@@ -1989,6 +1989,12 @@ impl Engine {
             )
         };
         let mut encode_budget = MAX_REQUEST_ENCODES;
+        // Every candidate of a verified search is scored
+        // against this image: the metric's work on it is done
+        // once, at the first score, and dropped with this call
+        // (issue #664). An encode that scores nothing prepares
+        // nothing.
+        let reference = crate::quality::SsimReference::new(img);
         let mut bytes = if let Some(first_guess) = perceptual {
             let scored = crate::quality::encode_to_target(
                 first_guess,
@@ -2003,7 +2009,7 @@ impl Engine {
                     let candidate = encode_at(Some(q))?;
                     let score = decode_image(&candidate)
                         .ok()
-                        .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
+                        .and_then(|decoded| reference.score(&decoded));
                     Ok::<_, EngineError>((candidate, score))
                 },
             )?;
@@ -2059,7 +2065,7 @@ impl Engine {
             // served: re-score the final encode once.
             ssim = decode_image(&bytes)
                 .ok()
-                .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
+                .and_then(|decoded| reference.score(&decoded));
         }
         Ok(StillEncode {
             bytes,
@@ -2216,7 +2222,7 @@ impl Engine {
                 pixels: frame.into_buffer(),
             })
             .collect();
-        let bytes = encoder.encode(&out_frames, format).map_err(|e| match e {
+        let bytes = encoder.encode(out_frames, format).map_err(|e| match e {
             crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
             crate::video::VideoError::Failed(what) => EngineError::Video(what),
         })?;

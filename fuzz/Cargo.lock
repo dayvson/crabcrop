@@ -1048,6 +1048,7 @@ dependencies = [
  "oxideav-webp",
  "png",
  "quantizr",
+ "ravif",
  "reqwest 0.13.5",
  "resvg",
  "roxmltree 0.21.2",
