@@ -4,10 +4,17 @@
 //! The log never contains the full source URL, only the operation
 //! summary (the path segments between the signature and the source).
 //! `cache_hit` records whether the result cache answered the
-//! request, as reported by the handler.
+//! request, as reported by the handler. The lines reach standard
+//! output through a [`RequestLog`] (issue #642).
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod request_log;
+
+#[cfg(test)]
+pub(crate) use request_log::fake::FakeStdout;
+pub use request_log::{QUEUE_BYTES, RequestLog, SHUTDOWN_WAIT};
 
 /// Which stage failed, for the error counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

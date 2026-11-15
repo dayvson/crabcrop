@@ -34,7 +34,7 @@ use axum::{
 use crate::cache::{Cache, CachedImage, etag_for_bytes};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
-use crate::observe::{FailStage, Metrics, RequestRecord};
+use crate::observe::{FailStage, Metrics, RequestLog, RequestRecord};
 use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
 /// One declared `boxes` detector (issue #166): the name
@@ -97,6 +97,14 @@ pub struct AppState {
     pub process_timeout: std::time::Duration,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
+    /// Where the lines on standard output go once the
+    /// server serves (issue #642): each request's line, the
+    /// purge and upload lines, and the shutdown lines. By
+    /// default a queue that one thread writes from; with
+    /// `CRABCROP_LOG_SYNC` each line is written where it is
+    /// logged. A handler that logs asks it for room first
+    /// ([`RequestLog::room`]).
+    pub request_log: RequestLog,
     /// The bearer token `/metrics` requires (issue #270),
     /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
     /// endpoint: it answers 403 rather than serving the
@@ -402,7 +410,8 @@ impl std::fmt::Debug for AppState {
             loader,
             engine,
             process_timeout,
-            metrics
+            metrics,
+            request_log
         );
         out.field(
             stringify!(metrics_token),
@@ -1394,6 +1403,7 @@ async fn begin_purge(
 async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
+    log: &RequestLog,
     begun: BegunPurge,
     epoch_base: Option<String>,
     event: &'static str,
@@ -1433,6 +1443,7 @@ async fn purge_shared_tier(
     removed += inline.removed;
     let shared = shared.clone();
     let tasks = background.clone();
+    let log = log.clone();
     match pending {
         Some(pending) => {
             background.spawn_walk(async move {
@@ -1442,9 +1453,9 @@ async fn purge_shared_tier(
                 };
                 let (event, log_target) = (purge.event, purge.log_target.clone());
                 end_purge_apart(&shared, &tasks, purge, inline.complete && rest.complete).await;
-                purge_log(event, &log_target, Some(rest.removed));
+                purge_log(&log, event, &log_target, Some(rest.removed)).await;
                 let joined = lease.take_joined();
-                walk_for_joined(&shared, &tasks, lease, joined).await;
+                walk_for_joined(&shared, &tasks, &log, lease, joined).await;
             });
         }
         None => {
@@ -1452,7 +1463,7 @@ async fn purge_shared_tier(
             let joined = lease.take_joined();
             if !joined.is_empty() {
                 background.spawn_walk(async move {
-                    walk_for_joined(&shared, &tasks, lease, joined).await;
+                    walk_for_joined(&shared, &tasks, &log, lease, joined).await;
                 });
             }
         }
@@ -1472,6 +1483,7 @@ async fn purge_shared_tier(
 async fn walk_for_joined(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
+    log: &RequestLog,
     mut lease: crate::s3store::WalkLease,
     mut joined: Vec<crate::s3store::SharedPurge>,
 ) {
@@ -1488,7 +1500,7 @@ async fn walk_for_joined(
         for purge in joined {
             let (event, log_target) = (purge.event, purge.log_target.clone());
             end_purge_apart(shared, background, purge, swept.complete).await;
-            purge_log(event, &log_target, Some(swept.removed));
+            purge_log(log, event, &log_target, Some(swept.removed)).await;
         }
         joined = lease.take_joined();
     }
@@ -1641,16 +1653,18 @@ pub async fn start_purge_tombstones(state: &AppState) {
 /// One structured line per purge request (audit PL-8): the
 /// destructive, secret-gated endpoint must be auditable. The
 /// target is hashed; a raw target can carry signed URLs.
-fn purge_log(event: &str, target: &str, removed: Option<usize>) {
+///
+/// The line is on standard output when this returns, so
+/// before the purge is answered (see [`RequestLog::event`]).
+async fn purge_log(log: &RequestLog, event: &str, target: &str, removed: Option<usize>) {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(target.as_bytes());
     let hash: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    match removed {
-        Some(n) => {
-            println!("{{\"event\":\"{event}\",\"target\":\"{hash}\",\"removed\":{n}}}")
-        }
-        None => println!("{{\"event\":\"{event}\",\"target\":\"{hash}\",\"rejected\":true}}"),
-    }
+    let line = match removed {
+        Some(n) => format!("{{\"event\":\"{event}\",\"target\":\"{hash}\",\"removed\":{n}}}"),
+        None => format!("{{\"event\":\"{event}\",\"target\":\"{hash}\",\"rejected\":true}}"),
+    };
+    log.event(&line).await;
 }
 
 /// `POST /purge/<signature>/<path>`: invalidate every stored
@@ -1670,6 +1684,9 @@ async fn purge_handle(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    // A purge leaves a log line: like an image request, it
+    // waits while the request log's queue is full.
+    state.request_log.room().await;
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -1699,7 +1716,7 @@ async fn purge_handle(
         .verify_purge(key_id.as_deref(), &signature, target)
     {
         state.metrics.record_purge();
-        purge_log("purge", target, None);
+        purge_log(&state.request_log, "purge", target, None).await;
         return error_response(
             StatusCode::FORBIDDEN,
             "bad_signature",
@@ -1812,6 +1829,7 @@ async fn purge_handle(
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
+                &task_state.request_log,
                 BegunPurge {
                     active,
                     tombstone,
@@ -1825,7 +1843,13 @@ async fn purge_handle(
         }
         wait_for_disk_purge(disk).await;
         task_state.metrics.record_purge();
-        purge_log("purge", &task_target, Some(removed));
+        purge_log(
+            &task_state.request_log,
+            "purge",
+            &task_target,
+            Some(removed),
+        )
+        .await;
         removed
     });
     let removed = task.await.unwrap_or(0);
@@ -1849,6 +1873,8 @@ async fn purge_group_handle(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    // As in `purge_handle`.
+    state.request_log.room().await;
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -1887,7 +1913,7 @@ async fn purge_group_handle(
         .verify_purge_group(key_id.as_deref(), &signature, group)
     {
         state.metrics.record_purge();
-        purge_log("purge-group", &target, None);
+        purge_log(&state.request_log, "purge-group", &target, None).await;
         return error_response(
             StatusCode::FORBIDDEN,
             "bad_signature",
@@ -1916,6 +1942,7 @@ async fn purge_group_handle(
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
+                &task_state.request_log,
                 BegunPurge {
                     active,
                     tombstone,
@@ -1929,7 +1956,13 @@ async fn purge_group_handle(
         }
         wait_for_disk_purge(disk).await;
         task_state.metrics.record_purge();
-        purge_log("purge-group", &task_target, Some(removed));
+        purge_log(
+            &task_state.request_log,
+            "purge-group",
+            &task_target,
+            Some(removed),
+        )
+        .await;
         removed
     });
     let removed = task.await.unwrap_or(0);
@@ -1940,11 +1973,16 @@ async fn purge_group_handle(
 /// precedent (audit PL-8): the write endpoint must be
 /// auditable. The name is hashed for the same reason the
 /// purge target is: a raw name is caller-chosen text.
-fn upload_log(name: &str, outcome: &str) {
+/// Like a purge's, the line is on standard output before
+/// the upload is answered.
+async fn upload_log(log: &RequestLog, name: &str, outcome: &str) {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(name.as_bytes());
     let hash: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    println!("{{\"event\":\"upload\",\"target\":\"{hash}\",\"outcome\":\"{outcome}\"}}");
+    log.event(&format!(
+        "{{\"event\":\"upload\",\"target\":\"{hash}\",\"outcome\":\"{outcome}\"}}"
+    ))
+    .await;
 }
 
 /// Read an upload body of at most `cap` bytes, charging it
@@ -2058,6 +2096,7 @@ async fn purge_source_everywhere(state: &Arc<AppState>, source: &str) -> usize {
             removed += purge_shared_tier(
                 shared,
                 &task_state.background,
+                &task_state.request_log,
                 BegunPurge {
                     active,
                     tombstone,
@@ -2070,7 +2109,13 @@ async fn purge_source_everywhere(state: &Arc<AppState>, source: &str) -> usize {
             .await;
         }
         wait_for_disk_purge(disk).await;
-        purge_log("purge-source", &source, Some(removed));
+        purge_log(
+            &task_state.request_log,
+            "purge-source",
+            &source,
+            Some(removed),
+        )
+        .await;
         removed
     });
     task.await.unwrap_or(0)
@@ -2114,6 +2159,10 @@ async fn upload_handle(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
 ) -> Response {
+    // An upload leaves a log line: like an image request,
+    // it waits while the request log's queue is full, before
+    // its body is read.
+    state.request_log.room().await;
     let accept = req
         .headers()
         .get(header::ACCEPT)
@@ -2200,12 +2249,12 @@ async fn finish_upload(
             answer: (status, code, message),
         } => {
             state.metrics.record_upload();
-            upload_log(&target, outcome);
+            upload_log(&state.request_log, &target, outcome).await;
             error_response(status, code, message, accept)
         }
         UploadOutcome::Busy { target, message } => {
             state.metrics.record_upload();
-            upload_log(&target, "rejected:busy");
+            upload_log(&state.request_log, &target, "rejected:busy").await;
             busy_response(message, 1, accept)
         }
         UploadOutcome::Stored {
@@ -2214,7 +2263,12 @@ async fn finish_upload(
             replaced,
         } => {
             state.metrics.record_upload();
-            upload_log(&name, if replaced { "replaced" } else { "stored" });
+            upload_log(
+                &state.request_log,
+                &name,
+                if replaced { "replaced" } else { "stored" },
+            )
+            .await;
             if replaced {
                 // An overwrite replaces the source every
                 // cached derivative was rendered from: purge
@@ -2647,6 +2701,11 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
 }
 
 async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    // Every request here leaves a log line, so it waits here
+    // while the request log's queue is full (issue #642):
+    // before anything is done for it, so a client that gives
+    // up meanwhile has cost nothing and is owed no line.
+    state.request_log.room().await;
     // The request's URI and headers are read where they are
     // (issue #641): the `Uri` and `HeaderMap` extractors
     // hand a handler a copy of each. The body goes at once,
@@ -2708,7 +2767,10 @@ async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Requ
     }
     record.request_id = request_id;
     state.metrics.record(&record);
-    println!("{}", record.to_json());
+    // The line goes to the request log (issue #642), which
+    // by default queues it for its writer thread: the
+    // response does not wait for a `write`.
+    state.request_log.line(&record.to_json());
     response
 }
 
