@@ -1677,15 +1677,20 @@ mod tests {
         }
         let timeout = Duration::from_secs(20);
         let dir = crate::test_support::scratch_dir("worker-pipe-test");
-        // The answer: the stand-in writes 200,000 bytes, past
+        // The answer: the stand-in writes 200,704 bytes, past
         // the 64 KiB a pipe starts with, and only then leaves
         // its mark, while the parent reads nothing. Through an
         // AVIF job's pipe that goes through; an SVG job's holds
-        // 64 KiB of it and the write waits.
+        // 64 KiB of it and the write waits. The bytes come
+        // from the shell's own `printf`, a page at a time,
+        // and not from `head -c`: the `head` of the Rust
+        // coreutils (Ubuntu 26.04) widens the pipe it writes
+        // to, and then an SVG job's pipe takes all of it.
         for (job, wide) in [(JOB_AVIF, true), (JOB_SVG, false)] {
             let written = dir.join(format!("written-{job}"));
             let script = format!(
-                "head -c 200000 /dev/zero; : > '{}'; exec sleep 30",
+                "i=0; while [ $i -lt 49 ]; do printf '%04096d' 0; i=$((i+1)); done; \
+                 : > '{}'; exec sleep 30",
                 written.display()
             );
             let mut worker = spawn(&shell_worker(&script), timeout, job).unwrap();
