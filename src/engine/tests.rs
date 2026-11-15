@@ -4712,12 +4712,16 @@ fn jpeg_decodes(bytes: &[u8], width: u32, height: u32) -> [Vec<u8>; 2] {
 /// come back with from a JPEG at `quality`. A flat block
 /// is its DC term alone, 8 times the sample less 128, so
 /// a quantizer step of `q` moves a sample by at most
-/// `q / 16`. Rounding the color conversion each way adds
+/// `q / 16`. Rounding to whole samples on the way in adds
 /// half a level per component, and blue leans hardest on
-/// chroma, with 1.772 of Cb.
+/// chroma, with 1.772 of Cb. Two levels more are the
+/// decoder's: its inverse DCT and its color conversion
+/// each round in their own fixed point, which differs
+/// between decoders and between one decoder's code for
+/// different CPUs.
 fn flat_tolerance(quality: u8) -> u8 {
     let sample = |dc_base| f64::from(libjpeg_quantizer(dc_base, quality)) / 16.0 + 0.5;
-    (sample(ANNEX_K[0][0]) + 1.772 * sample(ANNEX_K[1][0]) + 1.0).ceil() as u8
+    (sample(ANNEX_K[0][0]) + 1.772 * sample(ANNEX_K[1][0]) + 2.0).ceil() as u8
 }
 
 /// The largest root-mean-square error a gray image, whose
