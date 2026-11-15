@@ -684,7 +684,11 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// output's size #611).
 ///
 /// 7: the first release after 0.12.0, which changes output
-/// for existing URLs (JPEG output written by libjpeg-turbo
+/// for existing URLs (a JPEG source whose first operation
+/// is a resize to a third of its size or less decoded at a
+/// half, a quarter or an eighth of it before that resize,
+/// so those renders' pixels change #653; JPEG output
+/// written by libjpeg-turbo
 /// instead of the jpeg-encoder crate, so every JPEG's
 /// bytes change: at the same quality the quantization
 /// tables are the same, chroma is averaged where it is
