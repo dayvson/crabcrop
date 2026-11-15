@@ -1,8 +1,16 @@
 use super::*;
-use crate::ai::test_support::{noise_rgb, opaque_rgba, same_bits};
+use crate::ai::test_support::{noise_rgb, opaque_rgba, same_bits, solid};
 
 fn classes() -> Vec<String> {
     ["person", "car"].iter().map(|s| s.to_string()).collect()
+}
+
+/// The whole letterbox as the provider runs it: the scaled
+/// frame, then its tensor.
+fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
+    let (resized, scale) = letterbox_frame(img);
+    let (tensor, pad_x, pad_y) = letterbox_tensor(&resized);
+    (tensor, scale, pad_x, pad_y)
 }
 
 /// A channels-first output with two candidates on a
@@ -734,4 +742,339 @@ fn the_class_scan_by_rows_picks_what_the_scan_by_candidates_picked() {
         let got = postprocess_detections(&data, &dims, &none, 0.5, 64, 64, 1.0, 0, 0).unwrap();
         assert_eq!(format!("{got:?}"), format!("{want:?}"));
     }
+}
+
+/// A fake detector that counts its runs. It answers two
+/// candidates on a grid cell picked from the input, a
+/// person at 0.9 and a car at 0.55, so two inputs get two
+/// answers and a score floor between the two changes what
+/// comes back.
+fn fake_yolo(
+    runs: &std::cell::Cell<u32>,
+) -> impl Fn(Vec<f32>) -> Result<(Vec<i64>, Vec<f32>), AiError> + '_ {
+    move |input| {
+        runs.set(runs.get() + 1);
+        assert_eq!(input.len(), 3 * (DETECT_INPUT * DETECT_INPUT) as usize);
+        let sum: f32 = input.iter().step_by(1009).sum();
+        // Near the middle of the square, inside the frame
+        // whatever its padding.
+        let cell = (sum * 255.0) as u32 % 100;
+        let (cx, cy) = (
+            220.0 + (cell % 10) as f32 * 20.0,
+            220.0 + (cell / 10) as f32 * 20.0,
+        );
+        let (rows, n) = (6usize, 2usize);
+        let mut data = vec![0f32; rows * n];
+        for (i, (dx, class, score)) in [(0.0, 0, 0.9), (20.0, 1, 0.55)].into_iter().enumerate() {
+            data[i] = cx + dx;
+            data[n + i] = cy;
+            data[2 * n + i] = 40.0;
+            data[3 * n + i] = 40.0;
+            data[(4 + class) * n + i] = score;
+        }
+        Ok((vec![1, rows as i64, n as i64], data))
+    }
+}
+
+/// What the model answers for a frame with no memo in the
+/// way.
+fn fresh_objects(classes: &[String], threshold: f32, img: &DynamicImage) -> Vec<Detection> {
+    let runs = std::cell::Cell::new(0);
+    let found = detect_objects(None, classes, threshold, img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    found
+}
+
+#[test]
+fn a_repeated_frame_is_answered_without_running_the_detector() {
+    // Issue #677: the second detection of a frame finds its
+    // boxes in the memo. They are the boxes a fresh run
+    // gives, and what is remembered is the model's input,
+    // not the frame: a copy of it, and the same pixels in a
+    // layout that is converted first, hit too.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let classes = classes();
+    let rgb = noise_rgb(300, 200, 81);
+    let img = DynamicImage::ImageRgb8(rgb.clone());
+    let first = detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first, fresh_objects(&classes, 0.5, &img));
+    for again in [
+        img.clone(),
+        DynamicImage::ImageRgb8(rgb.clone()),
+        opaque_rgba(&rgb),
+    ] {
+        let found = detect_objects(Some(&memo), &classes, 0.5, &again, fake_yolo(&runs)).unwrap();
+        assert_eq!(found, first);
+        assert_eq!(runs.get(), 1, "a repeat ran the model");
+    }
+    // Another frame is another input.
+    let other = DynamicImage::ImageRgb8(noise_rgb(300, 200, 82));
+    let second = detect_objects(Some(&memo), &classes, 0.5, &other, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 2);
+    assert_eq!(second, fresh_objects(&classes, 0.5, &other));
+    assert_ne!(second, first);
+    assert_eq!(
+        detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap(),
+        first
+    );
+    assert_eq!(runs.get(), 2);
+}
+
+#[test]
+fn one_differing_pixel_of_the_detector_input_is_a_miss() {
+    // A square frame at the model's own size is its input
+    // as it stands: one sample of one pixel, one level
+    // apart, runs the model.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let classes = classes();
+    let rgb = noise_rgb(DETECT_INPUT, DETECT_INPUT, 83);
+    assert_eq!(
+        letterbox_frame(&DynamicImage::ImageRgb8(rgb.clone()))
+            .0
+            .as_raw(),
+        rgb.as_raw()
+    );
+    let img = DynamicImage::ImageRgb8(rgb.clone());
+    let first = detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap();
+    for (x, y, c) in [(0, 0, 0), (639, 639, 2), (317, 201, 1)] {
+        let mut changed = rgb.clone();
+        let sample = &mut changed.get_pixel_mut(x, y).0[c];
+        *sample = sample.wrapping_add(1);
+        let changed = DynamicImage::ImageRgb8(changed);
+        let before = runs.get();
+        let found = detect_objects(Some(&memo), &classes, 0.5, &changed, fake_yolo(&runs)).unwrap();
+        assert_eq!(runs.get(), before + 1, "pixel {x},{y} sample {c} hit");
+        assert_eq!(found, fresh_objects(&classes, 0.5, &changed));
+    }
+    assert_eq!(
+        detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap(),
+        first
+    );
+    assert_eq!(runs.get(), 4);
+}
+
+#[test]
+fn the_same_detector_input_at_another_source_size_is_a_miss() {
+    // Flat frames of one color and one aspect scale to the
+    // same input, and the model answers the same cell for
+    // each. The boxes are mapped back to the source, so
+    // they differ, and one frame's must never answer the
+    // other. A frame of another aspect is padded
+    // differently: another input altogether.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let classes = classes();
+    let small = solid(90, 120, 150, 100, 80);
+    let large = solid(90, 120, 150, 200, 160);
+    let square = solid(90, 120, 150, 100, 100);
+    assert_eq!(letterbox_frame(&small).0, letterbox_frame(&large).0);
+    let mut answers = Vec::new();
+    for frame in [&small, &large, &square] {
+        let found = detect_objects(Some(&memo), &classes, 0.5, frame, fake_yolo(&runs)).unwrap();
+        assert_eq!(found, fresh_objects(&classes, 0.5, frame));
+        answers.push(found);
+    }
+    assert_eq!(runs.get(), 3);
+    assert_ne!(answers[0], answers[1]);
+    for (frame, want) in [&small, &large, &square].into_iter().zip(&answers) {
+        assert_eq!(
+            &detect_objects(Some(&memo), &classes, 0.5, frame, fake_yolo(&runs)).unwrap(),
+            want
+        );
+    }
+    assert_eq!(runs.get(), 3);
+}
+
+#[test]
+fn the_score_floor_and_the_class_names_are_part_of_what_is_remembered() {
+    // The boxes are read with a score floor and a list of
+    // class names. On one memo, a frame detected with
+    // another floor, or with other names, runs the model
+    // and gets the answer for that floor and those names,
+    // never the one remembered for the first.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let classes = classes();
+    let img = DynamicImage::ImageRgb8(noise_rgb(300, 200, 84));
+    let both = detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(both.len(), 2);
+    let strict = detect_objects(Some(&memo), &classes, 0.6, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 2, "another floor hit");
+    assert_eq!(strict.len(), 1);
+    assert_eq!(strict, fresh_objects(&classes, 0.6, &img));
+    let renamed: Vec<String> = ["pedestrian", "vehicle"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let other = detect_objects(Some(&memo), &renamed, 0.5, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 3, "other class names hit");
+    assert_eq!(other, fresh_objects(&renamed, 0.5, &img));
+    assert_eq!(other[0].label, "pedestrian");
+    // Names that only differ in where one ends.
+    let shifted: Vec<String> = ["pedestrianv", "ehicle"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let moved = detect_objects(Some(&memo), &shifted, 0.5, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 4, "class names cut elsewhere hit");
+    assert_eq!(moved[0].label, "pedestrianv");
+    // Each is remembered as it was asked.
+    for (names, floor, want) in [
+        (&classes, 0.5, &both),
+        (&classes, 0.6, &strict),
+        (&renamed, 0.5, &other),
+        (&shifted, 0.5, &moved),
+    ] {
+        assert_eq!(
+            &detect_objects(Some(&memo), names, floor, &img, fake_yolo(&runs)).unwrap(),
+            want
+        );
+    }
+    assert_eq!(runs.get(), 4);
+}
+
+#[test]
+fn a_failed_detection_is_not_remembered() {
+    let memo = DetectionMemo::new();
+    let classes = classes();
+    let img = DynamicImage::ImageRgb8(noise_rgb(120, 90, 85));
+    // The model fails: the error goes out, nothing stays.
+    let failed = detect_objects(Some(&memo), &classes, 0.5, &img, |_input| {
+        Err::<(Vec<i64>, Vec<f32>), _>(AiError::Inference("inference failed: boom".to_string()))
+    });
+    assert_eq!(
+        failed,
+        Err(AiError::Inference("inference failed: boom".to_string()))
+    );
+    // The model answers a layout the decoder cannot read.
+    let unreadable = detect_objects(Some(&memo), &classes, 0.5, &img, |_input| {
+        Ok((vec![1i64, 9, 2], vec![0f32; 18]))
+    });
+    assert!(matches!(unreadable, Err(AiError::BadOutput(_))));
+    // The next detection runs the model and gets the
+    // answer; only that is remembered.
+    let runs = std::cell::Cell::new(0);
+    let found = detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(found, fresh_objects(&classes, 0.5, &img));
+    assert_eq!(
+        detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap(),
+        found
+    );
+    assert_eq!(runs.get(), 1);
+}
+
+#[test]
+fn concurrent_detections_share_the_memo_safely() {
+    // Four threads detect over the same three frames
+    // against one memo: every answer is the fresh one, and
+    // the model runs at most once for a call and at least
+    // once for a frame.
+    let memo = DetectionMemo::new();
+    let classes = classes();
+    let frames: Vec<DynamicImage> = (0..3)
+        .map(|i| DynamicImage::ImageRgb8(noise_rgb(64, 48, 90 + i)))
+        .collect();
+    let fresh: Vec<Vec<Detection>> = frames
+        .iter()
+        .map(|frame| fresh_objects(&classes, 0.5, frame))
+        .collect();
+    let total = std::sync::atomic::AtomicU32::new(0);
+    std::thread::scope(|scope| {
+        for t in 0..4 {
+            let (memo, classes, frames, fresh, total) = (&memo, &classes, &frames, &fresh, &total);
+            scope.spawn(move || {
+                let runs = std::cell::Cell::new(0);
+                for round in 0..4 {
+                    let i = (round + t) % frames.len();
+                    let found =
+                        detect_objects(Some(memo), classes, 0.5, &frames[i], fake_yolo(&runs))
+                            .unwrap();
+                    assert_eq!(found, fresh[i]);
+                }
+                total.fetch_add(runs.get(), std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+    });
+    let total = total.into_inner();
+    assert!((3..=16).contains(&total), "{total} runs");
+    let runs = std::cell::Cell::new(0);
+    for (frame, want) in frames.iter().zip(&fresh) {
+        assert_eq!(
+            &detect_objects(Some(&memo), &classes, 0.5, frame, fake_yolo(&runs)).unwrap(),
+            want
+        );
+    }
+    assert_eq!(runs.get(), 0);
+}
+
+#[test]
+fn without_a_memo_every_detection_runs_the_model() {
+    // A provider whose session lock is poisoned leaves its
+    // memo out, so that every detection reaches the lock and
+    // fails there as it always did. Without a memo nothing
+    // is looked up and nothing is remembered: a frame the
+    // memo knows runs the model again.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let classes = classes();
+    let img = DynamicImage::ImageRgb8(noise_rgb(120, 90, 86));
+    let first = detect_objects(Some(&memo), &classes, 0.5, &img, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(
+        detect_objects(None, &classes, 0.5, &img, fake_yolo(&runs)).unwrap(),
+        first
+    );
+    assert_eq!(runs.get(), 2, "a detection without the memo did not run");
+    // The model's failure goes out, although the memo could
+    // have answered.
+    let failed = detect_objects(None, &classes, 0.5, &img, |_input| {
+        Err::<(Vec<i64>, Vec<f32>), _>(AiError::LockPoisoned)
+    });
+    assert_eq!(failed, Err(AiError::LockPoisoned));
+    // And a frame detected without the memo is not in it.
+    let other = DynamicImage::ImageRgb8(noise_rgb(120, 90, 87));
+    detect_objects(None, &classes, 0.5, &other, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 3);
+    detect_objects(Some(&memo), &classes, 0.5, &other, fake_yolo(&runs)).unwrap();
+    assert_eq!(runs.get(), 4);
+}
+
+/// The memo with the real model: a repeat gets the boxes
+/// the model gave, and another frame gets its own.
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_DETECT_MODEL=...
+/// CRABCROP_TEST_DETECT_LABELS=... (optional)
+/// CRABCROP_TEST_IMAGE=...
+#[test]
+#[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+fn detect_live_repeats_a_frame_from_the_memo() {
+    let var = |name: &str| std::env::var(name).unwrap();
+    let load = || {
+        OnnxDetectionProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_DETECT_MODEL"),
+            std::env::var("CRABCROP_TEST_DETECT_LABELS").ok().as_deref(),
+            0.35,
+        )
+        .unwrap()
+    };
+    let provider = load();
+    let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
+    let first = provider.detect(&img).unwrap();
+    assert!(!first.is_empty());
+    assert_eq!(provider.detect(&img).unwrap(), first);
+    // The same photo mirrored is another input, with its
+    // objects on the other side.
+    let mirrored = img.fliph();
+    let other = provider.detect(&mirrored).unwrap();
+    assert_ne!(other, first);
+    assert_eq!(provider.detect(&mirrored).unwrap(), other);
+    assert_eq!(provider.detect(&img).unwrap(), first);
+    // A provider that has never seen the photo gives the
+    // same boxes: the memo changes no answer.
+    assert_eq!(load().detect(&img).unwrap(), first);
 }

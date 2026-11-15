@@ -5,6 +5,7 @@ use image::DynamicImage;
 use ort::session::Session;
 use std::sync::Mutex;
 
+use super::memo::{DetectionMemo, MemoKey};
 use super::session::{build_session, fir_resize, rgb8_view};
 use super::{AiError, FaceBox, FaceProvider};
 
@@ -17,6 +18,10 @@ use super::{AiError, FaceBox, FaceProvider};
 pub struct OnnxFaceProvider {
     session: Mutex<Session>,
     input_name: String,
+    /// The boxes of recent inputs (issue #677): a smart crop
+    /// of the same source at another size asks for the same
+    /// faces.
+    memo: DetectionMemo<FaceBox>,
 }
 
 impl OnnxFaceProvider {
@@ -33,6 +38,7 @@ impl OnnxFaceProvider {
         let provider = Self {
             session: Mutex::new(session),
             input_name,
+            memo: DetectionMemo::new(),
         };
         provider
             .detect(&DynamicImage::new_rgb8(8, 8))
@@ -62,35 +68,83 @@ const FACE_NMS_THRESHOLD: f32 = 0.3;
 
 impl FaceProvider for OnnxFaceProvider {
     fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, AiError> {
-        let (ow, oh) = (img.width(), img.height());
-        if ow == 0 || oh == 0 {
-            return Ok(Vec::new());
-        }
-        // The export takes exactly 640x640. The image is scaled
-        // to fit (the reference wrapper resizes the same way);
-        // boxes map back with independent axis scales.
-        let small = fir_resize(&*rgb8_view(img), FACE_INPUT, FACE_INPUT);
-        let tensor = ort::value::Tensor::from_array((
-            [1, 3, FACE_INPUT as usize, FACE_INPUT as usize],
-            face_tensor(&small).into_boxed_slice(),
-        ))
-        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
-        let outputs = session
-            .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
-        let mut by_name: std::collections::HashMap<String, Vec<f32>> =
-            std::collections::HashMap::new();
-        for (name, value) in outputs.into_iter() {
-            let (_, data) = value
-                .try_extract_tensor::<f32>()
-                .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
-            by_name.insert(name.to_string(), data.to_vec());
-        }
-        drop(session);
-        let candidates = decode_face_candidates(&by_name, ow, oh, FACE_SCORE_THRESHOLD)?;
-        Ok(nms(candidates))
+        // A provider whose session a panic has poisoned
+        // answers no frame, as before: the memo is left out,
+        // so a remembered frame fails at the lock like any
+        // other.
+        let memo = (!self.session.is_poisoned()).then_some(&self.memo);
+        detect_faces(memo, img, |input| {
+            let tensor = ort::value::Tensor::from_array((
+                [1, 3, FACE_INPUT as usize, FACE_INPUT as usize],
+                input.into_boxed_slice(),
+            ))
+            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let outputs = session
+                .run(ort::inputs![self.input_name.as_str() => tensor])
+                .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+            let mut by_name: FaceOutputs = std::collections::HashMap::new();
+            for (name, value) in outputs.into_iter() {
+                let (_, data) = value.try_extract_tensor::<f32>().map_err(|e| {
+                    AiError::BadOutput(format!("cannot read the model output: {e}"))
+                })?;
+                by_name.insert(name.to_string(), data.to_vec());
+            }
+            Ok(by_name)
+        })
     }
+}
+
+/// YuNet's outputs, by name.
+type FaceOutputs = std::collections::HashMap<String, Vec<f32>>;
+
+/// One face detection around a model run: `run` takes
+/// YuNet's input tensor and returns its outputs by name.
+/// The provider passes its session; the tests pass a fake
+/// model. With a memo, an input it knows is answered from
+/// it and `run` is not called, and a result is remembered
+/// only once the model has run and its output has decoded:
+/// a failure is never remembered.
+fn detect_faces(
+    memo: Option<&DetectionMemo<FaceBox>>,
+    img: &DynamicImage,
+    run: impl FnOnce(Vec<f32>) -> Result<FaceOutputs, AiError>,
+) -> Result<Vec<FaceBox>, AiError> {
+    let (ow, oh) = (img.width(), img.height());
+    if ow == 0 || oh == 0 {
+        return Ok(Vec::new());
+    }
+    // The export takes exactly 640x640. The image is scaled
+    // to fit (the reference wrapper resizes the same way);
+    // boxes map back with independent axis scales.
+    let small = fir_resize(&*rgb8_view(img), FACE_INPUT, FACE_INPUT);
+    // Two things decide the boxes: the model's input, which
+    // is these pixels in a fixed arrangement, and the source
+    // size the boxes are mapped back to.
+    let remembered = memo.map(|memo| {
+        let key = MemoKey::of(&[
+            small.as_raw().as_slice(),
+            &ow.to_le_bytes(),
+            &oh.to_le_bytes(),
+        ]);
+        (memo, key)
+    });
+    if let Some((memo, key)) = &remembered
+        && let Some(found) = memo.get(key)
+    {
+        return Ok(found);
+    }
+    let outputs = run(face_tensor(&small))?;
+    let found = nms(decode_face_candidates(
+        &outputs,
+        ow,
+        oh,
+        FACE_SCORE_THRESHOLD,
+    )?);
+    if let Some((memo, key)) = remembered {
+        memo.put(key, &found);
+    }
+    Ok(found)
 }
 
 /// YuNet's input for a frame at the model's size: BGR planar

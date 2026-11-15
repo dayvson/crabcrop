@@ -6,6 +6,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::clip::read_labels;
+use super::memo::{DetectionMemo, MemoKey};
 use super::session::{TensorOutput, build_session, fir_resize, first_output, rgb8_view};
 use super::{AiError, Detection, DetectionProvider};
 
@@ -24,6 +25,10 @@ pub struct OnnxDetectionProvider {
     input_name: String,
     classes: Vec<String>,
     threshold: f32,
+    /// The detections of recent inputs (issue #677): the
+    /// same source at another crop size, or a meta request
+    /// after the render, asks for the same boxes.
+    memo: DetectionMemo<Detection>,
 }
 
 impl OnnxDetectionProvider {
@@ -79,6 +84,7 @@ impl OnnxDetectionProvider {
             input_name,
             classes,
             threshold,
+            memo: DetectionMemo::new(),
         };
         // Probe the output layout with a blank image: any
         // detections found are discarded, but a layout the
@@ -111,39 +117,89 @@ impl DetectionProvider for OnnxDetectionProvider {
     }
 
     fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError> {
-        let (input, scale, pad_x, pad_y) = letterbox(img);
-        let tensor = ort::value::Tensor::from_array((
-            [1, 3, DETECT_INPUT as usize, DETECT_INPUT as usize],
-            input.into_boxed_slice(),
-        ))
-        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
-        let outputs = session
-            .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
-        // Only the first output is read, and in place: it
-        // is 2.8 MB for an 80-class export. The others are
-        // still checked to be float tensors, as collecting
-        // them all checked.
-        for value in outputs.values() {
-            value
-                .try_extract_tensor::<f32>()
-                .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
-        }
-        let first = first_output(outputs)?;
-        let (dims, data) = first.f32_tensor()?;
-        postprocess_detections(
-            data,
-            dims,
-            &self.classes,
-            self.threshold,
-            img.width(),
-            img.height(),
-            scale,
-            pad_x,
-            pad_y,
-        )
+        // A provider whose session a panic has poisoned
+        // answers no frame, as before: the memo is left out,
+        // so a remembered frame fails at the lock like any
+        // other.
+        let memo = (!self.session.is_poisoned()).then_some(&self.memo);
+        detect_objects(memo, &self.classes, self.threshold, img, |input| {
+            let tensor = ort::value::Tensor::from_array((
+                [1, 3, DETECT_INPUT as usize, DETECT_INPUT as usize],
+                input.into_boxed_slice(),
+            ))
+            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let outputs = session
+                .run(ort::inputs![self.input_name.as_str() => tensor])
+                .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+            // Only the first output is read, and in place:
+            // it is 2.8 MB for an 80-class export. The
+            // others are still checked to be float tensors,
+            // as collecting them all checked.
+            for value in outputs.values() {
+                value.try_extract_tensor::<f32>().map_err(|e| {
+                    AiError::BadOutput(format!("cannot read the model output: {e}"))
+                })?;
+            }
+            first_output(outputs)
+        })
     }
+}
+
+/// One detection around a model run: `run` takes the
+/// letterboxed input tensor and returns the model's first
+/// output. The provider passes its session; the tests pass
+/// a fake model. With a memo, an input it knows is answered
+/// from it and `run` is not called, and a result is
+/// remembered only once the model has run and its output
+/// has decoded: a failure is never remembered.
+fn detect_objects<O: TensorOutput>(
+    memo: Option<&DetectionMemo<Detection>>,
+    classes: &[String],
+    threshold: f32,
+    img: &DynamicImage,
+    run: impl FnOnce(Vec<f32>) -> Result<O, AiError>,
+) -> Result<Vec<Detection>, AiError> {
+    let (resized, scale) = letterbox_frame(img);
+    // What decides the detections: the model's input, which
+    // is these pixels centered on a fixed gray square; the
+    // source size the boxes are mapped back to; and the
+    // score floor and the class names the boxes are read
+    // with.
+    let remembered = memo.map(|memo| {
+        let sizes =
+            [resized.width(), resized.height(), img.width(), img.height()].map(u32::to_le_bytes);
+        let floor = threshold.to_bits().to_le_bytes();
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(6 + classes.len());
+        parts.push(resized.as_raw());
+        parts.extend(sizes.iter().map(|size| size.as_slice()));
+        parts.push(&floor);
+        parts.extend(classes.iter().map(|class| class.as_bytes()));
+        (memo, MemoKey::of(&parts))
+    });
+    if let Some((memo, key)) = &remembered
+        && let Some(found) = memo.get(key)
+    {
+        return Ok(found);
+    }
+    let (input, pad_x, pad_y) = letterbox_tensor(&resized);
+    let output = run(input)?;
+    let (dims, data) = output.f32_tensor()?;
+    let found = postprocess_detections(
+        data,
+        dims,
+        classes,
+        threshold,
+        img.width(),
+        img.height(),
+        scale,
+        pad_x,
+        pad_y,
+    )?;
+    if let Some((memo, key)) = remembered {
+        memo.put(key, &found);
+    }
+    Ok(found)
 }
 
 /// The class vocabulary from a model's `names` metadata
@@ -179,17 +235,24 @@ fn parse_names_metadata(raw: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Letterbox an image into the detector's square input:
-/// scale to fit, pad with the standard gray, planar CHW
-/// at 0..1. Returns the tensor, the scale, and the padding
-/// offset, which the post-processor needs to map boxes
-/// back to image coordinates.
-fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
+/// The first half of the letterbox: the image scaled to
+/// fit the detector's square input. Returns the scaled
+/// frame and the scale, which the post-processor needs to
+/// map boxes back to image coordinates.
+fn letterbox_frame(img: &DynamicImage) -> (image::RgbImage, f32) {
     let (w, h) = (img.width().max(1), img.height().max(1));
     let scale = (DETECT_INPUT as f32 / w as f32).min(DETECT_INPUT as f32 / h as f32);
     let nw = ((w as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
     let nh = ((h as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
-    let resized = fir_resize(&*rgb8_view(img), nw, nh);
+    (fir_resize(&*rgb8_view(img), nw, nh), scale)
+}
+
+/// The second half: the scaled frame centered on the
+/// standard gray, planar CHW at 0..1. Returns the tensor
+/// and the padding offset, which the post-processor needs
+/// too.
+fn letterbox_tensor(resized: &image::RgbImage) -> (Vec<f32>, u32, u32) {
+    let (nw, nh) = resized.dimensions();
     let pad_x = (DETECT_INPUT - nw) / 2;
     let pad_y = (DETECT_INPUT - nh) / 2;
     let plane = (DETECT_INPUT * DETECT_INPUT) as usize;
@@ -214,7 +277,7 @@ fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
             *b = px[2] as f32 / 255.0;
         }
     }
-    (out, scale, pad_x, pad_y)
+    (out, pad_x, pad_y)
 }
 
 /// Turn a YOLOv8-family output tensor into detections in

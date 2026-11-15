@@ -25,6 +25,7 @@ mod face;
 mod focal;
 mod inpaint;
 mod mask;
+mod memo;
 mod moderation;
 mod ocr;
 pub(crate) mod resample;
