@@ -158,10 +158,15 @@ const WORKER_PIPE_BYTES: usize = 256 * 1024;
 /// effort: where the kernel refuses (the user's pipe budget is
 /// spent, a lower `pipe-max-size`), and on a system with no
 /// such call, the pipe keeps its capacity and the exchange
-/// runs as it always has.
+/// runs as it always has. A pipe that already holds as much
+/// is left alone: the call sets a capacity, and a host whose
+/// pipes start larger than [`DEFAULT_PIPE_BYTES`] must not
+/// have one narrowed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn widen_pipe(pipe: &impl std::os::fd::AsFd, bytes: usize) {
-    let _ = rustix::pipe::fcntl_setpipe_size(pipe, bytes);
+    if rustix::pipe::fcntl_getpipe_size(pipe).is_ok_and(|held| held < bytes) {
+        let _ = rustix::pipe::fcntl_setpipe_size(pipe, bytes);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1621,11 +1626,18 @@ mod tests {
         widen_pipe(&writer, WORKER_PIPE_BYTES);
         let after = capacity(&writer);
         // Granted, or refused where this user's pipe budget is
-        // spent: never an error, never a smaller pipe.
+        // spent, or not needed where pipes start as large:
+        // never an error, never a smaller pipe.
         assert!(
-            after == WORKER_PIPE_BYTES || after == before,
+            after == before || (before < WORKER_PIPE_BYTES && after == WORKER_PIPE_BYTES),
             "{before} bytes became {after}"
         );
+        // A pipe that holds more is not narrowed to the size
+        // asked for.
+        if after == WORKER_PIPE_BYTES {
+            widen_pipe(&writer, DEFAULT_PIPE_BYTES);
+            assert_eq!(capacity(&writer), after);
+        }
         // A size the kernel refuses outright leaves the pipe as
         // it was, and so does a descriptor that is no pipe.
         widen_pipe(&writer, usize::MAX);
@@ -1642,11 +1654,17 @@ mod tests {
         assert_eq!(carried, "still a pipe");
     }
 
-    /// Whether the kernel widens a pipe for this user (it stops
-    /// once the user's pipe budget is spent).
+    /// Whether a pipe starts at [`DEFAULT_PIPE_BYTES`] here and
+    /// the kernel widens it for this user. Some hosts start
+    /// their pipes larger, and the kernel stops widening once
+    /// the user's pipe budget is spent; the test below can
+    /// tell a wide pipe from a default one in neither case.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn pipes_can_be_widened() -> bool {
         let (_reader, writer) = std::io::pipe().unwrap();
+        if rustix::pipe::fcntl_getpipe_size(&writer).unwrap() != DEFAULT_PIPE_BYTES {
+            return false;
+        }
         widen_pipe(&writer, WORKER_PIPE_BYTES);
         rustix::pipe::fcntl_getpipe_size(&writer).unwrap() == WORKER_PIPE_BYTES
     }
