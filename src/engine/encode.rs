@@ -7,6 +7,9 @@
 //!
 //! engine.rs re-exports the entry point the pipeline uses.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use super::{EngineError, flatten};
@@ -305,17 +308,21 @@ pub(in crate::engine) fn encode(
             // Opaque 8-bit RGB skips the image crate and takes
             // the same ravif call with its planes already
             // converted (issue #663).
+            // Either way the encode runs in a pool of
+            // [`AVIF_TILES`] threads, which is what fixes its
+            // tile count (issue #671).
             let img = src.integer();
+            let quality = quality.unwrap_or(80);
+            let pools = AvifPools::get()?;
             if let Some(rgb) = avif_direct(img) {
-                return encode_avif_rgb8(rgb, avif_speed, quality.unwrap_or(80));
+                return pools.run(|| encode_avif_rgb8(rgb, avif_speed, quality));
             }
-            image::codecs::avif::AvifEncoder::new_with_speed_quality(
-                &mut buf,
-                avif_speed,
-                quality.unwrap_or(80),
-            )
-            .write_image(img.as_bytes(), w, h, img.color().into())
-            .map_err(|e| EngineError::Encode(e.to_string()))?;
+            let out = &mut buf;
+            pools.run(move || {
+                image::codecs::avif::AvifEncoder::new_with_speed_quality(out, avif_speed, quality)
+                    .write_image(img.as_bytes(), w, h, img.color().into())
+                    .map_err(|e| EngineError::Encode(e.to_string()))
+            })?;
         }
         StillFormat::Gif => {
             let frame = gif_frame_quantized(src.rgba().as_raw(), w, h, 0)?;
@@ -493,6 +500,81 @@ fn avif_ycbcr_exact(r: u8, g: u8, b: u8) -> [u8; 3] {
     [y, cb, cr].map(|value| (f64::from(value) + 0.5) as u8)
 }
 
+/// How many tiles an AVIF is written in, where the frame is
+/// large enough for that many (issue #671). The encoder
+/// (ravif) is given no tile count: it takes the number of
+/// threads of the rayon pool it runs in, held to what the
+/// frame's size allows. Left to rayon's global pool that is
+/// the host's core count, so replicas with different core
+/// counts rendered one URL to different files. Four is what
+/// a four-core host has always written. More tiles encode
+/// faster on a host with the cores for them and compress
+/// worse: an 800x533 frame comes out 2% larger in four tiles
+/// than in one, and 5% larger in eight.
+const AVIF_TILES: usize = 4;
+
+/// The thread pools AVIF encodes run in: each of exactly
+/// [`AVIF_TILES`] threads, which is what holds the tile
+/// count, and one pool for every [`AVIF_TILES`] cores
+/// (rounded up), so a host with more cores still runs that
+/// many encodes side by side. Built at the first AVIF encode
+/// and kept: asking the encoder for a thread count instead
+/// (`with_num_threads`) builds and drops a pool inside every
+/// encode, which measured 9% slower at 800x533.
+struct AvifPools {
+    pools: Vec<rayon::ThreadPool>,
+    /// The encodes running in each pool.
+    running: Vec<AtomicUsize>,
+}
+
+static AVIF_POOLS: OnceLock<AvifPools> = OnceLock::new();
+
+impl AvifPools {
+    fn get() -> Result<&'static AvifPools, EngineError> {
+        if let Some(pools) = AVIF_POOLS.get() {
+            return Ok(pools);
+        }
+        // A failure to start the threads fails this encode and
+        // is not remembered: the next one tries again.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let built = Self::build(cores.div_ceil(AVIF_TILES))?;
+        Ok(AVIF_POOLS.get_or_init(|| built))
+    }
+
+    fn build(count: usize) -> Result<AvifPools, EngineError> {
+        let pools = (0..count)
+            .map(|pool| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(AVIF_TILES)
+                    .thread_name(move |thread| format!("avif-{pool}-{thread}"))
+                    .build()
+                    .map_err(|e| EngineError::Encode(format!("avif: no encoder threads: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AvifPools {
+            running: pools.iter().map(|_| AtomicUsize::new(0)).collect(),
+            pools,
+        })
+    }
+
+    /// Run `encode` in the pool with the fewest encodes
+    /// running. Encodes that share a pool share its threads.
+    fn run<R: Send>(&self, encode: impl FnOnce() -> R + Send) -> R {
+        struct Running<'a>(&'a AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let pool = (0..self.pools.len())
+            .min_by_key(|&pool| self.running[pool].load(Ordering::Relaxed))
+            .unwrap_or(0);
+        self.running[pool].fetch_add(1, Ordering::Relaxed);
+        let _running = Running(&self.running[pool]);
+        self.pools[pool].install(encode)
+    }
+}
+
 /// The image [`encode_avif_rgb8`] takes: opaque 8-bit RGB
 /// with at least one pixel. Alpha, gray, 16-bit and (through
 /// [`EncodeBuffers::integer`]) float images keep the image
@@ -510,7 +592,8 @@ fn avif_direct(img: &DynamicImage) -> Option<&image::RgbImage> {
 /// this ravif call itself (`encode_rgb`, with the quality
 /// for color and alpha, the speed and 8-bit depth set and
 /// everything else at ravif's defaults, the thread count
-/// among them), and ravif converts each pixel to YCbCr and
+/// among them: the pool the caller runs this in decides
+/// it), and ravif converts each pixel to YCbCr and
 /// passes the planes to `encode_raw_planes_8_bit`. The
 /// planes handed over here hold those same values (see
 /// [`avif_ycbcr`]), so the file is the same, byte for byte:
@@ -1209,10 +1292,25 @@ mod tests {
     }
 
     /// The image crate's AVIF encode of `img`: the path every
-    /// AVIF output took before the direct call.
+    /// AVIF output took before the direct call, asked for the
+    /// engine's tile count.
     fn image_crate_avif(img: &DynamicImage, speed: u8, quality: u8) -> image::ImageResult<Vec<u8>> {
+        image_crate_avif_in_tiles(img, speed, quality, AVIF_TILES)
+    }
+
+    /// The image crate's AVIF encode of `img` in `tiles` tiles,
+    /// or as many as the frame's size allows. The crate passes
+    /// the thread count it is asked for to ravif, which takes
+    /// it for its tile count as well (issue #671).
+    fn image_crate_avif_in_tiles(
+        img: &DynamicImage,
+        speed: u8,
+        quality: u8,
+        tiles: usize,
+    ) -> image::ImageResult<Vec<u8>> {
         let mut out = Vec::new();
         image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut out, speed, quality)
+            .with_num_threads(Some(tiles))
             .write_image(
                 img.as_bytes(),
                 img.width(),
@@ -1271,14 +1369,135 @@ mod tests {
         }
         same(&field(65, 65), 10, 60);
         // A frame large enough for two tiles. ravif takes the
-        // tile count from the size of the thread pool, so the
-        // bytes hold only while the direct call leaves the
-        // thread count unset, as the image crate does. A smooth
-        // frame keeps the encode short.
+        // tile count from the size of the thread pool it runs
+        // in, so the bytes hold only while the direct call
+        // runs in the pool the image crate's does (issue #671).
+        // A smooth frame keeps the encode short.
         let smooth = image::RgbImage::from_fn(256, 128, |x, y| {
             image::Rgb([x as u8, (y * 2) as u8, ((x + y) / 2) as u8])
         });
         same(&DynamicImage::ImageRgb8(smooth), 10, 80);
+    }
+
+    /// Smooth frames of 256x256, opaque and with alpha: large
+    /// enough for four tiles and no more at speed 10 and
+    /// quality 80, where ravif wants 128 pixels a side for a
+    /// tile. (Under quality 80 it wants 256, and this frame
+    /// is one tile whatever the pool.)
+    fn four_tile_frames() -> [DynamicImage; 2] {
+        let rgb = image::RgbImage::from_fn(256, 256, |x, y| {
+            image::Rgb([x as u8, y as u8, ((x + y) / 2) as u8])
+        });
+        let rgba = image::RgbaImage::from_fn(256, 256, |x, y| {
+            image::Rgba([x as u8, y as u8, ((x + y) / 2) as u8, (255 - x / 2) as u8])
+        });
+        [DynamicImage::ImageRgb8(rgb), DynamicImage::ImageRgba8(rgba)]
+    }
+
+    #[test]
+    fn avif_bytes_do_not_follow_the_callers_thread_pool() {
+        // Issue #671: ravif writes as many tiles as the rayon
+        // pool it runs in has threads. Left to the global pool
+        // that was the host's core count, so replicas with
+        // different core counts wrote different files. A pool
+        // around the call stands in for such a host here: with
+        // one thread, with two and with eight the bytes are
+        // those of a call from outside any pool, for the direct
+        // path and for the image crate's.
+        for img in four_tile_frames() {
+            let plain = engine_avif(&img, 10, 80).unwrap();
+            for threads in [1, 2, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let inside = pool.install(|| engine_avif(&img, 10, 80)).unwrap();
+                assert!(
+                    inside == plain,
+                    "{:?} from a pool of {threads}: {} and {} bytes",
+                    img.color(),
+                    inside.len(),
+                    plain.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn avif_is_written_in_four_tiles() {
+        // The count is part of what a URL renders to: a change
+        // changes the bytes of every AVIF large enough for two
+        // tiles, and needs a new rendering version.
+        assert_eq!(AVIF_TILES, 4);
+        for img in four_tile_frames() {
+            let in_tiles = |tiles| image_crate_avif_in_tiles(&img, 10, 80, tiles).unwrap();
+            let [one, two, four, eight] = [1, 2, 4, 8].map(in_tiles);
+            // What the comparison below rests on: ravif takes
+            // the thread count it is asked for as its tile
+            // count, each count up to four is another file, and
+            // this frame has room for four and no more. An
+            // update that changes how ravif picks its tiles
+            // fails here.
+            assert!(
+                one != two && two != four && one != four,
+                "{:?}",
+                img.color()
+            );
+            assert!(eight == four, "{:?}", img.color());
+            assert!(
+                engine_avif(&img, 10, 80).unwrap() == four,
+                "{:?}",
+                img.color()
+            );
+        }
+    }
+
+    #[test]
+    fn avif_pools_hold_four_threads_each_and_spread_the_encodes() {
+        let pools = AvifPools::build(3).unwrap();
+        assert_eq!(pools.pools.len(), 3);
+        for pool in &pools.pools {
+            assert_eq!(pool.current_num_threads(), AVIF_TILES);
+        }
+        // An encode runs on a thread of its pool, where ravif
+        // reads the pool's size.
+        assert_eq!(pools.run(rayon::current_num_threads), AVIF_TILES);
+        // Three encodes at once take the three pools, a fourth
+        // shares the first, and a pool is free again once its
+        // encode returns, an encode that panics included.
+        let running = |pools: &AvifPools| {
+            pools
+                .running
+                .iter()
+                .map(|n| n.load(Ordering::Relaxed))
+                .collect::<Vec<_>>()
+        };
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        std::thread::scope(|scope| {
+            for expected in [[1, 0, 0], [1, 1, 0], [1, 1, 1], [2, 1, 1]] {
+                let entered_tx = entered_tx.clone();
+                let (shared, gate) = (&pools, &held);
+                scope.spawn(move || {
+                    shared.run(|| {
+                        entered_tx.send(()).unwrap();
+                        let _ = gate.lock().unwrap().recv();
+                    });
+                });
+                entered.recv().unwrap();
+                assert_eq!(running(&pools), expected);
+            }
+            for _ in 0..4 {
+                release.send(()).unwrap();
+            }
+        });
+        assert_eq!(running(&pools), [0, 0, 0]);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pools.run(|| panic!("an encode that panics"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(running(&pools), [0, 0, 0]);
     }
 
     #[test]
