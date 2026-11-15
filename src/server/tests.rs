@@ -221,6 +221,7 @@ fn test_state() -> AppState {
         process_gate: Arc::new(Gate::new(4)),
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+        avif_tiles: crate::engine::AvifTiles::default(),
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,
@@ -9806,6 +9807,7 @@ fn provenance_job(
         dpr: None,
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+        avif_tiles: crate::engine::AvifTiles::default(),
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         progress: Default::default(),
     }
@@ -10535,6 +10537,7 @@ async fn processing_gate_bounds_concurrency() {
         dpr: None,
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
+        avif_tiles: state.avif_tiles,
         jxl_speed: state.jxl_speed,
         progress: Default::default(),
     };
@@ -10610,6 +10613,7 @@ async fn timed_out_encode_releases_the_process_gate() {
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
+            avif_tiles: state.avif_tiles,
             jxl_speed: state.jxl_speed,
             progress: Default::default(),
         }
@@ -11308,6 +11312,7 @@ fn lane_test_job(
         dpr: None,
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+        avif_tiles: crate::engine::AvifTiles::default(),
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         progress: Default::default(),
     }
@@ -11639,6 +11644,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         dpr: None,
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
+        avif_tiles: state.avif_tiles,
         jxl_speed: state.jxl_speed,
         progress: Default::default(),
     };
@@ -16707,6 +16713,53 @@ async fn negotiates_avif_from_accept() {
     );
     let body = resp.bytes().await.unwrap();
     assert_eq!(&body[4..8], b"ftyp");
+}
+
+/// The server's AVIF tile count (`CRABCROP_AVIF_TILES`, issue
+/// #688) reaches the encode: through the job and the
+/// pipeline's context to the pools the encode runs in.
+#[tokio::test]
+async fn avif_is_written_in_the_servers_tile_count() {
+    use image::ImageEncoder;
+    // Room for four tiles at speed 10 and quality 80, so two
+    // tiles are another file than the default four.
+    let frame = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 256, |x, y| {
+        image::Rgb([x as u8, y as u8, ((x + y) / 2) as u8])
+    }));
+    let in_tiles = |threads: usize| {
+        let mut out = Vec::new();
+        image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut out, 10, 80)
+            .with_num_threads(Some(threads))
+            .write_image(frame.as_bytes(), 256, 256, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    };
+    let (two, four) = (in_tiles(2), in_tiles(4));
+    assert!(two != four);
+    let mut png = std::io::Cursor::new(Vec::new());
+    frame.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let src = spawn_bytes_server(png.into_inner()).await;
+    let base = spawn_state(AppState {
+        avif_speed: 10,
+        avif_tiles: crate::engine::AvifTiles::new(2).unwrap(),
+        ..test_state()
+    })
+    .await;
+    let remainder = format!("filters:format(avif):quality(80)/{src}");
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.unwrap();
+    assert!(
+        body == two,
+        "{} bytes, two tiles are {} and four {}",
+        body.len(),
+        two.len(),
+        four.len()
+    );
 }
 
 /// A float TIFF source (Rgb32F samples) renders to PNG, plain

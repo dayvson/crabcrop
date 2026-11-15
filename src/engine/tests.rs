@@ -4658,6 +4658,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -4697,6 +4698,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -4715,6 +4717,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -4734,6 +4737,7 @@ fn jpeg_options_change_the_encode() {
             None,
             options,
             DEFAULT_AVIF_SPEED,
+            AvifTiles::default(),
             DEFAULT_JXL_SPEED,
         )
         .unwrap()
@@ -4792,6 +4796,7 @@ fn jpeg_bytes(
             ..FormatOptions::default()
         },
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap()
@@ -5281,6 +5286,7 @@ fn jpeg_refuses_the_sizes_the_format_and_libjpeg_do_not_take() {
             None,
             FormatOptions::default(),
             DEFAULT_AVIF_SPEED,
+            AvifTiles::default(),
             DEFAULT_JXL_SPEED,
         )
     };
@@ -5379,6 +5385,7 @@ fn jpeg_takes_every_pixel_layout_as_8_bit_rgb() {
             None,
             FormatOptions::default(),
             DEFAULT_AVIF_SPEED,
+            AvifTiles::default(),
             DEFAULT_JXL_SPEED,
         )
         .unwrap()
@@ -5521,6 +5528,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5538,6 +5546,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
             ..FormatOptions::default()
         },
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5576,6 +5585,7 @@ fn png_interlace_writes_16_bit_samples_big_endian() {
             ..FormatOptions::default()
         },
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5755,6 +5765,7 @@ fn webp_options_change_the_encode() {
             None,
             options,
             DEFAULT_AVIF_SPEED,
+            AvifTiles::default(),
             DEFAULT_JXL_SPEED,
         )
         .unwrap()
@@ -5793,6 +5804,7 @@ fn webp_options_change_the_encode() {
             ..FormatOptions::default()
         },
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5819,6 +5831,7 @@ fn format_options_do_not_leak_across_formats() {
             ..FormatOptions::default()
         },
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5830,6 +5843,7 @@ fn format_options_do_not_leak_across_formats() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5847,6 +5861,7 @@ fn format_options_do_not_leak_across_formats() {
             ..FormatOptions::default()
         },
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -5858,6 +5873,7 @@ fn format_options_do_not_leak_across_formats() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();
@@ -6101,6 +6117,7 @@ fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
         None,
         FormatOptions::default(),
         DEFAULT_AVIF_SPEED,
+        AvifTiles::default(),
         DEFAULT_JXL_SPEED,
     )
     .unwrap();

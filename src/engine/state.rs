@@ -299,6 +299,9 @@ pub struct ProcessContext<'a> {
     /// ravif speed tier for AVIF encodes (1 slowest to 10
     /// fastest), from `CRABCROP_AVIF_SPEED`.
     pub avif_speed: u8,
+    /// How many tiles an AVIF is written in, from
+    /// `CRABCROP_AVIF_TILES` (issue #688).
+    pub avif_tiles: super::AvifTiles,
     /// jixel speed tier for JPEG XL encodes, from
     /// `CRABCROP_JXL_SPEED`.
     pub jxl_speed: jixel::Speed,
