@@ -4694,8 +4694,8 @@ fn jpeg_layout_is_jfif_then_tables_frame_and_scans() {
 }
 
 /// A JPEG decoded by the engine's own decoder (zune-jpeg)
-/// and by libjpeg-turbo, the decoder browsers read JPEG
-/// with, each as RGB rows.
+/// and by libjpeg-turbo, the decoder Chrome and Firefox
+/// read JPEG with, each as RGB rows.
 fn jpeg_decodes(bytes: &[u8], width: u32, height: u32) -> [Vec<u8>; 2] {
     let ours = decode_image(bytes).expect("the engine decodes its own JPEG");
     assert_eq!((ours.width(), ours.height()), (width, height));
@@ -5096,7 +5096,10 @@ fn jpeg_takes_every_pixel_layout_as_8_bit_rgb() {
 /// file as the encoder wrote it; the C2PA signer adds its
 /// manifest store on top. After both, each decoder reads
 /// the picture it read before, the metadata reads back, and
-/// the manifest validates, baseline and progressive.
+/// the manifest validates, baseline and progressive. The
+/// signed file is then the parent of a second signing, as
+/// one render's output is when it is the source of the
+/// next: its store is found and its signature checked.
 #[test]
 fn jpeg_takes_metadata_a_profile_and_a_manifest() {
     use crate::color::fixture;
@@ -5166,6 +5169,39 @@ fn jpeg_takes_metadata_a_profile_and_a_manifest() {
         assert_eq!(kept, segments, "progressive {progressive}");
         assert_eq!(jpeg_decodes(&signed, 48, 32), pixels);
         carries(&signed);
+        // As a parent ingredient: the signer reads the
+        // store back out of the file's segments, records
+        // that its signature checked, and leaves the store
+        // itself out of the new file.
+        let child = signer
+            .sign(
+                &tagged,
+                "image/jpeg",
+                &crate::provenance::SignRequest {
+                    ingredient: Some((signed.as_slice(), "image/jpeg")),
+                    ai_edited: false,
+                },
+            )
+            .expect("the output signs with a parent");
+        let summary = crate::provenance::read_manifest(&child, "image/jpeg")
+            .expect("the signed output carries a manifest");
+        assert_eq!(summary.state, "valid", "progressive {progressive}");
+        assert_eq!(summary.manifests, 1, "progressive {progressive}");
+        assert_eq!(summary.ingredients, 1, "progressive {progressive}");
+        let store: serde_json::Value =
+            serde_json::from_str(&crate::provenance::manifest_json(&child, "image/jpeg")).unwrap();
+        let active = store["active_manifest"]
+            .as_str()
+            .expect("an active manifest");
+        let parent = &store["manifests"][active]["ingredients"][0];
+        assert!(
+            parent["validation_results"]["activeManifest"]["success"]
+                .as_array()
+                .is_some_and(|codes| codes
+                    .iter()
+                    .any(|status| status["code"] == "claimSignature.validated")),
+            "progressive {progressive}: the parent's store was not read: {parent}"
+        );
     }
 }
 
