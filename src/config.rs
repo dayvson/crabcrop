@@ -248,6 +248,8 @@ pub struct Config {
     /// The source buffer budget, in bytes (issue #403).
     pub source_buffer_bytes: u64,
     pub avif_speed: u8,
+    /// How many tiles an AVIF is written in (issue #688).
+    pub avif_tiles: crate::engine::AvifTiles,
     pub jxl_speed: jixel::Speed,
     pub width_step: u32,
     pub cache_bytes: usize,
@@ -415,6 +417,10 @@ impl Config {
                 format!("CRABCROP_AVIF_SPEED must be between 1 and 10, got {avif_speed}"),
             ));
         }
+        let avif_tiles = match get("CRABCROP_AVIF_TILES") {
+            Some(v) => parse_avif_tiles(&v)?,
+            None => crate::engine::AvifTiles::default(),
+        };
         let jxl_speed = match get("CRABCROP_JXL_SPEED") {
             Some(v) => parse_jxl_speed(&v)?,
             None => crate::engine::DEFAULT_JXL_SPEED,
@@ -505,6 +511,7 @@ impl Config {
             preserve_metadata,
             ssim_target,
             avif_speed,
+            avif_tiles,
             jxl_speed,
             width_step,
         );
@@ -569,6 +576,7 @@ impl Config {
             connections,
             source_buffer_bytes,
             avif_speed,
+            avif_tiles,
             jxl_speed,
             width_step,
             cache_bytes,
@@ -1073,6 +1081,22 @@ pub fn parse_jxl_speed(value: &str) -> Result<jixel::Speed, ConfigError> {
             ),
         )),
     }
+}
+
+/// `CRABCROP_AVIF_TILES` (issue #688): how many tiles an
+/// AVIF is written in, one of 1, 2, 4, 8 and 16.
+fn parse_avif_tiles(value: &str) -> Result<crate::engine::AvifTiles, ConfigError> {
+    value
+        .parse()
+        .ok()
+        .and_then(crate::engine::AvifTiles::new)
+        .ok_or_else(|| {
+            ConfigError::invalid(
+                "CRABCROP_AVIF_TILES",
+                value,
+                format!("invalid CRABCROP_AVIF_TILES: {value:?} (expected 1, 2, 4, 8, or 16)"),
+            )
+        })
 }
 
 /// Read the variable `name`'s `value` as `T`, or fall back

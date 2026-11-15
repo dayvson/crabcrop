@@ -172,6 +172,7 @@ fn state(dir: &std::path::Path) -> AppState {
         process_gate: Arc::new(Gate::new(4)),
         ssim_target: crabcrop::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crabcrop::engine::DEFAULT_AVIF_SPEED,
+        avif_tiles: crabcrop::engine::AvifTiles::default(),
         jxl_speed: crabcrop::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
         client_hints: true,

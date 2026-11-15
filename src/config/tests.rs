@@ -1645,6 +1645,7 @@ fn from_env_reads_every_default() {
         (40 * lanes).clamp(10, 65_536) * 1024 * 1024
     );
     assert_eq!(config.avif_speed, crate::engine::DEFAULT_AVIF_SPEED);
+    assert_eq!(config.avif_tiles, crate::engine::AvifTiles::default());
     assert_eq!(config.width_step, DEFAULT_WIDTH_STEP);
     assert_eq!(config.cache_bytes, 256 * 1024 * 1024);
     assert!(config.policy.block_private);
@@ -1671,6 +1672,7 @@ fn from_env_reads_every_default() {
             false,
             crate::quality::DEFAULT_SSIM_TARGET,
             crate::engine::DEFAULT_AVIF_SPEED,
+            crate::engine::AvifTiles::default(),
             crate::engine::DEFAULT_JXL_SPEED,
             DEFAULT_WIDTH_STEP,
         )
@@ -1726,6 +1728,41 @@ fn from_env_carries_what_it_read() {
         ("/c2pa/cert.pem", "/c2pa/key.pem")
     );
     assert!(config.meta_enabled);
+}
+
+#[test]
+fn from_env_reads_the_avif_tile_count() {
+    // Issue #688: one of the five counts, and nothing else.
+    for count in ["1", "2", "4", "8", "16"] {
+        let config = config_of(&[("CRABCROP_AVIF_TILES", count)]).unwrap();
+        assert_eq!(config.avif_tiles.count().to_string(), count);
+    }
+    for bad in ["0", "3", "6", "32", "256", "-4", "four", "4.0", " 4", ""] {
+        let err = refusal(&[("CRABCROP_AVIF_TILES", bad)]);
+        match &err {
+            ConfigError::Invalid { var, value, .. } => {
+                assert_eq!(*var, "CRABCROP_AVIF_TILES");
+                assert_eq!(*value, ConfigValue::Text(bad.to_string()));
+            }
+            other => panic!("{bad:?}: {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            format!("invalid CRABCROP_AVIF_TILES: {bad:?} (expected 1, 2, 4, 8, or 16)")
+        );
+    }
+    // The count is part of what a URL renders to, so each
+    // count is its own cache epoch. Four, set or not, is the
+    // fingerprint the default configuration has always had.
+    let fingerprint = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().config_fingerprint;
+    let unset = fingerprint(&[]);
+    assert_eq!(fingerprint(&[("CRABCROP_AVIF_TILES", "4")]), unset);
+    let mut seen = vec![unset];
+    for count in ["1", "2", "8", "16"] {
+        let set = fingerprint(&[("CRABCROP_AVIF_TILES", count)]);
+        assert!(!seen.contains(&set), "{count}: {set}");
+        seen.push(set);
+    }
 }
 
 #[test]
@@ -1838,6 +1875,7 @@ fn from_env_reports_the_first_bad_setting_in_boot_order() {
         ("CRABCROP_SHUTDOWN_GRACE_SECS", "x"),
         ("CRABCROP_SOURCE_BUFFER_MAX_MB", "1"),
         ("CRABCROP_AVIF_SPEED", "11"),
+        ("CRABCROP_AVIF_TILES", "3"),
         ("CRABCROP_JXL_SPEED", "turbo"),
         ("CRABCROP_WIDTH_STEP", "0"),
         ("CRABCROP_CACHE_MAX_MB", "x"),

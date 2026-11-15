@@ -322,6 +322,7 @@ pub(in crate::server) struct ProcessJob {
     pub(in crate::server) ssim_target: f64,
     pub(in crate::server) brand_color: Option<[u8; 3]>,
     pub(in crate::server) avif_speed: u8,
+    pub(in crate::server) avif_tiles: crate::engine::AvifTiles,
     pub(in crate::server) jxl_speed: jixel::Speed,
     /// How far the miss that built the job has got (see
     /// [`MissProgress`]): [`run_process`] marks each render
@@ -749,6 +750,7 @@ pub(in crate::server) async fn run_process(
                 ssim_target: job.ssim_target,
                 brand_color: job.brand_color,
                 avif_speed: job.avif_speed,
+                avif_tiles: job.avif_tiles,
                 jxl_speed: job.jxl_speed,
                 deadline: Some(deadline),
             };

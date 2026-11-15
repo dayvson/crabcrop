@@ -576,6 +576,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         slow_gate: Arc::new(crate::server::Gate::new(config.slow_lane_permits)),
         ssim_target: config.ssim_target,
         avif_speed: config.avif_speed,
+        avif_tiles: config.avif_tiles,
         jxl_speed: config.jxl_speed,
         width_step: config.width_step,
         client_hints: config.client_hints,
@@ -782,25 +783,25 @@ const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
-/// metadata policy, the quality tuning knobs, the
-/// width-hint step, the AI behavior thresholds, and the
-/// file-based inputs whose contents change results (the
-/// AI models, the CLIP set, the overlay font, the video
-/// and PDF tools, the detector declarations and the
-/// models they name), plus the brand color, whose value
-/// shapes studio composites. A file input is identified
-/// by a digest of its contents, never by its path alone:
-/// replacing a model or a font in place at the same path
-/// must start a fresh epoch, and the same contents under
-/// a new path must not. The fingerprint is embedded in
-/// every cache key (see `cache_key_for` in `server.rs`),
-/// so a restart under changed settings starts a fresh
-/// cache epoch instead of serving the old settings'
-/// renders from the persistent tiers. Settings that are
-/// already visible in the key (presets, default ops: both
-/// change the canonical form) are deliberately excluded,
-/// and so is the fallback image, whose responses are
-/// never cached.
+/// metadata policy, the quality tuning knobs, the AVIF
+/// tile count, the width-hint step, the AI behavior
+/// thresholds, and the file-based inputs whose contents
+/// change results (the AI models, the CLIP set, the
+/// overlay font, the video and PDF tools, the detector
+/// declarations and the models they name), plus the brand
+/// color, whose value shapes studio composites. A file
+/// input is identified by a digest of its contents, never
+/// by its path alone: replacing a model or a font in
+/// place at the same path must start a fresh epoch, and
+/// the same contents under a new path must not. The
+/// fingerprint is embedded in every cache key (see
+/// `cache_key_for` in `server.rs`), so a restart under
+/// changed settings starts a fresh cache epoch instead of
+/// serving the old settings' renders from the persistent
+/// tiers. Settings that are already visible in the key
+/// (presets, default ops: both change the canonical form)
+/// are deliberately excluded, and so is the fallback
+/// image, whose responses are never cached.
 ///
 /// Resolved through `get` (a name to value lookup, so
 /// tests can drive it without the process environment).
@@ -817,6 +818,7 @@ fn config_fingerprint(
     preserve_metadata: bool,
     ssim_target: f64,
     avif_speed: u8,
+    avif_tiles: crate::engine::AvifTiles,
     jxl_speed: jixel::Speed,
     width_step: u32,
 ) -> String {
@@ -835,6 +837,14 @@ fn config_fingerprint(
     );
     part("ssim_target", &ssim_target.to_string());
     part("avif_speed", &avif_speed.to_string());
+    // The AVIF tile count (issue #688), only when it is not
+    // the default four, which every AVIF was written in
+    // before the count was a setting: the default
+    // configuration keeps the fingerprint it had, and with
+    // it its cache epoch.
+    if avif_tiles != crate::engine::AvifTiles::default() {
+        part("avif_tiles", &avif_tiles.count().to_string());
+    }
     part("jxl_speed", &format!("{jxl_speed:?}"));
     part("width_step", &width_step.to_string());
     // The AI behavior thresholds, at their effective

@@ -65,6 +65,7 @@ fn default_fingerprint_leaves_the_0_9_10_epoch() {
         metadata_config(env_of(&[])).unwrap(),
         crate::quality::DEFAULT_SSIM_TARGET,
         crate::engine::DEFAULT_AVIF_SPEED,
+        crate::engine::AvifTiles::default(),
         crate::engine::DEFAULT_JXL_SPEED,
         DEFAULT_WIDTH_STEP,
     );
@@ -75,6 +76,48 @@ fn default_fingerprint_leaves_the_0_9_10_epoch() {
 }
 
 #[test]
+fn default_configuration_keeps_its_fingerprint() {
+    // The default configuration's fingerprint, with the
+    // rendering version it was taken at. A change that moves
+    // it starts a new cache epoch for every deployment on the
+    // default configuration. Raising RENDERING_VERSION does
+    // that on purpose: pin the new pair here (RELEASING.md,
+    // step 4). A new setting should not: `CRABCROP_AVIF_TILES`
+    // (issue #688) enters the fingerprint only when it names
+    // another count than the default four, so this is the
+    // value the default configuration had before it.
+    let fingerprint = config_fingerprint(
+        env_of(&[]),
+        metadata_config(env_of(&[])).unwrap(),
+        crate::quality::DEFAULT_SSIM_TARGET,
+        crate::engine::DEFAULT_AVIF_SPEED,
+        crate::engine::AvifTiles::default(),
+        crate::engine::DEFAULT_JXL_SPEED,
+        DEFAULT_WIDTH_STEP,
+    );
+    assert_eq!(
+        (RENDERING_VERSION, fingerprint.as_str()),
+        (7, "25e5e3685efb9abe")
+    );
+}
+
+#[test]
+fn config_fingerprint_tracks_the_avif_tile_count() {
+    // Issue #688: the tile count is part of what a URL renders
+    // to, so each count is its own cache epoch, and replicas
+    // that disagree on it keep separate entries instead of
+    // serving each other's files.
+    let speed = crate::engine::DEFAULT_JXL_SPEED;
+    let mut seen = Vec::new();
+    for count in [1, 2, 4, 8, 16] {
+        let tiles = crate::engine::AvifTiles::new(count).unwrap();
+        let fingerprint = config_fingerprint(env_of(&[]), false, 90.0, 6, tiles, speed, 100);
+        assert!(!seen.contains(&fingerprint), "{count} tiles");
+        seen.push(fingerprint);
+    }
+}
+
+#[test]
 fn config_fingerprint_tracks_output_shaping_settings() {
     // The fingerprint is a pure function of the
     // settings (issue #190, audit R2-08): stable for
@@ -82,26 +125,27 @@ fn config_fingerprint_tracks_output_shaping_settings() {
     // output-shaping input changes, and blind to
     // settings that do not shape output.
     let speed = crate::engine::DEFAULT_JXL_SPEED;
-    let base = config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100);
+    let tiles = crate::engine::AvifTiles::default();
+    let base = config_fingerprint(env_of(&[]), false, 90.0, 6, tiles, speed, 100);
     assert_eq!(base.len(), 16);
     assert_eq!(
         base,
-        config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100),
+        config_fingerprint(env_of(&[]), false, 90.0, 6, tiles, speed, 100),
         "identical configuration, identical fingerprint"
     );
     assert_ne!(
         base,
-        config_fingerprint(env_of(&[]), true, 90.0, 6, speed, 100),
+        config_fingerprint(env_of(&[]), true, 90.0, 6, tiles, speed, 100),
         "the metadata policy shapes output"
     );
     assert_ne!(
         base,
-        config_fingerprint(env_of(&[]), false, 80.0, 6, speed, 100),
+        config_fingerprint(env_of(&[]), false, 80.0, 6, tiles, speed, 100),
         "the SSIM target shapes output"
     );
     assert_ne!(
         base,
-        config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 50),
+        config_fingerprint(env_of(&[]), false, 90.0, 6, tiles, speed, 50),
         "the width step shapes output"
     );
     assert_ne!(
@@ -111,6 +155,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -123,6 +168,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -135,6 +181,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -147,6 +194,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -159,6 +207,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -173,6 +222,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
         false,
         90.0,
         6,
+        tiles,
         speed,
         100,
     );
@@ -183,6 +233,7 @@ fn config_fingerprint_tracks_output_shaping_settings() {
         false,
         90.0,
         6,
+        tiles,
         speed,
         100,
     );
@@ -198,13 +249,15 @@ fn config_fingerprint_identifies_files_by_content() {
     // a fresh epoch, and the same contents under a
     // different path do not.
     let speed = crate::engine::DEFAULT_JXL_SPEED;
-    let base = config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100);
+    let tiles = crate::engine::AvifTiles::default();
+    let base = config_fingerprint(env_of(&[]), false, 90.0, 6, tiles, speed, 100);
     let model = temp_file("fp-model", b"model weights, first build");
     let fp_model = config_fingerprint(
         env_of(&[("CRABCROP_REMOVEBG_MODEL", model.as_str())]),
         false,
         90.0,
         6,
+        tiles,
         speed,
         100,
     );
@@ -215,6 +268,7 @@ fn config_fingerprint_identifies_files_by_content() {
         false,
         90.0,
         6,
+        tiles,
         speed,
         100,
     );
@@ -228,6 +282,7 @@ fn config_fingerprint_identifies_files_by_content() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -240,6 +295,7 @@ fn config_fingerprint_identifies_files_by_content() {
         false,
         90.0,
         6,
+        tiles,
         speed,
         100,
     );
@@ -251,6 +307,7 @@ fn config_fingerprint_identifies_files_by_content() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -269,6 +326,7 @@ fn config_fingerprint_identifies_files_by_content() {
         false,
         90.0,
         6,
+        tiles,
         speed,
         100,
     );
@@ -280,6 +338,7 @@ fn config_fingerprint_identifies_files_by_content() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -299,7 +358,8 @@ fn config_fingerprint_tracks_ai_thresholds() {
     // starts a fresh epoch, and setting one to its
     // default changes nothing.
     let speed = crate::engine::DEFAULT_JXL_SPEED;
-    let base = config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100);
+    let tiles = crate::engine::AvifTiles::default();
+    let base = config_fingerprint(env_of(&[]), false, 90.0, 6, tiles, speed, 100);
     assert_ne!(
         base,
         config_fingerprint(
@@ -307,6 +367,7 @@ fn config_fingerprint_tracks_ai_thresholds() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -319,6 +380,7 @@ fn config_fingerprint_tracks_ai_thresholds() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -331,6 +393,7 @@ fn config_fingerprint_tracks_ai_thresholds() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -343,6 +406,7 @@ fn config_fingerprint_tracks_ai_thresholds() {
             false,
             90.0,
             6,
+            tiles,
             speed,
             100
         ),
@@ -1181,6 +1245,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
         ("CRABCROP_META_MODE", "1"),
         ("CRABCROP_CLIENT_HINTS", "0"),
         ("CRABCROP_EXPLAIN", "0"),
+        ("CRABCROP_AVIF_TILES", "16"),
     ]))
     .unwrap();
     let state = build_state(&config, open_stores(&config).unwrap()).unwrap();
@@ -1199,6 +1264,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     assert!(state.meta_enabled);
     assert!(!state.client_hints);
     assert!(!state.explain_enabled);
+    assert_eq!(state.avif_tiles.count(), 16);
     assert_eq!(state.config_fingerprint, config.config_fingerprint);
     assert_eq!(
         state.process_timeout,

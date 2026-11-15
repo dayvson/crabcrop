@@ -1182,6 +1182,7 @@ impl Default for ProcessContext<'_> {
             preserve_metadata: false,
             brand_color: None,
             avif_speed: DEFAULT_AVIF_SPEED,
+            avif_tiles: AvifTiles::default(),
             jxl_speed: DEFAULT_JXL_SPEED,
             deadline: None,
         }
@@ -2097,6 +2098,7 @@ impl Engine {
                 encode_opts.palette,
                 encode_opts.format_options,
                 ctx.avif_speed,
+                ctx.avif_tiles,
                 ctx.jxl_speed,
             )
         };
@@ -5480,6 +5482,7 @@ fn is_video_container(bytes: &[u8]) -> bool {
 mod encode;
 mod jpeg_scaled;
 mod webp_anim;
+pub use encode::AvifTiles;
 pub(in crate::engine) use encode::{
     EncodeBuffers, StillFormat, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };

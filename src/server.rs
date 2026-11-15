@@ -170,6 +170,9 @@ pub struct AppState {
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
     pub avif_speed: u8,
+    /// How many tiles an AVIF is written in
+    /// (`CRABCROP_AVIF_TILES`, issue #688).
+    pub avif_tiles: crate::engine::AvifTiles,
     pub jxl_speed: jixel::Speed,
     /// Quantization step for width client hints
     /// (`CRABCROP_WIDTH_STEP`).
@@ -464,6 +467,7 @@ impl std::fmt::Debug for AppState {
             slow_gate,
             ssim_target,
             avif_speed,
+            avif_tiles,
             jxl_speed,
             width_step,
             client_hints,
@@ -5211,6 +5215,7 @@ fn build_job(
         ssim_target: state.ssim_target,
         brand_color: state.brand_color,
         avif_speed: state.avif_speed,
+        avif_tiles: state.avif_tiles,
         jxl_speed: state.jxl_speed,
         progress: work.progress.clone(),
     }

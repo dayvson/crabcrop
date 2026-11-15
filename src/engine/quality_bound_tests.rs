@@ -92,6 +92,7 @@ fn plain(img: &DynamicImage, format: StillFormat, quality: u8) -> Vec<u8> {
         None,
         FormatOptions::default(),
         ctx.avif_speed,
+        ctx.avif_tiles,
         ctx.jxl_speed,
     )
     .expect("the frame encodes")

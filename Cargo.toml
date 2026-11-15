@@ -130,11 +130,12 @@ image = { version = "0.25", default-features = false, features = ["avif", "bmp",
 # switch on its assembly and its threading, as before. It
 # adds no crate.
 ravif = { version = "0.13", default-features = false }
-# The thread pools AVIF encodes run in (issue #671): ravif
-# writes as many tiles as the rayon pool it runs in has
-# threads, so the engine runs it in pools of a fixed size
-# (engine/encode.rs). Already in the tree through ravif and
-# the image crate: it adds no crate.
+# The thread pools AVIF encodes run in (issues #671, #688):
+# ravif writes as many tiles as the rayon pool it runs in
+# has threads, so the engine runs it in pools of the tile
+# count `CRABCROP_AVIF_TILES` sets (engine/encode.rs).
+# Already in the tree through ravif and the image crate: it
+# adds no crate.
 rayon = "1"
 # Direct decoder bindings for the two hottest source formats
 # (perf wave 3): zune-jpeg is the same decoder the image crate
