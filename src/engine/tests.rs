@@ -4793,7 +4793,7 @@ fn jpeg_round_trips_tiny_and_flat_images() {
                         for (decoder, pixels) in
                             jpeg_decodes(&bytes, width, height).iter().enumerate()
                         {
-                            for (i, pixel) in pixels.chunks_exact(3).enumerate() {
+                            for (i, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
                                 let off = pixel.iter().zip(color).map(|(a, b)| a.abs_diff(b)).max();
                                 assert!(
                                     off <= Some(tolerance),
@@ -5040,7 +5040,13 @@ fn jpeg_takes_every_pixel_layout_as_8_bit_rgb() {
         .1;
     assert_eq!(frame[5], 3, "components");
     for pixels in jpeg_decodes(&reference, 24, 16) {
-        assert!(pixels.chunks_exact(3).all(|p| p[0] == p[1] && p[1] == p[2]));
+        assert!(
+            pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|p| p[0] == p[1] && p[1] == p[2])
+        );
     }
     // Gray, gray with alpha, 16-bit and float layouts of the
     // same picture all reach the encoder as the same RGB.
