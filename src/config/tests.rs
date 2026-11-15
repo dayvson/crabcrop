@@ -131,6 +131,39 @@ fn explain_defaults_to_on_and_turns_off_by_the_boolean_spellings() {
 }
 
 #[test]
+fn log_sync_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
+    // Issue #642: unset, request lines go through the
+    // writer thread.
+    assert_eq!(
+        log_sync_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(false)
+    );
+    let set =
+        |v: &str| log_sync_config(env_of(&[("CRABCROP_LOG_SYNC", v)])).map_err(|e| e.to_string());
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    // A typo is a boot error naming the variable, never a
+    // silent default: an operator who asked for every line
+    // before its response must not get the queue instead.
+    for bad in ["", "sync", "yes please", "2"] {
+        let err = expect_err(set(bad));
+        assert!(err.contains("CRABCROP_LOG_SYNC"), "{bad:?}: {err}");
+    }
+    // The setting reaches the configuration.
+    let config = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRABCROP_SECRET", "a production-grade secret")];
+        env.extend_from_slice(extra);
+        Config::from_env(env_of(&env)).unwrap()
+    };
+    assert!(!config(&[]).log_sync);
+    assert!(config(&[("CRABCROP_LOG_SYNC", "1")]).log_sync);
+}
+
+#[test]
 fn clip_config_needs_all_four_paths_or_none() {
     let get = |pairs: &[(&str, &str)]| {
         let map: std::collections::HashMap<String, String> = pairs

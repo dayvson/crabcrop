@@ -424,6 +424,66 @@ fn rotate90_fast_matches_crate_around_the_size_gate() {
     assert_eq!(turned.as_bytes(), deep.rotate90().as_bytes());
 }
 
+/// `filters:rotate(90)` takes the block quarter turn of issue
+/// #648 (issue #661), as `rotate(180)` and `rotate(270)` take
+/// theirs: the image crate's bytes on every 8-bit layout, past
+/// the size gate and under it, at odd sizes, and however the
+/// angle is spelled. A frame under the gate and a 16-bit frame
+/// keep the crate's loop. The two write the same bytes, so the
+/// count of block turns says which one ran.
+#[test]
+fn rotate_90_filter_takes_the_block_turn_and_matches_the_crate() {
+    let turn = |img: &DynamicImage, degrees: f32| {
+        let before = ROT90_BLOCK_TURNS.with(|turns| turns.get());
+        let (out, _) = apply_filters(img.clone(), &[Filter::Rotate(degrees)]);
+        (out, ROT90_BLOCK_TURNS.with(|turns| turns.get()) - before)
+    };
+    let (mut past_gate, mut under_gate) = (0, 0);
+    // A landscape frame, its portrait twin, an odd square and
+    // small odd frames. At 1601x901 the gray layouts are under
+    // the gate and the color layouts past it.
+    for (w, h) in [
+        (1601u32, 901u32),
+        (901, 1601),
+        (1155, 1155),
+        (333, 257),
+        (7, 5),
+        (1, 1),
+    ] {
+        let base = photo(w, h);
+        for v in variants(&base) {
+            let past = v.as_bytes().len() >= PERM_FAST_MIN_SUBPIXELS;
+            for degrees in [90.0, -270.0, 450.0] {
+                let (out, block_turns) = turn(&v, degrees);
+                let what = format!("rotate({degrees}) of {:?} at {w}x{h}", v.color());
+                assert_eq!(bytes(&out), bytes(&v.rotate90()), "{what}");
+                assert_eq!(block_turns, usize::from(past), "{what}");
+            }
+            if past {
+                past_gate += 1;
+            } else {
+                under_gate += 1;
+            }
+        }
+    }
+    assert_eq!((past_gate, under_gate), (6, 18));
+
+    // 901x741 RGB16 is 4,005,846 bytes: past the gate, and the
+    // crate's loop all the same.
+    let deep = DynamicImage::ImageRgb16(photo(901, 741).to_rgb16());
+    assert!(deep.as_bytes().len() >= PERM_FAST_MIN_SUBPIXELS);
+    let (out, block_turns) = turn(&deep, 90.0);
+    assert_eq!(out.color(), image::ColorType::Rgb16);
+    assert_eq!(out.as_bytes(), deep.rotate90().as_bytes());
+    assert_eq!(block_turns, 0);
+
+    // The other turns do not come this way.
+    let frame = photo(1601, 901);
+    for degrees in [0.0, 180.0, 270.0, 33.0] {
+        assert_eq!(turn(&frame, degrees).1, 0, "rotate({degrees})");
+    }
+}
+
 #[test]
 fn w3_huerotate_and_brighten_match_crate() {
     for (w, h) in [(1600u32, 900u32), (333, 257)] {

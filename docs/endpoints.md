@@ -89,7 +89,7 @@ The response is `200` with a body like `purged 3`: every entry recorded in the g
 
 A [sealed URL](url-grammar.md#sealed-urls)'s responses carry no `Cache-Group`: its preset names are inside the token, and the header would show them to anyone who fetches the URL. Its cache entry still joins those groups, so `purge-group` reaches sealed renders exactly as it reaches plain ones. A CDN group purge does not. The group purge bridges in the [CDN recipes](deployment.md#put-a-cdn-in-front) for Cloudflare (the Worker), Fastly, BunnyCDN, and CloudFront build the edge's tags from this header, and the path-rule bridges (Cloudflare's Cache Response Rule, Akamai) match the `preset:` segment the token hides, so the edge copy of a sealed response carries no tag. Purge sealed URLs at the CDN by URL.
 
-Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
+Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL). The line is written within about a millisecond of the request, not before its response: [The request log](deployment.md#the-request-log) says how, and what `CRABCROP_LOG_SYNC` changes.
 
 ## Command line
 

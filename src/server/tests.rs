@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod disk_hang;
 mod disk_stall;
 mod meta_frame;
+mod request_log;
 mod shared_state;
 
 const SECRET: &[u8] = b"test-secret";
@@ -204,6 +205,9 @@ fn test_state() -> AppState {
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(30),
         metrics: Arc::new(Metrics::default()),
+        // Written where they are logged, with `println!`, so
+        // a test's log lines stay in its captured output.
+        request_log: RequestLog::inline(),
         metrics_token: None,
         cache: Arc::new(Cache::new(16 * 1024 * 1024)),
         providers: Arc::new(Providers::default()),

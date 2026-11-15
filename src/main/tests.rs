@@ -1206,6 +1206,17 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     );
     assert!(state.store.is_none() && state.shared_store.is_none());
     assert!(state.providers.font.is_none() && state.fallback.is_none());
+    // The request log is the queue and its writer thread
+    // (issue #642), unless `CRABCROP_LOG_SYNC` asks for
+    // each line where it is logged.
+    assert_eq!(format!("{:?}", state.request_log), "RequestLog(queued)");
+    let config = Config::from_env(env_of(&[
+        ("CRABCROP_SECRET", "a production-grade secret"),
+        ("CRABCROP_LOG_SYNC", "1"),
+    ]))
+    .unwrap();
+    let state = build_state(&config, open_stores(&config).unwrap()).unwrap();
+    assert_eq!(format!("{:?}", state.request_log), "RequestLog(inline)");
 }
 
 #[test]
