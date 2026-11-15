@@ -102,6 +102,15 @@ both SDKs must all pass.
   fuzzes. A Dependabot cargo pull request moves the root lockfile only,
   so one that moves a package both carry fails that check until the
   refresh is pushed to its branch.
+- `THIRD-PARTY-NOTICES.md`, which every artifact ships, is generated
+  from `Cargo.lock` for the release build (`scripts/check_notices.py
+  --write`, with the cargo-about version the script pins; RELEASING.md,
+  Third-party notices). Never edit it by hand: a dependency change
+  regenerates it in the same change, and a crate whose license
+  `scripts/notices/about.toml` does not accept is a decision, made
+  there with its reason. rust.yml's notices job fails on a stale file,
+  so a Dependabot cargo pull request needs the regenerated file pushed
+  to its branch as well.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.

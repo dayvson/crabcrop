@@ -155,3 +155,9 @@ MIT. See [LICENSE](LICENSE).
 The binaries and images include libjpeg-turbo, which writes JPEG output and
 decodes JPEG sources at reduced scale. This software is based in part on the
 work of the Independent JPEG Group.
+
+They include code from other projects too, each under its own license:
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) has every notice,
+libjpeg-turbo's among them. The release tarballs carry it beside the binary,
+the Homebrew formula installs it, and the images keep it in
+`/usr/share/doc/crabcrop/`.

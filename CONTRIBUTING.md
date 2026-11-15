@@ -102,6 +102,21 @@ port in the test and hand it to the server: another process can take it
 before the server binds, or another test's server can answer on it
 (issue #536).
 
+## Dependencies and license notices
+
+The binaries ship `THIRD-PARTY-NOTICES.md`, the license notices of every crate
+the release build compiles, generated from `Cargo.lock`. A pull request that
+adds, removes or updates a dependency regenerates it:
+
+```bash
+cargo install --locked --features cli cargo-about@0.9.3
+python3 scripts/check_notices.py --write
+```
+
+CI fails while the file lags `Cargo.lock`, and when a new crate's license is
+not one `scripts/notices/about.toml` accepts. RELEASING.md (Third-party
+notices) has the details.
+
 ## Code style
 
 CI enforces formatting and lints. Run both before pushing:
