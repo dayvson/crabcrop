@@ -385,6 +385,73 @@ fn decode_truncations_and_mutations_satisfy_the_invariants() {
     }
 }
 
+/// The JPEG seeds of the decode corpus.
+fn jpeg_seeds() -> Vec<Vec<u8>> {
+    byte_corpus_inputs("decode")
+        .into_iter()
+        .filter(|s| s.starts_with(b"\xff\xd8\xff"))
+        .collect()
+}
+
+/// How many of the three scales the scaled JPEG decode
+/// hands a frame back at.
+fn scaled_frames(bytes: &[u8]) -> usize {
+    [2, 4, 8]
+        .into_iter()
+        .filter(|d| crabcrop_fuzz::engine::decode_jpeg_scaled(bytes, *d).is_some())
+        .count()
+}
+
+#[test]
+fn the_decode_corpus_reaches_the_scaled_jpeg_decode() {
+    // Issue #653: a JPEG source whose first resize shrinks it
+    // far enough is decoded by libjpeg-turbo, in the server
+    // process. The corpus holds JPEGs it decodes at every
+    // scale, so the decode target fuzzes that decoder, and
+    // JPEGs it stands down for, one for each way: by the
+    // header (grayscale, CMYK, arithmetic, lossless, 12-bit,
+    // a declared size past the limits) and by the data (a
+    // truncated scan, scans past the limit, restart markers
+    // out of turn).
+    let seeds = jpeg_seeds();
+    let decoded = seeds.iter().filter(|s| scaled_frames(s) == 3).count();
+    let refused = seeds.iter().filter(|s| scaled_frames(s) == 0).count();
+    assert!(decoded >= 3, "{decoded} JPEG seeds decode at every scale");
+    assert!(
+        refused >= 9,
+        "{refused} JPEG seeds are refused at every scale"
+    );
+    assert_eq!(
+        decoded + refused,
+        seeds.len(),
+        "a seed decodes at some scales only"
+    );
+}
+
+#[test]
+fn jpeg_truncations_and_mutations_satisfy_the_invariants() {
+    // The smallest JPEG seed the scaled decode takes, a
+    // progressive one: truncations land in its header, its
+    // tables and every scan, and each byte in turn becomes a
+    // zero, a fill byte or the marker of a scan, the three
+    // taking turns along the file.
+    let seed = jpeg_seeds()
+        .into_iter()
+        .filter(|s| scaled_frames(s) == 3)
+        .min_by_key(|s| s.len())
+        .expect("a JPEG seed the scaled decode takes");
+    for end in 0..=seed.len() {
+        crabcrop_fuzz::check_decode(&seed[..end]);
+    }
+    let mut bytes = seed.clone();
+    for (i, replacement) in (0..bytes.len()).zip([0x00u8, 0xff, 0xda].into_iter().cycle()) {
+        let original = bytes[i];
+        bytes[i] = replacement;
+        crabcrop_fuzz::check_decode(&bytes);
+        bytes[i] = original;
+    }
+}
+
 #[test]
 fn source_meta_seeds_satisfy_the_invariants() {
     for input in byte_corpus_inputs("source_meta") {

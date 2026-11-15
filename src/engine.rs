@@ -267,13 +267,8 @@ fn declared_size(bytes: &[u8]) -> Option<(u32, u32)> {
 /// example arithmetic-coded files zune cannot read).
 fn decode_jpeg_direct(bytes: &[u8]) -> Option<DynamicImage> {
     use zune_core::colorspace::ColorSpace;
-    use zune_core::options::DecoderOptions;
-    let options = DecoderOptions::default()
-        .jpeg_set_out_colorspace(ColorSpace::RGB)
-        .set_strict_mode(false)
-        .set_max_width(MAX_DECODE_DIMENSION as usize)
-        .set_max_height(MAX_DECODE_DIMENSION as usize);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), zune_jpeg_options());
     decoder.decode_headers().ok()?;
     match decoder.input_colorspace()? {
         ColorSpace::YCbCr | ColorSpace::RGB => {}
@@ -284,6 +279,30 @@ fn decode_jpeg_direct(bytes: &[u8]) -> Option<DynamicImage> {
     let buf =
         image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(width as u32, height as u32, pixels)?;
     Some(DynamicImage::ImageRgb8(buf))
+}
+
+/// The options [`decode_jpeg_direct`] decodes under. The
+/// scaled decode reads a file's header with the same ones
+/// ([`jpeg_scaled`]), so the size and the colour space it
+/// goes by are the ones a full-size decode would.
+fn zune_jpeg_options() -> zune_core::options::DecoderOptions {
+    use zune_core::colorspace::ColorSpace;
+    zune_core::options::DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_strict_mode(false)
+        .set_max_width(MAX_DECODE_DIMENSION as usize)
+        .set_max_height(MAX_DECODE_DIMENSION as usize)
+}
+
+/// The scaled JPEG decode on its own (issue #653): `bytes`
+/// at one over `denominator` (2, 4 or 8), decoded exactly as
+/// a render decodes a source its first resize shrinks that
+/// far. `None` for a file the scaled decode does not take
+/// and for one libjpeg-turbo refuses or warns about, which a
+/// render decodes at full size instead. Public for the fuzz
+/// harness's decode target, as [`decode_image`] is.
+pub fn decode_jpeg_scaled(bytes: &[u8], denominator: u32) -> Option<DynamicImage> {
+    jpeg_scaled::decode_at(bytes, denominator)
 }
 
 /// WebP still decode through libwebp (the `webp` crate):
@@ -1219,8 +1238,16 @@ struct SniffedSource<'b> {
 enum Decoded {
     /// The still image the operation chain runs on (an
     /// animated source's first frame when the output is a
-    /// still format), with the source metadata.
-    Still(DynamicImage, crate::color::SourceMeta),
+    /// still format), with the source metadata. The last
+    /// field is set for a JPEG decoded at reduced scale
+    /// (issue #653): the image the frame is a reduction of,
+    /// whose size is the source's wherever one is reported
+    /// or resolved against.
+    Still(
+        DynamicImage,
+        crate::color::SourceMeta,
+        Option<jpeg_scaled::Reduced>,
+    ),
     /// An animated source the animated or video path
     /// rendered whole: the request's result.
     Rendered(Box<ProcessedImage>),
@@ -1396,22 +1423,15 @@ impl Engine {
         let keep_profile = directives.keep_profile
             && matches!(resolved_output, ImageFormat::Jpeg | ImageFormat::Png);
         Self::preflight(directives, &ctx, detected)?;
-        let (img, source_meta) =
+        let (img, source_meta, reduced) =
             match Self::decode_source(&source, ops, &ctx, directives, keep_profile)? {
-                Decoded::Still(img, source_meta) => (img, source_meta),
+                Decoded::Still(img, source_meta, reduced) => (img, source_meta, reduced),
                 Decoded::Rendered(processed) => return Ok(*processed),
             };
         let mut format = detected;
-        let (source_width, source_height) = (img.width(), img.height());
-        // `no_upscale` is a request-wide directive, like the encoding
-        // directives: wherever it appears, it caps every resize in
-        // the request at the (oriented) source dimensions.
-        let cap = if directives.no_upscale {
-            Some((img.width(), img.height()))
-        } else {
-            None
-        };
         ctx.check_deadline()?;
+        let (outcome, (source_width, source_height)) =
+            Self::still_chain(img, reduced, ops, &ctx, directives)?;
         let ApplyOutcome {
             img,
             encode_opts,
@@ -1419,15 +1439,7 @@ impl Engine {
             inpaint,
             segments,
             objects_crop,
-        } = apply_operations(
-            img,
-            ops,
-            cap,
-            dpr_factor(directives.dpr, &ctx),
-            &ctx,
-            directives,
-            None,
-        )?;
+        } = outcome;
         ctx.check_deadline()?;
         // Placeholders describe the final pixels, so they are
         // computed here, before encoding.
@@ -1487,6 +1499,45 @@ impl Engine {
             pdf,
             provenance: None,
         })
+    }
+
+    /// The operation chain of a still render, on the frame
+    /// the decode stage handed on: what the chain made of it,
+    /// and the source size the render reports.
+    ///
+    /// A frame the JPEG decoder reduced (issue #653) stands for
+    /// the image its header declares, `reduced`. That image's
+    /// size is the source size and the `no_upscale` cap, and
+    /// the chain's first operation, the plain resize that made
+    /// the decode eligible (see [`jpeg_scaled::plan`]),
+    /// resolves its target against it and resamples the
+    /// image's part of the frame to that target. Every
+    /// operation after it starts from an image of the size it
+    /// always started from.
+    fn still_chain(
+        img: DynamicImage,
+        reduced: Option<jpeg_scaled::Reduced>,
+        ops: &[Operation],
+        ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
+    ) -> Result<(ApplyOutcome, (u32, u32)), EngineError> {
+        let source_size = match reduced {
+            Some(reduced) => reduced.full,
+            None => (img.width(), img.height()),
+        };
+        // `no_upscale` is a request-wide directive, like the encoding
+        // directives: wherever it appears, it caps every resize in
+        // the request at the (oriented) source dimensions.
+        let cap = if directives.no_upscale {
+            Some(source_size)
+        } else {
+            None
+        };
+        check_operation_count(ops)?;
+        let dpr = dpr_factor(directives.dpr, ctx);
+        let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, None);
+        chain.reduced = reduced;
+        Ok((chain.run(img, ops)?, source_size))
     }
 
     /// Frame selection (issue #214), the first stage of
@@ -1806,6 +1857,9 @@ impl Engine {
                 source_meta,
             );
         }
+        // Set when the decode hands on a reduced frame (see
+        // [`Decoded::Still`]).
+        let mut reduced = None;
         let img = if let Some(screened) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
@@ -1843,15 +1897,30 @@ impl Engine {
             if detected == ImageFormat::Jxl {
                 check_jxl_dimensions(bytes)?;
             }
-            // An AVIF source decodes in the capped worker, killed
-            // at the request deadline (issue #522); every other
-            // still decodes in process.
-            let mut img = decode_source_image(bytes, ctx.deadline)?;
+            // A JPEG whose first operation shrinks it far enough
+            // decodes at reduced scale (issue #653), and the
+            // frame comes with the EXIF orientation the plan
+            // read. Every other still decodes as it always did:
+            // an AVIF source in the capped worker, killed at the
+            // request deadline (issue #522), and every other
+            // still in process.
+            let dpr = dpr_factor(directives.dpr, ctx);
+            let (mut img, orientation) =
+                match jpeg_scaled::decode_planned(bytes, ops, directives, dpr, ctx)? {
+                    Some((frame, scaled)) => {
+                        reduced = Some(scaled.reduced());
+                        (frame, scaled.orientation)
+                    }
+                    None => (
+                        decode_source_image(bytes, ctx.deadline)?,
+                        exif_orientation(bytes),
+                    ),
+                };
             // Phone photos store rotation in the EXIF orientation
             // tag instead of the pixels. Honor it before any
             // operation, so sizes and crops see the image as the
             // viewer would. (GIFs carry no EXIF, hence the split.)
-            if let Some(orientation) = exif_orientation(bytes) {
+            if let Some(orientation) = orientation {
                 img = apply_orientation(img, orientation);
             }
             // Color management: pixels arrive in the source
@@ -1869,7 +1938,7 @@ impl Engine {
             }
             img
         };
-        Ok(Decoded::Still(img, source_meta))
+        Ok(Decoded::Still(img, source_meta, reduced))
     }
 
     /// Decode an animated GIF or WebP source frame by frame. An
@@ -1913,7 +1982,7 @@ impl Engine {
             }
         }
         let first = DynamicImage::ImageRgba8(frames.first.into_buffer());
-        Ok(Decoded::Still(first, source_meta))
+        Ok(Decoded::Still(first, source_meta, None))
     }
 
     /// Resolve the quality directive against the final image
@@ -3770,7 +3839,7 @@ fn survey_trims(
 /// the animated paths (GIF and WebP), which run it once per
 /// frame.
 fn apply_operations(
-    mut img: DynamicImage,
+    img: DynamicImage,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
     dpr: f32,
@@ -3779,15 +3848,7 @@ fn apply_operations(
     share: Option<&mut FrameShare>,
 ) -> Result<ApplyOutcome, EngineError> {
     check_operation_count(ops)?;
-    let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, share);
-    for (op_index, op) in ops.iter().enumerate() {
-        img = chain.step(img, op_index, op)?;
-    }
-    let outcome = chain.finish(img)?;
-    if directives.dpr.is_none() && dpr > 1.0 && scales_with_dpr(ops) {
-        check_hinted_output(outcome.img.width(), outcome.img.height())?;
-    }
-    Ok(outcome)
+    ChainState::new(ops, cap, dpr, ctx, directives, share).run(img, ops)
 }
 
 /// The running state of one [`apply_operations`] pass: the
@@ -3848,6 +3909,12 @@ struct ChainState<'r, 'a> {
     /// resamples the window straight from the frame in hand.
     fusion: Option<FusionPlan>,
     fused_window: Option<(u32, u32, u32, u32)>,
+    /// The image the frame stands for when the chain starts
+    /// from a reduced decode of it (issue #653), until the
+    /// chain's first operation, a plain resize, has
+    /// resampled the frame to its target (see
+    /// [`Engine::still_chain`]).
+    reduced: Option<jpeg_scaled::Reduced>,
 }
 
 /// A pending focal form (issues #313, #465): the rectangle
@@ -4030,7 +4097,26 @@ impl<'r, 'a> ChainState<'r, 'a> {
             objects_crop_record: None,
             fusion: fusion_plan(ops),
             fused_window: None,
+            reduced: None,
         }
+    }
+
+    /// Run the whole chain on `img`: every operation in
+    /// order, then what the finished chain owes its caller.
+    fn run(
+        mut self,
+        mut img: DynamicImage,
+        ops: &[Operation],
+    ) -> Result<ApplyOutcome, EngineError> {
+        for (op_index, op) in ops.iter().enumerate() {
+            img = self.step(img, op_index, op)?;
+        }
+        let hinted = self.directives.dpr.is_none() && self.dpr > 1.0 && scales_with_dpr(ops);
+        let outcome = self.finish(img)?;
+        if hinted {
+            check_hinted_output(outcome.img.width(), outcome.img.height())?;
+        }
+        Ok(outcome)
     }
 
     /// Run one operation of the chain, with what every
@@ -4122,6 +4208,17 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         size,
                         self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
                         self.dpr,
+                    )?
+                } else if let Some(reduced) = self.reduced.take() {
+                    // The frame is a reduced decode (issue
+                    // #653): the size resolves against the
+                    // full image, as it would have on it.
+                    apply_size_windowed(
+                        img,
+                        size,
+                        self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
+                        self.dpr,
+                        SourceWindow::Reduced(reduced),
                     )?
                 } else {
                     apply_size(
@@ -5197,6 +5294,7 @@ fn is_video_container(bytes: &[u8]) -> bool {
 }
 
 mod encode;
+mod jpeg_scaled;
 mod webp_anim;
 /// Names the test module uses from encode: re-exported
 /// only for test builds, where they are used.
@@ -5516,6 +5614,13 @@ enum SourceWindow {
     /// chain's: the window cut to RGBA8, then resized (see
     /// [`resize_lanczos3_cut`]).
     Cut(Window),
+    /// A frame the JPEG decoder reduced (issue #653): the
+    /// picture of a larger image, at a fraction of its size.
+    /// The size resolves and is checked against that image's
+    /// dimensions, so the target is the one the image would
+    /// get, and the part of the frame the image fills is
+    /// resampled to it (see [`resize_lanczos3_reduced`]).
+    Reduced(jpeg_scaled::Reduced),
 }
 
 /// [`apply_size`] for the crop+resize fusion (issue #287):
@@ -5569,6 +5674,44 @@ fn proportional_side(side: u32, to: u32, from: u32) -> u32 {
     u32::try_from(q).unwrap_or(u32::MAX).max(1)
 }
 
+/// The size a resize to `size` leaves a `sw` by `sh` image
+/// at: a pixel side as written, scaled by `dpr`; an `orig`
+/// side and a proportional side from the image; then `cap`,
+/// from `no_upscale`. [`apply_size_windowed`] resamples to
+/// it, and the scaled JPEG decode reads it ahead of the
+/// decode (issue #653), so the two cannot disagree on where
+/// a resize is heading.
+fn resize_target(
+    size: &ImageSize,
+    dpr: f32,
+    (sw, sh): (u32, u32),
+    cap: Option<SizeCap>,
+) -> (u32, u32) {
+    let width = scale_dimension(size.width, dpr);
+    let height = scale_dimension(size.height, dpr);
+    let w = match width {
+        Dimension::Pixels(n) => n,
+        Dimension::Original => sw,
+        Dimension::Proportional => match height {
+            Dimension::Pixels(h) => proportional_side(sw, h, sh),
+            _ => sw,
+        },
+    };
+    let h = match height {
+        Dimension::Pixels(n) => n,
+        Dimension::Original => sh,
+        Dimension::Proportional => match width {
+            Dimension::Pixels(w) => proportional_side(sh, w, sw),
+            _ => sh,
+        },
+    };
+    match cap {
+        Some(SizeCap::Axes(cw, ch)) => (w.min(cw), h.min(ch)),
+        Some(SizeCap::Fit(cw, ch)) => cap_dimensions(w, h, (cw, ch)),
+        None => (w, h),
+    }
+}
+
 fn apply_size_windowed(
     img: DynamicImage,
     size: &ImageSize,
@@ -5577,12 +5720,6 @@ fn apply_size_windowed(
     window: SourceWindow,
 ) -> Result<DynamicImage, EngineError> {
     check_nonzero_size(size)?;
-    let size = &ImageSize {
-        width: scale_dimension(size.width, dpr),
-        height: scale_dimension(size.height, dpr),
-        flip_horizontal: size.flip_horizontal,
-        flip_vertical: size.flip_vertical,
-    };
     // A cut window is clamped into the frame first, as the
     // cut itself clamps it, so the size resolves and is
     // checked against the dimensions a materialized cut
@@ -5596,49 +5733,28 @@ fn apply_size_windowed(
     };
     let (sw, sh) = match window {
         SourceWindow::Fused((_, _, w, h)) | SourceWindow::Cut((_, _, w, h)) => (w, h),
+        SourceWindow::Reduced(reduced) => reduced.full,
         SourceWindow::Whole => (img.width(), img.height()),
     };
-    let w = match size.width {
-        Dimension::Pixels(n) => n,
-        Dimension::Original => sw,
-        Dimension::Proportional => match size.height {
-            Dimension::Pixels(h) => proportional_side(sw, h, sh),
-            _ => sw,
-        },
-    };
-    let h = match size.height {
-        Dimension::Pixels(n) => n,
-        Dimension::Original => sh,
-        Dimension::Proportional => match size.width {
-            Dimension::Pixels(w) => proportional_side(sh, w, sw),
-            _ => sh,
-        },
-    };
-    let (w, h) = match cap {
-        Some(SizeCap::Axes(cw, ch)) => (w.min(cw), h.min(ch)),
-        Some(SizeCap::Fit(cw, ch)) => cap_dimensions(w, h, (cw, ch)),
-        None => (w, h),
-    };
+    let (w, h) = resize_target(size, dpr, (sw, sh), cap);
     check_output_size(w, h, (sw, sh))?;
-    let mut img = if w == sw && h == sh {
-        match window {
-            // No resample runs: the two-step path returns
-            // the materialized window itself, so the fused
-            // path materializes it here.
-            SourceWindow::Fused((x, y, ww, wh)) => img.crop_imm(x, y, ww, wh),
-            SourceWindow::Cut(window) => {
-                DynamicImage::ImageRgba8(crate::crop::cut_rgba(&img, window))
-            }
-            SourceWindow::Whole => img,
+    let unchanged = w == sw && h == sh;
+    let mut img = match window {
+        // A reduced frame is not the size the target was
+        // resolved against, so it is resampled whatever the
+        // target is.
+        SourceWindow::Reduced(reduced) => resize_lanczos3_reduced(img, reduced.window, w, h),
+        // No resample runs: the two-step path returns
+        // the materialized window itself, so the fused
+        // path materializes it here.
+        SourceWindow::Fused((x, y, ww, wh)) if unchanged => img.crop_imm(x, y, ww, wh),
+        SourceWindow::Cut(window) if unchanged => {
+            DynamicImage::ImageRgba8(crate::crop::cut_rgba(&img, window))
         }
-    } else {
-        match window {
-            SourceWindow::Fused((x, y, ww, wh)) => {
-                resize_lanczos3_cropped(&img, x, y, ww, wh, w, h)
-            }
-            SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
-            SourceWindow::Whole => resize_lanczos3_owned(img, w, h),
-        }
+        SourceWindow::Whole if unchanged => img,
+        SourceWindow::Fused((x, y, ww, wh)) => resize_lanczos3_cropped(&img, x, y, ww, wh, w, h),
+        SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
+        SourceWindow::Whole => resize_lanczos3_owned(img, w, h),
     };
     if size.flip_horizontal {
         img = crate::filters::fliph_fast(&img);
@@ -6013,6 +6129,33 @@ pub(crate) fn resize_lanczos3_cropped(
     match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
         Ok(()) => dst,
         Err(_) => two_step(),
+    }
+}
+
+/// [`resize_lanczos3`] of a frame the JPEG decoder reduced
+/// (issue #653), read through the backend's crop box: the
+/// (left, top, width, height) part of the frame that the image
+/// fills, which ends a fraction of a pixel short of the frame
+/// along the edges where the image's size is not a multiple
+/// of the scale. The backend places its kernel by that box,
+/// so the picture is resampled at its own scale and keeps its
+/// place; resampling the whole frame instead stretches it by
+/// up to a pixel and moves the far edge by as much. A backend
+/// refusal, which no reduced frame meets, resamples the whole
+/// frame.
+fn resize_lanczos3_reduced(
+    img: DynamicImage,
+    (left, top, width, height): (f64, f64, f64, f64),
+    w: u32,
+    h: u32,
+) -> DynamicImage {
+    let Some(mut dst) = blank_like(&img, w, h) else {
+        return resize_lanczos3_owned(img, w, h);
+    };
+    let opts = lanczos3_options().crop(left, top, width, height);
+    match fast_image_resize::Resizer::new().resize(&img, &mut dst, &opts) {
+        Ok(()) => dst,
+        Err(_) => resize_lanczos3_owned(img, w, h),
     }
 }
 
