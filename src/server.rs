@@ -102,7 +102,8 @@ pub struct AppState {
     /// purge and upload lines, and the shutdown lines. By
     /// default a queue that one thread writes from; with
     /// `CRABCROP_LOG_SYNC` each line is written where it is
-    /// logged.
+    /// logged. A handler that logs asks it for room first
+    /// ([`RequestLog::room`]).
     pub request_log: RequestLog,
     /// The bearer token `/metrics` requires (issue #270),
     /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
@@ -1683,6 +1684,9 @@ async fn purge_handle(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    // A purge leaves a log line: like an image request, it
+    // waits while the request log's queue is full.
+    state.request_log.room().await;
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -1839,7 +1843,13 @@ async fn purge_handle(
         }
         wait_for_disk_purge(disk).await;
         task_state.metrics.record_purge();
-        purge_log(&task_state.request_log, "purge", &task_target, Some(removed)).await;
+        purge_log(
+            &task_state.request_log,
+            "purge",
+            &task_target,
+            Some(removed),
+        )
+        .await;
         removed
     });
     let removed = task.await.unwrap_or(0);
@@ -1863,6 +1873,8 @@ async fn purge_group_handle(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    // As in `purge_handle`.
+    state.request_log.room().await;
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -2147,6 +2159,10 @@ async fn upload_handle(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
 ) -> Response {
+    // An upload leaves a log line: like an image request,
+    // it waits while the request log's queue is full, before
+    // its body is read.
+    state.request_log.room().await;
     let accept = req
         .headers()
         .get(header::ACCEPT)
@@ -2685,6 +2701,11 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
 }
 
 async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    // Every request here leaves a log line, so it waits here
+    // while the request log's queue is full (issue #642):
+    // before anything is done for it, so a client that gives
+    // up meanwhile has cost nothing and is owed no line.
+    state.request_log.room().await;
     // The request's URI and headers are read where they are
     // (issue #641): the `Uri` and `HeaderMap` extractors
     // hand a handler a copy of each. The body goes at once,
@@ -2748,9 +2769,8 @@ async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Requ
     state.metrics.record(&record);
     // The line goes to the request log (issue #642), which
     // by default queues it for its writer thread: the
-    // response does not wait for a `write`. It waits here
-    // only while the queue is full.
-    state.request_log.line(&record.to_json()).await;
+    // response does not wait for a `write`.
+    state.request_log.line(&record.to_json());
     response
 }
 

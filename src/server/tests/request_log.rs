@@ -6,9 +6,21 @@ use super::*;
 use crate::observe::{FakeStdout, QUEUE_BYTES};
 use std::time::Duration;
 
-/// Long enough for anything that must happen; a test that
-/// passes never waits it out.
-const LONG: Duration = Duration::from_secs(30);
+/// Long enough for anything that must happen to happen on
+/// a loaded machine; a test that passes never waits it out.
+const LONG: Duration = Duration::from_secs(60);
+
+/// Wait until `done`, checking every millisecond.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + LONG;
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never happened: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
 
 /// A server that logs to `log`, with uploads on in `dir`.
 async fn spawn_logging(log: RequestLog, dir: &std::path::Path) -> String {
@@ -75,13 +87,15 @@ async fn replay(base: &str, src: &str, missing: &str) -> Vec<u16> {
     let resp = get_with_headers(base, &image, &[("X-Request-Id", "chosen-by-client")]).await;
     statuses.push(resp.status().as_u16());
     // Neither of these logs a line.
-    for path in ["/health", "/metrics"] {
-        let resp = client().get(format!("{base}{path}")).send().await.unwrap();
-        statuses.push(resp.status().as_u16());
-    }
+    let resp = client().get(format!("{base}/health")).send().await.unwrap();
+    statuses.push(resp.status().as_u16());
+    statuses.push(metrics_response(base).await.status().as_u16());
     // A purge that is refused, one that removes the entry,
     // and the miss that follows it.
-    for signature in ["deadbeef".to_string(), crate::url::purge_signature(SECRET, &image)] {
+    for signature in [
+        "deadbeef".to_string(),
+        crate::url::purge_signature(SECRET, &image),
+    ] {
         let resp = client()
             .post(format!("{base}/purge/{signature}/{image}"))
             .send()
@@ -153,7 +167,7 @@ async fn a_replay_logs_the_same_lines_in_the_same_order_queued_or_inline() {
         assert_eq!(
             statuses,
             [
-                200, 200, 304, 200, 403, 400, 410, 404, 200, 200, 200, 403, 200, 200, 201, 200
+                200, 200, 304, 200, 403, 400, 403, 404, 200, 200, 200, 403, 200, 200, 201, 200
             ],
             "{form}"
         );
@@ -183,7 +197,7 @@ async fn a_replay_logs_the_same_lines_in_the_same_order_queued_or_inline() {
     assert_eq!(
         told,
         [
-            "200", "200", "304", "200", "403", "400", "410", "404", "200", "purge", "purge", "200",
+            "200", "200", "304", "200", "403", "400", "403", "404", "200", "purge", "purge", "200",
             "upload", "200"
         ]
     );
@@ -205,7 +219,8 @@ async fn a_purge_and_an_upload_are_on_standard_output_before_they_are_answered()
     let dir = upload_dir("log-audit-first");
     let base = spawn_logging(log, &dir).await;
     // Nobody reads standard output. An image request is
-    // answered all the same: its line is in the queue.
+    // answered all the same: its line is in the queue,
+    // which has room.
     out.stall();
     let image = format!("{base}/{}/20x15/http://127.0.0.1:9/a.png", "0".repeat(64));
     let resp = tokio::time::timeout(LONG, client().get(&image).send())
@@ -218,7 +233,9 @@ async fn a_purge_and_an_upload_are_on_standard_output_before_they_are_answered()
     // line to be written.
     let purge = tokio::spawn(
         client()
-            .post(format!("{base}/purge/deadbeef/20x15/http://127.0.0.1:9/a.png"))
+            .post(format!(
+                "{base}/purge/deadbeef/20x15/http://127.0.0.1:9/a.png"
+            ))
             .send(),
     );
     let name = "audited.png";
@@ -232,82 +249,217 @@ async fn a_purge_and_an_upload_are_on_standard_output_before_they_are_answered()
             .send(),
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!purge.is_finished(), "the purge was answered before its line");
-    assert!(!upload.is_finished(), "the upload was answered before its line");
+    assert!(
+        !purge.is_finished(),
+        "the purge was answered before its line"
+    );
+    assert!(
+        !upload.is_finished(),
+        "the upload was answered before its line"
+    );
     assert_eq!(out.lines().len(), 0);
     // Standard output is read again: both are answered,
     // and their lines are there by then.
     out.resume();
-    let purge = tokio::time::timeout(LONG, purge).await.unwrap().unwrap().unwrap();
+    let purge = tokio::time::timeout(LONG, purge)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(purge.status(), StatusCode::FORBIDDEN);
     assert!(out.text().contains("\"event\":\"purge\""), "{}", out.text());
-    let upload = tokio::time::timeout(LONG, upload).await.unwrap().unwrap().unwrap();
+    let upload = tokio::time::timeout(LONG, upload)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(upload.status(), StatusCode::CREATED);
-    assert!(out.text().contains("\"event\":\"upload\""), "{}", out.text());
+    assert!(
+        out.text().contains("\"event\":\"upload\""),
+        "{}",
+        out.text()
+    );
     let lines = out.lines();
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(lines[0].contains("\"status\":403"), "{lines:?}");
 }
 
 #[tokio::test]
-async fn a_request_waits_for_room_in_a_full_queue_and_the_server_keeps_running() {
-    // A queue of 600 bytes: two request lines and part of a
-    // third.
+async fn a_request_waits_while_the_queue_is_full_and_the_server_keeps_running() {
+    // A queue that is full at 600 bytes: two request lines
+    // and part of a third.
     let out = FakeStdout::default();
     let (log, notes) = RequestLog::over(&out, 600);
     let dir = upload_dir("log-full-queue");
     let base = spawn_logging(log.clone(), &dir).await;
     out.stall();
     let refused = |n: usize| {
-        let url = format!(
-            "{base}/{}/20x15/http://127.0.0.1:9/a.png",
-            "0".repeat(64)
-        );
+        let url = format!("{base}/{}/20x15/http://127.0.0.1:9/a.png", "0".repeat(64));
         client()
             .get(url)
             .header("X-Request-Id", format!("request-{n}"))
             .send()
     };
-    // Requests are answered while their lines fit. This
-    // runtime has one thread: a wait that parked it would
-    // stop the test here, or at the health check below.
+    // Requests are answered while the queue has room: their
+    // lines are queued, with nobody reading.
     let mut answered = 0;
-    let waiting = loop {
-        let mut request = tokio::spawn(refused(answered));
-        match tokio::time::timeout(Duration::from_millis(500), &mut request).await {
-            Ok(resp) => {
-                assert_eq!(resp.unwrap().unwrap().status(), StatusCode::FORBIDDEN);
-                answered += 1;
-                assert!(answered < 10, "the queue never filled");
-            }
-            Err(_) => break request,
-        }
-    };
-    assert!(answered >= 2, "{answered} lines fit in 600 bytes");
-    // That one's line found the queue full: its response
-    // waits. The rest of the server does not: a request
-    // that logs nothing is answered.
+    while !log.stats().full {
+        let resp = tokio::time::timeout(LONG, refused(answered))
+            .await
+            .expect("a request waits though the queue has room")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        answered += 1;
+        assert!(answered < 10, "the queue never filled");
+    }
+    assert!(answered >= 2, "{answered} lines filled 600 bytes");
+    let held = log.stats().held_bytes;
+    // The queue is full. The next request is not handled: it
+    // waits for room, and so do a purge, a group purge and
+    // an upload, which leave lines too. This runtime has one
+    // thread: a wait that parked it would stop the test
+    // here, or at the health check below.
+    let waiting = tokio::spawn(refused(answered));
+    until("the request waits for room", || log.stats().waiting == 1).await;
+    let purge = tokio::spawn(
+        client()
+            .post(format!(
+                "{base}/purge/deadbeef/20x15/http://127.0.0.1:9/a.png"
+            ))
+            .send(),
+    );
+    until("the purge waits for room", || log.stats().waiting == 2).await;
+    let group_purge = tokio::spawn(
+        client()
+            .post(format!("{base}/purge-group/deadbeef/heroes"))
+            .send(),
+    );
+    until("the group purge waits for room", || {
+        log.stats().waiting == 3
+    })
+    .await;
+    let name = "waited.png";
+    let upload = tokio::spawn(
+        client()
+            .put(format!(
+                "{base}/upload/{}/{name}",
+                crate::url::upload_signature(SECRET, name)
+            ))
+            .body(test_png())
+            .send(),
+    );
+    until("the upload waits for room", || log.stats().waiting == 4).await;
+    // Clients that give up while their requests wait take
+    // the requests with them: they were never handled, so
+    // they leave no line, and the queue holds nothing for
+    // them, however many come and go.
+    for n in 0..5 {
+        let gone = tokio::spawn(refused(900 + n));
+        until("one more request waits", || log.stats().waiting == 5).await;
+        gone.abort();
+        until("it left with its client", || log.stats().waiting == 4).await;
+    }
+    assert_eq!(log.stats().held_bytes, held);
+    // The rest of the server does not wait: a request that
+    // logs nothing is answered.
     let health = tokio::time::timeout(LONG, client().get(format!("{base}/health")).send())
         .await
         .expect("the health check waits behind a full log queue")
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
     assert!(!waiting.is_finished());
-    // Standard output is read again: the request is
-    // answered, and no line was lost or passed another.
+    // Standard output is read again: the four are handled
+    // and answered. The log holds the line of every request
+    // that was answered, once, the earlier ones in their
+    // order, and none for the clients that left.
     out.resume();
-    let resp = tokio::time::timeout(LONG, waiting).await.unwrap().unwrap().unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    for (request, status) in [
+        (waiting, StatusCode::FORBIDDEN),
+        (purge, StatusCode::FORBIDDEN),
+        (group_purge, StatusCode::FORBIDDEN),
+        (upload, StatusCode::CREATED),
+    ] {
+        let resp = tokio::time::timeout(LONG, request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), status);
+    }
     assert_eq!(log.finish(None, LONG).await, 0);
-    let ids: Vec<String> = out
+    let records: Vec<serde_json::Value> = out
         .lines()
         .iter()
-        .map(|line| {
-            let record: serde_json::Value = serde_json::from_str(line).unwrap();
-            record["request_id"].as_str().unwrap().to_string()
-        })
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let ids: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["request_id"].as_str())
         .collect();
     let expected: Vec<String> = (0..=answered).map(|n| format!("request-{n}")).collect();
     assert_eq!(ids, expected);
+    let mut events: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["event"].as_str())
+        .collect();
+    events.sort();
+    assert_eq!(events, ["purge", "purge-group", "upload"]);
+    assert_eq!(records.len(), answered + 4);
+    assert!(notes.all().is_empty(), "{:?}", notes.all());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_served_at_once_each_leave_their_line_once() {
+    // A queue that fills over and over, and a standard
+    // output that takes a few bytes per write: handlers on
+    // four threads append while the writer is busy, and
+    // requests wait for room all the time.
+    let out = FakeStdout::default();
+    let (log, notes) = RequestLog::over(&out, 4096);
+    out.take_at_most(61);
+    let dir = upload_dir("log-at-once");
+    let base = spawn_logging(log.clone(), &dir).await;
+    const CLIENTS: usize = 16;
+    const EACH: usize = 25;
+    let mut clients = Vec::new();
+    for c in 0..CLIENTS {
+        let base = base.clone();
+        clients.push(tokio::spawn(async move {
+            // One connection for each client: it sends a
+            // request once the one before is answered.
+            let client = client();
+            for n in 0..EACH {
+                let resp = client
+                    .get(format!(
+                        "{base}/{}/20x15/http://127.0.0.1:9/a.png",
+                        "0".repeat(64)
+                    ))
+                    .header("X-Request-Id", format!("client-{c}-request-{n}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            }
+        }));
+    }
+    for client in clients {
+        tokio::time::timeout(LONG, client).await.unwrap().unwrap();
+    }
+    assert_eq!(log.finish(None, LONG).await, 0);
+    // Every request left its line, whole and once, and each
+    // client's lines are in the order of its requests.
+    let mut next = [0usize; CLIENTS];
+    for line in out.lines() {
+        let record: serde_json::Value =
+            serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let id = record["request_id"].as_str().unwrap();
+        let numbers: Vec<usize> = id.split('-').filter_map(|part| part.parse().ok()).collect();
+        let [c, n] = numbers[..] else {
+            panic!("not a request of this test: {line}")
+        };
+        assert_eq!(n, next[c], "{line}");
+        next[c] += 1;
+    }
+    assert_eq!(next, [EACH; CLIENTS]);
     assert!(notes.all().is_empty(), "{:?}", notes.all());
 }

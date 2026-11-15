@@ -31,13 +31,21 @@
 //!   after its request**, no longer before the response.
 //!   A process that is killed loses the lines still
 //!   queued.
-//! - **Standard output nobody reads.** The queue holds
-//!   8 MiB of text ([`QUEUE_BYTES`]), counting what the
-//!   writer has in hand. Past that a request waits for
-//!   room before its response leaves, as a request waited
-//!   in `write` before, and no line is dropped. The wait
-//!   is a task's, not a thread's: the runtime's workers
-//!   are never parked on the queue, so the health check,
+//! - **Standard output nobody reads.** The queue is full
+//!   at 8 MiB of text ([`QUEUE_BYTES`]), counting what the
+//!   writer has in hand. A handler asks for room before it
+//!   does anything else ([`RequestLog::room`]), and while
+//!   the queue is full that waits: the request is not
+//!   handled, and not answered, until the writer has made
+//!   room, as a request waited in `write` before. No line
+//!   is dropped: [`RequestLog::line`] never refuses one,
+//!   so the requests under way when the queue fills still
+//!   leave theirs, and past its 8 MiB the queue takes
+//!   their lines and nothing else. A request whose client
+//!   gives up while it waits for room was never handled:
+//!   it owes no line and holds nothing. The wait is a
+//!   task's, not a thread's: the runtime's workers are
+//!   never parked on the queue, so the health check,
 //!   `/metrics`, timers and a shutdown signal are still
 //!   served.
 //! - **Standard output that fails.** A write that fails
@@ -61,12 +69,13 @@
 
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
-/// The most text the queue holds, in bytes: the lines
+/// The text the queue is full at, in bytes: the lines
 /// waiting for the writer and the batch it is writing.
 /// A request line is a few hundred bytes, so this is tens
 /// of thousands of requests: room for a reader that falls
@@ -77,8 +86,9 @@ pub const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// How long a shutdown waits for the queue to be written
 /// before it exits without the lines that are left. A
 /// standard output that is being read takes the queue in
-/// well under a millisecond; one that takes nothing in a
-/// second is not being read.
+/// well under a millisecond; one that has not taken it in
+/// a second is not being read, or not fast enough to wait
+/// for.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// The writer starts a write no sooner than this after it
@@ -158,8 +168,8 @@ impl RequestLog {
         Self::queued(Box::new(Stdout), QUEUE_BYTES, Box::new(note_on_stderr))
     }
 
-    /// A queued log over `sink` that holds `cap` bytes and
-    /// reports what it drops through `note`.
+    /// A queued log over `sink` that is full at `cap` bytes
+    /// and reports what it drops through `note`.
     fn queued(sink: Box<dyn Sink>, cap: usize, note: Note) -> io::Result<Self> {
         let queue = Arc::new(Queue::new(cap));
         let writer = Writer::new(Arc::clone(&queue), sink, note);
@@ -186,17 +196,34 @@ impl RequestLog {
         Self::queued(Box::new(Stream(out)), QUEUE_BYTES, Box::new(|_| {})).unwrap()
     }
 
-    /// Log one request's line. Queued, it returns as soon
-    /// as the line is in the queue, which is at once unless
-    /// the queue is full: then it waits for room, so the
-    /// request's response waits with it.
-    pub async fn line(&self, line: &str) {
+    /// Wait until the log has room for a line. A handler
+    /// that logs calls this before it does anything else,
+    /// so while the queue is full a request waits here,
+    /// unhandled and unanswered, and one whose client gives
+    /// up has cost nothing and owes no line. It returns at
+    /// once unless the queue is full, and always for an
+    /// inline log, whose lines wait in their `write`.
+    pub async fn room(&self) {
+        if let Form::Queued(handle) = &*self.0 {
+            // One load for every request: the queue's lock
+            // is taken here only while the queue is full.
+            if handle.0.full.load(Ordering::Relaxed) {
+                handle.0.room().await;
+            }
+        }
+    }
+
+    /// Log one line: a request's, or one of the shutdown's.
+    /// Queued, the line is in the queue when this returns,
+    /// whatever the queue holds: a line is never refused
+    /// for want of room, and nothing waits here.
+    pub fn line(&self, line: &str) {
         match &*self.0 {
             Form::Inline => println!("{line}"),
             #[cfg(test)]
             Form::InlineTo(out) => write_inline(out, line),
             Form::Queued(handle) => {
-                handle.0.push(line, false).await;
+                handle.0.push(line, false);
             }
         }
     }
@@ -212,23 +239,10 @@ impl RequestLog {
             #[cfg(test)]
             Form::InlineTo(out) => write_inline(out, line),
             Form::Queued(handle) => {
-                if let Some(number) = handle.0.push(line, true).await {
+                if let Some(number) = handle.0.push(line, true) {
                     handle.0.settled(number).await;
                 }
             }
-        }
-    }
-
-    /// Log a line of the shutdown, in order with the lines
-    /// around it. It never waits: a shutdown must not hang
-    /// on a standard output nobody reads, so the line is
-    /// queued whatever the queue holds.
-    pub fn note(&self, line: &str) {
-        match &*self.0 {
-            Form::Inline => println!("{line}"),
-            #[cfg(test)]
-            Form::InlineTo(out) => write_inline(out, line),
-            Form::Queued(handle) => handle.0.push_past_the_cap(line),
         }
     }
 
@@ -236,8 +250,9 @@ impl RequestLog {
     /// then wait for the queue to be written, for at most
     /// `limit`. Returns how many lines were not written by
     /// then, `last` among them: none, unless standard
-    /// output takes nothing. Lines logged after this are
-    /// not written, so the log ends with `last`.
+    /// output did not take them in time. Lines logged after
+    /// this are not written, so the log ends with `last`,
+    /// and nothing waits for room any more.
     pub async fn finish(&self, last: Option<&str>, limit: Duration) -> u64 {
         let queue = match &*self.0 {
             Form::Inline => {
@@ -255,40 +270,40 @@ impl RequestLog {
             }
             Form::Queued(handle) => &handle.0,
         };
-        let (number, waiting) = {
+        let number = {
             let mut state = queue.lock();
-            // Lines that still wait for room are refused
-            // from here on: they are left too.
-            let waiting = if state.finished { 0 } else { state.waiting };
-            state.finished = true;
-            let number = match last {
-                Some(last) => queue.append(state, last, true),
-                None => {
+            let ended = std::mem::replace(&mut state.finished, true);
+            match last {
+                Some(last) if !ended => queue.append(state, last, true),
+                _ => {
+                    // What is queued is written without
+                    // waiting for more lines to share the
+                    // write.
                     let number = state.accepted;
                     state.urgent = true;
                     drop(state);
                     queue.wake.notify_one();
                     number
                 }
-            };
-            (number, waiting)
+            }
         };
-        // The lines that wait see that the log has ended,
-        // and let their requests go.
+        // The requests that wait for room see that the log
+        // has ended, and go on.
         queue.progress.notify_waiters();
         let _ = tokio::time::timeout(limit, queue.settled(number)).await;
         let state = queue.lock();
-        (state.accepted - state.settled) + waiting
+        state.accepted - state.settled
     }
 
     /// The queue's counters, for the tests.
     #[cfg(test)]
-    fn stats(&self) -> Stats {
+    pub(crate) fn stats(&self) -> Stats {
         match &*self.0 {
             Form::Queued(handle) => {
                 let state = handle.0.lock();
                 Stats {
-                    held_bytes: state.text.len() + state.writing,
+                    held_bytes: state.held(),
+                    full: handle.0.full.load(Ordering::Relaxed),
                     waiting: state.waiting,
                     dropped: state.dropped,
                     wakeups: state.wakeups,
@@ -303,17 +318,20 @@ impl RequestLog {
 /// What [`RequestLog::stats`] reads.
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Stats {
+pub(crate) struct Stats {
     /// Bytes queued and in the writer's hands.
-    held_bytes: usize,
-    /// Lines waiting for room.
-    waiting: u64,
+    pub(crate) held_bytes: usize,
+    /// The queue is full: a request that asks for room
+    /// waits.
+    pub(crate) full: bool,
+    /// Requests waiting for room.
+    pub(crate) waiting: u64,
     /// Lines given up on.
-    dropped: u64,
+    pub(crate) dropped: u64,
     /// How often the writer has woken from a wait.
-    wakeups: u64,
+    pub(crate) wakeups: u64,
     /// The writer thread has ended.
-    writer_gone: bool,
+    pub(crate) writer_gone: bool,
 }
 
 #[cfg(test)]
@@ -330,12 +348,14 @@ struct Queue {
     /// someone wants the queue written without delay.
     wake: Condvar,
     /// Notified after every write, when lines have settled
-    /// and room has come free, and when the log closes.
+    /// and room has come free, and when the log ends.
     progress: Notify,
-    /// The lines that wait for room look for it one at a
-    /// time, in the order they came.
-    turn: Semaphore,
-    /// The most bytes of text held at once.
+    /// The queue holds `cap` bytes or more. Set and cleared
+    /// under the lock, and read without it by every request
+    /// that asks for room, which takes the lock only when
+    /// this says the queue is full.
+    full: AtomicBool,
+    /// The bytes of text the queue is full at.
     cap: usize,
 }
 
@@ -346,8 +366,8 @@ struct State {
     /// How many lines `text` holds.
     lines: u64,
     /// The bytes of the batch the writer took and has not
-    /// finished with. They count against the cap, so the
-    /// cap bounds all the text held, not the queue alone.
+    /// finished with. They count as held, so the queue is
+    /// full by all the text held, not by `text` alone.
     writing: usize,
     /// How many lines that batch holds.
     writing_lines: u64,
@@ -360,13 +380,14 @@ struct State {
     /// Lines given up on since the start.
     #[cfg(test)]
     dropped: u64,
-    /// Lines that found the queue full and wait for room.
+    /// Requests waiting for room.
+    #[cfg(test)]
     waiting: u64,
     /// The writer sleeps until a line arrives: whoever
     /// queues one wakes it.
     asleep: bool,
-    /// Someone waits for the queue to be written, or for
-    /// room: the next write starts at once.
+    /// Someone waits for the queue to be written: the next
+    /// write starts at once.
     urgent: bool,
     /// The log was finished: it takes no more lines.
     finished: bool,
@@ -380,23 +401,11 @@ struct State {
     wakeups: u64,
 }
 
-/// Why a line was not queued.
-enum Refused {
-    /// The queue is full, or other lines already wait for
-    /// room. The line is counted as waiting.
-    Full,
-    /// The log was finished or closed.
-    Closed,
-}
-
-/// One line's place among those that wait for room: taken
-/// when the queue refuses the line, given up when the line
-/// is queued or its wait ends.
-struct Waiting(Arc<Queue>);
-
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        self.0.lock().waiting -= 1;
+impl State {
+    /// The bytes of text held: queued, and in the writer's
+    /// hands.
+    fn held(&self) -> usize {
+        self.text.len() + self.writing
     }
 }
 
@@ -412,6 +421,7 @@ impl Queue {
                 settled: 0,
                 #[cfg(test)]
                 dropped: 0,
+                #[cfg(test)]
                 waiting: 0,
                 asleep: false,
                 urgent: false,
@@ -423,7 +433,7 @@ impl Queue {
             }),
             wake: Condvar::new(),
             progress: Notify::new(),
-            turn: Semaphore::new(1),
+            full: AtomicBool::new(false),
             cap,
         }
     }
@@ -436,63 +446,14 @@ impl Queue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queue `line`, waiting for room if the queue is
-    /// full. Returns the line's number, or `None` if the
-    /// log takes no more lines.
-    async fn push(self: &Arc<Self>, line: &str, urgent: bool) -> Option<u64> {
-        match self.try_push(line, urgent, false) {
-            Ok(number) => Some(number),
-            Err(Refused::Closed) => None,
-            Err(Refused::Full) => {
-                let waiting = Waiting(Arc::clone(self));
-                let line = line.to_string();
-                // The wait is a task of its own. A request
-                // dropped while it waits, because its client
-                // left, still leaves its line, as it did when
-                // its handler wrote the line itself.
-                tokio::spawn(async move { waiting.push_when_room(&line, urgent).await })
-                    .await
-                    .ok()
-                    .flatten()
-            }
-        }
-    }
-
-    /// Queue `line` if there is room for it. `waited` says
-    /// the line already holds its place among the waiting.
-    fn try_push(&self, line: &str, urgent: bool, waited: bool) -> Result<u64, Refused> {
-        let mut state = self.lock();
-        if state.finished || state.closed {
-            return Err(Refused::Closed);
-        }
-        // With nothing held a line always fits, so one
-        // longer than the cap still gets through.
-        let held = state.text.len() + state.writing;
-        let room = held == 0 || held + line.len() < self.cap;
-        // A line does not pass those that wait for room.
-        if room && (waited || state.waiting == 0) {
-            return Ok(self.append(state, line, urgent));
-        }
-        if !waited {
-            state.waiting += 1;
-        }
-        // The writer may be holding back for more lines:
-        // with some waiting for room it writes at once.
-        let wake = !state.urgent;
-        state.urgent = true;
-        drop(state);
-        if wake {
-            self.wake.notify_one();
-        }
-        Err(Refused::Full)
-    }
-
-    /// Queue `line` whatever the queue holds.
-    fn push_past_the_cap(&self, line: &str) {
+    /// Queue `line`. Returns its number, or `None` if the
+    /// log has ended and takes no more lines.
+    fn push(&self, line: &str, urgent: bool) -> Option<u64> {
         let state = self.lock();
-        if !state.finished && !state.closed {
-            self.append(state, line, false);
+        if state.finished || state.closed {
+            return None;
         }
+        Some(self.append(state, line, urgent))
     }
 
     /// Append `line` and wake the writer if it sleeps, or
@@ -505,6 +466,9 @@ impl Queue {
         state.lines += 1;
         state.accepted += 1;
         let number = state.accepted;
+        if state.held() >= self.cap {
+            self.full.store(true, Ordering::Relaxed);
+        }
         // One wake for a sleeping writer, by the line that
         // finds it asleep: the lines after it see a writer
         // that is on its way, and cost no system call.
@@ -518,11 +482,48 @@ impl Queue {
         number
     }
 
-    /// Wait until line `number` has settled.
-    async fn settled(&self, number: u64) {
+    /// The writer is done with a batch: its lines have
+    /// settled, `_dropped` of them unwritten, and the room
+    /// it took is free.
+    fn settle(&self, _dropped: u64) {
+        let mut state = self.lock();
+        let lines = std::mem::take(&mut state.writing_lines);
+        state.writing = 0;
+        state.settled += lines;
+        #[cfg(test)]
+        {
+            state.dropped += _dropped;
+        }
+        if state.held() < self.cap {
+            self.full.store(false, Ordering::Relaxed);
+        }
+        drop(state);
+        self.progress.notify_waiters();
+    }
+
+    /// Wait while the queue is full.
+    async fn room(&self) {
+        #[cfg(test)]
+        let _waiting = Waiting::new(self);
         loop {
             // Created before the look below, so a write that
             // ends in between is not missed.
+            let progress = self.progress.notified();
+            {
+                let state = self.lock();
+                let ended = state.finished || state.closed || state.writer_gone;
+                if ended || state.held() < self.cap {
+                    return;
+                }
+            }
+            progress.await;
+        }
+    }
+
+    /// Wait until line `number` has settled.
+    async fn settled(&self, number: u64) {
+        loop {
+            // As in `room`.
             let progress = self.progress.notified();
             {
                 let state = self.lock();
@@ -535,20 +536,23 @@ impl Queue {
     }
 }
 
-impl Waiting {
-    /// Queue `line` once there is room, after the lines
-    /// that waited before it.
-    async fn push_when_room(self, line: &str, urgent: bool) -> Option<u64> {
-        let queue = &self.0;
-        let _turn = queue.turn.acquire().await.ok()?;
-        loop {
-            let progress = queue.progress.notified();
-            match queue.try_push(line, urgent, true) {
-                Ok(number) => return Some(number),
-                Err(Refused::Closed) => return None,
-                Err(Refused::Full) => progress.await,
-            }
-        }
+/// One request's wait for room, counted for the tests from
+/// when it starts to when it ends or is dropped.
+#[cfg(test)]
+struct Waiting<'a>(&'a Queue);
+
+#[cfg(test)]
+impl<'a> Waiting<'a> {
+    fn new(queue: &'a Queue) -> Self {
+        queue.lock().waiting += 1;
+        Waiting(queue)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.lock().waiting -= 1;
     }
 }
 
@@ -640,7 +644,8 @@ impl Writer {
             if catch_unwind(AssertUnwindSafe(|| self.write_until_closed())).is_ok() {
                 break;
             }
-            let lost = self.give_up_batch();
+            let lost = self.queue.lock().writing_lines;
+            self.queue.settle(lost);
             self.spare = String::new();
             (self.note)(&format!(
                 "request log: the writer failed and starts again; {lost} lines dropped"
@@ -650,21 +655,6 @@ impl Writer {
         }
         self.queue.lock().writer_gone = true;
         self.queue.progress.notify_waiters();
-    }
-
-    /// Settle the batch in hand as dropped, after a panic.
-    fn give_up_batch(&mut self) -> u64 {
-        let mut state = self.queue.lock();
-        let lost = std::mem::take(&mut state.writing_lines);
-        state.writing = 0;
-        state.settled += lost;
-        #[cfg(test)]
-        {
-            state.dropped += lost;
-        }
-        drop(state);
-        self.queue.progress.notify_waiters();
-        lost
     }
 
     fn write_until_closed(&mut self) {
@@ -684,7 +674,7 @@ impl Writer {
                 // cut by a failed write gets one last try.
                 drop(state);
                 if !self.carry.is_empty() {
-                    self.write(&[], 0);
+                    self.write(&[]);
                 }
                 return;
             }
@@ -703,31 +693,20 @@ impl Writer {
                 }
             }
             let batch = std::mem::replace(&mut state.text, std::mem::take(&mut self.spare));
-            let lines = std::mem::take(&mut state.lines);
             state.writing = batch.len();
-            state.writing_lines = lines;
+            state.writing_lines = std::mem::take(&mut state.lines);
             state.urgent = false;
             let finishing = state.finished;
             drop(state);
 
             self.last_write = Some(Instant::now());
-            let _dropped = self.write(batch.as_bytes(), lines);
+            let dropped = self.write(batch.as_bytes());
             if finishing {
                 // The last lines of a shutdown: say now what
                 // was dropped, not at the next report.
                 self.report(None);
             }
-
-            let mut state = self.queue.lock();
-            state.writing = 0;
-            state.writing_lines = 0;
-            state.settled += lines;
-            #[cfg(test)]
-            {
-                state.dropped += _dropped;
-            }
-            drop(state);
-            self.queue.progress.notify_waiters();
+            self.queue.settle(dropped);
 
             self.spare = batch;
             self.spare.clear();
@@ -758,9 +737,9 @@ impl Writer {
         state
     }
 
-    /// Write `batch`, which holds `lines` whole lines.
-    /// Returns how many of them were given up on.
-    fn write(&mut self, batch: &[u8], lines: u64) -> u64 {
+    /// Write `batch`, which holds whole lines. Returns how
+    /// many of them were given up on.
+    fn write(&mut self, batch: &[u8]) -> u64 {
         let carry = &mut self.carry;
         let mut outcome = Ok(());
         self.sink.hold(&mut |out| {
@@ -776,12 +755,9 @@ impl Writer {
                 0
             }
             Err((error, dropped)) => {
-                debug_assert!(dropped <= lines);
                 self.failing = true;
                 self.unreported += dropped;
-                let due = self
-                    .reported
-                    .is_none_or(|at| at.elapsed() >= REPORT_EVERY);
+                let due = self.reported.is_none_or(|at| at.elapsed() >= REPORT_EVERY);
                 if due {
                     self.report(Some(&format!(
                         "request log: cannot write to standard output: {error}"

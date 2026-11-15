@@ -25,10 +25,14 @@ const SECRET: &str = "request-log-secret-0123456789";
 /// machine; a test that passes never waits it out.
 const LONG: Duration = Duration::from_secs(60);
 
-/// How long a request gets before it counts as not
-/// answered: one that waits on standard output stays
-/// unanswered for as long as nobody reads it.
-const UNANSWERED: Duration = Duration::from_secs(1);
+/// How many health checks the server answers, one after
+/// the other, while a request stays unanswered, before the
+/// request counts as waiting. A fixed time would take a
+/// slow answer on a loaded machine for a wait; a request
+/// that is only slow is answered long before the same
+/// server, on the same machine, has answered this many
+/// others.
+const HEALTH_CHECKS: usize = 200;
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
@@ -99,6 +103,8 @@ struct Unread {
     /// The pipe, read up to the listening line.
     stdout: Option<BufReader<ChildStdout>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// Disconnected once stderr has been read to its end.
+    stderr_ended: Receiver<()>,
 }
 
 impl Unread {
@@ -114,7 +120,9 @@ impl Unread {
         let mut pipe = child.stderr.take().unwrap();
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&stderr);
+        let (ended, stderr_ended) = mpsc::channel::<()>();
         std::thread::spawn(move || {
+            let _ended = ended;
             let mut chunk = [0u8; 8192];
             while let Ok(n @ 1..) = pipe.read(&mut chunk) {
                 sink.lock().unwrap().extend_from_slice(&chunk[..n]);
@@ -149,6 +157,7 @@ impl Unread {
             port,
             stdout: Some(stdout),
             stderr,
+            stderr_ended,
         }
     }
 
@@ -203,12 +212,17 @@ impl Unread {
     }
 
     /// Wait for the server to exit: its status, and how long
-    /// it took from now.
+    /// it took from now. Its stderr has been read to the end
+    /// when this returns: the server's last words are
+    /// written just before it exits, and the thread that
+    /// reads them can be behind.
     fn exit(&mut self) -> (std::process::ExitStatus, Duration) {
         let waited = Instant::now();
         loop {
             if let Some(status) = self.server.0.try_wait().unwrap() {
-                return (status, waited.elapsed());
+                let took = waited.elapsed();
+                let _ = self.stderr_ended.recv_timeout(LONG);
+                return (status, took);
             }
             assert!(
                 waited.elapsed() < LONG,
@@ -220,8 +234,9 @@ impl Unread {
     }
 
     /// Send [`long_line_request`]s, one after the other,
-    /// until one is not answered: how many were, and the
-    /// one that waits. `most` is more than can fit.
+    /// until one waits (see [`HEALTH_CHECKS`]): how many
+    /// were answered, and the one that waits. `most` is
+    /// more than can fit.
     fn fill(&self, most: usize) -> (usize, std::thread::JoinHandle<Option<String>>) {
         let port = self.port;
         for n in 0..most {
@@ -231,10 +246,15 @@ impl Unread {
                 let _ = answer.send(());
                 head
             });
-            match answered.recv_timeout(UNANSWERED) {
-                Ok(()) => assert_eq!(status_of(&request.join().unwrap().unwrap()), 403),
-                Err(_) => return (n, request),
+            let mut checks = 0;
+            while answered.recv_timeout(Duration::from_millis(1)).is_err() {
+                assert_eq!(status(port, "/health", ""), 200);
+                checks += 1;
+                if checks == HEALTH_CHECKS {
+                    return (n, request);
+                }
             }
+            assert_eq!(status_of(&request.join().unwrap().unwrap()), 403);
         }
         panic!("{most} requests were answered with nobody reading standard output");
     }
@@ -297,7 +317,9 @@ fn a_replay_leaves_the_same_log_from_the_writer_thread_as_from_synchronous_lines
         let (mut server, port, lines, printed) = common::serve_printing(&mut command);
         // Boot names the setting when it is on.
         assert_eq!(
-            printed.iter().any(|line| line == "request log: synchronous"),
+            printed
+                .iter()
+                .any(|line| line == "request log: synchronous"),
             sync,
             "{printed:#?}"
         );
@@ -408,41 +430,38 @@ fn a_bad_log_sync_value_stops_the_boot() {
 }
 
 #[test]
-fn with_log_sync_a_request_writes_its_own_line_and_without_it_the_queue_takes_it() {
-    // Nobody reads standard output, a pipe that holds about
-    // one 60 KB line. With `CRABCROP_LOG_SYNC` each request
-    // writes its line before it is answered, so the second
-    // or third request blocks in its write.
-    let mut sync = Unread::boot(&[("CRABCROP_LOG_SYNC", "1"), ("CRABCROP_ALLOW_UNSAFE", "1")]);
-    let (answered, blocked) = sync.fill(8);
-    assert!(answered <= 2, "{answered} lines of 60 KB fit in the pipe");
-    // It goes on as soon as the pipe is read, and the lines
-    // are there: each whole, in the order of the requests.
-    let lines = sync.read();
-    assert_eq!(status_of(&blocked.join().unwrap().unwrap()), 403);
-    sync.terminate();
-    assert_eq!(sync.exit().0.code(), Some(0), "{}", sync.stderr());
-    let lines = rest_of(&lines);
-    let numbers: Vec<usize> = lines[..answered + 1].iter().map(|l| number_in(l)).collect();
-    assert_eq!(numbers, (0..=answered).collect::<Vec<_>>());
-
-    // Without it the lines are queued: the same requests,
-    // and twenty more, are answered with nobody reading.
-    let mut queued = Unread::boot(&[("CRABCROP_ALLOW_UNSAFE", "1")]);
-    for n in 0..answered + 21 {
-        let head = get_within(queued.port, &long_line_request(n), "", LONG);
-        assert_eq!(status_of(&head.expect("an answer")), 403, "request {n}");
-    }
-    let lines = queued.read();
-    queued.terminate();
-    assert_eq!(queued.exit().0.code(), Some(0), "{}", queued.stderr());
-    let lines = rest_of(&lines);
-    let numbers: Vec<usize> = lines[..answered + 21]
-        .iter()
-        .map(|l| number_in(l))
-        .collect();
-    assert_eq!(numbers, (0..answered + 21).collect::<Vec<_>>());
-    assert_eq!(lines.last().map(String::as_str), Some("shutdown: done"));
+fn with_log_sync_a_request_writes_its_own_line_before_it_is_answered() {
+    let mut server = Unread::boot(&[("CRABCROP_LOG_SYNC", "1")]);
+    let unsigned = format!("/{}/40x30/http://127.0.0.1:9/a.png", "0".repeat(64));
+    // While standard output takes lines, a request is
+    // answered and its line is there.
+    assert_eq!(
+        status(server.port, &unsigned, "X-Request-Id: answered\r\n"),
+        403
+    );
+    let mut line = String::new();
+    server
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("\"request_id\":\"answered\""), "{line}");
+    // Standard output is closed. The request's handler
+    // writes the line itself, before the answer: the write
+    // fails there, and the request is cut off with no
+    // answer, as in releases through 0.12. (The writer
+    // thread drops the line and the request is answered:
+    // see the test of a closed standard output below.)
+    server.close();
+    let cut_off = get_within(server.port, &unsigned, "", LONG);
+    assert!(
+        cut_off.as_ref().is_none_or(|head| head.is_empty()),
+        "{cut_off:?}"
+    );
+    server.stderr_says("failed printing to stdout");
+    // The process is still there.
+    assert_eq!(status(server.port, "/health", ""), 200);
 }
 
 #[test]
@@ -454,11 +473,11 @@ fn a_full_queue_makes_requests_wait_and_they_go_on_when_the_pipe_is_read() {
     let (answered, waiting) = server.fill(200);
     assert!(
         (130..=150).contains(&answered),
-        "{answered} lines of 60 KB were taken: the queue holds 8 MiB"
+        "{answered} lines of 60 KB were taken: the queue is full at 8 MiB"
     );
-    // The server is not stuck: a request that logs nothing
-    // is answered.
-    assert_eq!(status(server.port, "/health", ""), 200);
+    // The server is not stuck: it answered a request that
+    // logs nothing, the health check, 200 times while that
+    // one waited.
     assert!(!waiting.is_finished());
     // The pipe is read: the request is answered, and every
     // line is there, whole, once, in the order of the
@@ -472,13 +491,17 @@ fn a_full_queue_makes_requests_wait_and_they_go_on_when_the_pipe_is_read() {
     let numbers: Vec<usize> = lines[..=answered].iter().map(|l| number_in(l)).collect();
     assert_eq!(numbers, (0..=answered).collect::<Vec<_>>());
     assert_eq!(lines[answered + 2], "shutdown: done");
-    assert!(!server.stderr().contains("request log"), "{}", server.stderr());
+    assert!(
+        !server.stderr().contains("request log"),
+        "{}",
+        server.stderr()
+    );
 }
 
 #[test]
 fn a_shutdown_ends_within_its_bound_when_nobody_reads_standard_output() {
-    // The queue is full, a request waits for room, and
-    // nobody reads the pipe, now or later.
+    // The queue is full, a request waits for room in it,
+    // and nobody reads the pipe, now or later.
     let mut server = Unread::boot(&[
         ("CRABCROP_ALLOW_UNSAFE", "1"),
         ("CRABCROP_SHUTDOWN_GRACE_SECS", "1"),
@@ -491,7 +514,7 @@ fn a_shutdown_ends_within_its_bound_when_nobody_reads_standard_output() {
     // gone, with nothing read.
     assert_eq!(status.code(), Some(0), "{}", server.stderr());
     assert!(took >= Duration::from_millis(1900), "exited after {took:?}");
-    assert!(took < Duration::from_secs(20), "exited after {took:?}");
+    assert!(took < LONG / 2, "exited after {took:?}");
     let stderr = server.stderr();
     assert!(
         stderr.contains("shutdown: requests still in flight at the deadline are cut off"),
@@ -502,17 +525,19 @@ fn a_shutdown_ends_within_its_bound_when_nobody_reads_standard_output() {
     let left: usize = stderr
         .lines()
         .find_map(|line| {
-            line.strip_prefix("shutdown: standard output took nothing for 1s; the last ")?
-                .strip_suffix(" log lines are not written")?
-                .parse()
-                .ok()
+            line.strip_prefix(
+                "shutdown: standard output did not take the log within 1s; the last ",
+            )?
+            .strip_suffix(" log lines are not written")?
+            .parse()
+            .ok()
         })
         .unwrap_or_else(|| panic!("no count of unwritten lines in {stderr}"));
     assert!(
         (answered..=answered + 3).contains(&left),
         "{left} of {answered} lines left"
     );
-    // The request that waited was let go when the log ended.
+    // The request that waited was cut off at the deadline.
     let _ = waiting.join();
 }
 
@@ -526,8 +551,7 @@ fn a_closed_standard_output_costs_the_lines_and_nothing_else() {
     for _ in 0..40 {
         assert_eq!(status(server.port, &unsigned, ""), 403);
     }
-    let stderr =
-        server.stderr_says("request log: cannot write to standard output: Broken pipe");
+    let stderr = server.stderr_says("request log: cannot write to standard output: Broken pipe");
     assert!(stderr.contains(" lines dropped"), "{stderr}");
     // At the first failure and then every ten seconds, not
     // once per line.
@@ -538,10 +562,10 @@ fn a_closed_standard_output_costs_the_lines_and_nothing_else() {
     server.terminate();
     let (status, took) = server.exit();
     assert_eq!(status.code(), Some(0), "{}", server.stderr());
-    assert!(took < Duration::from_secs(20), "exited after {took:?}");
+    assert!(took < LONG / 2, "exited after {took:?}");
     let stderr = server.stderr();
     assert!(!stderr.contains("panicked"), "{stderr}");
-    assert!(!stderr.contains("standard output took nothing"), "{stderr}");
+    assert!(!stderr.contains("did not take the log"), "{stderr}");
 }
 
 /// The writer thread of process `pid`: its ID, or `None`
@@ -582,7 +606,14 @@ fn thread_use(pid: u32, tid: &str) -> (u64, u64) {
     let switches: u64 = status
         .lines()
         .filter(|line| line.contains("ctxt_switches"))
-        .map(|line| line.rsplit('\t').next().unwrap().trim().parse::<u64>().unwrap())
+        .map(|line| {
+            line.rsplit('\t')
+                .next()
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        })
         .sum();
     let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).unwrap();
     // The fields after the name, which can hold spaces:

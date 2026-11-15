@@ -227,7 +227,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     }
     let deadline = tokio::time::Instant::now() + shutdown_grace;
     let signalled_again = shutdown_signal();
-    log.note(&format!(
+    log.line(&format!(
         "shutdown: draining requests and background work for up to {}s",
         shutdown_grace.as_secs()
     ));
@@ -292,21 +292,21 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         // stay misses until a later purge of the target
         // finishes its walk. A purge whose tombstone the
         // bucket refused held in this process only.
-        log.note(&format!(
+        log.line(&format!(
             "shutdown: stopping {} background purge walks; a purge whose tombstone reached the bucket stays in force",
             left.walks
         ));
     }
     // The last line, after every line still queued (issue
     // #642). A standard output that is read takes the queue
-    // at once; one that takes nothing holds the exit for
+    // at once; one that does not holds the exit for
     // `SHUTDOWN_WAIT` at most, past the grace if the drain
     // used it up, and the lines it did not take are lost.
     let limit = crate::observe::SHUTDOWN_WAIT;
     let unwritten = log.finish(Some("shutdown: done"), limit).await;
     if unwritten > 0 {
         eprintln!(
-            "shutdown: standard output took nothing for {}s; the last {unwritten} log lines are not written",
+            "shutdown: standard output did not take the log within {}s; the last {unwritten} log lines are not written",
             limit.as_secs()
         );
     }

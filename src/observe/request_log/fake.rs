@@ -75,7 +75,7 @@ impl FakeStdout {
     /// Wait until a `write` is blocked on a stream nobody
     /// reads: the writer has a batch in hand.
     pub(crate) async fn blocked(&self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !self.state().blocked {
             assert!(Instant::now() < deadline, "no write reached the stream");
             tokio::time::sleep(Duration::from_millis(1)).await;
