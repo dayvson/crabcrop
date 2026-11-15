@@ -40,20 +40,39 @@ class McpClient {
     this.child = child;
     this.nextId = 1;
     this.pending = new Map();
+    // A server that has closed its output answers nothing
+    // more: one that could not start (a module that does not
+    // load, a bad environment), or one that died. Its
+    // requests fail at once. Left waiting, a request holds
+    // its test to the timeout, the test's `finally` never
+    // runs, and the listeners it did not close keep the
+    // whole run open (issue #684).
+    this.closed = null;
+    const close = () => {
+      this.closed ??= new Error("the MCP server closed its output with a request unanswered");
+      for (const { reject } of this.pending.values()) reject(this.closed);
+      this.pending.clear();
+    };
     const rl = createInterface({ input: child.stdout });
     rl.on("line", (line) => {
       const msg = JSON.parse(line);
-      const resolve = this.pending.get(msg.id);
-      if (resolve) {
+      const waiting = this.pending.get(msg.id);
+      if (waiting) {
         this.pending.delete(msg.id);
-        resolve(msg.result);
+        waiting.resolve(msg.result);
       }
     });
+    rl.on("close", close);
+    if (child.stdout.readableEnded || child.stdout.destroyed) close();
+    // A write to a server that is gone is reported by the
+    // request it carried, above, not by the stream.
+    child.stdin.on("error", () => {});
   }
   request(method, params) {
+    if (this.closed) return Promise.reject(this.closed);
     const id = this.nextId++;
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve);
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
       this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
   }
@@ -65,6 +84,21 @@ class McpClient {
     return result.content.map((c) => c.text).join("\n");
   }
 }
+
+test("a request to an MCP server that is gone fails instead of waiting (issue #684)", { timeout: 20000 }, async () => {
+  // The client the tests below talk through. A server that
+  // exits before it answers must fail the request, so the
+  // test that made it fails with that and cleans up.
+  const gone = spawn(process.execPath, ["-e", "process.exit(3)"], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  const client = new McpClient(gone);
+  const unanswered = /closed its output with a request unanswered/;
+  await assert.rejects(client.request("initialize", {}), unanswered);
+  // And a request made once the exit has been seen.
+  await assert.rejects(client.request("tools/list", {}), unanswered);
+  assert.equal(client.pending.size, 0);
+});
 
 test("the MCP tools work end to end against a live server", { timeout: 90000 }, async () => {
   assert.ok(existsSync(binary), "precondition: cargo build must have produced target/debug/crabcrop");

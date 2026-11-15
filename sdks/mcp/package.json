@@ -12,7 +12,7 @@
     "build": "tsc",
     "prepack": "npm --prefix ../typescript run build && npm run build",
     "start": "node src/index.ts",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "type": "module",
   "version": "0.12.0",
