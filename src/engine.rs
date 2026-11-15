@@ -2222,7 +2222,7 @@ impl Engine {
                 pixels: frame.into_buffer(),
             })
             .collect();
-        let bytes = encoder.encode(&out_frames, format).map_err(|e| match e {
+        let bytes = encoder.encode(out_frames, format).map_err(|e| match e {
             crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
             crate::video::VideoError::Failed(what) => EngineError::Video(what),
         })?;
