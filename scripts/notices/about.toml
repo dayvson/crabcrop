@@ -1,0 +1,88 @@
+# cargo-about's configuration for THIRD-PARTY-NOTICES.md (issue #682).
+#
+# scripts/check_notices.py runs cargo-about with this file, for the
+# features and targets dist-workspace.toml builds, and renders what
+# it finds into scripts/notices/template.md. After a change here, run
+# `python3 scripts/check_notices.py --write` and commit the result.
+
+# The licenses a crate in the release build may be used under, in
+# order of preference: where a crate offers a choice ("MIT OR
+# Apache-2.0"), the notices reproduce the first of its licenses this
+# list names. A crate whose license expression no entry satisfies
+# stops the generator, so a new license reaches a release only by
+# being added here, with its reason. check_notices.py also fails on an
+# entry no crate needs any more, so the list stays the audit of what
+# the binary carries.
+accepted = [
+    # Permissive licenses: a binary copy keeps the copyright notice
+    # and the license text.
+    "MIT",
+    # Also asks for the attribution in a crate's NOTICE file;
+    # check_notices.py copies every NOTICE file at a crate's root.
+    "Apache-2.0",
+    # target-lexicon: the exception only relaxes Apache-2.0.
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    # Unicode's data license, for the ICU4X crates, unicode-ident, and
+    # regex-syntax's Unicode tables (below). The notice goes with every
+    # copy of the data.
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    # webpki-roots: Mozilla's list of root certificates, under a data
+    # license that asks for its text, or a link to it, with the data.
+    "CDLA-Permissive-2.0",
+    # mp4parse, the AVIF container parser (avif-decode): file-level
+    # copyleft. The MIT binary may carry it; the files it covers must
+    # stay available as source, and the binary's recipients must be
+    # told where. THIRD-PARTY-NOTICES.md says where for every crate
+    # used under this license.
+    "MPL-2.0",
+]
+
+# Dev-dependencies never reach a release binary.
+ignore-dev-dependencies = true
+
+# Read license files from each crate's root directory only. A deeper
+# scan takes source files whose header is a license (whole .rs, .asm
+# and .js files) for license texts. The license files of code a crate
+# vendors in a subdirectory are named here (Rust code) or in
+# scripts/notices/template.md (C and assembly).
+max-depth = 1
+
+# quantizr names its license only through `license-file`.
+[quantizr.clarify]
+license = "MIT"
+[[quantizr.clarify.files]]
+path = "LICENSE"
+checksum = "407b2d167f73ef78da1fcbfb6c2f1051f195b1984b9bfeeac0a39b34c198a7fe"
+
+# tracing-core carries spin-rs's code in src/spin, under spin's own
+# MIT notice.
+[tracing-core.clarify]
+license = "MIT"
+[[tracing-core.clarify.files]]
+path = "LICENSE"
+checksum = "898b1ae9821e98daf8964c8d6c7f61641f5f5aa78ad500020771c0939ee0dea1"
+[[tracing-core.clarify.files]]
+path = "src/spin/LICENSE"
+checksum = "58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79"
+
+# regex-syntax's Unicode tables, compiled into the binary, are
+# Unicode data under Unicode's license, in src/unicode_tables.
+[regex-syntax.clarify]
+license = "(MIT OR Apache-2.0) AND Unicode-DFS-2016"
+[[regex-syntax.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+[[regex-syntax.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+[[regex-syntax.clarify.files]]
+path = "src/unicode_tables/LICENSE-UNICODE"
+license = "Unicode-DFS-2016"
+checksum = "74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3"

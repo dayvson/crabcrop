@@ -39,6 +39,9 @@ EXAMPLES = {
     ".github/workflows/release.yml": "cargo-dist's comment on tag formats",
     "docs/release-workflow.yml": "the mirror of release.yml",
     "scripts/test_check_locks.py": "made-up lockfile entries, third-party crates included",
+    # Generated from Cargo.lock, the workspace's own crates left out, so
+    # every version in it is a third-party crate's (issue #682).
+    "THIRD-PARTY-NOTICES.md": "third-party crates' own versions",
 }
 
 

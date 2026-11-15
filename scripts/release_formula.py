@@ -5,7 +5,10 @@ Usage: python3 scripts/release_formula.py X.Y.Z sha256.sum > crabcrop.rb
 
 Reads the release's sha256.sum (published by cargo-dist with the release)
 and fills the macOS and Linux blocks for both architectures. The formula
-installs the prebuilt binary; see RELEASING.md for how it reaches a tap.
+installs the prebuilt binary, and the third-party license notices the
+tarball carries beside it into the formula's doc directory (issue #682;
+scripts/check_notices.py fails if that line goes). See RELEASING.md for
+how the formula reaches a tap.
 """
 import re
 import sys
@@ -69,6 +72,7 @@ def main():
 
   def install
     bin.install "crabcrop"
+    doc.install "THIRD-PARTY-NOTICES.md"
   end
 
   test do
