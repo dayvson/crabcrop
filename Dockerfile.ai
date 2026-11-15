@@ -11,7 +11,9 @@
 # before extraction and the extracted library again after,
 # per architecture; the models are pinned at the ADD. The
 # model is a deployment artifact: it is never committed to
-# this repo.
+# this repo. ONNX Runtime's LICENSE and its third-party
+# notices come from the same checked tarball and go beside
+# the base image's THIRD-PARTY-NOTICES.md (issue #682).
 #
 # The base is an explicit build argument so a build cannot
 # silently layer onto a stale local image: pass a digest for
@@ -44,9 +46,10 @@ RUN set -eu; \
     curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-${ort_arch}-1.31.0.tgz" -o /tmp/ort.tgz; \
     echo "$tgz_sha  /tmp/ort.tgz" | sha256sum -c -; \
     tar -xzf /tmp/ort.tgz -C /tmp; \
-    mkdir -p /opt/onnxruntime; \
+    mkdir -p /opt/onnxruntime /opt/onnxruntime-notices; \
     cp "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/lib/libonnxruntime.so.1.31.0" /opt/onnxruntime/libonnxruntime.so; \
     echo "$so_sha  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c -; \
+    cp "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/LICENSE" "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/ThirdPartyNotices.txt" /opt/onnxruntime-notices/; \
     rm -rf /tmp/ort.tgz "/tmp/onnxruntime-linux-${ort_arch}-1.31.0"
 
 FROM ${BASE_IMAGE}
@@ -57,6 +60,7 @@ FROM ${BASE_IMAGE}
 USER root
 
 COPY --from=onnxruntime /opt/onnxruntime /opt/onnxruntime
+COPY --from=onnxruntime /opt/onnxruntime-notices /usr/share/doc/crabcrop/onnxruntime
 
 ADD --checksum=sha256:309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8 https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
 
