@@ -27,6 +27,7 @@ mod inpaint;
 mod mask;
 mod moderation;
 mod ocr;
+mod resample;
 mod sam;
 mod session;
 mod upscale;
