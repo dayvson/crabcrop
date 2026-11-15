@@ -1246,3 +1246,100 @@ fn build_state_names_a_component_that_does_not_build() {
         "{err}"
     );
 }
+
+/// The minor page faults this thread has taken (Linux).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn minor_faults() -> u64 {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+    // The fields after the command name, which is in
+    // parentheses and may hold spaces: state, ppid, pgrp,
+    // session, tty_nr, tpgid, flags, minflt.
+    let fields = stat.rsplit_once(')').unwrap().1;
+    fields.split_whitespace().nth(7).unwrap().parse().unwrap()
+}
+
+/// Run in a process of its own by
+/// `raised_malloc_thresholds_keep_a_renders_blocks`: the
+/// thresholds are the process's, and the other tests of
+/// this binary move them. Prints the page faults of one
+/// round of a render's blocks, once the first round is
+/// over.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+#[ignore = "run in a process of its own by raised_malloc_thresholds_keep_a_renders_blocks"]
+fn malloc_churn_helper() {
+    if env::var("CRABCROP_TEST_RAISE_THRESHOLDS").as_deref() == Ok("1") {
+        raise_malloc_thresholds();
+    }
+    // The frame-sized blocks of a resize from 2400x1600 to
+    // 1600 wide: the decoded source, the resizer's
+    // intermediate and the result, 24.3 MB together. Each
+    // is filled, as a render fills it, and freed.
+    let mut rounds = Vec::new();
+    for _ in 0..8 {
+        let before = minor_faults();
+        let decoded = vec![1u8; 2400 * 1600 * 3];
+        let intermediate = vec![2u8; 1600 * 1600 * 3];
+        let result = vec![3u8; 1600 * 1067 * 3];
+        std::hint::black_box((&decoded, &intermediate, &result));
+        drop(decoded);
+        drop(intermediate);
+        drop(result);
+        rounds.push(minor_faults() - before);
+    }
+    // The first round takes its pages for the first time
+    // either way.
+    let mut later = rounds[1..].to_vec();
+    later.sort_unstable();
+    println!("faults_per_round={}", later[later.len() / 2]);
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn raised_malloc_thresholds_keep_a_renders_blocks() {
+    // Issue #690. A fresh process hands a render's blocks
+    // back to the kernel when they total more than twice
+    // the largest block it has freed, and takes them again
+    // at the next render: one page fault for every 4 KiB,
+    // about 5,900 for these 24.3 MB. With the thresholds
+    // raised the blocks stay in the heap.
+    let faults_per_round = |raise: &str| -> u64 {
+        let out = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::malloc_churn_helper",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("CRABCROP_TEST_RAISE_THRESHOLDS", raise)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        // The count follows the test's name on its line.
+        let count = stdout
+            .split_once("faults_per_round=")
+            .unwrap_or_else(|| panic!("the helper printed no count: {stdout}"))
+            .1;
+        count
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let (fresh, raised) = (faults_per_round("0"), faults_per_round("1"));
+    assert!(
+        raised < 600,
+        "{raised} page faults a round with the thresholds raised ({fresh} without)"
+    );
+    // Where the allocator does hand the blocks back, which
+    // glibc does as long as its thresholds adjust
+    // themselves, raising them is what stops it. An
+    // allocator that keeps them anyway has nothing to show
+    // here.
+    if fresh >= 3000 {
+        assert!(raised * 5 < fresh, "{raised} against {fresh}");
+    }
+}
