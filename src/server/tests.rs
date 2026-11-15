@@ -1086,6 +1086,96 @@ fn a_padded_source_is_keyed_by_a_bounded_digest() {
     assert_ne!(key, other);
 }
 
+/// The cache key as it was put together before issue #640
+/// appended its parts to one buffer: a `format!` for every
+/// suffix.
+fn cache_key_by_formatting(
+    config_fingerprint: &str,
+    ops: &[crate::url::Operation],
+    source_url: &str,
+    negotiated: &Negotiated,
+) -> String {
+    let key_base =
+        crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
+    let key_base = format!("{key_base}#cfg{config_fingerprint}");
+    let mut cache_key = if negotiated.directives.explicit_format.is_some() {
+        key_base
+    } else {
+        let class = match negotiated.preferred {
+            Some(ImageFormat::Avif) => "avif",
+            Some(ImageFormat::Jxl) => "jxl",
+            Some(ImageFormat::WebP) => "webp",
+            _ => "source",
+        };
+        format!("{key_base}#{class}")
+    };
+    if let Some(w) = negotiated.hinted_width {
+        cache_key = format!("{cache_key}#w{w}");
+    }
+    if negotiated.save_data_applies {
+        cache_key = format!("{cache_key}#sd");
+    }
+    let effective_dpr = negotiated.effective_dpr;
+    if effective_dpr != 1.0 {
+        cache_key = format!("{cache_key}#dpr{effective_dpr}");
+    }
+    cache_key
+}
+
+#[test]
+fn every_cache_key_keeps_its_bytes() {
+    // Issue #640: the key is written into one buffer. A key
+    // that changed by a byte would orphan every entry the
+    // disk and shared tiers hold, so each suffix is compared
+    // with the text it was formatted to before: the
+    // negotiated class, the hinted width, Save-Data and the
+    // DPR, alone and together, on a plain form and on one
+    // carried as a digest.
+    let padded = format!("http://origin{}t.png", "/".repeat(5_000));
+    let remainders = [
+        "300x200/filters:grayscale/http://x/heroes/cat.jpg".to_string(),
+        "filters:format(webp):quality(80)/http://x/a.jpg".to_string(),
+        "http://x/a.jpg".to_string(),
+        format!("fit-in:800x600/{padded}"),
+    ];
+    let classes = [
+        None,
+        Some(ImageFormat::Avif),
+        Some(ImageFormat::Jxl),
+        Some(ImageFormat::WebP),
+        Some(ImageFormat::Jpeg),
+        Some(ImageFormat::Png),
+    ];
+    let mut checked = 0;
+    for remainder in &remainders {
+        let (ops, source, _, _) = parse_operations_with_expiry(remainder).unwrap();
+        for preferred in classes {
+            for hinted_width in [None, Some(100), Some(3840)] {
+                for save_data_applies in [false, true] {
+                    for effective_dpr in crate::url::DPR_FACTORS {
+                        let negotiated = Negotiated {
+                            preferred,
+                            hinted_width,
+                            save_data_applies,
+                            effective_dpr,
+                            ..plain_negotiation(&ops)
+                        };
+                        for fingerprint in ["test", "5f1d3c9a7e2b4860"] {
+                            assert_eq!(
+                                cache_key_for(fingerprint, &ops, source, &negotiated),
+                                cache_key_by_formatting(fingerprint, &ops, source, &negotiated),
+                                "{remainder}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 4 * 6 * 3 * 2 * 4 * 2);
+}
+
 /// A source server that reads each whole request head before
 /// it answers, however long the request line, and counts the
 /// requests.
@@ -3206,6 +3296,229 @@ fn preset_spellings_and_their_expansions_share_one_cache_key() {
     assert_eq!(err.code(), "unknown_preset");
     let err = crate::url::expand_presets(&format!("300x200/{src}"), &presets, true).unwrap_err();
     assert_eq!(err.code(), "presets_only");
+}
+
+/// [`resolve_request`] as it read every remainder before
+/// issue #640: the preset names, the expansion, and the
+/// parse of the expanded text, each a walk of its own.
+fn resolve_by_three_walks(
+    state: &AppState,
+    rest: &str,
+    record: &mut RequestRecord,
+) -> Result<Resolved, Refusal> {
+    let grammar = |e: crate::url::ParseError| Refusal::Payload(parse_failure_parts(&e));
+    if matches!(
+        rest.split('/').next(),
+        Some("purge" | "purge-group" | "upload")
+    ) {
+        return Err(Refusal::Payload((
+            StatusCode::BAD_REQUEST,
+            "reserved_segment",
+            "an image URL may not begin with a purge or upload segment".to_string(),
+        )));
+    }
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Err(Refusal::Payload(reserved_remainder_parts()));
+    }
+    let groups = crate::url::preset_names(rest);
+    let rest =
+        crate::url::expand_presets(rest, &state.presets, state.only_presets).map_err(grammar)?;
+    let (ops, source_url, expiry, max_age) =
+        parse_operations_with_expiry(&rest).map_err(grammar)?;
+    record.ops = rest[..rest.len() - source_url.len()]
+        .trim_end_matches('/')
+        .to_string();
+    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
+    crate::url::check_operation_count(&ops).map_err(grammar)?;
+    crate::url::check_watermark_count(&ops).map_err(grammar)?;
+    let (source_url, _) =
+        crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
+    if let Some(exp) = expiry
+        && now_unix() >= exp
+    {
+        return Err(Refusal::AsIs((
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired".to_string(),
+        )));
+    }
+    Ok(Resolved {
+        ops,
+        source_url,
+        groups,
+        max_age,
+    })
+}
+
+/// A resolved request: its operations, source, groups and
+/// cache lifetime.
+type ResolvedParts = (Vec<crate::url::Operation>, String, Vec<String>, Option<u32>);
+
+/// A refusal: its kind, and its answer when it has its own.
+type RefusalParts = (&'static str, Option<ErrorParts>);
+
+/// What a resolved request, or its refusal, comes to, in a
+/// form two of them can be compared in.
+fn resolved_parts(resolved: Result<Resolved, Refusal>) -> Result<ResolvedParts, RefusalParts> {
+    match resolved {
+        Ok(resolved) => Ok((
+            resolved.ops,
+            resolved.source_url,
+            resolved.groups,
+            resolved.max_age,
+        )),
+        Err(Refusal::Unopened) => Err(("unopened", None)),
+        Err(Refusal::Payload(parts)) => Err(("payload", Some(parts))),
+        Err(Refusal::MetaDisabled(parts)) => Err(("meta disabled", Some(parts))),
+        Err(Refusal::AsIs(parts)) => Err(("as is", Some(parts))),
+    }
+}
+
+#[test]
+fn a_remainder_resolves_as_the_three_walks_resolved_it() {
+    // Issue #640: a remainder that names no preset is
+    // parsed in one walk. On every server (no presets,
+    // presets, presets only, default operations and source
+    // roots) each remainder must resolve to the request the
+    // three walks resolved it to, with the same groups and
+    // the same operation summary in its log line, or be
+    // refused with the same answer: the grammar's errors,
+    // the caps, an unknown preset, an expired URL.
+    let presets: crate::url::Presets = [
+        ("thumb".to_string(), "150x150".parse().unwrap()),
+        (
+            "card".to_string(),
+            "crop:1200x630:smart/filters:quality(80)".parse().unwrap(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let states = [
+        test_state(),
+        AppState {
+            presets: presets.clone(),
+            ..test_state()
+        },
+        AppState {
+            presets: presets.clone(),
+            only_presets: true,
+            ..test_state()
+        },
+        AppState {
+            presets: presets.clone(),
+            default_ops: crate::url::parse_default_ops(
+                "filters:quality(80):format(webp)/preset:thumb",
+                &presets,
+            )
+            .unwrap(),
+            source_roots: [(
+                "photos".to_string(),
+                "https://cdn.example.com/p".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..test_state()
+        },
+    ];
+    let doc = load_spec("operation-vectors.json");
+    let mut remainders: Vec<String> = Vec::new();
+    for (n, case) in doc["cases"].as_array().unwrap().iter().enumerate() {
+        let rest = case["remainder"].as_str().unwrap();
+        remainders.push(rest.to_string());
+        match n % 6 {
+            0 => remainders.push(format!("preset:thumb/{rest}")),
+            1 => remainders.push(format!("exp:4102444800/maxage:60/{rest}")),
+            2 => remainders.push(format!("exp:1/{rest}")),
+            3 => remainders.push(format!("{rest}/preset:card")),
+            4 => remainders.push(format!("preset:nope/{rest}")),
+            _ => remainders.push(format!("preset:card/preset:thumb/{rest}")),
+        }
+    }
+    let src = "https://example.com/a.jpg";
+    let chain = |operations: usize| format!("{}{src}", "filters:grayscale/".repeat(operations));
+    let watermarks = |count: usize| {
+        let marks: Vec<String> = (0..count)
+            .map(|n| format!("watermark(https%3A%2F%2Fexample.com%2Fw{n}.png,0,0,0)"))
+            .collect();
+        format!("filters:{}/{src}", marks.join(":"))
+    };
+    remainders.extend([
+        chain(98),
+        chain(99),
+        chain(100),
+        chain(101),
+        watermarks(16),
+        watermarks(17),
+        format!("preset:card/{}", chain(98)),
+        format!("preset:card/{}", chain(99)),
+        "purge/300x200/x.jpg".to_string(),
+        "purge-group/hero".to_string(),
+        "upload/x.jpg".to_string(),
+        "crabcrop/purge-key".to_string(),
+        "300x200/root:photos/cat.jpg".to_string(),
+        "300x200/root:nope/cat.jpg".to_string(),
+        "preset:thumb/root:photos/cat.jpg".to_string(),
+        format!(
+            "300x200/https://example.com/preset:thumb/{}",
+            "a".repeat(300_000)
+        ),
+        format!("300x200/https://example.com/{}", "a".repeat(300_000)),
+        "300x200".to_string(),
+        String::new(),
+    ]);
+    let mut bad = Vec::new();
+    let (mut resolved, mut refused) = (0, 0);
+    for (n, state) in states.iter().enumerate() {
+        for rest in &remainders {
+            let (mut record, mut expected_record) = Default::default();
+            let got = resolved_parts(resolve_request(state, rest, &mut record));
+            let expected =
+                resolved_parts(resolve_by_three_walks(state, rest, &mut expected_record));
+            let shown: String = rest.chars().take(120).collect();
+            if got != expected {
+                bad.push(format!(
+                    "state {n}, {shown}: {got:?}, the three walks {expected:?}"
+                ));
+            } else if record.ops != expected_record.ops {
+                bad.push(format!(
+                    "state {n}, {shown}: logs {:?}, the three walks {:?}",
+                    record.ops, expected_record.ops
+                ));
+            }
+            match got {
+                Ok(_) => resolved += 1,
+                Err(_) => refused += 1,
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} mismatches:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+    assert!(
+        resolved > 1000 && refused > 1000,
+        "{resolved} resolved, {refused} refused"
+    );
+    // The reserved first segments are refused before either
+    // parse, with their own code.
+    for rest in [
+        "purge/300x200/x.jpg",
+        "purge-group/hero",
+        "upload/x.jpg",
+        "crabcrop/purge-key",
+    ] {
+        let refused = resolve_request(&states[0], rest, &mut RequestRecord::default());
+        let Err((_, Some((status, code, _)))) = resolved_parts(refused) else {
+            panic!("{rest} is not refused with an answer of its own");
+        };
+        assert_eq!(
+            (status, code),
+            (StatusCode::BAD_REQUEST, "reserved_segment"),
+            "{rest}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -12594,6 +12907,170 @@ async fn concurrent_misses_share_one_origin_fetch() {
     );
 }
 
+/// The value of the counter or gauge `name` in a metrics
+/// exposition.
+fn metric(exposition: &str, name: &str) -> u64 {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in:\n{exposition}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_identical_misses_shares_one_fetch_and_one_render() {
+    // Issue #641: a request builds its flight's identity
+    // only once it leads or follows a flight, and reads its
+    // key and groups in place until then. A burst must
+    // still be one flight: one leader that fetches and
+    // renders, and seven followers that take its render,
+    // from the memory tier, or with the tier off from the
+    // flight, where the leader's identity and a follower's
+    // must be the same text. The origin holds its answer
+    // until all seven are following, so each burst is
+    // exactly one fetch and one render.
+    const BURSTS: usize = 20;
+    for memory in [16 * 1024 * 1024, 0] {
+        let (src, hits, open) = spawn_held_server(test_png()).await;
+        let state = Arc::new(AppState {
+            cache: Arc::new(Cache::new(memory)),
+            ..test_state()
+        });
+        for burst in 0..BURSTS {
+            let _ = open.send(false);
+            // A source of its own for each burst; the origin
+            // answers every path alike.
+            let remainder = format!("20x12/{src}/{burst}");
+            let requests: Vec<_> = (0..8)
+                .map(|_| start_request(&state, &remainder, None))
+                .collect();
+            wait_until("seven requests follow the flight", || {
+                state
+                    .inflight
+                    .image_flights()
+                    .iter()
+                    .any(|(_, following)| *following == 7)
+            })
+            .await;
+            let _ = open.send(true);
+            let mut answers = Vec::new();
+            for request in requests {
+                let response = request.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "burst {burst}");
+                let etag = response.headers()[header::ETAG].clone();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                answers.push((etag, body));
+            }
+            assert!(
+                answers.windows(2).all(|w| w[0] == w[1]),
+                "memory {memory}, burst {burst}: the answers differ"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                burst + 1,
+                "memory {memory}, burst {burst}: one fetch for the burst"
+            );
+        }
+        let metrics = state.metrics.render();
+        let bursts = BURSTS as u64;
+        assert_eq!(
+            metric(&metrics, "crabcrop_process_duration_ms_count"),
+            bursts,
+            "memory {memory}: one render for each burst"
+        );
+        assert_eq!(metric(&metrics, "crabcrop_load_duration_ms_count"), bursts);
+        assert_eq!(
+            metric(&metrics, "crabcrop_requests_total{status_class=\"2xx\"}"),
+            8 * bursts
+        );
+        let followers_hit = if memory == 0 { 0 } else { 7 * bursts };
+        assert_eq!(metric(&metrics, "crabcrop_cache_hits_total"), followers_hit);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bursts_of_identical_misses_under_load_share_their_flights() {
+    // Issue #641, with nothing held back: 400 bursts of
+    // eight identical requests against an origin that
+    // answers at once, on four workers, so requests reach
+    // the lookup and the flight claim in every order the
+    // runtime produces. Every request is answered, and
+    // every fetch is one render.
+    //
+    // A burst is one fetch unless a request is held up
+    // between its lookup's miss and its claim for as long
+    // as the whole flight lasts; it then leads a second
+    // one. That takes a worker thread losing its core at
+    // that moment. With the machine to itself, a release
+    // build fetched twice in none of 61,200 such bursts; on
+    // a busy machine a few in a thousand can. More than one
+    // burst in twenty is a flight that does not share.
+    const BURSTS: usize = 400;
+    const FAN: usize = 8;
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let state = Arc::new(test_state());
+    for burst in 0..BURSTS {
+        // A source of its own for each burst; the origin
+        // answers every path alike.
+        let remainder = format!("20x12/{src}/{burst}");
+        let requests: Vec<_> = (0..FAN)
+            .map(|_| start_request(&state, &remainder, None))
+            .collect();
+        for request in requests {
+            let response = request.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "burst {burst}");
+        }
+    }
+    let fetched = hits.load(Ordering::SeqCst);
+    assert!(
+        (BURSTS..=BURSTS + BURSTS / 20).contains(&fetched),
+        "{fetched} fetches for {BURSTS} bursts of {FAN}"
+    );
+    let metrics = state.metrics.render();
+    assert_eq!(
+        metric(&metrics, "crabcrop_process_duration_ms_count"),
+        fetched as u64,
+        "a render for each fetch"
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_cache_hits_total")
+            + metric(&metrics, "crabcrop_cache_misses_total"),
+        (BURSTS * FAN) as u64
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_requests_total{status_class=\"2xx\"}"),
+        (BURSTS * FAN) as u64
+    );
+}
+
+/// The most a request's future may take, in bytes (issue
+/// #638). With the miss path boxed it takes about 5 KB.
+const REQUEST_FUTURE_MAX: usize = 8 * 1024;
+
+#[tokio::test]
+async fn a_request_future_does_not_carry_the_miss_path() {
+    // Issue #638: a future is as large as the largest thing
+    // it may await, and the router allocates and moves one
+    // per request. With the miss path awaited in line the
+    // request's future was 24,496 bytes, the loader's fetch
+    // state and the engine runner's included, for a memory
+    // hit, a 304 and a 403 alike. Whatever a later change
+    // awaits on the hit path, it must not grow back to that.
+    let state = Arc::new(test_state());
+    let request = axum::http::Request::builder()
+        .uri("/unsafe/100x0/http://127.0.0.1:9/a.png")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let request = handle(State(state), request);
+    let size = std::mem::size_of_val(&request);
+    assert!(
+        size <= REQUEST_FUTURE_MAX,
+        "a request's future is {size} bytes, over {REQUEST_FUTURE_MAX}: \
+         something large is awaited in line on the request path"
+    );
+}
+
 #[test]
 fn ai_gate_counts_a_smart_crop_only_when_a_provider_participates() {
     // Issue #379: the predicate matrix. A smart crop
@@ -13003,12 +13480,13 @@ fn start_request(
     remainder: &str,
     width_hint: Option<u32>,
 ) -> tokio::task::JoinHandle<Response> {
-    let uri: axum::http::Uri = format!("/{}/{remainder}", sign(remainder)).parse().unwrap();
-    let mut headers = HeaderMap::new();
+    let mut request =
+        axum::http::Request::builder().uri(format!("/{}/{remainder}", sign(remainder)));
     if let Some(width) = width_hint {
-        headers.insert("sec-ch-width", width.into());
+        request = request.header("sec-ch-width", width);
     }
-    tokio::spawn(handle(State(state.clone()), uri, headers))
+    let request = request.body(axum::body::Body::empty()).unwrap();
+    tokio::spawn(handle(State(state.clone()), request))
 }
 
 /// Drop a started request, as its client disconnecting
@@ -17180,6 +17658,90 @@ async fn scrape(base: &str, token: &str) -> String {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
+    // Issue #643: `/metrics` is written into one buffer,
+    // section after section. With a disk tier and a shared
+    // tier every section is there, and at rest every value
+    // is known: the request counters as `Metrics::render`
+    // gives them, then the lanes, the source buffer, the
+    // lookups and the tiers, each line the text it was when
+    // a string was formatted for it.
+    let dir = crate::test_support::scratch_dir("metrics-one-buffer");
+    let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
+    state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
+    let base = serve_state(&state).await;
+    state.metrics.record(&RequestRecord {
+        status: 200,
+        cache_looked_up: true,
+        bytes_out: 1234,
+        ..Default::default()
+    });
+    state.metrics.record_purge();
+    let scraped = scrape(&base, "metrics-token").await;
+    let requests = state.metrics.render();
+    assert!(requests.contains("crabcrop_bytes_served_total 1234\n"));
+    let sections = scraped
+        .strip_prefix(requests.as_str())
+        .unwrap_or_else(|| panic!("the exposition does not open with the counters:\n{scraped}"));
+    let source_buffer = state.loader.source_budget().capacity();
+    let (_, lookup_slots) = state.loader.lookup_slots();
+    let puts = SHARED_PUTS_AT_ONCE;
+    let expected = format!(
+        r#"# HELP crabcrop_lane_in_use Processing lane permits currently in use.
+# TYPE crabcrop_lane_in_use gauge
+crabcrop_lane_in_use{{lane="process"}} 0
+crabcrop_lane_in_use{{lane="slow"}} 0
+# HELP crabcrop_lane_capacity Processing lane permit capacity.
+# TYPE crabcrop_lane_capacity gauge
+crabcrop_lane_capacity{{lane="process"}} 4
+crabcrop_lane_capacity{{lane="slow"}} 2
+# HELP crabcrop_source_buffer_bytes Source bytes cache misses hold against the source buffer budget.
+# TYPE crabcrop_source_buffer_bytes gauge
+crabcrop_source_buffer_bytes 0
+# HELP crabcrop_source_buffer_capacity_bytes The source buffer budget.
+# TYPE crabcrop_source_buffer_capacity_bytes gauge
+crabcrop_source_buffer_capacity_bytes {source_buffer}
+# HELP crabcrop_source_lookups_in_flight Source host lookups running now.
+# TYPE crabcrop_source_lookups_in_flight gauge
+crabcrop_source_lookups_in_flight 0
+# HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.
+# TYPE crabcrop_source_lookups_capacity gauge
+crabcrop_source_lookups_capacity {lookup_slots}
+# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.
+# TYPE crabcrop_cache_tier_errors_total counter
+crabcrop_cache_tier_errors_total{{tier="disk"}} 0
+crabcrop_cache_tier_errors_total{{tier="shared"}} 0
+# HELP crabcrop_cache_disk_ops_in_flight Disk tier operations holding one of its 32 slots.
+# TYPE crabcrop_cache_disk_ops_in_flight gauge
+crabcrop_cache_disk_ops_in_flight 0
+# HELP crabcrop_cache_disk_groups_behind Disk entries whose file has not caught up with the cache groups they were served under.
+# TYPE crabcrop_cache_disk_groups_behind gauge
+crabcrop_cache_disk_groups_behind 0
+# HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.
+# TYPE crabcrop_cache_disk_deletions_queued gauge
+crabcrop_cache_disk_deletions_queued 0
+# HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.
+# TYPE crabcrop_cache_shared_puts_in_flight gauge
+crabcrop_cache_shared_puts_in_flight 0
+# HELP crabcrop_cache_shared_puts_capacity Shared tier writes allowed in flight.
+# TYPE crabcrop_cache_shared_puts_capacity gauge
+crabcrop_cache_shared_puts_capacity {puts}
+# HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.
+# TYPE crabcrop_cache_shared_puts_skipped_total counter
+crabcrop_cache_shared_puts_skipped_total 0
+# HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.
+# TYPE crabcrop_cache_shared_tombstones_unread gauge
+crabcrop_cache_shared_tombstones_unread 0
+# HELP crabcrop_cache_shared_tombstones_listed_timestamp_seconds When this replica last listed the purge tombstones completely, in Unix seconds; 0 before its first complete listing.
+# TYPE crabcrop_cache_shared_tombstones_listed_timestamp_seconds gauge
+crabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000
+"#
+    );
+    assert_eq!(sections, expected);
 }
 
 #[tokio::test]

@@ -2126,6 +2126,30 @@ pub fn parse_operations_with_expiry(input: &str) -> Result<ParsedRemainder<'_>, 
     }
 }
 
+/// The parse of a remainder that references no preset, in
+/// one walk (issue #640): what [`preset_names`],
+/// [`expand_presets`] with presets-only mode off, and
+/// [`parse_operations_with_expiry`] yield together for it,
+/// without walking it three times and copying it once.
+/// `None` whenever those three would not end in a parse of
+/// the remainder as written: the text `preset:` occurs in
+/// it, it does not parse, or it is past a cap the expansion
+/// enforces. The caller then runs the three, which also
+/// produce every error, in their own order.
+///
+/// Without a `preset:` segment the three agree with this by
+/// construction. There are no names to collect. The
+/// expansion counts the operations this parse yields and the
+/// length of this text, and writes the text back unchanged.
+/// The parse of that copy is this parse.
+pub fn parse_without_presets(rest: &str) -> Option<ParsedRemainder<'_>> {
+    if rest.len() > MAX_EXPANDED_LEN || rest.contains("preset:") {
+        return None;
+    }
+    let parsed = parse_operations_with_expiry(rest).ok()?;
+    (operation_count(&parsed.0) <= MAX_OPERATIONS).then_some(parsed)
+}
+
 /// Parse an operations-only string, the shape of a preset
 /// definition: every segment must be an operation, and neither
 /// `exp:` or `maxage:` metadata nor nested `preset:` references
@@ -3044,30 +3068,47 @@ fn operation_text(op: &Operation) -> String {
 /// the form: order changes pixels, so it is meaning, not
 /// spelling.
 pub fn canonical_form(ops: &[Operation], source: &str) -> String {
-    let mut segments: Vec<String> = Vec::new();
-    let mut filters: Vec<String> = Vec::new();
+    // Written into one buffer as it goes (issue #640): the
+    // form is built for every request's cache key, hits
+    // included.
+    let mut out = String::with_capacity(source.len() + 24 * ops.len() + 16);
+    // Whether a segment has been written, and whether the
+    // last one is a `filters:` segment, which the next
+    // filter joins.
+    let mut any = false;
+    let mut in_filters = false;
     for op in ops {
         match op {
             Operation::Filters(list) => {
-                filters.extend(list.iter().map(filter_text));
+                for filter in list {
+                    if in_filters {
+                        out.push(':');
+                    } else {
+                        if any {
+                            out.push('/');
+                        }
+                        out.push_str("filters:");
+                        any = true;
+                        in_filters = true;
+                    }
+                    out.push_str(&filter_text(filter));
+                }
             }
             other => {
-                if !filters.is_empty() {
-                    segments.push(format!("filters:{}", filters.join(":")));
-                    filters.clear();
+                if any {
+                    out.push('/');
                 }
-                segments.push(operation_text(other));
+                out.push_str(&operation_text(other));
+                any = true;
+                in_filters = false;
             }
         }
     }
-    if !filters.is_empty() {
-        segments.push(format!("filters:{}", filters.join(":")));
+    if any {
+        out.push('/');
     }
-    if segments.is_empty() {
-        source.to_string()
-    } else {
-        format!("{}/{source}", segments.join("/"))
-    }
+    out.push_str(source);
+    out
 }
 
 /// The cache key for a remainder: its canonical form, which

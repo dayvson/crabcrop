@@ -212,88 +212,99 @@ impl Metrics {
 
     /// Render the counters in Prometheus text format.
     pub fn render(&self) -> String {
+        let mut out = String::with_capacity(2048);
+        self.render_into(&mut out);
+        out
+    }
+
+    /// [`Metrics::render`], appended to `out` (issue #643):
+    /// `/metrics` writes its whole exposition into one
+    /// buffer, and every line here goes straight into it
+    /// instead of into a string of its own first.
+    pub fn render_into(&self, out: &mut String) {
+        use std::fmt::Write as _;
         let m = self.inner.lock().unwrap();
-        let mut out = String::new();
         out.push_str("# HELP crabcrop_requests_total Image requests by status class.\n");
         out.push_str("# TYPE crabcrop_requests_total counter\n");
-        out.push_str(&format!(
-            "crabcrop_requests_total{{status_class=\"2xx\"}} {}\n",
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(
+            out,
+            "crabcrop_requests_total{{status_class=\"2xx\"}} {}",
             m.requests_2xx
-        ));
-        out.push_str(&format!(
-            "crabcrop_requests_total{{status_class=\"4xx\"}} {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "crabcrop_requests_total{{status_class=\"4xx\"}} {}",
             m.requests_4xx
-        ));
-        out.push_str(&format!(
-            "crabcrop_requests_total{{status_class=\"5xx\"}} {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "crabcrop_requests_total{{status_class=\"5xx\"}} {}",
             m.requests_5xx
-        ));
-        out.push_str(&format!(
-            "crabcrop_requests_total{{status_class=\"other\"}} {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "crabcrop_requests_total{{status_class=\"other\"}} {}",
             m.requests_other
-        ));
+        );
         out.push_str("# HELP crabcrop_request_duration_ms Total request duration.\n");
         out.push_str("# TYPE crabcrop_request_duration_ms histogram\n");
         for (i, bound) in BUCKETS_MS.iter().enumerate() {
-            out.push_str(&format!(
-                "crabcrop_request_duration_ms_bucket{{le=\"{bound}\"}} {}\n",
+            let _ = writeln!(
+                out,
+                "crabcrop_request_duration_ms_bucket{{le=\"{bound}\"}} {}",
                 m.duration_buckets[i]
-            ));
+            );
         }
-        out.push_str(&format!(
-            "crabcrop_request_duration_ms_bucket{{le=\"+Inf\"}} {}\n",
+        let _ = writeln!(
+            out,
+            "crabcrop_request_duration_ms_bucket{{le=\"+Inf\"}} {}",
             m.duration_buckets[BUCKETS_MS.len()]
-        ));
-        out.push_str(&format!(
-            "crabcrop_request_duration_ms_sum {:.1}\n",
+        );
+        let _ = writeln!(
+            out,
+            "crabcrop_request_duration_ms_sum {:.1}",
             m.duration_sum
-        ));
-        out.push_str(&format!(
-            "crabcrop_request_duration_ms_count {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "crabcrop_request_duration_ms_count {}",
             m.duration_count
-        ));
+        );
         out.push_str("# HELP crabcrop_load_duration_ms Source load duration.\n");
         out.push_str("# TYPE crabcrop_load_duration_ms summary\n");
-        out.push_str(&format!(
-            "crabcrop_load_duration_ms_sum {:.1}\n",
-            m.load_ms_sum
-        ));
-        out.push_str(&format!(
-            "crabcrop_load_duration_ms_count {}\n",
-            m.load_count
-        ));
+        let _ = writeln!(out, "crabcrop_load_duration_ms_sum {:.1}", m.load_ms_sum);
+        let _ = writeln!(out, "crabcrop_load_duration_ms_count {}", m.load_count);
         out.push_str("# HELP crabcrop_process_duration_ms Engine processing duration.\n");
         out.push_str("# TYPE crabcrop_process_duration_ms summary\n");
-        out.push_str(&format!(
-            "crabcrop_process_duration_ms_sum {:.1}\n",
+        let _ = writeln!(
+            out,
+            "crabcrop_process_duration_ms_sum {:.1}",
             m.process_ms_sum
-        ));
-        out.push_str(&format!(
-            "crabcrop_process_duration_ms_count {}\n",
+        );
+        let _ = writeln!(
+            out,
+            "crabcrop_process_duration_ms_count {}",
             m.process_count
-        ));
+        );
         out.push_str("# TYPE crabcrop_loader_errors_total counter\n");
-        out.push_str(&format!("crabcrop_loader_errors_total {}\n", m.load_errors));
+        let _ = writeln!(out, "crabcrop_loader_errors_total {}", m.load_errors);
         out.push_str("# TYPE crabcrop_engine_errors_total counter\n");
-        out.push_str(&format!(
-            "crabcrop_engine_errors_total {}\n",
-            m.engine_errors
-        ));
+        let _ = writeln!(out, "crabcrop_engine_errors_total {}", m.engine_errors);
         out.push_str("# TYPE crabcrop_bytes_received_total counter\n");
-        out.push_str(&format!("crabcrop_bytes_received_total {}\n", m.bytes_in));
+        let _ = writeln!(out, "crabcrop_bytes_received_total {}", m.bytes_in);
         out.push_str("# TYPE crabcrop_bytes_served_total counter\n");
-        out.push_str(&format!("crabcrop_bytes_served_total {}\n", m.bytes_served));
+        let _ = writeln!(out, "crabcrop_bytes_served_total {}", m.bytes_served);
         out.push_str("# TYPE crabcrop_cache_hits_total counter\n");
-        out.push_str(&format!("crabcrop_cache_hits_total {}\n", m.cache_hits));
+        let _ = writeln!(out, "crabcrop_cache_hits_total {}", m.cache_hits);
         out.push_str("# TYPE crabcrop_cache_misses_total counter\n");
-        out.push_str(&format!("crabcrop_cache_misses_total {}\n", m.cache_misses));
+        let _ = writeln!(out, "crabcrop_cache_misses_total {}", m.cache_misses);
         out.push_str("# HELP crabcrop_purges_total Purge requests, accepted or rejected.\n");
         out.push_str("# TYPE crabcrop_purges_total counter\n");
-        out.push_str(&format!("crabcrop_purges_total {}\n", m.purges));
+        let _ = writeln!(out, "crabcrop_purges_total {}", m.purges);
         out.push_str("# HELP crabcrop_uploads_total Upload requests, accepted or rejected.\n");
         out.push_str("# TYPE crabcrop_uploads_total counter\n");
-        out.push_str(&format!("crabcrop_uploads_total {}\n", m.uploads));
-        out
+        let _ = writeln!(out, "crabcrop_uploads_total {}", m.uploads);
     }
 }
 
@@ -406,5 +417,135 @@ mod tests {
         let out = metrics.render();
         assert!(out.contains("crabcrop_cache_hits_total 1"), "{out}");
         assert!(out.contains("crabcrop_cache_misses_total 1"), "{out}");
+    }
+
+    /// [`Metrics::render`] as it was written before issue
+    /// #643: a string formatted for each line, then pushed.
+    fn render_by_formatting(m: &Inner) -> String {
+        let mut out = String::new();
+        out.push_str("# HELP crabcrop_requests_total Image requests by status class.\n");
+        out.push_str("# TYPE crabcrop_requests_total counter\n");
+        out.push_str(&format!(
+            "crabcrop_requests_total{{status_class=\"2xx\"}} {}\n",
+            m.requests_2xx
+        ));
+        out.push_str(&format!(
+            "crabcrop_requests_total{{status_class=\"4xx\"}} {}\n",
+            m.requests_4xx
+        ));
+        out.push_str(&format!(
+            "crabcrop_requests_total{{status_class=\"5xx\"}} {}\n",
+            m.requests_5xx
+        ));
+        out.push_str(&format!(
+            "crabcrop_requests_total{{status_class=\"other\"}} {}\n",
+            m.requests_other
+        ));
+        out.push_str("# HELP crabcrop_request_duration_ms Total request duration.\n");
+        out.push_str("# TYPE crabcrop_request_duration_ms histogram\n");
+        for (i, bound) in BUCKETS_MS.iter().enumerate() {
+            out.push_str(&format!(
+                "crabcrop_request_duration_ms_bucket{{le=\"{bound}\"}} {}\n",
+                m.duration_buckets[i]
+            ));
+        }
+        out.push_str(&format!(
+            "crabcrop_request_duration_ms_bucket{{le=\"+Inf\"}} {}\n",
+            m.duration_buckets[BUCKETS_MS.len()]
+        ));
+        out.push_str(&format!(
+            "crabcrop_request_duration_ms_sum {:.1}\n",
+            m.duration_sum
+        ));
+        out.push_str(&format!(
+            "crabcrop_request_duration_ms_count {}\n",
+            m.duration_count
+        ));
+        out.push_str("# HELP crabcrop_load_duration_ms Source load duration.\n");
+        out.push_str("# TYPE crabcrop_load_duration_ms summary\n");
+        out.push_str(&format!(
+            "crabcrop_load_duration_ms_sum {:.1}\n",
+            m.load_ms_sum
+        ));
+        out.push_str(&format!(
+            "crabcrop_load_duration_ms_count {}\n",
+            m.load_count
+        ));
+        out.push_str("# HELP crabcrop_process_duration_ms Engine processing duration.\n");
+        out.push_str("# TYPE crabcrop_process_duration_ms summary\n");
+        out.push_str(&format!(
+            "crabcrop_process_duration_ms_sum {:.1}\n",
+            m.process_ms_sum
+        ));
+        out.push_str(&format!(
+            "crabcrop_process_duration_ms_count {}\n",
+            m.process_count
+        ));
+        out.push_str("# TYPE crabcrop_loader_errors_total counter\n");
+        out.push_str(&format!("crabcrop_loader_errors_total {}\n", m.load_errors));
+        out.push_str("# TYPE crabcrop_engine_errors_total counter\n");
+        out.push_str(&format!(
+            "crabcrop_engine_errors_total {}\n",
+            m.engine_errors
+        ));
+        out.push_str("# TYPE crabcrop_bytes_received_total counter\n");
+        out.push_str(&format!("crabcrop_bytes_received_total {}\n", m.bytes_in));
+        out.push_str("# TYPE crabcrop_bytes_served_total counter\n");
+        out.push_str(&format!("crabcrop_bytes_served_total {}\n", m.bytes_served));
+        out.push_str("# TYPE crabcrop_cache_hits_total counter\n");
+        out.push_str(&format!("crabcrop_cache_hits_total {}\n", m.cache_hits));
+        out.push_str("# TYPE crabcrop_cache_misses_total counter\n");
+        out.push_str(&format!("crabcrop_cache_misses_total {}\n", m.cache_misses));
+        out.push_str("# HELP crabcrop_purges_total Purge requests, accepted or rejected.\n");
+        out.push_str("# TYPE crabcrop_purges_total counter\n");
+        out.push_str(&format!("crabcrop_purges_total {}\n", m.purges));
+        out.push_str("# HELP crabcrop_uploads_total Upload requests, accepted or rejected.\n");
+        out.push_str("# TYPE crabcrop_uploads_total counter\n");
+        out.push_str(&format!("crabcrop_uploads_total {}\n", m.uploads));
+        out
+    }
+
+    #[test]
+    fn the_exposition_is_the_text_it_was_formatted_to() {
+        // Issue #643: every line is written into one buffer.
+        // The text must be what the per-line strings came
+        // to, for counters of every kind: each status class,
+        // both failing stages, hits and misses, every
+        // histogram bucket, purges and uploads.
+        let metrics = Metrics::default();
+        let durations_ms = [0, 4, 5, 9, 24, 50, 99, 250, 400, 1000, 2400, 5000, 7000];
+        for (n, total) in durations_ms.into_iter().enumerate() {
+            let mut r = record([200, 204, 304, 403, 404, 502, 503, 101][n % 8]);
+            r.total = Duration::from_millis(total);
+            r.load = Duration::from_micros(1500 * n as u64);
+            r.process = Duration::from_micros(700 * n as u64);
+            r.load_ran = n % 3 != 0;
+            r.process_ran = n % 4 != 0;
+            r.cache_looked_up = n % 5 != 0;
+            r.cache_hit = n % 2 == 0;
+            r.fail = [FailStage::None, FailStage::Load, FailStage::Engine][n % 3];
+            r.bytes_in = 1000 * n;
+            r.bytes_out = 77 * n;
+            metrics.record(&r);
+        }
+        metrics.record_purge();
+        metrics.record_purge();
+        metrics.record_upload();
+        let expected = render_by_formatting(&metrics.inner.lock().unwrap());
+        assert_eq!(metrics.render(), expected);
+        assert!(expected.contains("crabcrop_requests_total{status_class=\"other\"} 3\n"));
+        assert!(expected.contains("crabcrop_request_duration_ms_bucket{le=\"+Inf\"} 13\n"));
+        assert!(expected.contains("crabcrop_request_duration_ms_sum 16241.0\n"));
+        assert!(expected.contains("crabcrop_purges_total 2\n"));
+        // It is appended to what the buffer holds.
+        let mut out = String::from("# before\n");
+        metrics.render_into(&mut out);
+        assert_eq!(out, format!("# before\n{expected}"));
+        // And a server that has seen nothing renders zeros.
+        let idle = Metrics::default();
+        assert_eq!(
+            idle.render(),
+            render_by_formatting(&idle.inner.lock().unwrap())
+        );
     }
 }

@@ -595,10 +595,13 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
         "x-content-type-options",
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    let stored_nowhere = headers
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| has_directive(v, "no-store"));
+    // Read only for an error (issue #641): a success keeps
+    // its own caching headers whatever they say.
+    let stored_nowhere = error
+        && headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| has_directive(v, "no-store"));
     if system || (error && !stored_nowhere) {
         headers.insert(
             header::CACHE_CONTROL,
@@ -670,18 +673,15 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
             accept.as_deref(),
         );
     }
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        format!(
-            "{}{}{}{}{}",
-            state.metrics.render(),
-            lane_metrics(&state),
-            source_buffer_metrics(&state),
-            source_lookup_metrics(&state),
-            tier_metrics(&state)
-        ),
-    )
-        .into_response()
+    // One buffer for the whole exposition (issue #643):
+    // each section appends its lines to it.
+    let mut out = String::with_capacity(4096);
+    state.metrics.render_into(&mut out);
+    lane_metrics(&state, &mut out);
+    source_buffer_metrics(&state, &mut out);
+    source_lookup_metrics(&state, &mut out);
+    tier_metrics(&state, &mut out);
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
 }
 
 /// Per-lane occupancy for `/metrics` (issue #324): how
@@ -689,29 +689,32 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 /// against the lane's capacity. Read live from the gates
 /// at scrape time, so a lane saturated by long encodes
 /// shows itself here while the stills lane stays free.
-fn lane_metrics(state: &AppState) -> String {
-    let mut out = String::new();
+fn lane_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     out.push_str("# HELP crabcrop_lane_in_use Processing lane permits currently in use.\n");
     out.push_str("# TYPE crabcrop_lane_in_use gauge\n");
-    out.push_str(&format!(
-        "crabcrop_lane_in_use{{lane=\"process\"}} {}\n",
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_in_use{{lane=\"process\"}} {}",
         state.process_gate.in_use()
-    ));
-    out.push_str(&format!(
-        "crabcrop_lane_in_use{{lane=\"slow\"}} {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_in_use{{lane=\"slow\"}} {}",
         state.slow_gate.in_use()
-    ));
+    );
     out.push_str("# HELP crabcrop_lane_capacity Processing lane permit capacity.\n");
     out.push_str("# TYPE crabcrop_lane_capacity gauge\n");
-    out.push_str(&format!(
-        "crabcrop_lane_capacity{{lane=\"process\"}} {}\n",
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_capacity{{lane=\"process\"}} {}",
         state.process_gate.capacity()
-    ));
-    out.push_str(&format!(
-        "crabcrop_lane_capacity{{lane=\"slow\"}} {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "crabcrop_lane_capacity{{lane=\"slow\"}} {}",
         state.slow_gate.capacity()
-    ));
-    out
+    );
 }
 
 /// Source buffer budget occupancy for `/metrics` (issue
@@ -720,9 +723,11 @@ fn lane_metrics(state: &AppState) -> String {
 /// scrape time. In use sitting at capacity while requests
 /// shed with `server_busy` is the signal to raise
 /// `CRABCROP_SOURCE_BUFFER_MAX_MB`.
-fn source_buffer_metrics(state: &AppState) -> String {
+fn source_buffer_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     let budget = state.loader.source_budget();
-    format!(
+    let _ = write!(
+        out,
         "# HELP crabcrop_source_buffer_bytes Source bytes cache misses hold against the source buffer budget.\n\
          # TYPE crabcrop_source_buffer_bytes gauge\n\
          crabcrop_source_buffer_bytes {}\n\
@@ -731,7 +736,7 @@ fn source_buffer_metrics(state: &AppState) -> String {
          crabcrop_source_buffer_capacity_bytes {}\n",
         budget.in_use(),
         budget.capacity()
-    )
+    );
 }
 
 /// Source host lookup slot occupancy for `/metrics`: the
@@ -740,16 +745,18 @@ fn source_buffer_metrics(state: &AppState) -> String {
 /// In flight sitting at capacity while requests shed with
 /// `server_busy` means the resolver is not answering for the
 /// host names requests carry.
-fn source_lookup_metrics(state: &AppState) -> String {
+fn source_lookup_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     let (in_flight, capacity) = state.loader.lookup_slots();
-    format!(
+    let _ = write!(
+        out,
         "# HELP crabcrop_source_lookups_in_flight Source host lookups running now.\n\
          # TYPE crabcrop_source_lookups_in_flight gauge\n\
          crabcrop_source_lookups_in_flight {in_flight}\n\
          # HELP crabcrop_source_lookups_capacity Source host lookups that can run at once.\n\
          # TYPE crabcrop_source_lookups_capacity gauge\n\
          crabcrop_source_lookups_capacity {capacity}\n"
-    )
+    );
 }
 
 /// Cache tier failures for `/metrics` (issue #367): the
@@ -759,27 +766,30 @@ fn source_lookup_metrics(state: &AppState) -> String {
 /// write-through slots and skips follow (issue #463), then
 /// what its last complete listing of the purge tombstones
 /// found unread, and when that was (issue #577).
-fn tier_metrics(state: &AppState) -> String {
-    let mut out = String::new();
+fn tier_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
     out.push_str("# TYPE crabcrop_cache_tier_errors_total counter\n");
     if let Some(store) = &state.store {
-        out.push_str(&format!(
-            "crabcrop_cache_tier_errors_total{{tier=\"disk\"}} {}\n",
+        let _ = writeln!(
+            out,
+            "crabcrop_cache_tier_errors_total{{tier=\"disk\"}} {}",
             store.errors()
-        ));
+        );
     }
     if let Some(store) = &state.shared_store {
-        out.push_str(&format!(
-            "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}\n",
+        let _ = writeln!(
+            out,
+            "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}",
             store.errors()
-        ));
+        );
     }
     // The disk tier's slots in use and its background work
     // (issue #572): queue lengths, never an index scan.
     if let Some(store) = &state.store {
         let (behind, deletions) = store.queued();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "# HELP crabcrop_cache_disk_ops_in_flight Disk tier operations holding one of its 32 slots.\n\
              # TYPE crabcrop_cache_disk_ops_in_flight gauge\n\
              crabcrop_cache_disk_ops_in_flight {}\n\
@@ -790,14 +800,15 @@ fn tier_metrics(state: &AppState) -> String {
              # TYPE crabcrop_cache_disk_deletions_queued gauge\n\
              crabcrop_cache_disk_deletions_queued {deletions}\n",
             store.ops_in_flight()
-        ));
+        );
     }
     if let Some(store) = &state.shared_store {
         // The write bound (issue #463): in flight against
         // its slots, and the render write-throughs skipped
         // because every slot was taken.
         let background = &state.background;
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "# HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.\n\
              # TYPE crabcrop_cache_shared_puts_in_flight gauge\n\
              crabcrop_cache_shared_puts_in_flight {}\n\
@@ -810,13 +821,14 @@ fn tier_metrics(state: &AppState) -> String {
             background.puts_in_flight(),
             background.put_capacity(),
             background.puts_skipped()
-        ));
+        );
         // The tombstone gap (issue #577): the unread count
         // stays as of the last complete listing, so a listing
         // time that stops moving is the sign of a failing
         // listing.
         let listed_ms = store.tombstones_listed_ms();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "# HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.\n\
              # TYPE crabcrop_cache_shared_tombstones_unread gauge\n\
              crabcrop_cache_shared_tombstones_unread {}\n\
@@ -826,9 +838,8 @@ fn tier_metrics(state: &AppState) -> String {
             store.tombstones_unread(),
             listed_ms / 1000,
             listed_ms % 1000
-        ));
+        );
     }
-    out
 }
 
 /// The DPR hint headers [`dpr_hint`] reads, the
@@ -2590,13 +2601,13 @@ fn sf_quote(value: &str) -> String {
 /// entry, never read back from this header.
 fn attach_cache_headers(
     response: &mut Response,
-    cache_status: &str,
+    cache_status: &'static str,
     groups: &[String],
     sealed: bool,
 ) {
     response.headers_mut().insert(
         axum::http::HeaderName::from_static("cache-status"),
-        axum::http::HeaderValue::from_str(cache_status).unwrap(),
+        axum::http::HeaderValue::from_static(cache_status),
     );
     if !sealed && !groups.is_empty() {
         let list = groups
@@ -2635,11 +2646,14 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
     .then(|| value.to_string())
 }
 
-async fn handle(
-    State(state): State<Arc<AppState>>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-) -> Response {
+async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    // The request's URI and headers are read where they are
+    // (issue #641): the `Uri` and `HeaderMap` extractors
+    // hand a handler a copy of each. The body goes at once,
+    // as it did with them.
+    let (parts, body) = request.into_parts();
+    drop(body);
+    let (uri, headers) = (&parts.uri, &parts.headers);
     // The raw path, exactly as sent: the signature covers it
     // byte-for-byte, so no percent-decoding may happen first
     // (the `Path` extractor decodes, which would rewrite e.g.
@@ -2650,34 +2664,22 @@ async fn handle(
     // content under a second spelling.
     let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
     let started = Instant::now();
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let chosen_id = client_request_id(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
-    let request_id = chosen_id.clone().unwrap_or_else(generate_request_id);
+    let chose_id = chosen_id.is_some();
+    let request_id = chosen_id.unwrap_or_else(generate_request_id);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .and_then(|v| v.to_str().ok());
     // With client hints off, no hint header is read at all:
     // every request for a URL gets the same bytes, the one
     // answer a cache that keys on the URL alone can hold.
     let hints = state.client_hints;
-    let dpr = dpr_hint(&headers).filter(|_| hints);
-    let width = width_hint(&headers).filter(|_| hints);
-    let save_data = hints && save_data_hint(&headers);
-    let (mut response, mut record) = serve(
-        &state,
-        path,
-        accept.as_deref(),
-        if_none_match.as_deref(),
-        dpr,
-        width,
-        save_data,
-    )
-    .await;
-    record.request_id = request_id.clone();
+    let dpr = dpr_hint(headers).filter(|_| hints);
+    let width = width_hint(headers).filter(|_| hints);
+    let save_data = hints && save_data_hint(headers);
+    let (mut response, mut record) =
+        serve(&state, path, accept, if_none_match, dpr, width, save_data).await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     // Every answer on this route, errors and meta included,
@@ -2689,18 +2691,22 @@ async fn handle(
     // viewer of the URL with the headers it was stored with,
     // so it never carries an ID the client chose: that
     // client already has it, and the log line records it.
-    // An ID the server generated is still sent.
-    let shared = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| has_directive(v, "public"));
-    if chosen_id.is_none() || !shared {
+    // An ID the server generated is still sent, so the
+    // answer's caching is read only for one the client
+    // chose.
+    let shared = chose_id
+        && response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| has_directive(v, "public"));
+    if !shared {
         response.headers_mut().insert(
             axum::http::HeaderName::from_static("x-request-id"),
             request_id.parse().unwrap(),
         );
     }
+    record.request_id = request_id;
     state.metrics.record(&record);
     println!("{}", record.to_json());
     response
@@ -3003,21 +3009,39 @@ fn resolve_request(
     if crabcrop_url::is_reserved_remainder(rest) {
         return Err(Refusal::Payload(reserved_remainder_parts()));
     }
-    // The cache groups (RFC 9875) are the presets the signed
-    // remainder references, read before expansion rewrites it.
-    let groups = crate::url::preset_names(rest);
-    // Preset expansion happens after verification (the
-    // signature covers the preset reference, not its expansion)
-    // and before everything else: parsing, the cache key, and
-    // the ops summary all see the expanded remainder, so
-    // editing a preset produces fresh cache entries naturally.
-    // Expansion always runs, even with no presets loaded:
-    // a `preset:` segment is a grammar error
-    // (`unknown_preset`) on every server, never source text.
-    let rest =
-        crate::url::expand_presets(rest, &state.presets, state.only_presets).map_err(grammar)?;
-    let (ops, source_url, expiry, max_age) =
-        parse_operations_with_expiry(&rest).map_err(grammar)?;
+    // A remainder that names no preset, the common request,
+    // is parsed in one walk (issue #640): it has no groups,
+    // and it expands to itself. Every other remainder, one
+    // that fails included, takes the three walks below, so
+    // each error still comes from the walk that owns it.
+    let plain = if state.only_presets {
+        None
+    } else {
+        crate::url::parse_without_presets(rest)
+    };
+    let expanded;
+    let (groups, rest, (ops, source_url, expiry, max_age)) = match plain {
+        Some(parsed) => (Vec::new(), rest, parsed),
+        None => {
+            // The cache groups (RFC 9875) are the presets the
+            // signed remainder references, read before
+            // expansion rewrites it.
+            let groups = crate::url::preset_names(rest);
+            // Preset expansion happens after verification (the
+            // signature covers the preset reference, not its
+            // expansion) and before everything else: parsing,
+            // the cache key, and the ops summary all see the
+            // expanded remainder, so editing a preset produces
+            // fresh cache entries naturally. Expansion always
+            // runs, even with no presets loaded: a `preset:`
+            // segment is a grammar error (`unknown_preset`) on
+            // every server, never source text.
+            expanded = crate::url::expand_presets(rest, &state.presets, state.only_presets)
+                .map_err(grammar)?;
+            let parsed = parse_operations_with_expiry(&expanded).map_err(grammar)?;
+            (groups, expanded.as_str(), parsed)
+        }
+    };
     // The operation summary is everything before the source URL.
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
@@ -3252,6 +3276,7 @@ fn cache_key_for(
     source_url: &str,
     negotiated: &Negotiated,
 ) -> String {
+    use std::fmt::Write as _;
     let key_base =
         crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
     // The key also carries the configuration fingerprint
@@ -3262,28 +3287,30 @@ fn cache_key_for(
     // or font or encoder files) starts a fresh epoch
     // instead of serving the old configuration's renders.
     // The fingerprint sits inside the base, ahead of the
-    // negotiated-class and hint suffixes.
-    let key_base = format!("{key_base}#cfg{config_fingerprint}");
-    let mut cache_key = if negotiated.directives.explicit_format.is_some() {
-        key_base
-    } else {
-        let class = match negotiated.preferred {
-            Some(ImageFormat::Avif) => "avif",
-            Some(ImageFormat::Jxl) => "jxl",
-            Some(ImageFormat::WebP) => "webp",
-            _ => "source",
-        };
-        format!("{key_base}#{class}")
-    };
+    // negotiated-class and hint suffixes. Each part is
+    // appended to the one buffer (issue #640): the key is
+    // built for every request.
+    let mut cache_key = key_base;
+    cache_key.reserve(config_fingerprint.len() + 24);
+    cache_key.push_str("#cfg");
+    cache_key.push_str(config_fingerprint);
+    if negotiated.directives.explicit_format.is_none() {
+        cache_key.push_str(match negotiated.preferred {
+            Some(ImageFormat::Avif) => "#avif",
+            Some(ImageFormat::Jxl) => "#jxl",
+            Some(ImageFormat::WebP) => "#webp",
+            _ => "#source",
+        });
+    }
     if let Some(w) = negotiated.hinted_width {
-        cache_key = format!("{cache_key}#w{w}");
+        let _ = write!(cache_key, "#w{w}");
     }
     if negotiated.save_data_applies {
-        cache_key = format!("{cache_key}#sd");
+        cache_key.push_str("#sd");
     }
     let effective_dpr = negotiated.effective_dpr;
     if effective_dpr != 1.0 {
-        cache_key = format!("{cache_key}#dpr{effective_dpr}");
+        let _ = write!(cache_key, "#dpr{effective_dpr}");
     }
     cache_key
 }
@@ -3320,16 +3347,22 @@ async fn run_flight(
     if_none_match: Option<&str>,
     mut record: RequestRecord,
 ) -> (Response, RequestRecord) {
+    // The miss path is boxed at each of the four places this
+    // function reaches it (issue #638). Its future holds the
+    // loader's and the engine runner's state, about 20 KB.
+    // Awaited in line it made every request's future that
+    // large, and a request allocates and moves its future
+    // once, whether it goes on to miss or not.
     // Debug requests bypass everything, per request.
     if work.debug {
-        let (response, record, _) = serve_miss(state, work, record).await;
+        let (response, record, _) = Box::pin(serve_miss(state, work, record)).await;
         return (response, record);
     }
     // Meta requests coalesce through their own flights
     // (issue #295), keyed by [`meta_flight_key`].
     if work.meta {
         let flight_key = meta_flight_key(&work);
-        return serve_meta_flight(state, work, record, &flight_key).await;
+        return Box::pin(serve_meta_flight(state, work, record, &flight_key)).await;
     }
     // Singleflight (audit R2-09): the first miss for a key
     // leads (one fetch, one encode, under the gates below);
@@ -3372,8 +3405,18 @@ async fn run_flight(
         work.hinted_width,
         work.save_data,
     );
-    let flight_request = format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
-    let (cache_key, groups) = (work.cache_key.clone(), work.groups.clone());
+    // That identity is built only by a request that leads
+    // or follows a flight (issue #641): a hit compares it
+    // with nothing. A follower builds it before it waits,
+    // and a leader once it holds the flight, never between
+    // a lookup that missed and the claim. Whatever a
+    // request does there widens the window in which the
+    // flight it would have followed can end unseen, and the
+    // request then leads a second flight for a render the
+    // first has just stored.
+    let flight_identity =
+        || format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
+    let mut flight_request: Option<String> = None;
     let (max_age, sealed) = (work.max_age, work.sealed);
     let mut waits = 0;
     let mut followed: Option<Arc<FlightSlot>> = None;
@@ -3381,12 +3424,14 @@ async fn run_flight(
     // (issue #572).
     let mut budget = DiskBudget::new();
     loop {
+        // The key and the groups are read where they are
+        // until the miss path takes the work.
+        let (cache_key, groups) = (work.cache_key.as_str(), work.groups.as_slice());
         if let Some((hit, cache_status)) =
-            lookup_tiers_within(state, &cache_key, &groups, &mut budget).await
+            lookup_tiers_within(state, cache_key, groups, &mut budget).await
         {
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
-            let etag = hit.etag.clone();
             let mut response = respond(
                 hit.format,
                 hit.quality,
@@ -3394,8 +3439,8 @@ async fn run_flight(
                 max_age,
                 state.client_hints,
             );
-            attach_cache_headers(&mut response, cache_status, &groups, sealed);
-            finalize_validators(&mut response, &etag, if_none_match);
+            attach_cache_headers(&mut response, cache_status, groups, sealed);
+            finalize_validators(&mut response, &hit.etag, if_none_match);
             return (response, record);
         }
         let taken = followed
@@ -3405,13 +3450,13 @@ async fn run_flight(
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .filter(|shared| shared.request == flight_request)
+                    .filter(|shared| Some(&shared.request) == flight_request.as_ref())
                     .cloned()
             })
             .filter(|shared| {
                 !state
                     .purge_guard
-                    .purge_covers(shared.snapshot, &cache_key, &groups)
+                    .purge_covers(shared.snapshot, cache_key, groups)
             });
         if let Some(shared) = taken {
             record.bytes_out = shared.response.body.len();
@@ -3422,8 +3467,9 @@ async fn run_flight(
             }
             return (response, record);
         }
-        match state.inflight.lead(&cache_key) {
+        match state.inflight.lead(cache_key) {
             Flight::Leader(guard, slot) => {
+                let flight_request = flight_request.take().unwrap_or_else(flight_identity);
                 let snapshot = state.purge_guard.snapshot();
                 let progress = work.progress.clone();
                 let task_progress = progress.clone();
@@ -3443,7 +3489,7 @@ async fn run_flight(
                 // answer, so it shares nothing.
                 let lead = async move {
                     let (response, record, render_etag) =
-                        serve_miss(&task_state, work, record).await;
+                        Box::pin(serve_miss(&task_state, work, record)).await;
                     let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
                     if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
                         *slot.shared.lock().unwrap() = Some(SharedFlight {
@@ -3489,7 +3535,7 @@ async fn run_flight(
                     // has not had its own attempt.
                     let progress = work.progress.clone();
                     let task_state = state.clone();
-                    let miss = async move { serve_miss(&task_state, work, record).await };
+                    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
                     let (mut response, record, render_etag) =
                         finish_started_miss(state, progress, miss).await;
                     if let Some(etag) = &render_etag {
@@ -3498,6 +3544,7 @@ async fn run_flight(
                     return (response, record);
                 }
                 waits += 1;
+                flight_request.get_or_insert_with(flight_identity);
                 // The leader always signals on drop; the
                 // timeout is only a backstop against a
                 // wedged leader, after which the waiter
@@ -5491,6 +5538,7 @@ fn respond(
     max_age: Option<u32>,
     client_hints: bool,
 ) -> Response {
+    use axum::http::HeaderValue;
     let content_type = match format {
         ImageFormat::Jpeg => "image/jpeg",
         ImageFormat::Png => "image/png",
@@ -5502,16 +5550,13 @@ fn respond(
         ImageFormat::WebM => "video/webm",
     };
     let cache_control = match max_age {
-        None => "public, max-age=31536000, immutable".to_string(),
-        Some(0) => "public, max-age=0".to_string(),
-        Some(n) => format!("public, max-age={n}, immutable"),
+        None => HeaderValue::from_static("public, max-age=31536000, immutable"),
+        Some(0) => HeaderValue::from_static("public, max-age=0"),
+        Some(n) => format!("public, max-age={n}, immutable").parse().unwrap(),
     };
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(content_type),
-    );
-    headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, cache_control);
     // `Vary` is set by `handle`, on every answer of the
     // image route alike. Advertise the client hints the
     // server reads, so browsers send them on later requests;
