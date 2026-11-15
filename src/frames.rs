@@ -41,10 +41,10 @@
 //!   -threads <n> -max_pixels <bound> -codec_whitelist
 //!   <decoders> -i fd: -ss <t> -frames:v 1 -an -sn -dn
 //!   -threads 2 -f image2pipe -vcodec png
-//!   -compression_level 1 -pred up pipe:1`. The two PNG
-//!   encoder settings make the PNG cheap to write (see
-//!   [`LIGHT_PNG`]); a run that needs the encoder's
-//!   defaults leaves them out. The
+//!   -compression_level 0 pipe:1`. The PNG encoder setting
+//!   has the frame's rows stored, not deflated (see
+//!   [`STORED_PNG`]); a run that needs the encoder's
+//!   defaults leaves it out. The
 //!   seek is output-side, which is the accurate form:
 //!   the tool decodes forward and returns the first frame
 //!   at or after `t`, and nothing when `t` is past the
@@ -111,27 +111,32 @@ use crate::url::FrameSelection;
 /// tool, not a frame.
 pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
 
-/// The PNG encoder settings of an extraction run (issue
-/// #647). The PNG only carries the frame to this process,
+/// The PNG encoder setting of an extraction run (issues #647
+/// and #651). The PNG only carries the frame to this process,
 /// which decodes it at once, and at FFmpeg's defaults (zlib
-/// level 6, no row filter) writing it is most of the run:
-/// about 250 of the 360 ms a 1080p frame takes. Level 1 with
-/// the `up` filter is lossless all the same, so the frame is
-/// the same pixels, takes about a third of the time, and on
-/// video frames comes out no larger (2.28 MB against 2.33 MB
-/// for that frame).
-const LIGHT_PNG: [&str; 4] = ["-compression_level", "1", "-pred", "up"];
+/// level 6) writing it is most of the run: about 250 of the
+/// 360 ms a 1080p frame takes. At level 0 the encoder stores
+/// the rows: nothing is deflated on its side of the pipe and
+/// nothing inflated on this one, and the frame is the same
+/// pixels, as PNG is lossless at every level. The price is
+/// the size of the PNG held while the frame is decoded, the
+/// raw frame with a third of a percent of framing: 6.2 MB
+/// for an 8-bit 1080p frame, where the default PNG of the
+/// measured clip was 2.3 MB. [`any_png_fits`] is the rule
+/// that keeps that inside the cap.
+const STORED_PNG: [&str; 2] = ["-compression_level", "0"];
 
 /// Whether a PNG of a `width` by `height` frame is within
 /// `cap` bytes whatever the encoder's settings, the frame's
 /// content and the depth of its pixels: at eight bytes a
 /// pixel (16-bit RGBA, the deepest the PNG encoder writes)
 /// and a filter byte a row, with one part in 128 on top for
-/// what deflate and the chunk framing add to data that does
-/// not compress (under half a percent), and 64 KiB for the
+/// what deflate and the chunk framing add to data that is
+/// not compressed (under half a percent), and 64 KiB for the
 /// other chunks. Either side may be the row, since a frame
-/// can come out rotated. For such a frame the cap admits
-/// the light PNG exactly when it admits the default one:
+/// can come out rotated. That is the size of the stored PNG
+/// at its largest, so for such a frame the cap admits the
+/// stored PNG exactly when it admits the default one:
 /// always.
 fn any_png_fits(width: u32, height: u32, cap: usize) -> bool {
     let raw = u128::from(width) * u128::from(height) * 8 + u128::from(width.max(height));
@@ -500,16 +505,18 @@ impl VideoFrameExtractor {
         let step = frame_interval(probe.fps);
         let (coded_width, coded_height) = probe.largest_coded();
         let threads = decoder_threads(coded_width, coded_height);
-        // The light PNG is asked for only where the cap admits
-        // a frame's PNG at any settings, whichever stream the
+        // The stored PNG is asked for only where the cap admits
+        // a frame's pixels uncompressed, whichever stream the
         // tool decodes: a larger frame keeps the encoder's
-        // defaults, so the cap admits what it always has.
-        let light = probe.streams.iter().all(|stream| {
+        // defaults and is deflated, so the cap admits what it
+        // always has. The probed sizes decide, before any
+        // extraction runs.
+        let stored = probe.streams.iter().all(|stream| {
             let (width, height) = stream.displayed;
             any_png_fits(width, height, self.max_frame_png)
         });
         for attempt in 0..=3 {
-            let png = self.extract_at(&input, timestamp, threads, deadline, light)?;
+            let png = self.extract_at(&input, timestamp, threads, deadline, stored)?;
             if !png.is_empty() {
                 if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Err(FrameError::Failed(
@@ -549,15 +556,15 @@ impl VideoFrameExtractor {
     /// failure is `Failed`. The decoder runs on
     /// `decoder_threads` threads (see [`decoder_threads`]).
     ///
-    /// With `light`, the first run asks for the light PNG (see
-    /// [`LIGHT_PNG`]). Its answer stands when it is no frame,
-    /// the decoder's refusal of a frame past the budget, a
-    /// timeout, or a frame whose PNG the cap admits at any
+    /// With `stored`, the first run asks for the stored PNG
+    /// (see [`STORED_PNG`]). Its answer stands when it is no
+    /// frame, the decoder's refusal of a frame past the budget,
+    /// a timeout, or a frame whose PNG the cap admits at any
     /// settings. Anything else is settled by a run at the
     /// encoder's defaults, the run every extraction was
     /// before: an output past the cap, a frame larger than the
     /// probe reported, or a failed run (a decoder that does
-    /// not take the settings among them). So the cap admits
+    /// not take the setting among them). So the cap admits
     /// and refuses the frames it always has, and a failure
     /// reads as it always has.
     fn extract_at(
@@ -566,10 +573,10 @@ impl VideoFrameExtractor {
         timestamp: f64,
         decoder_threads: usize,
         deadline: Instant,
-        light: bool,
+        stored: bool,
     ) -> Result<Vec<u8>, FrameError> {
-        if light {
-            match self.extraction_run(input, timestamp, decoder_threads, deadline, &LIGHT_PNG) {
+        if stored {
+            match self.extraction_run(input, timestamp, decoder_threads, deadline, &STORED_PNG) {
                 Ok(run) => match frame_of(run) {
                     Ok(png)
                         if png_size(&png).is_none_or(|(width, height)| {
