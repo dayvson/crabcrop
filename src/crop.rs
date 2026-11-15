@@ -59,6 +59,93 @@ pub struct CropTrace {
     pub faces_kept: usize,
 }
 
+/// A crop that has decided its window and not cut it yet: the
+/// frame as it came, and the window as (left, top, width,
+/// height), inside the frame. `None` when no cut runs (a
+/// zero target, or an aspect that already matches) and the
+/// frame is the answer as it stands.
+///
+/// The engine resizes every crop to its target, and it
+/// resamples the window straight from the frame instead of
+/// from a copy of it (issue #654); [`Uncut::into_image`] is
+/// the plain cut.
+#[derive(Debug)]
+pub(crate) struct Uncut {
+    pub(crate) img: DynamicImage,
+    pub(crate) window: Option<(u32, u32, u32, u32)>,
+}
+
+impl Uncut {
+    /// A frame no cut runs on.
+    pub(crate) fn whole(img: DynamicImage) -> Self {
+        Uncut { img, window: None }
+    }
+
+    /// Cut the window. A cut is RGBA8 whatever the frame's
+    /// own layout, as a crop's always was; a frame no cut
+    /// runs on comes back untouched.
+    pub(crate) fn into_image(self) -> DynamicImage {
+        match self.window {
+            Some(window) => DynamicImage::ImageRgba8(cut_rgba(&self.img, window)),
+            None => self.img,
+        }
+    }
+}
+
+/// `window` clamped into a `width` by `height` frame, as
+/// `image::imageops::crop_imm` clamps the window it is
+/// given: the corner first, then the size.
+pub(crate) fn clamp_window(
+    (x, y, w, h): (u32, u32, u32, u32),
+    (width, height): (u32, u32),
+) -> (u32, u32, u32, u32) {
+    let x = x.min(width);
+    let y = y.min(height);
+    (x, y, w.min(width - x), h.min(height - y))
+}
+
+/// The `window` of `img` as RGBA8: byte for byte
+/// `image::imageops::crop_imm(img, ..).to_image()`, which
+/// reads a `DynamicImage` one pixel at a time through its
+/// RGBA view. The two layouts nearly every source decodes to
+/// are copied by rows instead: RGB8 gains an opaque alpha,
+/// RGBA8 is copied as it is. Every other layout takes the
+/// crate's path.
+pub(crate) fn cut_rgba(img: &DynamicImage, (x, y, w, h): (u32, u32, u32, u32)) -> image::RgbaImage {
+    let (x, y, w, h) = clamp_window((x, y, w, h), (img.width(), img.height()));
+    let (left, columns) = (x as usize, w as usize);
+    let rows = (y as usize)..(y as usize + h as usize);
+    match img {
+        DynamicImage::ImageRgb8(src) if w > 0 && h > 0 => {
+            let stride = src.width() as usize * 3;
+            let lines = src.as_raw()[rows.start * stride..rows.end * stride].chunks_exact(stride);
+            let mut out = vec![0u8; columns * h as usize * 4];
+            for (dst, line) in out.chunks_exact_mut(columns * 4).zip(lines) {
+                let line = &line[left * 3..(left + columns) * 3];
+                for (d, s) in dst
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(line.as_chunks::<3>().0)
+                {
+                    *d = [s[0], s[1], s[2], 255];
+                }
+            }
+            image::RgbaImage::from_raw(w, h, out).expect("cut size")
+        }
+        DynamicImage::ImageRgba8(src) if w > 0 && h > 0 => {
+            let stride = src.width() as usize * 4;
+            let lines = src.as_raw()[rows.start * stride..rows.end * stride].chunks_exact(stride);
+            let mut out = Vec::with_capacity(columns * h as usize * 4);
+            for line in lines {
+                out.extend_from_slice(&line[left * 4..(left + columns) * 4]);
+            }
+            image::RgbaImage::from_raw(w, h, out).expect("cut size")
+        }
+        _ => image::imageops::crop_imm(img, x, y, w, h).to_image(),
+    }
+}
+
 /// [`crop_to_aspect`] with an optional face provider: when one
 /// is configured, smart alignment prefers detected faces over
 /// the saliency estimate. A declared focal provider (issue
@@ -71,6 +158,19 @@ pub fn crop_to_aspect_with(
     faces: Option<&dyn crate::ai::FaceProvider>,
     declared: Option<&dyn crate::ai::FocalProvider>,
 ) -> DynamicImage {
+    crop_to_aspect_uncut(img, target_w, target_h, align, faces, declared).into_image()
+}
+
+/// [`crop_to_aspect_with`] with the window left uncut (see
+/// [`Uncut`]).
+pub(crate) fn crop_to_aspect_uncut(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    align: Align,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+    declared: Option<&dyn crate::ai::FocalProvider>,
+) -> Uncut {
     crop_to_aspect_impl(img, target_w, target_h, align, faces, declared, false).0
 }
 
@@ -88,7 +188,8 @@ pub fn crop_to_aspect_traced(
     faces: Option<&dyn crate::ai::FaceProvider>,
     declared: Option<&dyn crate::ai::FocalProvider>,
 ) -> (DynamicImage, Option<CropTrace>) {
-    crop_to_aspect_impl(img, target_w, target_h, align, faces, declared, true)
+    let (uncut, trace) = crop_to_aspect_impl(img, target_w, target_h, align, faces, declared, true);
+    (uncut.into_image(), trace)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -100,9 +201,9 @@ fn crop_to_aspect_impl(
     faces: Option<&dyn crate::ai::FaceProvider>,
     declared: Option<&dyn crate::ai::FocalProvider>,
     trace: bool,
-) -> (DynamicImage, Option<CropTrace>) {
+) -> (Uncut, Option<CropTrace>) {
     if target_w == 0 || target_h == 0 {
-        return (img, None);
+        return (Uncut::whole(img), None);
     }
     let (w, h) = (img.width(), img.height());
     // Compare w/h with target_w/target_h via cross-multiplication.
@@ -115,7 +216,7 @@ fn crop_to_aspect_impl(
         // full-frame window positioned on the point.
         let traced = trace.then(|| focal_for(&align, &img, faces, declared));
         return (
-            img,
+            Uncut::whole(img),
             traced.map(|(point, face_boxes)| CropTrace {
                 faces_detected: face_boxes.len(),
                 faces_kept: faces_inside(&face_boxes, (0, 0, w, h)),
@@ -159,9 +260,11 @@ fn crop_to_aspect_impl(
     };
     let faces_detected = face_boxes.len();
     let faces_kept = faces_inside(&face_boxes, (x, y, cw, ch));
-    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
     (
-        DynamicImage::ImageRgba8(cropped),
+        Uncut {
+            img,
+            window: Some((x, y, cw, ch)),
+        },
         trace.then_some(CropTrace {
             window: (x, y, cw, ch),
             focal: if align == Align::Center {
@@ -265,18 +368,30 @@ pub fn crop_to_aspect_focal_traced(
     target_h: u32,
     rect: (u32, u32, u32, u32),
 ) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    let (uncut, window) = crop_to_aspect_focal_uncut(img, target_w, target_h, rect);
+    (uncut.into_image(), window)
+}
+
+/// [`crop_to_aspect_focal_traced`] with the window left
+/// uncut (see [`Uncut`]).
+pub(crate) fn crop_to_aspect_focal_uncut(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    rect: (u32, u32, u32, u32),
+) -> (Uncut, Option<(u32, u32, u32, u32)>) {
     if target_w == 0 || target_h == 0 {
-        return (img, None);
+        return (Uncut::whole(img), None);
     }
     let (w, h) = (img.width(), img.height());
     // Compare w/h with target_w/target_h via cross-multiplication.
     let src_ratio = w as u64 * target_h as u64;
     let dst_ratio = target_w as u64 * h as u64;
     if src_ratio == dst_ratio {
-        return (img, Some((0, 0, w, h)));
+        return (Uncut::whole(img), Some((0, 0, w, h)));
     }
     let (left, top, right, bottom) = rect;
-    let (x, y, cw, ch) = if src_ratio > dst_ratio {
+    let window = if src_ratio > dst_ratio {
         // Source is wider: crop the width.
         let cw = ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32;
         (focal_start(left, right, cw, w), 0, cw, h)
@@ -285,8 +400,8 @@ pub fn crop_to_aspect_focal_traced(
         let ch = ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32;
         (0, focal_start(top, bottom, ch, h), w, ch)
     };
-    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
+    let window = Some(window);
+    (Uncut { img, window }, window)
 }
 
 /// Crop `img` to the `target_w:target_h` aspect ratio,
@@ -321,15 +436,27 @@ pub fn crop_to_aspect_point_traced(
     target_h: u32,
     point: (f32, f32, f32),
 ) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    let (uncut, window) = crop_to_aspect_point_uncut(img, target_w, target_h, point);
+    (uncut.into_image(), window)
+}
+
+/// [`crop_to_aspect_point_traced`] with the window left
+/// uncut (see [`Uncut`]).
+pub(crate) fn crop_to_aspect_point_uncut(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    point: (f32, f32, f32),
+) -> (Uncut, Option<(u32, u32, u32, u32)>) {
     if target_w == 0 || target_h == 0 {
-        return (img, None);
+        return (Uncut::whole(img), None);
     }
     let (w, h) = (img.width(), img.height());
     // Compare w/h with target_w/target_h via cross-multiplication.
     let src_ratio = w as u64 * target_h as u64;
     let dst_ratio = target_w as u64 * h as u64;
     if src_ratio == dst_ratio {
-        return (img, Some((0, 0, w, h)));
+        return (Uncut::whole(img), Some((0, 0, w, h)));
     }
     let (fill_w, fill_h) = fill_window(w, h, target_w, target_h);
     let (fx, fy, zoom) = point;
@@ -365,8 +492,8 @@ pub fn crop_to_aspect_point_traced(
     let ch = ((exact_h / zoom as f64).round() as u32).clamp(1, fill_h);
     let x = point_start(fx, cw, w);
     let y = point_start(fy, ch, h);
-    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
+    let window = Some((x, y, cw, ch));
+    (Uncut { img, window }, window)
 }
 
 /// Crop `img` to the `target_w:target_h` aspect ratio, framing
@@ -398,8 +525,21 @@ pub fn crop_around_face_traced(
     face: &crate::ai::FaceBox,
     padding: f32,
 ) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    let (uncut, window) = crop_around_face_uncut(img, target_w, target_h, face, padding);
+    (uncut.into_image(), window)
+}
+
+/// [`crop_around_face_traced`] with the window left uncut
+/// (see [`Uncut`]).
+pub(crate) fn crop_around_face_uncut(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    face: &crate::ai::FaceBox,
+    padding: f32,
+) -> (Uncut, Option<(u32, u32, u32, u32)>) {
     let pad = padding.max(0.0) as f64;
-    crop_region_traced(
+    crop_region_uncut(
         img,
         target_w,
         target_h,
@@ -459,6 +599,19 @@ pub fn crop_around_objects_traced(
     union: (u32, u32, u32, u32),
     scale: f32,
 ) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    let (uncut, window) = crop_around_objects_uncut(img, target_w, target_h, union, scale);
+    (uncut.into_image(), window)
+}
+
+/// [`crop_around_objects_traced`] with the window left
+/// uncut (see [`Uncut`]).
+pub(crate) fn crop_around_objects_uncut(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    union: (u32, u32, u32, u32),
+    scale: f32,
+) -> (Uncut, Option<(u32, u32, u32, u32)>) {
     // The grammar guarantees the scale range; sanitize the
     // same way the point crop sanitizes its zoom, so a
     // hand-built call cannot invert the window math.
@@ -468,7 +621,7 @@ pub fn crop_around_objects_traced(
         1.0
     };
     let (left, top, right, bottom) = union;
-    crop_region_traced(
+    crop_region_uncut(
         img,
         target_w,
         target_h,
@@ -506,8 +659,8 @@ fn fill_window(w: u32, h: u32, target_w: u32, target_h: u32) -> (u32, u32) {
 /// (`cx`, `cy`), clamped into the image. When the subject
 /// cannot fit (the image is too small on one axis) the
 /// region shrinks to fit and the subject fills more of
-/// the frame.
-fn crop_region_traced(
+/// the frame. The window is left uncut (see [`Uncut`]).
+fn crop_region_uncut(
     img: DynamicImage,
     target_w: u32,
     target_h: u32,
@@ -515,9 +668,9 @@ fn crop_region_traced(
     cy: f64,
     pw: f64,
     ph: f64,
-) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+) -> (Uncut, Option<(u32, u32, u32, u32)>) {
     if target_w == 0 || target_h == 0 || img.width() == 0 || img.height() == 0 {
-        return (img, None);
+        return (Uncut::whole(img), None);
     }
     let (w, h) = (img.width() as f64, img.height() as f64);
     let (tw, th) = (target_w as f64, target_h as f64);
@@ -544,8 +697,8 @@ fn crop_region_traced(
     let ch = (rh.round() as u32).clamp(1, fill_h);
     let x = (ox.round() as u32).min(img.width() - cw);
     let y = (oy.round() as u32).min(img.height() - ch);
-    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
+    let window = Some((x, y, cw, ch));
+    (Uncut { img, window }, window)
 }
 
 /// Window start along one axis for a focal rectangle spanning
