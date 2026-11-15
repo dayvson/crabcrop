@@ -76,16 +76,16 @@ fn default_fingerprint_leaves_the_0_9_10_epoch() {
 }
 
 #[test]
-fn default_fingerprint_is_the_one_before_the_avif_tile_setting() {
-    // The default configuration's fingerprint at rendering
-    // version 7. `CRABCROP_AVIF_TILES` (issue #688) enters the
-    // fingerprint only when it names another count than the
-    // default four, so it left this value as it was: a server
-    // on an earlier build of this release keeps its cache
-    // epoch through the upgrade. A change that moves the value
-    // starts a new epoch for every deployment on the default
-    // configuration. Raising RENDERING_VERSION does that on
-    // purpose, and pins the new value here.
+fn default_configuration_keeps_its_fingerprint() {
+    // The default configuration's fingerprint, with the
+    // rendering version it was taken at. A change that moves
+    // it starts a new cache epoch for every deployment on the
+    // default configuration. Raising RENDERING_VERSION does
+    // that on purpose: pin the new pair here (RELEASING.md,
+    // step 4). A new setting should not: `CRABCROP_AVIF_TILES`
+    // (issue #688) enters the fingerprint only when it names
+    // another count than the default four, so this is the
+    // value the default configuration had before it.
     let fingerprint = config_fingerprint(
         env_of(&[]),
         metadata_config(env_of(&[])).unwrap(),

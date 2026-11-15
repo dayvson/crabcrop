@@ -93,7 +93,7 @@ Boot prints the request and source posture on one line, for example `request mod
 
 ### AVIF tiles
 
-`CRABCROP_AVIF_TILES` sets how many tiles an AVIF is written in: `1`, `2`, `4`, `8` or `16`, and `4` when it is unset. Any other value stops the boot with an error that names the variable. A frame too small for that many tiles gets fewer: at the default speed and quality a tile takes at least 128x128 pixels, so a 256x256 frame has room for four and an 800x533 one for 26.
+`CRABCROP_AVIF_TILES` sets how many tiles an AVIF is written in: `1`, `2`, `4`, `8` or `16`, and `4` when it is unset. Any other value stops the boot with an error that names the variable. A frame too small for that many tiles gets fewer: at the default speed and quality a tile takes at least 128x128 pixels, so a 256x256 frame has room for four and an 800x533 one for 26. Below quality 80 a tile takes at least 256x256 pixels, so an 800x533 frame has room for six, and eight or sixteen tiles write the same file as six.
 
 The encoder writes one tile per thread, so every AVIF encode runs in a pool of that many threads, and the server keeps one pool for every that many cores, rounded up. The file depends on the count and the image, never on the host: every replica with the same count writes the same bytes for the same URL. A host with more cores than the count runs several AVIF encodes side by side, each at full speed. A count above the host's core count is allowed, and makes one pool whose threads share the cores.
 
