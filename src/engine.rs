@@ -4986,8 +4986,8 @@ pub(crate) fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicI
         3 => crate::filters::rotate180_fast(&img),
         4 => crate::filters::flipv_fast(&img),
         // Transpose and anti-transpose: a rotation plus a mirror.
-        5 => crate::filters::fliph_fast(&img.rotate90()),
-        6 => img.rotate90(),
+        5 => crate::filters::fliph_fast(&crate::filters::rotate90_fast(&img)),
+        6 => crate::filters::rotate90_fast(&img),
         7 => crate::filters::fliph_fast(&crate::filters::rotate270_fast(&img)),
         8 => crate::filters::rotate270_fast(&img),
         _ => img,

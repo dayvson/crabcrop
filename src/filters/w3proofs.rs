@@ -290,6 +290,11 @@ fn w3_perms_match_crate() {
         let base = photo(w, h);
         for v in variants(&base) {
             assert_eq!(
+                bytes(&rotate90_fast(&v)),
+                bytes(&v.rotate90()),
+                "r90 {w}x{h}"
+            );
+            assert_eq!(
                 bytes(&rotate180_fast(&v)),
                 bytes(&v.rotate180()),
                 "r180 {w}x{h}"
@@ -312,6 +317,11 @@ fn w3_perms_match_crate() {
         DynamicImage::ImageLumaA8(big.to_luma_alpha8()),
     ] {
         assert_eq!(
+            bytes(&rotate90_fast(&v)),
+            bytes(&v.rotate90()),
+            "r90 luma big"
+        );
+        assert_eq!(
             bytes(&rotate180_fast(&v)),
             bytes(&v.rotate180()),
             "r180 luma big"
@@ -324,6 +334,94 @@ fn w3_perms_match_crate() {
         assert_eq!(bytes(&fliph_fast(&v)), bytes(&v.fliph()), "fliph luma big");
         assert_eq!(bytes(&flipv_fast(&v)), bytes(&v.flipv()), "flipv luma big");
     }
+}
+
+/// The block rotation of issue #648 is the crate's `rotate90`
+/// for every pixel layout the fast path takes, at any size:
+/// under one block of output rows, on both sides of a block
+/// boundary, sides that are no multiple of it, and one-pixel
+/// lines. The kernel is called directly, so these small frames
+/// run it, where `rotate90_fast` would hand them to the crate.
+#[test]
+fn rotate90_blocks_match_crate_at_any_size() {
+    let block = ROT90_BLOCK_ROWS as u32;
+    let mut sizes = vec![(1, 1), (1, 2), (2, 1), (1, 37), (37, 1), (3, 100), (100, 3)];
+    for side in [
+        block - 1,
+        block,
+        block + 1,
+        2 * block - 1,
+        2 * block,
+        3 * block + 5,
+    ] {
+        sizes.extend([(side, side), (side, 7), (7, side), (side, 1), (1, side)]);
+    }
+    sizes.extend([(257, 129), (129, 257)]);
+    let mut compared = 0;
+    for (w, h) in sizes {
+        let base = photo(w, h);
+        let (uw, uh) = (w as usize, h as usize);
+        for v in variants(&base) {
+            let got = match &v {
+                DynamicImage::ImageLuma8(i) => run_perm::<1>(i.as_raw(), uw, uh, rot90_px),
+                DynamicImage::ImageLumaA8(i) => run_perm::<2>(i.as_raw(), uw, uh, rot90_px),
+                DynamicImage::ImageRgb8(i) => run_perm::<3>(i.as_raw(), uw, uh, rot90_px),
+                DynamicImage::ImageRgba8(i) => run_perm::<4>(i.as_raw(), uw, uh, rot90_px),
+                other => panic!("an 8-bit layout was expected, not {:?}", other.color()),
+            };
+            let (_, size, want) = bytes(&v.rotate90());
+            assert_eq!(size, (h, w), "{:?} at {w}x{h}", v.color());
+            assert_eq!(got, want, "{:?} at {w}x{h}", v.color());
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 39 * 4);
+}
+
+/// `rotate90_fast` on both sides of its size gate, at sides
+/// that are no multiple of the block, and on one-pixel lines
+/// long enough to pass the gate. 16-bit frames keep the
+/// crate's own loop, as they do for the other permutations.
+/// (`w3_perms_match_crate` has the landscape frame in every
+/// layout and the gray frames past the gate.)
+#[test]
+fn rotate90_fast_matches_crate_around_the_size_gate() {
+    let same = |v: &DynamicImage| {
+        assert_eq!(
+            bytes(&rotate90_fast(v)),
+            bytes(&v.rotate90()),
+            "{:?} at {}x{}",
+            v.color(),
+            v.width(),
+            v.height()
+        );
+    };
+    // 1155x1155 RGB is 4,002,075 subpixels, just past the gate;
+    // 1154x1155 is 3,998,610, just under it.
+    let square = photo(1155, 1155);
+    assert!(square.as_bytes().len() >= PERM_FAST_MIN_SUBPIXELS);
+    same(&square);
+    same(&DynamicImage::ImageRgba8(square.to_rgba8()));
+    let under = photo(1154, 1155);
+    assert!(under.as_bytes().len() < PERM_FAST_MIN_SUBPIXELS);
+    same(&under);
+    // A portrait frame, as a phone stores a landscape photo.
+    same(&photo(901, 1601));
+    // One-pixel lines of 1,000,003 RGBA pixels, down and across.
+    for (w, h) in [(1u32, 1_000_003u32), (1_000_003, 1)] {
+        let line = image::RgbaImage::from_fn(w, h, |x, y| {
+            let v = ((x + y) % 251) as u8;
+            image::Rgba([v, v ^ 0x55, 255 - v, v.wrapping_mul(7)])
+        });
+        same(&DynamicImage::ImageRgba8(line));
+    }
+    // 901x741 RGB16 is 4,005,846 bytes: past the gate, and the
+    // crate's loop all the same.
+    let deep = DynamicImage::ImageRgb16(photo(901, 741).to_rgb16());
+    assert!(deep.as_bytes().len() >= PERM_FAST_MIN_SUBPIXELS);
+    let turned = rotate90_fast(&deep);
+    assert_eq!(turned.color(), image::ColorType::Rgb16);
+    assert_eq!(turned.as_bytes(), deep.rotate90().as_bytes());
 }
 
 #[test]

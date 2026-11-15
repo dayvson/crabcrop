@@ -1426,6 +1426,34 @@ fn rot270_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[
     });
 }
 
+/// Output rows written together by [`rot90_px`]. Measured on a
+/// 2400x1600 RGB frame: 8 rows 4.5 ms, 16 rows 4.1 ms, 32 rows
+/// 4.7 ms, 64 rows 7.1 ms (issue #648).
+const ROT90_BLOCK_ROWS: usize = 16;
+
+/// Rotate 90 degrees clockwise: output row `c` is input column
+/// `c` read bottom to top. The output is written a block of
+/// rows at a time: each input row hands a run of pixels to the
+/// block's rows, so the reads walk the input in order and the
+/// writes stay on a few lines already in cache. The crate's
+/// loop writes each pixel a whole output row away from the
+/// last, and misses on almost every one. One thread: the walk
+/// is bound by memory, and four frames rotating at once keep
+/// their single-frame time, which banding it over threads did
+/// not (issue #648).
+fn rot90_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
+    for (block, rows) in dst.chunks_mut(ROT90_BLOCK_ROWS * h).enumerate() {
+        let c = block * ROT90_BLOCK_ROWS;
+        let n = rows.len() / h;
+        for x in 0..h {
+            let run = &src[(h - 1 - x) * w + c..][..n];
+            for (k, px) in run.iter().enumerate() {
+                rows[k * h + x] = *px;
+            }
+        }
+    }
+}
+
 fn rot180_px<const CH: usize>(src: &[[u8; CH]], _w: usize, _h: usize, dst: &mut [[u8; CH]]) {
     let n = src.len();
     let br = perm_band_rows(n, n * CH);
@@ -1547,6 +1575,7 @@ macro_rules! perm_fn {
     };
 }
 
+perm_fn!(rotate90_fast, rot90_px, true, rotate90);
 perm_fn!(rotate270_fast, rot270_px, true, rotate270);
 perm_fn!(rotate180_fast, rot180_px, false, rotate180);
 perm_fn!(fliph_fast, fliph_px, false, fliph);

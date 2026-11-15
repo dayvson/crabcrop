@@ -1557,6 +1557,112 @@ fn invalid_exif_orientation_is_ignored() {
     );
 }
 
+/// The pixel layouts a decode can hand to [`apply_orientation`]:
+/// the four 8-bit ones the fast permutations take, and 16-bit
+/// ones, which keep the image crate's loops.
+const ORIENTATION_LAYOUTS: usize = 7;
+
+/// A frame of noise in one of the [`ORIENTATION_LAYOUTS`].
+fn orientation_frame(layout: usize, w: u32, h: u32) -> DynamicImage {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ (u64::from(w) << 32 | u64::from(h));
+    let mut samples = |channels: u32| -> Vec<u16> {
+        (0..w * h * channels)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u16
+            })
+            .collect()
+    };
+    fn narrow(samples: Vec<u16>) -> Vec<u8> {
+        samples.into_iter().map(|sample| sample as u8).collect()
+    }
+    fn frame<P: image::Pixel>(
+        w: u32,
+        h: u32,
+        samples: Vec<P::Subpixel>,
+    ) -> image::ImageBuffer<P, Vec<P::Subpixel>> {
+        image::ImageBuffer::from_raw(w, h, samples).expect("a whole frame")
+    }
+    match layout {
+        0 => DynamicImage::ImageLuma8(frame(w, h, narrow(samples(1)))),
+        1 => DynamicImage::ImageLumaA8(frame(w, h, narrow(samples(2)))),
+        2 => DynamicImage::ImageRgb8(frame(w, h, narrow(samples(3)))),
+        3 => DynamicImage::ImageRgba8(frame(w, h, narrow(samples(4)))),
+        4 => DynamicImage::ImageLuma16(frame(w, h, samples(1))),
+        5 => DynamicImage::ImageRgb16(frame(w, h, samples(3))),
+        _ => DynamicImage::ImageRgba16(frame(w, h, samples(4))),
+    }
+}
+
+/// Every EXIF orientation value turns a frame exactly as the
+/// image crate's own operations do (issue #648), whichever
+/// path takes it: the fast permutations for an 8-bit frame of
+/// four million bytes or more, the crate's loops for a smaller
+/// one and for 16-bit frames. Every layout is checked at small
+/// sizes for every value, the two that are no orientation
+/// among them. At the size the fast permutations start at,
+/// 1601 px wide (no multiple of the rotation's block), an RGB
+/// frame is checked for all eight values, and for the two the
+/// block rotation serves, 5 and 6: an RGB frame just under
+/// that size, an RGBA frame and a 16-bit frame past it. (The
+/// rotation itself is held to the crate for every layout in
+/// `filters::w3proofs`.)
+#[test]
+fn orientations_match_the_image_crate() {
+    fn by_the_crate(img: &DynamicImage, orientation: u32) -> DynamicImage {
+        match orientation {
+            2 => img.fliph(),
+            3 => img.rotate180(),
+            4 => img.flipv(),
+            5 => img.rotate90().fliph(),
+            6 => img.rotate90(),
+            7 => img.rotate270().fliph(),
+            8 => img.rotate270(),
+            _ => img.clone(),
+        }
+    }
+    let mut checked = 0;
+    let mut check = |img: &DynamicImage, orientations: std::ops::RangeInclusive<u32>| {
+        for orientation in orientations {
+            let want = by_the_crate(img, orientation);
+            let got = apply_orientation(img.clone(), orientation);
+            let what = format!(
+                "orientation {orientation} of {:?} at {}x{}",
+                img.color(),
+                img.width(),
+                img.height()
+            );
+            assert_eq!(
+                (got.color(), got.width(), got.height()),
+                (want.color(), want.width(), want.height()),
+                "{what}"
+            );
+            assert!(got.as_bytes() == want.as_bytes(), "{what}");
+            checked += 1;
+        }
+    };
+    for layout in 0..ORIENTATION_LAYOUTS {
+        for (w, h) in [(1, 1), (1, 9), (9, 1), (67, 45)] {
+            check(&orientation_frame(layout, w, h), 0..=9);
+        }
+    }
+    // The rows of a 1601 px wide frame that is the last one
+    // under four million bytes.
+    let rows = |layout| {
+        let bytes = orientation_frame(layout, 1, 1).color().bytes_per_pixel();
+        4_000_000 / (1601 * u32::from(bytes))
+    };
+    const RGB: usize = 2;
+    check(&orientation_frame(RGB, 1601, rows(RGB) + 1), 1..=8);
+    check(&orientation_frame(RGB, 1601, rows(RGB)), 5..=6);
+    for layout in [3, 5] {
+        check(&orientation_frame(layout, 1601, rows(layout) + 1), 5..=6);
+    }
+    assert_eq!(checked, ORIENTATION_LAYOUTS * 4 * 10 + 8 + 3 * 2);
+}
+
 #[test]
 fn avif_format_encodes() {
     let engine = Engine;
