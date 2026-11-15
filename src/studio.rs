@@ -14,7 +14,7 @@
 //! meta responses surface so the operation stays accountable
 //! instead of magical.
 
-use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage, imageops::FilterType};
+use image::{DynamicImage, GrayImage, Pixel, Rgba, RgbaImage, imageops::FilterType};
 
 use crate::filters::DeadlinePassed;
 use crate::url::{StudioBg, StudioMode, StudioShadow, StudioSpec};
@@ -188,21 +188,35 @@ fn resolve_bg(spec: &StudioSpec, brand_color: Option<[u8; 3]>) -> ResolvedBg {
 
 /// The inclusive bounding box of the mask pixels at or
 /// above `threshold`, as (x, y, width, height). `None`
-/// when no pixel qualifies.
+/// when no pixel qualifies. Read a row at a time: the first
+/// and the last qualifying pixel of each row are all the
+/// box needs.
 fn mask_bbox(mask: &GrayImage, threshold: u8) -> Option<(u32, u32, u32, u32)> {
-    let (mut min_x, mut min_y) = (u32::MAX, u32::MAX);
-    let (mut max_x, mut max_y) = (0u32, 0u32);
-    let mut any = false;
-    for (x, y, px) in mask.enumerate_pixels() {
-        if px[0] >= threshold {
-            any = true;
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-        }
+    let (width, height) = (mask.width() as usize, mask.height() as usize);
+    if width == 0 {
+        return None;
     }
-    any.then(|| (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+    let (mut min_x, mut max_x) = (usize::MAX, 0);
+    let (mut min_y, mut max_y) = (usize::MAX, 0);
+    let rows = mask.as_raw()[..width * height].chunks_exact(width);
+    for (y, row) in rows.enumerate() {
+        let Some(first) = row.iter().position(|&v| v >= threshold) else {
+            continue;
+        };
+        let last = row.iter().rposition(|&v| v >= threshold).unwrap_or(first);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+        min_y = min_y.min(y);
+        max_y = y;
+    }
+    (min_y != usize::MAX).then(|| {
+        (
+            min_x as u32,
+            min_y as u32,
+            (max_x - min_x + 1) as u32,
+            (max_y - min_y + 1) as u32,
+        )
+    })
 }
 
 /// Whether a subject box is a degenerate speck rather
@@ -237,79 +251,115 @@ fn degenerate_subject(subject: (u32, u32, u32, u32), region: (u32, u32, u32, u32
 /// neighbors (the grid is at most 64 by 64 cells), falling
 /// back to the whole image's uncovered mean, and to no
 /// change at all when the mask covers everything.
-fn defringe(img: &DynamicImage, mask: &GrayImage) -> DynamicImage {
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    // Global uncovered mean, the last-resort estimate.
-    let (mut total, mut count) = ([0u64; 3], 0u64);
-    for (px, m) in rgba.pixels().zip(mask.pixels()) {
-        if m[0] == 0 {
-            for c in 0..3 {
-                total[c] += px[c] as u64;
-            }
-            count += 1;
-        }
+///
+/// It works on the cut-out's own buffer, which is the size
+/// of the mask. One pass gathers the uncovered sums of every
+/// grid cell, each cell's local background is worked out
+/// once, and a second pass un-mixes the edge pixels.
+fn defringe(mut rgba: RgbaImage, mask: &GrayImage) -> RgbaImage {
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 || mask.dimensions() != (w, h) {
+        return rgba;
     }
-    if count == 0 {
-        return img.clone();
-    }
-    let global = [
-        (total[0] / count) as f32,
-        (total[1] / count) as f32,
-        (total[2] / count) as f32,
-    ];
     // Grid of uncovered sums: cell size chosen so neither
     // axis exceeds 64 cells.
     let cell = (w.max(h) / 64).max(1);
     let (gw, gh) = (w.div_ceil(cell), h.div_ceil(cell));
     let mut sums = vec![[0u64; 3]; (gw * gh) as usize];
     let mut counts = vec![0u64; (gw * gh) as usize];
-    for (x, y, px) in rgba.enumerate_pixels() {
-        if mask.get_pixel(x, y)[0] == 0 {
-            let i = (y / cell * gw + x / cell) as usize;
-            for c in 0..3 {
-                sums[i][c] += px[c] as u64;
-            }
-            counts[i] += 1;
-        }
-    }
-    let local_bg = |x: u32, y: u32| -> [f32; 3] {
-        let (cx, cy) = (x / cell, y / cell);
-        let (mut s, mut n) = ([0u64; 3], 0u64);
-        for gy in cy.saturating_sub(1)..=(cy + 1).min(gh - 1) {
-            for gx in cx.saturating_sub(1)..=(cx + 1).min(gw - 1) {
-                let i = (gy * gw + gx) as usize;
-                for c in 0..3 {
-                    s[c] += sums[i][c];
+    let (stride, cell_px, grid_w) = (w as usize, cell as usize, gw as usize);
+    let pixels = stride * h as usize;
+    let mask_rows = mask.as_raw()[..pixels].chunks_exact(stride);
+    for (y, (row, mask_row)) in rgba.as_raw()[..pixels * 4]
+        .chunks_exact(stride * 4)
+        .zip(mask_rows.clone())
+        .enumerate()
+    {
+        let cells = (y / cell_px) * grid_w;
+        for (cx, (cell_row, covers)) in row
+            .chunks(cell_px * 4)
+            .zip(mask_row.chunks(cell_px))
+            .enumerate()
+        {
+            let (sum, count) = (&mut sums[cells + cx], &mut counts[cells + cx]);
+            for (px, &m) in cell_row.as_chunks::<4>().0.iter().zip(covers) {
+                if m == 0 {
+                    sum[0] += u64::from(px[0]);
+                    sum[1] += u64::from(px[1]);
+                    sum[2] += u64::from(px[2]);
+                    *count += 1;
                 }
-                n += counts[i];
             }
         }
-        if n == 0 {
-            global
-        } else {
-            [
-                s[0] as f32 / n as f32,
-                s[1] as f32 / n as f32,
-                s[2] as f32 / n as f32,
-            ]
-        }
-    };
-    let mut out = rgba;
-    for (x, y, px) in out.enumerate_pixels_mut() {
-        let m = mask.get_pixel(x, y)[0];
-        if m == 0 || m == 255 {
-            continue;
-        }
-        let a = m as f32 / 255.0;
-        let divisor = a.max(0.2);
-        let bg = local_bg(x, y);
+    }
+    // Global uncovered mean, the last-resort estimate: the
+    // cells' sums add up to the whole image's.
+    let count: u64 = counts.iter().sum();
+    if count == 0 {
+        return rgba;
+    }
+    let mut total = [0u64; 3];
+    for sum in &sums {
         for c in 0..3 {
-            let fg = (px[c] as f32 - (1.0 - a) * bg[c]) / divisor;
-            px[c] = fg.round().clamp(0.0, 255.0) as u8;
+            total[c] += sum[c];
         }
     }
-    DynamicImage::ImageRgba8(out)
+    let global = [
+        (total[0] / count) as f32,
+        (total[1] / count) as f32,
+        (total[2] / count) as f32,
+    ];
+    // The local background of each cell: the uncovered mean
+    // of the cell and its neighbors.
+    let mut local = vec![global; (gw * gh) as usize];
+    for cy in 0..gh {
+        for cx in 0..gw {
+            let (mut s, mut n) = ([0u64; 3], 0u64);
+            for gy in cy.saturating_sub(1)..=(cy + 1).min(gh - 1) {
+                for gx in cx.saturating_sub(1)..=(cx + 1).min(gw - 1) {
+                    let i = (gy * gw + gx) as usize;
+                    for c in 0..3 {
+                        s[c] += sums[i][c];
+                    }
+                    n += counts[i];
+                }
+            }
+            if n != 0 {
+                local[(cy * gw + cx) as usize] = [
+                    s[0] as f32 / n as f32,
+                    s[1] as f32 / n as f32,
+                    s[2] as f32 / n as f32,
+                ];
+            }
+        }
+    }
+    let raw: &mut [u8] = &mut rgba;
+    for (y, (row, mask_row)) in raw[..pixels * 4]
+        .chunks_exact_mut(stride * 4)
+        .zip(mask_rows)
+        .enumerate()
+    {
+        let cells = (y / cell_px) * grid_w;
+        for (cx, (cell_row, covers)) in row
+            .chunks_mut(cell_px * 4)
+            .zip(mask_row.chunks(cell_px))
+            .enumerate()
+        {
+            let bg = local[cells + cx];
+            for (px, &m) in cell_row.as_chunks_mut::<4>().0.iter_mut().zip(covers) {
+                if m == 0 || m == 255 {
+                    continue;
+                }
+                let a = m as f32 / 255.0;
+                let divisor = a.max(0.2);
+                for c in 0..3 {
+                    let fg = (px[c] as f32 - (1.0 - a) * bg[c]) / divisor;
+                    px[c] = fg.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    rgba
 }
 
 /// Scale `piece` (a crop of the working image) so its
@@ -349,12 +399,21 @@ fn place(
     let piece_area = piece.width() as f32 * piece.height() as f32;
     let by_area = (crate::engine::MAX_OUTPUT_PIXELS as f32 / piece_area).sqrt();
     let scale = fit.min(by_axis).min(by_area);
-    let scaled = image::imageops::resize(
-        piece,
+    let size = (
         ((piece.width() as f32 * scale).round() as u32).max(1),
         ((piece.height() as f32 * scale).round() as u32).max(1),
-        FilterType::Triangle,
     );
+    // The image crate's Triangle resize, over rows (see
+    // `ai::resample`); the crate's own for anything that
+    // module leaves to it.
+    let scaled = crate::ai::resample::resize::<4>(
+        piece.as_raw(),
+        piece.dimensions(),
+        size,
+        crate::ai::resample::Kernel::Triangle,
+    )
+    .and_then(|raw| RgbaImage::from_raw(size.0, size.1, raw))
+    .unwrap_or_else(|| image::imageops::resize(piece, size.0, size.1, FilterType::Triangle));
     // Put the subject box's center on the canvas center:
     // the offset is the canvas center less the scaled
     // distance from the piece's origin to the box center.
@@ -365,16 +424,24 @@ fn place(
     (scaled, dx, dy)
 }
 
-/// Synthesize the contact shadow (part of pipeline step
-/// 3): the placed subject's alpha, blurred, dimmed by the
-/// strength's peak factor, and offset down. Returned as an
-/// RGBA layer the size of the canvas. The blur's sigma grows
-/// with the canvas, so it checks `deadline` before each row
-/// (issue #614).
-fn shadow_layer(
+/// The canvas for a backdrop color, with the contact shadow
+/// on it (part of pipeline step 3): the placed subject's
+/// alpha, blurred, dimmed by the strength's peak factor, and
+/// offset down. The blur's sigma grows with the canvas, so
+/// it checks `deadline` before each row (issue #614).
+///
+/// Under the shadow every canvas pixel is the backdrop
+/// blended with black at one of 256 strengths. The results
+/// are computed once, by the image crate's own blend, and
+/// written where the shadow falls; no canvas-sized layer is
+/// built and overlaid. That holds only while the canvas is
+/// the plain backdrop, which is why the canvas is made here
+/// and not handed in.
+fn shadowed_backdrop(
+    canvas: (u32, u32),
+    backdrop: [u8; 3],
     alpha: &GrayImage,
     at: (i64, i64),
-    canvas: (u32, u32),
     shadow: StudioShadow,
     deadline: Option<std::time::Instant>,
 ) -> Result<RgbaImage, DeadlinePassed> {
@@ -383,23 +450,89 @@ fn shadow_layer(
     let (sigma, peak) = match shadow {
         StudioShadow::Soft => ((min_dim * 0.02).max(1.0), 0.35),
         StudioShadow::Strong => ((min_dim * 0.006).max(1.0), 0.55),
-        StudioShadow::None => unreachable!("shadow layers are only built for soft or strong"),
+        StudioShadow::None => unreachable!("shadows are only cast for soft or strong"),
     };
     // `image::imageops::blur`, byte for byte.
     let blurred = crate::filters::blur_gray_within(alpha, sigma, deadline)?;
     let drop = ((h as f32 * 0.01).round() as i64).max(1);
-    let mut layer = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
-    for (x, y, px) in blurred.enumerate_pixels() {
-        let a = (px[0] as f32 / 255.0 * peak * 255.0).round() as u8;
-        if a == 0 {
-            continue;
-        }
-        let (tx, ty) = (x as i64 + at.0, y as i64 + at.1 + drop);
-        if tx >= 0 && ty >= 0 && tx < w as i64 && ty < h as i64 {
-            layer.put_pixel(tx as u32, ty as u32, Rgba([0, 0, 0, a]));
+    let plain = Rgba([backdrop[0], backdrop[1], backdrop[2], 255]);
+    let mut canvas = RgbaImage::from_pixel(w, h, plain);
+    // The backdrop under each blurred value: the value's
+    // strength, blended on as the overlay blended it. A
+    // strength of zero leaves the backdrop as it is.
+    let mut shaded = [plain.0; 256];
+    for (value, shade) in shaded.iter_mut().enumerate() {
+        let strength = (value as f32 / 255.0 * peak * 255.0).round() as u8;
+        let mut px = plain;
+        px.blend(&Rgba([0, 0, 0, strength]));
+        *shade = px.0;
+    }
+    // The part of the blurred plane that lands on the canvas.
+    let (bw, bh) = (i64::from(blurred.width()), i64::from(blurred.height()));
+    let (ox, oy) = (at.0, at.1.saturating_add(drop));
+    let x0 = ox.saturating_neg().clamp(0, bw);
+    let x1 = i64::from(w).saturating_sub(ox).clamp(0, bw);
+    let y0 = oy.saturating_neg().clamp(0, bh);
+    let y1 = i64::from(h).saturating_sub(oy).clamp(0, bh);
+    if x0 >= x1 || y0 >= y1 {
+        return Ok(canvas);
+    }
+    let stride = w as usize * 4;
+    let raw: &mut [u8] = &mut canvas;
+    for y in y0..y1 {
+        let from = (y * bw + x0) as usize;
+        let src = &blurred.as_raw()[from..from + (x1 - x0) as usize];
+        let to = (y + oy) as usize * stride + (x0 + ox) as usize * 4;
+        let (under, _) = raw[to..to + src.len() * 4].as_chunks_mut::<4>();
+        for (px, &value) in under.iter_mut().zip(src) {
+            *px = shaded[usize::from(value)];
         }
     }
-    Ok(layer)
+    Ok(canvas)
+}
+
+/// `image::imageops::overlay` for two RGBA8 buffers, a row at
+/// a time. A transparent top pixel leaves the bottom alone
+/// and an opaque one replaces it, which is what the crate's
+/// blend decides before it does any arithmetic; every other
+/// pixel goes through that blend.
+fn overlay_rgba(bottom: &mut RgbaImage, top: &RgbaImage, x: i64, y: i64) {
+    let (bw, bh) = (i64::from(bottom.width()), i64::from(bottom.height()));
+    let (tw, th) = (i64::from(top.width()), i64::from(top.height()));
+    // The crate's bounds: where the two overlap, in each
+    // image's own coordinates.
+    if x > bw || y > bh || x.saturating_add(tw) <= 0 || y.saturating_add(th) <= 0 {
+        return;
+    }
+    let bottom_x = x.clamp(0, bw) as usize;
+    let bottom_y = y.clamp(0, bh) as usize;
+    let range_w = x.saturating_add(tw).clamp(0, bw) as usize - bottom_x;
+    let range_h = y.saturating_add(th).clamp(0, bh) as usize - bottom_y;
+    let top_x = x.saturating_mul(-1).clamp(0, tw) as usize;
+    let top_y = y.saturating_mul(-1).clamp(0, th) as usize;
+    if range_w == 0 || range_h == 0 {
+        return;
+    }
+    let (bottom_stride, top_stride) = (bw as usize * 4, tw as usize * 4);
+    let top_raw = top.as_raw();
+    let bottom_raw: &mut [u8] = bottom;
+    for row in 0..range_h {
+        let b_at = (bottom_y + row) * bottom_stride + bottom_x * 4;
+        let t_at = (top_y + row) * top_stride + top_x * 4;
+        let (b_row, _) = bottom_raw[b_at..b_at + range_w * 4].as_chunks_mut::<4>();
+        let (t_row, _) = top_raw[t_at..t_at + range_w * 4].as_chunks::<4>();
+        for (b, t) in b_row.iter_mut().zip(t_row) {
+            match t[3] {
+                0 => {}
+                255 => *b = *t,
+                _ => {
+                    let mut px = Rgba(*b);
+                    px.blend(&Rgba(*t));
+                    *b = px.0;
+                }
+            }
+        }
+    }
 }
 
 /// Run the studio expansion over `img` with the provider's
@@ -466,7 +599,7 @@ pub fn composite_within(
             steps.push("defringe");
             let t_stage = std::time::Instant::now();
             let masked = crate::ai::apply_mask(img, mask);
-            let clean = defringe(&masked, mask).to_rgba8();
+            let clean = defringe(masked.into_rgba8(), mask);
             timing_mark("defringe", t_stage);
             // Crop to the covered region: nothing outside
             // it contributes pixels, and the crop keeps the
@@ -493,25 +626,34 @@ pub fn composite_within(
     let t_stage = std::time::Instant::now();
     let (scaled, dx, dy) = place(&piece, subject_in_piece, (w, h), spec.pad);
     timing_mark("place", t_stage);
-    let mut canvas = match resolved.color {
-        Some(c) => RgbaImage::from_pixel(w, h, Rgba([c[0], c[1], c[2], 255])),
-        None => RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0])),
-    };
     // The shadow rides under the subject, and only over a
     // backdrop: over transparency there is nothing for it
     // to darken.
-    if shadow_ok && resolved.color.is_some() {
-        let t_stage = std::time::Instant::now();
-        let alpha = GrayImage::from_fn(scaled.width(), scaled.height(), |x, y| {
-            Luma([scaled.get_pixel(x, y)[3]])
-        });
-        let layer = shadow_layer(&alpha, (dx, dy), (w, h), spec.shadow, deadline)?;
-        image::imageops::overlay(&mut canvas, &layer, 0, 0);
-        timing_mark("shadow", t_stage);
-        steps.push("shadow");
-    }
+    let mut canvas = match resolved.color {
+        Some(c) if shadow_ok => {
+            let t_stage = std::time::Instant::now();
+            let alpha = GrayImage::from_raw(
+                scaled.width(),
+                scaled.height(),
+                scaled
+                    .as_raw()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|px| px[3])
+                    .collect(),
+            )
+            .expect("one alpha sample per pixel");
+            let canvas = shadowed_backdrop((w, h), c, &alpha, (dx, dy), spec.shadow, deadline)?;
+            timing_mark("shadow", t_stage);
+            steps.push("shadow");
+            canvas
+        }
+        Some(c) => RgbaImage::from_pixel(w, h, Rgba([c[0], c[1], c[2], 255])),
+        None => RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0])),
+    };
     let t_stage = std::time::Instant::now();
-    image::imageops::overlay(&mut canvas, &scaled, dx, dy);
+    overlay_rgba(&mut canvas, &scaled, dx, dy);
     timing_mark("overlay", t_stage);
     steps.push("pad");
     // Over an opaque backdrop the composite is opaque by
@@ -922,7 +1064,7 @@ pub fn scene(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::ImageBuffer;
+    use image::{ImageBuffer, Luma};
 
     const GREEN: [u8; 3] = [30, 160, 30];
     const RED: [u8; 3] = [200, 30, 30];
@@ -1592,3 +1734,8 @@ mod tests {
         );
     }
 }
+
+/// The composite's row-wise steps against the forms they
+/// replaced (issue #674).
+#[cfg(test)]
+mod identity;

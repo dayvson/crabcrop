@@ -1,6 +1,6 @@
 use super::*;
 use crate::ai::env_or_skip;
-use crate::ai::test_support::{expect_load, missing_path};
+use crate::ai::test_support::{expect_load, missing_path, noise_rgb, opaque_rgba, same_bits};
 use image::imageops::FilterType;
 
 #[test]
@@ -386,5 +386,22 @@ fn decode_box_reads_an_exact_plane_without_resampling() {
     for (bx, by, p) in mask.enumerate_pixels() {
         let v = logits[((2 + by) * 20 + 3 + bx) as usize];
         assert_eq!(p[0], sigmoid_strength(v), "({bx}, {by})");
+    }
+}
+
+#[test]
+fn segment_preprocess_reads_an_rgb8_frame_in_place_to_the_same_tensor() {
+    // Issue #672: an RGB8 frame is resized from where it
+    // is. The tensor is the one the same colors give in a
+    // layout that is converted first.
+    for (w, h) in [(301, 517), (5, 3), (1, 1)] {
+        let rgb = noise_rgb(w, h, w * 7 + h);
+        assert!(
+            same_bits(
+                &segment_preprocess(&DynamicImage::ImageRgb8(rgb.clone())),
+                &segment_preprocess(&opaque_rgba(&rgb))
+            ),
+            "{w}x{h}"
+        );
     }
 }

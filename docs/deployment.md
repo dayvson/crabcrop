@@ -143,7 +143,7 @@ Rotation never invalidates a URL that is already in the wild: during a rotation 
 
 ## Building from source
 
-Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries), cmake and make (libjpeg-turbo, which writes JPEG output, is compiled from vendored sources with them), and nasm on x86_64 (assembly in the AVIF encoder and in libjpeg-turbo; the build fails without it). `cargo install crabcrop` is a source build and needs the same. The prebuilt routes (the installer, the Docker images, the release binaries) need none of this.
+Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries), cmake and make (libjpeg-turbo, which writes JPEG output and decodes JPEG sources at reduced scale, is compiled from vendored sources with them), and nasm on x86_64 (assembly in the AVIF encoder and in libjpeg-turbo; the build fails without it). `cargo install crabcrop` is a source build and needs the same. The prebuilt routes (the installer, the Docker images, the release binaries) need none of this.
 
 AVIF source decoding is behind the `avif-decode` cargo feature (off by default, on in the Docker image and the release builds; see [Source images](url-grammar.md#source-images)). Building with it needs dav1d 1.3 or newer reachable through pkg-config: the system's libdav1d (`libdav1d-dev` on Debian and Ubuntu), or the static dav1d the release builds, which `scripts/build_dav1d.sh` makes (it needs Python 3 and pkg-config too):
 

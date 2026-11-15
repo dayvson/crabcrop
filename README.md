@@ -152,5 +152,6 @@ Found a security vulnerability? Please report it privately: see [SECURITY.md](SE
 
 MIT. See [LICENSE](LICENSE).
 
-The binaries and images include libjpeg-turbo, which writes JPEG output. This
-software is based in part on the work of the Independent JPEG Group.
+The binaries and images include libjpeg-turbo, which writes JPEG output and
+decodes JPEG sources at reduced scale. This software is based in part on the
+work of the Independent JPEG Group.

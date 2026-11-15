@@ -58,6 +58,27 @@ Out of scope: vulnerabilities in third-party dependencies (please report those
 upstream, though a heads-up is welcome), and issues that require a
 misconfiguration the documentation explicitly warns against.
 
+## Decoders in the server process
+
+Every source that is not an SVG or an AVIF is decoded in the server process
+itself, under the decode limits in
+[Source images](docs/url-grammar.md#source-images). Most of that code is Rust:
+JPEG (zune-jpeg), PNG, GIF, TIFF, BMP, ICO, JPEG XL (jxl-rs) and HEIC
+(oxideav). Two C libraries, compiled into the binary, read source bytes there
+too:
+
+- libwebp decodes WebP sources;
+- libjpeg-turbo decodes a JPEG source at reduced scale, when the request's
+  first operation is a resize that shrinks it far enough (issue #653). It is
+  held to the declared-size limits before it starts and to 100 scans in a
+  progressive file, as the Rust decoder is, and a file it refuses or warns
+  about is decoded by the Rust decoder instead. It also writes JPEG output.
+
+A hostile source that exploits a bug in one of these decoders reaches the
+server itself, not a child. `scripts/check_locks.py` keeps every decoder crate
+at one version in both lockfiles, so the decoders that ship are the ones the
+tests and the fuzzers run.
+
 ## Child processes
 
 The server does some work in child processes: the SVG and AVIF worker, and,
@@ -65,8 +86,10 @@ when they are configured, the video encoder, the video frame decoder, and the
 PDF tools. A hostile source that exploits a bug in one of their decoders takes
 over the child, not the server. Each child:
 
-- starts with an empty environment (the worker keeps only the font variables),
-  so it is not handed the server's secrets;
+- starts with an empty environment (the worker keeps only the font variables,
+  and on Linux with glibc is given malloc settings of its own in
+  `GLIBC_TUNABLES`: a fixed value for its job, never the server's), so it is
+  not handed the server's secrets;
 - runs in its own process group, under a wall-clock limit and, on Linux, kernel
   limits on address space and CPU time.
 

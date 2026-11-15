@@ -306,7 +306,11 @@ pub fn sample_token(remainder: &str) -> String {
 /// allocation limits, the zune-jpeg and libwebp fast
 /// paths) for everything else. The still decode then runs
 /// on its own as well, since a still render of an
-/// animated source takes it too. Errors are the expected
+/// animated source takes it too. A JPEG also goes through
+/// the scaled decode (issue #653), at each of its scales:
+/// libjpeg-turbo, which a render runs in the server process
+/// when its first resize shrinks a JPEG source far enough.
+/// Errors are the expected
 /// outcome for most inputs; a panic or an unbounded
 /// allocation is the failure. The SVG render size is
 /// clamped so a well-formed but enormous SVG cannot turn
@@ -323,6 +327,31 @@ pub fn check_decode(data: &[u8]) {
     }
     let _ = engine::validate_source_image(data);
     let _ = engine::decode_image(data);
+    check_scaled_decode(data);
+}
+
+/// The scaled JPEG decode at a half, a quarter and an eighth
+/// (issue #653). It is total over any bytes, and a frame it
+/// returns is the size the header declares at that scale,
+/// rounded up: the size the render resolves its sizes
+/// against, so a frame of any other size would be resampled
+/// as a picture it is not.
+fn check_scaled_decode(data: &[u8]) {
+    for denominator in [2u32, 4, 8] {
+        let Some(frame) = engine::decode_jpeg_scaled(data, denominator) else {
+            continue;
+        };
+        let declared = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok());
+        let (width, height) = declared.expect("a frame from a file whose header states no size");
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (width.div_ceil(denominator), height.div_ceil(denominator)),
+            "a {width}x{height} JPEG decoded at 1/{denominator}",
+        );
+    }
 }
 
 /// The source-metadata invariants (issue #387):

@@ -51,7 +51,13 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 # the same bytes on every OS (the system libm differs in the last
 # bit between glibc and Apple). Already in the tree via image deps.
 libm = "0.2"
-jixel = "0.5"
+# The JPEG XL encoder, at 0.5.7 in the lock. Releases up to
+# 0.5.5 panic on some small frames with an alpha channel
+# (issue #670; fixed upstream in 0.5.6). A release can change
+# the bytes it writes for the same pixels, as 0.5.8 does for
+# every output: compare renders before the lock moves, and
+# raise RENDERING_VERSION with it when they differ.
+jixel = "0.5.7"
 # Default features off (issue #466): the defaults compile
 # ndarray (unused: tensors go in as shape-and-slice pairs)
 # and download-binaries with tls-native, which made OpenSSL
@@ -100,6 +106,10 @@ roxmltree = "0.21"
 # references usvg's cascade resolves. Keep it on usvg's line.
 simplecss = "0.2"
 sha2 = "0.11"
+# The detection memo's keyed digest (issue #677): SipHash-2-4
+# with a 128-bit output, the same cost on every CPU. Already
+# in the tree through usvg and svgtypes: it adds no crate.
+siphasher = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Default features off (issue #466): the defaults compile
@@ -141,7 +151,11 @@ zune-core = "0.5"
 # JPEG output is written by libjpeg-turbo (issue #668): about
 # three times faster than the pure-Rust encoder it replaced,
 # and it averages the chroma it subsamples where that encoder
-# kept one sample in two or four. turbojpeg-sys compiles the
+# kept one sample in two or four. It also decodes a JPEG
+# source at a half, a quarter or an eighth of its size where
+# the first operation is a resize that shrinks it that far
+# (issue #653), which zune-jpeg cannot; every other JPEG
+# decode stays zune-jpeg's. turbojpeg-sys compiles the
 # libjpeg-turbo sources it vendors with cmake and links the
 # library statically, so no system package or runtime library
 # is involved, and its bindings are pregenerated, so no

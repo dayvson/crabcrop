@@ -64,3 +64,71 @@ fn with_source_alpha_carries_alpha_at_the_source_depth() {
     let out = with_source_alpha(&src, ImageBuffer::from_pixel(3, 1, Rgb([7u16, 8, 9])));
     assert_eq!(out.color(), image::ColorType::Rgb16);
 }
+
+/// `u8::from_unit` as it was before issue #675: the same
+/// clamp and scale, rounded by `round`.
+fn u8_from_unit_by_round(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[test]
+fn u8_from_unit_rounds_as_round_does() {
+    // Issue #675: a comparison stands in for `round`. Every
+    // f32 cannot be walked in a unit test, so: NaN, both
+    // infinities, both zeros, negatives, values past 1,
+    // subnormals, every half point from 0.5/255 to
+    // 254.5/255 and every whole one with the floats on
+    // either side of each, and a sample of every sign and
+    // exponent with 4,096 mantissas each.
+    let mut values: Vec<f32> = vec![
+        f32::NAN,
+        -f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        -0.5,
+        1.5,
+        f32::MAX,
+        f32::MIN,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::from_bits(1),
+        f32::from_bits(0x8000_0001),
+        f32::EPSILON,
+        1.0 - f32::EPSILON,
+        1.0 + f32::EPSILON,
+    ];
+    for level in 0..=255u32 {
+        for unit in [level as f32 / 255.0, (level as f32 + 0.5) / 255.0] {
+            values.extend([unit, unit.next_up(), unit.next_down()]);
+        }
+    }
+    for sign_and_exponent in 0..512u32 {
+        for step in 0..4096u32 {
+            // Spread over the 23 mantissa bits, with the low
+            // bits varied too.
+            let mantissa = (step << 11) | (step.wrapping_mul(2_654_435_761) >> 21);
+            values.push(f32::from_bits(
+                (sign_and_exponent << 23) | (mantissa & 0x7f_ffff),
+            ));
+        }
+    }
+    assert!(values.len() > 2_000_000);
+    for v in values {
+        assert_eq!(
+            u8::from_unit(v),
+            u8_from_unit_by_round(v),
+            "{v:e} ({:#x})",
+            v.to_bits()
+        );
+    }
+    // The halves themselves go away from zero.
+    assert_eq!(
+        u8::from_unit(0.5 / 255.0),
+        u8_from_unit_by_round(0.5 / 255.0)
+    );
+    assert_eq!(u8::from_unit(0.5), 128);
+}

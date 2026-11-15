@@ -741,7 +741,11 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// output's size #611).
 ///
 /// 7: the first release after 0.12.0, which changes output
-/// for existing URLs (JPEG output written by libjpeg-turbo
+/// for existing URLs (a JPEG source whose first operation
+/// is a resize to a third of its size or less decoded at a
+/// half, a quarter or an eighth of it before that resize,
+/// so those renders' pixels change #653; JPEG output
+/// written by libjpeg-turbo
 /// instead of the jpeg-encoder crate, so every JPEG's
 /// bytes change: at the same quality the quantization
 /// tables are the same, chroma is averaged where it is
@@ -749,10 +753,26 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// dropped, progressive files carry Huffman tables built
 /// from the image, and `quality(auto)` settles on a lower
 /// quality and a smaller file for the same target #668;
-/// and AVIF output written in four tiles on every host,
-/// where the tile count was the host's core count, so AVIF
-/// bytes change on a host with another core count and then
-/// repeat on every replica of one build #671).
+/// AVIF output written in four tiles on every host, where
+/// the tile count was the host's core count, so AVIF bytes
+/// change on a host with another core count and then
+/// repeat on every replica of one build #671; an 8-bit
+/// source whose embedded profile is sRGB in effect, as the
+/// sRGB profiles cameras, phones and editors write are,
+/// keeps the pixels it decodes to instead of going through
+/// a conversion to sRGB that moved some of them by one
+/// level of rounding, so a render of such a source can
+/// differ from the release before by that level, carried
+/// through its operations and its encoder #662;
+/// JPEG XL output written by jixel 0.5.7 where 0.5.5
+/// wrote it: the small frames with an alpha channel that
+/// 0.5.5 failed on are encoded, a few other small frames
+/// with alpha get other bytes at the default speed tier,
+/// and every JPEG XL output does at
+/// `CRABCROP_JXL_SPEED=fast` and slower #670; and
+/// `quality(auto)` JPEG and JPEG XL output too large for
+/// its pick to be verified, now encoded once at the first
+/// pick instead of at the quality the search ended on).
 const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered

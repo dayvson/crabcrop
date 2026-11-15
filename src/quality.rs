@@ -11,7 +11,8 @@
 //! formats with a decoder to verify against, [`encode_to_target`]
 //! closes the loop: encode, decode, score with SSIMULACRA2
 //! ([`ssimulacra2`]), and bisect on quality until the score lands
-//! in the target band.
+//! in the target band. The loop runs for outputs of up to
+//! [`MAX_VERIFIED_PIXELS`]; a larger one keeps the first guess.
 
 use image::DynamicImage;
 
@@ -36,6 +37,18 @@ pub const SSIM_OVER_TOLERANCE: f64 = 10.0;
 /// first guess included.
 pub const MAX_PERCEPTUAL_ATTEMPTS: usize = 4;
 
+/// The most pixels an output may have for `quality(auto)` to
+/// verify its pick: 4,194,304 (2^22), a 2048x2048 frame. The
+/// pipeline starts no search for a larger output, which is
+/// encoded once at the first guess, and neither
+/// [`ssimulacra2`] nor [`SsimReference::score`] scores a
+/// larger image, whoever asks.
+pub const MAX_VERIFIED_PIXELS: u64 = 1 << 22;
+
+// The metric's own pixel limit is the looser of the two, so
+// `MAX_VERIFIED_PIXELS` is the one that binds.
+const _: () = assert!(MAX_VERIFIED_PIXELS <= fast_ssim2::MAX_IMAGE_PIXELS as u64);
+
 /// The result of a verified encode: the bytes to serve, the
 /// quality that produced them, and the SSIMULACRA2 score they
 /// measured at (`None` when the candidate could not be scored
@@ -48,14 +61,15 @@ pub struct ScoredEncode {
 
 /// Score `distorted` against `reference` with SSIMULACRA2.
 /// Returns `None` when the pair cannot be scored (size mismatch,
-/// empty, beyond the metric's pixel limit, or a metric error):
-/// scoring is verification, never a reason to fail a request.
+/// empty, more than [`MAX_VERIFIED_PIXELS`] pixels, or a metric
+/// error): scoring is verification, never a reason to fail a
+/// request.
 pub fn ssimulacra2(reference: &DynamicImage, distorted: &DynamicImage) -> Option<f64> {
     if reference.width() != distorted.width() || reference.height() != distorted.height() {
         return None;
     }
     let (w, h) = (reference.width(), reference.height());
-    if w == 0 || h == 0 || (w as u64 * h as u64) > fast_ssim2::MAX_IMAGE_PIXELS as u64 {
+    if !scorable(w, h) {
         return None;
     }
     let reference = reference.to_rgb8();
@@ -120,11 +134,13 @@ impl<'a> SsimReference<'a> {
     /// [`ssimulacra2`] returns for the pair, `None` under the
     /// same conditions.
     pub fn score(&self, distorted: &DynamicImage) -> Option<f64> {
+        #[cfg(test)]
+        counters::ASKED.with(|count| count.set(count.get() + 1));
         let (w, h) = (self.image.width(), self.image.height());
         if w != distorted.width() || h != distorted.height() {
             return None;
         }
-        if w == 0 || h == 0 || (w as u64 * h as u64) > fast_ssim2::MAX_IMAGE_PIXELS as u64 {
+        if !scorable(w, h) {
             return None;
         }
         let prepared = self
@@ -152,7 +168,9 @@ impl Drop for SsimReference<'_> {
 
 /// How many references the current thread has prepared and
 /// released, for the tests that hold a search to one
-/// reference that does not outlive its encode.
+/// reference that does not outlive its encode, and how many
+/// scores it has asked a reference for, for the tests that
+/// hold an encode to none.
 #[cfg(test)]
 pub(crate) mod counters {
     use std::cell::Cell;
@@ -160,12 +178,25 @@ pub(crate) mod counters {
     thread_local! {
         pub(crate) static PREPARED: Cell<usize> = const { Cell::new(0) };
         pub(crate) static RELEASED: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static ASKED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// (prepared, released) on this thread so far.
     pub(crate) fn snapshot() -> (usize, usize) {
         (PREPARED.with(Cell::get), RELEASED.with(Cell::get))
     }
+
+    /// The calls of [`super::SsimReference::score`] on this
+    /// thread so far, whatever they returned.
+    pub(crate) fn asked() -> usize {
+        ASKED.with(Cell::get)
+    }
+}
+
+/// Whether an image of `w` x `h` pixels is one the metric
+/// scores: not empty, and within [`MAX_VERIFIED_PIXELS`].
+fn scorable(w: u32, h: u32) -> bool {
+    w != 0 && h != 0 && u64::from(w) * u64::from(h) <= MAX_VERIFIED_PIXELS
 }
 
 /// `img` as 8-bit RGB: its own buffer when it has that layout,
@@ -398,6 +429,29 @@ mod tests {
     #[test]
     fn mismatched_sizes_do_not_score() {
         assert!(ssimulacra2(&solid(10), &DynamicImage::new_rgb8(10, 10)).is_none());
+    }
+
+    #[test]
+    fn the_metric_scores_up_to_the_verified_bound() {
+        // At the bound and one pixel under it, in several
+        // shapes; then one pixel past it, and empty frames.
+        for (w, h) in [
+            (2048, 2048),
+            (4096, 1024),
+            (2047, 2049),
+            (1, 4_194_304),
+            (1, 1),
+        ] {
+            assert!(scorable(w, h), "{w}x{h}");
+        }
+        for (w, h) in [(1985, 2113), (2049, 2048), (4096, 1025), (65_536, 65_536)] {
+            assert!(!scorable(w, h), "{w}x{h}");
+        }
+        for (w, h) in [(0, 0), (0, 7), (7, 0)] {
+            assert!(!scorable(w, h), "{w}x{h}");
+        }
+        assert_eq!(2047u64 * 2049, MAX_VERIFIED_PIXELS - 1);
+        assert_eq!(1985u64 * 2113, MAX_VERIFIED_PIXELS + 1);
     }
 
     #[test]

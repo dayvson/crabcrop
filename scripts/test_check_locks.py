@@ -158,6 +158,20 @@ class CheckLocks(unittest.TestCase):
             fuzz_packages=[*packages, *FUZZ_ONLY],
         )
 
+    def test_libjpeg_turbo_is_a_decoder(self):
+        # libjpeg-turbo decodes a JPEG source at reduced scale in the
+        # server process (issue #653): the crate that calls it and the
+        # crate that builds it are both held to one version.
+        for name in ["turbojpeg", "turbojpeg-sys"]:
+            with self.subTest(name=name):
+                self.assertTrue(check_locks.decoder_label(name), f"{name} is not in DECODERS")
+        packages = [*ROOT_PACKAGES, ("turbojpeg-sys", "1.1.1", REGISTRY), ("turbojpeg-sys", "1.2.0", REGISTRY)]
+        self.assert_fails(
+            ["turbojpeg-sys (JPEG at reduced scale, through libjpeg-turbo) is locked at 2 versions (1.1.1, 1.2.0)"],
+            root_packages=packages,
+            fuzz_packages=[*packages, *FUZZ_ONLY],
+        )
+
     def test_a_duplicate_that_decodes_nothing_passes(self):
         packages = [*ROOT_PACKAGES, ("thiserror", "1.0.69", REGISTRY), ("thiserror", "2.0.21", REGISTRY)]
         code, output = self.run_check(root_packages=packages)

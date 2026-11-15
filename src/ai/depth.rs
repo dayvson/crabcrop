@@ -79,7 +79,16 @@ impl Sample for u8 {
         self as f32 / 255.0
     }
     fn from_unit(v: f32) -> u8 {
-        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+        // Rounded half away from zero without a call to
+        // `round` (issue #675), which is a libm call for
+        // every sample of an upscale's output. The product
+        // is in 0..=255, or NaN, which casts to 0: its
+        // integer part is the truncating cast, the
+        // difference to it is exact, and the rounding is one
+        // comparison.
+        let x = v.clamp(0.0, 1.0) * 255.0;
+        let whole = x as u8;
+        whole + u8::from(x - f32::from(whole) >= 0.5)
     }
     fn from_255(v: f32) -> u8 {
         v.clamp(0.0, 255.0).round() as u8
