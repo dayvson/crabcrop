@@ -65,8 +65,10 @@ when they are configured, the video encoder, the video frame decoder, and the
 PDF tools. A hostile source that exploits a bug in one of their decoders takes
 over the child, not the server. Each child:
 
-- starts with an empty environment (the worker keeps only the font variables),
-  so it is not handed the server's secrets;
+- starts with an empty environment (the worker keeps only the font variables,
+  and on Linux with glibc is given malloc settings of its own in
+  `GLIBC_TUNABLES`: a fixed value for its job, never the server's), so it is
+  not handed the server's secrets;
 - runs in its own process group, under a wall-clock limit and, on Linux, kernel
   limits on address space and CPU time.
 
