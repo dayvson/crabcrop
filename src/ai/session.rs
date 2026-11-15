@@ -33,6 +33,22 @@ fn ort_search_path(ort_dylib_path: Option<&str>) -> std::path::PathBuf {
     }
 }
 
+/// The one thread pool every model runs on (issue #693). ONNX
+/// Runtime gives each session a pool of its own by default: a
+/// thread per core, its workers pinned to cores 1 and up, and
+/// spinning for a while after each operator before they sleep.
+/// Two inferences at once, which the AI gate allows, then put
+/// two pools' workers on the same cores, each pool's spinning
+/// in the other's way and core 0 left to the callers: on four
+/// cores, four AI requests at once took 1.28 times as long as
+/// with one pool. The shared pool is the size and the spinning
+/// of a session's own (a thread per core, spinning on), so one
+/// inference alone runs as it did, and ort runs every session
+/// built in this environment on it. Its threads are not pinned.
+fn shared_thread_pool() -> ort::environment::GlobalThreadPoolOptions {
+    ort::environment::GlobalThreadPoolOptions::default()
+}
+
 fn environment(dylib: Option<&str>) -> Result<&'static ort::environment::Environment, AiError> {
     if let Some(env) = ENVIRONMENT.get() {
         return Ok(env);
@@ -55,6 +71,7 @@ fn environment(dylib: Option<&str>) -> Result<&'static ort::environment::Environ
         ))
     })?;
     let env = builder
+        .with_global_thread_pool(shared_thread_pool())
         .build()
         .map_err(|e| AiError::Load(format!("cannot initialize the ONNX runtime: {e}")))?;
     let _ = ENVIRONMENT.set(env);
