@@ -6,7 +6,7 @@ use image::imageops::FilterType;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, collect_outputs, fir_resize};
+use super::session::{build_session, collect_outputs, fir_resize, rgb8_view};
 use super::{AiError, OcrLine, OcrProvider, OcrReport};
 
 /// The detection stage's side limit: the image is scaled
@@ -97,7 +97,7 @@ fn ocr_det_preprocess(img: &DynamicImage) -> (Vec<f32>, u32, u32) {
     const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
     const STD: [f32; 3] = [0.229, 0.224, 0.225];
     let (rw, rh) = ocr_det_size(img.width(), img.height());
-    let resized = fir_resize(&img.to_rgb8(), rw, rh);
+    let resized = fir_resize(&*rgb8_view(img), rw, rh);
     let plane = (rw * rh) as usize;
     let mut out = vec![0f32; 3 * plane];
     for (i, px) in resized.pixels().enumerate() {
@@ -736,7 +736,7 @@ impl OnnxOcrProvider {
     ) -> Result<OcrReport, AiError> {
         let (prob, map_w, map_h) = self.detect_probs(img)?;
         let quads = ocr_det_quads(&prob, map_w, map_h, img.width(), img.height());
-        let rgb = img.to_rgb8();
+        let rgb = rgb8_view(img);
         let mut lines = Vec::new();
         for quad in &quads {
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {

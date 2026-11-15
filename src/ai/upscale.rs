@@ -1,6 +1,6 @@
 //! AI upscale: the super-resolution provider.
 
-use image::{DynamicImage, ImageBuffer, Pixel};
+use image::{DynamicImage, ImageBuffer};
 use ort::session::Session;
 use std::sync::Mutex;
 
@@ -126,21 +126,7 @@ fn upscale_at<S: Sample, O: TensorOutput>(
     // its reshape agrees with its output (issue #326);
     // the result is cropped back below.
     let (pw, ph) = upscale_padded_dims(w, h);
-    let rgb = S::rgb(img);
-    let raw = rgb.as_raw();
-    let in_plane = pw as usize * ph as usize;
-    let mut input = vec![0f32; 3 * in_plane];
-    for y in 0..ph as usize {
-        let sy = y.min(h.saturating_sub(1) as usize);
-        for x in 0..pw as usize {
-            let sx = x.min(w.saturating_sub(1) as usize);
-            let src = (sy * w as usize + sx) * 3;
-            let dst = y * pw as usize + x;
-            for c in 0..3 {
-                input[c * in_plane + dst] = raw[src + c].to_unit();
-            }
-        }
-    }
+    let input = padded_input::<S>(img, (pw, ph));
     let output = run(input, [1, 3, ph as usize, pw as usize])?;
     let (shape, data) = output.f32_tensor()?;
     if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
@@ -164,11 +150,7 @@ fn upscale_at<S: Sample, O: TensorOutput>(
         )));
     }
     let mut out = ImageBuffer::<S::Rgb, Vec<S>>::new(ow, oh);
-    for (i, px) in out.pixels_mut().enumerate() {
-        for (c, v) in px.channels_mut().iter_mut().enumerate() {
-            *v = S::from_unit(data[c * plane + i]);
-        }
-    }
+    samples_from_planes::<S>(&data[..plane * 3], plane, &mut out);
     if (pw, ph) != (w, h) {
         // The model enlarged the padded input; crop the
         // replicated-edge margin back off so the result
@@ -195,6 +177,77 @@ fn upscale_at<S: Sample, O: TensorOutput>(
     // any depth, is carried over with a plain resize so
     // transparency survives.
     Ok(with_source_alpha(img, out))
+}
+
+/// The model's planar input for a frame: its RGB samples as
+/// values in 0..1, on a canvas of `(pw, ph)` whose columns
+/// and rows past the frame repeat its last column and row.
+/// Filled a row at a time.
+fn padded_input<S: Sample>(img: &DynamicImage, (pw, ph): (u32, u32)) -> Vec<f32> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let (pw, ph) = (pw as usize, ph as usize);
+    let plane = pw * ph;
+    let mut input = vec![0f32; 3 * plane];
+    if w == 0 || h == 0 {
+        return input;
+    }
+    let rgb = S::rgb(img);
+    let raw = rgb.as_raw();
+    let (red, rest) = input.split_at_mut(plane);
+    let (green, blue) = rest.split_at_mut(plane);
+    let rows = red
+        .chunks_exact_mut(pw)
+        .zip(green.chunks_exact_mut(pw))
+        .zip(blue.chunks_exact_mut(pw));
+    for (y, ((r, g), b)) in rows.enumerate() {
+        let sy = y.min(h - 1);
+        let src = &raw[sy * w * 3..(sy + 1) * w * 3];
+        let (pixels, _) = src.as_chunks::<3>();
+        for (((px, r), g), b) in pixels
+            .iter()
+            .zip(r.iter_mut())
+            .zip(g.iter_mut())
+            .zip(b.iter_mut())
+        {
+            *r = px[0].to_unit();
+            *g = px[1].to_unit();
+            *b = px[2].to_unit();
+        }
+        for plane_row in [r, g, b] {
+            let last = plane_row[w - 1];
+            plane_row[w..].fill(last);
+        }
+    }
+    input
+}
+
+/// The model's three output planes as interleaved samples:
+/// sample `c` of pixel `i` is `data[c * plane + i]`, clamped
+/// and rounded by [`Sample::from_unit`]. A block of each
+/// plane is converted at a time, so the conversion is a
+/// loop over one slice, and the block is then interleaved.
+fn samples_from_planes<S: Sample>(data: &[f32], plane: usize, out: &mut [S]) {
+    const BLOCK: usize = 256;
+    let (red, rest) = data.split_at(plane);
+    let (green, blue) = rest.split_at(plane);
+    let mut block = [[S::DEFAULT_MIN_VALUE; BLOCK]; 3];
+    let blocks = out
+        .chunks_mut(3 * BLOCK)
+        .zip(red.chunks(BLOCK))
+        .zip(green.chunks(BLOCK))
+        .zip(blue.chunks(BLOCK));
+    for (((pixels, r), g), b) in blocks {
+        for (samples, values) in block.iter_mut().zip([r, g, b]) {
+            for (sample, &value) in samples.iter_mut().zip(values) {
+                *sample = S::from_unit(value);
+            }
+        }
+        let [r, g, b] = &block;
+        let (pixels, _) = pixels.as_chunks_mut::<3>();
+        for (((px, &r), &g), &b) in pixels.iter_mut().zip(r).zip(g).zip(b) {
+            *px = [r, g, b];
+        }
+    }
 }
 
 #[cfg(test)]

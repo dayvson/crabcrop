@@ -1,5 +1,7 @@
 use super::*;
-use crate::ai::test_support::{expect_load, missing_path, solid, temp_file};
+use crate::ai::test_support::{
+    expect_load, missing_path, noise_rgb, opaque_rgba, same_bits, solid, temp_file,
+};
 
 /// Real-model verification, run manually with the deployment
 /// artifacts in place:
@@ -297,4 +299,293 @@ fn nms_keeps_a_box_at_exactly_the_iou_threshold() {
 #[test]
 fn nms_of_nothing_is_nothing() {
     assert!(nms(Vec::new()).is_empty());
+}
+
+#[test]
+fn face_tensor_is_bit_identical_to_the_indexed_fill() {
+    // Issue #672: the planes are written front to back. The
+    // tensor is the one the per-pixel indexed stores built:
+    // BGR planar, each sample the pixel's own value.
+    for (w, h) in [(FACE_INPUT, FACE_INPUT), (7, 5), (1, 1)] {
+        let small = noise_rgb(w, h, w + h);
+        let plane = (w * h) as usize;
+        let mut want = vec![0f32; 3 * plane];
+        for (i, px) in small.pixels().enumerate() {
+            want[i] = px[2] as f32;
+            want[plane + i] = px[1] as f32;
+            want[2 * plane + i] = px[0] as f32;
+        }
+        assert!(same_bits(&face_tensor(&small), &want), "{w}x{h}");
+    }
+}
+
+/// A fake YuNet that counts its runs. Its one face sits in
+/// a cell picked from the input, so two inputs get two
+/// answers and an answer handed to the wrong input shows.
+fn fake_yunet(
+    runs: &std::cell::Cell<u32>,
+) -> impl Fn(Vec<f32>) -> Result<std::collections::HashMap<String, Vec<f32>>, AiError> + '_ {
+    move |input| {
+        runs.set(runs.get() + 1);
+        assert_eq!(input.len(), 3 * (FACE_INPUT * FACE_INPUT) as usize);
+        let sum: f32 = input.iter().step_by(1009).sum();
+        let cell = sum as u32 % 6400;
+        let mut outputs = silent_face_outputs();
+        plant_peak(&mut outputs, 8, cell / 80, cell % 80, 1.0, 1.0, [0.0; 4]);
+        Ok(outputs)
+    }
+}
+
+/// What the model answers for a frame with no memo in the
+/// way.
+fn fresh_faces(img: &DynamicImage) -> Vec<FaceBox> {
+    let runs = std::cell::Cell::new(0);
+    let found = detect_faces(None, img, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    found
+}
+
+#[test]
+fn a_repeated_frame_is_answered_without_running_the_face_model() {
+    // Issue #677: the second detection of a frame finds its
+    // boxes in the memo. They are the boxes a fresh run
+    // gives, and what is remembered is the model's input,
+    // not the frame: a copy of the frame, and the same
+    // pixels in a layout that is converted first, hit too.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let rgb = noise_rgb(300, 200, 61);
+    let img = DynamicImage::ImageRgb8(rgb.clone());
+    let first = detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first, fresh_faces(&img));
+    for again in [
+        img.clone(),
+        DynamicImage::ImageRgb8(rgb.clone()),
+        opaque_rgba(&rgb),
+    ] {
+        assert_eq!(
+            detect_faces(Some(&memo), &again, fake_yunet(&runs)).unwrap(),
+            first
+        );
+        assert_eq!(runs.get(), 1, "a repeat ran the model");
+    }
+    // Another frame is another input: it runs the model
+    // and gets its own boxes, and the first is still there.
+    let other = DynamicImage::ImageRgb8(noise_rgb(300, 200, 62));
+    let second = detect_faces(Some(&memo), &other, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 2);
+    assert_eq!(second, fresh_faces(&other));
+    assert_ne!(second, first);
+    assert_eq!(
+        detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap(),
+        first
+    );
+    assert_eq!(
+        detect_faces(Some(&memo), &other, fake_yunet(&runs)).unwrap(),
+        second
+    );
+    assert_eq!(runs.get(), 2);
+}
+
+#[test]
+fn one_differing_pixel_of_the_face_input_is_a_miss() {
+    // A frame at the model's own size is its input as it
+    // stands. One sample of one pixel, one level apart,
+    // is another input: the model runs.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let rgb = noise_rgb(FACE_INPUT, FACE_INPUT, 63);
+    let img = DynamicImage::ImageRgb8(rgb.clone());
+    assert_eq!(
+        fir_resize(&rgb, FACE_INPUT, FACE_INPUT).as_raw(),
+        rgb.as_raw(),
+        "a frame at the input size is the input"
+    );
+    let first = detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap();
+    for (x, y, c) in [(0, 0, 0), (639, 639, 2), (317, 201, 1)] {
+        let mut changed = rgb.clone();
+        let sample = &mut changed.get_pixel_mut(x, y).0[c];
+        *sample = sample.wrapping_add(1);
+        let changed = DynamicImage::ImageRgb8(changed);
+        let before = runs.get();
+        let found = detect_faces(Some(&memo), &changed, fake_yunet(&runs)).unwrap();
+        assert_eq!(runs.get(), before + 1, "pixel {x},{y} sample {c} hit");
+        assert_eq!(found, fresh_faces(&changed));
+    }
+    assert_eq!(
+        detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap(),
+        first
+    );
+    assert_eq!(runs.get(), 4);
+}
+
+#[test]
+fn the_same_face_input_at_another_source_size_is_a_miss() {
+    // Two flat frames of one color resize to the same
+    // input, and the model answers the same cell for both.
+    // The boxes are mapped back to the source, so they
+    // differ, and one frame's must never answer the other.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let narrow = solid(90, 120, 150, 100, 80);
+    let wide = solid(90, 120, 150, 200, 80);
+    let tall = solid(90, 120, 150, 100, 160);
+    assert_eq!(
+        fir_resize(&narrow.to_rgb8(), FACE_INPUT, FACE_INPUT).as_raw(),
+        fir_resize(&wide.to_rgb8(), FACE_INPUT, FACE_INPUT).as_raw()
+    );
+    let in_narrow = detect_faces(Some(&memo), &narrow, fake_yunet(&runs)).unwrap();
+    let in_wide = detect_faces(Some(&memo), &wide, fake_yunet(&runs)).unwrap();
+    let in_tall = detect_faces(Some(&memo), &tall, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 3);
+    assert_eq!(in_narrow, fresh_faces(&narrow));
+    assert_eq!(in_wide, fresh_faces(&wide));
+    assert_eq!(in_tall, fresh_faces(&tall));
+    assert_ne!(in_narrow, in_wide);
+    assert_ne!(in_narrow, in_tall);
+    // Each is remembered under its own size.
+    assert_eq!(
+        detect_faces(Some(&memo), &wide, fake_yunet(&runs)).unwrap(),
+        in_wide
+    );
+    assert_eq!(
+        detect_faces(Some(&memo), &narrow, fake_yunet(&runs)).unwrap(),
+        in_narrow
+    );
+    assert_eq!(runs.get(), 3);
+}
+
+#[test]
+fn a_failed_face_inference_is_not_remembered() {
+    let memo = DetectionMemo::new();
+    let img = DynamicImage::ImageRgb8(noise_rgb(120, 90, 64));
+    // The model fails: the error goes out, nothing stays.
+    let failed = detect_faces(Some(&memo), &img, |_input| {
+        Err(AiError::Inference("inference failed: boom".to_string()))
+    });
+    assert_eq!(
+        failed,
+        Err(AiError::Inference("inference failed: boom".to_string()))
+    );
+    // The model answers something that does not decode.
+    let undecodable = detect_faces(Some(&memo), &img, |_input| {
+        let mut outputs = silent_face_outputs();
+        outputs.remove("bbox_16");
+        Ok(outputs)
+    });
+    assert!(matches!(undecodable, Err(AiError::BadOutput(_))));
+    // The next detection runs the model and gets the
+    // answer; only that is remembered.
+    let runs = std::cell::Cell::new(0);
+    let found = detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(found, fresh_faces(&img));
+    assert_eq!(
+        detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap(),
+        found
+    );
+    assert_eq!(runs.get(), 1);
+    // An empty frame never reaches the model or the memo.
+    let empty = DynamicImage::new_rgb8(0, 7);
+    assert_eq!(
+        detect_faces(Some(&memo), &empty, fake_yunet(&runs)).unwrap(),
+        []
+    );
+    assert_eq!(runs.get(), 1);
+}
+
+#[test]
+fn concurrent_face_detections_share_the_memo_safely() {
+    // Four threads detect over the same three frames
+    // against one memo: every answer is the fresh one, and
+    // the model runs at most once for a call and at least
+    // once for a frame.
+    let memo = DetectionMemo::new();
+    let frames: Vec<DynamicImage> = (0..3)
+        .map(|i| DynamicImage::ImageRgb8(noise_rgb(64, 48, 70 + i)))
+        .collect();
+    let fresh: Vec<Vec<FaceBox>> = frames.iter().map(fresh_faces).collect();
+    let total = std::sync::atomic::AtomicU32::new(0);
+    std::thread::scope(|scope| {
+        for t in 0..4 {
+            let (memo, frames, fresh, total) = (&memo, &frames, &fresh, &total);
+            scope.spawn(move || {
+                let runs = std::cell::Cell::new(0);
+                for round in 0..4 {
+                    let i = (round + t) % frames.len();
+                    let found = detect_faces(Some(memo), &frames[i], fake_yunet(&runs)).unwrap();
+                    assert_eq!(found, fresh[i]);
+                }
+                total.fetch_add(runs.get(), std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+    });
+    let total = total.into_inner();
+    assert!((3..=16).contains(&total), "{total} runs");
+    // Everything is remembered now.
+    let runs = std::cell::Cell::new(0);
+    for (frame, want) in frames.iter().zip(&fresh) {
+        assert_eq!(
+            &detect_faces(Some(&memo), frame, fake_yunet(&runs)).unwrap(),
+            want
+        );
+    }
+    assert_eq!(runs.get(), 0);
+}
+
+#[test]
+fn without_a_memo_every_face_detection_runs_the_model() {
+    // A provider whose session lock is poisoned leaves its
+    // memo out, so that every detection reaches the lock and
+    // fails there as it always did. Without a memo nothing
+    // is looked up and nothing is remembered: a frame the
+    // memo knows runs the model again.
+    let memo = DetectionMemo::new();
+    let runs = std::cell::Cell::new(0);
+    let img = DynamicImage::ImageRgb8(noise_rgb(120, 90, 65));
+    let first = detect_faces(Some(&memo), &img, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(detect_faces(None, &img, fake_yunet(&runs)).unwrap(), first);
+    assert_eq!(runs.get(), 2, "a detection without the memo did not run");
+    // The model's failure goes out, although the memo could
+    // have answered.
+    let failed = detect_faces(None, &img, |_input| Err(AiError::LockPoisoned));
+    assert_eq!(failed, Err(AiError::LockPoisoned));
+    // And a frame detected without the memo is not in it.
+    let other = DynamicImage::ImageRgb8(noise_rgb(120, 90, 66));
+    detect_faces(None, &other, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 3);
+    detect_faces(Some(&memo), &other, fake_yunet(&runs)).unwrap();
+    assert_eq!(runs.get(), 4);
+}
+
+/// The memo with the real model: a repeat gets the boxes
+/// the model gave, and another frame gets its own.
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_FACE_MODEL=...
+/// cargo test -- --ignored face_detection_repeats_with_the_real_model
+#[test]
+#[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+fn face_detection_repeats_with_the_real_model() {
+    let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+    let model = std::env::var("CRABCROP_TEST_FACE_MODEL").unwrap();
+    let provider = OnnxFaceProvider::load(Some(&dylib), &model).unwrap();
+    let bytes = include_bytes!("../../../tests/fixtures/portrait.jpg");
+    let img = image::load_from_memory(bytes).unwrap();
+    let first = provider.detect(&img).unwrap();
+    assert_eq!(first.len(), 1, "faces: {first:?}");
+    assert_eq!(provider.detect(&img).unwrap(), first);
+    // The same portrait mirrored is another input, with
+    // its face on the other side.
+    let mirrored = img.fliph();
+    let other = provider.detect(&mirrored).unwrap();
+    assert_eq!(other.len(), 1, "faces: {other:?}");
+    assert_ne!(other, first);
+    assert_eq!(provider.detect(&mirrored).unwrap(), other);
+    assert_eq!(provider.detect(&img).unwrap(), first);
+    // A provider that has never seen the portrait gives
+    // the same boxes: the memo changes no answer.
+    let fresh = OnnxFaceProvider::load(Some(&dylib), &model).unwrap();
+    assert_eq!(fresh.detect(&img).unwrap(), first);
 }

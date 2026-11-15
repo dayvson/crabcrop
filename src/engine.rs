@@ -2015,7 +2015,9 @@ impl Engine {
         // against (JPEG, JXL) closes the loop: encode, decode,
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
-        // the first guess. Other formats keep the one-shot pick.
+        // the first guess. Other formats keep the one-shot pick,
+        // and so does an output too large to verify (see
+        // `encode_still_within`).
         let perceptual = encode_quality.filter(|_| {
             matches!(resolved_quality, Some(ResolvedQuality::Auto))
                 && matches!(format, StillFormat::Jpeg | StillFormat::Jxl)
@@ -2037,11 +2039,52 @@ impl Engine {
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> Result<StillEncode, EngineError> {
+        // Every candidate of a verified search is scored
+        // against this image: the metric's work on it is done
+        // once, at the first score, and dropped with this call
+        // (issue #664). An encode that scores nothing prepares
+        // nothing.
+        let reference = crate::quality::SsimReference::new(img);
+        Self::encode_still_within(
+            img,
+            format,
+            encode_opts,
+            ctx,
+            crate::quality::MAX_VERIFIED_PIXELS,
+            |candidate| {
+                decode_image(candidate)
+                    .ok()
+                    .and_then(|decoded| reference.score(&decoded))
+            },
+        )
+    }
+
+    /// [`Engine::encode_still`] with the two things a test
+    /// stands in for: `max_verified_pixels`, the largest
+    /// output whose `quality(auto)` pick is verified (always
+    /// [`crate::quality::MAX_VERIFIED_PIXELS`]), and `score`,
+    /// which decodes a candidate's bytes and scores them
+    /// against `img`.
+    fn encode_still_within(
+        img: &DynamicImage,
+        format: StillFormat,
+        encode_opts: &EncodeOptions,
+        ctx: &ProcessContext<'_>,
+        max_verified_pixels: u64,
+        score: impl Fn(&[u8]) -> Option<f64>,
+    ) -> Result<StillEncode, EngineError> {
         let StillQuality {
             encode_quality,
             mut chosen_quality,
             perceptual,
         } = Self::resolve_still_quality(img, format, encode_opts, ctx);
+        // `quality(auto)` verifies its pick for an output of
+        // up to `max_verified_pixels`. A larger output is
+        // encoded once at the pick and reports it, as the
+        // formats with no search do. That is settled here,
+        // before any candidate is encoded.
+        let perceptual = perceptual
+            .filter(|_| u64::from(img.width()) * u64::from(img.height()) <= max_verified_pixels);
         let mut ssim: Option<f64> = None;
         let enc_src = EncodeBuffers::new(img);
         // Every encode of this image differs only in its quality.
@@ -2058,12 +2101,6 @@ impl Engine {
             )
         };
         let mut encode_budget = MAX_REQUEST_ENCODES;
-        // Every candidate of a verified search is scored
-        // against this image: the metric's work on it is done
-        // once, at the first score, and dropped with this call
-        // (issue #664). An encode that scores nothing prepares
-        // nothing.
-        let reference = crate::quality::SsimReference::new(img);
         let mut bytes = if let Some(first_guess) = perceptual {
             let scored = crate::quality::encode_to_target(
                 first_guess,
@@ -2076,9 +2113,7 @@ impl Engine {
                     // encoding long past it.
                     ctx.check_deadline()?;
                     let candidate = encode_at(Some(q))?;
-                    let score = decode_image(&candidate)
-                        .ok()
-                        .and_then(|decoded| reference.score(&decoded));
+                    let score = score(&candidate);
                     Ok::<_, EngineError>((candidate, score))
                 },
             )?;
@@ -2132,9 +2167,7 @@ impl Engine {
             // The budget overruled the verified quality, so the
             // reported score must describe the bytes actually
             // served: re-score the final encode once.
-            ssim = decode_image(&bytes)
-                .ok()
-                .and_then(|decoded| reference.score(&decoded));
+            ssim = score(&bytes);
         }
         Ok(StillEncode {
             bytes,
@@ -2375,9 +2408,56 @@ fn render_frames(
 /// of its own (see [`gif_frame_quantized`]) with its delay in
 /// hundredths of a second. GIF output has no quality lever and
 /// keeps the GIF encoder's defaults otherwise, as it always has.
+/// The frames are prepared on up to four threads (see
+/// [`gif_frame_workers`]) and written in frame order.
 fn encode_animated_gif(
     frames: &Frames,
     deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, EngineError> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let (width, height) = frames.dimensions();
+    let workers = gif_frame_workers(cores, frames.len(), width, height);
+    encode_animated_gif_on(frames, deadline, workers, gif_frame_quantized)
+}
+
+/// How many threads prepare the frames of an animated GIF on
+/// a host with `cores` cores (issue #667): the cores, four at
+/// most (the bound the banded filters use), never more than
+/// the frames, and one for a single frame or for an animation
+/// under 64x64 pixels, too small to repay a thread.
+fn gif_frame_workers(cores: usize, frames: usize, width: u32, height: u32) -> usize {
+    if frames < 2 || u64::from(width) * u64::from(height) < 64 * 64 {
+        return 1;
+    }
+    cores.clamp(1, 4).min(frames)
+}
+
+/// [`encode_animated_gif`] on `workers` threads. `quantize`
+/// turns one frame's RGBA pixels, width, height and delay
+/// into its GIF frame: always [`gif_frame_quantized`], and a
+/// parameter only so a test can see which frames are
+/// prepared.
+///
+/// Each frame is quantized onto its own palette and compressed
+/// by itself, with nothing carried from one frame to the next,
+/// so the frames can be prepared in any order: one thread
+/// writes each as it goes, and several prepare them side by
+/// side (see [`in_index_order`]) and then write them in frame
+/// order, the LZW pass `write_frame` runs having run on the
+/// thread that quantized the frame. The file is the same
+/// bytes either way.
+///
+/// The prepared frames wait for the write as palette and
+/// LZW data, the file's own image data: at most about a byte
+/// and a half per pixel, where the frames they come from hold
+/// four, so the frame cap and the pixel budgets that bound the
+/// frames bound them too. Each thread works on one frame at a
+/// time.
+fn encode_animated_gif_on(
+    frames: &Frames,
+    deadline: Option<std::time::Instant>,
+    workers: usize,
+    quantize: impl Fn(&[u8], u32, u32, u16) -> Result<gif::Frame<'static>, EngineError> + Sync,
 ) -> Result<Vec<u8>, EngineError> {
     let mut out = Vec::new();
     let (canvas_w, canvas_h) = frames.dimensions();
@@ -2392,12 +2472,13 @@ fn encode_animated_gif(
         &[],
     )
     .map_err(|e| EngineError::Encode(e.to_string()))?;
-    for f in frames.iter() {
+    let prepare = |f: &image::Frame| {
         // The deadline is checked per frame inside the encode
-        // loop itself (issue #322): a many-frame GIF encode is
-        // chunked work, so it aborts at the deadline instead of
-        // running every frame's quantization first and being
-        // noticed only afterwards.
+        // loop itself (issue #322), on whichever thread takes
+        // the frame: a many-frame GIF encode is chunked work,
+        // so it aborts at the deadline instead of running
+        // every frame's quantization first and being noticed
+        // only afterwards.
         state::check_deadline(deadline)?;
         // GIF delays are hundredths of a second; the image
         // crate saturated this conversion at u16::MAX, and so
@@ -2405,12 +2486,104 @@ fn encode_animated_gif(
         let (numer, denom) = f.delay().numer_denom_ms();
         let delay = u16::try_from(numer / denom / 10).unwrap_or(u16::MAX);
         let buffer = f.buffer();
-        let frame = gif_frame_quantized(buffer.as_raw(), buffer.width(), buffer.height(), delay)?;
-        enc.write_frame(&frame)
-            .map_err(|e| EngineError::Encode(e.to_string()))?;
+        quantize(buffer.as_raw(), buffer.width(), buffer.height(), delay)
+    };
+    if workers <= 1 {
+        for f in frames.iter() {
+            let frame = prepare(f)?;
+            enc.write_frame(&frame)
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
+    } else {
+        let all: Vec<&image::Frame> = frames.iter().collect();
+        let prepared = in_index_order(all.len(), workers, |index| {
+            let mut frame = prepare(all[index])?;
+            frame.make_lzw_pre_encoded();
+            Ok(frame)
+        })?;
+        for frame in &prepared {
+            enc.write_lzw_pre_encoded_frame(frame)
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
     }
     drop(enc);
     Ok(out)
+}
+
+/// Run `work` for every index below `count` on up to `workers`
+/// threads, the calling thread among them, and return the
+/// results in index order.
+///
+/// The threads take the indexes in order from a shared
+/// counter. A failure stops every thread before its next
+/// index, so the work behind it is never started, and the
+/// failure returned is the first in index order: the one a
+/// loop over the indexes would have met. (An index is left
+/// untaken only behind one that failed, and every index taken
+/// is finished, so no index below the first failure is
+/// missing.) A panic in `work` stops the other threads the
+/// same way and is raised again on the calling thread, where
+/// it unwinds as it would have from a loop.
+///
+/// The threads are scoped: all of them have ended when this
+/// returns, however it returns. A thread the host cannot
+/// start is one helper fewer, not a failure, since the
+/// calling thread takes indexes too.
+fn in_index_order<T: Send>(
+    count: usize,
+    workers: usize,
+    work: impl Fn(usize) -> Result<T, EngineError> + Sync,
+) -> Result<Vec<T>, EngineError> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    /// Sets the flag when dropped by a panic's unwinding.
+    struct StopOnPanic<'a>(&'a AtomicBool);
+    impl Drop for StopOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let take = || {
+        let mut done: Vec<(usize, Result<T, EngineError>)> = Vec::new();
+        // Declared after `done`, so a panic's unwinding sets
+        // the flag before it drops what this thread finished.
+        let _stop_on_panic = StopOnPanic(&stop);
+        while !stop.load(Ordering::Relaxed) {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            if index >= count {
+                break;
+            }
+            let result = work(index);
+            if result.is_err() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            done.push((index, result));
+        }
+        done
+    };
+    let mut results: Vec<Option<Result<T, EngineError>>> = (0..count).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let helpers: Vec<_> = (1..workers.min(count))
+            .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, take).ok())
+            .collect();
+        let mut done = take();
+        for helper in helpers {
+            match helper.join() {
+                Ok(more) => done.extend(more),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        for (index, result) in done {
+            results[index] = Some(result);
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.expect("an index is left untaken only behind a failed one"))
+        .collect()
 }
 
 /// Collect an animation decoder's frames under the shared
@@ -6364,6 +6537,18 @@ mod tests;
 // Fast paths against the code they replaced, byte for byte.
 #[cfg(test)]
 mod identity_proofs;
+
+// Small frames with an alpha channel through every encoder.
+#[cfg(test)]
+mod small_frame_tests;
+
+// Animated GIF frames prepared on several threads.
+#[cfg(test)]
+mod gif_frame_tests;
+
+// The largest output whose `quality(auto)` pick is verified.
+#[cfg(test)]
+mod quality_bound_tests;
 
 #[cfg(test)]
 pub(crate) mod test_formats;

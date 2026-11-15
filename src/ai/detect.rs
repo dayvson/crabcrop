@@ -6,7 +6,8 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::clip::read_labels;
-use super::session::{build_session, collect_outputs, fir_resize};
+use super::memo::DetectionMemo;
+use super::session::{TensorOutput, build_session, fir_resize, first_output, rgb8_view};
 use super::{AiError, Detection, DetectionProvider};
 
 /// The detector's fixed input edge (YOLO letterbox).
@@ -24,6 +25,10 @@ pub struct OnnxDetectionProvider {
     input_name: String,
     classes: Vec<String>,
     threshold: f32,
+    /// The detections of recent inputs (issue #677): the
+    /// same source at another crop size, or a meta request
+    /// after the render, asks for the same boxes.
+    memo: DetectionMemo<Detection>,
 }
 
 impl OnnxDetectionProvider {
@@ -79,6 +84,7 @@ impl OnnxDetectionProvider {
             input_name,
             classes,
             threshold,
+            memo: DetectionMemo::new(),
         };
         // Probe the output layout with a blank image: any
         // detections found are discarded, but a layout the
@@ -111,33 +117,90 @@ impl DetectionProvider for OnnxDetectionProvider {
     }
 
     fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError> {
-        let (input, scale, pad_x, pad_y) = letterbox(img);
-        let tensor = ort::value::Tensor::from_array((
-            [1, 3, DETECT_INPUT as usize, DETECT_INPUT as usize],
-            input.into_boxed_slice(),
-        ))
-        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
-        let outputs = session
-            .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
-        let outputs = collect_outputs(outputs)?;
-        let (_, dims, data) = outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
-        postprocess_detections(
-            &data,
-            &dims,
-            &self.classes,
-            self.threshold,
-            img.width(),
-            img.height(),
-            scale,
-            pad_x,
-            pad_y,
-        )
+        // A provider whose session a panic has poisoned
+        // answers no frame, as before: the memo is left out,
+        // so a remembered frame fails at the lock like any
+        // other.
+        let memo = (!self.session.is_poisoned()).then_some(&self.memo);
+        detect_objects(memo, &self.classes, self.threshold, img, |input| {
+            let tensor = ort::value::Tensor::from_array((
+                [1, 3, DETECT_INPUT as usize, DETECT_INPUT as usize],
+                input.into_boxed_slice(),
+            ))
+            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let outputs = session
+                .run(ort::inputs![self.input_name.as_str() => tensor])
+                .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+            // Only the first output is read, and in place:
+            // it is 2.8 MB for an 80-class export. The
+            // others are still checked to be float tensors,
+            // as collecting them all checked.
+            for value in outputs.values() {
+                value.try_extract_tensor::<f32>().map_err(|e| {
+                    AiError::BadOutput(format!("cannot read the model output: {e}"))
+                })?;
+            }
+            first_output(outputs)
+        })
     }
+}
+
+/// One detection around a model run: `run` takes the
+/// letterboxed input tensor and returns the model's first
+/// output. The provider passes its session; the tests pass
+/// a fake model. With a memo, an input it knows is answered
+/// from it and `run` is not called, and a result is
+/// remembered only once the model has run and its output
+/// has decoded: a failure is never remembered.
+fn detect_objects<O: TensorOutput>(
+    memo: Option<&DetectionMemo<Detection>>,
+    classes: &[String],
+    threshold: f32,
+    img: &DynamicImage,
+    run: impl FnOnce(Vec<f32>) -> Result<O, AiError>,
+) -> Result<Vec<Detection>, AiError> {
+    let (resized, scale) = letterbox_frame(img);
+    // What decides the detections: the model's input, which
+    // is these pixels centered on a fixed gray square; the
+    // source size the boxes are mapped back to; and the
+    // score floor and the class names the boxes are read
+    // with.
+    let remembered = memo.map(|memo| {
+        let sizes =
+            [resized.width(), resized.height(), img.width(), img.height()].map(u32::to_le_bytes);
+        let floor = threshold.to_bits().to_le_bytes();
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(6 + classes.len());
+        parts.push(resized.as_raw());
+        parts.extend(sizes.iter().map(|size| size.as_slice()));
+        parts.push(&floor);
+        parts.extend(classes.iter().map(|class| class.as_bytes()));
+        let key = memo.key(&parts);
+        (memo, key)
+    });
+    if let Some((memo, key)) = &remembered
+        && let Some(found) = memo.get(key)
+    {
+        return Ok(found);
+    }
+    let (input, pad_x, pad_y) = letterbox_tensor(&resized);
+    let output = run(input)?;
+    let (dims, data) = output.f32_tensor()?;
+    let found = postprocess_detections(
+        data,
+        dims,
+        classes,
+        threshold,
+        img.width(),
+        img.height(),
+        scale,
+        pad_x,
+        pad_y,
+    )?;
+    if let Some((memo, key)) = remembered {
+        memo.put(key, &found);
+    }
+    Ok(found)
 }
 
 /// The class vocabulary from a model's `names` metadata
@@ -173,30 +236,49 @@ fn parse_names_metadata(raw: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Letterbox an image into the detector's square input:
-/// scale to fit, pad with the standard gray, planar CHW
-/// at 0..1. Returns the tensor, the scale, and the padding
-/// offset, which the post-processor needs to map boxes
-/// back to image coordinates.
-fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
+/// The first half of the letterbox: the image scaled to
+/// fit the detector's square input. Returns the scaled
+/// frame and the scale, which the post-processor needs to
+/// map boxes back to image coordinates.
+fn letterbox_frame(img: &DynamicImage) -> (image::RgbImage, f32) {
     let (w, h) = (img.width().max(1), img.height().max(1));
     let scale = (DETECT_INPUT as f32 / w as f32).min(DETECT_INPUT as f32 / h as f32);
     let nw = ((w as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
     let nh = ((h as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
-    let resized = fir_resize(&img.to_rgb8(), nw, nh);
+    (fir_resize(&*rgb8_view(img), nw, nh), scale)
+}
+
+/// The second half: the scaled frame centered on the
+/// standard gray, planar CHW at 0..1. Returns the tensor
+/// and the padding offset, which the post-processor needs
+/// too.
+fn letterbox_tensor(resized: &image::RgbImage) -> (Vec<f32>, u32, u32) {
+    let (nw, nh) = resized.dimensions();
     let pad_x = (DETECT_INPUT - nw) / 2;
     let pad_y = (DETECT_INPUT - nh) / 2;
     let plane = (DETECT_INPUT * DETECT_INPUT) as usize;
     let mut out = vec![114f32 / 255.0; 3 * plane];
-    for (i, px) in resized.pixels().enumerate() {
-        let x = i as u32 % nw;
-        let y = i as u32 / nw;
-        let at = ((y + pad_y) * DETECT_INPUT + (x + pad_x)) as usize;
-        for c in 0..3 {
-            out[c * plane + at] = px[c] as f32 / 255.0;
+    // A row at a time: a pixel's place in the padded frame
+    // needs no division.
+    let (edge, width) = (DETECT_INPUT as usize, nw as usize);
+    let (red, rest) = out.split_at_mut(plane);
+    let (green, blue) = rest.split_at_mut(plane);
+    let pixels = &resized.as_raw()[..width * nh as usize * 3];
+    for (y, row) in pixels.chunks_exact(width * 3).enumerate() {
+        let at = (y + pad_y as usize) * edge + pad_x as usize;
+        let (row, _) = row.as_chunks::<3>();
+        for (((px, r), g), b) in row
+            .iter()
+            .zip(&mut red[at..at + width])
+            .zip(&mut green[at..at + width])
+            .zip(&mut blue[at..at + width])
+        {
+            *r = px[0] as f32 / 255.0;
+            *g = px[1] as f32 / 255.0;
+            *b = px[2] as f32 / 255.0;
         }
     }
-    (out, scale, pad_x, pad_y)
+    (out, pad_x, pad_y)
 }
 
 /// Turn a YOLOv8-family output tensor into detections in
@@ -240,15 +322,41 @@ fn postprocess_detections(
         }
     };
     let mut found: Vec<Detection> = Vec::new();
-    for i in 0..n {
-        let (mut best_class, mut best_score) = (0usize, f32::MIN);
-        for (c, _) in classes.iter().enumerate() {
-            let score = at(i, 4 + c);
-            if score > best_score {
-                best_score = score;
-                best_class = c;
+    // The best class of every candidate. A channels-first
+    // output holds one row per class, so the scan goes row
+    // by row, front to back, instead of reading one value
+    // from each of the rows for a candidate: a candidate
+    // still meets its classes in order, so the same class
+    // and score win. A tensor shorter than its dims claim
+    // keeps the per-candidate scan, and fails where it did.
+    let whole = stride.checked_mul(n).is_some_and(|len| data.len() >= len);
+    let by_rows = (channels_first && whole).then(|| {
+        let mut best_class = vec![0u32; n];
+        let mut best_score = vec![f32::MIN; n];
+        for (c, row) in data[4 * n..stride * n].chunks_exact(n.max(1)).enumerate() {
+            for ((class, best), &score) in best_class.iter_mut().zip(&mut best_score).zip(row) {
+                let better = score > *best;
+                *class = if better { c as u32 } else { *class };
+                *best = if better { score } else { *best };
             }
         }
+        (best_class, best_score)
+    });
+    for i in 0..n {
+        let (best_class, best_score) = match &by_rows {
+            Some((class_of, score_of)) => (class_of[i] as usize, score_of[i]),
+            None => {
+                let (mut best_class, mut best_score) = (0usize, f32::MIN);
+                for (c, _) in classes.iter().enumerate() {
+                    let score = at(i, 4 + c);
+                    if score > best_score {
+                        best_score = score;
+                        best_class = c;
+                    }
+                }
+                (best_class, best_score)
+            }
+        };
         if best_score < threshold {
             continue;
         }

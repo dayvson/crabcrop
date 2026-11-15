@@ -1,5 +1,9 @@
 use super::*;
-use crate::ai::test_support::{OPAQUE16, expect_load, missing_path, rgba_halves, solid, temp_file};
+use crate::ai::test_support::{
+    OPAQUE16, expect_load, layouts, missing_path, noise_rgb, rgba_halves, snapshot, solid,
+    temp_file,
+};
+use image::Pixel;
 
 /// Real-model verification, run manually with the deployment
 /// artifacts in place:
@@ -282,4 +286,160 @@ fn upscale_load_non_upscaling_model_is_a_load_error() {
         message.contains("not an integer-factor super-resolution model"),
         "{message}"
     );
+}
+
+/// `upscale_at` as it was before issue #675: the input
+/// filled through an index computation with two clamps for
+/// every sample, and the output converted one sample at a
+/// time through `from_unit`, which is passed in because the
+/// 8-bit one rounded with `round` then.
+fn upscale_by_samples<S: Sample, O: TensorOutput>(
+    img: &DynamicImage,
+    run: impl FnOnce(Vec<f32>, [usize; 4]) -> Result<O, AiError>,
+    from_unit: impl Fn(f32) -> S,
+) -> Result<DynamicImage, AiError> {
+    let (w, h) = (img.width(), img.height());
+    let (pw, ph) = upscale_padded_dims(w, h);
+    let rgb = S::rgb(img);
+    let raw = rgb.as_raw();
+    let in_plane = pw as usize * ph as usize;
+    let mut input = vec![0f32; 3 * in_plane];
+    for y in 0..ph as usize {
+        let sy = y.min(h.saturating_sub(1) as usize);
+        for x in 0..pw as usize {
+            let sx = x.min(w.saturating_sub(1) as usize);
+            let src = (sy * w as usize + sx) * 3;
+            let dst = y * pw as usize + x;
+            for c in 0..3 {
+                input[c * in_plane + dst] = raw[src + c].to_unit();
+            }
+        }
+    }
+    let output = run(input, [1, 3, ph as usize, pw as usize])?;
+    let (shape, data) = output.f32_tensor()?;
+    if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
+        return Err(AiError::BadOutput(format!(
+            "unexpected model output shape: {shape:?}"
+        )));
+    }
+    let (ow, oh) = (shape[3] as u32, shape[2] as u32);
+    let plane = (ow as usize)
+        .checked_mul(oh as usize)
+        .ok_or_else(|| AiError::BadOutput(format!("model output shape overflows: {shape:?}")))?;
+    if data.len() < plane * 3 {
+        return Err(AiError::BadOutput(format!(
+            "model output has {} values, short of the {} its shape claims",
+            data.len(),
+            plane * 3
+        )));
+    }
+    let mut out = ImageBuffer::<S::Rgb, Vec<S>>::new(ow, oh);
+    for (i, px) in out.pixels_mut().enumerate() {
+        for (c, v) in px.channels_mut().iter_mut().enumerate() {
+            *v = from_unit(data[c * plane + i]);
+        }
+    }
+    if (pw, ph) != (w, h) {
+        let f = if pw > 0 && ph > 0 && ow % pw == 0 && oh % ph == 0 && ow / pw == oh / ph {
+            ow / pw
+        } else {
+            0
+        };
+        let (Some(crop_w), Some(crop_h)) = (w.checked_mul(f), h.checked_mul(f)) else {
+            return Err(AiError::BadOutput(format!(
+                "unexpected model output shape for a padded input: {shape:?}"
+            )));
+        };
+        if f < 1 || crop_w > ow || crop_h > oh {
+            return Err(AiError::BadOutput(format!(
+                "unexpected model output shape for a padded input: {shape:?}"
+            )));
+        }
+        out = image::imageops::crop_imm(&out, 0, 0, crop_w, crop_h).to_image();
+    }
+    Ok(with_source_alpha(img, out))
+}
+
+/// [`upscale_by_samples`] at the image's depth, as
+/// `upscale_with` dispatches.
+fn upscale_with_by_samples<O: TensorOutput>(
+    img: &DynamicImage,
+    run: impl FnOnce(Vec<f32>, [usize; 4]) -> Result<O, AiError>,
+) -> Result<DynamicImage, AiError> {
+    match SampleDepth::of(img) {
+        SampleDepth::Eight => {
+            upscale_by_samples::<u8, O>(img, run, |v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+        }
+        SampleDepth::Sixteen => upscale_by_samples::<u16, O>(img, run, u16::from_unit),
+        SampleDepth::Float => upscale_by_samples::<f32, O>(img, run, f32::from_unit),
+    }
+}
+
+/// A fake 2x model whose output depends on its whole input
+/// and leaves the 0..1 range: the nearest-neighbor
+/// enlargement, stretched and shifted per channel, with a
+/// NaN, an infinity and exact half levels planted.
+fn fake_sr_x2_wild(input: Vec<f32>, dims: [usize; 4]) -> Result<(Vec<i64>, Vec<f32>), AiError> {
+    let (shape, mut out) = fake_sr_x2(input, dims)?;
+    let plane = out.len() / 3;
+    for (i, v) in out.iter_mut().enumerate() {
+        let c = i / plane.max(1);
+        *v = *v * (1.3 - 0.2 * c as f32) - 0.1 + ((i % 7) as f32) * 0.011;
+        match i % 211 {
+            0 => *v = f32::NAN,
+            1 => *v = f32::INFINITY,
+            2 => *v = f32::NEG_INFINITY,
+            3 => *v = ((i % 255) as f32 + 0.5) / 255.0,
+            _ => {}
+        }
+    }
+    Ok((shape, out))
+}
+
+#[test]
+fn upscale_matches_the_per_sample_form() {
+    // Issue #675: the input is filled a row at a time and
+    // the output converted a block of a plane at a time.
+    // The result is the per-sample form's, for every layout
+    // and depth, at sizes on the 8-pixel grid and off it
+    // (padded, then cropped), down to one pixel.
+    for (w, h) in [(16, 16), (8, 24), (13, 7), (20, 12), (1, 1), (9, 300)] {
+        let rgb = noise_rgb(w, h, w * 19 + h);
+        for (layout, img) in layouts(&rgb) {
+            for model in [fake_sr_x2, fake_sr_x2_wild] {
+                let got = upscale_with(&img, model).unwrap();
+                let want = upscale_with_by_samples(&img, model).unwrap();
+                assert_eq!(snapshot(&got), snapshot(&want), "{layout} {w}x{h}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_model_input_is_the_per_sample_one_bit_for_bit() {
+    // The tensor the model is handed, padding included, for
+    // every depth: the fake model hands its input back.
+    for (w, h) in [(16, 8), (13, 7), (1, 1), (3, 21)] {
+        let rgb = noise_rgb(w, h, w * 23 + h);
+        for (layout, img) in layouts(&rgb) {
+            let seen = std::cell::RefCell::new((Vec::new(), [0usize; 4]));
+            let record = |input: Vec<f32>, dims: [usize; 4]| {
+                *seen.borrow_mut() = (input.clone(), dims);
+                fake_sr_x2(input, dims)
+            };
+            upscale_with(&img, record).unwrap();
+            let got = seen.replace((Vec::new(), [0; 4]));
+            upscale_with_by_samples(&img, record).unwrap();
+            let want = seen.replace((Vec::new(), [0; 4]));
+            assert_eq!(got.1, want.1, "{layout} {w}x{h}");
+            assert_eq!(got.0.len(), want.0.len(), "{layout} {w}x{h}");
+            assert!(
+                got.0
+                    .iter()
+                    .zip(&want.0)
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "{layout} {w}x{h}"
+            );
+        }
+    }
 }

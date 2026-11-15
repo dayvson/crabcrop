@@ -1,5 +1,6 @@
 use super::*;
 use crate::ai::env_or_skip;
+use crate::ai::test_support::{noise_rgb, opaque_rgba, same_bits};
 use crate::test_support::{ScratchDir, scratch_dir};
 
 /// Write bytes to a fresh temp file and return the
@@ -361,4 +362,18 @@ fn ocr_load_missing_model_file_is_a_load_error() {
         "en",
     ));
     assert!(message.contains("cannot load the model"), "{message}");
+}
+
+#[test]
+fn ocr_det_preprocess_reads_an_rgb8_frame_in_place_to_the_same_tensor() {
+    // Issue #672: an RGB8 frame is resized from where it
+    // is. The tensor and its size are the ones the same
+    // colors give in a layout that is converted first.
+    for (w, h) in [(1301, 517), (301, 200), (5, 3), (1, 1)] {
+        let rgb = noise_rgb(w, h, w * 9 + h);
+        let (borrowed, rw, rh) = ocr_det_preprocess(&DynamicImage::ImageRgb8(rgb.clone()));
+        let (converted, rw2, rh2) = ocr_det_preprocess(&opaque_rgba(&rgb));
+        assert!(same_bits(&borrowed, &converted), "{w}x{h}");
+        assert_eq!((rw, rh), (rw2, rh2), "{w}x{h}");
+    }
 }
