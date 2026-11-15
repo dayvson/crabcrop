@@ -166,7 +166,8 @@ pub(super) fn collect_outputs(
 }
 
 /// A session's first output, owned: the single-output models
-/// (upscale, inpainting) read their result from it.
+/// (upscale, inpainting) and the detector read their result
+/// from it.
 pub(super) fn first_output(
     outputs: ort::session::SessionOutputs<'_>,
 ) -> Result<ort::value::DynValue, AiError> {

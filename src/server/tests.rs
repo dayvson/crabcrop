@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 mod disk_hang;
 mod disk_stall;
+mod meta_frame;
 mod shared_state;
 
 const SECRET: &[u8] = b"test-secret";

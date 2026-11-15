@@ -475,3 +475,263 @@ fn letterbox_reads_an_rgb8_frame_in_place_to_the_same_tensor() {
         assert_eq!((scale, pad_x, pad_y), (scale2, pad_x2, pad_y2), "{w}x{h}");
     }
 }
+
+/// `letterbox` as it filled its tensor before issue #676: a
+/// division and a remainder place every pixel.
+fn letterbox_by_pixels(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = (DETECT_INPUT as f32 / w as f32).min(DETECT_INPUT as f32 / h as f32);
+    let nw = ((w as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
+    let nh = ((h as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
+    let resized = fir_resize(&img.to_rgb8(), nw, nh);
+    let pad_x = (DETECT_INPUT - nw) / 2;
+    let pad_y = (DETECT_INPUT - nh) / 2;
+    let plane = (DETECT_INPUT * DETECT_INPUT) as usize;
+    let mut out = vec![114f32 / 255.0; 3 * plane];
+    for (i, px) in resized.pixels().enumerate() {
+        let x = i as u32 % nw;
+        let y = i as u32 / nw;
+        let at = ((y + pad_y) * DETECT_INPUT + (x + pad_x)) as usize;
+        for c in 0..3 {
+            out[c * plane + at] = px[c] as f32 / 255.0;
+        }
+    }
+    (out, scale, pad_x, pad_y)
+}
+
+#[test]
+fn letterbox_fills_by_rows_to_the_per_pixel_tensor() {
+    // Issue #676: the tensor, the scale and the padding are
+    // the ones the per-pixel fill gave: wide, tall, square,
+    // upscaled, a sliver either way, and one pixel.
+    for (w, h) in [
+        (810, 540),
+        (301, 517),
+        (640, 640),
+        (64, 64),
+        (5, 3),
+        (2000, 3),
+        (3, 2000),
+        (1, 1),
+    ] {
+        let img = DynamicImage::ImageRgb8(noise_rgb(w, h, w * 29 + h));
+        let (got, scale, pad_x, pad_y) = letterbox(&img);
+        let (want, want_scale, want_pad_x, want_pad_y) = letterbox_by_pixels(&img);
+        assert!(same_bits(&got, &want), "{w}x{h}");
+        assert_eq!(scale.to_bits(), want_scale.to_bits(), "{w}x{h}");
+        assert_eq!((pad_x, pad_y), (want_pad_x, want_pad_y), "{w}x{h}");
+    }
+}
+
+/// `postprocess_detections` as it was before issue #676:
+/// the best class of a candidate found by reading one value
+/// from each class row, for both layouts.
+#[allow(clippy::too_many_arguments)]
+fn postprocess_by_candidates(
+    data: &[f32],
+    dims: &[i64],
+    classes: &[String],
+    threshold: f32,
+    img_w: u32,
+    img_h: u32,
+    scale: f32,
+    pad_x: u32,
+    pad_y: u32,
+) -> Result<Vec<Detection>, AiError> {
+    if dims.len() != 3 || dims[0] != 1 {
+        return Err(AiError::BadOutput(format!(
+            "expected a [1, 4+classes, N] output, got dims {dims:?}"
+        )));
+    }
+    let rows = (4 + classes.len()) as i64;
+    let channels_first = dims[1] == rows;
+    let transposed = dims[2] == rows;
+    if !channels_first && !transposed {
+        return Err(AiError::BadOutput(format!(
+            "expected a [1, 4+classes, N] output for {} classes, got dims {dims:?}",
+            classes.len()
+        )));
+    }
+    let n = if channels_first { dims[2] } else { dims[1] } as usize;
+    let stride = rows as usize;
+    let at = |candidate: usize, channel: usize| -> f32 {
+        if channels_first {
+            data[channel * n + candidate]
+        } else {
+            data[candidate * stride + channel]
+        }
+    };
+    let mut found: Vec<Detection> = Vec::new();
+    for i in 0..n {
+        let (mut best_class, mut best_score) = (0usize, f32::MIN);
+        for (c, _) in classes.iter().enumerate() {
+            let score = at(i, 4 + c);
+            if score > best_score {
+                best_score = score;
+                best_class = c;
+            }
+        }
+        if best_score < threshold {
+            continue;
+        }
+        let (cx, cy, bw, bh) = (at(i, 0), at(i, 1), at(i, 2), at(i, 3));
+        let x1 = ((cx - bw / 2.0) - pad_x as f32) / scale;
+        let y1 = ((cy - bh / 2.0) - pad_y as f32) / scale;
+        let x2 = ((cx + bw / 2.0) - pad_x as f32) / scale;
+        let y2 = ((cy + bh / 2.0) - pad_y as f32) / scale;
+        let x = x1.round().clamp(0.0, img_w as f32) as u32;
+        let y = y1.round().clamp(0.0, img_h as f32) as u32;
+        let x2 = x2.round().clamp(0.0, img_w as f32) as u32;
+        let y2 = y2.round().clamp(0.0, img_h as f32) as u32;
+        if x2 <= x || y2 <= y {
+            continue;
+        }
+        found.push(Detection {
+            label: classes[best_class].clone(),
+            score: (best_score * 1000.0).round() / 1000.0,
+            x,
+            y,
+            w: x2 - x,
+            h: y2 - y,
+        });
+    }
+    Ok(nms_detections(found))
+}
+
+/// A channels-first output of `n` candidates over seven
+/// classes: noisy scores and disjoint boxes, with the cases
+/// a scan order could settle differently planted in it.
+fn tricky_output(n: usize) -> (Vec<f32>, Vec<i64>, Vec<String>) {
+    let classes: Vec<String> = (0..7).map(|c| format!("class{c}")).collect();
+    let rows = 4 + classes.len();
+    let mut state = 0x9e37_79b9u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let mut data = vec![0f32; rows * n];
+    for i in 0..n {
+        // Boxes on a grid, 20 pixels a side, so that
+        // suppression does not hide a wrong class.
+        data[i] = 20.0 + (i % 20) as f32 * 30.0;
+        data[n + i] = 20.0 + (i / 20) as f32 * 30.0;
+        data[2 * n + i] = 20.0;
+        data[3 * n + i] = 20.0;
+        for c in 0..classes.len() {
+            data[(4 + c) * n + i] = next();
+        }
+    }
+    let mut plant = |i: usize, scores: [f32; 7]| {
+        for (c, score) in scores.into_iter().enumerate() {
+            data[(4 + c) * n + i] = score;
+        }
+    };
+    let nan = f32::NAN;
+    // Ties: the first of the equal classes wins.
+    plant(0, [0.9, 0.9, 0.1, 0.9, 0.2, 0.3, 0.9]);
+    plant(1, [0.1, 0.7, 0.7, 0.2, 0.7, 0.3, 0.1]);
+    plant(2, [0.8; 7]);
+    // A NaN never wins and never ends the scan.
+    plant(3, [nan, 0.6, nan, 0.95, nan, 0.1, 0.2]);
+    plant(4, [0.6, nan, 0.99, nan, 0.1, 0.2, nan]);
+    // Nothing but NaN: no class, no detection.
+    plant(5, [nan; 7]);
+    // The lowest scores there are: none passes the start.
+    plant(6, [f32::MIN; 7]);
+    plant(7, [f32::NEG_INFINITY; 7]);
+    // Infinity wins once, at its first class.
+    plant(8, [0.5, f32::INFINITY, 0.7, f32::INFINITY, 0.1, 0.2, 0.3]);
+    // The last class and the first.
+    plant(9, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.97]);
+    plant(10, [0.97, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]);
+    // Signed zeros compare equal: the first stays.
+    plant(11, [-0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0]);
+    (data, vec![1, rows as i64, n as i64], classes)
+}
+
+/// The same output with candidates as rows.
+fn transpose(data: &[f32], dims: &[i64]) -> (Vec<f32>, Vec<i64>) {
+    let (rows, n) = (dims[1] as usize, dims[2] as usize);
+    let mut out = vec![0f32; rows * n];
+    for r in 0..rows {
+        for i in 0..n {
+            out[i * rows + r] = data[r * n + i];
+        }
+    }
+    (out, vec![1, n as i64, rows as i64])
+}
+
+#[test]
+fn the_class_scan_by_rows_picks_what_the_scan_by_candidates_picked() {
+    // Issue #676: a channels-first output is scanned class
+    // row by class row. Every candidate still gets the
+    // class and score the per-candidate scan gave it, ties
+    // and NaN included, at every threshold; and a
+    // transposed output, which keeps the per-candidate
+    // scan, gives the same detections again.
+    for n in [12usize, 400] {
+        let (data, dims, classes) = tricky_output(n);
+        let (flipped, flipped_dims) = transpose(&data, &dims);
+        for threshold in [0.0, 0.25, 0.5, 0.9, 1.0, f32::MIN] {
+            let want =
+                postprocess_by_candidates(&data, &dims, &classes, threshold, 640, 640, 1.0, 0, 0)
+                    .unwrap();
+            let got =
+                postprocess_detections(&data, &dims, &classes, threshold, 640, 640, 1.0, 0, 0)
+                    .unwrap();
+            let label = format!("{n} candidates at {threshold}");
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{label}");
+            let got = postprocess_detections(
+                &flipped,
+                &flipped_dims,
+                &classes,
+                threshold,
+                640,
+                640,
+                1.0,
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{want:?}"),
+                "transposed, {label}"
+            );
+        }
+        // The planted cases decided what they should have.
+        let found =
+            postprocess_detections(&data, &dims, &classes, 0.5, 640, 640, 1.0, 0, 0).unwrap();
+        let label_at = |i: usize| {
+            let (x, y) = (10 + (i % 20) as u32 * 30, 10 + (i / 20) as u32 * 30);
+            found
+                .iter()
+                .find(|d| (d.x, d.y) == (x, y))
+                .map(|d| d.label.as_str())
+        };
+        assert_eq!(label_at(0), Some("class0"));
+        assert_eq!(label_at(1), Some("class1"));
+        assert_eq!(label_at(2), Some("class0"));
+        assert_eq!(label_at(3), Some("class3"));
+        assert_eq!(label_at(4), Some("class2"));
+        assert_eq!(label_at(5), None);
+        assert_eq!(label_at(6), None);
+        assert_eq!(label_at(7), None);
+        assert_eq!(label_at(8), Some("class1"));
+        assert_eq!(label_at(9), Some("class6"));
+        assert_eq!(label_at(10), Some("class0"));
+        assert_eq!(label_at(11), None);
+    }
+    // No classes at all, and no candidates.
+    let none: Vec<String> = Vec::new();
+    for (data, dims) in [
+        (vec![1.0f32; 4 * 3], vec![1, 4, 3]),
+        (Vec::new(), vec![1, 4, 0]),
+    ] {
+        let want = postprocess_by_candidates(&data, &dims, &none, 0.5, 64, 64, 1.0, 0, 0).unwrap();
+        let got = postprocess_detections(&data, &dims, &none, 0.5, 64, 64, 1.0, 0, 0).unwrap();
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+    }
+}

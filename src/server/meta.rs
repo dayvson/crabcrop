@@ -221,6 +221,69 @@ pub(in crate::server) fn compose_annotation(
     }
 }
 
+/// Where an annotation section gets the render's pixels.
+pub(in crate::server) trait FrameSource {
+    /// The decoded render, or `None` when it does not
+    /// decode.
+    fn frame(&self) -> Option<Arc<image::DynamicImage>>;
+}
+
+/// A render on its own, decoded again for every section
+/// that asks: what each section did before the document
+/// shared a frame. The tests hold the shared frame to it.
+#[cfg(test)]
+impl FrameSource for crate::engine::ProcessedImage {
+    fn frame(&self) -> Option<Arc<image::DynamicImage>> {
+        crate::engine::decode_image(&self.bytes).ok().map(Arc::new)
+    }
+}
+
+/// The render as the annotation sections of one meta
+/// document read it (issue #676): decoded by the first
+/// section that needs pixels and shared by the sections
+/// after it, where each used to decode the bytes for
+/// itself. The sections run one after the other and only
+/// read the frame, so each sees the pixels it would have
+/// decoded. One decoded frame is alive at a time, as
+/// before: it is now the same one from the first section
+/// to the last. A render that does not decode is not
+/// remembered: every section that asks tries for itself and
+/// reports its own failure, as it always did.
+pub(in crate::server) struct DocumentFrame<'a> {
+    bytes: &'a [u8],
+    decode: fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>,
+    decoded: std::sync::OnceLock<Arc<image::DynamicImage>>,
+}
+
+impl<'a> DocumentFrame<'a> {
+    pub(in crate::server) fn new(processed: &'a crate::engine::ProcessedImage) -> Self {
+        Self::with_decoder(processed, crate::engine::decode_image)
+    }
+
+    /// A frame decoded by `decode`: the engine's decoder in
+    /// production, a counting one in the tests.
+    pub(in crate::server) fn with_decoder(
+        processed: &'a crate::engine::ProcessedImage,
+        decode: fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>,
+    ) -> Self {
+        Self {
+            bytes: &processed.bytes,
+            decode,
+            decoded: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl FrameSource for DocumentFrame<'_> {
+    fn frame(&self) -> Option<Arc<image::DynamicImage>> {
+        if let Some(frame) = self.decoded.get() {
+            return Some(frame.clone());
+        }
+        let frame = Arc::new((self.decode)(self.bytes).ok()?);
+        Some(self.decoded.get_or_init(|| frame).clone())
+    }
+}
+
 /// Annotate a processed image for a meta response, when a
 /// tag provider is configured. Bounded by the AI gate like
 /// every other inference; any failure (gate busy, decode,
@@ -233,7 +296,7 @@ pub(in crate::server) fn compose_annotation(
 /// sections run.
 pub(in crate::server) async fn annotate_meta(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    render: &impl FrameSource,
 ) -> Option<Annotation> {
     let tagger = state.providers.tagger.as_ref()?;
     // The permit moves into the blocking task below and
@@ -248,7 +311,7 @@ pub(in crate::server) async fn annotate_meta(
         .await
         .ok()?
         .ok()?;
-    let img = crate::engine::decode_image(&processed.bytes).ok()?;
+    let img = render.frame()?;
     let tagger = tagger.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -286,7 +349,7 @@ pub(in crate::server) async fn annotate_meta(
 /// least one configured provider answered.
 pub(in crate::server) async fn detect_meta(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    render: &impl FrameSource,
 ) -> Option<Vec<(String, crate::ai::Detection)>> {
     let mut providers: Vec<(String, Arc<dyn crate::ai::DetectionProvider>)> = Vec::new();
     if let Some(detector) = &state.providers.detect {
@@ -310,11 +373,12 @@ pub(in crate::server) async fn detect_meta(
             .ok()?
             .ok()?,
     );
-    let img = crate::engine::decode_image(&processed.bytes).ok()?;
+    let img = render.frame()?;
     let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
     let mut any_answered = false;
     for (name, provider) in providers {
-        let provider_img = img.clone();
+        // Every provider reads the one frame.
+        let provider_img = Arc::clone(&img);
         let task_permit = permit.clone();
         match tokio::task::spawn_blocking(move || {
             let _permit = task_permit;
@@ -405,7 +469,7 @@ pub(in crate::server) fn compose_moderation(
 /// because the client asked for the field by name.
 pub(in crate::server) async fn moderate_meta(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    render: &impl FrameSource,
 ) -> ModerationMeta {
     let Some(provider) = state.providers.moderation.as_ref() else {
         return ModerationMeta::Unavailable("not_configured");
@@ -418,9 +482,8 @@ pub(in crate::server) async fn moderate_meta(
             Ok(Ok(permit)) => permit,
             _ => return ModerationMeta::Unavailable("busy"),
         };
-    let img = match crate::engine::decode_image(&processed.bytes) {
-        Ok(img) => img,
-        Err(_) => return ModerationMeta::Unavailable("inference_failed"),
+    let Some(img) = render.frame() else {
+        return ModerationMeta::Unavailable("inference_failed");
     };
     let provider = provider.clone();
     match tokio::task::spawn_blocking(move || {
@@ -587,7 +650,7 @@ pub enum EmbeddingMeta {
 /// the vector).
 pub(in crate::server) async fn embed_meta(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    render: &impl FrameSource,
 ) -> EmbeddingMeta {
     let Some(provider) = state.providers.embeddings.as_ref() else {
         return EmbeddingMeta::Unavailable("not_configured");
@@ -600,9 +663,8 @@ pub(in crate::server) async fn embed_meta(
             Ok(Ok(permit)) => permit,
             _ => return EmbeddingMeta::Unavailable("busy"),
         };
-    let img = match crate::engine::decode_image(&processed.bytes) {
-        Ok(img) => img,
-        Err(_) => return EmbeddingMeta::Unavailable("inference_failed"),
+    let Some(img) = render.frame() else {
+        return EmbeddingMeta::Unavailable("inference_failed");
     };
     let provider = provider.clone();
     match tokio::task::spawn_blocking(move || {
@@ -673,7 +735,7 @@ fn compose_ocr(report: &crate::ai::OcrReport) -> crate::ai::OcrReport {
 /// field by name.
 pub(in crate::server) async fn ocr_meta(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    render: &impl FrameSource,
     deadline: Instant,
 ) -> OcrMeta {
     let Some(provider) = state.providers.ocr.as_ref() else {
@@ -687,9 +749,8 @@ pub(in crate::server) async fn ocr_meta(
             Ok(Ok(permit)) => permit,
             _ => return OcrMeta::Unavailable("busy"),
         };
-    let img = match crate::engine::decode_image(&processed.bytes) {
-        Ok(img) => img,
-        Err(_) => return OcrMeta::Unavailable("inference_failed"),
+    let Some(img) = render.frame() else {
+        return OcrMeta::Unavailable("inference_failed");
     };
     let provider = provider.clone();
     match tokio::task::spawn_blocking(move || {

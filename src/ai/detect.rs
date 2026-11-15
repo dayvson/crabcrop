@@ -6,7 +6,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::clip::read_labels;
-use super::session::{build_session, collect_outputs, fir_resize, rgb8_view};
+use super::session::{TensorOutput, build_session, fir_resize, first_output, rgb8_view};
 use super::{AiError, Detection, DetectionProvider};
 
 /// The detector's fixed input edge (YOLO letterbox).
@@ -121,14 +121,20 @@ impl DetectionProvider for OnnxDetectionProvider {
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
-        let outputs = collect_outputs(outputs)?;
-        let (_, dims, data) = outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
+        // Only the first output is read, and in place: it
+        // is 2.8 MB for an 80-class export. The others are
+        // still checked to be float tensors, as collecting
+        // them all checked.
+        for value in outputs.values() {
+            value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
+        }
+        let first = first_output(outputs)?;
+        let (dims, data) = first.f32_tensor()?;
         postprocess_detections(
-            &data,
-            &dims,
+            data,
+            dims,
             &self.classes,
             self.threshold,
             img.width(),
@@ -188,12 +194,24 @@ fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
     let pad_y = (DETECT_INPUT - nh) / 2;
     let plane = (DETECT_INPUT * DETECT_INPUT) as usize;
     let mut out = vec![114f32 / 255.0; 3 * plane];
-    for (i, px) in resized.pixels().enumerate() {
-        let x = i as u32 % nw;
-        let y = i as u32 / nw;
-        let at = ((y + pad_y) * DETECT_INPUT + (x + pad_x)) as usize;
-        for c in 0..3 {
-            out[c * plane + at] = px[c] as f32 / 255.0;
+    // A row at a time: a pixel's place in the padded frame
+    // needs no division.
+    let (edge, width) = (DETECT_INPUT as usize, nw as usize);
+    let (red, rest) = out.split_at_mut(plane);
+    let (green, blue) = rest.split_at_mut(plane);
+    let pixels = &resized.as_raw()[..width * nh as usize * 3];
+    for (y, row) in pixels.chunks_exact(width * 3).enumerate() {
+        let at = (y + pad_y as usize) * edge + pad_x as usize;
+        let (row, _) = row.as_chunks::<3>();
+        for (((px, r), g), b) in row
+            .iter()
+            .zip(&mut red[at..at + width])
+            .zip(&mut green[at..at + width])
+            .zip(&mut blue[at..at + width])
+        {
+            *r = px[0] as f32 / 255.0;
+            *g = px[1] as f32 / 255.0;
+            *b = px[2] as f32 / 255.0;
         }
     }
     (out, scale, pad_x, pad_y)
@@ -240,15 +258,41 @@ fn postprocess_detections(
         }
     };
     let mut found: Vec<Detection> = Vec::new();
-    for i in 0..n {
-        let (mut best_class, mut best_score) = (0usize, f32::MIN);
-        for (c, _) in classes.iter().enumerate() {
-            let score = at(i, 4 + c);
-            if score > best_score {
-                best_score = score;
-                best_class = c;
+    // The best class of every candidate. A channels-first
+    // output holds one row per class, so the scan goes row
+    // by row, front to back, instead of reading one value
+    // from each of the rows for a candidate: a candidate
+    // still meets its classes in order, so the same class
+    // and score win. A tensor shorter than its dims claim
+    // keeps the per-candidate scan, and fails where it did.
+    let whole = stride.checked_mul(n).is_some_and(|len| data.len() >= len);
+    let by_rows = (channels_first && whole).then(|| {
+        let mut best_class = vec![0u32; n];
+        let mut best_score = vec![f32::MIN; n];
+        for (c, row) in data[4 * n..stride * n].chunks_exact(n.max(1)).enumerate() {
+            for ((class, best), &score) in best_class.iter_mut().zip(&mut best_score).zip(row) {
+                let better = score > *best;
+                *class = if better { c as u32 } else { *class };
+                *best = if better { score } else { *best };
             }
         }
+        (best_class, best_score)
+    });
+    for i in 0..n {
+        let (best_class, best_score) = match &by_rows {
+            Some((class_of, score_of)) => (class_of[i] as usize, score_of[i]),
+            None => {
+                let (mut best_class, mut best_score) = (0usize, f32::MIN);
+                for (c, _) in classes.iter().enumerate() {
+                    let score = at(i, 4 + c);
+                    if score > best_score {
+                        best_score = score;
+                        best_class = c;
+                    }
+                }
+                (best_class, best_score)
+            }
+        };
         if best_score < threshold {
             continue;
         }

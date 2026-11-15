@@ -5354,6 +5354,20 @@ async fn meta_document(
     sealed: bool,
     accept: Option<&str>,
 ) -> Response {
+    let frame = DocumentFrame::new(processed);
+    meta_document_from(state, processed, frame, sealed, accept).await
+}
+
+/// [`meta_document`] on the frame its sections share: the
+/// render is decoded once for all of them (issue #676), by
+/// the first that needs pixels.
+async fn meta_document_from(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    frame: impl FrameSource,
+    sealed: bool,
+    accept: Option<&str>,
+) -> Response {
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a
     // section that has not answered when it passes is
@@ -5367,7 +5381,7 @@ async fn meta_document(
     let annotation_deadline = Instant::now() + state.process_timeout;
     let annotation = tokio::time::timeout_at(
         tokio::time::Instant::from_std(annotation_deadline),
-        annotate_meta(state, processed),
+        annotate_meta(state, &frame),
     )
     .await
     .ok()
@@ -5375,7 +5389,7 @@ async fn meta_document(
     let detections = if wants_detections(accept) {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            detect_meta(state, processed),
+            detect_meta(state, &frame),
         )
         .await
         .ok()
@@ -5387,7 +5401,7 @@ async fn meta_document(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                moderate_meta(state, processed),
+                moderate_meta(state, &frame),
             )
             .await
             {
@@ -5407,7 +5421,7 @@ async fn meta_document(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                embed_meta(state, processed),
+                embed_meta(state, &frame),
             )
             .await
             {
@@ -5423,7 +5437,7 @@ async fn meta_document(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                ocr_meta(state, processed, annotation_deadline),
+                ocr_meta(state, &frame, annotation_deadline),
             )
             .await
             {
@@ -5434,6 +5448,8 @@ async fn meta_document(
     } else {
         None
     };
+    // The sections are done with the pixels.
+    drop(frame);
     meta_response(
         processed,
         sealed,
@@ -5512,12 +5528,12 @@ pub(in crate::server) use meta::{
     f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json, pack_embedding, score_list,
     segments_json, studio_json,
 };
-pub use meta::{EmbeddingMeta, ModerationMeta, OcrMeta};
 pub(in crate::server) use meta::{
-    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_cache_headers, meta_response,
-    moderate_meta, ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation,
-    wants_ocr, wants_placeholders,
+    DocumentFrame, FrameSource, annotate_meta, compose_aesthetic, detect_meta, embed_meta,
+    meta_cache_headers, meta_response, moderate_meta, ocr_meta, wants_detections, wants_embeddings,
+    wants_meta, wants_moderation, wants_ocr, wants_placeholders,
 };
+pub use meta::{EmbeddingMeta, ModerationMeta, OcrMeta};
 
 /// Build a successful image response: content type, cache
 /// headers, and the auto-quality header when quality was chosen.
