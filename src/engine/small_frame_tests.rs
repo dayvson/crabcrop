@@ -174,7 +174,7 @@ fn tolerance(format: StillFormat, quality: Option<u8>) -> Option<(f64, f64)> {
         StillFormat::Jpeg => (0.0, 26.0),
         StillFormat::WebP if quality >= 100 => (0.0, 0.0),
         StillFormat::WebP => (0.0, 5.0),
-        StillFormat::Avif => (6.0, 12.0),
+        StillFormat::Avif => (10.0, 9.0),
         StillFormat::Jxl => match quality {
             100.. => (1.0, 2.0),
             95..=99 => (4.0, 6.0),
