@@ -259,14 +259,8 @@ pub(in crate::engine) fn encode(
         StillFormat::Jpeg => {
             // JPEG has no alpha channel. A fill color composites
             // transparency over that background; without one, the
-            // stored RGB values are used as-is. Encoding uses the
-            // jpeg-encoder crate with 4:2:0 chroma subsampling
-            // (the image crate's vendored encoder is fixed at
-            // 4:2:2, and its quality scale runs hot compared to
-            // libjpeg). Optimized Huffman tables stay OFF:
-            // jpeg-encoder's optimized tables for degenerate
-            // (tiny, flat) inputs produce files zune-jpeg decodes
-            // incorrectly, an interop hazard measured in #38.
+            // stored RGB values are used as-is. libjpeg-turbo
+            // writes the file (see `encode_jpeg`).
             let flattened;
             let rgb: &image::RgbImage = match fill {
                 Some(bg) if img.color().has_alpha() => {
@@ -280,24 +274,7 @@ pub(in crate::engine) fn encode(
                     "jpeg: dimension exceeds the 65535 format limit".into(),
                 ));
             }
-            let mut enc = jpeg_encoder::Encoder::new(&mut buf, quality.unwrap_or(80));
-            enc.set_sampling_factor(match format_options.jpeg_subsampling {
-                Some(Subsampling::S444) => jpeg_encoder::SamplingFactor::F_1_1,
-                Some(Subsampling::S422) => jpeg_encoder::SamplingFactor::F_2_1,
-                // The standing behavior: 4:2:0, also what an
-                // explicit subsampling:420 spells.
-                Some(Subsampling::S420) | None => jpeg_encoder::SamplingFactor::F_2_2,
-            });
-            if format_options.jpeg_progressive {
-                enc.set_progressive(true);
-            }
-            enc.encode(
-                rgb.as_raw(),
-                w as u16,
-                h as u16,
-                jpeg_encoder::ColorType::Rgb,
-            )
-            .map_err(|e| EngineError::Encode(e.to_string()))?;
+            return encode_jpeg(rgb, quality.unwrap_or(80), format_options);
         }
         StillFormat::Png => {
             if let Some(max_colors) = palette {
@@ -718,4 +695,74 @@ fn encode_webp(
         .encode_advanced(&config)
         .map_err(|e| EngineError::Encode(format!("webp: {e:?}")))?;
     Ok(encoded.to_vec())
+}
+
+/// Encode JPEG with libjpeg-turbo, through the `turbojpeg`
+/// crate (issue #668): three components (Y, Cb, Cr) from
+/// 8-bit RGB, behind a JFIF header, as every JPEG this
+/// engine has written.
+///
+/// - `quality` is libjpeg's 1 to 100 scale: the Annex K
+///   tables scaled as `jpeg_set_quality` scales them and held
+///   to 8 bits, which are the tables the encoder before this
+///   one wrote for the same number. A value outside the range
+///   is brought into it, as that encoder did.
+/// - Chroma is subsampled 4:2:0 unless the request names
+///   4:2:2 or 4:4:4. Where it is subsampled, each chroma
+///   sample is the average of the pixels it stands for. The
+///   encoder before this one kept one of them and dropped the
+///   rest, which aliased color edges.
+/// - Baseline output carries the standard Huffman tables.
+///   Progressive output cannot: libjpeg builds tables from the
+///   image for every progressive file. The encoder before
+///   this one could build such tables too, and for tiny and
+///   flat images it wrote files that zune-jpeg, the decoder
+///   this engine reads JPEG with, decoded to the wrong colors
+///   (issue #38), which is why they stayed off. libjpeg's own
+///   are read back correctly: the tests decode tiny and flat
+///   images, baseline and progressive, at every subsampling.
+/// - The DCT is libjpeg's accurate integer one, the library's
+///   default, which the `turbojpeg` crate has no switch to
+///   change. The color conversion, the chroma averaging and
+///   the quantization are integer arithmetic too, and the
+///   library's C code and its SSE2, AVX2 and Neon code
+///   compute all of them to the same values. So the bytes do
+///   not depend on the CPU or the architecture: the tests pin
+///   them, and compare the vector code with the plain C code.
+///
+/// libjpeg takes no side past 65,500 pixels, a little under
+/// the format's 65,535 that the caller holds the image to. No
+/// output comes near either (see `check_final_output`); a
+/// side between them is the library's error, returned here.
+fn encode_jpeg(
+    rgb: &image::RgbImage,
+    quality: u8,
+    format_options: FormatOptions,
+) -> Result<Vec<u8>, EngineError> {
+    let failed = |e: turbojpeg::Error| EngineError::Encode(format!("jpeg: {e}"));
+    let mut compressor = turbojpeg::Compressor::new().map_err(failed)?;
+    compressor
+        .set_quality(i32::from(quality.clamp(1, 100)))
+        .map_err(failed)?;
+    compressor
+        .set_subsamp(match format_options.jpeg_subsampling {
+            Some(Subsampling::S444) => turbojpeg::Subsamp::None,
+            Some(Subsampling::S422) => turbojpeg::Subsamp::Sub2x1,
+            // The standing behavior: 4:2:0, also what an
+            // explicit subsampling:420 spells.
+            Some(Subsampling::S420) | None => turbojpeg::Subsamp::Sub2x2,
+        })
+        .map_err(failed)?;
+    compressor
+        .set_progressive(format_options.jpeg_progressive)
+        .map_err(failed)?;
+    let (width, height) = (rgb.width() as usize, rgb.height() as usize);
+    let image = turbojpeg::Image {
+        pixels: rgb.as_raw().as_slice(),
+        width,
+        pitch: width * 3,
+        height,
+        format: turbojpeg::PixelFormat::RGB,
+    };
+    compressor.compress_to_vec(image).map_err(failed)
 }

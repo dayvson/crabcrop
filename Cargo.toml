@@ -52,7 +52,6 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 # bit between glibc and Apple). Already in the tree via image deps.
 libm = "0.2"
 jixel = "0.5"
-jpeg-encoder = { version = "0.7", features = ["simd"] }
 # Default features off (issue #466): the defaults compile
 # ndarray (unused: tensors go in as shape-and-slice pairs)
 # and download-binaries with tls-native, which made OpenSSL
@@ -123,6 +122,21 @@ image = { version = "0.25", default-features = false, features = ["avif", "bmp",
 # so no system package or runtime library is involved.
 zune-jpeg = "0.5"
 zune-core = "0.5"
+# JPEG output is written by libjpeg-turbo (issue #668): about
+# three times faster than the pure-Rust encoder it replaced,
+# and it averages the chroma it subsamples where that encoder
+# kept one sample in two or four. turbojpeg-sys compiles its
+# vendored libjpeg-turbo 3.1.0 with cmake and links it
+# statically, so no system package or runtime library is
+# involved, and its bindings are pregenerated, so no bindgen
+# runs. Default features off: `pkg-config` would let a build
+# pick up a system libturbojpeg instead. `cmake` is the
+# vendored build; `require-simd` fails the build where the
+# library's assembly cannot be built (on x86_64 that needs
+# nasm, as the AVIF encoder does) rather than shipping its
+# plain C paths, which write the same bytes several times
+# slower. The unsafe calls stay inside the turbojpeg crate.
+turbojpeg = { version = "1.5", default-features = false, features = ["cmake", "require-simd"] }
 webp = "0.3"
 # GIF writes go through the gif crate directly (already in the
 # tree transitively via image) so quantization can swap from
