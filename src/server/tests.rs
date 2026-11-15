@@ -13002,11 +13002,10 @@ async fn bursts_of_identical_misses_under_load_share_their_flights() {
     // between its lookup's miss and its claim for as long
     // as the whole flight lasts; it then leads a second
     // one. That takes a worker thread losing its core at
-    // that moment. With the machine to itself this server
-    // does it in none of 20,000 bursts, before and after the
-    // change; on a busy machine a few in a thousand can.
-    // More than one burst in twenty is a flight that does
-    // not share.
+    // that moment. With the machine to itself, a release
+    // build fetched twice in none of 61,200 such bursts; on
+    // a busy machine a few in a thousand can. More than one
+    // burst in twenty is a flight that does not share.
     const BURSTS: usize = 400;
     const FAN: usize = 8;
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
