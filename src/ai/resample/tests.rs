@@ -24,20 +24,21 @@ fn crate_filter(kernel: Kernel) -> FilterType {
 
 const KERNELS: [Kernel; 2] = [Kernel::Triangle, Kernel::CatmullRom];
 
-/// Whether a case runs with `kernel`. The two kernels differ
-/// in their weights and nothing else, so the largest frames,
-/// which are most of the suite's time in a debug build, run
-/// with the kernel whose caller reaches them: the 224-crop's
-/// CatmullRom.
-fn in_scope(kernel: Kernel, (sw, sh): (u32, u32), (dw, dh): (u32, u32)) -> bool {
-    kernel == Kernel::CatmullRom || (sw * sh).max(dw * dh) <= 100_000
+/// Whether a case is one of the largest frames. The image
+/// crate's resize of one takes most of a second in a debug
+/// build, and the kernels and layouts differ in nothing a
+/// smaller frame does not show, so these run once: with the
+/// kernel and the layout of the caller that reaches them,
+/// the 224-crop's CatmullRom on RGB.
+fn large((sw, sh): (u32, u32), (dw, dh): (u32, u32)) -> bool {
+    (sw * sh).max(dw * dh) > 100_000
 }
 
 /// Source and target sizes: one pixel either way, upscales,
 /// downscales, an unchanged size, exact halvings and
 /// doublings (whose sums land on half values), a long thin
 /// frame, and the sizes the callers reach.
-const SIZES: [((u32, u32), (u32, u32)); 17] = [
+const SIZES: [((u32, u32), (u32, u32)); 18] = [
     ((1, 1), (1, 1)),
     ((1, 1), (5, 3)),
     ((2, 3), (1, 1)),
@@ -50,6 +51,7 @@ const SIZES: [((u32, u32), (u32, u32)); 17] = [
     ((61, 97), (224, 31)),
     ((500, 3), (7, 300)),
     ((200, 150), (336, 224)),
+    ((400, 250), (168, 112)),
     ((413, 277), (512, 512)),
     ((512, 512), (360, 361)),
     ((800, 533), (336, 224)),
@@ -64,7 +66,8 @@ fn resize_matches_the_image_crate_byte_for_byte() {
     // back `None`: none does.
     for kernel in KERNELS {
         for ((sw, sh), (dw, dh)) in SIZES {
-            if !in_scope(kernel, (sw, sh), (dw, dh)) {
+            let large = large((sw, sh), (dw, dh));
+            if large && kernel != Kernel::CatmullRom {
                 continue;
             }
             let filter = crate_filter(kernel);
@@ -75,6 +78,9 @@ fn resize_matches_the_image_crate_byte_for_byte() {
                 Some(image::imageops::resize(&img, dw, dh, filter).into_raw()),
                 "RGB {sw}x{sh} to {dw}x{dh} with {kernel:?}"
             );
+            if large {
+                continue;
+            }
             let rgba = noise((sw * sh * 4) as usize, sw * 17 + sh);
             let img = image::RgbaImage::from_raw(sw, sh, rgba.clone()).unwrap();
             assert_eq!(
@@ -93,13 +99,17 @@ fn resize_matches_the_image_crate_byte_for_byte() {
     }
 }
 
+/// A source size, a target size, and a window of the target.
+type WindowCase = ((u32, u32), (u32, u32), (u32, u32, u32, u32));
+
 #[test]
 fn a_window_is_the_crop_of_the_full_resize() {
     // The 224-crop's windows (wide, tall, and at the long
     // side's cap), a window in a corner, one against the far
     // edges, a single sample, and a window of an unchanged
     // size.
-    let cases: [((u32, u32), (u32, u32), (u32, u32, u32, u32)); 8] = [
+    let cases: [WindowCase; 9] = [
+        ((300, 200), (336, 224), (56, 0, 224, 224)),
         ((800, 533), (336, 224), (56, 0, 224, 224)),
         ((533, 800), (224, 336), (0, 56, 224, 224)),
         ((100, 2000), (224, 4096), (0, 1936, 224, 224)),
@@ -111,7 +121,8 @@ fn a_window_is_the_crop_of_the_full_resize() {
     ];
     for kernel in KERNELS {
         for ((sw, sh), (dw, dh), window) in cases {
-            if !in_scope(kernel, (sw, sh), (dw, dh)) {
+            let large = large((sw, sh), (dw, dh));
+            if large && kernel != Kernel::CatmullRom {
                 continue;
             }
             let (wx, wy, ww, wh) = window;
@@ -127,6 +138,9 @@ fn a_window_is_the_crop_of_the_full_resize() {
                 ),
                 "RGB {sw}x{sh} to {dw}x{dh}, window {window:?}, {kernel:?}"
             );
+            if large {
+                continue;
+            }
             let rgba = noise((sw * sh * 4) as usize, sw * 3 + sh);
             let img = image::RgbaImage::from_raw(sw, sh, rgba.clone()).unwrap();
             let full = image::imageops::resize(&img, dw, dh, crate_filter(kernel));
@@ -213,18 +227,12 @@ fn what_the_module_cannot_read_is_left_to_the_caller() {
     );
 }
 
-/// The crate's conversion of a sum to a `u8`: its own clamp,
-/// `round`, and the checked cast, which refuses a NaN (the
-/// crate unwraps it; a bounded weighted sum of 8-bit samples
-/// is never one).
+/// The crate's conversion of a sum to a `u8`: its clamp,
+/// which like `f32::clamp` hands a NaN on, `round`, and the
+/// checked cast, which refuses a NaN (the crate unwraps it;
+/// a bounded weighted sum of 8-bit samples is never one).
 fn crate_to_u8(t: f32) -> Option<u8> {
-    let x = if t < 0.0 {
-        0.0
-    } else if t > 255.0 {
-        255.0
-    } else {
-        t
-    };
+    let x = t.clamp(0.0, 255.0);
     let rounded = x.round();
     (rounded > -1.0 && rounded < 256.0).then_some(rounded as u8)
 }

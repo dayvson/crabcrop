@@ -129,11 +129,9 @@ pub fn apply_mask(img: &DynamicImage, mask: &GrayImage) -> DynamicImage {
         // plane and one pass writes the result (issue #672).
         let pixels = rgb.width() as usize * rgb.height() as usize;
         let mut out = vec![0u8; pixels * 4];
-        for ((dst, src), m) in out
-            .chunks_exact_mut(4)
-            .zip(rgb.as_raw().chunks_exact(3))
-            .zip(mask.as_raw())
-        {
+        let (cut, _) = out.as_chunks_mut::<4>();
+        let (colors, _) = rgb.as_raw().as_chunks::<3>();
+        for ((dst, src), m) in cut.iter_mut().zip(colors).zip(mask.as_raw()) {
             dst[..3].copy_from_slice(src);
             dst[3] = *m;
         }

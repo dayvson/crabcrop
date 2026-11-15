@@ -155,7 +155,8 @@ fn face_tensor(small: &image::RgbImage) -> Vec<f32> {
     let mut input = vec![0f32; 3 * plane];
     let (blue, rest) = input.split_at_mut(plane);
     let (green, red) = rest.split_at_mut(plane);
-    for (((px, b), g), r) in small.as_raw().chunks_exact(3).zip(blue).zip(green).zip(red) {
+    let (pixels, _) = small.as_raw().as_chunks::<3>();
+    for (((px, b), g), r) in pixels.iter().zip(blue).zip(green).zip(red) {
         *b = f32::from(px[2]);
         *g = f32::from(px[1]);
         *r = f32::from(px[0]);

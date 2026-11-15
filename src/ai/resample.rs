@@ -139,13 +139,7 @@ fn axis_taps(src_len: u32, dst_len: u32, kernel: Kernel, from: u32, to: u32) -> 
 /// comparison and no call to `round`.
 #[inline]
 fn to_u8(t: f32) -> u8 {
-    let x = if t < 0.0 {
-        0.0
-    } else if t > 255.0 {
-        255.0
-    } else {
-        t
-    };
+    let x = t.clamp(0.0, 255.0);
     let whole = x as u8;
     whole + u8::from(x - f32::from(whole) >= 0.5)
 }
@@ -208,7 +202,7 @@ pub(crate) fn resize_window<const CH: usize>(
                 *a += f32::from(s) * w;
             }
         }
-        for (x, px) in out_row.chunks_exact_mut(CH).enumerate() {
+        for (x, px) in out_row.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
             let (first_col, weights) = cols.run(x);
             let at = (first_col - col_from) * CH;
             // Four lanes at once, whatever `CH` is: a lane past

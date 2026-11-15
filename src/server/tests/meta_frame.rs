@@ -6,10 +6,13 @@ use crate::ai::{
     DetectionProvider, EmbeddingProvider, ModerationProvider, OcrProvider, TagProvider,
 };
 
-/// The frames the providers were handed: who was called,
-/// where the frame was, and its size.
+/// One provider call: who was called, where the frame was,
+/// and its size.
+type Seen = (&'static str, usize, (u32, u32));
+
+/// The frames the providers were handed.
 #[derive(Debug, Clone, Default)]
-struct FrameLog(Arc<std::sync::Mutex<Vec<(&'static str, usize, (u32, u32))>>>);
+struct FrameLog(Arc<std::sync::Mutex<Vec<Seen>>>);
 
 impl FrameLog {
     fn note(&self, who: &'static str, img: &DynamicImage) {
@@ -20,7 +23,7 @@ impl FrameLog {
             .push((who, at, (img.width(), img.height())));
     }
 
-    fn take(&self) -> Vec<(&'static str, usize, (u32, u32))> {
+    fn take(&self) -> Vec<Seen> {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
 }

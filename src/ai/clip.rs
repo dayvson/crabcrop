@@ -352,9 +352,8 @@ fn crop224(img: &DynamicImage) -> image::RgbImage {
         DynamicImage::ImageRgba8(rgba) => {
             resample::resize_window::<4>(rgba.as_raw(), rgba.dimensions(), (nw, nh), kernel, window)
                 .map(|wide| {
-                    wide.chunks_exact(4)
-                        .flat_map(|px| [px[0], px[1], px[2]])
-                        .collect()
+                    let (pixels, _) = wide.as_chunks::<4>();
+                    pixels.iter().flat_map(|px| [px[0], px[1], px[2]]).collect()
                 })
         }
         _ => None,

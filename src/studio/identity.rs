@@ -543,13 +543,16 @@ fn the_shadow_matches_the_layer_and_overlay_form() {
     );
 }
 
+/// A piece's size, the subject box in it, and the canvas.
+type PlaceCase = ((u32, u32), (u32, u32, u32, u32), (u32, u32));
+
 #[test]
 fn place_matches_the_crate_resize() {
     // Pieces scaled up and down, a subject box that is the
     // whole piece and one that is a corner of it, at each
     // pad, and issue #243's piece, whose scale the bounds
     // hold down.
-    let cases: [((u32, u32), (u32, u32, u32, u32), (u32, u32)); 7] = [
+    let cases: [PlaceCase; 7] = [
         ((40, 30), (5, 4, 20, 15), (80, 60)),
         ((40, 30), (0, 0, 40, 30), (33, 57)),
         ((40, 30), (30, 20, 10, 10), (200, 120)),
