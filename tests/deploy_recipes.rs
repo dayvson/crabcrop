@@ -1149,6 +1149,30 @@ const DOCKERFILES: [&str; 3] = ["Dockerfile", "Dockerfile.release", "Dockerfile.
 const HEALTHCHECK: &str = r#"HEALTHCHECK --interval=30s --timeout=3s CMD ["crabcrop", "health"]"#;
 
 #[test]
+fn the_source_image_installs_what_the_build_needs() {
+    // Issue #668: the build compiles libjpeg-turbo from the
+    // sources its crate vendors, with cmake, and assembles
+    // its x86 code, like the AVIF encoder's, with nasm. The
+    // Rust base image carries neither. No CI job builds this
+    // image (the published ones package the release
+    // binaries), so a tool dropped from this list would
+    // first show when an operator builds the image.
+    let stages = stages(&read("Dockerfile"));
+    let builder = stages.first().expect("Dockerfile: a build stage");
+    assert!(builder[0].ends_with(" AS builder"), "{}", builder[0]);
+    let install = builder
+        .iter()
+        .find(|i| i.starts_with("RUN ") && i.contains("apt-get install"))
+        .expect("Dockerfile: the build stage installs its tools");
+    for tool in ["cmake", "nasm", "pkg-config", "libdav1d-dev"] {
+        assert!(
+            install.split_whitespace().any(|word| word == tool),
+            "Dockerfile: the build stage does not install {tool}: {install}"
+        );
+    }
+}
+
+#[test]
 fn images_run_as_a_numeric_user() {
     // Issue #592: the images said `USER nobody`. The kubelet
     // cannot check a user name against `runAsNonRoot`, so a
