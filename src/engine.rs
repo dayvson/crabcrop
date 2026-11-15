@@ -5480,13 +5480,13 @@ fn is_video_container(bytes: &[u8]) -> bool {
 mod encode;
 mod jpeg_scaled;
 mod webp_anim;
-/// Names the test module uses from encode: re-exported
-/// only for test builds, where they are used.
-#[cfg(test)]
-pub(in crate::engine) use encode::encode_png_indexed;
 pub(in crate::engine) use encode::{
     EncodeBuffers, StillFormat, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };
+/// Names the test module uses from encode: re-exported
+/// only for test builds, where they are used.
+#[cfg(test)]
+pub(in crate::engine) use encode::{encode_png_indexed, jxl_config};
 
 /// One channel of a blend mode: the CSS formulas on the
 /// 0-255 scale (`b` is the base channel, `o` the overlay's).
