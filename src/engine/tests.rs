@@ -843,6 +843,90 @@ fn keep_profile_converts_when_the_output_cannot_tag() {
 }
 
 #[test]
+fn a_source_tagged_srgb_renders_the_pixels_it_decodes_to() {
+    // Issue #662: an sRGB profile as cameras, phones and
+    // editors write it (here HP's sRGB IEC61966-2.1, from a
+    // corpus photo) is sRGB in effect, so the source is not
+    // converted: it renders the pixels it decodes to, where
+    // the conversion moved some of them by a level.
+    let icc = crate::color::extract_source_meta(
+        include_bytes!("../../tests/functional/corpus/person-fullbody.jpg"),
+        false,
+    )
+    .icc
+    .expect("the corpus photo embeds a profile");
+    assert_eq!(icc.len(), 3144);
+    let pixels = image::RgbImage::from_fn(64, 48, |x, y| {
+        image::Rgb([
+            (x * 37 + y * 11) as u8,
+            (x * 5 + y * 53) as u8,
+            (x * 101 + y * 7) as u8,
+        ])
+    });
+    let source = crate::color::inject_png(
+        &png_bytes(&DynamicImage::ImageRgb8(pixels.clone())),
+        Some(&icc),
+        &crate::color::SourceMeta::default(),
+        false,
+    );
+    let engine = Engine;
+    let out = engine
+        .process(
+            &source,
+            &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Png,
+            ))])],
+        )
+        .unwrap();
+    let rendered = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+    assert!(rendered == pixels, "the render is the source's own pixels");
+    // No profile goes out with them: they are sRGB.
+    assert!(
+        crate::color::extract_source_meta(&out.bytes, true)
+            .icc
+            .is_none()
+    );
+    // What the conversion would have done to this frame: it
+    // moves some samples, none by more than a level.
+    let mut converted = vec![0u8; pixels.as_raw().len()];
+    moxcms::ColorProfile::new_from_slice(&icc)
+        .unwrap()
+        .create_transform_8bit(
+            moxcms::Layout::Rgb,
+            &moxcms::ColorProfile::new_srgb(),
+            moxcms::Layout::Rgb,
+            moxcms::TransformOptions::default(),
+        )
+        .unwrap()
+        .transform(pixels.as_raw(), &mut converted)
+        .unwrap();
+    let moved = pixels
+        .as_raw()
+        .iter()
+        .zip(&converted)
+        .map(|(from, to)| from.abs_diff(*to));
+    assert!(moved.clone().any(|by| by == 1), "no sample would move");
+    assert!(moved.clone().all(|by| by <= 1));
+    // keep_profile is what it was: the same pixels, and the
+    // profile embedded.
+    let kept = engine
+        .process(
+            &source,
+            &[Operation::Filters(vec![
+                Filter::KeepProfile,
+                Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+            ])],
+        )
+        .unwrap();
+    let kept_pixels = image::load_from_memory(&kept.bytes).unwrap().to_rgb8();
+    assert!(kept_pixels == pixels);
+    assert_eq!(
+        crate::color::extract_source_meta(&kept.bytes, true).icc,
+        Some(icc)
+    );
+}
+
+#[test]
 fn a_cmyk_jpeg_converts_sanely() {
     // Saturated red in CMYK (no cyan, full magenta and
     // yellow, no black), written by the library the engine
