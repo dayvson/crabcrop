@@ -99,6 +99,60 @@ fn not_dumpable() {
     }
 }
 
+/// The block [`raise_malloc_thresholds`] takes and gives
+/// back: just under the 32 MiB that is the most glibc's
+/// malloc raises its mmap threshold to, so the block still
+/// counts once its header and page rounding are added.
+const MALLOC_THRESHOLD_BLOCK: usize = 32 * 1024 * 1024 - 64 * 1024;
+
+/// Put glibc's malloc where a long-running server ends up,
+/// before the first request (issue #690).
+///
+/// A render takes a few frame-sized blocks (the decoded
+/// source, the resizer's intermediate, the result) and
+/// frees them when it is done. glibc decides by two
+/// thresholds what that costs. A block at or over the mmap
+/// threshold is mapped from the kernel and unmapped when
+/// freed. Smaller blocks come from a heap, and once more
+/// than the trim threshold is free at the top of a heap,
+/// that memory goes back to the kernel. Both start low
+/// (128 KiB) and glibc raises them by itself: each time an
+/// mmapped block is freed, the mmap threshold becomes that
+/// block's size and the trim threshold twice that, up to
+/// 32 MiB and 64 MiB.
+///
+/// So a server that has only decoded 2400x1600 sources (an
+/// 11.5 MB block) trims at 23 MB. A render whose blocks
+/// total more than that, a resize to 1600 wide or a
+/// full-size rotation, hands them back at the end of every
+/// request and takes them from the kernel again at the
+/// next: about 6,000 page faults, 10 ms of a 38 ms request.
+/// The first source of 6 megapixels or more ends that for
+/// the life of the process, since the thresholds only go
+/// up. This does at boot what that source would do: it
+/// takes one block just under 32 MiB and frees it, without
+/// touching it, so no memory is used.
+///
+/// From then on the process keeps up to 64 MiB of freed
+/// memory at the top of each of malloc's heaps, as it does
+/// today once a large source has come through, instead of
+/// handing it back between requests. Blocks of 32 MiB and
+/// more (a decoded source past about 10 megapixels) are
+/// still mapped and unmapped each time: no threshold
+/// changes that.
+///
+/// Other allocators (musl, macOS) have no such thresholds:
+/// there this allocates and frees a block and changes
+/// nothing. A failed allocation is ignored.
+fn raise_malloc_thresholds() {
+    let mut block: Vec<u8> = Vec::new();
+    if block.try_reserve_exact(MALLOC_THRESHOLD_BLOCK).is_ok() {
+        // Kept from being optimized away with the free
+        // that follows it: the pair is the point.
+        std::hint::black_box(&mut block);
+    }
+}
+
 /// Run a CLI verb, or the server. For the server, returns
 /// the deadline by which its runtime must stop.
 async fn start() -> Option<std::time::Instant> {
@@ -126,6 +180,9 @@ async fn start() -> Option<std::time::Instant> {
         }
         return None;
     }
+    // Before the first render: the allocator keeps freed
+    // frame buffers from the start (see the function).
+    raise_malloc_thresholds();
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
     match crabcrop::svg::WorkerCommand::current_binary() {

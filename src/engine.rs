@@ -2408,7 +2408,7 @@ fn render_frames(
 /// of its own (see [`gif_frame_quantized`]) with its delay in
 /// hundredths of a second. GIF output has no quality lever and
 /// keeps the GIF encoder's defaults otherwise, as it always has.
-/// The frames are prepared on up to four threads (see
+/// The frames are prepared on up to two threads (see
 /// [`gif_frame_workers`]) and written in frame order.
 fn encode_animated_gif(
     frames: &Frames,
@@ -2420,16 +2420,27 @@ fn encode_animated_gif(
     encode_animated_gif_on(frames, deadline, workers, gif_frame_quantized)
 }
 
+/// The most threads that prepare the frames of one animated
+/// GIF (issue #695). An animated GIF render holds one permit of
+/// the stills lane, like any still, so its threads share the
+/// cores with the still renders beside it. With four, a still
+/// render beside one GIF encode took 1.13 to 1.29 times as long
+/// as beside the single-thread encoder, and its 90th percentile
+/// about 1.6 times; with two it took 0.98 times as long, and a
+/// GIF render still got 1.76 times the throughput of one thread
+/// (four gave 2.34). The bytes are the same at any count.
+const GIF_FRAME_THREADS: usize = 2;
+
 /// How many threads prepare the frames of an animated GIF on
-/// a host with `cores` cores (issue #667): the cores, four at
-/// most (the bound the banded filters use), never more than
-/// the frames, and one for a single frame or for an animation
-/// under 64x64 pixels, too small to repay a thread.
+/// a host with `cores` cores (issue #667): the cores, at most
+/// [`GIF_FRAME_THREADS`], never more than the frames, and one
+/// for a single frame or for an animation under 64x64 pixels,
+/// too small to repay a thread.
 fn gif_frame_workers(cores: usize, frames: usize, width: u32, height: u32) -> usize {
     if frames < 2 || u64::from(width) * u64::from(height) < 64 * 64 {
         return 1;
     }
-    cores.clamp(1, 4).min(frames)
+    cores.clamp(1, GIF_FRAME_THREADS).min(frames)
 }
 
 /// [`encode_animated_gif`] on `workers` threads. `quantize`
