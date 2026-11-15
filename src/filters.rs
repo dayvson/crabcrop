@@ -401,7 +401,7 @@ pub fn apply_filters_within(
             Filter::Rotate(degrees) => {
                 let normalized = fold_degrees(*degrees);
                 img = if normalized == 90.0 {
-                    img.rotate90()
+                    rotate90_fast(&img)
                 } else if normalized == 180.0 {
                     rotate180_fast(&img)
                 } else if normalized == 270.0 {
@@ -1639,6 +1639,14 @@ fn rot270_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[
 /// 4.7 ms, 64 rows 7.1 ms (issue #648).
 const ROT90_BLOCK_ROWS: usize = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// How many frames [`rot90_px`] has turned on this thread.
+    /// The turn and the image crate's write the same bytes, so
+    /// the tests count the calls to tell which one a frame took.
+    static ROT90_BLOCK_TURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rotate 90 degrees clockwise: output row `c` is input column
 /// `c` read bottom to top. The output is written a block of
 /// rows at a time: each input row hands a run of pixels to the
@@ -1650,6 +1658,8 @@ const ROT90_BLOCK_ROWS: usize = 16;
 /// their single-frame time, which banding it over threads did
 /// not (issue #648).
 fn rot90_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
+    #[cfg(test)]
+    ROT90_BLOCK_TURNS.with(|turns| turns.set(turns.get() + 1));
     for (block, rows) in dst.chunks_mut(ROT90_BLOCK_ROWS * h).enumerate() {
         let c = block * ROT90_BLOCK_ROWS;
         let n = rows.len() / h;
