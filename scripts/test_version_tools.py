@@ -45,6 +45,13 @@ EXAMPLES = {
     # The recipe imports the Bunny SDK at the SDK's own version, which
     # is no pin of this release either.
     "deploy/bunnycdn/cache-tag-middleware.ts": "the Bunny SDK's own version",
+    # Dated benchmark records: the version in them is the release the
+    # run measured, a historical fact a bump must not rewrite. The
+    # harness pins that do move with a release are sites instead
+    # (scripts/version_sites.py).
+    "benchmark/results/2026-11-15.md": "a dated benchmark record",
+    "benchmark/results/2026-11-15.json": "a dated benchmark record",
+    "benchmark/results/2026-11-15-cache.json": "a dated benchmark record",
 }
 
 

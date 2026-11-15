@@ -149,6 +149,27 @@ def json_fields(path, *fields):
 VERSION = ("version",)
 ROOT_PACKAGE = ("packages", "", "version")
 
+_BENCHMARK_README_PINS = [
+    # The summary line: "- crabcrop X.Y.Z (release build from the
+    # `vX.Y.Z` tag)".
+    re.compile(r"^- crabcrop (\d+\.\d+\.\d+) \(release build", re.M),
+    re.compile(r"\(release build from the `v(\d+\.\d+\.\d+)` tag\)"),
+    # The setup description: "the `vX.Y.Z` tag in a detached worktree".
+    re.compile(r"the `v(\d+\.\d+\.\d+)` tag in a detached worktree"),
+    # The version notes entry: "- crabcrop X.Y.Z, tag `vX.Y.Z`, commit".
+    # The imgproxy entry in the same list has the same shape after the
+    # name, so both patterns anchor on the crabcrop name.
+    re.compile(r"^- crabcrop (\d+\.\d+\.\d+), tag `v\d+\.\d+\.\d+`, commit", re.M),
+    re.compile(r"^- crabcrop \d+\.\d+\.\d+, tag `v(\d+\.\d+\.\d+)`, commit", re.M),
+]
+
+
+def _benchmark_readme_pins(text):
+    """The spans of benchmark/README.md's five release pins: the version
+    and tag on its summary line, the tag in its setup description, and
+    the version and tag in its version notes entry."""
+    return [m.span(1) for rx in _BENCHMARK_README_PINS for m in rx.finditer(text)]
+
 
 def linked(relative):
     """A package-lock.json entry for @crabcrop/url linked from the tree:
@@ -261,6 +282,19 @@ SITES = [
             "deploy/helm/crabcrop/README.md",
         )
     ),
+    # The benchmark harness pins the release it measures (issue #312):
+    # setup.sh names the version and tag it builds, the two runners
+    # default to that build's worktree, and the README's version notes
+    # record it. The commit line in setup.sh is not a site: a bump
+    # cannot know the new tag's commit, so the refresh that lands new
+    # results writes it. The dated files under benchmark/results/ are
+    # records of the release they measured, not pins; the version
+    # tools test exempts them as EXAMPLES.
+    pattern("benchmark/setup.sh", "CRABCROP_VERSION", r"^CRABCROP_VERSION=(.+)$", re.M),
+    pattern("benchmark/setup.sh", "CRABCROP_TAG", r"^CRABCROP_TAG=v(.+)$", re.M),
+    pattern("benchmark/bench.py", "default crabcrop build (worktree name)", r"crabcrop-v(\d+\.\d+\.\d+)"),
+    pattern("benchmark/bench_cache.py", "default crabcrop build (worktree name)", r"crabcrop-v(\d+\.\d+\.\d+)"),
+    Site("benchmark/README.md", "crabcrop version and tag (current release lines)", _benchmark_readme_pins, count=5),
 ]
 
 
