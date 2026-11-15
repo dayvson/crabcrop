@@ -134,6 +134,44 @@ const TAG_REFUSED: u8 = 1;
 const JOB_SVG: u8 = 0;
 const JOB_AVIF: u8 = 1;
 
+/// The capacity a pipe starts with on Linux.
+const DEFAULT_PIPE_BYTES: usize = 64 * 1024;
+
+/// The capacity asked for the pipes of an AVIF job: the one
+/// its answer comes back through, and the one its request goes
+/// out through when the source is larger than
+/// [`DEFAULT_PIPE_BYTES`] (issue #650). The answer is megabytes
+/// (a 2400x1600 AVIF comes back as 15 MB), and through the
+/// default pipe the two processes trade a wake-up for every
+/// 64 KiB of it, about 240 of them and a fifth of that decode's
+/// time. 256 KiB measured the same as 1 MiB, the most an
+/// unprivileged process may ask for, and keeps the server
+/// clear of the 64 MiB of pipe buffers a user may hold before
+/// the kernel hands every new pipe one page
+/// (`pipe-user-pages-soft`): an AVIF job holds at most two such
+/// pipes. An SVG job keeps the default pipes: its raster is
+/// smaller, its render is most of its time, and the wider pipe
+/// measured no gain there.
+const WORKER_PIPE_BYTES: usize = 256 * 1024;
+
+/// Ask the kernel to hold `bytes` in `pipe` (Linux). Best
+/// effort: where the kernel refuses (the user's pipe budget is
+/// spent, a lower `pipe-max-size`), and on a system with no
+/// such call, the pipe keeps its capacity and the exchange
+/// runs as it always has. A pipe that already holds as much
+/// is left alone: the call sets a capacity, and a host whose
+/// pipes start larger than [`DEFAULT_PIPE_BYTES`] must not
+/// have one narrowed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn widen_pipe(pipe: &impl std::os::fd::AsFd, bytes: usize) {
+    if rustix::pipe::fcntl_getpipe_size(pipe).is_ok_and(|held| held < bytes) {
+        let _ = rustix::pipe::fcntl_setpipe_size(pipe, bytes);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn widen_pipe<P>(_pipe: &P, _bytes: usize) {}
+
 /// The worker a failure names, by job, so an AVIF decode that
 /// fails is not reported as an SVG render.
 fn worker_name(job: u8) -> &'static str {
@@ -151,16 +189,6 @@ fn work_name(job: u8) -> &'static str {
     } else {
         "SVG rendering"
     }
-}
-
-/// How many bytes the worker's answer may carry: an exact
-/// length the parent already knows (the SVG size frame, the
-/// SVG raster), or any length up to a cap (the AVIF pixels,
-/// bounded by the decode budget plus the small header).
-#[derive(Clone, Copy)]
-enum Want {
-    Exact(usize),
-    UpTo(usize),
 }
 
 /// How to start a worker: a program and the arguments that
@@ -286,30 +314,23 @@ enum Frame {
     Refused(String),
 }
 
-/// Read one frame whose ok payload matches `want`: an exact
-/// length, or any length up to a cap. Anything else is a
-/// protocol violation; an end of stream before a whole frame
-/// is `UnexpectedEof`.
-fn read_frame(input: &mut impl Read, want: Want) -> io::Result<Frame> {
+/// Read one frame whose ok payload is exactly `want` bytes,
+/// the length the parent already knows for every answer: the
+/// SVG size and raster, the AVIF header and the pixels it
+/// announces. Anything else is a protocol violation; an end of
+/// stream before a whole frame is `UnexpectedEof`.
+fn read_frame(input: &mut impl Read, want: usize) -> io::Result<Frame> {
     let mut head = [0u8; 9];
     input.read_exact(&mut head)?;
     let len = u64::from_le_bytes(head[1..].try_into().expect("eight bytes"));
     let malformed = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
     let cap = match head[0] {
-        TAG_OK => match want {
-            Want::Exact(n) if len == n as u64 => n,
-            Want::Exact(n) => {
-                return Err(malformed(format!(
-                    "a {len} byte answer where {n} were expected"
-                )));
-            }
-            Want::UpTo(cap) if len <= cap as u64 => len as usize,
-            Want::UpTo(cap) => {
-                return Err(malformed(format!(
-                    "a {len} byte answer past the {cap} byte cap"
-                )));
-            }
-        },
+        TAG_OK if len == want as u64 => want,
+        TAG_OK => {
+            return Err(malformed(format!(
+                "a {len} byte answer where {want} were expected"
+            )));
+        }
         TAG_REFUSED if len <= MAX_MESSAGE as u64 => len as usize,
         TAG_REFUSED => return Err(malformed(format!("a {len} byte refusal"))),
         tag => return Err(malformed(format!("frame tag {tag}"))),
@@ -328,7 +349,8 @@ fn read_frame(input: &mut impl Read, want: Want) -> io::Result<Frame> {
 /// The parent's side of the exchange: the frame reader runs
 /// on its own thread, so every wait honors the deadline.
 struct Session {
-    want: mpsc::Sender<Want>,
+    /// The payload length of the next ok frame.
+    want: mpsc::Sender<usize>,
     frames: mpsc::Receiver<io::Result<Frame>>,
     stderr: mpsc::Receiver<String>,
     deadline: Instant,
@@ -345,7 +367,7 @@ enum Ended {
 }
 
 impl Session {
-    fn next(&self, want: Want) -> Result<Frame, Ended> {
+    fn next(&self, want: usize) -> Result<Frame, Ended> {
         if self.want.send(want).is_err() {
             return Err(Ended::Broken(io::ErrorKind::UnexpectedEof.into()));
         }
@@ -471,6 +493,9 @@ fn exchange(
     job: u8,
 ) -> (Session, mpsc::Receiver<std::process::ChildStdin>) {
     let mut stdin = worker.child.stdin.take().expect("stdin was piped");
+    if job == JOB_AVIF && request.len() > DEFAULT_PIPE_BYTES {
+        widen_pipe(&stdin, WORKER_PIPE_BYTES);
+    }
     let (stdin_tx, stdin_rx) = mpsc::channel();
     std::thread::spawn(move || {
         if stdin
@@ -483,7 +508,10 @@ fn exchange(
     });
 
     let mut stdout = worker.child.stdout.take().expect("stdout was piped");
-    let (want_tx, want_rx) = mpsc::channel::<Want>();
+    if job == JOB_AVIF {
+        widen_pipe(&stdout, WORKER_PIPE_BYTES);
+    }
+    let (want_tx, want_rx) = mpsc::channel::<usize>();
     let (frame_tx, frame_rx) = mpsc::channel();
     std::thread::spawn(move || {
         for want in want_rx {
@@ -548,21 +576,43 @@ pub(super) fn run_avif(
     request.extend_from_slice(&max_alloc.to_le_bytes());
     request.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     request.extend_from_slice(bytes);
-    // The answer carries a one-byte color tag, two u32 sizes,
-    // and the pixels, which cannot exceed the decode budget.
-    let cap = (max_alloc as usize).saturating_add(AVIF_HEADER);
     let (session, _stdin) = exchange(&mut worker, request, deadline, timeout, JOB_AVIF);
-    match session.next(Want::UpTo(cap)) {
-        Ok(Frame::Ok(payload)) => decode_avif_payload(payload).ok_or_else(|| {
-            RenderError::Refused("the AVIF decoder sent a malformed image".to_string())
-        }),
+    let malformed = || RenderError::Refused("the AVIF decoder sent a malformed image".to_string());
+    // The answer is two frames: a header that names the color
+    // type and the size, then the pixels alone, read straight
+    // into the buffer that becomes the image (issue #650).
+    let header: [u8; AVIF_HEADER] = match session.next(AVIF_HEADER) {
+        Ok(Frame::Ok(header)) => header.try_into().map_err(|_| malformed())?,
+        Ok(Frame::Refused(why)) => return Err(RenderError::Refused(why)),
+        Err(ended) => return Err(session.failure(&mut worker, ended)),
+    };
+    let (color, width, height) = read_avif_header(&header);
+    let pixel_bytes = avif_pixel_bytes(color, width, height).ok_or_else(malformed)?;
+    // An image past the decode budget is refused on its
+    // header: nothing of that size is read or reserved. The
+    // refusal is the one the single-frame answer got, a
+    // protocol violation that counts the header with the
+    // pixels on both sides.
+    let answer = (pixel_bytes as u64).saturating_add(AVIF_HEADER as u64);
+    let cap = max_alloc.saturating_add(AVIF_HEADER as u64);
+    if answer > cap {
+        let past = io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a {answer} byte answer past the {cap} byte cap"),
+        );
+        return Err(session.failure(&mut worker, Ended::Broken(past)));
+    }
+    match session.next(pixel_bytes) {
+        Ok(Frame::Ok(pixels)) => {
+            build_dynamic_image(color, width, height, pixels).ok_or_else(malformed)
+        }
         Ok(Frame::Refused(why)) => Err(RenderError::Refused(why)),
         Err(ended) => Err(session.failure(&mut worker, ended)),
     }
 }
 
-/// The AVIF answer's fixed header: a color tag and two u32
-/// dimensions before the pixels.
+/// The header frame of an AVIF answer: a color tag and two u32
+/// dimensions. The pixels follow in a frame of their own.
 const AVIF_HEADER: usize = 1 + 4 + 4;
 
 /// A test-only environment variable the AVIF job reads for a
@@ -571,24 +621,33 @@ const AVIF_HEADER: usize = 1 + 4 + 4;
 /// the configuration docs.
 const AVIF_DELAY_ENV: &str = "CRABCROP_TEST_AVIF_WORKER_DELAY_MS";
 
-/// Rebuild the decoded image from the worker's answer: a color
-/// tag, the width and height, then exactly the pixels the tag
-/// and size imply. `None` on any length or tag mismatch. The
-/// answer is taken by value and its header dropped in place, so
-/// an 8-bit image costs no second copy of its pixels.
-fn decode_avif_payload(mut payload: Vec<u8>) -> Option<image::DynamicImage> {
-    let header: [u8; AVIF_HEADER] = payload.get(..AVIF_HEADER)?.try_into().ok()?;
-    let color = header[0];
-    let width = u32::from_le_bytes(header[1..5].try_into().ok()?);
-    let height = u32::from_le_bytes(header[5..9].try_into().ok()?);
-    let count = (width as usize)
+/// The header frame for an image of `color` (see
+/// [`encode_avif`]), `width` by `height`.
+fn avif_header(color: u8, width: u32, height: u32) -> [u8; AVIF_HEADER] {
+    let mut header = [0u8; AVIF_HEADER];
+    header[0] = color;
+    header[1..5].copy_from_slice(&width.to_le_bytes());
+    header[5..].copy_from_slice(&height.to_le_bytes());
+    header
+}
+
+/// The color tag, width and height a header frame carries.
+fn read_avif_header(header: &[u8; AVIF_HEADER]) -> (u8, u32, u32) {
+    (
+        header[0],
+        u32::from_le_bytes(header[1..5].try_into().expect("four bytes")),
+        u32::from_le_bytes(header[5..].try_into().expect("four bytes")),
+    )
+}
+
+/// The bytes of pixels a header announces: exactly what the
+/// color tag and the size imply. `None` for an unknown tag or
+/// a size whose count overflows.
+fn avif_pixel_bytes(color: u8, width: u32, height: u32) -> Option<usize> {
+    (width as usize)
         .checked_mul(height as usize)?
-        .checked_mul(avif_channels(color)? as usize)?;
-    if payload.len() - AVIF_HEADER != count.checked_mul(avif_depth(color)?)? {
-        return None;
-    }
-    payload.drain(..AVIF_HEADER);
-    build_dynamic_image(color, width, height, payload)
+        .checked_mul(avif_channels(color)? as usize)?
+        .checked_mul(avif_depth(color)?)
 }
 
 /// Parse `document` (sanitized) in a worker started from
@@ -612,7 +671,7 @@ pub(super) fn run(
     request.extend_from_slice(&(document.len() as u64).to_le_bytes());
     request.extend_from_slice(document.as_bytes());
     let (session, stdin_rx) = exchange(&mut worker, request, deadline, timeout, JOB_SVG);
-    let size = match session.next(Want::Exact(8)) {
+    let size = match session.next(8) {
         Ok(Frame::Ok(bytes)) => (
             f32::from_le_bytes(bytes[..4].try_into().expect("four bytes")),
             f32::from_le_bytes(bytes[4..].try_into().expect("four bytes")),
@@ -636,7 +695,7 @@ pub(super) fn run(
     let Ok(mut stdin) = stdin_rx.recv_timeout(wait) else {
         // The request never finished going out: the worker
         // stopped reading, or the deadline passed first.
-        return Err(match session.next(Want::Exact(0)) {
+        return Err(match session.next(0) {
             Ok(_) => RenderError::Refused("the SVG renderer answered out of turn".to_string()),
             Err(ended) => session.failure(&mut worker, ended),
         });
@@ -653,7 +712,7 @@ pub(super) fn run(
         .checked_mul(h as usize)
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| RenderError::Refused("SVG raster size out of range".to_string()))?;
-    match session.next(Want::Exact(raster_bytes)) {
+    match session.next(raster_bytes) {
         Ok(Frame::Ok(raster)) => {
             let raster = image::RgbaImage::from_raw(w, h, raster).ok_or_else(|| {
                 RenderError::Refused("SVG raster buffer size mismatch".to_string())
@@ -782,8 +841,9 @@ pub(super) fn serve(input: &mut impl Read, output: &mut impl Write) -> io::Resul
 
 /// Decode one AVIF source: read the decode limits and the
 /// bytes, decode on the image crate's bounded path (the same
-/// one the in-process decode runs), and answer with the color
-/// tag, the dimensions, and the pixels, or a refusal.
+/// one the in-process decode runs), and answer with two
+/// frames, the header (the color tag and the dimensions) and
+/// then the pixels, or with a refusal.
 fn serve_avif(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
     let mut limits = [0u8; 12];
     input.read_exact(&mut limits)?;
@@ -817,14 +877,9 @@ fn serve_avif(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> 
     match decode_avif_bounded(&bytes, max_dimension, max_alloc) {
         Ok(image) => match encode_avif(&image) {
             Some((color, pixels)) => {
-                let (w, h) = (image.width(), image.height());
-                output.write_all(&[TAG_OK])?;
-                output.write_all(&((AVIF_HEADER + pixels.len()) as u64).to_le_bytes())?;
-                output.write_all(&[color])?;
-                output.write_all(&w.to_le_bytes())?;
-                output.write_all(&h.to_le_bytes())?;
-                output.write_all(pixels)?;
-                output.flush()
+                let header = avif_header(color, image.width(), image.height());
+                send(output, TAG_OK, &header)?;
+                send(output, TAG_OK, pixels)
             }
             None => refuse(output, "the AVIF decoded to an unsupported color type"),
         },
@@ -980,7 +1035,7 @@ mod tests {
     fn frames(mut output: &[u8], wants: &[usize]) -> Vec<Frame> {
         wants
             .iter()
-            .map(|want| read_frame(&mut output, Want::Exact(*want)).expect("a whole frame"))
+            .map(|want| read_frame(&mut output, *want).expect("a whole frame"))
             .collect()
     }
 
@@ -1074,10 +1129,7 @@ mod tests {
             bytes.extend_from_slice(payload);
             bytes
         };
-        let error = |bytes: Vec<u8>, want: usize| match read_frame(
-            &mut bytes.as_slice(),
-            Want::Exact(want),
-        ) {
+        let error = |bytes: Vec<u8>, want: usize| match read_frame(&mut bytes.as_slice(), want) {
             Err(e) => e.kind(),
             Ok(_) => panic!("accepted"),
         };
@@ -1266,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn the_avif_payload_round_trips_every_color_type() {
+    fn the_avif_answer_round_trips_every_color_type() {
         use image::DynamicImage;
         let images = [
             DynamicImage::ImageLuma8(image::GrayImage::from_raw(2, 2, vec![1, 2, 3, 4]).unwrap()),
@@ -1294,33 +1346,55 @@ mod tests {
         for image in images {
             let (color, pixels) = encode_avif(&image).expect("a supported color type");
             tags.push(color);
-            let mut payload = vec![color];
-            payload.extend_from_slice(&image.width().to_le_bytes());
-            payload.extend_from_slice(&image.height().to_le_bytes());
-            payload.extend_from_slice(pixels);
-            let rebuilt = decode_avif_payload(payload.clone()).expect("a whole image");
+            // The header frame carries the tag and the size,
+            // and announces exactly the pixels that follow.
+            let header = avif_header(color, image.width(), image.height());
+            assert_eq!(
+                read_avif_header(&header),
+                (color, image.width(), image.height())
+            );
+            assert_eq!(
+                avif_pixel_bytes(color, image.width(), image.height()),
+                Some(pixels.len())
+            );
+            let rebuilt =
+                build_dynamic_image(color, image.width(), image.height(), pixels.to_vec())
+                    .expect("a whole image");
             assert_eq!(rebuilt.color(), image.color());
             assert_eq!(rebuilt.as_bytes(), image.as_bytes());
-            // A payload a byte short of the pixels, or a byte
-            // over, is refused, and so is one that names more
-            // pixels than it carries.
-            assert!(decode_avif_payload(payload[..payload.len() - 1].to_vec()).is_none());
-            let mut over = payload.clone();
-            over.push(0);
-            assert!(decode_avif_payload(over).is_none());
-            let mut taller = payload.clone();
-            taller[5..9].copy_from_slice(&(image.height() + 1).to_le_bytes());
-            assert!(decode_avif_payload(taller).is_none());
+            // A taller image announces more pixels than these,
+            // and pixels a byte short of their size build no
+            // image.
+            assert!(
+                avif_pixel_bytes(color, image.width(), image.height() + 1) > Some(pixels.len())
+            );
+            assert!(
+                build_dynamic_image(
+                    color,
+                    image.width(),
+                    image.height(),
+                    pixels[..pixels.len() - 1].to_vec()
+                )
+                .is_none()
+            );
             // A size whose pixel count overflows is refused, not
-            // wrapped.
-            let mut vast = payload;
-            vast[1..9].copy_from_slice(&[0xFF; 8]);
-            assert!(decode_avif_payload(vast).is_none());
+            // wrapped: the largest size announces more than any
+            // budget, or nothing.
+            assert!(
+                avif_pixel_bytes(color, u32::MAX, u32::MAX)
+                    .is_none_or(|bytes| bytes as u64 > crate::engine::MAX_DECODE_ALLOC)
+            );
+            if color != 0 {
+                assert_eq!(avif_pixel_bytes(color, u32::MAX, u32::MAX), None);
+            }
         }
         assert_eq!(tags, (0..8).collect::<Vec<u8>>(), "a closed set of tags");
-        // An unknown tag, and an answer shorter than its header.
-        assert!(decode_avif_payload(vec![8, 1, 0, 0, 0, 1, 0, 0, 0, 0]).is_none());
-        assert!(decode_avif_payload(vec![3, 0, 0]).is_none());
+        // An unknown tag announces nothing and builds nothing.
+        assert_eq!(avif_pixel_bytes(8, 1, 1), None);
+        assert!(build_dynamic_image(8, 1, 1, vec![0; 8]).is_none());
+        // The largest RGBA image the engine's decode budget
+        // admits is announced whole.
+        assert_eq!(avif_pixel_bytes(3, 8192, 8192), Some(256 << 20));
     }
 
     #[cfg(unix)]
@@ -1380,18 +1454,290 @@ mod tests {
             matches!(&result, Err(RenderError::Refused(why)) if why.starts_with("could not start the AVIF decoder")),
             "{result:?}"
         );
-        // An answer past the decode budget is refused unread.
+    }
+
+    /// `bytes` as `printf` octal escapes.
+    #[cfg(unix)]
+    fn octal(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("\\{byte:03o}")).collect()
+    }
+
+    /// An ok frame around `payload`, as `printf` octal escapes.
+    #[cfg(unix)]
+    fn ok_frame(payload: &[u8]) -> String {
+        let mut frame = vec![TAG_OK];
+        frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        frame.extend_from_slice(payload);
+        octal(&frame)
+    }
+
+    /// Run an AVIF job against a shell stand-in that prints
+    /// `answer` (`printf` escapes) and exits, as the worker
+    /// does after its answer, under `max_alloc` and a 20 s
+    /// deadline.
+    #[cfg(unix)]
+    fn run_avif_answer(answer: &str, max_alloc: u64) -> Result<image::DynamicImage, RenderError> {
+        run_avif(
+            &shell_worker(&format!("printf '{answer}'")),
+            b"",
+            crate::engine::MAX_DECODE_DIMENSION,
+            max_alloc,
+            Instant::now() + Duration::from_secs(20),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_avif_answer_is_a_header_frame_and_a_pixel_frame() {
+        // Issue #650: the header, then the pixels in a frame of
+        // their own, which becomes the image's buffer.
+        let rgb = [10, 20, 30, 40, 50, 60];
+        let answer = ok_frame(&avif_header(2, 2, 1)) + &ok_frame(&rgb);
+        let image = run_avif_answer(&answer, 1 << 20).unwrap();
+        assert_eq!(image.color(), image::ColorType::Rgb8);
+        assert_eq!((image.width(), image.height()), (2, 1));
+        assert_eq!(image.as_bytes(), rgb);
+        // A 16-bit image, its samples in the machine's order.
+        let deep: Vec<u8> = [300u16, 1, 2, 65000]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        let answer = ok_frame(&avif_header(7, 1, 1)) + &ok_frame(&deep);
+        let image = run_avif_answer(&answer, 1 << 20).unwrap();
+        assert_eq!(image.color(), image::ColorType::Rgba16);
+        assert_eq!(image.as_bytes(), deep);
+
+        // Pixels of another length than the header announces,
+        // and the header and pixels in one frame (the answer
+        // before issue #650): both break the protocol.
+        for answer in [
+            ok_frame(&avif_header(2, 2, 1)) + &ok_frame(&rgb[..5]),
+            ok_frame(&[&avif_header(2, 2, 1)[..], &rgb[..]].concat()),
+        ] {
+            let result = run_avif_answer(&answer, 1 << 20);
+            assert!(
+                matches!(&result, Err(RenderError::Refused(why))
+                    if why.starts_with("the AVIF decoder sent a malformed answer")),
+                "{result:?}"
+            );
+        }
+        // A header with a color tag outside the closed set.
+        let result = run_avif_answer(&ok_frame(&avif_header(9, 2, 1)), 1 << 20);
+        assert_eq!(
+            result.unwrap_err(),
+            RenderError::Refused("the AVIF decoder sent a malformed image".to_string())
+        );
+        // A worker that dies between the two frames is a crash,
+        // and one that hangs there is killed at the deadline.
+        let header = ok_frame(&avif_header(2, 2, 1));
         let result = run_avif(
-            &shell_worker(r"printf '\000\377\377\377\377\000\000\000\000'; exec sleep 30"),
+            &shell_worker(&format!("printf '{header}'; kill -ABRT $$")),
             b"",
             1,
             1 << 20,
             Instant::now() + Duration::from_secs(20),
         );
         assert!(
-            matches!(&result, Err(RenderError::Refused(why)) if why.contains("past the")),
+            matches!(&result, Err(RenderError::Refused(why))
+                if why.starts_with("the AVIF decoder crashed")),
             "{result:?}"
         );
+        let started = Instant::now();
+        let result = run_avif(
+            &shell_worker(&format!("printf '{header}'; exec sleep 30")),
+            b"",
+            1,
+            1 << 20,
+            started + Duration::from_millis(500),
+        );
+        assert!(
+            matches!(&result, Err(RenderError::TimedOut(why)) if why.starts_with("AVIF decoding")),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_avif_answer_past_the_decode_budget_is_refused_on_its_header() {
+        // The header announces a 65535x65535 RGBA image, 17 GB,
+        // under a 1 MiB budget. It is refused before a byte of
+        // pixels is read or reserved, with the words an answer
+        // past the cap always got, once the worker has had its
+        // two seconds to exit (the stand-in would hold its pipe
+        // for 30), and the worker is killed.
+        let dir = crate::test_support::scratch_dir("avif-budget-test");
+        let pid_file = dir.join("worker.pid");
+        let header = ok_frame(&avif_header(3, 65_535, 65_535));
+        let script = format!(
+            "echo $$ > '{}'; printf '{header}'; exec sleep 30",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let result = run_avif(
+            &shell_worker(&script),
+            b"",
+            crate::engine::MAX_DECODE_DIMENSION,
+            1 << 20,
+            started + Duration::from_secs(20),
+        );
+        assert!(
+            matches!(&result, Err(RenderError::Refused(why))
+            if why.starts_with(
+                "the AVIF decoder sent a malformed answer (a 17179344909 byte answer past \
+                 the 1048585 byte cap; "
+            )),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "the worker outlived the refusal"
+        );
+        // The budget is the bound, to the byte: a 2x2 RGBA
+        // image is 16 bytes of pixels.
+        let pixels = [7u8; 16];
+        let answer = ok_frame(&avif_header(3, 2, 2)) + &ok_frame(&pixels);
+        assert_eq!(run_avif_answer(&answer, 16).unwrap().as_bytes(), pixels);
+        let result = run_avif_answer(&answer, 15);
+        assert!(
+            matches!(&result, Err(RenderError::Refused(why))
+                if why.contains("a 25 byte answer past the 24 byte cap")),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_wider_pipe_is_asked_for_and_a_refusal_changes_nothing() {
+        let capacity = |pipe: &std::io::PipeWriter| rustix::pipe::fcntl_getpipe_size(pipe).unwrap();
+        let (mut reader, mut writer) = std::io::pipe().unwrap();
+        let before = capacity(&writer);
+        widen_pipe(&writer, WORKER_PIPE_BYTES);
+        let after = capacity(&writer);
+        // Granted, or refused where this user's pipe budget is
+        // spent, or not needed where pipes start as large:
+        // never an error, never a smaller pipe.
+        assert!(
+            after == before || (before < WORKER_PIPE_BYTES && after == WORKER_PIPE_BYTES),
+            "{before} bytes became {after}"
+        );
+        // A pipe that holds more is not narrowed to the size
+        // asked for.
+        if after == WORKER_PIPE_BYTES {
+            widen_pipe(&writer, DEFAULT_PIPE_BYTES);
+            assert_eq!(capacity(&writer), after);
+        }
+        // A size the kernel refuses outright leaves the pipe as
+        // it was, and so does a descriptor that is no pipe.
+        widen_pipe(&writer, usize::MAX);
+        assert_eq!(capacity(&writer), after);
+        widen_pipe(
+            &std::fs::File::open("/dev/null").unwrap(),
+            WORKER_PIPE_BYTES,
+        );
+        // Either way it still carries what is written to it.
+        writer.write_all(b"still a pipe").unwrap();
+        drop(writer);
+        let mut carried = String::new();
+        reader.read_to_string(&mut carried).unwrap();
+        assert_eq!(carried, "still a pipe");
+    }
+
+    /// Whether a pipe starts at [`DEFAULT_PIPE_BYTES`] here and
+    /// the kernel widens it for this user. Some hosts start
+    /// their pipes larger, and the kernel stops widening once
+    /// the user's pipe budget is spent; the test below can
+    /// tell a wide pipe from a default one in neither case.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn pipes_can_be_widened() -> bool {
+        let (_reader, writer) = std::io::pipe().unwrap();
+        if rustix::pipe::fcntl_getpipe_size(&writer).unwrap() != DEFAULT_PIPE_BYTES {
+            return false;
+        }
+        widen_pipe(&writer, WORKER_PIPE_BYTES);
+        rustix::pipe::fcntl_getpipe_size(&writer).unwrap() == WORKER_PIPE_BYTES
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_avif_job_gets_wider_pipes_and_an_svg_job_the_default_ones() {
+        if !pipes_can_be_widened() {
+            return;
+        }
+        let timeout = Duration::from_secs(20);
+        let dir = crate::test_support::scratch_dir("worker-pipe-test");
+        // The answer: the stand-in writes 200,704 bytes, past
+        // the 64 KiB a pipe starts with, and only then leaves
+        // its mark, while the parent reads nothing. Through an
+        // AVIF job's pipe that goes through; an SVG job's holds
+        // 64 KiB of it and the write waits. The bytes come
+        // from the shell's own `printf`, a page at a time,
+        // and not from `head -c`: the `head` of the Rust
+        // coreutils (Ubuntu 26.04) widens the pipe it writes
+        // to, and then an SVG job's pipe takes all of it.
+        for (job, wide) in [(JOB_AVIF, true), (JOB_SVG, false)] {
+            let written = dir.join(format!("written-{job}"));
+            let script = format!(
+                "i=0; while [ $i -lt 49 ]; do printf '%04096d' 0; i=$((i+1)); done; \
+                 : > '{}'; exec sleep 30",
+                written.display()
+            );
+            let mut worker = spawn(&shell_worker(&script), timeout, job).unwrap();
+            let (_session, stdin) = exchange(
+                &mut worker,
+                request_head(job),
+                Instant::now() + timeout,
+                timeout,
+                job,
+            );
+            let wait = Duration::from_secs(if wide { 10 } else { 1 });
+            let until = Instant::now() + wait;
+            while !written.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(written.exists(), wide, "job {job}");
+            // A request that fits the default pipe leaves stdin
+            // as it is, for either job.
+            let stdin = stdin.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                rustix::pipe::fcntl_getpipe_size(&stdin).unwrap(),
+                DEFAULT_PIPE_BYTES,
+                "job {job}"
+            );
+        }
+        // The request: 200,000 bytes go out whole to a stand-in
+        // that reads nothing when the job is an AVIF decode,
+        // through a pipe of the wider size. An SVG job's wait
+        // in the default one.
+        for (job, wide) in [(JOB_AVIF, true), (JOB_SVG, false)] {
+            let mut worker = spawn(&shell_worker("exec sleep 30"), timeout, job).unwrap();
+            let mut request = request_head(job);
+            request.resize(200_000, 0);
+            let (_session, stdin) =
+                exchange(&mut worker, request, Instant::now() + timeout, timeout, job);
+            let wait = Duration::from_secs(if wide { 5 } else { 1 });
+            match stdin.recv_timeout(wait) {
+                Ok(stdin) => {
+                    assert!(wide, "job {job}: the request fit a default pipe");
+                    assert_eq!(
+                        rustix::pipe::fcntl_getpipe_size(&stdin).unwrap(),
+                        WORKER_PIPE_BYTES
+                    );
+                }
+                Err(_) => assert!(!wide, "job {job}: the request did not go out"),
+            }
+        }
     }
 
     #[cfg(feature = "avif-decode")]
@@ -1413,12 +1759,21 @@ mod tests {
         );
         let mut output = Vec::new();
         serve(&mut input.as_slice(), &mut output).unwrap();
-        let Frame::Ok(payload) =
-            read_frame(&mut output.as_slice(), Want::UpTo(output.len())).expect("a whole frame")
+        // Two frames: the header, then exactly the pixels it
+        // announces.
+        let mut answer = output.as_slice();
+        let Frame::Ok(header) = read_frame(&mut answer, AVIF_HEADER).expect("a header frame")
         else {
             panic!("the AVIF was refused");
         };
-        let decoded = decode_avif_payload(payload).expect("a decoded image");
+        let header: [u8; AVIF_HEADER] = header.try_into().expect("nine bytes");
+        let (color, width, height) = read_avif_header(&header);
+        let pixel_bytes = avif_pixel_bytes(color, width, height).expect("a known color type");
+        let Frame::Ok(pixels) = read_frame(&mut answer, pixel_bytes).expect("a pixel frame") else {
+            panic!("the pixels were refused");
+        };
+        assert!(answer.is_empty(), "two frames and nothing after them");
+        let decoded = build_dynamic_image(color, width, height, pixels).expect("a decoded image");
         let in_process = crate::engine::decode_image(&avif).unwrap();
         assert_eq!(
             (decoded.width(), decoded.height()),

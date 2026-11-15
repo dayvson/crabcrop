@@ -844,16 +844,34 @@ fn keep_profile_converts_when_the_output_cannot_tag() {
 
 #[test]
 fn a_cmyk_jpeg_converts_sanely() {
-    // Saturated red in CMYK (Adobe storage), encoded
-    // with the same encoder family the engine uses.
+    // Saturated red in CMYK (no cyan, full magenta and
+    // yellow, no black), written by the library the engine
+    // encodes with, as Photoshop writes CMYK: four
+    // components behind an Adobe marker, each sample
+    // stored inverted.
     let mut data = Vec::new();
     for _ in 0..64 {
-        data.extend_from_slice(&[0u8, 255, 255, 0]);
+        data.extend_from_slice(&[255u8, 0, 0, 255]);
     }
-    let mut jpg = Vec::new();
-    jpeg_encoder::Encoder::new(&mut jpg, 95)
-        .encode(&data, 8, 8, jpeg_encoder::ColorType::Cmyk)
+    let mut compressor = turbojpeg::Compressor::new().unwrap();
+    compressor.set_quality(95).unwrap();
+    compressor.set_subsamp(turbojpeg::Subsamp::None).unwrap();
+    compressor
+        .set_colorspace(turbojpeg::Colorspace::CMYK)
         .unwrap();
+    let jpg = compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: data.as_slice(),
+            width: 8,
+            pitch: 32,
+            height: 8,
+            format: turbojpeg::PixelFormat::CMYK,
+        })
+        .unwrap();
+    assert!(
+        jpg.windows(5).any(|w| w == b"Adobe"),
+        "the fixture carries no Adobe marker"
+    );
     let engine = Engine;
     let out = engine
         .process(
@@ -1663,6 +1681,112 @@ fn invalid_exif_orientation_is_ignored() {
         shape_and_quadrants(&out.bytes),
         (8, 4, [true, false, false, false])
     );
+}
+
+/// The pixel layouts a decode can hand to [`apply_orientation`]:
+/// the four 8-bit ones the fast permutations take, and 16-bit
+/// ones, which keep the image crate's loops.
+const ORIENTATION_LAYOUTS: usize = 7;
+
+/// A frame of noise in one of the [`ORIENTATION_LAYOUTS`].
+fn orientation_frame(layout: usize, w: u32, h: u32) -> DynamicImage {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ (u64::from(w) << 32 | u64::from(h));
+    let mut samples = |channels: u32| -> Vec<u16> {
+        (0..w * h * channels)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u16
+            })
+            .collect()
+    };
+    fn narrow(samples: Vec<u16>) -> Vec<u8> {
+        samples.into_iter().map(|sample| sample as u8).collect()
+    }
+    fn frame<P: image::Pixel>(
+        w: u32,
+        h: u32,
+        samples: Vec<P::Subpixel>,
+    ) -> image::ImageBuffer<P, Vec<P::Subpixel>> {
+        image::ImageBuffer::from_raw(w, h, samples).expect("a whole frame")
+    }
+    match layout {
+        0 => DynamicImage::ImageLuma8(frame(w, h, narrow(samples(1)))),
+        1 => DynamicImage::ImageLumaA8(frame(w, h, narrow(samples(2)))),
+        2 => DynamicImage::ImageRgb8(frame(w, h, narrow(samples(3)))),
+        3 => DynamicImage::ImageRgba8(frame(w, h, narrow(samples(4)))),
+        4 => DynamicImage::ImageLuma16(frame(w, h, samples(1))),
+        5 => DynamicImage::ImageRgb16(frame(w, h, samples(3))),
+        _ => DynamicImage::ImageRgba16(frame(w, h, samples(4))),
+    }
+}
+
+/// Every EXIF orientation value turns a frame exactly as the
+/// image crate's own operations do (issue #648), whichever
+/// path takes it: the fast permutations for an 8-bit frame of
+/// four million bytes or more, the crate's loops for a smaller
+/// one and for 16-bit frames. Every layout is checked at small
+/// sizes for every value, the two that are no orientation
+/// among them. At the size the fast permutations start at,
+/// 1601 px wide (no multiple of the rotation's block), an RGB
+/// frame is checked for all eight values, and for the two the
+/// block rotation serves, 5 and 6: an RGB frame just under
+/// that size, an RGBA frame and a 16-bit frame past it. (The
+/// rotation itself is held to the crate for every layout in
+/// `filters::w3proofs`.)
+#[test]
+fn orientations_match_the_image_crate() {
+    fn by_the_crate(img: &DynamicImage, orientation: u32) -> DynamicImage {
+        match orientation {
+            2 => img.fliph(),
+            3 => img.rotate180(),
+            4 => img.flipv(),
+            5 => img.rotate90().fliph(),
+            6 => img.rotate90(),
+            7 => img.rotate270().fliph(),
+            8 => img.rotate270(),
+            _ => img.clone(),
+        }
+    }
+    let mut checked = 0;
+    let mut check = |img: &DynamicImage, orientations: std::ops::RangeInclusive<u32>| {
+        for orientation in orientations {
+            let want = by_the_crate(img, orientation);
+            let got = apply_orientation(img.clone(), orientation);
+            let what = format!(
+                "orientation {orientation} of {:?} at {}x{}",
+                img.color(),
+                img.width(),
+                img.height()
+            );
+            assert_eq!(
+                (got.color(), got.width(), got.height()),
+                (want.color(), want.width(), want.height()),
+                "{what}"
+            );
+            assert!(got.as_bytes() == want.as_bytes(), "{what}");
+            checked += 1;
+        }
+    };
+    for layout in 0..ORIENTATION_LAYOUTS {
+        for (w, h) in [(1, 1), (1, 9), (9, 1), (67, 45)] {
+            check(&orientation_frame(layout, w, h), 0..=9);
+        }
+    }
+    // The rows of a 1601 px wide frame that is the last one
+    // under four million bytes.
+    let rows = |layout| {
+        let bytes = orientation_frame(layout, 1, 1).color().bytes_per_pixel();
+        4_000_000 / (1601 * u32::from(bytes))
+    };
+    const RGB: usize = 2;
+    check(&orientation_frame(RGB, 1601, rows(RGB) + 1), 1..=8);
+    check(&orientation_frame(RGB, 1601, rows(RGB)), 5..=6);
+    for layout in [3, 5] {
+        check(&orientation_frame(layout, 1601, rows(layout) + 1), 5..=6);
+    }
+    assert_eq!(checked, ORIENTATION_LAYOUTS * 4 * 10 + 8 + 3 * 2);
 }
 
 #[test]
@@ -4427,12 +4551,20 @@ fn default_format_options_reproduce_the_standing_encoders() {
     let img = gradient_image();
     let src = EncodeBuffers::new(&img);
 
-    // JPEG: jpeg-encoder at quality 80, 4:2:0, baseline.
+    // JPEG: libjpeg-turbo at quality 80, 4:2:0, baseline
+    // (issue #668).
     let rgb = img.to_rgb8();
-    let mut legacy = Vec::new();
-    let mut enc = jpeg_encoder::Encoder::new(&mut legacy, 80);
-    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
-    enc.encode(rgb.as_raw(), 48, 32, jpeg_encoder::ColorType::Rgb)
+    let mut compressor = turbojpeg::Compressor::new().unwrap();
+    compressor.set_quality(80).unwrap();
+    compressor.set_subsamp(turbojpeg::Subsamp::Sub2x2).unwrap();
+    let legacy = compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: rgb.as_raw().as_slice(),
+            width: 48,
+            pitch: 144,
+            height: 32,
+            format: turbojpeg::PixelFormat::RGB,
+        })
         .unwrap();
     let now = encode(
         &src,
@@ -4446,6 +4578,23 @@ fn default_format_options_reproduce_the_standing_encoders() {
     )
     .unwrap();
     assert_eq!(now, legacy, "jpeg default encode changed");
+    // The bytes themselves, not only that two calls into
+    // one library agree. CI runs this test on x86-64 and
+    // on aarch64, under Linux and macOS, and libjpeg-turbo
+    // runs different code on each architecture (AVX2,
+    // Neon), so one digest for all of them is the proof
+    // that a URL renders to the same JPEG on every
+    // platform. A change here changes the bytes of every
+    // JPEG the server has rendered: it needs a new
+    // rendering version.
+    assert_eq!(
+        (now.len(), sha256_hex(&now).as_str()),
+        (
+            1446,
+            "8c110b76daf71afec271dda3a5f6a9e80484899b8d34fbd061f81c515eede21c"
+        ),
+        "jpeg default encode changed"
+    );
 
     // WebP lossy: libwebp, quality 80, method 4, no SNS
     // override.
@@ -4532,6 +4681,748 @@ fn jpeg_options_change_the_encode() {
         ..FormatOptions::default()
     });
     assert_eq!(s420, baseline);
+}
+
+/// SHA-256 of `bytes`, in hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// `img` through the engine's JPEG encoder.
+fn jpeg_bytes(
+    img: &DynamicImage,
+    quality: u8,
+    subsampling: Option<Subsampling>,
+    progressive: bool,
+) -> Vec<u8> {
+    encode(
+        &EncodeBuffers::new(img),
+        StillFormat::Jpeg,
+        Some(quality),
+        None,
+        None,
+        FormatOptions {
+            jpeg_subsampling: subsampling,
+            jpeg_progressive: progressive,
+            ..FormatOptions::default()
+        },
+        DEFAULT_AVIF_SPEED,
+        DEFAULT_JXL_SPEED,
+    )
+    .unwrap()
+}
+
+/// The three chroma layouts a request can name; `None` is
+/// the 4:2:0 a request gets without naming one.
+const JPEG_SUBSAMPLINGS: [Option<Subsampling>; 3] =
+    [None, Some(Subsampling::S422), Some(Subsampling::S444)];
+
+/// A JPEG's segments in file order, as (marker, payload):
+/// everything from SOI to EOI, the entropy-coded data
+/// after each SOS skipped.
+fn jpeg_segments(bytes: &[u8]) -> Vec<(u8, &[u8])> {
+    assert_eq!(&bytes[..2], [0xFF, 0xD8], "no SOI");
+    let mut segments = vec![(0xD8, &bytes[..0])];
+    let mut i = 2;
+    while i < bytes.len() {
+        assert_eq!(bytes[i], 0xFF, "no marker at offset {i}");
+        let marker = bytes[i + 1];
+        if marker == 0xD9 {
+            segments.push((marker, &bytes[..0]));
+            assert_eq!(i + 2, bytes.len(), "bytes after EOI");
+            return segments;
+        }
+        let len = usize::from(u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]));
+        segments.push((marker, &bytes[i + 4..i + 2 + len]));
+        i += 2 + len;
+        if marker == 0xDA {
+            // Entropy-coded data runs to the next marker
+            // that is neither a stuffed zero nor a restart.
+            while bytes[i] != 0xFF || bytes[i + 1] == 0 || (0xD0..=0xD7).contains(&bytes[i + 1]) {
+                i += 1;
+            }
+        }
+    }
+    panic!("no EOI");
+}
+
+/// The quantizer libjpeg derives from `base`, an entry of
+/// the JPEG standard's Annex K tables, at `quality`
+/// (`jpeg_set_quality` held to baseline's 8 bits).
+fn libjpeg_quantizer(base: u16, quality: u8) -> u16 {
+    let quality = u32::from(quality);
+    let scale = if quality < 50 {
+        5000 / quality
+    } else {
+        200 - 2 * quality
+    };
+    ((u32::from(base) * scale + 50) / 100).clamp(1, 255) as u16
+}
+
+/// The JPEG standard's example quantization tables (Annex
+/// K), luminance then chrominance, row by row: the tables
+/// libjpeg scales by the quality.
+#[rustfmt::skip]
+const ANNEX_K: [[u16; 64]; 2] = [
+    [
+        16, 11, 10, 16, 24, 40, 51, 61,
+        12, 12, 14, 19, 26, 58, 60, 55,
+        14, 13, 16, 24, 40, 57, 69, 56,
+        14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68, 109, 103, 77,
+        24, 35, 55, 64, 81, 104, 113, 92,
+        49, 64, 78, 87, 103, 121, 120, 101,
+        72, 92, 95, 98, 112, 100, 103, 99,
+    ],
+    [
+        17, 18, 24, 47, 99, 99, 99, 99,
+        18, 21, 26, 66, 99, 99, 99, 99,
+        24, 26, 56, 99, 99, 99, 99, 99,
+        47, 66, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+    ],
+];
+
+/// The zigzag order a DQT segment stores a table in: the
+/// position in the 8x8 block of each entry in turn.
+#[rustfmt::skip]
+const ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10,
+    17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+#[test]
+fn jpeg_quality_is_libjpegs_scale() {
+    // The `quality(...)` a URL names means what it meant
+    // before issue #668: libjpeg's scaling of the Annex K
+    // tables. The tables in the file say so directly.
+    let img = gradient_image();
+    for quality in [1, 10, 49, 50, 80, 95, 100] {
+        let bytes = jpeg_bytes(&img, quality, None, false);
+        let tables: Vec<&[u8]> = jpeg_segments(&bytes)
+            .into_iter()
+            .filter(|(marker, _)| *marker == 0xDB)
+            .map(|(_, payload)| payload)
+            .collect();
+        assert_eq!(tables.len(), 2, "quality {quality}");
+        for (slot, table) in tables.into_iter().enumerate() {
+            // One 8-bit table per segment: its slot, then
+            // 64 entries.
+            assert_eq!(table.len(), 65, "quality {quality}");
+            assert_eq!(usize::from(table[0]), slot, "quality {quality}");
+            let expected: Vec<u8> = ZIGZAG
+                .iter()
+                .map(|at| libjpeg_quantizer(ANNEX_K[slot][*at], quality) as u8)
+                .collect();
+            assert_eq!(&table[1..], expected, "quality {quality}, table {slot}");
+        }
+    }
+    // A quality outside the scale is brought into it.
+    let encode_at = |quality: u8| jpeg_bytes(&img, quality, None, false);
+    assert_eq!(encode_at(0), encode_at(1));
+    assert_eq!(encode_at(101), encode_at(100));
+    assert_eq!(encode_at(255), encode_at(100));
+}
+
+#[test]
+fn jpeg_layout_is_jfif_then_tables_frame_and_scans() {
+    let img = gradient_image();
+    let markers = |bytes: &[u8]| -> Vec<u8> {
+        jpeg_segments(bytes)
+            .into_iter()
+            .map(|(marker, _)| marker)
+            .collect()
+    };
+    // Baseline: SOI, the JFIF header, two quantization
+    // tables, the frame, the four standard Huffman
+    // tables, one scan, EOI. No Adobe marker, no comment,
+    // no restart interval.
+    let baseline = jpeg_bytes(&img, 80, None, false);
+    assert_eq!(
+        markers(&baseline),
+        [
+            0xD8, 0xE0, 0xDB, 0xDB, 0xC0, 0xC4, 0xC4, 0xC4, 0xC4, 0xDA, 0xD9
+        ]
+    );
+    let segments = jpeg_segments(&baseline);
+    // JFIF 1.01, no density unit, 1:1 pixels, no thumbnail.
+    assert_eq!(segments[1].1, b"JFIF\0\x01\x01\x00\x00\x01\x00\x01\x00\x00");
+    // The frame: 8-bit samples, 32 rows of 48, and Y, Cb
+    // and Cr as components 1 to 3, chroma halved both ways
+    // and on the second quantization table.
+    assert_eq!(
+        segments[4].1,
+        [8, 0, 32, 0, 48, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]
+    );
+    // The Huffman tables are the standard's own (Annex K),
+    // the same in every baseline file: DC then AC for
+    // luminance, DC then AC for chrominance.
+    let tables: Vec<(u8, usize)> = segments[5..9]
+        .iter()
+        .map(|(_, payload)| (payload[0], payload.len()))
+        .collect();
+    assert_eq!(tables, [(0x00, 29), (0x10, 179), (0x01, 29), (0x11, 179)]);
+    let other = jpeg_bytes(&speckled_image(48, 32), 80, None, false);
+    assert_eq!(
+        jpeg_segments(&other)[5..9],
+        segments[5..9],
+        "baseline Huffman tables follow the image"
+    );
+    // The scan covers all three components, interleaved.
+    assert_eq!(segments[9].1, [3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
+    // The other two chroma layouts differ in the frame's Y
+    // sampling alone.
+    for (subsampling, sampling) in [(Subsampling::S422, 0x21), (Subsampling::S444, 0x11)] {
+        let bytes = jpeg_bytes(&img, 80, Some(subsampling), false);
+        assert_eq!(markers(&bytes), markers(&baseline));
+        let frame = jpeg_segments(&bytes)[4].1;
+        assert_eq!(frame[7], sampling);
+        assert_eq!([frame[10], frame[13]], [0x11, 0x11]);
+    }
+    // Progressive: the same header, a progressive frame
+    // (SOF2), then libjpeg's ten scans, each behind the
+    // Huffman table built for it (the DC refinement scan
+    // sends raw bits and needs none).
+    let progressive = jpeg_bytes(&img, 80, None, true);
+    let found = markers(&progressive);
+    assert_eq!(found[..5], [0xD8, 0xE0, 0xDB, 0xDB, 0xC2]);
+    assert_eq!(found.iter().filter(|m| **m == 0xDA).count(), 10);
+    assert!(
+        found[5..found.len() - 1]
+            .iter()
+            .all(|m| matches!(m, 0xC4 | 0xDA)),
+        "{found:02X?}"
+    );
+    assert_eq!(found.last(), Some(&0xD9));
+    assert_eq!(jpeg_segments(&progressive)[1].1, segments[1].1);
+}
+
+/// A JPEG decoded by the engine's own decoder (zune-jpeg)
+/// and by libjpeg-turbo, the decoder Chrome and Firefox
+/// read JPEG with, each as RGB rows.
+fn jpeg_decodes(bytes: &[u8], width: u32, height: u32) -> [Vec<u8>; 2] {
+    let ours = decode_image(bytes).expect("the engine decodes its own JPEG");
+    assert_eq!((ours.width(), ours.height()), (width, height));
+    let theirs = turbojpeg::decompress(bytes, turbojpeg::PixelFormat::RGB)
+        .expect("libjpeg-turbo decodes the JPEG");
+    assert_eq!(
+        (theirs.width, theirs.height, theirs.pitch),
+        (width as usize, height as usize, width as usize * 3)
+    );
+    [ours.to_rgb8().into_raw(), theirs.pixels]
+}
+
+/// The largest error, per channel, that a flat color can
+/// come back with from a JPEG at `quality`. A flat block
+/// is its DC term alone, 8 times the sample less 128, so
+/// a quantizer step of `q` moves a sample by at most
+/// `q / 16`. Rounding to whole samples on the way in adds
+/// half a level per component, and blue leans hardest on
+/// chroma, with 1.772 of Cb. Two levels more are the
+/// decoder's: its inverse DCT and its color conversion
+/// each round in their own fixed point, which differs
+/// between decoders and between one decoder's code for
+/// different CPUs.
+fn flat_tolerance(quality: u8) -> u8 {
+    let sample = |dc_base| f64::from(libjpeg_quantizer(dc_base, quality)) / 16.0 + 0.5;
+    (sample(ANNEX_K[0][0]) + 1.772 * sample(ANNEX_K[1][0]) + 2.0).ceil() as u8
+}
+
+/// The largest root-mean-square error a gray image, whose
+/// chroma is flat, can come back with at `quality`. The
+/// DCT is orthonormal, so a block's squared pixel error is
+/// its squared coefficient error, and quantizing moves a
+/// coefficient by at most half its step. The blocks also
+/// cover the padding around a size that is not a multiple
+/// of 8; at worst all of the error lands on the pixels
+/// that show. Rounding adds a level and a half.
+fn gray_rms_tolerance(quality: u8, width: u32, height: u32) -> f64 {
+    let mean_square = ANNEX_K[0]
+        .iter()
+        .map(|base| (f64::from(libjpeg_quantizer(*base, quality)) / 2.0).powi(2))
+        .sum::<f64>()
+        / 64.0;
+    let covered = f64::from(width.div_ceil(8) * 8 * height.div_ceil(8) * 8);
+    (mean_square * covered / f64::from(width * height)).sqrt() + 1.5
+}
+
+/// Tiny and flat images come back as they went in. The
+/// encoder before libjpeg-turbo could not be trusted with
+/// image-derived Huffman tables here: for exactly these
+/// images it wrote files zune-jpeg decoded to the wrong
+/// colors (issue #38: a flat green 16x16 came back as
+/// (0, 105, 0)). libjpeg derives the tables of every
+/// progressive file from the image, and a flat image is
+/// the degenerate case, with one symbol to code. So each
+/// file is read back by the engine's decoder and by
+/// libjpeg-turbo, baseline and progressive, in the three
+/// chroma layouts, from the lowest quality to the highest.
+#[test]
+fn jpeg_round_trips_tiny_and_flat_images() {
+    const SIZES: [(u32, u32); 9] = [
+        (1, 1),
+        (1, 7),
+        (7, 1),
+        (7, 5),
+        (1, 33),
+        (33, 1),
+        (8, 8),
+        (16, 16),
+        (17, 9),
+    ];
+    const COLORS: [[u8; 3]; 7] = [
+        [0, 0, 0],
+        [255, 255, 255],
+        [128, 128, 128],
+        [0, 255, 1],
+        [255, 0, 0],
+        [0, 0, 255],
+        [37, 201, 113],
+    ];
+    let mut files = 0;
+    for quality in [1, 25, 50, 80, 95, 100] {
+        let tolerance = flat_tolerance(quality);
+        for subsampling in JPEG_SUBSAMPLINGS {
+            for progressive in [false, true] {
+                let case = format!("quality {quality}, {subsampling:?}, progressive {progressive}");
+                for (width, height) in SIZES {
+                    for color in COLORS {
+                        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                            width,
+                            height,
+                            image::Rgb(color),
+                        ));
+                        let bytes = jpeg_bytes(&img, quality, subsampling, progressive);
+                        files += 1;
+                        for (decoder, pixels) in
+                            jpeg_decodes(&bytes, width, height).iter().enumerate()
+                        {
+                            for (i, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
+                                let off = pixel.iter().zip(color).map(|(a, b)| a.abs_diff(b)).max();
+                                assert!(
+                                    off <= Some(tolerance),
+                                    "{width}x{height} of {color:?}, {case}: decoder {decoder} \
+                                     read pixel {i} as {pixel:?} (tolerance {tolerance})"
+                                );
+                            }
+                        }
+                    }
+                    // The same sizes, not flat: a gray ramp
+                    // from black to white along the longer
+                    // side.
+                    let span = (width.max(height) - 1).max(1);
+                    let ramp = image::RgbImage::from_fn(width, height, |x, y| {
+                        let v = (x.max(y) * 255 / span) as u8;
+                        image::Rgb([v, v, v])
+                    });
+                    let bytes = jpeg_bytes(
+                        &DynamicImage::ImageRgb8(ramp.clone()),
+                        quality,
+                        subsampling,
+                        progressive,
+                    );
+                    files += 1;
+                    let limit = gray_rms_tolerance(quality, width, height);
+                    let decodes = jpeg_decodes(&bytes, width, height);
+                    for (decoder, pixels) in decodes.iter().enumerate() {
+                        let squares: f64 = pixels
+                            .iter()
+                            .zip(ramp.as_raw())
+                            .map(|(a, b)| f64::from(a.abs_diff(*b)).powi(2))
+                            .sum();
+                        let rms = (squares / pixels.len() as f64).sqrt();
+                        assert!(
+                            rms <= limit,
+                            "{width}x{height} ramp, {case}: decoder {decoder} is off by \
+                             {rms:.1} rms (tolerance {limit:.1})"
+                        );
+                    }
+                    // Whatever the quality cost, the two
+                    // decoders read the same picture.
+                    let apart = decodes[0]
+                        .iter()
+                        .zip(&decodes[1])
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max();
+                    assert!(
+                        apart <= Some(DECODERS_APART),
+                        "{width}x{height} ramp, {case}: the decoders differ by {apart:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(files, 6 * 3 * 2 * 9 * 8);
+}
+
+/// How far the engine's decoder and libjpeg-turbo may sit
+/// apart on one sample of a gray image: each rounds its
+/// inverse DCT its own way.
+const DECODERS_APART: u8 = 3;
+
+/// An image with busy and smooth parts: speckle on the
+/// left half, a gradient on the right, so an encode has
+/// long and short runs of zero coefficients to code.
+fn speckled_image(width: u32, height: u32) -> DynamicImage {
+    let mut state: u32 = 0x2545_F491 ^ (width << 16) ^ height;
+    DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        if x * 2 < width {
+            image::Rgb([(state >> 24) as u8, (state >> 16) as u8, (state >> 8) as u8])
+        } else {
+            image::Rgb([
+                (x * 5 + y * 3) as u8,
+                (x * x + y * 7) as u8,
+                (x * 11 + y * y) as u8,
+            ])
+        }
+    }))
+}
+
+/// One line per JPEG, its size and SHA-256, for a set of
+/// encodes that walks libjpeg-turbo's vector code: widths
+/// on both sides of the 8, 16 and 32 pixel steps its loops
+/// take, so every loop's tail runs, in the three chroma
+/// layouts, baseline and progressive, and the ends and the
+/// middle of the quality scale.
+fn jpeg_digest_lines() -> String {
+    let mut lines = String::new();
+    let mut add = |img: &DynamicImage, quality: u8| {
+        for subsampling in JPEG_SUBSAMPLINGS {
+            for progressive in [false, true] {
+                let bytes = jpeg_bytes(img, quality, subsampling, progressive);
+                lines.push_str(&format!(
+                    "{}x{} quality {quality} {subsampling:?} progressive {progressive}: {} bytes {}\n",
+                    img.width(),
+                    img.height(),
+                    bytes.len(),
+                    sha256_hex(&bytes)
+                ));
+            }
+        }
+    };
+    for width in [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 97] {
+        add(&speckled_image(width, 11), 80);
+    }
+    for quality in [1, 37, 100] {
+        add(&speckled_image(97, 61), quality);
+    }
+    lines
+}
+
+/// Not a test on its own: the process
+/// `jpeg_bytes_are_the_same_with_and_without_vector_code`
+/// starts, by re-running this test binary with one of
+/// libjpeg-turbo's switches set, writes its digests where
+/// that test reads them.
+#[test]
+#[ignore = "a helper the vector-code test runs as its child"]
+fn jpeg_digests_helper() {
+    let Ok(path) = std::env::var("CRABCROP_TEST_JPEG_DIGESTS") else {
+        return;
+    };
+    std::fs::write(path, jpeg_digest_lines()).unwrap();
+}
+
+/// The encoder writes the same bytes whatever the CPU
+/// offers. libjpeg-turbo picks its code per host: AVX2 or
+/// SSE2 on x86-64, Neon on aarch64, plain C where it finds
+/// neither, and for Huffman coding a vector routine of its
+/// own. Two replicas of one deployment on different hosts
+/// must render one URL to the same bytes, so the set of
+/// encodes above is repeated in child processes with the
+/// library's own switches set: `JSIMD_FORCENONE` leaves it
+/// the plain C paths, `JSIMD_FORCESSE2` withholds AVX2,
+/// `JSIMD_NOHUFFENC` the vector Huffman coder. (A switch a
+/// platform does not know changes nothing there.) The
+/// digest of the whole set is pinned as well: CI runs this
+/// test on x86-64 and on aarch64, under Linux and macOS, so
+/// it is also the proof that those write the same bytes.
+#[test]
+fn jpeg_bytes_are_the_same_with_and_without_vector_code() {
+    use std::process::{Command, Stdio};
+    let here = jpeg_digest_lines();
+    assert_eq!(here.lines().count(), 20 * 6);
+    let dir = crate::test_support::scratch_dir("jpeg-digests");
+    for switch in ["JSIMD_FORCENONE", "JSIMD_FORCESSE2", "JSIMD_NOHUFFENC"] {
+        let path = dir.join(switch);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::jpeg_digests_helper",
+                "--ignored",
+                "--test-threads=1",
+                "--quiet",
+            ])
+            .env(switch, "1")
+            .env("CRABCROP_TEST_JPEG_DIGESTS", &path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{switch}: {status}");
+        let there = std::fs::read_to_string(&path).expect("the child wrote its digests");
+        assert_eq!(there, here, "the bytes differ with {switch}=1");
+    }
+    assert_eq!(
+        sha256_hex(here.as_bytes()),
+        "95da092e75c2bc5eb60233af4dd427e35bb3643785797f54c89e2d4fd51a4889",
+        "the JPEG encoder's bytes changed:\n{here}"
+    );
+}
+
+#[test]
+fn jpeg_refuses_the_sizes_the_format_and_libjpeg_do_not_take() {
+    let encode_sized = |width: u32, height: u32| {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            width,
+            height,
+            image::Rgb([40, 90, 200]),
+        ));
+        encode(
+            &EncodeBuffers::new(&img),
+            StillFormat::Jpeg,
+            Some(80),
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+    };
+    let refusal = |width: u32, height: u32| match encode_sized(width, height) {
+        Err(EngineError::Encode(message)) => message,
+        Err(other) => panic!("{width}x{height}: {other:?}"),
+        Ok(bytes) => panic!("{width}x{height} encoded to {} bytes", bytes.len()),
+    };
+    // libjpeg's ceiling, 65,500, still encodes.
+    for (width, height) in [(65_500, 1), (1, 65_500)] {
+        let bytes = encode_sized(width, height).unwrap();
+        let header = turbojpeg::read_header(&bytes).unwrap();
+        assert_eq!(
+            (header.width, header.height),
+            (width as usize, height as usize)
+        );
+    }
+    // A side between that and the format's 65,535 is
+    // libjpeg's refusal, returned as an encode error.
+    for (width, height) in [(65_501, 1), (65_535, 1), (1, 65_501), (1, 65_535)] {
+        let message = refusal(width, height);
+        assert!(
+            message.starts_with("jpeg: ") && message.contains("65500"),
+            "{width}x{height}: {message}"
+        );
+    }
+    // Past the format's limit the engine's own check
+    // answers, before the encoder is called.
+    for (width, height) in [(65_536, 1), (1, 65_536)] {
+        assert_eq!(
+            refusal(width, height),
+            "jpeg: dimension exceeds the 65535 format limit"
+        );
+    }
+    // A frame with no pixels is refused as well, not
+    // written as an empty file.
+    for (width, height) in [(0, 4), (4, 0)] {
+        let message = refusal(width, height);
+        assert!(message.starts_with("jpeg: "), "{width}x{height}: {message}");
+    }
+}
+
+#[test]
+fn jpeg_takes_every_pixel_layout_as_8_bit_rgb() {
+    // Three components always: a gray image is written as
+    // Y with neutral chroma, not as a one-component file,
+    // and comes back with equal channels.
+    let gray = image::GrayImage::from_fn(24, 16, |x, y| image::Luma([(x * 9 + y * 3) as u8]));
+    let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageLuma8(gray.clone()).to_rgb8());
+    let reference = jpeg_bytes(&rgb, 90, None, false);
+    let frame = jpeg_segments(&reference)
+        .into_iter()
+        .find(|(marker, _)| *marker == 0xC0)
+        .expect("a baseline frame")
+        .1;
+    assert_eq!(frame[5], 3, "components");
+    for pixels in jpeg_decodes(&reference, 24, 16) {
+        assert!(
+            pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|p| p[0] == p[1] && p[1] == p[2])
+        );
+    }
+    // Gray, gray with alpha, 16-bit and float layouts of the
+    // same picture all reach the encoder as the same RGB.
+    for layout in [
+        DynamicImage::ImageLuma8(gray.clone()),
+        DynamicImage::ImageLumaA8(DynamicImage::ImageLuma8(gray.clone()).to_luma_alpha8()),
+        DynamicImage::ImageLuma16(rgb.to_luma16()),
+        DynamicImage::ImageRgb16(rgb.to_rgb16()),
+        DynamicImage::ImageRgba16(rgb.to_rgba16()),
+        DynamicImage::ImageRgb32F(rgb.to_rgb32f()),
+        DynamicImage::ImageRgba32F(rgb.to_rgba32f()),
+    ] {
+        assert_eq!(
+            jpeg_bytes(&layout, 90, None, false),
+            reference,
+            "{:?}",
+            layout.color()
+        );
+    }
+    // Alpha: with a fill the picture is composited over
+    // it, without one the stored colors are written as
+    // they are.
+    let translucent = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(24, 16, |x, y| {
+        image::Rgba([200, (x * 10) as u8, (y * 15) as u8, (x * 11) as u8])
+    }));
+    let encode_filled = |fill| {
+        encode(
+            &EncodeBuffers::new(&translucent),
+            StillFormat::Jpeg,
+            Some(90),
+            fill,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap()
+    };
+    let over_blue = DynamicImage::ImageRgb8(flatten(&translucent, [0, 0, 255]));
+    assert_eq!(
+        encode_filled(Some([0, 0, 255])),
+        jpeg_bytes(&over_blue, 90, None, false)
+    );
+    let stored = DynamicImage::ImageRgb8(translucent.to_rgb8());
+    assert_eq!(encode_filled(None), jpeg_bytes(&stored, 90, None, false));
+    assert_ne!(encode_filled(None), encode_filled(Some([0, 0, 255])));
+}
+
+/// The steps that work on the encoded bytes still fit the
+/// file libjpeg-turbo writes. The injector puts the EXIF,
+/// XMP, Photoshop and profile segments right after SOI,
+/// ahead of the JFIF header, and leaves the rest of the
+/// file as the encoder wrote it; the C2PA signer adds its
+/// manifest store on top. After both, each decoder reads
+/// the picture it read before, the metadata reads back, and
+/// the manifest validates, baseline and progressive. The
+/// signed file is then the parent of a second signing, as
+/// one render's output is when it is the source of the
+/// next: its store is found and its signature checked.
+#[test]
+fn jpeg_takes_metadata_a_profile_and_a_manifest() {
+    use crate::color::fixture;
+    let img = gradient_image();
+    let icc = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let photoshop = [
+        b"Photoshop 3.0\0".as_slice(),
+        &fixture::irb(0x0404, b"\x1c\x02\x00\x00\x02\x00\x04"),
+    ]
+    .concat();
+    let meta = crate::color::SourceMeta {
+        icc: Some(icc.clone()),
+        exif_tiff: Some(fixture::camera(true, 1, (48, 32), &[]).tiff),
+        xmp: Some(b"<x:xmpmeta>fixture</x:xmpmeta>".to_vec()),
+        xmp_compressed: false,
+        photoshop: Some(photoshop),
+    };
+    // What a reader of the output finds: the segments as
+    // they went in.
+    let carries = |bytes: &[u8]| {
+        let read = crate::color::extract_source_meta(bytes, true);
+        assert_eq!(read.icc, meta.icc);
+        assert_eq!(read.xmp, meta.xmp);
+        assert_eq!(fixture::carried_exif(bytes), meta.exif_tiff);
+        assert_eq!(fixture::carried_photoshop(bytes), meta.photoshop);
+    };
+    let signer = crate::provenance::test_signer();
+    for progressive in [false, true] {
+        let plain = jpeg_bytes(&img, 80, None, progressive);
+        let pixels = jpeg_decodes(&plain, 48, 32);
+        let tagged = crate::color::inject_jpeg(&plain, Some(&icc), &meta, true);
+        let segments = jpeg_segments(&tagged);
+        let markers: Vec<u8> = segments.iter().map(|(marker, _)| *marker).collect();
+        assert_eq!(
+            markers[..6],
+            [0xD8, 0xE1, 0xE1, 0xED, 0xE2, 0xE0],
+            "progressive {progressive}"
+        );
+        assert_eq!(
+            segments[5..],
+            jpeg_segments(&plain)[1..],
+            "progressive {progressive}: the encoder's segments moved"
+        );
+        assert_eq!(jpeg_decodes(&tagged, 48, 32), pixels);
+        carries(&tagged);
+        let signed = signer
+            .sign(
+                &tagged,
+                "image/jpeg",
+                &crate::provenance::SignRequest {
+                    ingredient: None,
+                    ai_edited: false,
+                },
+            )
+            .expect("the output signs");
+        let summary = crate::provenance::read_manifest(&signed, "image/jpeg")
+            .expect("the signed output carries a manifest");
+        assert_eq!(summary.state, "valid", "progressive {progressive}");
+        // The store travels in APP11 segments, and nothing
+        // the encoder or the injector wrote is lost.
+        let signed_segments = jpeg_segments(&signed);
+        assert!(signed_segments.iter().any(|(marker, _)| *marker == 0xEB));
+        let kept: Vec<_> = signed_segments
+            .into_iter()
+            .filter(|(marker, _)| *marker != 0xEB)
+            .collect();
+        assert_eq!(kept, segments, "progressive {progressive}");
+        assert_eq!(jpeg_decodes(&signed, 48, 32), pixels);
+        carries(&signed);
+        // As a parent ingredient: the signer reads the
+        // store back out of the file's segments, records
+        // that its signature checked, and leaves the store
+        // itself out of the new file.
+        let child = signer
+            .sign(
+                &tagged,
+                "image/jpeg",
+                &crate::provenance::SignRequest {
+                    ingredient: Some((signed.as_slice(), "image/jpeg")),
+                    ai_edited: false,
+                },
+            )
+            .expect("the output signs with a parent");
+        let summary = crate::provenance::read_manifest(&child, "image/jpeg")
+            .expect("the signed output carries a manifest");
+        assert_eq!(summary.state, "valid", "progressive {progressive}");
+        assert_eq!(summary.manifests, 1, "progressive {progressive}");
+        assert_eq!(summary.ingredients, 1, "progressive {progressive}");
+        let store: serde_json::Value =
+            serde_json::from_str(&crate::provenance::manifest_json(&child, "image/jpeg")).unwrap();
+        let active = store["active_manifest"]
+            .as_str()
+            .expect("an active manifest");
+        let parent = &store["manifests"][active]["ingredients"][0];
+        assert!(
+            parent["validation_results"]["activeManifest"]["success"]
+                .as_array()
+                .is_some_and(|codes| codes
+                    .iter()
+                    .any(|status| status["code"] == "claimSignature.validated")),
+            "progressive {progressive}: the parent's store was not read: {parent}"
+        );
+    }
 }
 
 #[test]

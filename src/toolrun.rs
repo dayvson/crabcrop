@@ -394,7 +394,11 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     }
     // Then the exit status, under the same deadline: a tool
     // that closed its output and then hung still gets killed
-    // on time.
+    // on time. The pipes close as the tool exits, a moment
+    // before it can be reaped, so the first naps are short:
+    // that moment used to cost most runs a whole 5 ms poll
+    // (issue #647).
+    let mut nap = Duration::from_micros(50);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -403,7 +407,8 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
                     kill_tool(&mut child);
                     return Err(ToolError::TimedOut);
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(Duration::from_millis(5));
             }
             Err(e) => return Err(ToolError::Wait(e)),
         }

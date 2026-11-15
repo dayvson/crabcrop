@@ -15,9 +15,12 @@
 # scripts/build_dav1d.sh pins for the release binaries.
 FROM rust:1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
 WORKDIR /build
-# pkg-config + the dav1d headers for the avif-decode build.
+# pkg-config + the dav1d headers for the avif-decode build;
+# cmake for libjpeg-turbo, the JPEG encoder, which the build
+# compiles from the sources its crate vendors; nasm for its
+# assembly and the AVIF encoder's.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config libdav1d-dev nasm \
+    && apt-get install -y --no-install-recommends pkg-config libdav1d-dev nasm cmake \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates

@@ -40,7 +40,11 @@
 //!   -format_whitelist <containers> -filter_threads 2
 //!   -threads <n> -max_pixels <bound> -codec_whitelist
 //!   <decoders> -i fd: -ss <t> -frames:v 1 -an -sn -dn
-//!   -threads 2 -f image2pipe -vcodec png pipe:1`. The
+//!   -threads 2 -f image2pipe -vcodec png
+//!   -compression_level 1 -pred up pipe:1`. The two PNG
+//!   encoder settings make the PNG cheap to write (see
+//!   [`LIGHT_PNG`]); a run that needs the encoder's
+//!   defaults leaves them out. The
 //!   seek is output-side, which is the accurate form:
 //!   the tool decodes forward and returns the first frame
 //!   at or after `t`, and nothing when `t` is past the
@@ -106,6 +110,43 @@ use crate::url::FrameSelection;
 /// budgets, so anything larger is a broken or hostile
 /// tool, not a frame.
 pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
+
+/// The PNG encoder settings of an extraction run (issue
+/// #647). The PNG only carries the frame to this process,
+/// which decodes it at once, and at FFmpeg's defaults (zlib
+/// level 6, no row filter) writing it is most of the run:
+/// about 250 of the 360 ms a 1080p frame takes. Level 1 with
+/// the `up` filter is lossless all the same, so the frame is
+/// the same pixels, takes about a third of the time, and on
+/// video frames comes out no larger (2.28 MB against 2.33 MB
+/// for that frame).
+const LIGHT_PNG: [&str; 4] = ["-compression_level", "1", "-pred", "up"];
+
+/// Whether a PNG of a `width` by `height` frame is within
+/// `cap` bytes whatever the encoder's settings, the frame's
+/// content and the depth of its pixels: at eight bytes a
+/// pixel (16-bit RGBA, the deepest the PNG encoder writes)
+/// and a filter byte a row, with one part in 128 on top for
+/// what deflate and the chunk framing add to data that does
+/// not compress (under half a percent), and 64 KiB for the
+/// other chunks. Either side may be the row, since a frame
+/// can come out rotated. For such a frame the cap admits
+/// the light PNG exactly when it admits the default one:
+/// always.
+fn any_png_fits(width: u32, height: u32, cap: usize) -> bool {
+    let raw = u128::from(width) * u128::from(height) * 8 + u128::from(width.max(height));
+    raw + raw / 128 + 64 * 1024 <= cap as u128
+}
+
+/// The frame size a PNG's header declares, when it has one.
+fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    let header = png.get(..24)?;
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
+        return None;
+    }
+    let side = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().expect("four bytes"));
+    Some((side(16), side(20)))
+}
 
 /// The input formats the extractor accepts (issue #361):
 /// the container demuxers a video source can legitimately
@@ -318,6 +359,10 @@ impl std::error::Error for FrameError {}
 pub struct VideoFrameExtractor {
     program: PathBuf,
     timeout: Duration,
+    /// The cap on an extracted frame's PNG,
+    /// [`MAX_FRAME_PNG_BYTES`]; a field so that a test can
+    /// meet it with a small file.
+    max_frame_png: usize,
 }
 
 impl VideoFrameExtractor {
@@ -345,7 +390,11 @@ impl VideoFrameExtractor {
                 )));
             }
         }
-        Ok(Self { program, timeout })
+        Ok(Self {
+            program,
+            timeout,
+            max_frame_png: MAX_FRAME_PNG_BYTES,
+        })
     }
 
     /// Probe the source: its duration, its first video
@@ -451,8 +500,16 @@ impl VideoFrameExtractor {
         let step = frame_interval(probe.fps);
         let (coded_width, coded_height) = probe.largest_coded();
         let threads = decoder_threads(coded_width, coded_height);
+        // The light PNG is asked for only where the cap admits
+        // a frame's PNG at any settings, whichever stream the
+        // tool decodes: a larger frame keeps the encoder's
+        // defaults, so the cap admits what it always has.
+        let light = probe.streams.iter().all(|stream| {
+            let (width, height) = stream.displayed;
+            any_png_fits(width, height, self.max_frame_png)
+        });
         for attempt in 0..=3 {
-            let png = self.extract_at(&input, timestamp, threads, deadline)?;
+            let png = self.extract_at(&input, timestamp, threads, deadline, light)?;
             if !png.is_empty() {
                 if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Err(FrameError::Failed(
@@ -482,76 +539,113 @@ impl VideoFrameExtractor {
         )))
     }
 
-    /// One extraction run at an already-resolved
-    /// timestamp. An empty `Ok` means the tool ran fine
-    /// and there is no frame at that time (the caller
-    /// decides whether to step back). No frame from a run
-    /// whose decoder refused a frame past the budget is
-    /// `NotVideo`, whatever the exit status: an earlier
-    /// timestamp would only answer with a different frame
-    /// than the one asked for. Any other failure is
-    /// `Failed`. The decoder runs on `decoder_threads`
-    /// threads (see [`decoder_threads`]).
+    /// The frame at an already-resolved timestamp, as PNG
+    /// bytes. An empty `Ok` means the tool ran fine and there
+    /// is no frame at that time (the caller decides whether to
+    /// step back). No frame from a run whose decoder refused a
+    /// frame past the budget is `NotVideo`, whatever the exit
+    /// status: an earlier timestamp would only answer with a
+    /// different frame than the one asked for. Any other
+    /// failure is `Failed`. The decoder runs on
+    /// `decoder_threads` threads (see [`decoder_threads`]).
+    ///
+    /// With `light`, the first run asks for the light PNG (see
+    /// [`LIGHT_PNG`]). Its answer stands when it is no frame,
+    /// the decoder's refusal of a frame past the budget, a
+    /// timeout, or a frame whose PNG the cap admits at any
+    /// settings. Anything else is settled by a run at the
+    /// encoder's defaults, the run every extraction was
+    /// before: an output past the cap, a frame larger than the
+    /// probe reported, or a failed run (a decoder that does
+    /// not take the settings among them). So the cap admits
+    /// and refuses the frames it always has, and a failure
+    /// reads as it always has.
     fn extract_at(
         &self,
         input: &File,
         timestamp: f64,
         decoder_threads: usize,
         deadline: Instant,
+        light: bool,
     ) -> Result<Vec<u8>, FrameError> {
+        if light {
+            match self.extraction_run(input, timestamp, decoder_threads, deadline, &LIGHT_PNG) {
+                Ok(run) => match frame_of(run) {
+                    Ok(png)
+                        if png_size(&png).is_none_or(|(width, height)| {
+                            any_png_fits(width, height, self.max_frame_png)
+                        }) =>
+                    {
+                        return Ok(png);
+                    }
+                    // No encoder setting changes what the
+                    // decoder refuses.
+                    Err(refusal @ FrameError::NotVideo(_)) => return Err(refusal),
+                    Ok(_) | Err(_) => {}
+                },
+                // The deadline has passed: a second run would
+                // only start to be killed.
+                Err(timeout @ RunError::Tool(ToolError::TimedOut)) => {
+                    return Err(self.run_failure(timeout));
+                }
+                Err(_) => {}
+            }
+        }
+        let run = self
+            .extraction_run(input, timestamp, decoder_threads, deadline, &[])
+            .map_err(|e| self.run_failure(e))?;
+        frame_of(run)
+    }
+
+    /// One extraction run, with `png_settings` for the PNG
+    /// encoder, or none for its defaults.
+    fn extraction_run(
+        &self,
+        input: &File,
+        timestamp: f64,
+        decoder_threads: usize,
+        deadline: Instant,
+        png_settings: &[&str],
+    ) -> Result<ToolRun, RunError> {
         let seek = format_seconds(timestamp);
         let few = FEW_THREADS.to_string();
         let decoder = decoder_threads.to_string();
         let max_pixels = DECODER_MAX_PIXELS.to_string();
-        let run = self.run(
-            &[
-                "-nostdin",
-                "-v",
-                "info",
-                "-protocol_whitelist",
-                "fd",
-                "-format_whitelist",
-                FORMAT_WHITELIST,
-                "-filter_threads",
-                &few,
-                "-threads",
-                &decoder,
-                "-max_pixels",
-                &max_pixels,
-                "-codec_whitelist",
-                CODEC_WHITELIST,
-                "-i",
-                "fd:",
-                "-ss",
-                &seek,
-                "-frames:v",
-                "1",
-                "-an",
-                "-sn",
-                "-dn",
-                "-threads",
-                &few,
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "png",
-                "pipe:1",
-            ],
-            input,
-            MAX_FRAME_PNG_BYTES,
-            deadline,
-        )?;
-        if run.stdout.is_empty() && met_the_pixel_bound(&run) {
-            return Err(frame_past_the_budget());
-        }
-        if !run.status.success() {
-            return Err(FrameError::Failed(format!(
-                "video decoder exited with {}: {}",
-                run.status,
-                run.stderr_excerpt()
-            )));
-        }
-        Ok(run.stdout)
+        let mut args = vec![
+            "-nostdin",
+            "-v",
+            "info",
+            "-protocol_whitelist",
+            "fd",
+            "-format_whitelist",
+            FORMAT_WHITELIST,
+            "-filter_threads",
+            &few,
+            "-threads",
+            &decoder,
+            "-max_pixels",
+            &max_pixels,
+            "-codec_whitelist",
+            CODEC_WHITELIST,
+            "-i",
+            "fd:",
+            "-ss",
+            &seek,
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-threads",
+            &few,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+        ];
+        args.extend_from_slice(png_settings);
+        args.push("pipe:1");
+        self.try_run(&args, input, self.max_frame_png, deadline)
     }
 
     /// Run the program once through the shared runner
@@ -566,11 +660,21 @@ impl VideoFrameExtractor {
         max_stdout: usize,
         deadline: Instant,
     ) -> Result<ToolRun, FrameError> {
-        let staging_failed = |e: std::io::Error| {
-            FrameError::Failed(format!("staging the video for the decoder failed: {e}"))
-        };
-        let mut stdin = input.try_clone().map_err(staging_failed)?;
-        stdin.rewind().map_err(staging_failed)?;
+        self.try_run(args, input, max_stdout, deadline)
+            .map_err(|e| self.run_failure(e))
+    }
+
+    /// [`Self::run`] before its failure is put into words, for
+    /// a caller that settles a failed run with another.
+    fn try_run(
+        &self,
+        args: &[&str],
+        input: &File,
+        max_stdout: usize,
+        deadline: Instant,
+    ) -> Result<ToolRun, RunError> {
+        let mut stdin = input.try_clone().map_err(RunError::Staging)?;
+        stdin.rewind().map_err(RunError::Staging)?;
         run_tool(ToolCommand {
             program: &self.program,
             args,
@@ -581,23 +685,56 @@ impl VideoFrameExtractor {
             cpu_limit: tool_cpu_limit(self.timeout),
             max_address_space: DECODER_MAX_ADDRESS_SPACE,
         })
-        .map_err(|e| {
-            FrameError::Failed(match e {
-                ToolError::Spawn(e) => format!(
-                    "could not start the video decoder {}: {e}",
-                    self.program.display()
-                ),
-                ToolError::OutputCap(cap) => {
-                    format!("the decoder's output passed the {cap} byte cap")
-                }
-                ToolError::Read(e) => format!("reading the decoder's output failed: {e}"),
-                ToolError::TimedOut => {
-                    format!("video decoder timed out after {}s", self.timeout.as_secs())
-                }
-                ToolError::Wait(e) => format!("waiting on the video decoder failed: {e}"),
-            })
+        .map_err(RunError::Tool)
+    }
+
+    /// The failure a run that did not complete reports.
+    fn run_failure(&self, error: RunError) -> FrameError {
+        FrameError::Failed(match error {
+            RunError::Staging(e) => format!("staging the video for the decoder failed: {e}"),
+            RunError::Tool(ToolError::Spawn(e)) => format!(
+                "could not start the video decoder {}: {e}",
+                self.program.display()
+            ),
+            RunError::Tool(ToolError::OutputCap(cap)) => {
+                format!("the decoder's output passed the {cap} byte cap")
+            }
+            RunError::Tool(ToolError::Read(e)) => {
+                format!("reading the decoder's output failed: {e}")
+            }
+            RunError::Tool(ToolError::TimedOut) => {
+                format!("video decoder timed out after {}s", self.timeout.as_secs())
+            }
+            RunError::Tool(ToolError::Wait(e)) => {
+                format!("waiting on the video decoder failed: {e}")
+            }
         })
     }
+}
+
+/// Why a run of the tool did not complete.
+enum RunError {
+    /// The staged source could not be handed to the tool.
+    Staging(std::io::Error),
+    /// The runner's own failure.
+    Tool(ToolError),
+}
+
+/// What an extraction run that completed handed back: the
+/// frame's PNG, nothing when there is no frame at that time,
+/// or the refusal its report or exit status names.
+fn frame_of(run: ToolRun) -> Result<Vec<u8>, FrameError> {
+    if run.stdout.is_empty() && met_the_pixel_bound(&run) {
+        return Err(frame_past_the_budget());
+    }
+    if !run.status.success() {
+        return Err(FrameError::Failed(format!(
+            "video decoder exited with {}: {}",
+            run.status,
+            run.stderr_excerpt()
+        )));
+    }
+    Ok(run.stdout)
 }
 
 /// Refuse a probed frame past the decode budget, in any of
