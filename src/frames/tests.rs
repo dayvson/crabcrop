@@ -808,6 +808,310 @@ fn the_extraction_decoder_runs_on_the_default_thread_count_up_to_dci_4k() {
     }
 }
 
+/// The extraction lines of a recorded argv log: every run
+/// but the probe, which comes first.
+fn extraction_runs(record: &Path) -> Vec<String> {
+    let recorded = std::fs::read_to_string(record).unwrap();
+    recorded.lines().skip(1).map(str::to_string).collect()
+}
+
+/// The arguments an extraction ends with at the encoder's
+/// defaults, the whole PNG encoder section before issue #647.
+const DEFAULT_PNG_TAIL: &str = " -f image2pipe -vcodec png pipe:1";
+
+/// The same section with the light PNG settings.
+const LIGHT_PNG_TAIL: &str = " -f image2pipe -vcodec png -compression_level 1 -pred up pipe:1";
+
+/// A PNG signature and header for a `width` by `height`
+/// frame, followed by `rest`, as a `printf` format string.
+fn png_printf(width: u32, height: u32, rest: &str) -> String {
+    let mut out = String::from("\\211PNG\\015\\012\\032\\012\\000\\000\\000\\015IHDR");
+    for byte in width.to_be_bytes().into_iter().chain(height.to_be_bytes()) {
+        out.push_str(&format!("\\{byte:03o}"));
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn the_extraction_asks_for_a_light_png() {
+    // Issue #647: the PNG only carries the frame to this
+    // process, so the run asks the encoder for its fastest
+    // lossless settings, right before the output target.
+    // One run does it: the answer stands.
+    let records = temp_dir("light-png");
+    let record = records.join("argv.log");
+    let script = recording_tool(
+        &record,
+        "yuv420p, 1920x1080, 25 fps, 25 tbr",
+        "",
+        EXTRACT_PNG,
+    );
+    let (_tool, program) = fake_tool("light-png", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap();
+    let runs = extraction_runs(&record);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+    // A real header for a frame of the probed size is read
+    // and passes too.
+    let records = temp_dir("light-png-header");
+    let record = records.join("argv.log");
+    let extract = format!("printf '{}'\nexit 0", png_printf(1920, 1080, "light"));
+    let script = recording_tool(&record, "yuv420p, 1920x1080, 25 fps, 25 tbr", "", &extract);
+    let (_tool, program) = fake_tool("light-png-header", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    let frame = extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap();
+    assert_eq!(png_size(&frame.png), Some((1920, 1080)));
+    assert!(frame.png.ends_with(b"light"));
+    assert_eq!(extraction_runs(&record).len(), 1);
+}
+
+#[test]
+fn the_cap_admits_any_png_of_a_frame_or_the_light_one_is_not_asked_for() {
+    // The 256 MiB cap on the PNG must admit the frames it
+    // always has. A frame's PNG is within it at any settings
+    // up to 8K at 16-bit RGBA; past that, how well the frame
+    // compresses decides, so the run keeps the encoder's
+    // defaults and its arguments are the ones before issue
+    // #647, to the letter.
+    let fits = |width, height| any_png_fits(width, height, MAX_FRAME_PNG_BYTES);
+    assert!(fits(1920, 1080));
+    assert!(fits(7680, 4320));
+    assert!(fits(4320, 7680), "a rotated frame");
+    assert!(!fits(8192, 4320));
+    assert!(!fits(8192, 8192));
+    // The bound is the stored size at eight bytes a pixel
+    // with a filter byte a row, and room for the framing.
+    let stored = |width: u64, height: u64| width * height * 8 + width.max(height);
+    assert!(stored(7680, 4320) + stored(7680, 4320) / 128 + 65_536 <= 256 << 20);
+    assert!(stored(8192, 4096) > 256 << 20);
+    assert!(!fits(8192, 4096));
+    assert!(any_png_fits(1, 1, 65_536 + 9));
+    assert!(!any_png_fits(1, 1, 65_536 + 8));
+    assert!(!any_png_fits(u32::MAX, u32::MAX, usize::MAX));
+
+    for (size, tail) in [
+        ("7680x4320", LIGHT_PNG_TAIL),
+        ("8192x4320", DEFAULT_PNG_TAIL),
+        ("8192x8192", DEFAULT_PNG_TAIL),
+    ] {
+        let records = temp_dir("png-settings");
+        let record = records.join("argv.log");
+        let stream = format!("yuv420p10le, {size}, 10 fps, 10 tbr");
+        let (_tool, program) = fake_tool(
+            "png-settings",
+            &recording_tool(&record, &stream, "", EXTRACT_PNG),
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        extractor
+            .extract_frame(b"video bytes", FrameSelection::Poster)
+            .unwrap();
+        let runs = extraction_runs(&record);
+        assert_eq!(runs.len(), 1, "{size}: {runs:?}");
+        assert!(runs[0].ends_with(tail), "{size}: {}", runs[0]);
+        assert_eq!(
+            runs[0].contains("-compression_level") || runs[0].contains("-pred"),
+            tail == LIGHT_PNG_TAIL,
+            "{size}: {}",
+            runs[0]
+        );
+    }
+    // A second video stream past the bound keeps the
+    // defaults too: the tool may decode either.
+    let records = temp_dir("png-settings-streams");
+    let record = records.join("argv.log");
+    let script = format!(
+        "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> '{}'\nsep=', '\nprev=\n\
+for a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n{EXTRACT_PNG}\n  fi\n\
+  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\n\
+printf '%s\\n' 'Input #0, matroska,webm, from fd:' \
+'  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' \
+'  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' \
+'  Stream #0:1: Video: hevc, yuv420p10le, 8192x4320, 10 fps, 10 tbr' \
+| sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
+        record.display()
+    );
+    let (_tool, program) = fake_tool("png-settings-streams", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap();
+    let runs = extraction_runs(&record);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert!(runs[0].ends_with(DEFAULT_PNG_TAIL), "{}", runs[0]);
+}
+
+/// A stand-in decoder whose extraction does `light` when the
+/// run asks for the light PNG and `default` when it does not
+/// (shell lines each).
+fn settings_tool(record: &Path, stream: &str, light: &str, default: &str) -> String {
+    let extract = format!(
+        "    case \" $* \" in\n      *' -compression_level 1 -pred up '*)\n{light}\n      ;;\n      *)\n{default}\n      ;;\n    esac"
+    );
+    recording_tool(record, stream, "", &extract)
+}
+
+#[test]
+fn a_run_the_light_png_fails_is_settled_by_the_encoder_defaults() {
+    // A decoder that does not take the two settings (a
+    // stand-in with the old contract, an encoder build
+    // without them) fails the first run. The run before
+    // issue #647 follows, and its answer is the request's:
+    // the frame, or its own failure, word for word.
+    let records = temp_dir("light-refused");
+    let record = records.join("argv.log");
+    let script = settings_tool(
+        &record,
+        "yuv420p, 64x48, 10 fps, 10 tbr",
+        "echo \"Unrecognized option 'pred'.\" >&2\nexit 1",
+        EXTRACT_PNG,
+    );
+    let (_tool, program) = fake_tool("light-refused", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    let frame = extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap();
+    assert!(frame.png.ends_with(b"fakepng"));
+    let runs = extraction_runs(&record);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+    assert!(runs[1].ends_with(DEFAULT_PNG_TAIL), "{}", runs[1]);
+    assert_eq!(
+        runs[1],
+        runs[0].replace(LIGHT_PNG_TAIL, DEFAULT_PNG_TAIL),
+        "the second run differs in the PNG settings alone"
+    );
+
+    // Both runs fail: the failure reported is the second
+    // run's, the one a server before issue #647 reported.
+    let records = temp_dir("both-fail");
+    let record = records.join("argv.log");
+    let script = settings_tool(
+        &record,
+        "yuv420p, 64x48, 10 fps, 10 tbr",
+        "echo 'the light run failed' >&2\nexit 4",
+        "echo 'the default run failed' >&2\nexit 3",
+    );
+    let (_tool, program) = fake_tool("both-fail", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    let err = extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap_err();
+    assert!(matches!(err, FrameError::Failed(_)), "{err}");
+    assert!(err.to_string().contains("the default run failed"), "{err}");
+    assert!(!err.to_string().contains("the light run failed"), "{err}");
+    assert_eq!(extraction_runs(&record).len(), 2);
+}
+
+#[test]
+fn a_frame_larger_than_the_probe_reported_is_settled_by_the_encoder_defaults() {
+    // A stream can change size after the frames the probe
+    // reads. If the light PNG that comes back is of a frame
+    // the cap might refuse at the encoder's defaults, the
+    // defaults decide, as they did before issue #647: their
+    // PNG is the frame, or their run's refusal the answer.
+    let records = temp_dir("grown");
+    let record = records.join("argv.log");
+    let light = format!("printf '{}'\nexit 0", png_printf(8192, 8192, "light"));
+    let default = format!("printf '{}'\nexit 0", png_printf(8192, 8192, "default"));
+    let script = settings_tool(&record, "yuv420p, 64x48, 10 fps, 10 tbr", &light, &default);
+    let (_tool, program) = fake_tool("grown", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    let frame = extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap();
+    assert!(frame.png.ends_with(b"default"), "the default run's PNG");
+    assert_eq!(png_size(&frame.png), Some((8192, 8192)));
+    let runs = extraction_runs(&record);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+    assert!(runs[1].ends_with(DEFAULT_PNG_TAIL), "{}", runs[1]);
+}
+
+#[test]
+fn an_output_past_the_cap_is_settled_by_the_encoder_defaults() {
+    // With the cap lowered to 70,000 bytes, a 1x1 frame's PNG
+    // fits at any settings, so the light one is asked for. A
+    // tool that answers with more than the cap anyway gets
+    // the run before issue #647: what that hands back within
+    // the cap is the frame, and past it, the refusal it
+    // always was.
+    let cap = 70_000;
+    assert!(any_png_fits(1, 1, cap));
+    let over = "head -c 80000 /dev/zero\nexit 0";
+    for (default, want) in [(EXTRACT_PNG, Ok(())), (over, Err(()))] {
+        let records = temp_dir("past-the-cap");
+        let record = records.join("argv.log");
+        let script = settings_tool(&record, "yuv420p, 1x1, 10 fps, 10 tbr", over, default);
+        let (_tool, program) = fake_tool("past-the-cap", &script);
+        let mut extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        extractor.max_frame_png = cap;
+        let result = extractor.extract_frame(b"video bytes", FrameSelection::Poster);
+        match (result, want) {
+            (Ok(frame), Ok(())) => assert!(frame.png.ends_with(b"fakepng")),
+            (Err(err), Err(())) => {
+                assert!(matches!(err, FrameError::Failed(_)), "{err}");
+                assert_eq!(
+                    err.to_string(),
+                    "the decoder's output passed the 70000 byte cap"
+                );
+            }
+            (result, want) => panic!("{result:?} where {want:?} was expected"),
+        }
+        let runs = extraction_runs(&record);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert!(runs[0].ends_with(LIGHT_PNG_TAIL), "{}", runs[0]);
+        assert!(runs[1].ends_with(DEFAULT_PNG_TAIL), "{}", runs[1]);
+    }
+}
+
+#[test]
+fn a_refusal_or_a_timeout_at_the_light_settings_is_not_run_again() {
+    // The decoder's refusal of a frame past the pixel budget
+    // does not depend on the PNG settings, and a run that
+    // met the deadline leaves no time for another: neither
+    // gets a second run.
+    let records = temp_dir("no-second-run");
+    let record = records.join("argv.log");
+    let refusal = format!("printf '%s\\n' '{PIXEL_BOUND_LINE}' >&2\nexit 234");
+    let script = settings_tool(
+        &record,
+        "yuv420p, 64x48, 10 fps, 10 tbr",
+        &refusal,
+        EXTRACT_PNG,
+    );
+    let (_tool, program) = fake_tool("no-second-run", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    let err = extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap_err();
+    assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
+    assert_eq!(extraction_runs(&record).len(), 1);
+
+    let records = temp_dir("no-run-past-the-deadline");
+    let record = records.join("argv.log");
+    let script = settings_tool(
+        &record,
+        "yuv420p, 64x48, 10 fps, 10 tbr",
+        "sleep 30",
+        EXTRACT_PNG,
+    );
+    let (_tool, program) = fake_tool("no-run-past-the-deadline", &script);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(1)).unwrap();
+    let started = Instant::now();
+    let err = extractor
+        .extract_frame(b"video bytes", FrameSelection::Poster)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "video decoder timed out after 1s");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(extraction_runs(&record).len(), 1);
+}
+
 #[test]
 fn a_frame_larger_than_the_decode_budget_is_refused_before_extraction() {
     // The probed frame size meets the decode budget the
@@ -1604,6 +1908,179 @@ fn encode_clip(ffmpeg: &Path, path: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .status()
         .unwrap();
     status.success().then(|| std::fs::read(path).unwrap())
+}
+
+/// A PNG's chunks other than IDAT, each with its type and
+/// data, in order: everything a reader takes from the file
+/// besides the compressed pixels.
+fn png_chunks_around_the_pixels(png: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut chunks = Vec::new();
+    let mut at = 8;
+    while let Some(head) = png.get(at..at + 8) {
+        let len = u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+        let kind = String::from_utf8_lossy(&head[4..]).into_owned();
+        if kind != "IDAT" {
+            chunks.push((kind, png[at + 8..at + 8 + len].to_vec()));
+        }
+        at += 12 + len;
+    }
+    chunks
+}
+
+#[test]
+fn real_tool_hands_over_the_same_frame_at_the_light_settings() {
+    // Issue #647: PNG is lossless at every setting, so the
+    // frame in the light PNG is the frame in a PNG at the
+    // encoder's defaults: the same pixels in the same layout,
+    // with the same chunks around them. Held to the real
+    // tool for every layout its PNG encoder writes from the
+    // codecs the extraction allows: 8-bit RGB (H.264, Motion
+    // JPEG), 16-bit RGB (10-bit H.264) and 16-bit RGBA
+    // (ProRes 4444 with alpha).
+    let Some(ffmpeg) = ffmpeg_path() else {
+        return;
+    };
+    let dir = temp_dir("real-light");
+    let opaque = [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=5:duration=1",
+    ];
+    let translucent = [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=5:duration=1",
+        "-vf",
+        "format=rgba,colorchannelmixer=aa=0.5",
+    ];
+    use image::ColorType;
+    /// A clip to encode: its file name, the arguments that
+    /// name its source and its codec, the layout its frame
+    /// comes back in, and whether every FFmpeg build encodes
+    /// it.
+    struct Clip<'a> {
+        file: &'a str,
+        source: &'a [&'a str],
+        codec: &'a [&'a str],
+        color: ColorType,
+        required: bool,
+    }
+    let clips = [
+        Clip {
+            file: "h264.mp4",
+            source: &opaque,
+            codec: &["-c:v", "libx264", "-pix_fmt", "yuv420p"],
+            color: ColorType::Rgb8,
+            required: true,
+        },
+        Clip {
+            file: "mjpeg.avi",
+            source: &opaque,
+            codec: &["-c:v", "mjpeg", "-pix_fmt", "yuvj444p"],
+            color: ColorType::Rgb8,
+            required: true,
+        },
+        Clip {
+            file: "h264-10bit.mp4",
+            source: &opaque,
+            codec: &["-c:v", "libx264", "-pix_fmt", "yuv420p10le"],
+            color: ColorType::Rgb16,
+            required: false,
+        },
+        Clip {
+            file: "prores-4444.mov",
+            source: &translucent,
+            codec: &[
+                "-c:v",
+                "prores_ks",
+                "-profile:v",
+                "4444",
+                "-pix_fmt",
+                "yuva444p10le",
+            ],
+            color: ColorType::Rgba16,
+            required: true,
+        },
+    ];
+    let extractor = VideoFrameExtractor::new(ffmpeg.clone(), Duration::from_secs(60)).unwrap();
+    let threads = decoder_threads(320, 240);
+    let mut compared = 0;
+    for Clip {
+        file,
+        source,
+        codec,
+        color,
+        required,
+    } in clips
+    {
+        let args: Vec<&str> = source.iter().chain(codec).copied().collect();
+        let Some(bytes) = encode_clip(&ffmpeg, &dir.join(file), &args) else {
+            // A build without the 10-bit H.264 encoder skips
+            // that clip; the others are FFmpeg's own encoders
+            // and the one every real-tool test here uses.
+            assert!(!required, "{file}: the clip was not encoded");
+            continue;
+        };
+        let input = stage_input(&bytes).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // The first clip at its first frame and at a later
+        // one, the others at the later one.
+        let timestamps: &[f64] = if file == "h264.mp4" {
+            &[0.0, 0.6]
+        } else {
+            &[0.6]
+        };
+        for &timestamp in timestamps {
+            let what = format!("{file} at {timestamp}s");
+            let light = extractor
+                .extract_at(&input, timestamp, threads, deadline, true)
+                .unwrap_or_else(|e| panic!("{what}, light: {e}"));
+            let default = extractor
+                .extract_at(&input, timestamp, threads, deadline, false)
+                .unwrap_or_else(|e| panic!("{what}, defaults: {e}"));
+            // Two different files: the settings reached the
+            // encoder.
+            assert!(light != default, "{what}: one PNG at both settings");
+            assert_eq!(
+                png_chunks_around_the_pixels(&light),
+                png_chunks_around_the_pixels(&default),
+                "{what}"
+            );
+            let (a, b) = (
+                image::load_from_memory(&light).unwrap(),
+                image::load_from_memory(&default).unwrap(),
+            );
+            assert_eq!(a.color(), color, "{what}");
+            assert_eq!(
+                (a.color(), a.width(), a.height()),
+                (b.color(), 320, 240),
+                "{what}"
+            );
+            assert!(a.as_bytes() == b.as_bytes(), "{what}: other pixels");
+            // And what the engine decodes from each, the frame
+            // a `frame:` request goes on with.
+            let (a, b) = (
+                crate::engine::decode_image(&light).unwrap(),
+                crate::engine::decode_image(&default).unwrap(),
+            );
+            assert_eq!(a.color(), b.color(), "{what}");
+            assert!(a.as_bytes() == b.as_bytes(), "{what}: other pixels");
+            compared += 1;
+        }
+        // The request path hands over the light one.
+        if file == "h264.mp4" {
+            let frame = extractor
+                .extract_frame(&bytes, FrameSelection::Seconds(0.6))
+                .unwrap();
+            let light = extractor
+                .extract_at(&input, 0.6, threads, deadline, true)
+                .unwrap();
+            assert!(frame.png == light, "{file}: the request's PNG");
+        }
+    }
+    assert!(compared >= 4, "{compared} frames compared");
 }
 
 #[test]
