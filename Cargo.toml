@@ -125,18 +125,17 @@ zune-core = "0.5"
 # JPEG output is written by libjpeg-turbo (issue #668): about
 # three times faster than the pure-Rust encoder it replaced,
 # and it averages the chroma it subsamples where that encoder
-# kept one sample in two or four. turbojpeg-sys compiles its
-# vendored libjpeg-turbo 3.1.0 with cmake and links it
-# statically, so no system package or runtime library is
-# involved, and its bindings are pregenerated, so no bindgen
-# runs. Default features off: `pkg-config` would let a build
-# pick up a system libturbojpeg instead. `cmake` is the
-# vendored build; `require-simd` fails the build where the
-# library's assembly cannot be built (on x86_64 that needs
-# nasm, as the AVIF encoder does) rather than shipping its
-# plain C paths, which write the same bytes several times
-# slower. The unsafe calls stay inside the turbojpeg crate.
-turbojpeg = { version = "1.5", default-features = false, features = ["cmake", "require-simd"] }
+# kept one sample in two or four. turbojpeg-sys compiles the
+# libjpeg-turbo sources it vendors with cmake and links the
+# library statically, so no system package or runtime library
+# is involved, and its bindings are pregenerated, so no
+# bindgen runs. Default features off. Of the crate's three,
+# `cmake` is that vendored build; `pkg-config` only adds a
+# way to link a system libturbojpeg instead, which this
+# build does not use; and `require-simd` is taken per
+# architecture, further down. The unsafe calls stay inside
+# the turbojpeg crate.
+turbojpeg = { version = "1.5", default-features = false, features = ["cmake"] }
 webp = "0.3"
 # GIF writes go through the gif crate directly (already in the
 # tree transitively via image) so quantization can swap from
@@ -166,6 +165,18 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # without blocking. It adds no crate.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process", "fs"] }
+
+# libjpeg-turbo's vector code (issue #668) is required on
+# the architectures the release binaries and images are
+# built for: `require-simd` fails a build that cannot
+# assemble it (on x86_64 that takes nasm, as the AVIF
+# encoder does). Without the feature the library falls back,
+# with a warning cargo does not show, to its plain C paths,
+# which write the same bytes more slowly. Any other
+# architecture builds what the library has for it, which a
+# requirement would refuse where it has no vector code.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+turbojpeg = { version = "1.5", default-features = false, features = ["require-simd"] }
 
 [dev-dependencies]
 # Property tests (issue #478): tests/proptest_url.rs and
