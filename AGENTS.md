@@ -33,7 +33,8 @@ both SDKs must all pass.
   `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
   `server.rs`, `engine.rs`, `url.rs`, `filters.rs`, `frames.rs`
   and the files under `ai/` do; a second test module (the
-  identity proofs in `filters.rs`) is a sibling file there.
+  identity proofs in `filters.rs` and `engine.rs`) is a
+  sibling file there.
   `main.rs` is a crate root, where `mod tests;` would load
   `src/tests.rs`, so it names `main/tests.rs` with `#[path]`.
   `config.rs` belongs to the binary: it reads and validates the

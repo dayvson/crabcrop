@@ -492,12 +492,13 @@ impl S3Store {
             url_string = format!("{url_string}?{}", qs.join("&"));
         }
         let url = reqwest::Url::parse(&url_string).ok()?;
-        let payload_hash = {
-            let digest = Sha256::digest(&body);
-            digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+        // A read sends no body, and the digest of nothing is
+        // a constant (issue #644): only a write hashes its
+        // payload.
+        let payload_hash = if body.is_empty() {
+            sigv4::EMPTY_PAYLOAD_SHA256.to_string()
+        } else {
+            hex::encode(Sha256::digest(&body))
         };
         let verb = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
         // A body goes out on the client without a read
@@ -2658,6 +2659,112 @@ mod tests {
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"pixels"));
         assert_eq!(got.groups, vec!["hero".to_string()]);
         assert_eq!(got.quality, Some(80));
+    }
+
+    #[tokio::test]
+    async fn every_request_names_the_digest_of_the_body_it_sends() {
+        // Issue #644: a request with no body names the
+        // digest of nothing from a constant, and a write
+        // hashes its payload, without formatting it a byte
+        // at a time. Either way `x-amz-content-sha256` is
+        // the lower-case hex SHA-256 of the body the store
+        // receives, which the signature covers.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert_eq!(
+            sigv4::EMPTY_PAYLOAD_SHA256,
+            hex::encode(Sha256::digest(b""))
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    // One request per connection: its head,
+                    // then the body its length declares.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let header = |name: &str| {
+                        head.lines()
+                            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+                            .map(|value| value.trim().to_string())
+                    };
+                    let length: usize = header("content-length")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + length {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let method = head.split(' ').next().unwrap_or_default().to_string();
+                    // A write is accepted; a read finds nothing.
+                    let status = if method == "put" {
+                        "200 OK"
+                    } else {
+                        "404 Not Found"
+                    };
+                    recorded.lock().unwrap().push((
+                        method,
+                        header("x-amz-content-sha256"),
+                        header("authorization"),
+                        buf[head_end..head_end + length].to_vec(),
+                    ));
+                    let answer = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        let store = S3Store::new(
+            "results".into(),
+            "cache/".into(),
+            Some(endpoint),
+            "us-east-1".into(),
+            Some(sigv4::Credentials {
+                access_key: "AKIDEXAMPLE".to_string(),
+                secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                session_token: None,
+            }),
+            test_entry_key(),
+        )
+        .unwrap();
+        assert!(store.get("300x200/example.com/i.jpg").await.is_none());
+        store
+            .put("300x200/example.com/i.jpg", &image(b"pixels", &["hero"]))
+            .await;
+        assert_eq!(store.errors(), 0);
+        let seen = seen.lock().unwrap().clone();
+        let methods: Vec<&str> = seen.iter().map(|(method, ..)| method.as_str()).collect();
+        assert_eq!(methods, ["get", "put"]);
+        for (method, digest, authorization, body) in &seen {
+            assert_eq!(body.is_empty(), method == "get", "{method}");
+            assert_eq!(
+                digest.as_deref(),
+                Some(hex::encode(Sha256::digest(body)).as_str()),
+                "{method}"
+            );
+            let authorization = authorization.as_deref().unwrap_or_default();
+            assert!(
+                authorization.contains("signedheaders=host;x-amz-content-sha256;x-amz-date"),
+                "{method}: {authorization}"
+            );
+        }
+        assert_eq!(seen[0].1.as_deref(), Some(sigv4::EMPTY_PAYLOAD_SHA256));
     }
 
     #[tokio::test]

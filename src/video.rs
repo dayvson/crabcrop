@@ -46,6 +46,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ChildStdin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::toolrun::{ToolCommand, ToolError, ToolInput, run_tool, tool_cpu_limit};
@@ -256,10 +258,74 @@ fn plan(frames: &[VideoFrame]) -> Result<Plan, VideoError> {
     })
 }
 
+/// A frame's pixels as they lie in its buffer: RGBA, row by
+/// row.
+fn frame_bytes(frame: &VideoFrame) -> &[u8] {
+    let len = frame.pixels.width() as usize * frame.pixels.height() as usize * 4;
+    &frame.pixels.as_raw()[..len]
+}
+
+/// Whether a frame's own bytes are its sample: the plan keeps
+/// its size and every pixel is opaque, so compositing over
+/// black and fitting it change nothing.
+fn frame_is_its_sample(frame: &VideoFrame, plan: &Plan) -> bool {
+    frame.pixels.width() == plan.width
+        && frame.pixels.height() == plan.height
+        && frame_bytes(frame)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| px[3] == 255)
+}
+
 /// Composite one frame over black and fit it to the plan's
 /// dimensions, padding by edge replication or cropping the
 /// last row or column at the limit: the exact bytes one
-/// sample sends the encoder.
+/// sample sends the encoder, written into `out`, which the
+/// caller reuses from frame to frame. An opaque pixel is
+/// copied as it is: `(c * 255 + 127) / 255` is `c`.
+fn sample_into(frame: &VideoFrame, plan: &Plan, out: &mut Vec<u8>) {
+    let (sw, sh) = (
+        frame.pixels.width() as usize,
+        frame.pixels.height() as usize,
+    );
+    let (pw, ph) = (plan.width as usize, plan.height as usize);
+    out.clear();
+    out.resize(pw * ph * 4, 0);
+    if out.is_empty() || sw == 0 || sh == 0 {
+        return;
+    }
+    let source = frame_bytes(frame);
+    let kept = pw.min(sw) * 4;
+    for (y, row) in out.chunks_exact_mut(pw * 4).enumerate() {
+        // A row past the frame's last repeats it.
+        let from = y.min(sh - 1) * sw * 4;
+        let (row, pad) = row.split_at_mut(kept);
+        let pixels = row.as_chunks_mut::<4>().0.iter_mut();
+        for (to, px) in pixels.zip(source[from..from + kept].as_chunks::<4>().0) {
+            let a = u32::from(px[3]);
+            *to = if a == 255 {
+                [px[0], px[1], px[2], 255]
+            } else {
+                // Over black: scale by alpha, rounding to nearest.
+                [
+                    ((u32::from(px[0]) * a + 127) / 255) as u8,
+                    ((u32::from(px[1]) * a + 127) / 255) as u8,
+                    ((u32::from(px[2]) * a + 127) / 255) as u8,
+                    255,
+                ]
+            };
+        }
+        // A column past the frame's last repeats it.
+        if let Some(&last) = row.as_chunks::<4>().0.last() {
+            pad.as_chunks_mut::<4>().0.fill(last);
+        }
+    }
+}
+
+/// [`sample_into`] one pixel at a time, as it was first
+/// written: what the row-wise form is held to.
+#[cfg(test)]
 fn sample_bytes(frame: &VideoFrame, plan: &Plan) -> Vec<u8> {
     let (sw, sh) = (frame.pixels.width(), frame.pixels.height());
     let mut out = vec![0u8; (plan.width * plan.height * 4) as usize];
@@ -278,6 +344,31 @@ fn sample_bytes(frame: &VideoFrame, plan: &Plan) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Write every frame's sample to the encoder, each repeated
+/// for its scheduled count, in frame order. A sample is
+/// composited as its frame's turn comes, into one buffer that
+/// every frame reuses; a frame that is its own sample is
+/// written from where it lies.
+fn write_samples(
+    frames: &[VideoFrame],
+    plan: &Plan,
+    encoder: &mut impl Write,
+) -> std::io::Result<()> {
+    let mut composited = Vec::new();
+    for (frame, &count) in frames.iter().zip(&plan.counts) {
+        let sample = if frame_is_its_sample(frame, plan) {
+            frame_bytes(frame)
+        } else {
+            sample_into(frame, plan, &mut composited);
+            &composited
+        };
+        for _ in 0..count {
+            encoder.write_all(sample)?;
+        }
+    }
+    Ok(())
 }
 
 /// The operator-configured external encoder: a program path
@@ -416,40 +507,44 @@ impl VideoEncoder {
     }
 
     /// Encode frames to the requested video format under
-    /// the configured bounds.
+    /// the configured bounds. The frames are handed over
+    /// (issue #666): the writer thread composites each one
+    /// as it comes to write it, while the encoder starts and
+    /// runs, so no composited copy of the animation is built
+    /// first or held beside the frames.
     pub fn encode(
         &self,
-        frames: &[VideoFrame],
+        frames: Vec<VideoFrame>,
         format: VideoFormat,
     ) -> Result<Vec<u8>, VideoError> {
-        let plan = plan(frames)?;
+        let plan = plan(&frames)?;
         let argv = self.argv(&plan, format);
-        self.run(&argv, frames, &plan)
+        self.run(&argv, move |stdin| write_samples(&frames, &plan, stdin))
     }
 
     /// Run the encoder through the shared runner
-    /// ([`crate::toolrun::run_tool`]): the scheduled samples
-    /// fed on stdin from a writer thread, the video read from
-    /// stdout under the output cap, and the whole run held to
-    /// the wall-clock timeout. Stderr is quoted in the error
-    /// message and never trusted beyond that.
+    /// ([`crate::toolrun::run_tool`]): its input written to
+    /// stdin by `feed` on a writer thread, the video read
+    /// from stdout under the output cap, and the whole run,
+    /// the feed's own work included, held to the wall-clock
+    /// timeout. Stderr is quoted in the error message and
+    /// never trusted beyond that.
     fn run(
         &self,
         argv: &[String],
-        frames: &[VideoFrame],
-        plan: &Plan,
+        feed: impl FnOnce(&mut ChildStdin) -> std::io::Result<()> + Send + 'static,
     ) -> Result<Vec<u8>, VideoError> {
-        // One composited sample per frame, computed once;
-        // the writer repeats each for its scheduled count.
-        let samples: Vec<Vec<u8>> = frames.iter().map(|f| sample_bytes(f, plan)).collect();
-        let counts = plan.counts.clone();
-        let feed = move |stdin: &mut ChildStdin| {
-            for (sample, &count) in samples.iter().zip(&counts) {
-                for _ in 0..count {
-                    stdin.write_all(sample)?;
-                }
+        // Whether the feed came back, with or without a write
+        // error (an encoder that stopped reading explains
+        // itself through its status and output).
+        let returned = Arc::new(AtomicBool::new(false));
+        let feed = {
+            let returned = Arc::clone(&returned);
+            move |stdin: &mut ChildStdin| {
+                let fed = feed(stdin);
+                returned.store(true, Ordering::Release);
+                fed
             }
-            Ok(())
         };
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         let run = run_tool(ToolCommand {
@@ -479,6 +574,15 @@ impl VideoEncoder {
                 ToolError::Wait(_) => "could not be waited on after it finished".to_string(),
             })
         })?;
+        // A run that comes back has joined its writer. A feed
+        // that never returned panicked on a frame, with the
+        // encoder's input cut short: whatever the encoder made
+        // of that is not the video.
+        if !returned.load(Ordering::Acquire) {
+            return Err(VideoError::Failed(
+                "did not receive its frames: preparing one failed".to_string(),
+            ));
+        }
         if !run.status.success() {
             return Err(VideoError::Failed(format!(
                 "exited with status {}: {}",
@@ -602,7 +706,7 @@ mod tests {
             .pixels
             .put_pixel(0, 0, image::Rgba([100, 200, 50, 128]));
         let frames = vec![first, frame(5, 3, [0, 0, 255, 255], 300)];
-        let out = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        let out = encoder.encode(frames, VideoFormat::Mp4).unwrap();
         assert_eq!(out, b"FAKE-MP4-BYTES");
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         let args: Vec<&str> = argv.lines().collect();
@@ -699,7 +803,7 @@ mod tests {
             wide.pixels.put_pixel(16_381, y, image::Rgba(kept));
             wide.pixels.put_pixel(16_382, y, image::Rgba(dropped));
         }
-        encoder.encode(&[wide], VideoFormat::Mp4).unwrap();
+        encoder.encode(vec![wide], VideoFormat::Mp4).unwrap();
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(argv.lines().any(|arg| arg == "16382x4"), "{argv}");
         let stdin = std::fs::read(&stdin_file).unwrap();
@@ -725,7 +829,7 @@ mod tests {
         );
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
         let frames = vec![frame(4, 4, [9, 9, 9, 255], 100)];
-        let out = encoder.encode(&frames, VideoFormat::WebM).unwrap();
+        let out = encoder.encode(frames, VideoFormat::WebM).unwrap();
         assert_eq!(out, b"FAKE-WEBM");
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(argv.contains("libvpx-vp9"), "{argv}");
@@ -750,7 +854,7 @@ mod tests {
         );
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
         let frames = vec![frame(4, 4, [9, 9, 9, 255], 100)];
-        let out = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        let out = encoder.encode(frames, VideoFormat::Mp4).unwrap();
         assert_eq!(out, b"FAKE-MP4");
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         let lines: Vec<&str> = argv.lines().collect();
@@ -794,7 +898,9 @@ mod tests {
         let script = "#!/bin/sh\ncat > /dev/null\necho 'encoder exploded' >&2\nexit 3\n";
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder
+            .encode(frames.clone(), VideoFormat::Mp4)
+            .unwrap_err();
         assert!(matches!(err, VideoError::Failed(_)), "{err:?}");
         assert!(err.to_string().contains("exit status: 3"), "{err}");
         assert!(err.to_string().contains("encoder exploded"), "{err}");
@@ -805,14 +911,18 @@ mod tests {
         let script_path = fake_encoder(&dir, "#!/bin/sh\nprintf 'x'\n");
         let encoder = VideoEncoder::with_defaults(&script_path).unwrap();
         std::fs::remove_file(&script_path).unwrap();
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder
+            .encode(frames.clone(), VideoFormat::Mp4)
+            .unwrap_err();
         assert!(err.to_string().contains("could not be started"), "{err}");
 
         // Empty output is a failure, not an empty video.
         let dir = test_dir("fail-empty");
         let script = "#!/bin/sh\ncat > /dev/null\n";
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder
+            .encode(frames.clone(), VideoFormat::Mp4)
+            .unwrap_err();
         assert!(err.to_string().contains("no output"), "{err}");
     }
 
@@ -829,7 +939,7 @@ mod tests {
         );
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let out = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        let out = encoder.encode(frames, VideoFormat::Mp4).unwrap();
         assert_eq!(out, b"FAKE-MP4");
         let cwd = std::fs::read_to_string(&cwd_file).unwrap();
         assert_eq!(
@@ -847,7 +957,7 @@ mod tests {
         let script = "#!/bin/sh\ncat > /dev/null\nhead -c 2000 /dev/zero | tr '\\000' x >&2\necho ' the real failure' >&2\nexit 1\n";
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder.encode(frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().ends_with("x the real failure"), "{err}");
     }
 
@@ -858,7 +968,7 @@ mod tests {
         let encoder =
             VideoEncoder::new(fake_encoder(&dir, script), Duration::from_secs(30), 1024).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder.encode(frames, VideoFormat::Mp4).unwrap_err();
         assert!(
             err.to_string().contains("exceeded the 1024 byte cap"),
             "{err}"
@@ -877,7 +987,7 @@ mod tests {
         .unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
         let started = Instant::now();
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder.encode(frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -907,7 +1017,7 @@ mod tests {
         .unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
         let started = Instant::now();
-        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
+        let err = encoder.encode(frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -936,6 +1046,279 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// A frame whose pixels differ from one another: alpha
+    /// follows `x`, so a frame 256 wide holds every alpha value
+    /// against every value of red (`y`) and green.
+    fn varied_frame(width: u32, height: u32) -> VideoFrame {
+        VideoFrame {
+            pixels: image::RgbaImage::from_fn(width, height, |x, y| {
+                image::Rgba([y as u8, 255 - y as u8, (x * 7 + y * 3) as u8, x as u8])
+            }),
+            delay_ms: 100,
+        }
+    }
+
+    /// The same frame with every pixel opaque.
+    fn opaque(mut frame: VideoFrame) -> VideoFrame {
+        for px in frame.pixels.pixels_mut() {
+            px[3] = 255;
+        }
+        frame
+    }
+
+    #[test]
+    fn row_wise_samples_match_the_per_pixel_composite() {
+        // Issue #666: the sample the writer composites row by
+        // row is, byte for byte, the one built a pixel at a
+        // time. The buffer is reused from frame to frame, so it
+        // starts each time with the last sample in it.
+        let mut sample = vec![0xAA; 7];
+        let mut same = |frame: &VideoFrame, plan: &Plan| {
+            sample_into(frame, plan, &mut sample);
+            assert!(
+                sample == sample_bytes(frame, plan),
+                "{}x{} on a {}x{} canvas",
+                frame.pixels.width(),
+                frame.pixels.height(),
+                plan.width,
+                plan.height
+            );
+        };
+        // Every alpha value against every value of a channel,
+        // then odd and even canvases down to one pixel: an odd
+        // side pads by repeating its last row or column.
+        let sizes = [
+            (256, 256),
+            (255, 3),
+            (3, 255),
+            (17, 31),
+            (16, 16),
+            (2, 2),
+            (1, 2),
+            (2, 1),
+            (1, 1),
+        ];
+        for (width, height) in sizes {
+            for frame in [
+                varied_frame(width, height),
+                opaque(varied_frame(width, height)),
+            ] {
+                let plan = plan(std::slice::from_ref(&frame)).unwrap();
+                assert_eq!(
+                    (plan.width, plan.height),
+                    (even_dimension(width), even_dimension(height))
+                );
+                same(&frame, &plan);
+            }
+        }
+        // At the per-axis limit the odd side is cropped: its
+        // last column or row never reaches the encoder.
+        let max = crate::url::MAX_DIMENSION;
+        for (width, height, canvas) in [
+            (max, 3, (max - 1, 4)),
+            (3, max, (4, max - 1)),
+            (max, 2, (max - 1, 2)),
+        ] {
+            let frame = varied_frame(width, height);
+            let plan = plan(std::slice::from_ref(&frame)).unwrap();
+            assert_eq!((plan.width, plan.height), canvas);
+            same(&frame, &plan);
+        }
+        // Any canvas, not only the one the plan gives a frame:
+        // narrower and shorter, wider and taller, and mixed.
+        let frame = varied_frame(9, 7);
+        for (width, height) in [(8, 6), (10, 8), (8, 8), (10, 6), (9, 7), (30, 2)] {
+            let plan = Plan {
+                width,
+                height,
+                fps: 10,
+                counts: vec![1],
+            };
+            same(&frame, &plan);
+        }
+    }
+
+    #[test]
+    fn an_opaque_frame_of_the_canvas_size_is_its_own_sample() {
+        // Issue #666: such a frame is written from where it
+        // lies, so its bytes must be exactly its sample.
+        let frame = opaque(varied_frame(8, 6));
+        let plan_of = |frame: &VideoFrame| plan(std::slice::from_ref(frame)).unwrap();
+        assert!(frame_is_its_sample(&frame, &plan_of(&frame)));
+        assert!(frame_bytes(&frame) == sample_bytes(&frame, &plan_of(&frame)));
+        // One pixel short of opaque, wherever it lies, and the
+        // frame is composited.
+        for (x, y) in [(0, 0), (7, 5), (3, 2)] {
+            let mut frame = opaque(varied_frame(8, 6));
+            frame.pixels.get_pixel_mut(x, y)[3] = 254;
+            assert!(!frame_is_its_sample(&frame, &plan_of(&frame)), "({x}, {y})");
+        }
+        // An odd side is padded, and one at the limit cropped:
+        // the canvas is not the frame's own size.
+        let max = crate::url::MAX_DIMENSION;
+        for (width, height) in [(7, 6), (8, 5), (7, 5), (max, 2), (2, max)] {
+            let frame = opaque(varied_frame(width, height));
+            assert!(
+                !frame_is_its_sample(&frame, &plan_of(&frame)),
+                "{width}x{height}"
+            );
+        }
+        // Bytes a buffer holds past its pixels are not part of
+        // the frame.
+        let mut raw = frame.pixels.as_raw().clone();
+        raw.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let padded = VideoFrame {
+            pixels: image::RgbaImage::from_raw(8, 6, raw).unwrap(),
+            delay_ms: 100,
+        };
+        assert!(frame_is_its_sample(&padded, &plan_of(&padded)));
+        assert!(frame_bytes(&padded) == sample_bytes(&padded, &plan_of(&padded)));
+    }
+
+    #[test]
+    fn the_writer_sends_every_frame_in_order_for_its_count() {
+        // Issue #666: what reaches the encoder is each frame's
+        // sample, repeated for its scheduled count, in frame
+        // order, whether a frame is composited or written as
+        // it lies.
+        let stream = |frames: &[VideoFrame]| {
+            let plan = plan(frames).unwrap();
+            let mut written = Vec::new();
+            write_samples(frames, &plan, &mut written).unwrap();
+            let mut expected = Vec::new();
+            for (frame, &count) in frames.iter().zip(&plan.counts) {
+                for _ in 0..count {
+                    expected.extend_from_slice(&sample_bytes(frame, &plan));
+                }
+            }
+            assert!(written == expected);
+            (plan, written)
+        };
+        // Even canvas: opaque frames go out as they lie, the
+        // one with alpha is composited between them.
+        let mut frames = vec![
+            opaque(varied_frame(8, 6)),
+            varied_frame(8, 6),
+            frame(8, 6, [9, 8, 7, 255], 100),
+        ];
+        for (frame, delay_ms) in frames.iter_mut().zip([100, 300, 200]) {
+            frame.delay_ms = delay_ms;
+        }
+        let (planned, written) = stream(&frames);
+        assert_eq!(planned.counts, [1, 3, 2]);
+        assert_eq!(written.len(), 6 * 8 * 6 * 4);
+        assert!(written[..8 * 6 * 4] == *frames[0].pixels.as_raw());
+        assert!(written[5 * 8 * 6 * 4..] == *frames[2].pixels.as_raw());
+        // Odd canvas: every frame is composited and padded.
+        let frames = vec![
+            opaque(varied_frame(7, 5)),
+            varied_frame(7, 5),
+            opaque(varied_frame(7, 5)),
+        ];
+        let (planned, written) = stream(&frames);
+        assert_eq!((planned.width, planned.height), (8, 6));
+        assert_eq!(written.len(), 3 * 8 * 6 * 4);
+
+        // A write the encoder refuses ends the feed with that
+        // error, as it always has.
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = write_samples(&frames, &planned, &mut Closed).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn encode_writes_an_opaque_even_frame_as_it_lies() {
+        // Issue #666, through the encoder's pipe: opaque frames
+        // on an even canvas arrive as their own bytes, each for
+        // its count.
+        let dir = test_dir("as-it-lies");
+        let stdin_file = dir.join("stdin.bin");
+        let script = format!(
+            "#!/bin/sh\ncat > '{}'\nprintf 'FAKE-MP4-BYTES'\n",
+            stdin_file.display()
+        );
+        let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
+        let mut frames = vec![opaque(varied_frame(6, 4)), opaque(varied_frame(6, 4))];
+        frames[1].delay_ms = 200;
+        frames[1]
+            .pixels
+            .put_pixel(5, 3, image::Rgba([1, 2, 3, 255]));
+        let mut expected = frames[0].pixels.as_raw().clone();
+        expected.extend_from_slice(frames[1].pixels.as_raw());
+        expected.extend_from_slice(frames[1].pixels.as_raw());
+        let out = encoder.encode(frames, VideoFormat::Mp4).unwrap();
+        assert_eq!(out, b"FAKE-MP4-BYTES");
+        assert!(std::fs::read(&stdin_file).unwrap() == expected);
+    }
+
+    #[test]
+    fn a_panic_in_the_feed_is_a_contained_video_error() {
+        // Issue #666: the writer thread composites, so a panic
+        // there cuts the encoder's input short. An encoder that
+        // exits cleanly with what it got must not pass for the
+        // video; the failure is a video error, and the next
+        // encode runs.
+        let dir = test_dir("feed-panic");
+        let script = "#!/bin/sh\ncat > /dev/null\nprintf 'FAKE-MP4-BYTES'\n";
+        let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
+        let argv = ["-i".to_string(), "pipe:0".to_string()];
+        let err = encoder
+            .run(&argv, |stdin| {
+                stdin.write_all(&[0; 64])?;
+                panic!("a frame that cannot be composited");
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            VideoError::Failed("did not receive its frames: preparing one failed".to_string())
+        );
+        // A feed that returns, with or without a write error,
+        // leaves the verdict to the encoder as before.
+        let out = encoder.run(&argv, |stdin| stdin.write_all(&[0; 64]));
+        assert_eq!(out.unwrap(), b"FAKE-MP4-BYTES");
+        let out = encoder.run(&argv, |_| Err(std::io::ErrorKind::BrokenPipe.into()));
+        assert_eq!(out.unwrap(), b"FAKE-MP4-BYTES");
+        let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
+        let out = encoder.encode(frames, VideoFormat::Mp4).unwrap();
+        assert_eq!(out, b"FAKE-MP4-BYTES");
+    }
+
+    #[test]
+    fn a_feed_slower_than_the_timeout_ends_at_the_timeout() {
+        // Issue #666: compositing runs under the encoder's
+        // wall-clock limit now, so a feed that outlasts it is
+        // cut off with the encoder, not waited for.
+        let dir = test_dir("feed-slow");
+        let script = "#!/bin/sh\ncat > /dev/null\nprintf 'FAKE-MP4-BYTES'\n";
+        let encoder = VideoEncoder::new(
+            fake_encoder(&dir, script),
+            Duration::from_millis(300),
+            1024 * 1024,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let err = encoder
+            .run(&["-i".to_string()], |stdin| {
+                std::thread::sleep(Duration::from_secs(5));
+                stdin.write_all(&[0; 64])
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the encode waited for its feed: {:?}",
+            started.elapsed()
+        );
     }
 
     /// The FFmpeg the real-encoder tests run.
@@ -968,19 +1351,19 @@ mod tests {
             frame(64, 48, [200, 40, 40, 255], 100),
             frame(64, 48, [40, 40, 200, 255], 100),
         ];
-        let mp4 = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        let mp4 = encoder.encode(frames.clone(), VideoFormat::Mp4).unwrap();
         assert!(mp4.len() > 100, "suspiciously small MP4: {}", mp4.len());
         assert_eq!(&mp4[4..8], b"ftyp", "MP4 has no ftyp box");
-        let mp4_again = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
+        let mp4_again = encoder.encode(frames.clone(), VideoFormat::Mp4).unwrap();
         assert_eq!(mp4, mp4_again, "two MP4 renders of the same frames differ");
-        let webm = encoder.encode(&frames, VideoFormat::WebM).unwrap();
+        let webm = encoder.encode(frames.clone(), VideoFormat::WebM).unwrap();
         assert!(webm.len() > 100, "suspiciously small WebM: {}", webm.len());
         assert_eq!(
             &webm[0..4],
             &[0x1a, 0x45, 0xdf, 0xa3],
             "WebM has no EBML header"
         );
-        let webm_again = encoder.encode(&frames, VideoFormat::WebM).unwrap();
+        let webm_again = encoder.encode(frames.clone(), VideoFormat::WebM).unwrap();
         assert_eq!(
             webm, webm_again,
             "two WebM renders of the same frames differ"
@@ -1062,8 +1445,8 @@ mod tests {
             })
             .collect();
         for format in [VideoFormat::Mp4, VideoFormat::WebM] {
-            let on_all = free.encode(&frames, format).unwrap();
-            let on_one = pinned.encode(&frames, format).unwrap();
+            let on_all = free.encode(frames.clone(), format).unwrap();
+            let on_one = pinned.encode(frames.clone(), format).unwrap();
             assert!(on_all.len() > 100, "suspiciously small {format:?}");
             assert!(
                 on_all == on_one,

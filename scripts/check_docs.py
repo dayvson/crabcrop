@@ -91,7 +91,6 @@ UNTESTED = {
     "invalid_upload_name",
     "meta_not_available",
     "processing_failed",
-    "reserved_segment",
     "upload_media_mismatch",
     "upload_store_failed",
     "upload_store_unavailable",

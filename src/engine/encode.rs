@@ -99,7 +99,9 @@ impl From<StillFormat> for ImageFormat {
 /// re-encode one image up to a dozen times; converting the
 /// full frame inside each attempt copied it every time. The
 /// buffers compute lazily: a JPEG-only request never pays for
-/// the RGBA layout.
+/// the RGBA layout. An image that already has the layout an
+/// encoder asks for is lent as it is (issue #665): converting
+/// it would only copy the frame.
 pub(in crate::engine) struct EncodeBuffers<'a> {
     img: &'a DynamicImage,
     rgb: std::cell::OnceCell<image::RgbImage>,
@@ -118,11 +120,17 @@ impl<'a> EncodeBuffers<'a> {
     }
 
     fn rgb(&self) -> &image::RgbImage {
-        self.rgb.get_or_init(|| self.img.to_rgb8())
+        match self.img {
+            DynamicImage::ImageRgb8(rgb) => rgb,
+            img => self.rgb.get_or_init(|| img.to_rgb8()),
+        }
     }
 
     fn rgba(&self) -> &image::RgbaImage {
-        self.rgba.get_or_init(|| self.img.to_rgba8())
+        match self.img {
+            DynamicImage::ImageRgba8(rgba) => rgba,
+            img => self.rgba.get_or_init(|| img.to_rgba8()),
+        }
     }
 
     /// The image with integer samples, for the encoders that
@@ -317,7 +325,13 @@ pub(in crate::engine) fn encode(
             // speed tier is operator configuration; AVIF encoding
             // is the expensive step in the pipeline by a wide
             // margin, so the tier trades real latency for bytes.
+            // Opaque 8-bit RGB skips the image crate and takes
+            // the same ravif call with its planes already
+            // converted (issue #663).
             let img = src.integer();
+            if let Some(rgb) = avif_direct(img) {
+                return encode_avif_rgb8(rgb, avif_speed, quality.unwrap_or(80));
+            }
             image::codecs::avif::AvifEncoder::new_with_speed_quality(
                 &mut buf,
                 avif_speed,
@@ -348,6 +362,213 @@ pub(in crate::engine) fn encode(
         }
     }
     Ok(buf)
+}
+
+/// The BT.601 luma weights as the AVIF encoder (ravif)
+/// holds them: `f32` constants.
+const AVIF_BT601: [f32; 3] = [0.2990, 0.5870, 0.1140];
+
+/// How close to a rounding boundary, in 1/65536 of a sample,
+/// a fixed-point sum may come before [`avif_ycbcr`] takes the
+/// exact path. The sum is within 1.5 units of the real value
+/// (three table entries, each rounded to the nearest unit).
+/// ravif's `f32` evaluation is within 2 units of it: three
+/// roundings of at most half a unit go into Y, a fourth into
+/// the difference from it, the chroma factor (below 0.72)
+/// scales those four, and the last rounding adds half a unit.
+/// So a sum more than 3.5 units from a boundary rounds the
+/// same way on both sides. Over all 16,777,216 colors the
+/// farthest sum that rounds the other way is one unit out; 8
+/// leaves room, and sends about one color in 200 down the
+/// exact path.
+const AVIF_FIXED_MARGIN: i32 = 8;
+
+/// Each channel value's share of Y, Cb and Cr in 16.16 fixed
+/// point, for [`avif_ycbcr`]. The blue and red tables carry
+/// the +128 of their own chroma channel.
+struct AvifYcbcrTables {
+    red: [[i32; 3]; 256],
+    green: [[i32; 3]; 256],
+    blue: [[i32; 3]; 256],
+}
+
+static AVIF_YCBCR: AvifYcbcrTables = AvifYcbcrTables::new();
+
+impl AvifYcbcrTables {
+    /// The tables for `y = kr r + kg g + kb b`,
+    /// `cb = (b - y) cb_scale + 128` and
+    /// `cr = (r - y) cr_scale + 128`, from the constants as
+    /// ravif's `f32` arithmetic holds them.
+    const fn new() -> Self {
+        let [kr, kg, kb] = AVIF_BT601;
+        let cb_scale = (0.5 / (1.0 - kb)) as f64;
+        let cr_scale = (0.5 / (1.0 - kr)) as f64;
+        let (kr, kg, kb) = (kr as f64, kg as f64, kb as f64);
+        let mut tables = AvifYcbcrTables {
+            red: [[0; 3]; 256],
+            green: [[0; 3]; 256],
+            blue: [[0; 3]; 256],
+        };
+        let mut value = 0;
+        while value < 256 {
+            let v = value as f64;
+            tables.red[value] = [
+                avif_fixed(kr * v),
+                avif_fixed(-cb_scale * kr * v),
+                avif_fixed(cr_scale * (1.0 - kr) * v + 128.0),
+            ];
+            tables.green[value] = [
+                avif_fixed(kg * v),
+                avif_fixed(-cb_scale * kg * v),
+                avif_fixed(-cr_scale * kg * v),
+            ];
+            tables.blue[value] = [
+                avif_fixed(kb * v),
+                avif_fixed(cb_scale * (1.0 - kb) * v + 128.0),
+                avif_fixed(-cr_scale * kb * v),
+            ];
+            value += 1;
+        }
+        tables
+    }
+}
+
+/// `value` in 16.16 fixed point, rounded to the nearest unit.
+const fn avif_fixed(value: f64) -> i32 {
+    let units = value * 65536.0;
+    if units < 0.0 {
+        (units - 0.5) as i32
+    } else {
+        (units + 0.5) as i32
+    }
+}
+
+/// Y, Cb and Cr of one RGB pixel as sums of table entries, in
+/// 16.16 fixed point.
+#[inline]
+fn avif_fixed_sums(r: u8, g: u8, b: u8) -> [i32; 3] {
+    let (red, green, blue) = (
+        &AVIF_YCBCR.red[r as usize],
+        &AVIF_YCBCR.green[g as usize],
+        &AVIF_YCBCR.blue[b as usize],
+    );
+    [
+        red[0] + green[0] + blue[0],
+        red[1] + green[1] + blue[1],
+        red[2] + green[2] + blue[2],
+    ]
+}
+
+/// A fixed-point sum as an 8-bit sample: rounded to nearest,
+/// a half going up as ravif's `round` takes it.
+#[inline]
+fn avif_fixed_sample(sum: i32) -> u8 {
+    ((sum + 0x8000) >> 16).clamp(0, 255) as u8
+}
+
+/// One RGB pixel as the full-range 8-bit BT.601 YCbCr triple
+/// that ravif's own conversion (`rgb_to_8_bit_ycbcr`) yields,
+/// value for value. ravif evaluates it in `f32` with fused
+/// multiply-adds and `round`; a build without the FMA target
+/// feature (the x86-64 baseline) turns each of those into a
+/// libm call, nine a pixel.
+///
+/// Here the three values are sums of table entries in fixed
+/// point. A sum that is not near a rounding boundary rounds
+/// the way ravif's value does (see [`AVIF_FIXED_MARGIN`]); one
+/// that is near takes [`avif_ycbcr_exact`].
+#[inline]
+fn avif_ycbcr(r: u8, g: u8, b: u8) -> [u8; 3] {
+    let sums = avif_fixed_sums(r, g, b);
+    // The fraction's distance from one half, as one unsigned
+    // comparison.
+    let near_boundary = |sum: i32| {
+        (((sum & 0xFFFF) - (0x8000 - AVIF_FIXED_MARGIN)) as u32) <= (2 * AVIF_FIXED_MARGIN) as u32
+    };
+    if near_boundary(sums[0]) | near_boundary(sums[1]) | near_boundary(sums[2]) {
+        return avif_ycbcr_exact(r, g, b);
+    }
+    sums.map(avif_fixed_sample)
+}
+
+/// [`avif_ycbcr`] by ravif's own steps:
+/// `y = fma(kb, b, fma(kr, r, kg * g))`, then
+/// `cb = fma(b - y, 0.5 / (1 - kb), 128)` and the same for
+/// `cr` from `r`, each rounded to the nearest integer. A
+/// fused multiply-add is one multiply and one add in `f64`,
+/// which holds the product of two `f32` values exactly,
+/// rounded once to `f32`. The sums are exact in `f64` too,
+/// except that the last one can round there for the darkest
+/// colors (a Y below 4), where a second rounding could in
+/// principle land elsewhere; it does not, for any color:
+/// `avif_ycbcr_matches_ravif` compares every such color with
+/// the fused form. The final rounding is `+ 0.5` and a
+/// truncating cast, which is `round` for these values.
+#[cold]
+#[inline(never)]
+fn avif_ycbcr_exact(r: u8, g: u8, b: u8) -> [u8; 3] {
+    let [kr, kg, kb] = AVIF_BT601;
+    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
+    let fused = |x: f32, y: f32, z: f32| (f64::from(x) * f64::from(y) + f64::from(z)) as f32;
+    let y = fused(kb, b, fused(kr, r, kg * g));
+    let cb = fused(b - y, 0.5 / (1.0 - kb), 128.0);
+    let cr = fused(r - y, 0.5 / (1.0 - kr), 128.0);
+    [y, cb, cr].map(|value| (f64::from(value) + 0.5) as u8)
+}
+
+/// The image [`encode_avif_rgb8`] takes: opaque 8-bit RGB
+/// with at least one pixel. Alpha, gray, 16-bit and (through
+/// [`EncodeBuffers::integer`]) float images keep the image
+/// crate's encoder, and so does an empty image, which it
+/// refuses in its own words.
+fn avif_direct(img: &DynamicImage) -> Option<&image::RgbImage> {
+    match img {
+        DynamicImage::ImageRgb8(rgb) if rgb.width() > 0 && rgb.height() > 0 => Some(rgb),
+        _ => None,
+    }
+}
+
+/// Encode an opaque 8-bit RGB image to AVIF through ravif
+/// directly (issue #663). The image crate's encoder makes
+/// this ravif call itself (`encode_rgb`, with the quality
+/// for color and alpha, the speed and 8-bit depth set and
+/// everything else at ravif's defaults, the thread count
+/// among them), and ravif converts each pixel to YCbCr and
+/// passes the planes to `encode_raw_planes_8_bit`. The
+/// planes handed over here hold those same values (see
+/// [`avif_ycbcr`]), so the file is the same, byte for byte:
+/// `avif_rgb8_bytes_match_the_image_crate` holds the two
+/// together.
+fn encode_avif_rgb8(rgb: &image::RgbImage, speed: u8, quality: u8) -> Result<Vec<u8>, EngineError> {
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    // The clamps of `AvifEncoder::new_with_speed_quality`.
+    let quality = f32::from(quality.min(100));
+    let encoder = ravif::Encoder::new()
+        .with_quality(quality)
+        .with_alpha_quality(quality)
+        .with_speed(speed.min(10))
+        .with_bit_depth(ravif::BitDepth::Eight);
+    let pixels = rgb.as_raw()[..w * h * 3].as_chunks::<3>().0;
+    let planes = pixels.iter().map(|&[r, g, b]| avif_ycbcr(r, g, b));
+    let encoded = encoder
+        .encode_raw_planes_8_bit(
+            w,
+            h,
+            planes,
+            None::<[u8; 0]>,
+            ravif::PixelRange::Full,
+            ravif::MatrixCoefficients::BT601,
+        )
+        .map_err(|e| {
+            // Wrapped as the image crate wraps it, so a
+            // failure reads as it always has.
+            let wrapped = image::ImageError::Encoding(image::error::EncodingError::new(
+                image::ImageFormat::Avif.into(),
+                e,
+            ));
+            EngineError::Encode(wrapped.to_string())
+        })?;
+    Ok(encoded.avif_file)
 }
 
 /// Encode an indexed-color (palette) PNG (issue #313): the
@@ -718,4 +939,352 @@ fn encode_webp(
         .encode_advanced(&config)
         .map_err(|e| EngineError::Encode(format!("webp: {e:?}")))?;
     Ok(encoded.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{DEFAULT_AVIF_SPEED, DEFAULT_JXL_SPEED};
+
+    /// Noise and a ramp in a checkerboard: flat steps,
+    /// gradients, and in the noise colors that take the exact
+    /// path.
+    fn test_field(w: u32, h: u32) -> image::RgbImage {
+        image::RgbImage::from_fn(w, h, |x, y| {
+            let mut n = x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77);
+            n ^= n >> 13;
+            n = n.wrapping_mul(0xC2B2_AE35);
+            if (x / 16 + y / 16) % 2 == 0 {
+                image::Rgb([(n >> 24) as u8, (n >> 16) as u8, (n >> 8) as u8])
+            } else {
+                image::Rgb([(x * 3) as u8, (y * 5) as u8, (x + y) as u8])
+            }
+        })
+    }
+
+    #[test]
+    fn a_frame_in_the_encoders_layout_is_lent_not_copied() {
+        // Issue #665: an image that already has the layout an
+        // encoder reads is that encoder's buffer.
+        let rgb = DynamicImage::ImageRgb8(test_field(9, 5));
+        let src = EncodeBuffers::new(&rgb);
+        assert!(std::ptr::eq(src.rgb(), rgb.as_rgb8().unwrap()));
+        let with_alpha = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(9, 5, |x, y| {
+            image::Rgba([(x * 20) as u8, (y * 40) as u8, 7, (x * 28 + y) as u8])
+        }));
+        let src_alpha = EncodeBuffers::new(&with_alpha);
+        assert!(std::ptr::eq(
+            src_alpha.rgba(),
+            with_alpha.as_rgba8().unwrap()
+        ));
+
+        // The layout an image does not have is converted once,
+        // to what the conversion always gave: the RGBA layout of
+        // an opaque image, the RGB layout of one with alpha (a
+        // JPEG without a fill), and both layouts of gray, 16-bit
+        // and float images.
+        let gray = DynamicImage::ImageLuma8(rgb.to_luma8());
+        let others = [
+            rgb.clone(),
+            with_alpha.clone(),
+            gray.clone(),
+            DynamicImage::ImageLumaA8(with_alpha.to_luma_alpha8()),
+            DynamicImage::ImageRgb16(rgb.to_rgb16()),
+            DynamicImage::ImageRgba16(with_alpha.to_rgba16()),
+            DynamicImage::ImageLuma16(gray.to_luma16()),
+            DynamicImage::ImageRgb32F(rgb.to_rgb32f()),
+            DynamicImage::ImageRgba32F(with_alpha.to_rgba32f()),
+        ];
+        for img in &others {
+            let src = EncodeBuffers::new(img);
+            let (as_rgb, as_rgba) = (src.rgb(), src.rgba());
+            assert!(*as_rgb == img.to_rgb8(), "{:?}", img.color());
+            assert!(*as_rgba == img.to_rgba8(), "{:?}", img.color());
+            assert!(std::ptr::eq(as_rgb, src.rgb()), "{:?}", img.color());
+            assert!(std::ptr::eq(as_rgba, src.rgba()), "{:?}", img.color());
+            let own = img.as_bytes().as_ptr();
+            let lent_rgb = matches!(img, DynamicImage::ImageRgb8(_));
+            let lent_rgba = matches!(img, DynamicImage::ImageRgba8(_));
+            assert_eq!(
+                as_rgb.as_raw().as_ptr() == own,
+                lent_rgb,
+                "{:?}",
+                img.color()
+            );
+            assert_eq!(
+                as_rgba.as_raw().as_ptr() == own,
+                lent_rgba,
+                "{:?}",
+                img.color()
+            );
+        }
+
+        // Converting an image to the layout it has copies its
+        // buffer as it stands, bytes past the pixels included,
+        // so the lent frame is what the copy held even then.
+        let padded = image::RgbImage::from_raw(2, 2, vec![7; 20]).unwrap();
+        let padded = DynamicImage::ImageRgb8(padded);
+        let src = EncodeBuffers::new(&padded);
+        assert!(std::ptr::eq(src.rgb(), padded.as_rgb8().unwrap()));
+        assert_eq!(src.rgb().as_raw(), padded.to_rgb8().as_raw());
+    }
+
+    #[test]
+    fn a_jpeg_of_a_flattened_image_does_not_read_the_lent_frame() {
+        // Issue #665: an image with alpha flattened onto a fill
+        // encodes from the flattened pixels, not from its own
+        // buffer, and no fill reads its color channels as they
+        // are.
+        let with_alpha = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(24, 16, |x, y| {
+            image::Rgba([(x * 9) as u8, (y * 13) as u8, 90, (x * 11) as u8])
+        }));
+        let jpeg = |img: &DynamicImage, fill: Option<[u8; 3]>| {
+            encode(
+                &EncodeBuffers::new(img),
+                StillFormat::Jpeg,
+                Some(80),
+                fill,
+                None,
+                FormatOptions::default(),
+                DEFAULT_AVIF_SPEED,
+                DEFAULT_JXL_SPEED,
+            )
+            .unwrap()
+        };
+        let white = [255, 255, 255];
+        let flattened = DynamicImage::ImageRgb8(flatten(&with_alpha, white));
+        assert!(jpeg(&with_alpha, Some(white)) == jpeg(&flattened, None));
+        let channels = DynamicImage::ImageRgb8(with_alpha.to_rgb8());
+        assert!(jpeg(&with_alpha, None) == jpeg(&channels, None));
+        assert!(jpeg(&with_alpha, None) != jpeg(&with_alpha, Some(white)));
+    }
+
+    /// ravif's conversion as its source spells it (ravif 0.13,
+    /// `rgb_to_ycbcr` at 8 bits). `mul_add` is a fused
+    /// multiply-add on every target, through the CPU's
+    /// instruction or through libm, so this is the value ravif
+    /// computes wherever the test runs.
+    fn ravif_ycbcr(r: u8, g: u8, b: u8) -> [u8; 3] {
+        let matrix = AVIF_BT601;
+        let depth = 8;
+        let max_value = ((1 << depth) - 1) as f32;
+        let scale = max_value / 255.;
+        let shift = (max_value * 0.5).round();
+        let y = (scale * matrix[2]).mul_add(
+            f32::from(b),
+            (scale * matrix[0]).mul_add(f32::from(r), scale * matrix[1] * f32::from(g)),
+        );
+        let cb = f32::from(b)
+            .mul_add(scale, -y)
+            .mul_add(0.5 / (1. - matrix[2]), shift);
+        let cr = f32::from(r)
+            .mul_add(scale, -y)
+            .mul_add(0.5 / (1. - matrix[0]), shift);
+        [y.round() as u8, cb.round() as u8, cr.round() as u8]
+    }
+
+    /// Colors whose table sums round the wrong way where they
+    /// stand: each lands within one unit of a rounding
+    /// boundary, on the other side of it from ravif's value.
+    /// Y, Cb and Cr each go wrong for three of them.
+    const NEEDS_THE_EXACT_PATH: [[u8; 3]; 9] = [
+        [255, 203, 71],
+        [255, 127, 129],
+        [255, 37, 224],
+        [253, 253, 254],
+        [253, 253, 244],
+        [253, 253, 232],
+        [255, 250, 250],
+        [255, 240, 240],
+        [255, 220, 220],
+    ];
+
+    #[test]
+    fn avif_ycbcr_matches_ravif() {
+        // The whole cube, all 16,777,216 colors, was compared
+        // once on both paths and agrees: 17,531 colors need the
+        // exact path, every one within one unit of a boundary.
+        // That loop takes ten seconds in a debug build, so the
+        // suite holds the cube's faces, the dark corner and a
+        // sample through the rest, which between them meet
+        // hundreds of the colors the tables alone get wrong.
+        let check = |r: u8, g: u8, b: u8| {
+            let want = ravif_ycbcr(r, g, b);
+            assert_eq!(avif_ycbcr(r, g, b), want, "rgb({r}, {g}, {b})");
+            assert_eq!(
+                avif_ycbcr_exact(r, g, b),
+                want,
+                "exact path, rgb({r}, {g}, {b})"
+            );
+        };
+        // The faces of the color cube: every color with a
+        // channel at either end, where the samples clamp.
+        for u in 0..=255 {
+            for v in 0..=255 {
+                for end in [0, 255] {
+                    check(end, u, v);
+                    check(u, end, v);
+                    check(u, v, end);
+                }
+            }
+        }
+        // The darkest colors: every one with a Y below 4 lies
+        // in this corner, and for those the exact path's last
+        // sum can round in `f64`.
+        for r in 0..16 {
+            for g in 0..8 {
+                for b in 0..40 {
+                    check(r, g, b);
+                }
+            }
+        }
+        // One color in 31 through the whole cube, which meets
+        // every value of every channel.
+        for color in (0..1u32 << 24).step_by(31) {
+            check((color >> 16) as u8, (color >> 8) as u8, color as u8);
+        }
+        for [r, g, b] in NEEDS_THE_EXACT_PATH {
+            assert_ne!(
+                avif_fixed_sums(r, g, b).map(avif_fixed_sample),
+                ravif_ycbcr(r, g, b),
+                "rgb({r}, {g}, {b}) no longer needs the exact path"
+            );
+            check(r, g, b);
+        }
+    }
+
+    /// The image crate's AVIF encode of `img`: the path every
+    /// AVIF output took before the direct call.
+    fn image_crate_avif(img: &DynamicImage, speed: u8, quality: u8) -> image::ImageResult<Vec<u8>> {
+        let mut out = Vec::new();
+        image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut out, speed, quality)
+            .write_image(
+                img.as_bytes(),
+                img.width(),
+                img.height(),
+                img.color().into(),
+            )?;
+        Ok(out)
+    }
+
+    fn engine_avif(img: &DynamicImage, speed: u8, quality: u8) -> Result<Vec<u8>, EngineError> {
+        encode(
+            &EncodeBuffers::new(img),
+            StillFormat::Avif,
+            Some(quality),
+            None,
+            None,
+            FormatOptions::default(),
+            speed,
+            DEFAULT_JXL_SPEED,
+        )
+    }
+
+    #[test]
+    fn avif_rgb8_bytes_match_the_image_crate() {
+        let same = |img: &DynamicImage, speed: u8, quality: u8| {
+            assert!(avif_direct(img).is_some());
+            let got = engine_avif(img, speed, quality).unwrap();
+            let want = image_crate_avif(img, speed, quality).unwrap();
+            assert!(
+                got == want,
+                "{}x{} speed {speed} quality {quality}: {} and {} bytes",
+                img.width(),
+                img.height(),
+                got.len(),
+                want.len()
+            );
+        };
+        let field = |w: u32, h: u32| DynamicImage::ImageRgb8(test_field(w, h));
+        // Every speed the server can be configured with, on a
+        // frame small enough for the slow ones: its bytes
+        // change at six of the nine steps from one speed to the
+        // next, the step from 9 to 10 among them.
+        for speed in 1..=10 {
+            same(&field(16, 8), speed, 80);
+        }
+        // The quality range, with both sides of the steps ravif
+        // takes at 25, 55, 80 and 82.
+        for quality in [1, 25, 26, 55, 56, 79, 80, 81, 82, 100] {
+            same(&field(17, 9), DEFAULT_AVIF_SPEED, quality);
+        }
+        // Sizes from one pixel up, odd ones included, and one
+        // past a 64-pixel block on both sides.
+        for (w, h) in [(1, 1), (1, 9), (7, 5)] {
+            same(&field(w, h), DEFAULT_AVIF_SPEED, 80);
+            same(&field(w, h), 10, 60);
+        }
+        same(&field(65, 65), 10, 60);
+        // A frame large enough for two tiles. ravif takes the
+        // tile count from the size of the thread pool, so the
+        // bytes hold only while the direct call leaves the
+        // thread count unset, as the image crate does. A smooth
+        // frame keeps the encode short.
+        let smooth = image::RgbImage::from_fn(256, 128, |x, y| {
+            image::Rgb([x as u8, (y * 2) as u8, ((x + y) / 2) as u8])
+        });
+        same(&DynamicImage::ImageRgb8(smooth), 10, 80);
+    }
+
+    #[test]
+    fn avif_goes_direct_for_opaque_rgb8_only() {
+        let rgb = test_field(9, 5);
+        let rgba = image::RgbaImage::from_fn(9, 5, |x, y| {
+            let [r, g, b] = rgb.get_pixel(x, y).0;
+            image::Rgba([r, g, b, (x * 28) as u8])
+        });
+        let opaque_rgba = DynamicImage::ImageRgb8(rgb.clone()).to_rgba8();
+        let others = [
+            DynamicImage::ImageRgba8(rgba.clone()),
+            DynamicImage::ImageRgba8(opaque_rgba),
+            DynamicImage::ImageLuma8(DynamicImage::ImageRgb8(rgb.clone()).to_luma8()),
+            DynamicImage::ImageLumaA8(DynamicImage::ImageRgba8(rgba.clone()).to_luma_alpha8()),
+            DynamicImage::ImageRgb16(DynamicImage::ImageRgb8(rgb.clone()).to_rgb16()),
+            DynamicImage::ImageRgba16(DynamicImage::ImageRgba8(rgba.clone()).to_rgba16()),
+            DynamicImage::ImageLuma16(DynamicImage::ImageRgb8(rgb.clone()).to_luma16()),
+            DynamicImage::ImageRgb32F(DynamicImage::ImageRgb8(rgb.clone()).to_rgb32f()),
+            DynamicImage::ImageRgba32F(DynamicImage::ImageRgba8(rgba).to_rgba32f()),
+        ];
+        for other in &others {
+            // What the AVIF arm hands on: a float image as 16
+            // bits, every other image as it is.
+            let src = EncodeBuffers::new(other);
+            let handed = src.integer();
+            assert!(avif_direct(handed).is_none(), "{:?}", other.color());
+            // The bytes are the image crate's, as they were.
+            assert!(
+                engine_avif(other, 10, 80).unwrap() == image_crate_avif(handed, 10, 80).unwrap(),
+                "{:?}",
+                other.color()
+            );
+        }
+        assert!(avif_direct(&DynamicImage::ImageRgb8(rgb)).is_some());
+        // An image with no pixels is left to the image crate.
+        for (w, h) in [(0, 0), (0, 5), (5, 0)] {
+            assert!(avif_direct(&DynamicImage::new_rgb8(w, h)).is_none());
+        }
+    }
+
+    #[test]
+    fn avif_failures_read_as_the_image_crates() {
+        let message = |e: image::ImageError| EngineError::Encode(e.to_string()).to_string();
+        // An image with no pixels: the image crate refuses it.
+        let empty = DynamicImage::new_rgb8(0, 0);
+        assert_eq!(
+            engine_avif(&empty, DEFAULT_AVIF_SPEED, 80)
+                .unwrap_err()
+                .to_string(),
+            message(image_crate_avif(&empty, DEFAULT_AVIF_SPEED, 80).unwrap_err())
+        );
+        // A frame the AV1 encoder refuses (one past its widest):
+        // the direct call reports it in the image crate's words.
+        let wide = DynamicImage::new_rgb8(65_536, 1);
+        assert!(avif_direct(&wide).is_some());
+        let direct = engine_avif(&wide, DEFAULT_AVIF_SPEED, 80).unwrap_err();
+        assert!(matches!(direct, EngineError::Encode(_)), "{direct:?}");
+        assert_eq!(
+            direct.to_string(),
+            message(image_crate_avif(&wide, DEFAULT_AVIF_SPEED, 80).unwrap_err())
+        );
+    }
 }
