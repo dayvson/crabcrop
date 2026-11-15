@@ -117,9 +117,29 @@ struct TimedSigner {
 }
 
 impl TimedSigner {
-    /// A context whose resolver is the timed agent.
-    fn context(&self) -> Context {
+    /// A context whose resolver is the timed agent, with the
+    /// SDK's defaults otherwise: it validates each manifest
+    /// once it has signed it. The boot probe signs under it.
+    fn validating_context(&self) -> Context {
         Context::new().with_resolver(self.agent.clone())
+    }
+
+    /// The context a request's signing runs under. Without a
+    /// timestamp authority the SDK's pass over the manifest
+    /// it has just signed (`verify_after_sign`) is off (issue
+    /// #669): it costs about as much as the signing itself,
+    /// and signing is local work whose every input the boot
+    /// probe has already put through that pass, the identity
+    /// and each shape of manifest [`ManifestParts::of`]
+    /// builds. With an authority the pass stays on: the
+    /// authority's reply is an outside input in every
+    /// signature.
+    fn context(&self) -> Context {
+        let mut context = self.validating_context();
+        if self.inner.time_authority_url().is_none() {
+            context.settings_mut().verify.verify_after_sign = false;
+        }
+        context
     }
 
     /// A fresh signing pass over this signer.
@@ -667,9 +687,15 @@ impl ProvenanceSigner {
     /// preloads, instead of the first signed request
     /// discovering a broken identity.
     ///
-    /// The algorithm search runs without the authority,
-    /// and the authority is then asked exactly once, with
-    /// the settled algorithm (issue #397). Probing every
+    /// Once the algorithm is settled, the probe signs one
+    /// manifest of every shape a request can ask for (see
+    /// [`ProvenanceSigner::probe_shapes`]), so each has been
+    /// through the SDK's validation before the server
+    /// answers.
+    ///
+    /// The algorithm search and the shapes run without the
+    /// authority, and the authority is then asked exactly
+    /// once, with the settled algorithm (issue #397). Probing every
     /// candidate against it would multiply a stalled
     /// authority's bound by every algorithm the key
     /// happens to load under (an RSA key loads as all
@@ -679,6 +705,19 @@ impl ProvenanceSigner {
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         tsa: Option<TimestampAuthority>,
+    ) -> Result<Self, String> {
+        Self::from_pem_probing(cert_pem, key_pem, tsa, ManifestParts::of)
+    }
+
+    /// [`ProvenanceSigner::from_pem`] with the manifests of
+    /// the shape probe built by `parts`: always
+    /// [`ManifestParts::of`], and a parameter only so a test
+    /// can hand the boot a manifest assembled wrongly.
+    fn from_pem_probing(
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        tsa: Option<TimestampAuthority>,
+        parts: impl Fn(&SignRequest<'_>) -> ManifestParts,
     ) -> Result<Self, String> {
         let mut first_error = None;
         for alg in [
@@ -701,6 +740,7 @@ impl ProvenanceSigner {
             };
             match signer.probe() {
                 Ok(name) => {
+                    signer.probe_shapes(&parts)?;
                     let Some(tsa) = tsa else {
                         return Ok(Self { name, ..signer });
                     };
@@ -765,17 +805,20 @@ impl ProvenanceSigner {
     }
 
     /// The boot probe: sign the self-test image with this
-    /// identity and read the manifest back. Ok carries the
-    /// signer name the readback reports.
+    /// identity, with the SDK's validation of what it signed
+    /// on, and read the manifest back. Ok carries the signer
+    /// name the readback reports.
     fn probe(&self) -> Result<String, String> {
+        let request = SignRequest {
+            ingredient: None,
+            ai_edited: false,
+        };
         let signed = self
-            .sign(
+            .sign_parts(
+                self.signer.validating_context(),
                 SELF_TEST_PNG,
                 "image/png",
-                &SignRequest {
-                    ingredient: None,
-                    ai_edited: false,
-                },
+                ManifestParts::of(&request),
             )
             .map_err(|e| e.to_string())?;
         let summary = read_manifest(&signed, "image/png")
@@ -788,6 +831,73 @@ impl ProvenanceSigner {
              organization are missing or hold only control characters"
                 .to_string()
         })
+    }
+
+    /// The boot probe's second half (issue #669): sign one
+    /// manifest of every shape [`ManifestParts::of`] builds,
+    /// with the SDK's validation of what it signed on, and
+    /// read each back valid. A request's signing skips that
+    /// validation when no timestamp authority is configured
+    /// (see [`TimedSigner::context`]), so this is where a
+    /// manifest the engine assembles wrongly is caught: at
+    /// boot, as a startup error, for every shape and not
+    /// only the one the identity's own probe signs.
+    ///
+    /// `parts` builds the manifest for a request: always
+    /// [`ManifestParts::of`] (see
+    /// [`ProvenanceSigner::from_pem_probing`]).
+    fn probe_shapes(
+        &self,
+        parts: impl Fn(&SignRequest<'_>) -> ManifestParts,
+    ) -> Result<(), String> {
+        let sign = |source: Option<&[u8]>, records_status: bool, ai_edited: bool| {
+            let what = format!(
+                "{}{}",
+                match (source, records_status) {
+                    (None, _) => "without an ingredient",
+                    (Some(_), false) => "with a parent ingredient",
+                    (Some(_), true) => "with a parent ingredient and its recorded status",
+                },
+                if ai_edited { ", AI-edited" } else { "" }
+            );
+            let failed =
+                |why: &str| format!("the signing self-test failed on a manifest {what}: {why}");
+            let request = SignRequest {
+                ingredient: source.map(|bytes| (bytes, "image/png")),
+                ai_edited,
+            };
+            let parts = parts(&request);
+            if parts.records_status() != records_status {
+                return Err(failed(if records_status {
+                    "the parent's validation status was not recorded"
+                } else {
+                    "a validation status was recorded for a parent with no manifest store"
+                }));
+            }
+            let signed = self
+                .sign_parts(
+                    self.signer.validating_context(),
+                    SELF_TEST_PNG,
+                    "image/png",
+                    parts,
+                )
+                .map_err(|e| failed(&e.to_string()))?;
+            match read_manifest(&signed, "image/png") {
+                Some(summary) if summary.state == "valid" => Ok(signed),
+                Some(_) => Err(failed("it did not read back valid")),
+                None => Err(failed("the output carried no readable manifest")),
+            }
+        };
+        // The self-test image is a source with no manifest
+        // store; signed, it is one whose store validates, so
+        // its ingredient records a status.
+        let signed_source = sign(None, false, false)?;
+        sign(None, false, true)?;
+        for ai_edited in [false, true] {
+            sign(Some(SELF_TEST_PNG), false, ai_edited)?;
+            sign(Some(&signed_source[..]), true, ai_edited)?;
+        }
+        Ok(())
     }
 
     /// Sign one output. The returned bytes are the output
@@ -820,6 +930,24 @@ impl ProvenanceSigner {
         mime: &str,
         request: &SignRequest<'_>,
     ) -> Result<Vec<u8>, SignError> {
+        self.sign_parts(
+            self.signer.context(),
+            output,
+            mime,
+            ManifestParts::of(request),
+        )
+    }
+
+    /// Sign `output` with a manifest holding `parts`, under
+    /// `context`: the request's ([`TimedSigner::context`])
+    /// or the boot probe's, which validates what it signs.
+    fn sign_parts(
+        &self,
+        context: Context,
+        output: &[u8],
+        mime: &str,
+        parts: ManifestParts,
+    ) -> Result<Vec<u8>, SignError> {
         let failed = |e: c2pa::Error| SignError::Failed(e.to_string());
         let definition = serde_json::json!({
             "title": "crabcrop output",
@@ -830,15 +958,64 @@ impl ProvenanceSigner {
             }],
         })
         .to_string();
-        let mut builder = Builder::from_context(self.signer.context())
+        let mut builder = Builder::from_context(context)
             .with_definition(definition)
             .map_err(failed)?;
+        if let Some(ingredient) = parts.ingredient {
+            let ingredient =
+                c2pa::Ingredient::from_json(&ingredient.to_string()).map_err(failed)?;
+            builder.add_ingredient(ingredient);
+        }
+        for action in parts.actions {
+            builder.add_action(action).map_err(failed)?;
+        }
+        let mut source = Cursor::new(output);
+        let mut dest = Cursor::new(Vec::new());
+        let pass = self.signer.pass();
+        builder
+            .sign(&pass, mime, &mut source, &mut dest)
+            .map_err(|e| {
+                if pass.authority_failed.get() {
+                    SignError::Authority(e.to_string())
+                } else {
+                    failed(e)
+                }
+            })?;
+        Ok(dest.into_inner())
+    }
+}
+
+/// What a manifest says about one request, before the SDK
+/// signs it: the parent ingredient, when the source is one,
+/// and the actions, in order.
+struct ManifestParts {
+    ingredient: Option<serde_json::Value>,
+    actions: Vec<serde_json::Value>,
+}
+
+impl ManifestParts {
+    /// The parts for `request`. They come in six shapes, set
+    /// by three things only: whether the source is a parent
+    /// ingredient, whether that ingredient records a
+    /// validation status (the source carries a manifest
+    /// store that was read), and whether the request ran an
+    /// AI edit. The boot probe signs one manifest of each
+    /// ([`ProvenanceSigner::probe_shapes`]); a change here
+    /// that adds a shape adds it there.
+    fn of(request: &SignRequest<'_>) -> Self {
+        // Every field is named, so a new one does not
+        // compile until this function, and the probe after
+        // it, say what it does to the manifest.
+        let SignRequest {
+            ingredient,
+            ai_edited,
+        } = *request;
         // The actions assertion must open with a created
-        // or opened action (the SDK's own post-sign
-        // validation enforces it): opened when a parent
-        // ingredient exists to open, created when the
-        // output starts a fresh chain.
-        if let Some((source_bytes, source_format)) = request.ingredient {
+        // or opened action (the SDK's validation of a
+        // signed manifest enforces it): opened when a
+        // parent ingredient exists to open, created when
+        // the output starts a fresh chain.
+        let (ingredient, first_action) = if let Some((source_bytes, source_format)) = ingredient {
             // A bare JPEG XL codestream has no box a manifest
             // could live in, and the SDK's JPEG XL reader
             // refuses one outright instead of finding no
@@ -862,51 +1039,44 @@ impl ProvenanceSigner {
             if let Some(status) = source_status(source_bytes, read_as) {
                 ingredient["validation_results"] = status;
             }
-            let ingredient =
-                c2pa::Ingredient::from_json(&ingredient.to_string()).map_err(failed)?;
-            builder.add_ingredient(ingredient);
-            builder
-                .add_action(serde_json::json!({
-                    "action": "c2pa.opened",
-                    "parameters": { "ingredientIds": ["source"] },
-                }))
-                .map_err(failed)?;
+            let opened = serde_json::json!({
+                "action": "c2pa.opened",
+                "parameters": { "ingredientIds": ["source"] },
+            });
+            (Some(ingredient), opened)
         } else {
             // No ingredient to open: the source was a video
             // or a PDF, whose frame or page this output was
             // rendered from (every image source is an
             // ingredient). The chain starts here, with the
             // software-image source type. A created action
-            // must carry a digital source type (the
-            // post-sign validation enforces that too).
-            builder
-                .add_action(serde_json::json!({
-                    "action": "c2pa.created",
-                    "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/softwareImage",
-                }))
-                .map_err(failed)?;
+            // must carry a digital source type (that
+            // validation enforces it too).
+            let created = serde_json::json!({
+                "action": "c2pa.created",
+                "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/softwareImage",
+            });
+            (None, created)
+        };
+        let mut actions = vec![first_action];
+        if ai_edited {
+            actions.push(serde_json::json!({
+                "action": "c2pa.edited",
+                "digitalSourceType": AI_EDITED_SOURCE_TYPE,
+            }));
         }
-        if request.ai_edited {
-            builder
-                .add_action(serde_json::json!({
-                    "action": "c2pa.edited",
-                    "digitalSourceType": AI_EDITED_SOURCE_TYPE,
-                }))
-                .map_err(failed)?;
+        Self {
+            ingredient,
+            actions,
         }
-        let mut source = Cursor::new(output);
-        let mut dest = Cursor::new(Vec::new());
-        let pass = self.signer.pass();
-        builder
-            .sign(&pass, mime, &mut source, &mut dest)
-            .map_err(|e| {
-                if pass.authority_failed.get() {
-                    SignError::Authority(e.to_string())
-                } else {
-                    failed(e)
-                }
-            })?;
-        Ok(dest.into_inner())
+    }
+
+    /// Whether the parent ingredient records how the
+    /// source's own manifest store validated.
+    fn records_status(&self) -> bool {
+        self.ingredient
+            .as_ref()
+            .is_some_and(|ingredient| ingredient.get("validation_results").is_some())
     }
 }
 
@@ -1069,6 +1239,9 @@ mod state_tests;
 
 #[cfg(test)]
 mod identity_tests;
+
+#[cfg(test)]
+mod shape_tests;
 
 /// The test identity whose common name runs past 64
 /// characters over two lines, for other modules' suites
