@@ -99,7 +99,9 @@ impl From<StillFormat> for ImageFormat {
 /// re-encode one image up to a dozen times; converting the
 /// full frame inside each attempt copied it every time. The
 /// buffers compute lazily: a JPEG-only request never pays for
-/// the RGBA layout.
+/// the RGBA layout. An image that already has the layout an
+/// encoder asks for is lent as it is (issue #665): converting
+/// it would only copy the frame.
 pub(in crate::engine) struct EncodeBuffers<'a> {
     img: &'a DynamicImage,
     rgb: std::cell::OnceCell<image::RgbImage>,
@@ -118,11 +120,17 @@ impl<'a> EncodeBuffers<'a> {
     }
 
     fn rgb(&self) -> &image::RgbImage {
-        self.rgb.get_or_init(|| self.img.to_rgb8())
+        match self.img {
+            DynamicImage::ImageRgb8(rgb) => rgb,
+            img => self.rgb.get_or_init(|| img.to_rgb8()),
+        }
     }
 
     fn rgba(&self) -> &image::RgbaImage {
-        self.rgba.get_or_init(|| self.img.to_rgba8())
+        match self.img {
+            DynamicImage::ImageRgba8(rgba) => rgba,
+            img => self.rgba.get_or_init(|| img.to_rgba8()),
+        }
     }
 
     /// The image with integer samples, for the encoders that
@@ -952,6 +960,103 @@ mod tests {
                 image::Rgb([(x * 3) as u8, (y * 5) as u8, (x + y) as u8])
             }
         })
+    }
+
+    #[test]
+    fn a_frame_in_the_encoders_layout_is_lent_not_copied() {
+        // Issue #665: an image that already has the layout an
+        // encoder reads is that encoder's buffer.
+        let rgb = DynamicImage::ImageRgb8(test_field(9, 5));
+        let src = EncodeBuffers::new(&rgb);
+        assert!(std::ptr::eq(src.rgb(), rgb.as_rgb8().unwrap()));
+        let with_alpha = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(9, 5, |x, y| {
+            image::Rgba([(x * 20) as u8, (y * 40) as u8, 7, (x * 28 + y) as u8])
+        }));
+        let src_alpha = EncodeBuffers::new(&with_alpha);
+        assert!(std::ptr::eq(
+            src_alpha.rgba(),
+            with_alpha.as_rgba8().unwrap()
+        ));
+
+        // The layout an image does not have is converted once,
+        // to what the conversion always gave: the RGBA layout of
+        // an opaque image, the RGB layout of one with alpha (a
+        // JPEG without a fill), and both layouts of gray, 16-bit
+        // and float images.
+        let gray = DynamicImage::ImageLuma8(rgb.to_luma8());
+        let others = [
+            rgb.clone(),
+            with_alpha.clone(),
+            gray.clone(),
+            DynamicImage::ImageLumaA8(with_alpha.to_luma_alpha8()),
+            DynamicImage::ImageRgb16(rgb.to_rgb16()),
+            DynamicImage::ImageRgba16(with_alpha.to_rgba16()),
+            DynamicImage::ImageLuma16(gray.to_luma16()),
+            DynamicImage::ImageRgb32F(rgb.to_rgb32f()),
+            DynamicImage::ImageRgba32F(with_alpha.to_rgba32f()),
+        ];
+        for img in &others {
+            let src = EncodeBuffers::new(img);
+            let (as_rgb, as_rgba) = (src.rgb(), src.rgba());
+            assert!(*as_rgb == img.to_rgb8(), "{:?}", img.color());
+            assert!(*as_rgba == img.to_rgba8(), "{:?}", img.color());
+            assert!(std::ptr::eq(as_rgb, src.rgb()), "{:?}", img.color());
+            assert!(std::ptr::eq(as_rgba, src.rgba()), "{:?}", img.color());
+            let own = img.as_bytes().as_ptr();
+            let lent_rgb = matches!(img, DynamicImage::ImageRgb8(_));
+            let lent_rgba = matches!(img, DynamicImage::ImageRgba8(_));
+            assert_eq!(
+                as_rgb.as_raw().as_ptr() == own,
+                lent_rgb,
+                "{:?}",
+                img.color()
+            );
+            assert_eq!(
+                as_rgba.as_raw().as_ptr() == own,
+                lent_rgba,
+                "{:?}",
+                img.color()
+            );
+        }
+
+        // Converting an image to the layout it has copies its
+        // buffer as it stands, bytes past the pixels included,
+        // so the lent frame is what the copy held even then.
+        let padded = image::RgbImage::from_raw(2, 2, vec![7; 20]).unwrap();
+        let padded = DynamicImage::ImageRgb8(padded);
+        let src = EncodeBuffers::new(&padded);
+        assert!(std::ptr::eq(src.rgb(), padded.as_rgb8().unwrap()));
+        assert_eq!(src.rgb().as_raw(), padded.to_rgb8().as_raw());
+    }
+
+    #[test]
+    fn a_jpeg_of_a_flattened_image_does_not_read_the_lent_frame() {
+        // Issue #665: an image with alpha flattened onto a fill
+        // encodes from the flattened pixels, not from its own
+        // buffer, and no fill reads its color channels as they
+        // are.
+        let with_alpha = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(24, 16, |x, y| {
+            image::Rgba([(x * 9) as u8, (y * 13) as u8, 90, (x * 11) as u8])
+        }));
+        let jpeg = |img: &DynamicImage, fill: Option<[u8; 3]>| {
+            encode(
+                &EncodeBuffers::new(img),
+                StillFormat::Jpeg,
+                Some(80),
+                fill,
+                None,
+                FormatOptions::default(),
+                DEFAULT_AVIF_SPEED,
+                DEFAULT_JXL_SPEED,
+            )
+            .unwrap()
+        };
+        let white = [255, 255, 255];
+        let flattened = DynamicImage::ImageRgb8(flatten(&with_alpha, white));
+        assert!(jpeg(&with_alpha, Some(white)) == jpeg(&flattened, None));
+        let channels = DynamicImage::ImageRgb8(with_alpha.to_rgb8());
+        assert!(jpeg(&with_alpha, None) == jpeg(&channels, None));
+        assert!(jpeg(&with_alpha, None) != jpeg(&with_alpha, Some(white)));
     }
 
     /// ravif's conversion as its source spells it (ravif 0.13,
