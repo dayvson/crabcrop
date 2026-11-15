@@ -132,23 +132,24 @@ fn frames_prepared_on_threads_write_the_bytes_one_thread_writes() {
 
 #[test]
 fn the_thread_count_follows_the_cores_the_frames_and_the_size() {
-    // The cores, four at most.
+    // The cores, two at most (issue #695).
+    assert_eq!(GIF_FRAME_THREADS, 2);
     assert_eq!(gif_frame_workers(1, 12, 480, 320), 1);
     assert_eq!(gif_frame_workers(2, 12, 480, 320), 2);
-    assert_eq!(gif_frame_workers(3, 12, 480, 320), 3);
-    assert_eq!(gif_frame_workers(4, 12, 480, 320), 4);
-    assert_eq!(gif_frame_workers(8, 12, 480, 320), 4);
-    assert_eq!(gif_frame_workers(256, 200, 480, 320), 4);
+    assert_eq!(gif_frame_workers(3, 12, 480, 320), 2);
+    assert_eq!(gif_frame_workers(4, 12, 480, 320), 2);
+    assert_eq!(gif_frame_workers(8, 12, 480, 320), 2);
+    assert_eq!(gif_frame_workers(256, 200, 480, 320), 2);
     // Never more than the frames, and one for a single frame.
-    assert_eq!(gif_frame_workers(8, 3, 480, 320), 3);
+    assert_eq!(gif_frame_workers(8, 3, 480, 320), 2);
     assert_eq!(gif_frame_workers(8, 2, 480, 320), 2);
     assert_eq!(gif_frame_workers(8, 1, 480, 320), 1);
     // One under 64x64 pixels, whatever the shape.
-    assert_eq!(gif_frame_workers(8, 12, 64, 64), 4);
+    assert_eq!(gif_frame_workers(8, 12, 64, 64), 2);
     assert_eq!(gif_frame_workers(8, 12, 63, 64), 1);
     assert_eq!(gif_frame_workers(8, 12, 4095, 1), 1);
-    assert_eq!(gif_frame_workers(8, 12, 4096, 1), 4);
-    assert_eq!(gif_frame_workers(8, 12, 16383, 16383), 4);
+    assert_eq!(gif_frame_workers(8, 12, 4096, 1), 2);
+    assert_eq!(gif_frame_workers(8, 12, 16383, 16383), 2);
     // A host that reports no core still gets the one thread.
     assert_eq!(gif_frame_workers(0, 12, 480, 320), 1);
 }
