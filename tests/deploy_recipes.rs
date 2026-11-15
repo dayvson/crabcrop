@@ -1228,7 +1228,7 @@ fn runtime_images_carry_no_curl() {
 
     // The AI image keeps the base image's check. ONNX Runtime
     // comes from a download stage that checks both hashes;
-    // the runtime stage copies only the library.
+    // the runtime stage copies the library and its notices.
     let ai = stages(&read("Dockerfile.ai"));
     let [download, runtime] = &ai[..] else {
         panic!("Dockerfile.ai: a download stage, then the runtime stage: {ai:#?}");
@@ -1267,6 +1267,50 @@ fn runtime_images_carry_no_curl() {
         })
         .collect();
     assert_eq!(bases.len(), 1, "one pinned Debian base: {bases:?}");
+}
+
+#[test]
+fn images_carry_the_third_party_notices() {
+    // Issue #682: an image carries the license notices of the
+    // code its binary contains, with crabcrop's own license,
+    // where Debian keeps a package's. The AI image adds ONNX
+    // Runtime's license and its own third-party notices,
+    // copied from the tarball its download stage checks, which
+    // THIRD-PARTY-NOTICES.md tells the reader to look for.
+    const COPY: &str = "COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/crabcrop/";
+    for rel in ["Dockerfile", "Dockerfile.release"] {
+        let stage = final_stage(&read(rel));
+        assert!(
+            stage.iter().any(|i| i == COPY),
+            "{rel}: the runtime stage must `{COPY}`: {stage:#?}"
+        );
+    }
+    let ai = stages(&read("Dockerfile.ai"));
+    let [download, runtime] = &ai[..] else {
+        panic!("Dockerfile.ai: a download stage, then the runtime stage: {ai:#?}");
+    };
+    let fetch = download
+        .iter()
+        .find(|i| i.contains("curl -fsSL "))
+        .expect("Dockerfile.ai: the download stage fetches ONNX Runtime");
+    for file in ["LICENSE", "ThirdPartyNotices.txt"] {
+        let copied = format!("-1.31.0/{file}\"");
+        assert!(
+            fetch.contains(&copied) && fetch.contains("/opt/onnxruntime-notices/;"),
+            "Dockerfile.ai: the download stage copies the tarball's {file} to /opt/onnxruntime-notices/: {fetch}"
+        );
+    }
+    let notices = "/usr/share/doc/crabcrop/onnxruntime";
+    assert!(
+        runtime
+            .iter()
+            .any(|i| i == &format!("COPY --from=onnxruntime /opt/onnxruntime-notices {notices}")),
+        "Dockerfile.ai: the runtime stage installs ONNX Runtime's notices at {notices}: {runtime:#?}"
+    );
+    assert!(
+        read("THIRD-PARTY-NOTICES.md").contains(&format!("`{notices}/ThirdPartyNotices.txt`")),
+        "THIRD-PARTY-NOTICES.md: points the reader at ONNX Runtime's notices in the AI image"
+    );
 }
 
 /// Every file under `dir`, recursively, sorted.

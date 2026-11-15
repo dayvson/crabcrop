@@ -1,10 +1,11 @@
 # crabcrop server image.
 #
 # Multi-stage: the builder compiles the release binary; the
-# runtime stage carries only the binary, CA certificates
-# (source fetching is HTTPS) and the dav1d library. It has
-# no curl: the binary checks its own health. The AI variant
-# layers on top of this image: see Dockerfile.ai.
+# runtime stage carries only the binary, its license notices,
+# CA certificates (source fetching is HTTPS) and the dav1d
+# library. It has no curl: the binary checks its own health.
+# The AI variant layers on top of this image: see
+# Dockerfile.ai.
 #
 # Base images are digest-pinned (audit PL-13); refresh the
 # digests deliberately when moving to a newer base.
@@ -33,6 +34,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libdav1d7 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/crabcrop /usr/local/bin/crabcrop
+# The license notices of the code the binary carries, with
+# crabcrop's own license (issue #682). The release binaries
+# link a static dav1d; this image links Debian's libdav1d7,
+# whose notices are in /usr/share/doc/libdav1d7/.
+COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/crabcrop/
 ENV PORT=3000
 EXPOSE 3000
 # The disk result tier's conventional directory, owned by the

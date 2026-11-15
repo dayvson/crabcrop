@@ -22,6 +22,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 COPY image-bin/${TARGETARCH}/crabcrop /usr/local/bin/crabcrop
+# The license notices of the code the binary carries, with
+# crabcrop's own license, where Debian keeps a package's
+# (issue #682). scripts/check_notices.py generates the file.
+COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/crabcrop/
 ENV PORT=3000
 EXPOSE 3000
 # The disk result tier's conventional directory, owned by the
