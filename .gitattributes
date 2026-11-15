@@ -1,3 +1,6 @@
 # The TypeScript SDK's build of its explainer, copied by
 # scripts/sync_playground_sdk.py (issue #482).
 playground/sdk/** linguist-generated=true
+# Generated from Cargo.lock by scripts/check_notices.py (issue #682);
+# a dependency change rewrites much of it.
+THIRD-PARTY-NOTICES.md linguist-generated=true

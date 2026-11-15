@@ -103,6 +103,12 @@ step "Lockfiles (one version of each decoder, and the fuzz lock matches the root
 python3 scripts/check_locks.py
 python3 scripts/test_check_locks.py
 
+step "Third-party notices (THIRD-PARTY-NOTICES.md lists the crates the release build compiles, and every artifact ships it)"
+# Regenerates the file too when the pinned cargo-about is installed;
+# CI's notices job installs it and passes --strict.
+python3 scripts/check_notices.py
+python3 scripts/test_check_notices.py
+
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
 # CI checks out the full history, so there a skip means the checkout
 # lost the tags: --strict fails it instead.

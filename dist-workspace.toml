@@ -19,6 +19,11 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 # scripts/build_dav1d.sh from a pinned, checksummed release
 # tarball (issue #596; see docs/release-workflow.yml).
 features = ["avif-decode"]
+# Every tarball carries the third-party license notices beside the
+# binary and dist's automatic LICENSE, README.md and CHANGELOG.md
+# (issue #682). scripts/check_notices.py generates the file for the
+# features and targets above, and fails when this line goes.
+include = ["THIRD-PARTY-NOTICES.md"]
 # The release workflow carries repo-maintained jobs (container images,
 # registry publishing) beyond what dist generates, so the generated
 # file is not expected to match byte for byte.
