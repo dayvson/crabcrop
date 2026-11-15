@@ -42,6 +42,9 @@ EXAMPLES = {
     # Generated from Cargo.lock, the workspace's own crates left out, so
     # every version in it is a third-party crate's (issue #682).
     "THIRD-PARTY-NOTICES.md": "third-party crates' own versions",
+    # The recipe imports the Bunny SDK at the SDK's own version, which
+    # is no pin of this release either.
+    "deploy/bunnycdn/cache-tag-middleware.ts": "the Bunny SDK's own version",
 }
 
 
