@@ -1,4 +1,4 @@
-//! Recent detections, remembered by the digest of the
+//! Recent detections, remembered by a keyed digest of the
 //! model's input (issue #677).
 //!
 //! The engine shares one detection between the operations of
@@ -10,7 +10,7 @@
 //! same input, and each is its own miss in the result cache.
 //!
 //! A model is a function of its input, so a provider keeps
-//! the boxes it last answered, keyed by the SHA-256 of
+//! the boxes it last answered, keyed by a digest of
 //! everything that decides them: the pixels the model's
 //! input is filled from and whatever the boxes are mapped
 //! back with. A hit hands back the boxes a fresh run would
@@ -20,9 +20,34 @@
 //! make is a miss, and a result it cannot keep is not kept.
 //! It is a field of its provider and goes when the provider
 //! goes.
+//!
+//! The digest is SipHash-2-4 with a 128-bit output, keyed
+//! with a secret each memo draws when it is made. Keyed, it
+//! is a pseudorandom function of the input: without the
+//! secret nobody can construct two inputs that share a key,
+//! so a source cannot be made to collide with another one.
+//! By chance, two of 2^32 different inputs share a key with
+//! a probability below 2^-64. So a hit hands back what a
+//! fresh run would have given, which matters because the
+//! face memo's boxes decide what `blurfaces` covers. The
+//! secret never leaves the memo, and a restart draws a new
+//! one.
+//!
+//! Why this digest: it costs the same on every CPU. Over
+//! the face model's 1.2 MB input, a SHA-256 (the memo's
+//! first key) took 0.79 ms with the CPU's SHA extensions
+//! and 3.7 ms in sha2's portable code, which is what runs
+//! on Intel server CPUs before Ice Lake. SipHash-2-4 takes
+//! 0.57 ms on either kind of CPU: it is plain 64-bit
+//! arithmetic.
+//! SipHash-1-3, the variant the standard library's hash
+//! maps use, takes 0.31 ms; 2-4 keeps the rounds its
+//! authors recommend, for a key whose collision would hand
+//! one image's boxes to another.
 
-use sha2::{Digest, Sha256};
+use siphasher::sip128::{Hasher128, SipHasher24};
 use std::collections::VecDeque;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Mutex;
 
 /// How many results a provider remembers.
@@ -36,26 +61,11 @@ const MEMO_ENTRIES: usize = 256;
 /// kilobytes.
 const MEMO_BOXES: usize = 64;
 
-/// What a result is remembered under: the SHA-256 of
-/// everything that decides it.
+/// What a result is remembered under: the 128-bit digest of
+/// everything that decides it, keyed with its memo's
+/// secret. Only the memo that made a key can make it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MemoKey([u8; 32]);
-
-impl MemoKey {
-    /// The digest of the parts in order, each behind its
-    /// length, so that no two lists of parts hash the same
-    /// bytes.
-    pub(super) fn of(parts: &[&[u8]]) -> Self {
-        let mut hasher = Sha256::new();
-        for part in parts {
-            hasher.update((part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&hasher.finalize());
-        Self(key)
-    }
-}
+pub(super) struct MemoKey([u8; 16]);
 
 /// A provider's most recent results, most recently used
 /// first. Safe to share between threads: every operation
@@ -64,6 +74,25 @@ impl MemoKey {
 pub(super) struct DetectionMemo<B> {
     entries: Mutex<VecDeque<(MemoKey, Vec<B>)>>,
     capacity: usize,
+    /// The digest's key, drawn when the memo is made. Only
+    /// [`DetectionMemo::key`] uses it: there is no accessor,
+    /// and the memo has no `Debug`.
+    secret: (u64, u64),
+}
+
+/// 128 bits nobody outside this process can predict: the
+/// standard library seeds every `RandomState` from the
+/// operating system's random source and steps the seed for
+/// each new one, so a constant hashed under two fresh ones
+/// gives two such 64-bit halves (the source the video probe
+/// separator in src/frames.rs draws from too).
+fn fresh_secret() -> (u64, u64) {
+    let half = || {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write(b"detection memo");
+        hasher.finish()
+    };
+    (half(), half())
 }
 
 impl<B: Clone> DetectionMemo<B> {
@@ -75,7 +104,20 @@ impl<B: Clone> DetectionMemo<B> {
         Self {
             entries: Mutex::new(VecDeque::new()),
             capacity,
+            secret: fresh_secret(),
         }
+    }
+
+    /// The key of a result: the digest of the parts in
+    /// order, each behind its length, so that no two lists
+    /// of parts hash the same bytes.
+    pub(super) fn key(&self, parts: &[&[u8]]) -> MemoKey {
+        let mut hasher = SipHasher24::new_with_keys(self.secret.0, self.secret.1);
+        for part in parts {
+            hasher.write(&(part.len() as u64).to_le_bytes());
+            hasher.write(part);
+        }
+        MemoKey(hasher.finish128().as_bytes())
     }
 
     /// The boxes remembered under `key`, which becomes the

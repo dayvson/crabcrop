@@ -1,8 +1,11 @@
 use super::*;
 use std::sync::Arc;
 
+/// A key for the tests of the entries: any 16 bytes will do.
 fn key(n: u32) -> MemoKey {
-    MemoKey::of(&[&n.to_le_bytes()])
+    let mut bytes = [0u8; 16];
+    bytes[..4].copy_from_slice(&n.to_le_bytes());
+    MemoKey(bytes)
 }
 
 fn keys_in_order<B>(memo: &DetectionMemo<B>) -> Vec<MemoKey> {
@@ -14,30 +17,99 @@ fn a_key_is_the_digest_of_its_parts_and_their_lengths() {
     // The same parts give the same key; any part that
     // differs, and the same bytes cut into other parts,
     // give another.
-    let a = MemoKey::of(&[b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()]);
+    let memo = DetectionMemo::<u32>::new();
+    let a = memo.key(&[b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()]);
     assert_eq!(
         a,
-        MemoKey::of(&[b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()])
+        memo.key(&[b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()])
     );
     assert_ne!(
         a,
-        MemoKey::of(&[b"pixelz", &640u32.to_le_bytes(), &480u32.to_le_bytes()])
+        memo.key(&[b"pixelz", &640u32.to_le_bytes(), &480u32.to_le_bytes()])
     );
     assert_ne!(
         a,
-        MemoKey::of(&[b"pixels", &641u32.to_le_bytes(), &480u32.to_le_bytes()])
+        memo.key(&[b"pixels", &641u32.to_le_bytes(), &480u32.to_le_bytes()])
     );
     assert_ne!(
         a,
-        MemoKey::of(&[b"pixels", &480u32.to_le_bytes(), &640u32.to_le_bytes()])
+        memo.key(&[b"pixels", &480u32.to_le_bytes(), &640u32.to_le_bytes()])
     );
-    assert_ne!(MemoKey::of(&[b"ab", b"c"]), MemoKey::of(&[b"a", b"bc"]));
-    assert_ne!(MemoKey::of(&[b"abc"]), MemoKey::of(&[b"abc", b""]));
-    // It is SHA-256: one part of no bytes hashes its
-    // eight-byte length, a known digest.
-    use sha2::{Digest, Sha256};
-    let want: [u8; 32] = Sha256::digest(0u64.to_le_bytes()).into();
-    assert_eq!(MemoKey::of(&[b""]).0, want);
+    assert_ne!(memo.key(&[b"ab", b"c"]), memo.key(&[b"a", b"bc"]));
+    assert_ne!(memo.key(&[b"abc"]), memo.key(&[b"abc", b""]));
+    assert_ne!(memo.key(&[]), memo.key(&[b""]));
+}
+
+#[test]
+fn the_digest_is_siphash_2_4_with_a_128_bit_output_under_the_secret() {
+    // With the secret set to the reference key 00..0f, the
+    // key of no parts is the digest of the empty message:
+    // the first SipHash-2-4-128 test vector of the
+    // algorithm's reference implementation. SipHash-1-3, a
+    // 64-bit output, or a digest that leaves the secret out
+    // gives another value.
+    let mut memo = DetectionMemo::<u32>::new();
+    memo.secret = (0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908);
+    let vector = [
+        0xa3, 0x81, 0x7f, 0x04, 0xba, 0x25, 0xa8, 0xe6, 0x6d, 0xf6, 0x72, 0x14, 0xc7, 0x55, 0x02,
+        0x93,
+    ];
+    assert_eq!(memo.key(&[]), MemoKey(vector));
+    // A part is its eight-byte little-endian length, then
+    // its bytes.
+    use siphasher::sip128::SipHasher24;
+    let mut message = 3u64.to_le_bytes().to_vec();
+    message.extend_from_slice(b"abc");
+    let want = SipHasher24::new_with_keys(memo.secret.0, memo.secret.1)
+        .hash(&message)
+        .as_bytes();
+    assert_eq!(memo.key(&[b"abc"]), MemoKey(want));
+}
+
+#[test]
+fn every_memo_keys_with_its_own_secret() {
+    // Two memos give the same input different keys: each
+    // drew its own secret, so a key made by one means
+    // nothing to another, and nobody outside a memo can
+    // make its keys.
+    let parts: [&[u8]; 3] = [b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()];
+    let first = DetectionMemo::<u32>::new();
+    let second = DetectionMemo::<u32>::new();
+    assert_ne!(first.secret, second.secret);
+    assert_ne!(first.key(&parts), second.key(&parts));
+    assert_ne!(first.key(&[]), second.key(&[]));
+    // Neither half of a secret is a constant, and the two
+    // halves are drawn apart.
+    let third = DetectionMemo::<u32>::new();
+    assert_ne!(first.secret.0, third.secret.0);
+    assert_ne!(first.secret.1, third.secret.1);
+    assert_ne!(first.secret.0, first.secret.1);
+    // A result one memo keeps is a miss in another.
+    first.put(first.key(&parts), &[1]);
+    assert_eq!(first.get(&first.key(&parts)), Some(vec![1]));
+    assert_eq!(second.get(&second.key(&parts)), None);
+}
+
+#[test]
+fn a_memo_gives_the_same_input_the_same_key_every_time() {
+    // The secret is drawn once, when the memo is made: the
+    // same parts get the same key on every call and from
+    // every thread, so a repeat finds its entry.
+    let memo = Arc::new(DetectionMemo::<u32>::new());
+    let parts: [&[u8]; 3] = [b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()];
+    let first = memo.key(&parts);
+    assert_eq!(memo.key(&parts), first);
+    let from_another_thread = {
+        let memo = memo.clone();
+        std::thread::spawn(move || {
+            memo.key(&[b"pixels", &640u32.to_le_bytes(), &480u32.to_le_bytes()])
+        })
+        .join()
+        .unwrap()
+    };
+    assert_eq!(from_another_thread, first);
+    memo.put(first, &[7]);
+    assert_eq!(memo.get(&memo.key(&parts)), Some(vec![7]));
 }
 
 #[test]
@@ -177,12 +249,12 @@ fn what_the_memo_holds_goes_when_the_memo_goes() {
 
 #[test]
 fn an_entry_is_a_key_and_boxes_and_nothing_else() {
-    // No pixels: an entry of a face memo is its 32-byte key
+    // No pixels: an entry of a face memo is its 16-byte key
     // and its boxes, 20 bytes each.
-    assert_eq!(std::mem::size_of::<MemoKey>(), 32);
+    assert_eq!(std::mem::size_of::<MemoKey>(), 16);
     assert_eq!(std::mem::size_of::<crate::ai::FaceBox>(), 20);
     assert_eq!(
         std::mem::size_of::<(MemoKey, Vec<crate::ai::FaceBox>)>(),
-        32 + std::mem::size_of::<Vec<crate::ai::FaceBox>>()
+        16 + std::mem::size_of::<Vec<crate::ai::FaceBox>>()
     );
 }

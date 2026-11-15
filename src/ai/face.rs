@@ -5,7 +5,7 @@ use image::DynamicImage;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::memo::{DetectionMemo, MemoKey};
+use super::memo::DetectionMemo;
 use super::session::{build_session, fir_resize, rgb8_view};
 use super::{AiError, FaceBox, FaceProvider};
 
@@ -122,7 +122,7 @@ fn detect_faces(
     // is these pixels in a fixed arrangement, and the source
     // size the boxes are mapped back to.
     let remembered = memo.map(|memo| {
-        let key = MemoKey::of(&[
+        let key = memo.key(&[
             small.as_raw().as_slice(),
             &ow.to_le_bytes(),
             &oh.to_le_bytes(),

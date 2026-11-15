@@ -6,7 +6,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::clip::read_labels;
-use super::memo::{DetectionMemo, MemoKey};
+use super::memo::DetectionMemo;
 use super::session::{TensorOutput, build_session, fir_resize, first_output, rgb8_view};
 use super::{AiError, Detection, DetectionProvider};
 
@@ -175,7 +175,8 @@ fn detect_objects<O: TensorOutput>(
         parts.extend(sizes.iter().map(|size| size.as_slice()));
         parts.push(&floor);
         parts.extend(classes.iter().map(|class| class.as_bytes()));
-        (memo, MemoKey::of(&parts))
+        let key = memo.key(&parts);
+        (memo, key)
     });
     if let Some((memo, key)) = &remembered
         && let Some(found) = memo.get(key)
