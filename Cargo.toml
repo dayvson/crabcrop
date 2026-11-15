@@ -151,7 +151,11 @@ zune-core = "0.5"
 # JPEG output is written by libjpeg-turbo (issue #668): about
 # three times faster than the pure-Rust encoder it replaced,
 # and it averages the chroma it subsamples where that encoder
-# kept one sample in two or four. turbojpeg-sys compiles the
+# kept one sample in two or four. It also decodes a JPEG
+# source at a half, a quarter or an eighth of its size where
+# the first operation is a resize that shrinks it that far
+# (issue #653), which zune-jpeg cannot; every other JPEG
+# decode stays zune-jpeg's. turbojpeg-sys compiles the
 # libjpeg-turbo sources it vendors with cmake and links the
 # library statically, so no system package or runtime library
 # is involved, and its bindings are pregenerated, so no

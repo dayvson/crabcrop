@@ -25,9 +25,9 @@
    "path": "/622623aeec61c4e64fcaa047340c9da2d2f938cf747d88636906bef5cfd47961/300x200/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 16054,
-   "sha256": "6e1ddac7cc5c8f6143697828cd81d0d307b99f6355caf46b16a1fbf169fd0c06",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 15822,
+   "sha256": "1364089528987577c4e485b675c6fb88331343bdaa9ca85cfbe740e5efb55ca3",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
   },
   {
    "id": "resize-proportional",
@@ -85,9 +85,9 @@
    "path": "/7e8a621d78b50ad6a2ee4be5e2e12c872ce493caa0dabec9d32c2036777c98cd/300x0/filters:format(webp)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/webp",
-   "bytes": 13400,
-   "sha256": "ae3a9a8011e9037fdf31516c3a6f2c059ff17c60c74764b047f5304765a5b105",
-   "note": ""
+   "bytes": 13242,
+   "sha256": "94a2b7ac10923098b6dd93f28b9f0c58204855b81cf69537cfcb9254e1a7faaa",
+   "note": "Re-baselined 2026-11-15 against the current build: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render of the 1000x667 crab-photo.jpg, which is decoded at half size before the resize to 300 wide, differs from the baseline bytes. The output size is unchanged."
   },
   {
    "id": "format-avif",
@@ -95,9 +95,9 @@
    "path": "/d96b613cafafd80fa5940974539ac77c0c67073e47ac64630cc9b6a378695dc3/300x0/filters:format(avif)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/avif",
-   "bytes": 12034,
-   "sha256": "683324fa1e21b23466c1cef39d55102a7d96f916ce35f970b6a9565514e49fa4",
-   "note": ""
+   "bytes": 11875,
+   "sha256": "245b135b2402f68b72fff131d6a40d3bc232d868f2bc976c34980650bda7e7dc",
+   "note": "Re-baselined 2026-11-15 against the current build: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render of the 1000x667 crab-photo.jpg, which is decoded at half size before the resize to 300 wide, differs from the baseline bytes. The output size is unchanged."
   },
   {
    "id": "format-jxl",
@@ -105,9 +105,9 @@
    "path": "/e7b6578bbb85df9bcbe0ba403c1267584ae4411b22929bbb0e8260fe8af7fc4a/300x0/filters:format(jxl)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jxl",
-   "bytes": 7805,
-   "sha256": "316c0142c0278b0163d47fb4ebdb45506cebc6571729731238b9d2cc547af901",
-   "note": "Re-baselined 2026-11-08 against the current build: the JPEG XL encoder jixel changed deliberately (PR #493), moving from 0.5.2 to 0.5.5, whose output at the same quality setting runs 11 to 19 percent smaller at slightly lower fidelity, so format(jxl) renders differ from the baseline bytes."
+   "bytes": 7688,
+   "sha256": "19dbacfd6db0b679e3ae2462b9d0512abbe9eeb4ecc3f90246bc50d5e959d7f3",
+   "note": "Re-baselined 2026-11-08 against the current build: the JPEG XL encoder jixel changed deliberately (PR #493), moving from 0.5.2 to 0.5.5, whose output at the same quality setting runs 11 to 19 percent smaller at slightly lower fidelity, so format(jxl) renders differ from the baseline bytes. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
   },
   {
    "id": "format-png",
@@ -115,9 +115,9 @@
    "path": "/c3c391bb4a4f1421eaa0b43642b9940bc91dda485a3033bfa16bfea0a3945ee7/300x0/filters:format(png)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/png",
-   "bytes": 121273,
-   "sha256": "047eaf5c3b0e49792da3e03314aa2460530028f9b4813f9e5cfe8e23302f1515",
-   "note": ""
+   "bytes": 120291,
+   "sha256": "ba71e5dc136899318c18370089cab9802264955c056fe358dbecb8c224165da5",
+   "note": "Re-baselined 2026-11-15 against the current build: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render of the 1000x667 crab-photo.jpg, which is decoded at half size before the resize to 300 wide, differs from the baseline bytes. The output size is unchanged."
   },
   {
    "id": "format-gif",
@@ -125,9 +125,9 @@
    "path": "/9a75932128bdbd15218574134c44c71dc66c88b13d0b7b5c87cfb5876ec9bb24/300x0/filters:format(gif)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/gif",
-   "bytes": 43077,
-   "sha256": "9ae618232df5f0d8c921fc0bbd9ceada3657823ff88446b6932e5b72548f39d7",
-   "note": ""
+   "bytes": 42829,
+   "sha256": "3216379b94209e7da03d63e25ade3df969ae937d2d2a56a3c1db91091541097f",
+   "note": "Re-baselined 2026-11-15 against the current build: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render of the 1000x667 crab-photo.jpg, which is decoded at half size before the resize to 300 wide, differs from the baseline bytes. The output size is unchanged."
   },
   {
    "id": "quality-override",
@@ -135,9 +135,9 @@
    "path": "/92a6abeeb92cc5805c2a8f68afe6e0b0c2a740ab474e2d6d235b2c14a91de5a1/300x0/filters:quality(55)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 10319,
-   "sha256": "2fa6cd2bec148a10c1db08380cd2404453c4937113147035f888198fbb9fdb52",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 10209,
+   "sha256": "19cf7e82d12f46d54e12eede7e0529e3b63bd1f91094d6ef30b25acdce4d7442",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
   },
   {
    "id": "grayscale",
@@ -145,9 +145,9 @@
    "path": "/6d52f0e7c2d89b10e5c1bd07770294d5cb317621c5b20cb0ca0bf413213ff526/300x0/filters:grayscale/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 14416,
-   "sha256": "d97f0c58cddb1189c25223094bbaa2666d7614570178a13e10f81e695856053e",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 14175,
+   "sha256": "e7ccf5b03b65efade9d680525b7d7e909e8df947c1a774dba1b606203f0a8f5b",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
   },
   {
    "id": "chain-multi-filter",
@@ -285,9 +285,9 @@
    "path": "/921bc6aa9461bc56c424302379dec4ee32554b1b2da0550c2187cb99635a96c8/preset:thumb/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/webp",
-   "bytes": 13400,
-   "sha256": "ae3a9a8011e9037fdf31516c3a6f2c059ff17c60c74764b047f5304765a5b105",
-   "note": ""
+   "bytes": 13242,
+   "sha256": "94a2b7ac10923098b6dd93f28b9f0c58204855b81cf69537cfcb9254e1a7faaa",
+   "note": "Re-baselined 2026-11-15 against the current build: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render of the 1000x667 crab-photo.jpg, which is decoded at half size before the resize to 300 wide, differs from the baseline bytes. The output size is unchanged."
   },
   {
    "id": "preset-card",
@@ -305,9 +305,9 @@
    "path": "/96451c9d9ff0857ecc7af0cc39fa678c5529e82e72d26efd8e1cf73320cb8765/300x200/root:photos/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 16054,
-   "sha256": "6e1ddac7cc5c8f6143697828cd81d0d307b99f6355caf46b16a1fbf169fd0c06",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 15822,
+   "sha256": "1364089528987577c4e485b675c6fb88331343bdaa9ca85cfbe740e5efb55ca3",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
   },
   {
    "id": "sealed-url",
@@ -315,9 +315,9 @@
    "path": "/s1.dXBnMzExbm9uY2Ux5a9pTF9TrjNSr2ihi6NcaPQO-xCpH21yrTJhWhXsPiqLzuEW5JkYG1T-jxEScnTsJXci1iM8reRAH01D/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 16054,
-   "sha256": "6e1ddac7cc5c8f6143697828cd81d0d307b99f6355caf46b16a1fbf169fd0c06",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 15822,
+   "sha256": "1364089528987577c4e485b675c6fb88331343bdaa9ca85cfbe740e5efb55ca3",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
   },
   {
    "id": "exp-future",
