@@ -411,12 +411,10 @@ fn rgb_rows_widen_to_rgba_in_place() {
         buf.resize(pixels * 4 + 3, 0xAB);
         spread_rgb_to_rgba(&mut buf, pixels);
         let (spread, past) = buf.split_at(pixels * 4);
-        for (i, (wide, px)) in spread
-            .chunks_exact(4)
-            .zip(packed.chunks_exact(3))
-            .enumerate()
-        {
-            assert_eq!(wide, [px[0], px[1], px[2], 255], "pixel {i} of {pixels}");
+        let (wide, _) = spread.as_chunks::<4>();
+        let (narrow, _) = packed.as_chunks::<3>();
+        for (i, (wide, px)) in wide.iter().zip(narrow).enumerate() {
+            assert_eq!(*wide, [px[0], px[1], px[2], 255], "pixel {i} of {pixels}");
         }
         assert_eq!(past, [0xAB; 3], "{pixels}");
     }
@@ -543,8 +541,8 @@ fn the_view_ends_at_the_window_and_the_crop_box_does_not() {
 /// The bytes of an 8-bit color frame, to edit in place.
 fn image_bytes_mut(img: &mut DynamicImage) -> &mut [u8] {
     match img {
-        DynamicImage::ImageRgb8(i) => &mut **i,
-        DynamicImage::ImageRgba8(i) => &mut **i,
+        DynamicImage::ImageRgb8(i) => i,
+        DynamicImage::ImageRgba8(i) => i,
         _ => unreachable!("an 8-bit color frame"),
     }
 }
@@ -575,7 +573,8 @@ fn an_opaque_window_stays_opaque_within_the_reduction_bound() {
             same(&cut_then_resize(&img, window, tw, th), &ours),
             "{ww}x{wh} to {tw}x{th}"
         );
-        assert!(ours.as_bytes().chunks_exact(4).all(|px| px[3] == 255));
+        let (pixels, _) = ours.as_bytes().as_chunks::<4>();
+        assert!(pixels.iter().all(|px| px[3] == 255));
     }
 }
 
