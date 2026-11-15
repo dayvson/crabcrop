@@ -334,10 +334,9 @@ pub(in crate::engine) fn encode(
         StillFormat::Jxl => {
             // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
             // 0-100 scale, matching the quality filter's semantics.
-            let config = jixel::EncodeConfig::default()
-                .with_quality(quality.unwrap_or(80) as f32)
-                .with_speed(jxl_speed);
-            let encoded = if img.color().has_alpha() {
+            let alpha = img.color().has_alpha();
+            let config = jxl_config(quality.unwrap_or(80), jxl_speed, w, h, alpha);
+            let encoded = if alpha {
                 jixel::encode_image_with_alpha(src.rgba().as_raw(), w as usize, h as usize, &config)
             } else {
                 jixel::encode_image(src.rgb().as_raw(), w as usize, h as usize, &config)
@@ -346,6 +345,57 @@ pub(in crate::engine) fn encode(
         }
     }
     Ok(buf)
+}
+
+/// The quality under which the alpha of a small JPEG XL frame
+/// is coded as at this quality (issue #696). jixel codes alpha
+/// as lossily as the color unless told otherwise, in a squeeze
+/// pyramid that halves the frame until it fits 8x8: the step
+/// of its coarsest level grows with the distance and halves
+/// with every level. Under this quality a frame with few
+/// levels can get a coarsest step larger than any alpha it
+/// holds. Every sample rounds to 0, the encoder keeps that
+/// over the exact alpha because it is smaller, and the frame
+/// decodes fully transparent, as the corpus cut-out did at
+/// 16x16, at 32x8, and at 16x8 at every quality from 1 to 12.
+/// The color still follows the quality asked for; the alpha
+/// takes this quality's distance, at which those frames keep
+/// it. From this quality up, and in a larger frame, the
+/// encoder gets the settings it always had.
+const JXL_ALPHA_FLOOR_QUALITY: u8 = 15;
+
+/// The largest frame, in pixels, whose JPEG XL alpha is held
+/// to [`JXL_ALPHA_FLOOR_QUALITY`]: 64x64. The pyramid of a
+/// larger frame has at least seven levels, so its coarsest
+/// step stays under 20 of 255 even at quality 1. The largest
+/// frame found losing its alpha under quality 15, a one-pixel
+/// ring at half alpha, was 48x32. Larger images keep the
+/// bytes they had, where holding their alpha too would cost
+/// them 4 to 8% under quality 15.
+const JXL_ALPHA_FLOOR_PIXELS: u64 = 64 * 64;
+
+/// The JPEG XL encoder's settings at `quality` and `speed`
+/// for a `width` x `height` frame, with an alpha channel when
+/// `alpha` is set: the quality's distance, and in a frame of
+/// up to [`JXL_ALPHA_FLOOR_PIXELS`] with alpha, under
+/// [`JXL_ALPHA_FLOOR_QUALITY`], that quality's distance for
+/// the alpha.
+pub(in crate::engine) fn jxl_config(
+    quality: u8,
+    speed: jixel::Speed,
+    width: u32,
+    height: u32,
+    alpha: bool,
+) -> jixel::EncodeConfig {
+    let config = jixel::EncodeConfig::default()
+        .with_quality(f32::from(quality))
+        .with_speed(speed);
+    let small = u64::from(width) * u64::from(height) <= JXL_ALPHA_FLOOR_PIXELS;
+    if alpha && small && quality < JXL_ALPHA_FLOOR_QUALITY {
+        let floor = jixel::distance_from_quality(f32::from(JXL_ALPHA_FLOOR_QUALITY));
+        return config.with_alpha_distance(floor);
+    }
+    config
 }
 
 /// The BT.601 luma weights as the AVIF encoder (ravif)

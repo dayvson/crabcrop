@@ -712,10 +712,15 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// 0.5.5 failed on are encoded, a few other small frames
 /// with alpha get other bytes at the default speed tier,
 /// and every JPEG XL output does at
-/// `CRABCROP_JXL_SPEED=fast` and slower #670; and
-/// `quality(auto)` JPEG and JPEG XL output too large for
-/// its pick to be verified, now encoded once at the first
-/// pick instead of at the quality the search ended on).
+/// `CRABCROP_JXL_SPEED=fast` and slower #670; JPEG XL
+/// output with an alpha channel under quality 15 of a
+/// frame of up to 4096 pixels (64x64), whose alpha is
+/// coded as at quality 15 instead of as lossily as the
+/// quality asks, which could leave a frame that small fully
+/// transparent #696; and `quality(auto)` JPEG and JPEG XL
+/// output too large for its pick to be verified, now
+/// encoded once at the first pick instead of at the quality
+/// the search ended on).
 const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered
