@@ -6222,5 +6222,9 @@ mod tests;
 #[cfg(test)]
 mod identity_proofs;
 
+// Small frames with an alpha channel through every encoder.
+#[cfg(test)]
+mod small_frame_tests;
+
 #[cfg(test)]
 pub(crate) mod test_formats;
