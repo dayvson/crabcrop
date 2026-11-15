@@ -315,6 +315,34 @@ def new_log_lines(pos, base):
     return out
 
 
+def request_log_line(pos, base, hdrs, timeout_s=10.0):
+    """The log line of the request that was answered with `hdrs`.
+
+    The server writes a request's line up to about a millisecond after
+    the request, from a thread of its own (issue #642), so the line can
+    reach the log after the response has been read, and a line that
+    arrives after `pos` can belong to an earlier request. The line is
+    therefore found by the request ID the response carries, and waited
+    for. Returns {} when it does not arrive in time.
+    """
+    rid = hdrs.get("x-request-id")
+    deadline = time.time() + timeout_s
+    while True:
+        lines = [l for l in new_log_lines(pos, base)
+                 if l.get("method") == "GET"]
+        if rid is None:
+            # An answer with no ID to go by: the last line, once any is there.
+            if lines:
+                return lines[-1]
+        else:
+            for line in reversed(lines):
+                if line.get("request_id") == rid:
+                    return line
+        if time.time() >= deadline:
+            return {}
+        time.sleep(0.005)
+
+
 def raw_log_tail(pos, base):
     try:
         with open(LOGS[base], "rb") as f:
@@ -362,8 +390,7 @@ def timed_render(cell, base, path, headers=None, timeout=120, save=True):
     """One GET with facts recorded; the caller drives priming/purging."""
     pos = log_size(base)
     status, hdrs, payload, ms = get(base, path, headers, timeout)
-    lines = [l for l in new_log_lines(pos, base) if l.get("method") == "GET"]
-    logline = lines[-1] if lines else {}
+    logline = request_log_line(pos, base, hdrs)
     fact = fact_of(cell, base, "GET", path, status, hdrs, payload, ms)
     fact["server_ms"] = logline.get("total_ms")
     fact["cache"] = logline.get("cache")
@@ -452,9 +479,7 @@ def render_dsl(cell, ops, src, instance="A", headers=None, accept=None,
     pos = log_size(instance)
     status, rsp_headers, payload, client_ms = fetch(url, hdrs,
                                                     timeout=timeout)
-    lines = [l for l in new_log_lines(pos, instance)
-             if l.get("method") == "GET"]
-    logline = lines[-1] if lines else {}
+    logline = request_log_line(pos, instance, rsp_headers)
     ext = IMG_EXT.get(rsp_headers.get("content-type", "").split(";")[0],
                       "bin")
     path = os.path.join(OUT, "renders", f"{cell}.{ext}")

@@ -41,7 +41,7 @@ use crate::config::{
 };
 use crate::engine::Engine;
 use crate::loader::Loader;
-use crate::observe::Metrics;
+use crate::observe::{Metrics, RequestLog};
 use crate::server::{AppState, Providers, app};
 
 fn main() {
@@ -187,6 +187,11 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     crate::server::start_purge_tombstones(&state).await;
     let background = state.background.clone();
     let disk = state.store.clone();
+    // From the listening line on, every line on standard
+    // output goes through the request log (issue #642), so
+    // the shutdown's lines come after the request lines
+    // logged before them.
+    let log = state.request_log.clone();
     let signalled = shutdown_signal();
     println!("crabcrop listening on port {port}");
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
@@ -211,15 +216,21 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         stop.clone()
     ));
     tokio::select! {
-        () = &mut serve => return Ok(std::time::Instant::now()),
+        () = &mut serve => {
+            // The accept loop ended with no signal: there
+            // is nothing to drain, but the lines the
+            // requests left are written before the exit.
+            log.finish(None, crate::observe::SHUTDOWN_WAIT).await;
+            return Ok(std::time::Instant::now());
+        }
         () = signalled => stop.cancel(),
     }
     let deadline = tokio::time::Instant::now() + shutdown_grace;
     let signalled_again = shutdown_signal();
-    println!(
+    log.note(&format!(
         "shutdown: draining requests and background work for up to {}s",
         shutdown_grace.as_secs()
-    );
+    ));
     let drain = async {
         if tokio::time::timeout_at(deadline, serve).await.is_err() {
             eprintln!("shutdown: requests still in flight at the deadline are cut off");
@@ -281,12 +292,24 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         // stay misses until a later purge of the target
         // finishes its walk. A purge whose tombstone the
         // bucket refused held in this process only.
-        println!(
+        log.note(&format!(
             "shutdown: stopping {} background purge walks; a purge whose tombstone reached the bucket stays in force",
             left.walks
+        ));
+    }
+    // The last line, after every line still queued (issue
+    // #642). A standard output that is read takes the queue
+    // at once; one that takes nothing holds the exit for
+    // `SHUTDOWN_WAIT` at most, past the grace if the drain
+    // used it up, and the lines it did not take are lost.
+    let limit = crate::observe::SHUTDOWN_WAIT;
+    let unwritten = log.finish(Some("shutdown: done"), limit).await;
+    if unwritten > 0 {
+        eprintln!(
+            "shutdown: standard output took nothing for {}s; the last {unwritten} log lines are not written",
+            limit.as_secs()
         );
     }
-    println!("shutdown: done");
     Ok(stop_by)
 }
 
@@ -428,6 +451,20 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if !config.explain_enabled {
         println!("explain: off");
     }
+    // The request log (issue #642): a queue and its writer
+    // thread, or with `CRABCROP_LOG_SYNC` a line written
+    // where it is logged.
+    let request_log = if config.log_sync {
+        println!("request log: synchronous");
+        RequestLog::inline()
+    } else {
+        RequestLog::to_stdout().map_err(|e| {
+            ConfigError::build(
+                None,
+                format!("cannot start the request log's writer thread: {e}"),
+            )
+        })?
+    };
 
     Ok(AppState {
         keyring: config.keyring.clone(),
@@ -445,6 +482,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(config.process_timeout_secs),
         metrics: Arc::new(Metrics::default()),
+        request_log,
         metrics_token: config
             .metrics_token
             .as_ref()

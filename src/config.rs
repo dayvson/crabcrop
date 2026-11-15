@@ -284,6 +284,10 @@ pub struct Config {
     /// Whether the server serves `/explain/...`
     /// (`CRABCROP_EXPLAIN`, issue #591).
     pub explain_enabled: bool,
+    /// Whether each log line is written where it is logged
+    /// (`CRABCROP_LOG_SYNC`, issue #642), instead of by the
+    /// request log's writer thread.
+    pub log_sync: bool,
 }
 
 /// Disk result storage: `CRABCROP_RESULT_STORAGE_DIR`, with
@@ -548,6 +552,7 @@ impl Config {
         let meta_enabled = meta_mode_config(&get)?;
         let client_hints = client_hints_config(&get)?;
         let explain_enabled = explain_config(&get)?;
+        let log_sync = log_sync_config(&get)?;
         Ok(Config {
             keyring,
             allow_unsafe,
@@ -588,6 +593,7 @@ impl Config {
             meta_enabled,
             client_hints,
             explain_enabled,
+            log_sync,
         })
     }
 }
@@ -1855,6 +1861,19 @@ pub fn client_hints_config(get: impl Fn(&str) -> Option<String>) -> Result<bool,
 /// `GET` or `HEAD` to the route answers `404 not_found`.
 pub fn explain_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
     parse_bool_value("CRABCROP_EXPLAIN", get("CRABCROP_EXPLAIN"), true)
+}
+
+/// Whether the server writes each line of its log on
+/// standard output where it is logged, before the request
+/// goes on: `CRABCROP_LOG_SYNC`, off by default (issue
+/// #642). Off, a request's line is queued and a thread of
+/// its own writes it, up to about a millisecond later. On,
+/// the line is written before the response leaves, as it
+/// was through 0.12: for a deployment that must have every
+/// line on standard output before its request is answered,
+/// at the cost of one `write` per request.
+pub fn log_sync_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
+    parse_bool_value("CRABCROP_LOG_SYNC", get("CRABCROP_LOG_SYNC"), false)
 }
 
 /// The AI settings: every model path, checked for
