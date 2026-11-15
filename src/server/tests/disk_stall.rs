@@ -1273,6 +1273,7 @@ async fn a_purge_holds_its_targets_tombstones_from_when_it_queues_its_disk_delet
     purge_shared_tier(
         &shared,
         &state.background,
+        &state.request_log,
         BegunPurge {
             active,
             tombstone,

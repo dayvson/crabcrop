@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crabcrop::cache::{Cache, PurgeGuard};
 use crabcrop::engine::Engine;
 use crabcrop::loader::{Loader, SourceConfig};
-use crabcrop::observe::Metrics;
+use crabcrop::observe::{Metrics, RequestLog};
 use crabcrop::s3store::S3Store;
 use crabcrop::server::{AppState, Gate, Inflight, Providers};
 use crabcrop::sigv4::Credentials;
@@ -158,6 +158,7 @@ fn state(dir: &std::path::Path) -> AppState {
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(30),
         metrics: Arc::new(Metrics::default()),
+        request_log: RequestLog::inline(),
         metrics_token: Some(METRICS_TOKEN.to_string()),
         cache: Arc::new(Cache::new(1024 * 1024)),
         providers: Arc::new(Providers::default()),
