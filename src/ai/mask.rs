@@ -6,7 +6,7 @@ use image::{DynamicImage, GrayImage};
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, fir_resize};
+use super::session::{build_session, fir_resize, rgb8_view};
 use super::{AiError, MaskProvider};
 
 /// Background removal backed by a U²-Net-family ONNX model
@@ -71,7 +71,7 @@ impl MaskProvider for OnnxMaskProvider {
 /// then normalize per channel with ImageNet statistics. Output
 /// is planar CHW.
 fn preprocess(img: &DynamicImage) -> Vec<f32> {
-    let small = fir_resize(&img.to_rgb8(), 320, 320);
+    let small = fir_resize(&*rgb8_view(img), 320, 320);
     let max = small.pixels().flat_map(|p| p.0).max().unwrap_or(0);
     let scale = if max == 0 { 1.0 } else { max as f32 };
     const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -119,6 +119,31 @@ fn postprocess(data: &[f32], w: u32, h: u32) -> Result<GrayImage, AiError> {
 /// alpha scaled by the mask, so the subject stays and the
 /// background becomes transparent.
 pub fn apply_mask(img: &DynamicImage, mask: &GrayImage) -> DynamicImage {
+    if let Some(rgb) = img.as_rgb8()
+        && mask.dimensions() == rgb.dimensions()
+    {
+        // An opaque RGB8 source at the mask's size, as every
+        // decoded JPEG behind the mask model is: the RGBA
+        // conversion below would give each pixel alpha 255,
+        // and 255 * m / 255 is m, so the mask is the alpha
+        // plane and one pass writes the result (issue #672).
+        let pixels = rgb.width() as usize * rgb.height() as usize;
+        let mut out = vec![0u8; pixels * 4];
+        for ((dst, src), m) in out
+            .chunks_exact_mut(4)
+            .zip(rgb.as_raw().chunks_exact(3))
+            .zip(mask.as_raw())
+        {
+            dst[..3].copy_from_slice(src);
+            dst[3] = *m;
+        }
+        if let Some(rgba) = image::RgbaImage::from_raw(rgb.width(), rgb.height(), out) {
+            let mut out = DynamicImage::ImageRgba8(rgba);
+            // The conversion keeps the source's color space.
+            let _ = out.set_color_space(img.color_space());
+            return out;
+        }
+    }
     let mut rgba = img.to_rgba8();
     let fitted;
     let mask = if mask.width() == rgba.width() && mask.height() == rgba.height() {

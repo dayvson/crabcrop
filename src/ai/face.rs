@@ -5,7 +5,7 @@ use image::DynamicImage;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, fir_resize};
+use super::session::{build_session, fir_resize, rgb8_view};
 use super::{AiError, FaceBox, FaceProvider};
 
 /// Face detection backed by YuNet (the 2023mar ONNX export):
@@ -69,19 +69,10 @@ impl FaceProvider for OnnxFaceProvider {
         // The export takes exactly 640x640. The image is scaled
         // to fit (the reference wrapper resizes the same way);
         // boxes map back with independent axis scales.
-        let small = fir_resize(&img.to_rgb8(), FACE_INPUT, FACE_INPUT);
-        // BGR planar floats at 0..255: the channel order and
-        // scale the model was trained with.
-        let plane = (FACE_INPUT * FACE_INPUT) as usize;
-        let mut input = vec![0f32; 3 * plane];
-        for (i, px) in small.pixels().enumerate() {
-            input[i] = px[2] as f32;
-            input[plane + i] = px[1] as f32;
-            input[2 * plane + i] = px[0] as f32;
-        }
+        let small = fir_resize(&*rgb8_view(img), FACE_INPUT, FACE_INPUT);
         let tensor = ort::value::Tensor::from_array((
             [1, 3, FACE_INPUT as usize, FACE_INPUT as usize],
-            input.into_boxed_slice(),
+            face_tensor(&small).into_boxed_slice(),
         ))
         .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
         let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
@@ -100,6 +91,22 @@ impl FaceProvider for OnnxFaceProvider {
         let candidates = decode_face_candidates(&by_name, ow, oh, FACE_SCORE_THRESHOLD)?;
         Ok(nms(candidates))
     }
+}
+
+/// YuNet's input for a frame at the model's size: BGR planar
+/// floats at 0..255, the channel order and scale the model
+/// was trained with. Each plane is written front to back.
+fn face_tensor(small: &image::RgbImage) -> Vec<f32> {
+    let plane = small.width() as usize * small.height() as usize;
+    let mut input = vec![0f32; 3 * plane];
+    let (blue, rest) = input.split_at_mut(plane);
+    let (green, red) = rest.split_at_mut(plane);
+    for (((px, b), g), r) in small.as_raw().chunks_exact(3).zip(blue).zip(green).zip(red) {
+        *b = f32::from(px[2]);
+        *g = f32::from(px[1]);
+        *r = f32::from(px[0]);
+    }
+    input
 }
 
 /// Decode YuNet's three stride heads into candidate boxes

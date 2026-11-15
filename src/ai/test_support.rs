@@ -70,3 +70,73 @@ pub(super) fn rgba_halves(depth: SampleDepth, w: u32, h: u32) -> DynamicImage {
         SampleDepth::Float => DynamicImage::ImageRgba32F(img.to_rgba32f()),
     }
 }
+
+/// A deterministic noisy RGB frame: a smooth ramp would hide
+/// a misplaced pixel or tap.
+pub(super) fn noise_rgb(w: u32, h: u32, seed: u32) -> image::RgbImage {
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let raw = (0..w as usize * h as usize * 3)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect();
+    image::RgbImage::from_raw(w, h, raw).unwrap()
+}
+
+/// The frame as RGB8 and in every other layout a decoder can
+/// hand a provider: with alpha (not all opaque), gray, gray
+/// with alpha, 16-bit and float.
+pub(super) fn layouts(rgb: &image::RgbImage) -> Vec<(&'static str, DynamicImage)> {
+    let base = DynamicImage::ImageRgb8(rgb.clone());
+    let mut rgba = base.to_rgba8();
+    for (i, px) in rgba.pixels_mut().enumerate() {
+        px[3] = (i * 37 % 256) as u8;
+    }
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    vec![
+        ("rgb8", base.clone()),
+        ("rgba8", rgba.clone()),
+        ("luma8", DynamicImage::ImageLuma8(base.to_luma8())),
+        (
+            "luma-alpha8",
+            DynamicImage::ImageLumaA8(rgba.to_luma_alpha8()),
+        ),
+        ("rgb16", DynamicImage::ImageRgb16(base.to_rgb16())),
+        ("rgba16", DynamicImage::ImageRgba16(rgba.to_rgba16())),
+        ("luma16", DynamicImage::ImageLuma16(base.to_luma16())),
+        ("rgb32f", DynamicImage::ImageRgb32F(base.to_rgb32f())),
+        ("rgba32f", DynamicImage::ImageRgba32F(rgba.to_rgba32f())),
+    ]
+}
+
+/// Everything two images must agree on to be the same image:
+/// the layout, the size, the color space and every byte.
+pub(super) fn snapshot(
+    img: &DynamicImage,
+) -> (
+    std::mem::Discriminant<DynamicImage>,
+    (u32, u32),
+    image::metadata::Cicp,
+    Vec<u8>,
+) {
+    (
+        std::mem::discriminant(img),
+        (img.width(), img.height()),
+        img.color_space(),
+        img.as_bytes().to_vec(),
+    )
+}
+
+/// The frame as opaque RGBA8: the same colors in a layout a
+/// preprocessor has to convert before it can read them.
+pub(super) fn opaque_rgba(rgb: &image::RgbImage) -> DynamicImage {
+    DynamicImage::ImageRgba8(DynamicImage::ImageRgb8(rgb.clone()).to_rgba8())
+}
+
+/// Whether two tensors hold the same values bit for bit.
+pub(super) fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}

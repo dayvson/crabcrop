@@ -1,5 +1,8 @@
 use super::*;
-use crate::ai::test_support::{expect_load, missing_path, solid, temp_file};
+use crate::ai::test_support::{
+    expect_load, layouts, missing_path, noise_rgb, opaque_rgba, same_bits, snapshot, solid,
+    temp_file,
+};
 
 #[test]
 fn apply_mask_scales_alpha_by_the_mask() {
@@ -155,4 +158,90 @@ fn postprocess_rejects_an_output_shorter_than_the_field() {
     let err = postprocess(&data, 320, 320).unwrap_err();
     assert!(matches!(err, AiError::BadOutput(_)), "{err}");
     assert!(err.to_string().contains("320x320"), "{err}");
+}
+
+/// `apply_mask` as it was before issue #672: convert to
+/// RGBA, then scale the alpha in a second pass.
+fn apply_mask_in_two_steps(img: &DynamicImage, mask: &GrayImage) -> DynamicImage {
+    let mut rgba = img.to_rgba8();
+    let fitted;
+    let mask = if mask.width() == rgba.width() && mask.height() == rgba.height() {
+        mask
+    } else {
+        fitted = image::imageops::resize(mask, rgba.width(), rgba.height(), FilterType::Triangle);
+        &fitted
+    };
+    for (px, m) in rgba.pixels_mut().zip(mask.pixels()) {
+        px[3] = ((px[3] as u16 * m[0] as u16) / 255) as u8;
+    }
+    DynamicImage::ImageRgba8(rgba)
+}
+
+#[test]
+fn apply_mask_on_rgb8_equals_the_two_step_form_for_every_mask_value() {
+    // Issue #672: an RGB8 source at the mask's size is
+    // written in one pass. Every mask value, 0 to 255, over
+    // noisy colors, lands on the bytes the two passes wrote.
+    let rgb = noise_rgb(256, 5, 3);
+    let mask = GrayImage::from_fn(256, 5, |x, y| image::Luma([((x + y * 51) % 256) as u8]));
+    assert!((0..=255u8).all(|v| mask.pixels().any(|p| p[0] == v)));
+    let img = DynamicImage::ImageRgb8(rgb);
+    assert_eq!(
+        snapshot(&apply_mask(&img, &mask)),
+        snapshot(&apply_mask_in_two_steps(&img, &mask))
+    );
+    // One pixel, and a source in another color space: the
+    // result keeps it, as the conversion did.
+    let mut img = DynamicImage::ImageRgb8(noise_rgb(1, 1, 9));
+    img.set_color_space(image::metadata::Cicp::DISPLAY_P3)
+        .unwrap();
+    let mask = GrayImage::from_pixel(1, 1, image::Luma([77]));
+    let out = apply_mask(&img, &mask);
+    assert_eq!(out.color_space(), image::metadata::Cicp::DISPLAY_P3);
+    assert_eq!(
+        snapshot(&out),
+        snapshot(&apply_mask_in_two_steps(&img, &mask))
+    );
+}
+
+#[test]
+fn apply_mask_keeps_the_two_step_result_for_every_other_source() {
+    // Sources with alpha of their own, gray, 16-bit and
+    // float sources, and a mask that is not the frame's
+    // size (it is resized first) are not the one-pass case:
+    // each still gives the two-step result.
+    let rgb = noise_rgb(23, 17, 5);
+    let mask = GrayImage::from_fn(23, 17, |x, y| {
+        image::Luma([((x * 11 + y * 29) % 256) as u8])
+    });
+    for (layout, img) in layouts(&rgb) {
+        assert_eq!(
+            snapshot(&apply_mask(&img, &mask)),
+            snapshot(&apply_mask_in_two_steps(&img, &mask)),
+            "{layout}"
+        );
+    }
+    let small = GrayImage::from_fn(8, 6, |x, y| image::Luma([((x * 31 + y * 17) % 256) as u8]));
+    let img = DynamicImage::ImageRgb8(rgb);
+    assert_eq!(
+        snapshot(&apply_mask(&img, &small)),
+        snapshot(&apply_mask_in_two_steps(&img, &small))
+    );
+}
+
+#[test]
+fn preprocess_reads_an_rgb8_frame_in_place_to_the_same_tensor() {
+    // Issue #672: an RGB8 frame is resized from where it
+    // is. The tensor is the one the same colors give in a
+    // layout that is converted first, down and up.
+    for (w, h) in [(701, 517), (5, 3), (1, 1)] {
+        let rgb = noise_rgb(w, h, w * 3 + h);
+        assert!(
+            same_bits(
+                &preprocess(&DynamicImage::ImageRgb8(rgb.clone())),
+                &preprocess(&opaque_rgba(&rgb))
+            ),
+            "{w}x{h}"
+        );
+    }
 }

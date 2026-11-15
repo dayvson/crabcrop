@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::test_support::{noise_rgb, opaque_rgba, same_bits};
 
 fn classes() -> Vec<String> {
     ["person", "car"].iter().map(|s| s.to_string()).collect()
@@ -458,4 +459,19 @@ fn declared_load_non_yolo_model_is_a_load_error() {
         0.5,
     ));
     assert!(message.contains("not a YOLOv8-family export"), "{message}");
+}
+
+#[test]
+fn letterbox_reads_an_rgb8_frame_in_place_to_the_same_tensor() {
+    // Issue #672: an RGB8 frame is resized from where it
+    // is. The tensor, scale and padding are the ones the
+    // same colors give in a layout that is converted
+    // first: wide, tall, upscaled and one pixel.
+    for (w, h) in [(810, 540), (301, 517), (5, 3), (1, 1)] {
+        let rgb = noise_rgb(w, h, w * 5 + h);
+        let (borrowed, scale, pad_x, pad_y) = letterbox(&DynamicImage::ImageRgb8(rgb.clone()));
+        let (converted, scale2, pad_x2, pad_y2) = letterbox(&opaque_rgba(&rgb));
+        assert!(same_bits(&borrowed, &converted), "{w}x{h}");
+        assert_eq!((scale, pad_x, pad_y), (scale2, pad_x2, pad_y2), "{w}x{h}");
+    }
 }

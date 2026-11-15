@@ -1,5 +1,5 @@
 use super::*;
-use crate::ai::test_support::{expect_load, missing_path, solid, temp_file};
+use crate::ai::test_support::{expect_load, missing_path, noise_rgb, same_bits, solid, temp_file};
 
 /// Real-model verification, run manually with the deployment
 /// artifacts in place:
@@ -297,4 +297,22 @@ fn nms_keeps_a_box_at_exactly_the_iou_threshold() {
 #[test]
 fn nms_of_nothing_is_nothing() {
     assert!(nms(Vec::new()).is_empty());
+}
+
+#[test]
+fn face_tensor_is_bit_identical_to_the_indexed_fill() {
+    // Issue #672: the planes are written front to back. The
+    // tensor is the one the per-pixel indexed stores built:
+    // BGR planar, each sample the pixel's own value.
+    for (w, h) in [(FACE_INPUT, FACE_INPUT), (7, 5), (1, 1)] {
+        let small = noise_rgb(w, h, w + h);
+        let plane = (w * h) as usize;
+        let mut want = vec![0f32; 3 * plane];
+        for (i, px) in small.pixels().enumerate() {
+            want[i] = px[2] as f32;
+            want[plane + i] = px[1] as f32;
+            want[2 * plane + i] = px[0] as f32;
+        }
+        assert!(same_bits(&face_tensor(&small), &want), "{w}x{h}");
+    }
 }
