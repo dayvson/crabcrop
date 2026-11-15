@@ -25,9 +25,9 @@
    "path": "/622623aeec61c4e64fcaa047340c9da2d2f938cf747d88636906bef5cfd47961/300x200/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 16307,
-   "sha256": "28111a651af844ca80ae8f5a44bbb234cc3ca8ae4a3c4fb9fc013ac7fde3d2f6",
-   "note": ""
+   "bytes": 16054,
+   "sha256": "6e1ddac7cc5c8f6143697828cd81d0d307b99f6355caf46b16a1fbf169fd0c06",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "resize-proportional",
@@ -45,9 +45,9 @@
    "path": "/c3ee9f05d79b9ac7018bf5f59c66e4e10583d4e53a54c017a6e6663a085e3912/crop:400x300/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 28849,
-   "sha256": "06713baf71b383d511d80fc5df3812848e5797f9d0e184b23d1ca2976e28aa6d",
-   "note": ""
+   "bytes": 28728,
+   "sha256": "20f6cca9fcede365d27f0ba7b4e4f0a40fe5e37734b3baa3f6c2261126080716",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "crop-gravity",
@@ -55,9 +55,9 @@
    "path": "/420c70d2666c2bc0b323ec681973540f88a3212f47faba1bf8b944439eec65d7/crop:300x300:bottom-right/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 19939,
-   "sha256": "7120b5e05daec4337f3fbaa1b714ff17bed4f521af5adc2487482f3876239ed4",
-   "note": ""
+   "bytes": 19897,
+   "sha256": "8f1c825ef076237836afee0f0178715e97601ad32961bed4c98ea3ccd0a46345",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "rotate-90",
@@ -135,9 +135,9 @@
    "path": "/92a6abeeb92cc5805c2a8f68afe6e0b0c2a740ab474e2d6d235b2c14a91de5a1/300x0/filters:quality(55)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 10444,
-   "sha256": "b20a4ad13420f3a75bde5c156e69e4353811d69d368e9047b095b8bc1774c9a8",
-   "note": ""
+   "bytes": 10319,
+   "sha256": "2fa6cd2bec148a10c1db08380cd2404453c4937113147035f888198fbb9fdb52",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "grayscale",
@@ -145,9 +145,9 @@
    "path": "/6d52f0e7c2d89b10e5c1bd07770294d5cb317621c5b20cb0ca0bf413213ff526/300x0/filters:grayscale/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 14605,
-   "sha256": "4ad48fd5fe959a90141cab206442eba9c3f46e4982109b2fc3ee89ec60563842",
-   "note": ""
+   "bytes": 14416,
+   "sha256": "d97f0c58cddb1189c25223094bbaa2666d7614570178a13e10f81e695856053e",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "chain-multi-filter",
@@ -245,9 +245,9 @@
    "path": "/2dd2bbdbe1f2311e0e7879bfae9b41678b17091be7b4dff7a36de7718db82d65/0x0/filters:format(jpeg)/http://127.0.0.1:8991/exif-orient.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 66847,
-   "sha256": "57ee613bcdeabea7def615be5de85380697aafdfdce35e4c5d08e90be5425646",
-   "note": ""
+   "bytes": 66682,
+   "sha256": "3842bdd5ea933ef16a77926f5e33a3bfa1d14205faa7e00c0ac3778b1f080a3d",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "metadata-preserve",
@@ -255,9 +255,9 @@
    "path": "/2dd2bbdbe1f2311e0e7879bfae9b41678b17091be7b4dff7a36de7718db82d65/0x0/filters:format(jpeg)/http://127.0.0.1:8991/exif-orient.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 66967,
-   "sha256": "dab58cfdb2d474d779ce92ceb3c9325d015fd4edad69e8826972123ef8bac4a1",
-   "note": ""
+   "bytes": 66802,
+   "sha256": "45b0167af84a1bbfe47bc8e58d8eeefb993c961103b5771b02d957e53d61073a",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "watermark-overlay",
@@ -295,9 +295,9 @@
    "path": "/91c46cf9287e54e3f8fa6d8ab019b5f9d85e6125f25fd86d37a8ac2be8623889/preset:card/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 20412,
-   "sha256": "8963ed0e37b88c7b67b9e2e16b9804d686dc755ba5650cade57cf8740acb32a2",
-   "note": ""
+   "bytes": 20136,
+   "sha256": "3edc5bcc5b0682785a2bbb2ded0916a31045d2927987ea05fea60f4720165e72",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "source-root-short",
@@ -305,9 +305,9 @@
    "path": "/96451c9d9ff0857ecc7af0cc39fa678c5529e82e72d26efd8e1cf73320cb8765/300x200/root:photos/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 16307,
-   "sha256": "28111a651af844ca80ae8f5a44bbb234cc3ca8ae4a3c4fb9fc013ac7fde3d2f6",
-   "note": ""
+   "bytes": 16054,
+   "sha256": "6e1ddac7cc5c8f6143697828cd81d0d307b99f6355caf46b16a1fbf169fd0c06",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "sealed-url",
@@ -315,9 +315,9 @@
    "path": "/s1.dXBnMzExbm9uY2Ux5a9pTF9TrjNSr2ihi6NcaPQO-xCpH21yrTJhWhXsPiqLzuEW5JkYG1T-jxEScnTsJXci1iM8reRAH01D/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 16307,
-   "sha256": "28111a651af844ca80ae8f5a44bbb234cc3ca8ae4a3c4fb9fc013ac7fde3d2f6",
-   "note": ""
+   "bytes": 16054,
+   "sha256": "6e1ddac7cc5c8f6143697828cd81d0d307b99f6355caf46b16a1fbf169fd0c06",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
   },
   {
    "id": "exp-future",
