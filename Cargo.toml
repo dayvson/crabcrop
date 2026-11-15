@@ -70,7 +70,9 @@ jxl = "0.8"
 flate2 = "1"
 fdeflate = "0.3"
 kamadak-exif = "0.6"
-moxcms = "0.9"
+# `in_place` is the transform that rewrites a buffer where it
+# lies (issue #649): a feature of the crate, no new crate.
+moxcms = { version = "0.9", features = ["in_place"] }
 # Default features off: the crate's `deflate` feature would let a
 # crafted HEIC inflate embedded metadata toward a 1 GiB cap on
 # every decode (issue #184); `registry` is the decode path itself.
