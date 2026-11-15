@@ -126,6 +126,54 @@ const FONT_ENV: &[&str] = &[
     "USERPROFILE",
 ];
 
+/// The malloc settings an SVG worker starts with where the C
+/// library is glibc (issue #652), as the value of its
+/// `GLIBC_TUNABLES`. A worker lives for one job, so all its
+/// memory is new to it, and glibc's defaults make that
+/// costly: a buffer over 128 KiB is mapped on its own and
+/// unmapped when freed, the heap is trimmed as soon as its
+/// top is free, and every page arrives through a 4 KiB
+/// fault. An SVG render allocates and frees a layer the size
+/// of the raster for every group with opacity or a clip, and
+/// an AVIF decode's buffers are megabytes each (15 MB of
+/// RGBA for a 2400x1600 image). So:
+///
+/// - `hugetlb=1` has malloc ask for huge pages, which the
+///   kernel grants where its transparent huge page mode is
+///   `madvise` (in the `always` and `never` modes the
+///   setting does nothing);
+/// - `mmap_threshold` (32 MiB), `trim_threshold` (256 MiB)
+///   and `top_pad` (64 MiB) keep buffers under 32 MiB in the
+///   heap, and freed memory with it, for the worker's short
+///   life.
+///
+/// They change how the worker's heap is laid out inside the
+/// address-space cap, and nothing about the cap: an
+/// allocation past it fails as before. What they cost is
+/// address space for buffers between 128 KiB and 32 MiB,
+/// which now share 64 MiB heap regions that two or three of
+/// them may not fill (at worst half again what the buffers
+/// hold), and resident memory that rounds up to 2 MiB pages.
+/// glibc older than 2.35 has no `hugetlb` setting and
+/// ignores it; one older than 2.26 ignores the variable.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const SVG_MALLOC_TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:\
+     glibc.malloc.trim_threshold=268435456:glibc.malloc.top_pad=67108864";
+
+/// The malloc settings an AVIF worker starts with: the huge
+/// page request alone. It is the whole of the decode's gain
+/// (11% to 16% on a 2400x1600 image), and without huge pages
+/// the three thresholds measured 2% to 8% slower on that
+/// decode than glibc's defaults, where on an SVG render they
+/// are a gain either way. So a host with huge pages off
+/// decodes AVIF as it did.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const AVIF_MALLOC_TUNABLES: &str = "glibc.malloc.hugetlb=1";
+
+/// The variable glibc reads the malloc settings from.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const TUNABLES_ENV: &str = "GLIBC_TUNABLES";
+
 const TAG_OK: u8 = 0;
 const TAG_REFUSED: u8 = 1;
 
@@ -437,6 +485,42 @@ fn request_head(job: u8) -> Vec<u8> {
     request
 }
 
+/// The whole environment the worker of a `job` starts with,
+/// where `var` reads a variable of the server's own: the font
+/// variables that are set ([`FONT_ENV`]), the test knob of
+/// the AVIF job when it is set, and, where the C library is
+/// glibc, the job's malloc settings ([`SVG_MALLOC_TUNABLES`],
+/// [`AVIF_MALLOC_TUNABLES`]), which are constants of this
+/// build and never the server's own `GLIBC_TUNABLES`. Nothing
+/// else of the server's environment reaches a worker.
+fn worker_environment(
+    job: u8,
+    var: impl Fn(&'static str) -> Option<OsString>,
+) -> Vec<(&'static str, OsString)> {
+    let mut environment: Vec<(&'static str, OsString)> = FONT_ENV
+        .iter()
+        .filter_map(|&name| Some((name, var(name)?)))
+        .collect();
+    // A test-only knob the AVIF job reads to stall past a short
+    // deadline, forwarded through the cleared environment so an
+    // end-to-end deadline test needs no special source file.
+    if let Some(value) = var(AVIF_DELAY_ENV) {
+        environment.push((AVIF_DELAY_ENV, value));
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    environment.push((
+        TUNABLES_ENV,
+        match job {
+            JOB_AVIF => AVIF_MALLOC_TUNABLES,
+            _ => SVG_MALLOC_TUNABLES,
+        }
+        .into(),
+    ));
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = job;
+    environment
+}
+
 /// Start a worker from `command` with the address-space and
 /// CPU caps, its pipes open and its own process group, so the
 /// whole group can be killed at the deadline. `timeout` sizes
@@ -454,18 +538,8 @@ fn spawn(command: &WorkerCommand, timeout: Duration, job: u8) -> Result<Worker, 
         // No `current_dir`: the worker reads no relative path,
         // and a chdir into a missing directory (a TMPDIR that
         // does not exist) would fail every job at spawn.
-        .env_clear();
-    for name in FONT_ENV {
-        if let Some(value) = std::env::var_os(name) {
-            cmd.env(name, value);
-        }
-    }
-    // A test-only knob the AVIF job reads to stall past a short
-    // deadline, forwarded through the cleared environment so an
-    // end-to-end deadline test needs no special source file.
-    if let Some(value) = std::env::var_os(AVIF_DELAY_ENV) {
-        cmd.env(AVIF_DELAY_ENV, value);
-    }
+        .env_clear()
+        .envs(worker_environment(job, std::env::var_os));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1305,6 +1379,283 @@ mod tests {
             matches!(&result, Err(RenderError::Refused(why)) if why.contains("could not start")),
             "{result:?}"
         );
+    }
+
+    /// The malloc settings an SVG worker starts with, spelled
+    /// out: a change to them is a change here too.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const WANT_SVG_TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:\
+         glibc.malloc.trim_threshold=268435456:glibc.malloc.top_pad=67108864";
+
+    /// And an AVIF worker's: the huge page request alone.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const WANT_AVIF_TUNABLES: &str = "glibc.malloc.hugetlb=1";
+
+    /// The malloc settings the worker of `job` is to start
+    /// with.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn want_tunables(job: u8) -> &'static str {
+        if job == JOB_AVIF {
+            WANT_AVIF_TUNABLES
+        } else {
+            WANT_SVG_TUNABLES
+        }
+    }
+
+    #[test]
+    fn a_worker_gets_the_font_variables_the_malloc_settings_and_nothing_else() {
+        // Issue #652. From a server with every variable set,
+        // the worker's environment is the font variables and
+        // the AVIF test knob, with the server's values, and
+        // then, where the C library is glibc, the malloc
+        // settings of its job. Those are the only variables
+        // looked up: the server's own GLIBC_TUNABLES is not
+        // read, and nothing else of the server's is either.
+        for job in [JOB_SVG, JOB_AVIF] {
+            let asked = std::cell::RefCell::new(Vec::new());
+            let environment = worker_environment(job, |name| {
+                asked.borrow_mut().push(name);
+                Some(format!("the server's {name}").into())
+            });
+            #[allow(unused_mut)]
+            let mut want: Vec<(&str, OsString)> = FONT_ENV
+                .iter()
+                .chain([&AVIF_DELAY_ENV])
+                .map(|&name| (name, format!("the server's {name}").into()))
+                .collect();
+            let names: Vec<&str> = want.iter().map(|(name, _)| *name).collect();
+            assert_eq!(asked.into_inner(), names);
+            assert_eq!(names.len(), 10, "nine font variables and the knob");
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            want.push(("GLIBC_TUNABLES", want_tunables(job).into()));
+            assert_eq!(environment, want, "job {job}");
+
+            // From a server with none of them set: the
+            // settings alone with glibc, and nothing at all
+            // elsewhere (macOS, musl), where a worker starts
+            // as it always has.
+            let bare = worker_environment(job, |_| None);
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            assert_eq!(
+                bare,
+                [("GLIBC_TUNABLES", OsString::from(want_tunables(job)))],
+                "job {job}"
+            );
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            assert!(bare.is_empty(), "job {job}: {bare:?}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_malloc_settings_are_the_ones_glibc_reads() {
+        // The value is glibc's own syntax, `name=value` pairs
+        // joined by colons, with the sizes in bytes: 32 MiB,
+        // 256 MiB and 64 MiB. An SVG worker gets all four
+        // settings and an AVIF worker the first, the huge
+        // page request, which does nothing where huge pages
+        // are off: there an AVIF decode runs as it did, where
+        // the thresholds would slow it.
+        let parse = |value: &'static str| -> Vec<(&str, u64)> {
+            value
+                .split(':')
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').expect("name=value");
+                    (name, value.parse().expect("a number"))
+                })
+                .collect()
+        };
+        let settings = parse(WANT_SVG_TUNABLES);
+        assert_eq!(
+            settings,
+            [
+                ("glibc.malloc.hugetlb", 1),
+                ("glibc.malloc.mmap_threshold", 32 << 20),
+                ("glibc.malloc.trim_threshold", 256 << 20),
+                ("glibc.malloc.top_pad", 64 << 20),
+            ]
+        );
+        assert_eq!(parse(WANT_AVIF_TUNABLES), settings[..1]);
+        assert_eq!(SVG_MALLOC_TUNABLES, WANT_SVG_TUNABLES);
+        assert_eq!(AVIF_MALLOC_TUNABLES, WANT_AVIF_TUNABLES);
+        assert_eq!(TUNABLES_ENV, "GLIBC_TUNABLES");
+        // Every setting leaves the cap far above it: the heap
+        // keeps what it holds inside the worker's limit, never
+        // in place of it.
+        assert!(
+            settings
+                .iter()
+                .all(|&(_, value)| value < WORKER_MAX_ADDRESS_SPACE / 8)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_started_worker_holds_that_environment_and_no_more() {
+        // The stand-in writes down the environment it was
+        // started with, once for each job. This process has
+        // variables of its own (a PATH, the ones the test
+        // runner sets). The worker holds the font variables
+        // among them, unchanged, and no other; with glibc it
+        // also holds the malloc settings of its job, whatever
+        // this process's own are.
+        let dir = crate::test_support::scratch_dir("svg-worker-env");
+        for job in [JOB_SVG, JOB_AVIF] {
+            let seen = dir.join(format!("environment-{job}"));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            if job == JOB_SVG {
+                let script = format!("env > '{}'; printf '{SIZE_FRAME}'", seen.display());
+                let result = run(&shell_worker(&script), SIMPLE, deadline, |_| None);
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                // The stand-in decodes nothing: what it was
+                // started with is all this asks of it.
+                let script = format!("env > '{}'", seen.display());
+                let result = run_avif(
+                    &shell_worker(&script),
+                    b"\x00\x00\x00\x18ftypavif",
+                    16,
+                    1024,
+                    deadline,
+                );
+                assert!(result.is_err(), "the stand-in decoded an image");
+            }
+            let seen = std::fs::read_to_string(&seen).unwrap();
+            let held = |name: &str| {
+                seen.lines()
+                    .filter_map(|line| line.split_once('='))
+                    .find(|(held, _)| *held == name)
+                    .map(|(_, value)| value.to_string())
+            };
+            // What a shell sets for itself when it starts.
+            let of_the_shell = ["PWD", "OLDPWD", "SHLVL", "_"];
+            let glibc = cfg!(all(target_os = "linux", target_env = "gnu"));
+            let mut own = 0;
+            for (name, value) in std::env::vars_os() {
+                let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+                    continue;
+                };
+                if of_the_shell.contains(&name) || (glibc && name == "GLIBC_TUNABLES") {
+                    continue;
+                }
+                own += 1;
+                if FONT_ENV.contains(&name) {
+                    // A value of several lines would not read
+                    // back from the listing.
+                    if !value.contains('\n') {
+                        assert_eq!(held(name).as_deref(), Some(value), "job {job}: {name}");
+                    }
+                } else {
+                    assert_eq!(held(name), None, "job {job}: the worker was handed {name}");
+                }
+            }
+            assert!(own > 0, "this process has variables of its own");
+            assert!(std::env::var_os("PATH").is_some(), "a PATH among them");
+            assert_eq!(held("PATH"), None, "job {job}");
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            assert_eq!(
+                held("GLIBC_TUNABLES").as_deref(),
+                Some(want_tunables(job)),
+                "job {job}"
+            );
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            if std::env::var_os("GLIBC_TUNABLES").is_none() {
+                assert_eq!(held("GLIBC_TUNABLES"), None, "job {job}");
+            }
+        }
+    }
+
+    /// The address-space cap the helper below gives itself, the
+    /// way a worker does. Smaller than a worker's, so the run
+    /// that meets it holds few buffers.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const HELPER_ADDRESS_SPACE: u64 = 2 << 30;
+
+    /// Not a test on its own: the process that
+    /// `the_cap_stops_buffers_the_settings_keep_in_the_heap`
+    /// starts, by re-running this test binary. It caps itself
+    /// as a worker does, then holds 16 MiB buffers, a size
+    /// glibc maps one by one at its defaults and keeps in the
+    /// heap with an SVG worker's settings, until one is refused.
+    /// The exit code says how that went.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "a helper the malloc settings test runs as its child"]
+    fn malloc_settings_helper() {
+        if std::env::var_os("CRABCROP_TEST_WORKER_MALLOC").is_none() {
+            return;
+        }
+        crate::toolrun::limit_self(Duration::from_secs(60), HELPER_ADDRESS_SPACE);
+        // A test run under a tighter cap of its own keeps it:
+        // `limit_self` never raises a limit.
+        let cap = rustix::process::getrlimit(rustix::process::Resource::As)
+            .current
+            .unwrap_or(u64::MAX);
+        if cap > HELPER_ADDRESS_SPACE {
+            std::process::exit(3);
+        }
+        const BUFFER: usize = 16 << 20;
+        let most = (cap / BUFFER as u64) as usize;
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let mut buffer = Vec::new();
+            if buffer.try_reserve_exact(BUFFER).is_err() {
+                break;
+            }
+            held.push(buffer);
+            if held.len() > most {
+                // More than the cap holds: it did not stop this.
+                std::process::exit(4);
+            }
+        }
+        // The cap stopped it. What it held before that is at
+        // least a quarter of the cap: the heap regions the
+        // settings pack these buffers into waste a part of
+        // the address space, not most of it. (Under a tighter
+        // cap the test binary's own mappings may be most of
+        // it, so there only the stop is checked.)
+        if cap == HELPER_ADDRESS_SPACE && held.len() < most / 4 {
+            std::process::exit(5);
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_cap_stops_buffers_the_settings_keep_in_the_heap() {
+        // Issue #652: an SVG worker's malloc settings keep
+        // buffers under 32 MiB in the heap, where glibc's
+        // defaults, and an AVIF worker's settings, map each
+        // one on its own. Either way they count against the
+        // address-space cap: a process that holds more and
+        // more of them is refused the next one at the cap,
+        // with either worker's environment and with none (the
+        // defaults).
+        let helper = |environment: Vec<(&'static str, OsString)>| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "svg::worker::tests::malloc_settings_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env_clear()
+                .envs(environment)
+                .env("CRABCROP_TEST_WORKER_MALLOC", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+        };
+        for job in [JOB_SVG, JOB_AVIF] {
+            let settings = worker_environment(job, |_| None);
+            assert_eq!(settings.len(), 1, "{settings:?}");
+            let status = helper(settings);
+            assert!(status.success(), "with the settings of job {job}: {status}");
+        }
+        let status = helper(Vec::new());
+        assert!(status.success(), "at the defaults: {status}");
     }
 
     #[cfg(feature = "avif-decode")]

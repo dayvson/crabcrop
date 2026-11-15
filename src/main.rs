@@ -692,10 +692,17 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// dropped, progressive files carry Huffman tables built
 /// from the image, and `quality(auto)` settles on a lower
 /// quality and a smaller file for the same target #668;
-/// and AVIF output written in four tiles on every host,
-/// where the tile count was the host's core count, so AVIF
-/// bytes change on a host with another core count and then
-/// repeat on every replica of one build #671).
+/// AVIF output written in four tiles on every host, where
+/// the tile count was the host's core count, so AVIF bytes
+/// change on a host with another core count and then
+/// repeat on every replica of one build #671; and an 8-bit
+/// source whose embedded profile is sRGB in effect, as the
+/// sRGB profiles cameras, phones and editors write are,
+/// keeps the pixels it decodes to instead of going through
+/// a conversion to sRGB that moved some of them by one
+/// level of rounding, so a render of such a source can
+/// differ from the release before by that level, carried
+/// through its operations and its encoder #662).
 const RENDERING_VERSION: u32 = 7;
 
 /// Fingerprint the configuration that shapes rendered
