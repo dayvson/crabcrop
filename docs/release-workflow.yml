@@ -81,10 +81,12 @@ jobs:
   # crabcrop addition (issue #457; re-apply after any `cargo
   # dist generate`, like the jobs at the bottom of this file):
   # a tag run stops here, before anything builds, unless the
-  # `release` environment still has a Required reviewers rule
-  # and the tagged commit passed rust.yml on main. plan and
-  # the ai-models gate wait for this job, and every other job
-  # waits for one of them. Pull request runs skip it.
+  # `release` environment still has a Required reviewers rule,
+  # the tagged commit passed rust.yml on main, and its
+  # THIRD-PARTY-NOTICES.md lists the crates its release build
+  # compiles (issue #682). plan and the ai-models gate wait
+  # for this job, and every other job waits for one of them.
+  # Pull request runs skip it.
   preflight:
     name: Release preflight (approval gate and CI)
     if: ${{ !github.event.pull_request }}
@@ -104,6 +106,13 @@ jobs:
         env:
           RELEASE_COMMIT: ${{ github.sha }}
         run: python3 scripts/release_preflight.py --repo "$GITHUB_REPOSITORY" --sha "$RELEASE_COMMIT"
+      # crabcrop (issue #682): the notices file every artifact
+      # ships matches the crates the tag builds, its inputs and
+      # the download pins. The rust.yml run the step above
+      # requires also regenerated it with the pinned cargo-about;
+      # this part needs no install.
+      - name: Check the third-party notices
+        run: python3 scripts/check_notices.py
 
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:

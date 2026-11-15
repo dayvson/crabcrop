@@ -110,6 +110,26 @@ jobs:
       - name: Check crabcrop at its declared MSRV
         run: cargo +1.96.0 check --locked -p crabcrop
 
+  notices:
+
+    # THIRD-PARTY-NOTICES.md (issue #682) lists every crate the
+    # release build compiles, with its license text, and it is
+    # what the pinned cargo-about generates from Cargo.lock
+    # now: a dependency change regenerates it
+    # (scripts/check_notices.py --write). A crate whose license
+    # scripts/notices/about.toml does not accept fails here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # From crates.io with its own lockfile, at the version
+      # scripts/check_notices.py pins (CARGO_ABOUT_VERSION).
+      - name: Install cargo-about
+        run: cargo install --locked --features cli cargo-about@0.9.3
+      - name: Check the third-party notices
+        run: python3 scripts/check_notices.py --strict
+
   audit:
 
     runs-on: ubuntu-latest

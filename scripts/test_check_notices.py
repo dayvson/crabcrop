@@ -25,6 +25,7 @@ SCRIPT = HERE / "check_notices.py"
 sys.path.insert(0, str(HERE))
 
 import check_notices  # noqa: E402
+import check_workflows  # noqa: E402
 
 TARGETS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 MIT = "MIT License\n\nCopyright (c) {who}\n\nPermission is hereby granted, free of charge.\n"
@@ -426,6 +427,18 @@ class CheckNotices(unittest.TestCase):
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(f'    bin.install "crabcrop"\n    {check_notices.FORMULA_INSTALL}\n', done.stdout)
+
+    def test_ci_runs_the_check_with_the_pinned_cargo_about(self):
+        # The notices job installs the version the script pins, and the
+        # release preflight runs the check before anything builds.
+        repo = HERE.parent
+        rust = check_workflows.load((repo / "docs/rust-workflow.yml").read_text(), "docs/rust-workflow.yml")
+        runs = [step.get("run", "") for step in rust["jobs"]["notices"]["steps"]]
+        self.assertIn(check_notices.INSTALL, runs)
+        self.assertIn("python3 scripts/check_notices.py --strict", runs)
+        release = check_workflows.load((repo / "docs/release-workflow.yml").read_text(), "docs/release-workflow.yml")
+        runs = [step.get("run", "") for step in release["jobs"]["preflight"]["steps"]]
+        self.assertIn("python3 scripts/check_notices.py", runs)
 
 
 if __name__ == "__main__":
