@@ -375,6 +375,92 @@ fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
             "{pairs:?}"
         );
     }
+    // With the check kept for allowlisted hosts, they are
+    // pinned too, and listing them no longer routes them
+    // through the proxy: the warning says so.
+    let policy = build_source_policy(env_of(&[
+        ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+        ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+    ]))
+    .unwrap();
+    assert!(policy.pins_hostnames());
+    let warning = proxy_bypass_warning(proxied("HTTPS_PROXY"), &policy).unwrap();
+    assert!(
+        warning.contains("Turn CRABCROP_CHECK_ALLOWED_SOURCES off"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn allowlisted_hosts_can_be_held_to_the_private_address_check() {
+    // Off by default: listed hosts skip the check, as the
+    // configuration reference has always said.
+    let listed = ("CRABCROP_ALLOWED_SOURCES", "images.example.com,10.0.0.5");
+    let policy = build_source_policy(env_of(&[listed])).unwrap();
+    assert!(policy.block_private && !policy.check_allowlisted);
+    assert!(!policy.checks(true) && policy.checks(false));
+    let policy =
+        build_source_policy(env_of(&[listed, ("CRABCROP_CHECK_ALLOWED_SOURCES", "1")])).unwrap();
+    assert!(policy.check_allowlisted);
+    assert!(policy.checks(true) && policy.checks(false));
+    // Asking for the check while switching it off is a
+    // contradiction, refused at boot whichever switch does it.
+    for off in [
+        ("CRABCROP_BLOCK_PRIVATE_SOURCES", "0"),
+        ("CRABCROP_ALLOW_ANY_SOURCE", "1"),
+    ] {
+        let err = expect_err(build_source_policy(env_of(&[
+            listed,
+            ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            off,
+        ])));
+        assert!(err.contains("CRABCROP_CHECK_ALLOWED_SOURCES"), "{err}");
+        assert!(err.contains(off.0), "{err}");
+    }
+    let err = expect_err(build_source_policy(env_of(&[(
+        "CRABCROP_CHECK_ALLOWED_SOURCES",
+        "maybe",
+    )])));
+    assert!(err.contains("CRABCROP_CHECK_ALLOWED_SOURCES"), "{err}");
+}
+
+#[test]
+fn allowlisted_host_names_under_the_exemption_are_warned_about() {
+    let warning = |pairs: &[(&str, &str)]| {
+        allowlist_exemption_warning(&build_source_policy(env_of(pairs)).unwrap())
+    };
+    // A listed name also matches the names under it, and
+    // all of them skip the check: the warning counts the
+    // names and points at the opt-in.
+    let found = warning(&[(
+        "CRABCROP_ALLOWED_SOURCES",
+        "images.example.com,cdn.example.net,192.0.2.10,[2001:db8::1]",
+    )])
+    .expect("a warning for two names");
+    assert!(found.contains("lists 2 host names"), "{found}");
+    assert!(
+        found.contains("CRABCROP_CHECK_ALLOWED_SOURCES=1"),
+        "{found}"
+    );
+    let found = warning(&[("CRABCROP_ALLOWED_SOURCES", "images.example.com")]).unwrap();
+    assert!(found.contains("lists 1 host name,"), "{found}");
+    // No warning without an allowlist, for address entries
+    // alone (they match only themselves), with the check
+    // off, or with the check kept for listed hosts.
+    for pairs in [
+        &[][..],
+        &[("CRABCROP_ALLOWED_SOURCES", "192.0.2.10,[2001:db8::1]")],
+        &[
+            ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+            ("CRABCROP_BLOCK_PRIVATE_SOURCES", "0"),
+        ],
+        &[
+            ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+            ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+        ],
+    ] {
+        assert!(warning(pairs).is_none(), "{pairs:?}");
+    }
 }
 
 #[test]
@@ -507,7 +593,7 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
     // allowlist's host count and the private-address check.
     let presets = temp_file("posture-presets", b"thumb = 300x200\n");
     let presets = presets.path.as_str();
-    let cases: [(&[(&str, &str)], &str); 8] = [
+    let cases: [(&[(&str, &str)], &str); 9] = [
         (
             &[],
             "request mode: signed; source allowlist: none; private-address check: on",
@@ -549,6 +635,14 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
         (
             &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
             "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+        (
+            &[
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+                ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            ],
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts included",
         ),
     ];
     for (pairs, line) in cases {

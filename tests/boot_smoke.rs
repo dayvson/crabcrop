@@ -408,7 +408,7 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
                 ),
             ],
             "request mode: unsafe; source allowlist: 2 hosts; private-address check: on",
-            None,
+            Some("warning: CRABCROP_ALLOWED_SOURCES lists 2 host names"),
         ),
         (
             vec![unsafe_on, ("CRABCROP_ALLOW_ANY_SOURCE", "1")],
@@ -428,6 +428,23 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
                 ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
             ],
             "request mode: presets-only; source allowlist: 1 host; private-address check: on",
+            Some("warning: CRABCROP_ALLOWED_SOURCES lists 1 host name"),
+        ),
+        (
+            vec![
+                unsafe_on,
+                only_presets,
+                presets_file,
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+                ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            ],
+            "request mode: presets-only; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts included",
+            None,
+        ),
+        (
+            vec![unsafe_on, ("CRABCROP_ALLOWED_SOURCES", "192.0.2.10")],
+            "request mode: unsafe; source allowlist: 1 host; private-address check: on",
             None,
         ),
         (

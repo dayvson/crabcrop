@@ -339,7 +339,8 @@ impl Config {
     /// read them, so of two bad settings the same one is
     /// reported. The lines boot prints while reading them
     /// print here, in the same order: the short metrics
-    /// token warning and the proxy warning on stderr, then
+    /// token warning, the proxy warning and the allowlist
+    /// exemption warning on stderr, then
     /// the bucket endpoint note, the upload destination, the
     /// source roots, the default operations, and the brand
     /// color. The posture line and its warning
@@ -463,6 +464,9 @@ impl Config {
         })?;
         let policy = build_source_policy(&get)?;
         if let Some(warning) = proxy_bypass_warning(&get, &policy) {
+            eprintln!("warning: {warning}");
+        }
+        if let Some(warning) = allowlist_exemption_warning(&policy) {
             eprintln!("warning: {warning}");
         }
         let mut sources = build_source_config(&get)?;
@@ -638,10 +642,10 @@ impl Config {
             1 => "1 host".to_string(),
             n => format!("{n} hosts"),
         };
-        let check = if self.policy.block_private {
-            "on"
-        } else {
-            "off"
+        let check = match (self.policy.block_private, self.policy.check_allowlisted) {
+            (false, _) => "off",
+            (true, false) => "on",
+            (true, true) => "on, allowlisted hosts included",
         };
         format!(
             "request mode: {mode}; source allowlist: {allowlist}; private-address check: {check}"
@@ -917,7 +921,9 @@ pub fn check_bucket_policy(
 /// `CRABCROP_ALLOW_ANY_SOURCE` is the deliberate full
 /// opt-out: it switches the private-address check off
 /// entirely. A configured allowlist still applies either
-/// way.
+/// way. `CRABCROP_CHECK_ALLOWED_SOURCES` applies the check
+/// to allowlisted hosts too, which asks for a check the
+/// other two switch off, so it is refused with either.
 ///
 /// A set allowlist must name at least one host (issue
 /// #590). A value that normalizes to no entries (empty,
@@ -943,7 +949,27 @@ pub fn build_source_policy(
         get("CRABCROP_ALLOW_ANY_SOURCE"),
         false,
     )?;
-    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any);
+    let check_allowlisted = parse_bool_value(
+        "CRABCROP_CHECK_ALLOWED_SOURCES",
+        get("CRABCROP_CHECK_ALLOWED_SOURCES"),
+        false,
+    )?;
+    if check_allowlisted && (!block_private || allow_any) {
+        let off = if allow_any {
+            "CRABCROP_ALLOW_ANY_SOURCE"
+        } else {
+            "CRABCROP_BLOCK_PRIVATE_SOURCES"
+        };
+        return Err(ConfigError::conflict(
+            &["CRABCROP_CHECK_ALLOWED_SOURCES", off],
+            format!(
+                "CRABCROP_CHECK_ALLOWED_SOURCES applies the private-address check to \
+                 allowlisted hosts, but {off} switches the check off: set one of them"
+            ),
+        ));
+    }
+    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any)
+        .with_allowlisted_checked(check_allowlisted);
     if let Some(raw) = &raw
         && policy.allowed_suffixes.is_empty()
     {
@@ -1548,6 +1574,20 @@ pub fn proxy_bypass_warning(
     if !policy.pins_hostnames() {
         return None;
     }
+    let (why, fix) = if policy.allowed_suffixes.is_empty() {
+        (
+            "with private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
+             CRABCROP_ALLOWED_SOURCES",
+            "List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy",
+        )
+    } else {
+        (
+            "with CRABCROP_CHECK_ALLOWED_SOURCES on, the private-address check covers the \
+             allowlisted hosts too, and",
+            "Turn CRABCROP_CHECK_ALLOWED_SOURCES off to fetch the allowlisted hosts through \
+             the proxy",
+        )
+    };
     let set: Vec<&str> = PROXY_VARIABLES
         .iter()
         .filter_map(|pair| {
@@ -1561,13 +1601,41 @@ pub fn proxy_bypass_warning(
         return None;
     }
     Some(format!(
-        "a proxy is configured ({}), but source fetches bypass it: with private-address \
-         blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no CRABCROP_ALLOWED_SOURCES, \
-         each source host is pinned to the address the check validated and connected to \
-         directly, so under proxy-only egress those fetches fail. List the source hosts \
-         in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy \
-         (see docs/configuration.md)",
+        "a proxy is configured ({}), but source fetches bypass it: {why} each source host \
+         is pinned to the address the check validated and connected to directly, so under \
+         proxy-only egress those fetches fail. {fix} (see docs/configuration.md)",
         set.join(", ")
+    ))
+}
+
+/// The boot warning for allowlisted host names that the
+/// private-address check exempts, or `None`. An allowlist
+/// entry that is a name matches every name under it as well,
+/// so with the exemption on, any such name that resolves to
+/// an internal address is fetched, unpinned. IP address
+/// entries match only themselves and are not counted. The
+/// warning goes away with exact hosts listed as addresses,
+/// with the check off, or with `CRABCROP_CHECK_ALLOWED_SOURCES`.
+pub fn allowlist_exemption_warning(policy: &SourcePolicy) -> Option<String> {
+    if !policy.block_private || policy.check_allowlisted {
+        return None;
+    }
+    let names = policy.name_entries().count();
+    if names == 0 {
+        return None;
+    }
+    let entries = if names == 1 {
+        "1 host name".to_string()
+    } else {
+        format!("{names} host names")
+    };
+    Some(format!(
+        "CRABCROP_ALLOWED_SOURCES lists {entries}, and each also matches every name under \
+         it: listed hosts skip the private-address check and are fetched without pinning, \
+         so a name under a listed one that resolves to an internal address is fetched too. \
+         If others can create or point names under a listed one, set \
+         CRABCROP_CHECK_ALLOWED_SOURCES=1 to keep the check for listed hosts \
+         (see docs/configuration.md)"
     ))
 }
 
