@@ -6,6 +6,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Changed
 
+- A local upload (`CRABCROP_UPLOAD_DIR`) checks that the name's directory resolves inside the upload directory before it creates any directory, where it created the missing directories first and checked after. On Unix it then creates the directories and the file relative to the upload directory's open descriptor, a component at a time and following no symbolic link, where it wrote by path, so a directory replaced between the check and the write could take the write elsewhere. A symbolic link that resolves inside the upload directory still works as before. A directory replaced after the check fails the upload with `500 upload_store_failed`, and a temp file of the same name left by an earlier process is skipped rather than reused.
 - The types that hold secrets now zero their bytes when they are dropped, with the zeroize crate, already in the tree through rustls and the RustCrypto crates: the secret settings, the bucket credentials, the signing keyring, the stores' entry key, the `/metrics` token, the C2PA key file's bytes once boot has built its signer, and the keys derived from a secret for one purge, purge-group or upload check or one bucket request. `Debug` still prints each of them as `[redacted]`. The process environment keeps its own copy of each variable.
 
 ## [0.13.0] - 2026-11-15
