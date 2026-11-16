@@ -14,7 +14,8 @@
 //! form, [`RequestLog::to_stdout`], a handler appends its
 //! line to a queue in memory and goes on, and one thread,
 //! the writer, writes what has gathered: at most about
-//! once a millisecond, in one `write`. What that keeps and
+//! once a millisecond, in one `write`, or in pieces of at
+//! most 64 KiB when more has gathered. What that keeps and
 //! what it changes:
 //!
 //! - **Text and order.** The queue is one string of whole
