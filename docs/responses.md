@@ -106,6 +106,7 @@ Operational failures carry these codes:
 | `invalid_upload_name` | `400` | The upload name is not valid. |
 | `upload_too_large` | `413` | The upload body is larger than the cap. |
 | `upload_unreadable` | `400` | The upload body could not be read to its end: the client aborted it, or its chunked framing is malformed. |
+| `upload_too_slow` | `408` | The upload body arrived too slowly: past its first 10 seconds, it had sent less than 64 KiB for each further second (see [Upload an original](endpoints.md#upload-an-original)). Nothing is stored, and the connection closes. |
 | `upload_not_an_image` | `415` | The upload body is empty or does not decode as an image. |
 | `upload_media_mismatch` | `415` | The upload name's extension does not match the body's media kind. |
 | `upload_already_exists` | `409` | An upload to a name that already exists, while overwriting is off. |
@@ -122,6 +123,7 @@ The statuses you can get:
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy from the URL itself (a host not in `CRABCROP_ALLOWED_SOURCES`, an IP address in a non-public range refused under `CRABCROP_BLOCK_PRIVATE_SOURCES`, or credentials in the URL). A host name that resolves to a non-public address answers `502` instead, like a name that does not resolve. |
 | `404` | The source was not found: a file missing under a source root, a file path with a `..` segment, one that leads outside the root or cannot be resolved inside it (whatever exists at it: a file, a directory, a symlink loop, or nothing), or an origin (an object store included) that answered 404. All of these answer with the same `source not found` body, so the response does not reveal what exists. Also a `PUT` to `/upload/...` when uploads are not configured (`uploads_not_configured`), a `PUT` on the image route, a path no route matches, such as `/`, or `/explain/...` with `CRABCROP_EXPLAIN=0` (`not_found`). |
 | `405` | The path matches a route but the method does not: a `POST` or `DELETE` to an image path, a `GET` on `/upload/...`, a `PUT` on `/health`. The answer carries an `Allow` header listing the methods the route serves. An image path's `Allow` also names `PUT`, which answers `404 not_found` there. |
+| `408` | An upload body that arrived too slowly once its signature had verified (`upload_too_slow`). |
 | `409` | An upload to a name that already exists, while `CRABCROP_UPLOAD_ALLOW_OVERWRITE` is off. |
 | `413` | An upload body larger than the `CRABCROP_UPLOAD_MAX_MB` cap. |
 | `415` | An upload body that does not decode as an image, or whose media kind does not match the name's extension. |

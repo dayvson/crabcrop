@@ -10,6 +10,7 @@ mod disk_stall;
 mod meta_frame;
 mod request_log;
 mod shared_state;
+mod upload_pace;
 
 const SECRET: &[u8] = b"test-secret";
 
