@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- `CRABCROP_MAX_CONNECTIONS_PER_CLIENT` holds each client to a share of `CRABCROP_MAX_CONNECTIONS`, for a server that clients reach directly. A client is an IPv4 address, or the /64 an IPv6 address is in, since a host is usually given a whole /64. A connection past its client's share is closed as soon as it is accepted, with no answer, so one client can no longer hold every connection while the others wait in the listen queue. Stderr counts those closes, at most one line every 10 seconds and with no address. The default, `0`, sets no share, as a server behind a proxy, a load balancer or a CDN needs: every connection then comes from their few addresses. When a share is set, the boot's `connections:` line names it (`at most 16 per client`). The idle timeout keeps its 65-minute default, which stays above the time the common edges keep an idle pooled connection.
+
 ### Changed
 
 - An upload body is now bounded in time once its signature has verified. A body that stalled or arrived a few bytes at a time held its connection and its share of the source buffer budget for as long as it kept sending. Past its first 10 seconds it must now have sent 64 KiB for every further second, the rate a source fetch must keep to hold its read-ahead, and the time the server itself waits for budget does not count. A body that falls behind is answered `408 upload_too_slow`, is never stored, and its connection closes. An upload sent at 64 KiB a second or faster is never cut off, and one at the default 10 MB cap that keeps that pace is done within 2 minutes 50 seconds (see docs/endpoints.md).

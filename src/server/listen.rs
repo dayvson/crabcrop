@@ -12,7 +12,10 @@
 //! - At most `max_connections` connections are open at
 //!   once. At the cap the loop stops accepting, so a new
 //!   connection waits in the kernel's listen queue until
-//!   an open one closes.
+//!   an open one closes. With a per-client share set
+//!   (`per_client`, off by default), one client may hold at
+//!   most that many of them, and a connection past its share
+//!   is closed as soon as it is accepted.
 //! - The header timeout: a new connection must send its
 //!   first request head within it. On HTTP/1 each later
 //!   request head must also arrive within it, counted from
@@ -84,6 +87,13 @@ pub struct ConnectionLimits {
     pub idle_timeout: Duration,
     /// How many connections may be open at once.
     pub max_connections: usize,
+    /// How many of them one client may hold, or `None` for
+    /// no share: a client is an IPv4 address, or the /64 an
+    /// IPv6 address is in (see [`ClientKey`]). Behind a proxy
+    /// or a load balancer every connection comes from its
+    /// few addresses, so the share is for a server that
+    /// clients reach directly.
+    pub per_client: Option<usize>,
 }
 
 /// Serve `router` on `listener` within `limits` until
@@ -97,6 +107,8 @@ pub async fn serve_connections(
     stop: CancellationToken,
 ) {
     let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let clients = limits.per_client.map(|share| Arc::new(Clients::new(share)));
+    let mut refusals = Refusals::default();
     let connections = TaskTracker::new();
     let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
     loop {
@@ -113,8 +125,8 @@ pub async fn serve_connections(
             () = stop.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
-        let stream = match accepted {
-            Ok((stream, _)) => stream,
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
             // The connection was reset before it was
             // accepted: take the next one.
             Err(e) if is_per_connection(&e) => continue,
@@ -130,18 +142,140 @@ pub async fn serve_connections(
                 }
             }
         };
-        connections.spawn(serve_connection(
+        // A client at its share: the connection closes here,
+        // unanswered, and its slot is free again.
+        let client = match &clients {
+            Some(clients) => match clients.admit(peer.ip()) {
+                Some(client) => Some(client),
+                None => {
+                    refusals.note(clients.share);
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let served = serve_connection(
             stream,
             router.clone(),
             Arc::clone(&builder),
             limits,
             stop.clone(),
             slot,
-        ));
+        );
+        connections.spawn(async move {
+            let _client = client;
+            served.await;
+        });
     }
     drop(listener);
     connections.close();
     connections.wait().await;
+}
+
+/// A client, as the per-client share counts it: an IPv4
+/// address, or the first 64 bits of an IPv6 one, since a
+/// host is usually given a whole /64 and can use any address
+/// in it. An IPv4 client that reaches a dual-stack listener
+/// as an IPv4-mapped address counts as its IPv4 address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ClientKey {
+    V4(std::net::Ipv4Addr),
+    V6(u64),
+}
+
+impl ClientKey {
+    fn of(ip: std::net::IpAddr) -> Self {
+        match ip.to_canonical() {
+            std::net::IpAddr::V4(v4) => ClientKey::V4(v4),
+            std::net::IpAddr::V6(v6) => ClientKey::V6((u128::from(v6) >> 64) as u64),
+        }
+    }
+}
+
+/// The connections each client holds, while the per-client
+/// share is on. A client with none has no entry, so the map
+/// holds at most one entry per open connection.
+struct Clients {
+    share: usize,
+    held: Mutex<std::collections::HashMap<ClientKey, usize>>,
+}
+
+impl Clients {
+    fn new(share: usize) -> Self {
+        Clients {
+            share,
+            held: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, std::collections::HashMap<ClientKey, usize>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A place for one more connection from `ip`, held until
+    /// it is dropped, or `None` when the client already holds
+    /// its share.
+    fn admit(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<ClientConnection> {
+        let key = ClientKey::of(ip);
+        let mut held = self.held();
+        let count = held.entry(key).or_insert(0);
+        if *count >= self.share {
+            return None;
+        }
+        *count += 1;
+        Some(ClientConnection {
+            clients: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+/// One connection's place in its client's share.
+struct ClientConnection {
+    clients: Arc<Clients>,
+    key: ClientKey,
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        let mut held = self.clients.held();
+        if let Some(count) = held.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// How often the accept loop says that it closed connections
+/// past a client's share: one line on stderr, with a count of
+/// the rest, at most this often. The line names no address.
+const REFUSAL_LINE_EVERY: Duration = Duration::from_secs(10);
+
+/// The connections closed past a client's share since the
+/// last line about them.
+#[derive(Default)]
+struct Refusals {
+    unreported: u64,
+    next_line: Option<Instant>,
+}
+
+impl Refusals {
+    fn note(&mut self, share: usize) {
+        self.unreported += 1;
+        let now = Instant::now();
+        if self.next_line.is_some_and(|at| now < at) {
+            return;
+        }
+        eprintln!(
+            "crabcrop: closed {} connection(s) from clients already holding {share} \
+             (CRABCROP_MAX_CONNECTIONS_PER_CLIENT)",
+            self.unreported
+        );
+        self.unreported = 0;
+        self.next_line = Some(now + REFUSAL_LINE_EVERY);
+    }
 }
 
 /// Whether an accept error concerns only the connection it

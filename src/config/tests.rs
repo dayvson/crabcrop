@@ -1299,6 +1299,42 @@ fn the_connection_bounds_default_and_check_their_range() {
 }
 
 #[test]
+fn the_per_client_share_is_off_unless_set() {
+    // A directly exposed server can hold each client to a
+    // share of the connection cap; 0, the default, is no
+    // share, as it must be behind a proxy.
+    let set = |v: &str| connection_limits(&env_of(&[("CRABCROP_MAX_CONNECTIONS_PER_CLIENT", v)]));
+    assert_eq!(connection_limits(&env_of(&[])).unwrap().per_client, None);
+    assert_eq!(set("0").unwrap().per_client, None);
+    assert_eq!(set("1").unwrap().per_client, Some(1));
+    assert_eq!(set("16").unwrap().per_client, Some(16));
+    for bad in ["-1", "1000001", "some", ""] {
+        let err = expect_err(set(bad));
+        assert!(
+            err.contains("CRABCROP_MAX_CONNECTIONS_PER_CLIENT"),
+            "{bad:?}: {err}"
+        );
+    }
+    // The boot line names the share only when one is set,
+    // so the line is unchanged for every server without it.
+    let line = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().connections_line();
+    let plain = line(&[("CRABCROP_MAX_CONNECTIONS", "100")]);
+    assert_eq!(
+        plain,
+        "connections: bind 0.0.0.0, at most 100 open, header timeout 30s, idle timeout 3900s"
+    );
+    let shared = line(&[
+        ("CRABCROP_MAX_CONNECTIONS", "100"),
+        ("CRABCROP_MAX_CONNECTIONS_PER_CLIENT", "8"),
+    ]);
+    assert_eq!(
+        shared,
+        "connections: bind 0.0.0.0, at most 100 open, at most 8 per client, \
+         header timeout 30s, idle timeout 3900s"
+    );
+}
+
+#[test]
 fn the_source_buffer_budget_follows_the_configured_fetch_cap() {
     const MB: u64 = 1024 * 1024;
     let budget = |pairs: &[(&str, &str)], permits| source_buffer_budget(env_of(pairs), permits);
@@ -1645,6 +1681,7 @@ fn from_env_reads_every_default() {
             ),
             idle_timeout: std::time::Duration::from_secs(crate::server::DEFAULT_IDLE_TIMEOUT_SECS),
             max_connections: default_max_connections(),
+            per_client: None,
         }
     );
     let lanes = (config.process_permits + config.slow_lane_permits) as u64;

@@ -653,8 +653,12 @@ impl Config {
     /// default comes from the open-file limit, so the line
     /// says what it came to.
     pub fn connections_line(&self) -> String {
+        let per_client = match self.connections.per_client {
+            Some(share) => format!(", at most {share} per client"),
+            None => String::new(),
+        };
         format!(
-            "connections: bind {}, at most {} open, header timeout {}s, idle timeout {}s",
+            "connections: bind {}, at most {} open{per_client}, header timeout {}s, idle timeout {}s",
             self.bind,
             self.connections.max_connections,
             self.connections.header_timeout.as_secs(),
@@ -1432,9 +1436,11 @@ const MAX_CONNECTIONS_LIMIT: usize = 1_000_000;
 /// (issue #607): `CRABCROP_HEADER_TIMEOUT_SECS`, 1 to 600
 /// like the other wall-clock limits;
 /// `CRABCROP_IDLE_TIMEOUT_SECS`, 1 to 86400, since an edge
-/// may pool connections for longer than 10 minutes; and
+/// may pool connections for longer than 10 minutes;
 /// `CRABCROP_MAX_CONNECTIONS`, 1 to a million, by default
-/// three quarters of the open-file limit.
+/// three quarters of the open-file limit; and
+/// `CRABCROP_MAX_CONNECTIONS_PER_CLIENT`, how many of those
+/// one client may hold, 0 (the default) for no share.
 pub fn connection_limits(
     get: &impl Fn(&str) -> Option<String>,
 ) -> Result<crate::server::ConnectionLimits, ConfigError> {
@@ -1476,10 +1482,25 @@ pub fn connection_limits(
             ),
         ));
     }
+    let per_client: usize = parse_env_value(
+        "CRABCROP_MAX_CONNECTIONS_PER_CLIENT",
+        get("CRABCROP_MAX_CONNECTIONS_PER_CLIENT"),
+        0,
+    )?;
+    if per_client > MAX_CONNECTIONS_LIMIT {
+        return Err(ConfigError::invalid(
+            "CRABCROP_MAX_CONNECTIONS_PER_CLIENT",
+            &get("CRABCROP_MAX_CONNECTIONS_PER_CLIENT").unwrap_or_default(),
+            format!(
+                "CRABCROP_MAX_CONNECTIONS_PER_CLIENT must be between 0 and {MAX_CONNECTIONS_LIMIT}, got {per_client}"
+            ),
+        ));
+    }
     Ok(crate::server::ConnectionLimits {
         header_timeout: std::time::Duration::from_secs(header),
         idle_timeout: std::time::Duration::from_secs(idle),
         max_connections,
+        per_client: (per_client > 0).then_some(per_client),
     })
 }
 
