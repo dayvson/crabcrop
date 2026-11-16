@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Fixed
+
+- An animated WebP's frames are now counted against the 100 million decoded-pixel budget from its VP8X canvas and its ANMF frame headers, before any frame decodes, as an animated GIF's frames are, and its canvas, which every frame is composited onto, is held to the 256 MiB decode allocation budget the same way. An animated WebP whose frame count times its canvas is past the decoded-pixel budget, or whose canvas alone is past the allocation budget, now fails with `502` from its headers, instead of being refused only after its frames had begun to decode; the image crate's frame iterator is no longer reached for a canvas the walk declines. The libwebp still decode applies the same per-axis dimension and allocation limits as the generic decode, so a still the dimension probe cannot read is held to the budget there as well. An animated WebP within the budgets decodes to the same frames as before.
+
 ## [0.13.0] - 2026-11-15
 
 ### Added
