@@ -779,7 +779,35 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// output too large for its pick to be verified, now
 /// encoded once at the first pick instead of at the quality
 /// the search ended on).
-const RENDERING_VERSION: u32 = 7;
+///
+/// 8: the first release after 0.13.0, which changes output
+/// for existing URLs (an aspect crop of a source that is not
+/// 8-bit RGBA, which keeps the source's layout and depth
+/// where it was cut to 8-bit RGBA: an opaque source's crop
+/// has no alpha channel, so its PNG and JPEG XL bytes
+/// change, a gray source's crop stays gray, and a
+/// 16-bit or float source's crop is resized at its own
+/// depth; the redaction filters, `blur_region`,
+/// `pixelate_region`, `blurfaces`, `pixelatefaces`,
+/// `blurclass`, `pixelateclass` and `recolorclass`, which
+/// keep the image's layout and depth in the same way, a
+/// gray image recolored becoming RGB; a watermark or overlay
+/// that lands off the canvas, which leaves the base in its
+/// own layout; `quality(auto)` JPEG output with a `fill`,
+/// whose quality is picked and scored against the image
+/// flattened over the fill; `sharpen` past 255, which
+/// sharpens as 255 does; `huerotate` past -359 to 359, which
+/// turns by its remainder modulo 360; `blur_region` and
+/// `blurclass` boxes of more than 240 px on their shorter
+/// side, which blur at an eighth of it where the sigma
+/// stopped at 30; video output of a smart crop, whose frames
+/// are all cut from the window the first frame decided;
+/// class redaction with a segmentation model and more than
+/// 64 detections in a request, which redacts the detections
+/// past the 64th by their boxes; and a progressive JPEG
+/// source whose first operation is a resize to a third of
+/// its size or less, which decodes at full size again, #713).
+const RENDERING_VERSION: u32 = 8;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the

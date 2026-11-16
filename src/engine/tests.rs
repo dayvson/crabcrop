@@ -8621,7 +8621,8 @@ fn composite_walks_only_the_rows_that_land_on_the_base() {
     // it, so a large watermark placed off the canvas paid for
     // the whole walk. It walks only the rows and columns that
     // land on the base now. A top image off the canvas walks
-    // none and returns the base as it was, in RGBA as before.
+    // none and returns the base as it was, in its own layout
+    // (issue #713), where it used to come back as RGBA.
     let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
         20,
         10,
@@ -8658,7 +8659,7 @@ fn composite_walks_only_the_rows_that_land_on_the_base() {
     for at in off_canvas {
         let (rows, out) = walk(at);
         assert_eq!(rows, 0, "rows walked at {at:?}");
-        assert_eq!(out, DynamicImage::ImageRgba8(base.to_rgba8()), "{at:?}");
+        assert_eq!(out, base, "{at:?}");
     }
     // Partly on the canvas, only the rows that land are
     // walked: a negative y anchors the top's bottom edge
@@ -8731,7 +8732,10 @@ fn composite_matches_the_composite_before_issue_604() {
     // old loop at every offset that puts the top image
     // inside, across an edge, and past each edge of the base,
     // for bases with and without alpha, tops smaller and
-    // larger than the base, and every blend mode.
+    // larger than the base, and every blend mode. A top image
+    // that lands nowhere leaves the base as it was, in its own
+    // layout, where the old loop converted it to RGBA (issue
+    // #713).
     use crate::url::BlendMode;
     let bases = [
         DynamicImage::ImageRgb8(image::RgbImage::from_fn(13, 9, |x, y| {
@@ -8785,6 +8789,8 @@ fn composite_matches_the_composite_before_issue_604() {
                 for (alpha, mode) in looks {
                     let blend = |b, o| blend_channel(mode, b, o);
                     let Ok(want) = composite_before_604(base, top, at, alpha, no_check, blend);
+                    let lands = landing((base.width(), base.height()), top.dimensions(), at);
+                    let want = if lands.is_some() { want } else { base.clone() };
                     let Ok(got) = composite(base, top, at, alpha, no_check, blend);
                     assert!(
                         got == want,
@@ -9027,7 +9033,8 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
     // now, from a copy of that part when the image is not
     // RGBA (issue #604). They must still write the old bytes:
     // those of the old loop over the whole image converted to
-    // RGBA. Checked for each kind of pixel, at offsets inside,
+    // RGBA, except where nothing lands, which leaves the base
+    // as it was (issue #713). Checked for each kind of pixel, at offsets inside,
     // across and past each edge, with one image kept across
     // all the offsets as a request keeps it, with a fresh one
     // each time, and through `overlay(...,width)`.
@@ -9080,8 +9087,14 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
             for x in -16..=16 {
                 for y in -16..=16 {
                     let at = format!("{:?} on {:?} at ({x}, {y})", top.color(), base.color());
+                    let dims = (base.width(), base.height());
+                    let lands = |top: (u32, u32)| landing(dims, top, (x, y)).is_some();
+                    let unless_off = |want: DynamicImage, top| {
+                        if lands(top) { want } else { base.clone() }
+                    };
                     let Ok(want) =
                         composite_before_604(base, &rgba, (x, y), 70, no_check, |_, o| o);
+                    let want = unless_off(want, rgba.dimensions());
                     assert_eq!(
                         overlay_watermark(&ctx, base, &kept, x, y, 70).unwrap(),
                         want,
@@ -9095,11 +9108,13 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
                     );
                     let overlay = |b, o| blend_channel(BlendMode::Overlay, b, o);
                     let Ok(want) = composite_before_604(base, &rgba, (x, y), 55, no_check, overlay);
+                    let want = unless_off(want, rgba.dimensions());
                     let got = blend_overlay(&ctx, base, &kept, x, y, 55, BlendMode::Overlay, None);
                     assert_eq!(got.unwrap(), want, "{at}");
                     let screen = |b, o| blend_channel(BlendMode::Screen, b, o);
                     let Ok(want) =
                         composite_before_604(base, &scaled, (x, y), 90, no_check, screen);
+                    let want = unless_off(want, scaled.dimensions());
                     let got =
                         blend_overlay(&ctx, base, &kept, x, y, 90, BlendMode::Screen, Some(150));
                     assert_eq!(got.unwrap(), want, "{at}, scaled");

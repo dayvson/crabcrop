@@ -49,7 +49,7 @@ limits and its JPEG and WebP fast paths. A JPEG also goes
 through `engine::decode_jpeg_scaled` at a half, a quarter
 and an eighth (issue #653): the libjpeg-turbo decode a
 render runs, in the server process, when its first resize
-shrinks a JPEG source far enough. A frame it returns must
+shrinks a baseline JPEG source far enough. A frame it returns must
 be the size the header declares at that scale.
 
 `source_meta` checks metadata handling (`check_meta`):
@@ -246,13 +246,16 @@ screen refuses before decoding (issue #522): one whose
 two length-0 extents each run to the end of the same `mdat`,
 one with more extents than the cap, and one whose primary `ispe`
 declares a size past the decode limits; and JPEGs around the
-scaled decode (issue #653): a progressive file it decodes, and
-one for each way it stands down and leaves the file to the
+scaled decode (issue #653): small baseline files it decodes,
+and one for each way it stands down and leaves the file to the
 full-size decoder: a grayscale, a CMYK, an arithmetic-coded
 and a lossless file, a header that declares 12-bit samples,
-one that declares a size past the decode limits, a scan cut
-short, a progressive file with more scans than the limit of
-100, and restart markers numbered the wrong way. `corpus/op_chain/` seeds filter-chain
+one that declares a size past the decode limits, every
+progressive file (issue #713: a clean one, one cut short, one
+with more scans than the limit of 100, and one whose damaged
+scan libjpeg-turbo reads without a warning where zune-jpeg
+refuses it), a baseline scan cut short, and restart markers
+numbered the wrong way. `corpus/op_chain/` seeds filter-chain
 remainders: plain, face-shaped, quarter and arbitrary-angle
 rotations (`rotate(91)`, `rotate(45)`, negative and
 fractional angles), and trims that shrink the canvas. Add a
