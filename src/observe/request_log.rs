@@ -48,6 +48,17 @@
 //!   never parked on the queue, so the health check,
 //!   `/metrics`, timers and a shutdown signal are still
 //!   served.
+//! - **A queue that stays full** (issue #707). Every
+//!   request that logs waits while the queue is full, so
+//!   a queue that stays full is a server that answers
+//!   none of them. Once it has stayed full for
+//!   [`STALLED_AFTER`], [`RequestLog::stalled`] says so,
+//!   and the health check fails on it; requests keep
+//!   waiting and no line is dropped. That reading takes
+//!   two atomics and never the queue's lock.
+//!   [`RequestLog::queue_state`] reads what `/metrics`
+//!   shows: the bytes held, the requests waiting, and the
+//!   time the queue has spent full.
 //! - **Standard output that fails.** A write that fails
 //!   (the reader closed the pipe, the disk is full) drops
 //!   the lines it had not written and counts them on
@@ -66,10 +77,13 @@
 //! line with `println!` where it is logged, as before:
 //! `CRABCROP_LOG_SYNC=1` selects it, and the tests' state
 //! uses it, so a test's lines stay in its captured output.
+//! It has no queue, so it never stalls in the sense above:
+//! a standard output nobody reads holds each request in
+//! its own write instead.
 
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -90,6 +104,26 @@ pub const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// a second is not being read, or not fast enough to wait
 /// for.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the queue may stay full, without a break,
+/// before the log counts as stalled and the health check
+/// fails (issue #707). A standard output that is read
+/// takes a full queue in well under a second (see
+/// [`SHUTDOWN_WAIT`]), so a queue that stays full this
+/// long is one nobody reads, or reads at a pace no
+/// request should wait on: each request that arrives
+/// meanwhile has waited for room as long as a request may
+/// wait for a processing slot or for source buffer budget
+/// before the server sheds it, 5 seconds. A pause in the
+/// reader shorter than that, such as a log shipper that
+/// restarts, does not fail the check. It is well inside
+/// what the bundled liveness probes allow before a
+/// restart, about 45 seconds, so a replica whose log has
+/// stalled restarts within a minute or so of its queue
+/// filling, as it did before the queue (issue #642), when
+/// a standard output nobody read held the whole server,
+/// the health check included.
+pub const STALLED_AFTER: Duration = Duration::from_secs(5);
 
 /// The writer starts a write no sooner than this after it
 /// started the one before, so lines that arrive close
@@ -122,13 +156,33 @@ const WRITER_THREAD: &str = "crabcrop-log";
 pub struct RequestLog(Arc<Form>);
 
 enum Form {
-    /// Every line is written where it is logged.
-    Inline,
+    /// Every line is written where it is logged, until the
+    /// log is finished: then nothing more is, as for a
+    /// queued log. A request whose client has gone files
+    /// its line when it is dropped (issue #707), which at
+    /// shutdown can be after the last line.
+    Inline(Finished),
     /// [`Form::Inline`] to a stream a test reads back.
     #[cfg(test)]
-    InlineTo(Mutex<Box<dyn Write + Send>>),
+    InlineTo(Mutex<Box<dyn Write + Send>>, Finished),
     /// Lines are queued for the writer thread.
     Queued(Handle),
+}
+
+/// Whether an inline log has been finished.
+#[derive(Default)]
+struct Finished(AtomicBool);
+
+impl Finished {
+    /// Whether the log still takes lines.
+    fn open(&self) -> bool {
+        !self.0.load(Ordering::Acquire)
+    }
+
+    /// End the log: whether it was open until now.
+    fn end(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
 }
 
 /// The handlers' end of a queue. When the last clone of
@@ -147,9 +201,9 @@ impl Drop for Handle {
 impl std::fmt::Debug for RequestLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match &*self.0 {
-            Form::Inline => "RequestLog(inline)",
+            Form::Inline(_) => "RequestLog(inline)",
             #[cfg(test)]
-            Form::InlineTo(_) => "RequestLog(inline)",
+            Form::InlineTo(..) => "RequestLog(inline)",
             Form::Queued(_) => "RequestLog(queued)",
         })
     }
@@ -159,19 +213,31 @@ impl RequestLog {
     /// A log whose lines are written with `println!` where
     /// they are logged, before the caller goes on.
     pub fn inline() -> Self {
-        RequestLog(Arc::new(Form::Inline))
+        RequestLog(Arc::new(Form::Inline(Finished::default())))
     }
 
     /// A log whose lines are queued and written to standard
     /// output by a thread of its own, which this starts.
     pub fn to_stdout() -> io::Result<Self> {
-        Self::queued(Box::new(Stdout), QUEUE_BYTES, Box::new(note_on_stderr))
+        Self::queued(
+            Box::new(Stdout),
+            QUEUE_BYTES,
+            STALLED_AFTER,
+            Box::new(note_on_stderr),
+        )
     }
 
-    /// A queued log over `sink` that is full at `cap` bytes
-    /// and reports what it drops through `note`.
-    fn queued(sink: Box<dyn Sink>, cap: usize, note: Note) -> io::Result<Self> {
-        let queue = Arc::new(Queue::new(cap));
+    /// A queued log over `sink` that is full at `cap` bytes,
+    /// counts as stalled once it has been full for
+    /// `stalled_after`, and reports what it drops through
+    /// `note`.
+    fn queued(
+        sink: Box<dyn Sink>,
+        cap: usize,
+        stalled_after: Duration,
+        note: Note,
+    ) -> io::Result<Self> {
+        let queue = Arc::new(Queue::new(cap, stalled_after));
         let writer = Writer::new(Arc::clone(&queue), sink, note);
         // A thread of its own, not a runtime worker and not
         // a blocking-pool thread: it blocks in `write` for
@@ -187,13 +253,22 @@ impl RequestLog {
     /// [`RequestLog::inline`], written to `out`.
     #[cfg(test)]
     pub(crate) fn inline_to(out: impl Write + Send + 'static) -> Self {
-        RequestLog(Arc::new(Form::InlineTo(Mutex::new(Box::new(out)))))
+        RequestLog(Arc::new(Form::InlineTo(
+            Mutex::new(Box::new(out)),
+            Finished::default(),
+        )))
     }
 
     /// [`RequestLog::to_stdout`], written to `out`.
     #[cfg(test)]
     pub(crate) fn queued_to(out: impl Write + Send + 'static) -> Self {
-        Self::queued(Box::new(Stream(out)), QUEUE_BYTES, Box::new(|_| {})).unwrap()
+        Self::queued(
+            Box::new(Stream(out)),
+            QUEUE_BYTES,
+            STALLED_AFTER,
+            Box::new(|_| {}),
+        )
+        .unwrap()
     }
 
     /// Wait until the log has room for a line. A handler
@@ -219,9 +294,17 @@ impl RequestLog {
     /// for want of room, and nothing waits here.
     pub fn line(&self, line: &str) {
         match &*self.0 {
-            Form::Inline => println!("{line}"),
+            Form::Inline(finished) => {
+                if finished.open() {
+                    println!("{line}");
+                }
+            }
             #[cfg(test)]
-            Form::InlineTo(out) => write_inline(out, line),
+            Form::InlineTo(out, finished) => {
+                if finished.open() {
+                    write_inline(out, line);
+                }
+            }
             Form::Queued(handle) => {
                 handle.0.push(line, false);
             }
@@ -235,9 +318,17 @@ impl RequestLog {
     /// refused it.
     pub async fn event(&self, line: &str) {
         match &*self.0 {
-            Form::Inline => println!("{line}"),
+            Form::Inline(finished) => {
+                if finished.open() {
+                    println!("{line}");
+                }
+            }
             #[cfg(test)]
-            Form::InlineTo(out) => write_inline(out, line),
+            Form::InlineTo(out, finished) => {
+                if finished.open() {
+                    write_inline(out, line);
+                }
+            }
             Form::Queued(handle) => {
                 if let Some(number) = handle.0.push(line, true) {
                     handle.0.settled(number).await;
@@ -255,15 +346,17 @@ impl RequestLog {
     /// and nothing waits for room any more.
     pub async fn finish(&self, last: Option<&str>, limit: Duration) -> u64 {
         let queue = match &*self.0 {
-            Form::Inline => {
-                if let Some(last) = last {
+            Form::Inline(finished) => {
+                let was_open = finished.end();
+                if let Some(last) = last.filter(|_| was_open) {
                     println!("{last}");
                 }
                 return 0;
             }
             #[cfg(test)]
-            Form::InlineTo(out) => {
-                if let Some(last) = last {
+            Form::InlineTo(out, finished) => {
+                let was_open = finished.end();
+                if let Some(last) = last.filter(|_| was_open) {
                     write_inline(out, last);
                 }
                 return 0;
@@ -295,6 +388,42 @@ impl RequestLog {
         state.accepted - state.settled
     }
 
+    /// How long the queue has been full without a break,
+    /// once that is [`STALLED_AFTER`] or more (issue #707):
+    /// every request that logs has waited for room since,
+    /// so the server answers none of them, and the health
+    /// check fails on it. `None` while the queue has room,
+    /// while it has been full for less, and for an inline
+    /// log, which has no queue. It reads two atomics and
+    /// never takes the queue's lock, so the health check
+    /// never waits on the queue.
+    pub fn stalled(&self) -> Option<Duration> {
+        let Form::Queued(handle) = &*self.0 else {
+            return None;
+        };
+        let full_for = handle.0.full_for()?;
+        (full_for >= handle.0.stalled_after).then_some(full_for)
+    }
+
+    /// The queue as `/metrics` shows it (issue #707), or
+    /// `None` for an inline log, which has no queue.
+    pub fn queue_state(&self) -> Option<QueueState> {
+        let Form::Queued(handle) = &*self.0 else {
+            return None;
+        };
+        let queue = &handle.0;
+        let state = queue.lock();
+        let spell = state
+            .full_from
+            .map_or(Duration::ZERO, |from| from.elapsed());
+        Some(QueueState {
+            held_bytes: state.held(),
+            capacity: queue.cap,
+            waiting: state.waiting,
+            full_time: state.full_time + spell,
+        })
+    }
+
     /// The queue's counters, for the tests.
     #[cfg(test)]
     pub(crate) fn stats(&self) -> Stats {
@@ -313,6 +442,22 @@ impl RequestLog {
             _ => Stats::default(),
         }
     }
+}
+
+/// What [`RequestLog::queue_state`] reads: the queue as
+/// `/metrics` shows it (issue #707).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueState {
+    /// Bytes of lines held: queued, and in the writer's
+    /// hands.
+    pub held_bytes: usize,
+    /// The bytes the queue is full at ([`QUEUE_BYTES`]).
+    pub capacity: usize,
+    /// Requests waiting for room.
+    pub waiting: u64,
+    /// How long the queue has been full since the log
+    /// started, a spell still under way included.
+    pub full_time: Duration,
 }
 
 /// What [`RequestLog::stats`] reads.
@@ -351,12 +496,23 @@ struct Queue {
     /// and room has come free, and when the log ends.
     progress: Notify,
     /// The queue holds `cap` bytes or more. Set and cleared
-    /// under the lock, and read without it by every request
-    /// that asks for room, which takes the lock only when
-    /// this says the queue is full.
+    /// under the lock, with `full_since` and the spell in
+    /// [`State`], and read without it by every request that
+    /// asks for room, which takes the lock only when this
+    /// says the queue is full, and by the health check.
     full: AtomicBool,
+    /// When the queue last became full, in microseconds
+    /// from `born`: meaningful while `full` is set, which is
+    /// stored after it.
+    full_since: AtomicU64,
+    /// When the queue was made, the clock `full_since`
+    /// counts from.
+    born: Instant,
     /// The bytes of text the queue is full at.
     cap: usize,
+    /// How long the queue stays full before the log counts
+    /// as stalled ([`STALLED_AFTER`]).
+    stalled_after: Duration,
 }
 
 struct State {
@@ -381,8 +537,13 @@ struct State {
     #[cfg(test)]
     dropped: u64,
     /// Requests waiting for room.
-    #[cfg(test)]
     waiting: u64,
+    /// When the spell of fullness under way began, while
+    /// the queue is full.
+    full_from: Option<Instant>,
+    /// How long the spells of fullness that have ended
+    /// lasted, together.
+    full_time: Duration,
     /// The writer sleeps until a line arrives: whoever
     /// queues one wakes it.
     asleep: bool,
@@ -410,7 +571,7 @@ impl State {
 }
 
 impl Queue {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, stalled_after: Duration) -> Self {
         Queue {
             state: Mutex::new(State {
                 text: String::new(),
@@ -421,8 +582,9 @@ impl Queue {
                 settled: 0,
                 #[cfg(test)]
                 dropped: 0,
-                #[cfg(test)]
                 waiting: 0,
+                full_from: None,
+                full_time: Duration::ZERO,
                 asleep: false,
                 urgent: false,
                 finished: false,
@@ -434,8 +596,45 @@ impl Queue {
             wake: Condvar::new(),
             progress: Notify::new(),
             full: AtomicBool::new(false),
+            full_since: AtomicU64::new(0),
+            born: Instant::now(),
             cap,
+            stalled_after,
         }
+    }
+
+    /// Mark the queue full or not by what it holds now,
+    /// under its lock, and time its spells of fullness.
+    fn mark_full(&self, state: &mut State) {
+        let full = state.held() >= self.cap;
+        match (full, state.full_from) {
+            (true, None) => {
+                let now = Instant::now();
+                state.full_from = Some(now);
+                let since = now.saturating_duration_since(self.born).as_micros();
+                self.full_since
+                    .store(u64::try_from(since).unwrap_or(u64::MAX), Ordering::Relaxed);
+                // After `full_since`, which a reader that
+                // sees this takes as the spell's start.
+                self.full.store(true, Ordering::Release);
+            }
+            (false, Some(from)) => {
+                state.full_time += from.elapsed();
+                state.full_from = None;
+                self.full.store(false, Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+
+    /// How long the queue has been full without a break,
+    /// read without the lock; `None` while it has room.
+    fn full_for(&self) -> Option<Duration> {
+        if !self.full.load(Ordering::Acquire) {
+            return None;
+        }
+        let since = Duration::from_micros(self.full_since.load(Ordering::Relaxed));
+        Some(self.born.elapsed().saturating_sub(since))
     }
 
     /// The state. A panic while it was held leaves nothing
@@ -466,9 +665,7 @@ impl Queue {
         state.lines += 1;
         state.accepted += 1;
         let number = state.accepted;
-        if state.held() >= self.cap {
-            self.full.store(true, Ordering::Relaxed);
-        }
+        self.mark_full(&mut state);
         // One wake for a sleeping writer, by the line that
         // finds it asleep: the lines after it see a writer
         // that is on its way, and cost no system call.
@@ -494,16 +691,13 @@ impl Queue {
         {
             state.dropped += _dropped;
         }
-        if state.held() < self.cap {
-            self.full.store(false, Ordering::Relaxed);
-        }
+        self.mark_full(&mut state);
         drop(state);
         self.progress.notify_waiters();
     }
 
     /// Wait while the queue is full.
     async fn room(&self) {
-        #[cfg(test)]
         let _waiting = Waiting::new(self);
         loop {
             // Created before the look below, so a write that
@@ -536,12 +730,13 @@ impl Queue {
     }
 }
 
-/// One request's wait for room, counted for the tests from
-/// when it starts to when it ends or is dropped.
-#[cfg(test)]
+/// One request's wait for room, counted from when it
+/// starts to when it ends or is dropped: what `/metrics`
+/// shows as the requests waiting (issue #707). Only a
+/// request that finds the queue full gets here, so the
+/// two lock takings cost nothing while it has room.
 struct Waiting<'a>(&'a Queue);
 
-#[cfg(test)]
 impl<'a> Waiting<'a> {
     fn new(queue: &'a Queue) -> Self {
         queue.lock().waiting += 1;
@@ -549,7 +744,6 @@ impl<'a> Waiting<'a> {
     }
 }
 
-#[cfg(test)]
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         self.0.lock().waiting -= 1;

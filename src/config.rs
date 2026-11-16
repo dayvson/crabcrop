@@ -469,7 +469,7 @@ impl Config {
         if !source_roots.is_empty() {
             let mut names: Vec<&String> = source_roots.keys().collect();
             names.sort();
-            println!(
+            boot_line!(
                 "source roots: {}",
                 names
                     .iter()
@@ -490,7 +490,7 @@ impl Config {
                         format!("invalid CRABCROP_DEFAULT_OPS: {e}"),
                     )
                 })?;
-                println!("default operations: {text}");
+                boot_line!("default operations: {text}");
                 ops
             }
             _ => Vec::new(),
@@ -498,7 +498,7 @@ impl Config {
         let preserve_metadata = metadata_config(&get)?;
         let brand_color = brand_color_config(&get)?;
         if let Some(c) = brand_color {
-            println!("brand color: #{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+            boot_line!("brand color: #{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
         }
         // The configuration fingerprint (audit R2-08): every
         // cache key carries it, so the persistent tiers never
@@ -1036,7 +1036,7 @@ pub fn build_source_config(
     // boot, where the endpoint is set, rather than leaving
     // the split implicit.
     if sources.s3_endpoint.is_some() || nonempty("CRABCROP_GCS_ENDPOINT").is_some() {
-        println!(
+        boot_line!(
             "note: bucket sources fetch from the configured store endpoints; \
              CRABCROP_ALLOWED_BUCKETS gates them, the host allowlist does not"
         );
@@ -1664,7 +1664,7 @@ pub fn build_upload_store(
                      (uploaded objects are served back as file:// sources)",
                 ));
             }
-            println!(
+            boot_line!(
                 "uploads enabled: directory {dir} (cap {max_mb} MB, overwrite {allow_overwrite})"
             );
             // The reference an upload hands back must name
@@ -1724,7 +1724,7 @@ pub fn build_upload_store(
                     format!("cannot build the upload store client: {}", with_causes(&e)),
                 )
             })?;
-            println!(
+            boot_line!(
                 "uploads enabled: bucket {bucket} (cap {max_mb} MB, overwrite {allow_overwrite})"
             );
             Ok(Some(Arc::new(store)))

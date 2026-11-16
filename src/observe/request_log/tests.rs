@@ -637,3 +637,110 @@ async fn an_inline_log_and_a_queued_one_write_the_same_bytes() {
     // one write for the line, one for its newline.
     assert_eq!(inline.writes().len(), 102);
 }
+
+#[tokio::test]
+async fn the_queue_shows_what_it_holds_who_waits_and_how_long_it_was_full() {
+    // Issue #707: `/metrics` reads these.
+    let (log, out, _) = queued_holding(1000);
+    let at_rest = log.queue_state().unwrap();
+    assert_eq!(
+        at_rest,
+        QueueState {
+            held_bytes: 0,
+            capacity: 1000,
+            waiting: 0,
+            full_time: Duration::ZERO,
+        }
+    );
+    fill(&log, &out).await;
+    let requests: Vec<_> = (10..13)
+        .map(|n| tokio::spawn(request(log.clone(), numbered(n))))
+        .collect();
+    until("three requests wait", || log.stats().waiting == 3).await;
+    let full = log.queue_state().unwrap();
+    assert_eq!(full.held_bytes, 1000);
+    assert_eq!(full.waiting, 3);
+    // The spell under way counts, and grows.
+    tokio::time::sleep(SHORT).await;
+    let later = log.queue_state().unwrap();
+    assert!(later.full_time >= SHORT, "{later:?}");
+    assert!(later.full_time > full.full_time, "{later:?} {full:?}");
+    out.resume();
+    for request in requests {
+        tokio::time::timeout(LONG, request).await.unwrap().unwrap();
+    }
+    until("the queue has room", || !log.stats().full).await;
+    let after = log.queue_state().unwrap();
+    assert_eq!(after.waiting, 0);
+    // The spell ended: the time spent full stops growing.
+    tokio::time::sleep(SHORT).await;
+    assert_eq!(log.queue_state().unwrap().full_time, after.full_time);
+    assert!(after.full_time >= later.full_time);
+    assert_eq!(log.finish(None, LONG).await, 0);
+}
+
+#[tokio::test]
+async fn the_log_stalls_once_its_queue_has_stayed_full_for_its_bound() {
+    // Issue #707: what the health check reads. A queue
+    // that is full counts as stalled only once it has
+    // stayed full for the bound, and no longer once it has
+    // room again; a new spell starts the count again.
+    let bound = Duration::from_millis(500);
+    let out = FakeStdout::default();
+    let (log, _) = RequestLog::over_stalling(&out, 1000, bound);
+    assert_eq!(log.stalled(), None);
+    let filling = Instant::now();
+    fill(&log, &out).await;
+    if filling.elapsed() < bound / 2 {
+        assert_eq!(log.stalled(), None, "stalled as soon as it filled");
+    }
+    until("the log stalls", || log.stalled().is_some()).await;
+    let stalled = log.stalled().unwrap();
+    assert!(stalled >= bound, "{stalled:?}");
+    assert!(filling.elapsed() >= bound);
+    out.resume();
+    until("the queue has room", || !log.stats().full).await;
+    assert_eq!(log.stalled(), None);
+    until("the queue is written", || log.stats().held_bytes == 0).await;
+    // Full again: a new spell, counted from its own start.
+    let refilling = Instant::now();
+    fill(&log, &out).await;
+    if refilling.elapsed() < bound / 2 {
+        assert_eq!(log.stalled(), None, "the spell before counted");
+    }
+    out.resume();
+    assert_eq!(log.finish(None, LONG).await, 0);
+    // A log whose default bound is STALLED_AFTER, and an
+    // inline log, which has no queue to stall.
+    let (default, out, _) = queued_holding(1000);
+    fill(&default, &out).await;
+    assert_eq!(default.stalled(), None);
+    out.resume();
+    assert_eq!(default.finish(None, LONG).await, 0);
+    let inline = RequestLog::inline_to(FakeStdout::default());
+    assert_eq!(inline.stalled(), None);
+    assert_eq!(inline.queue_state(), None);
+}
+
+#[tokio::test]
+async fn an_inline_log_writes_nothing_after_its_last_line() {
+    // Issue #707: a request whose client went away files
+    // its line when it is dropped, which at shutdown can
+    // be after the last line. A queued log ends with its
+    // last line whatever comes after; an inline log now
+    // does too.
+    let out = FakeStdout::default();
+    let log = RequestLog::inline_to(out.clone());
+    log.line("one");
+    assert_eq!(log.finish(Some("the end"), LONG).await, 0);
+    log.line("late");
+    log.event("late").await;
+    assert_eq!(log.finish(Some("a second end"), LONG).await, 0);
+    assert_eq!(out.text(), "one\nthe end\n");
+    // Finished with no last line, it ends all the same.
+    let out = FakeStdout::default();
+    let log = RequestLog::inline_to(out.clone());
+    assert_eq!(log.finish(None, LONG).await, 0);
+    log.line("late");
+    assert_eq!(out.text(), "");
+}

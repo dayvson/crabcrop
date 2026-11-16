@@ -171,10 +171,17 @@ impl RequestLog {
     /// A queued log that writes to `out`, holds `cap` bytes,
     /// and reports what it drops to the notes it returns.
     pub(crate) fn over(out: &FakeStdout, cap: usize) -> (Self, Notes) {
+        Self::over_stalling(out, cap, STALLED_AFTER)
+    }
+
+    /// [`RequestLog::over`], counting as stalled once its
+    /// queue has been full for `after` (issue #707), so a
+    /// test need not wait out [`STALLED_AFTER`].
+    pub(crate) fn over_stalling(out: &FakeStdout, cap: usize, after: Duration) -> (Self, Notes) {
         let notes = Notes::default();
         let sink = notes.clone();
         let note: Note = Box::new(move |text| sink.0.lock().unwrap().push(text.to_string()));
-        let log = Self::queued(Box::new(out.clone()), cap, note).unwrap();
+        let log = Self::queued(Box::new(out.clone()), cap, after, note).unwrap();
         (log, notes)
     }
 }
