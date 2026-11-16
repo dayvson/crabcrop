@@ -516,8 +516,9 @@ fn a_shutdown_ends_within_its_bound_when_nobody_reads_standard_output() {
     assert!(took >= Duration::from_millis(1900), "exited after {took:?}");
     assert!(took < LONG / 2, "exited after {took:?}");
     let stderr = server.stderr();
+    // The one request that waited, counted (issue #715).
     assert!(
-        stderr.contains("shutdown: requests still in flight at the deadline are cut off"),
+        stderr.contains("shutdown: 1 requests still in flight at the deadline are cut off"),
         "{stderr}"
     );
     // Stderr says how many lines went unwritten: all but

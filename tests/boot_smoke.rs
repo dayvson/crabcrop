@@ -253,6 +253,7 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
 }
 
 #[test]
+#[cfg(unix)]
 fn crabcrop_bind_on_the_ipv6_any_address_takes_ipv4_too_or_fails_cleanly() {
     // Issue #715: `CRABCROP_BIND=::` listens on every IPv6
     // address and, with IPV6_V6ONLY off, on IPv4 too,

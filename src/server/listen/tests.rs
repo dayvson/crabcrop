@@ -502,6 +502,7 @@ fn a_request_counts_in_flight_until_its_body_is_sent_or_it_is_dropped() {
     assert_eq!(in_flight.count(), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn an_ipv6_listener_takes_ipv4_too_or_says_the_host_has_no_ipv6() {
     // Issue #715: `CRABCROP_BIND=::` listens with
@@ -526,7 +527,6 @@ async fn an_ipv6_listener_takes_ipv4_too_or_says_the_host_has_no_ipv6() {
             return;
         }
     };
-    #[cfg(unix)]
     assert!(!rustix::net::sockopt::ipv6_v6only(&listener).unwrap());
     let port = listener.local_addr().unwrap().port();
     let ipv4 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
