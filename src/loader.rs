@@ -643,20 +643,6 @@ impl SourcePolicy {
     pub fn pins_hostnames(&self) -> bool {
         self.block_private && (self.allowed_suffixes.is_empty() || self.check_allowlisted)
     }
-
-    /// The allowlist entries that are host names, not IP
-    /// addresses: each matches every subdomain of it as well,
-    /// so while listed hosts are exempt from the
-    /// private-address check, so is every name under them.
-    pub fn name_entries(&self) -> impl Iterator<Item = &str> {
-        self.allowed_suffixes
-            .iter()
-            .map(String::as_str)
-            .filter(|entry| {
-                let bare = entry.trim_start_matches('[').trim_end_matches(']');
-                bare.parse::<IpAddr>().is_err()
-            })
-    }
 }
 
 /// Fetches source image bytes over HTTP(S).

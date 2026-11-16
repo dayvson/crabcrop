@@ -339,8 +339,7 @@ impl Config {
     /// read them, so of two bad settings the same one is
     /// reported. The lines boot prints while reading them
     /// print here, in the same order: the short metrics
-    /// token warning, the proxy warning and the allowlist
-    /// exemption warning on stderr, then
+    /// token warning and the proxy warning on stderr, then
     /// the bucket endpoint note, the upload destination, the
     /// source roots, the default operations, and the brand
     /// color. The posture line and its warning
@@ -464,9 +463,6 @@ impl Config {
         })?;
         let policy = build_source_policy(&get)?;
         if let Some(warning) = proxy_bypass_warning(&get, &policy) {
-            eprintln!("warning: {warning}");
-        }
-        if let Some(warning) = allowlist_exemption_warning(&policy) {
             eprintln!("warning: {warning}");
         }
         let mut sources = build_source_config(&get)?;
@@ -629,7 +625,9 @@ impl Config {
     /// The boot line that names the request and source
     /// posture (issue #590): the request mode, the source
     /// allowlist's host count, and the private-address
-    /// check.
+    /// check, including whether listed hosts are exempt from
+    /// it (the default) or held to it
+    /// (`CRABCROP_CHECK_ALLOWED_SOURCES`).
     pub fn posture_line(&self) -> String {
         let mode = match (self.allow_unsafe, self.only_presets) {
             (false, false) => "signed",
@@ -642,10 +640,16 @@ impl Config {
             1 => "1 host".to_string(),
             n => format!("{n} hosts"),
         };
-        let check = match (self.policy.block_private, self.policy.check_allowlisted) {
-            (false, _) => "off",
-            (true, false) => "on",
-            (true, true) => "on, allowlisted hosts included",
+        let listed = !self.policy.allowed_suffixes.is_empty();
+        let check = match (
+            self.policy.block_private,
+            listed,
+            self.policy.check_allowlisted,
+        ) {
+            (false, _, _) => "off",
+            (true, false, _) => "on",
+            (true, true, false) => "on, allowlisted hosts exempt",
+            (true, true, true) => "on, allowlisted hosts included",
         };
         format!(
             "request mode: {mode}; source allowlist: {allowlist}; private-address check: {check}"
@@ -1605,37 +1609,6 @@ pub fn proxy_bypass_warning(
          is pinned to the address the check validated and connected to directly, so under \
          proxy-only egress those fetches fail. {fix} (see docs/configuration.md)",
         set.join(", ")
-    ))
-}
-
-/// The boot warning for allowlisted host names that the
-/// private-address check exempts, or `None`. An allowlist
-/// entry that is a name matches every name under it as well,
-/// so with the exemption on, any such name that resolves to
-/// an internal address is fetched, unpinned. IP address
-/// entries match only themselves and are not counted. The
-/// warning goes away with exact hosts listed as addresses,
-/// with the check off, or with `CRABCROP_CHECK_ALLOWED_SOURCES`.
-pub fn allowlist_exemption_warning(policy: &SourcePolicy) -> Option<String> {
-    if !policy.block_private || policy.check_allowlisted {
-        return None;
-    }
-    let names = policy.name_entries().count();
-    if names == 0 {
-        return None;
-    }
-    let entries = if names == 1 {
-        "1 host name".to_string()
-    } else {
-        format!("{names} host names")
-    };
-    Some(format!(
-        "CRABCROP_ALLOWED_SOURCES lists {entries}, and each also matches every name under \
-         it: listed hosts skip the private-address check and are fetched without pinning, \
-         so a name under a listed one that resolves to an internal address is fetched too. \
-         If others can create or point names under a listed one, set \
-         CRABCROP_CHECK_ALLOWED_SOURCES=1 to keep the check for listed hosts \
-         (see docs/configuration.md)"
     ))
 }
 
