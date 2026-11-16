@@ -23,8 +23,8 @@
 // importing them at the crate root lets every `crate::`
 // path in this file and in `config.rs` resolve to them.
 use crabcrop::{
-    ai, cache, cli, engine, frames, loader, observe, pdf, provenance, quality, s3store, server,
-    sigv4, storage, text, upload, url, video,
+    ai, cache, cli, credentials, engine, frames, loader, observe, pdf, provenance, quality,
+    s3store, server, sigv4, storage, text, upload, url, video,
 };
 
 mod config;
@@ -237,6 +237,19 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     );
     println!("{}", config.connections_line());
     println!("configuration fingerprint: {}", state.config_fingerprint);
+    // Credentials from the container endpoint (issue #709) are
+    // fetched before the first AWS request, the tombstone read
+    // below, and refreshed in the background from then on. The
+    // static keys need nothing here.
+    if let Some(creds) = &config.sources.aws_creds
+        && let Some(line) = creds.start().await
+    {
+        if line.starts_with("warning: ") {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461). A slow or hanging
     // store holds the first request, and the listening line,

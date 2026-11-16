@@ -473,6 +473,13 @@ pub struct DiskStore {
     /// failed: a disk that refuses them fails each one again
     /// at every retry.
     job_log: StallLog,
+    /// Inline deletes of entry files that failed (issue #709):
+    /// an evicted entry's, a doomed write's, a corrupt one's.
+    /// Each also counts in `errors`.
+    unlinks_failed: AtomicU64,
+    /// Rate-limits their log lines: a disk that refuses
+    /// deletes refuses one per eviction.
+    unlink_log: StallLog,
     /// Test-only: run at every entry read (after the bytes are
     /// in, as a read stuck in the kernel has its file open),
     /// write and delete, on the blocking thread, with the
@@ -708,6 +715,8 @@ impl DiskStore {
             last_job_done_ms: AtomicU64::new(0),
             stall_log: StallLog::new("disk waits ran out"),
             job_log: StallLog::new("background disk jobs failed"),
+            unlinks_failed: AtomicU64::new(0),
+            unlink_log: StallLog::new("entry file deletes failed"),
             #[cfg(test)]
             hold: Mutex::new(None),
         };
@@ -1118,6 +1127,19 @@ impl DiskStore {
         match learned {
             Learned::Indexed { grew, groups, .. } => Some(HitLearn { grew, owed, groups }),
             _ => None,
+        }
+    }
+
+    /// Record that the bucket copy of `key` lacks groups copy
+    /// `id`'s record holds (issue #709): a write-back that was
+    /// to carry them was skipped, so the next disk hit sends
+    /// them again. No-op when the record is gone or replaced.
+    pub fn owe_shared(&self, key: &str, id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(record) = inner.entries.get_mut(key)
+            && record.id == id
+        {
+            record.owes_shared = true;
         }
     }
 
@@ -1722,11 +1744,37 @@ impl DiskStore {
 
     /// Delete an entry file under the claim the caller holds,
     /// best-effort: a file left behind by a failure is one the
-    /// next boot indexes again or deletes as corrupt.
+    /// next boot indexes again or deletes as corrupt. A failure
+    /// is no longer silent (issue #709): it counts in
+    /// `crabcrop_cache_disk_unlinks_failed_total` and the
+    /// tier's errors, and is logged, the first at once and then
+    /// at most one line every 10 seconds. A file already gone
+    /// is no failure.
     fn unlink(&self, path: &Path) {
-        let _ = self
+        match self
             .held(OpKind::Unlink, path)
-            .and_then(|()| std::fs::remove_file(path));
+            .and_then(|()| std::fs::remove_file(path))
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                self.unlinks_failed.fetch_add(1, Ordering::Relaxed);
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                let line = format!(
+                    "cannot delete a cache entry file; it stays on disk, out of the index, until the next boot finds it: {e}"
+                );
+                if let Some(line) = self.unlink_log.note_now(&line) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+    }
+
+    /// Inline deletes of entry files that failed so far (issue
+    /// #709), surfaced on /metrics as
+    /// `crabcrop_cache_disk_unlinks_failed_total`.
+    pub fn unlinks_failed(&self) -> u64 {
+        self.unlinks_failed.load(Ordering::Relaxed)
     }
 
     /// Run every queued job now, on this thread, retry times
@@ -1984,6 +2032,9 @@ fn learn_locked(inner: &mut Inner, key: &str, groups: &[String], bucket: Bucket<
                 *s = stamp;
             }
         }
+        if matches!(bucket, Bucket::Lacks) {
+            record.owes_shared = true;
+        }
         if let Bucket::Carries(carried) = bucket
             && record.groups.iter().all(|g| carried.contains(g))
         {
@@ -2235,6 +2286,10 @@ pub enum Bucket<'a> {
     /// slot (issue #463): groups the record learns now are
     /// owed to the bucket.
     Skipped,
+    /// A group write-back was skipped past the waiting cap
+    /// (issue #709): the bucket copy lacks groups the record
+    /// holds, grown now or not, so the record owes them.
+    Lacks,
     /// Nothing is known: the debt stays as it is.
     Unknown,
 }
@@ -2399,8 +2454,9 @@ impl Stall {
     }
 }
 
-/// A rate-limited log of one kind of disk trouble: disk waits
-/// that ran out, or background jobs that failed. The first
+/// A rate-limited log of one kind of tier trouble: disk waits
+/// that ran out, background jobs or inline deletes that
+/// failed, or (issue #709) bucket requests refused. The first
 /// line comes at once, then at most one every
 /// [`STALL_LOG_EVERY_MS`], with how many were left out since
 /// the last one. Its times are [`monotonic_ms`]: on the wall
@@ -2410,17 +2466,31 @@ impl Stall {
 pub(crate) struct StallLog {
     next_line_ms: AtomicU64,
     since: AtomicU64,
+    /// The tier the lines speak for, at their start.
+    tier: &'static str,
     /// What the left-out ones are, after their count.
     rest: &'static str,
 }
 
 impl StallLog {
+    /// A log of the disk tier's, `result storage:` lines.
     pub(crate) fn new(rest: &'static str) -> Self {
+        Self::for_tier("result storage", rest)
+    }
+
+    /// A log whose lines start with `tier`.
+    pub(crate) fn for_tier(tier: &'static str, rest: &'static str) -> Self {
         StallLog {
             next_line_ms: AtomicU64::new(0),
             since: AtomicU64::new(0),
+            tier,
             rest,
         }
+    }
+
+    /// [`StallLog::note`] at the time now.
+    pub(crate) fn note_now(&self, what: &str) -> Option<String> {
+        self.note(monotonic_ms(), what)
     }
 
     /// Count one stall at `now_ms`, and return the line to
@@ -2442,10 +2512,10 @@ impl StallLog {
             return None;
         }
         Some(match self.since.swap(0, Ordering::Relaxed) {
-            0 => format!("result storage: {what}"),
+            0 => format!("{}: {what}", self.tier),
             more => format!(
-                "result storage: {what}; {more} more {} since the last line",
-                self.rest
+                "{}: {what}; {more} more {} since the last line",
+                self.tier, self.rest
             ),
         })
     }
@@ -3333,6 +3403,42 @@ mod tests {
         assert!(total <= budget, "total {total}");
         assert!(store.get("a").is_none(), "the LRU entry went first");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_inline_delete_is_counted_not_silent() {
+        // Issue #709: an evicted entry's file is deleted inline,
+        // best-effort, and a delete that failed was silent: the
+        // file stayed on disk out of the index, and the next boot
+        // indexed it again, with nothing in the log or on
+        // /metrics. Each failure now counts, in the tier's errors
+        // and on its own series, and is logged at a limited
+        // rate. A file that is already gone is no failure.
+        let dir = temp_dir("unlink-fails");
+        let payload = vec![7u8; 100];
+        let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
+        let one = entry_charge("a", file, &[]);
+        let store = DiskStore::open(&dir, 2 * one + one / 2, test_entry_key()).unwrap();
+        store.put("a", &image(&payload));
+        store.put("b", &image(&payload));
+        store.set_hold(Some(Arc::new(|kind, _| match kind {
+            OpKind::Unlink => Err(std::io::Error::from_raw_os_error(30)),
+            _ => Ok(()),
+        })));
+        let errors = store.errors();
+        // `c` evicts `a`, whose file the disk will not delete.
+        store.put("c", &image(&payload));
+        assert!(store.get("a").is_none());
+        assert_eq!(store.unlinks_failed(), 1);
+        assert_eq!(store.errors(), errors + 1);
+        assert!(dir.join(format!("{}.bin", key_stem("a"))).exists());
+        // `d` evicts `b`, whose file is already gone.
+        store.set_hold(None);
+        std::fs::remove_file(dir.join(format!("{}.bin", key_stem("b")))).unwrap();
+        store.put("d", &image(&payload));
+        assert!(store.get("b").is_none());
+        assert_eq!(store.unlinks_failed(), 1);
+        assert_eq!(store.errors(), errors + 1);
     }
 
     #[test]

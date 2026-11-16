@@ -27,8 +27,7 @@ replace the remaining `REPLACE_ME` values in
   for the tasks.
 - An IAM execution role for the task definition: step 1
   grants it the secret read it needs. Step 5 covers the
-  S3 credentials, which are environment-provided (the
-  server does not use a task role).
+  S3 credentials: the task role's, or keys you provide.
 
 ## 1. The signing secret
 
@@ -103,15 +102,19 @@ Add plain environment entries:
 
 The credentials the server signs with then need
 `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
-`s3:ListBucket` on that bucket. Credentials are
-environment-provided only: the server reads
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
-`AWS_SESSION_TOKEN` once at startup, and does not fetch
-credentials from the task role or any other part of the
-AWS credential chain. Add the three entries to the task
-definition's environment (sourced from Secrets Manager,
-like the signing secret), for an IAM user or role you
-mint keys for; a task role alone is not picked up.
+`s3:ListBucket` on that bucket. With no
+`AWS_ACCESS_KEY_ID` in the task definition, they are the
+task role's: the server asks ECS's agent for them at
+`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, which ECS sets
+for a task with a role, before its first request, and
+again 15 minutes before they expire, so give the task
+definition a `taskRoleArn` with those permissions. To sign
+with keys of your own instead, add `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` to the
+task definition's environment (sourced from Secrets
+Manager, like the signing secret): the server reads them
+once at startup and then never asks the agent, so
+temporary keys given that way expire until a restart.
 
 Disk tier per task: add
 `CRABCROP_RESULT_STORAGE_DIR=/var/cache/crabcrop` plus

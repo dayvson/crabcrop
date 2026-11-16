@@ -9,6 +9,7 @@ mod disk_hang;
 mod disk_stall;
 mod meta_frame;
 mod request_log;
+mod shared_bounds;
 mod shared_state;
 
 const SECRET: &[u8] = b"test-secret";
@@ -8600,13 +8601,15 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
                 .unwrap(),
             )
         }),
+        // Signed with the fake's credentials: it refuses any
+        // request whose signature does not verify (issue #709).
         shared_store: Some(Arc::new(
             crate::s3store::S3Store::new(
                 "results".into(),
                 String::new(),
                 Some(endpoint.into()),
                 "us-east-1".into(),
-                None,
+                Some(crate::s3store::test_support::test_aws()),
                 crate::url::entry_key(b"disk-key-test"),
             )
             .unwrap(),
@@ -17820,6 +17823,9 @@ crabcrop_cache_disk_groups_behind 0
 # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.
 # TYPE crabcrop_cache_disk_deletions_queued gauge
 crabcrop_cache_disk_deletions_queued 0
+# HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete failed to remove, left on disk out of the index.
+# TYPE crabcrop_cache_disk_unlinks_failed_total counter
+crabcrop_cache_disk_unlinks_failed_total 0
 # HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.
 # TYPE crabcrop_cache_shared_puts_in_flight gauge
 crabcrop_cache_shared_puts_in_flight 0
@@ -17829,6 +17835,17 @@ crabcrop_cache_shared_puts_capacity {puts}
 # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.
 # TYPE crabcrop_cache_shared_puts_skipped_total counter
 crabcrop_cache_shared_puts_skipped_total 0
+# HELP crabcrop_cache_shared_group_writes_waiting Shared tier group write-backs waiting for a write slot.
+# TYPE crabcrop_cache_shared_group_writes_waiting gauge
+crabcrop_cache_shared_group_writes_waiting 0
+# HELP crabcrop_cache_shared_group_writes_skipped_total Shared tier group write-backs skipped with as many waiting for a slot as may.
+# TYPE crabcrop_cache_shared_group_writes_skipped_total counter
+crabcrop_cache_shared_group_writes_skipped_total 0
+# HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.
+# TYPE crabcrop_cache_shared_refused_total counter
+crabcrop_cache_shared_refused_total{{request="lookup"}} 0
+crabcrop_cache_shared_refused_total{{request="exists"}} 0
+crabcrop_cache_shared_refused_total{{request="purge"}} 0
 # HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.
 # TYPE crabcrop_cache_shared_tombstones_unread gauge
 crabcrop_cache_shared_tombstones_unread 0

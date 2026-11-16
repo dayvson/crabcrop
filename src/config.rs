@@ -1006,9 +1006,35 @@ pub fn build_source_config(
             )),
         }
     };
-    sources.aws_creds = cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?;
-    if let Some(creds) = &mut sources.aws_creds {
-        creds.session_token = nonempty("AWS_SESSION_TOKEN");
+    sources.aws_creds =
+        cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?.map(|mut creds| {
+            creds.session_token = nonempty("AWS_SESSION_TOKEN");
+            creds.into()
+        });
+    // With no static keys, the container credentials endpoint
+    // ECS and EKS Pod Identity serve, refreshed before each
+    // expiry (issue #709). The static keys, when set, are used
+    // exactly as before and the endpoint is never asked.
+    if sources.aws_creds.is_none()
+        && let Some(endpoint) =
+            crate::credentials::container_endpoint(&get).map_err(|(var, reason)| match var {
+                // The token is a credential: its value is never
+                // kept, in the error or in its message.
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN" => ConfigError::invalid_redacted(var, reason),
+                _ => ConfigError::invalid(var, &get(var).unwrap_or_default(), reason),
+            })?
+    {
+        let var = endpoint.var;
+        let creds = crate::credentials::AwsCredentials::container(endpoint).map_err(|e| {
+            ConfigError::build(
+                Some(var),
+                format!(
+                    "cannot build the container credentials client: {}",
+                    with_causes(&e)
+                ),
+            )
+        })?;
+        sources.aws_creds = Some(creds);
     }
     if let Some(endpoint) = nonempty("CRABCROP_GCS_ENDPOINT") {
         sources.gcs_endpoint = store_endpoint("CRABCROP_GCS_ENDPOINT", &endpoint)?;
@@ -1025,8 +1051,16 @@ pub fn build_source_config(
                 .collect()
         })
         .unwrap_or_default();
+    // Container credentials do not count: the platform sets
+    // their endpoint for every task or pod with a role, so a
+    // deployment that boots today keeps booting. An empty
+    // bucket allowlist still refuses every bucket fetch.
     check_bucket_policy(
-        sources.aws_creds.is_some() || sources.gcs_creds.is_some(),
+        sources
+            .aws_creds
+            .as_ref()
+            .is_some_and(|creds| !creds.is_container())
+            || sources.gcs_creds.is_some(),
         &sources.allowed_buckets,
     )?;
     // A configured store endpoint is where every bucket

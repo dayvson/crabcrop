@@ -187,7 +187,7 @@ impl UploadStore {
         prefix: String,
         endpoint: Option<String>,
         region: String,
-        creds: Option<crate::sigv4::Credentials>,
+        creds: Option<crate::credentials::AwsCredentials>,
         max_bytes: u64,
         allow_overwrite: bool,
     ) -> Result<Self, reqwest::Error> {
@@ -608,7 +608,7 @@ mod tests {
             "orig/".to_string(),
             Some(fake.endpoint.clone()),
             "us-east-1".to_string(),
-            None,
+            Some(crate::s3store::test_support::test_aws()),
             1024,
             false,
         )
@@ -637,7 +637,7 @@ mod tests {
             String::new(),
             Some(fake.endpoint.clone()),
             "us-east-1".to_string(),
-            None,
+            Some(crate::s3store::test_support::test_aws()),
             1024,
             false,
         )
