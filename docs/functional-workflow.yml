@@ -68,7 +68,7 @@ jobs:
             # Full tier when the diff touches the lockfile, the
             # manifests, any file under src/ (a pattern rather
             # than a module list, so a new module cannot fall
-            # outside it), or this harness.
+            # outside it; src/url/ included), or this harness.
             files=$(git diff --name-only \
               "origin/${{ github.base_ref }}...HEAD")
             while IFS= read -r f; do
@@ -76,7 +76,6 @@ jobs:
                 Cargo.lock|Cargo.toml|crates/*/Cargo.toml) tier=full ;;
                 src/*) tier=full ;;
                 tests/functional/*) tier=full ;;
-                src/url/*) tier=full ;;
               esac
             done <<< "$files"
           fi

@@ -18,27 +18,63 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # The daily audit (scheduled-audit below, issue #710): a
+  # new advisory against a locked dependency shows up the
+  # day it is published, not at the next push. Every other
+  # job skips a scheduled run.
+  schedule:
+    - cron: "21 4 * * *"
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables, not full debug info: a failing test and a
+  # backtrace still name the file and line, and the target
+  # directory the cargo cache below saves is a fraction of
+  # the size (issue #710).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # Every job's timeout-minutes is at least twice its longest
 # recent run (issue #543): a hung test fails the job in
 # minutes instead of holding it for GitHub's six-hour
-# default.
+# default. The longest recent runs, with no cache to
+# restore: build 23.0 minutes, macos 14.5, suites 11.5,
+# msrv, notices and audit under 3 (issue #710).
+#
+# The cargo cache (Swatinem/rust-cache, issue #710) holds
+# the registry and the dependencies' build output, keyed by
+# the job, the toolchain and the lockfiles. Only a push to
+# main saves an entry: a pull request restores main's and
+# writes none, so nothing a pull request builds reaches a
+# later run. Its keys start with rust-ci-, and the release
+# workflow restores no cache at all (scripts/check_workflows.py,
+# the cache rule): the binaries a release publishes always
+# build from a clean checkout.
 jobs:
   build:
 
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install nasm (rav1e SIMD build)
         run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: rust-ci-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # The static dav1d the release links, built the same way
+      # (issue #596; see the step of the same name in
+      # docs/release-workflow.yml), so the AVIF tests below
+      # decode with the dav1d 1.5.1 every shipped binary
+      # carries, not the runner's libdav1d (issue #710).
+      - name: Build dav1d from the pinned, checksummed tarball
+        run: bash scripts/build_dav1d.sh "$RUNNER_TEMP/dav1d"
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check versions
@@ -48,9 +84,10 @@ jobs:
       - name: Check lockfiles
         run: python3 scripts/check_locks.py
       # Actions pinned by SHA, no download piped into a shell,
-      # hashed pip installs, dav1d from a checked tarball, and
-      # publishing behind the release approval (issues #593,
-      # #596, #597, #598, #599).
+      # hashed pip installs, dav1d from a checked tarball,
+      # publishing behind the release approval, every fuzz
+      # run under a memory limit, and no cache in the release
+      # (issues #593, #596, #597, #598, #599, #710).
       - name: Check workflows
         run: python3 scripts/check_workflows.py
       - name: Clippy
@@ -63,8 +100,6 @@ jobs:
         run: cargo build --locked --verbose
       - name: Run tests
         run: cargo test --locked --workspace --verbose
-      - name: Install libdav1d (AVIF decode)
-        run: sudo apt-get update && sudo apt-get install -y libdav1d-dev
       - name: Run tests with AVIF decode
         run: cargo test --locked --verbose --features avif-decode
 
@@ -75,6 +110,7 @@ jobs:
     # system APIs exist only on Linux, so a pull request
     # must build that feature set on macOS and pass the
     # library tests there as well.
+    if: github.event_name != 'schedule'
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -82,6 +118,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install nasm
         run: brew install nasm
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: rust-ci-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # The static dav1d the release links, built the same way
       # (issue #596): see the step of the same name in
       # docs/release-workflow.yml.
@@ -94,6 +135,7 @@ jobs:
 
   msrv:
 
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -118,11 +160,21 @@ jobs:
     # now: a dependency change regenerates it
     # (scripts/check_notices.py --write). A crate whose license
     # scripts/notices/about.toml does not accept fails here.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The registry and the installed cargo-about: the install
+      # below finds the pinned version in place and builds it
+      # from source only when the cache has none.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: rust-ci-v1
+          cache-targets: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # From crates.io with its own lockfile, at the version
       # scripts/check_notices.py pins (CARGO_ABOUT_VERSION).
       - name: Install cargo-about
@@ -132,6 +184,7 @@ jobs:
 
   audit:
 
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -147,8 +200,84 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  scheduled-audit:
+
+    # The same audit, daily (issue #710). On a scheduled run
+    # audit-check files an issue for each advisory it has
+    # not filed before, warnings such as an unmaintained
+    # crate included, instead of failing a check; the next
+    # push's audit job fails on a vulnerability as before.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  semver:
+
+    # crabcrop-url's public API against the last version on
+    # crates.io (issue #710): a change that breaks a caller
+    # fails here unless the crate's version allows it (a
+    # 0.y.z crate breaks only in 0.(y+1).0). It runs when a
+    # pull request or a push to main changes
+    # crates/crabcrop-url, so the release commit that moves
+    # the version runs it too, and the release preflight
+    # waits for that run.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide whether crabcrop-url changed
+        id: changed
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # With no base to compare against, check anyway.
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null \
+            && git diff --quiet "$BASE" HEAD -- crates/crabcrop-url; then
+            echo "crates/crabcrop-url is unchanged since $BASE"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The release binary, checked against its pinned SHA-256
+      # before it is unpacked. 0.51.0 reads the rustdoc JSON
+      # of the toolchain rust-toolchain.toml pins; moving the
+      # toolchain may need a newer release here.
+      - name: Install cargo-semver-checks
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-semver-checks.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$archive" \
+            https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.51.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz
+          echo "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" cargo-semver-checks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Check crabcrop-url against its last published version
+        if: steps.changed.outputs.changed == 'true'
+        run: cargo semver-checks --package crabcrop-url
+
   suites:
 
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -161,6 +290,16 @@ jobs:
           fetch-depth: 0
       - name: Install nasm (rav1e SIMD build)
         run: sudo apt-get update && sudo apt-get install -y nasm
+      # The debug binary the suites start, and the fuzz smoke,
+      # which builds in a workspace of its own.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: rust-ci-v1
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:

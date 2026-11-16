@@ -44,14 +44,22 @@ both SDKs must all pass.
   server's parser is `src/url.rs`.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
-- `fuzz/`: cargo-fuzz targets for the URL parser, the token
-  opener, image decode (AVIF through dav1d included), metadata,
-  and operation chains through the engine, built on the server
-  library and `crabcrop-url` (the opener's home). The smoke runs
-  in `scripts/test_all.sh`; `.github/workflows/fuzz.yml` fuzzes
-  every target nightly.
-- `tests/functional/`: the HTTP functional suite, tiered; the local tier
-  runs without network or model files.
+- `fuzz/`: cargo-fuzz targets for the URL parser (and what the
+  server does with a remainder after it: sealed tokens, the
+  default operations, the operation and watermark caps, the
+  explain forecast), the token opener, image decode (AVIF
+  through dav1d included), metadata, operation chains through
+  the engine, and source renders (the scaled JPEG decode and the
+  animated WebP walk), built on the server library and
+  `crabcrop-url` (the opener's home). The smoke runs in
+  `scripts/test_all.sh`. `.github/workflows/fuzz.yml` fuzzes
+  every target nightly once the workflow is enabled, which is
+  the owner's switch: it has been disabled since before its
+  first scheduled run, so until then no open-ended fuzzing runs
+  anywhere (issue #710).
+- `tests/functional/`: the HTTP functional suite, tiered: the smoke and
+  full tiers run without network or model files, and the local tier holds
+  the AI cases, which need the models.
 
 ## Build and test
 
@@ -65,20 +73,26 @@ both SDKs must all pass.
   the first CI run fails on style alone.
 - The real-model AI tests are `#[ignore]`d in the normal gate: they need
   model files and an ONNX Runtime library, which are deployment artifacts,
-  never repo content. `.github/workflows/ai-models.yml` downloads the
-  pinned artifacts and runs them (`cargo test -- --ignored`) on pull
-  requests and main pushes that touch `src/ai/`, `src/tokenizer.rs`,
-  `tests/fixtures/portrait.jpg`, its hash-locked Python requirements
-  (`scripts/requirements/ai-fixtures.txt`) or the workflow itself, on
-  every release tag before anything publishes, weekly, and by hand. When
-  you cannot run them locally, that pull-request run is where an AI
-  change is verified.
-  A change outside those paths can still break them (the real-model tests
-  in `src/main.rs` and `src/engine.rs`, an `ort` bump in `Cargo.lock`)
-  without starting it: run the workflow by hand on the branch
-  (`gh workflow run ai-models.yml --ref <branch>`).
-- The AI functional groups (`tests/functional`, tier `local`) run in no CI
-  workflow: only a local run with the models verifies them.
+  never repo content. Each one skips when its `CRABCROP_TEST_*` variable
+  is unset (`crate::ai::env_or_skip`), so a local run tests the models it
+  has. `.github/workflows/ai-models.yml` downloads the pinned artifacts and
+  runs every ignored test (`cargo test -- --ignored`), the ones in
+  `src/main.rs` and `src/engine.rs` included, with every variable set and
+  `CRABCROP_TEST_REQUIRE_MODELS=1`, which turns a skip into a failure. It
+  runs on pull requests and main pushes that touch anything under `src/`,
+  the manifests, `Cargo.lock` (an `ort` bump), `rust-toolchain.toml`, the
+  fixture photos the tests embed, its hash-locked Python requirements
+  (`scripts/requirements/ai-fixtures.txt`) or the workflow itself; on
+  every release tag before anything publishes; weekly; and by hand
+  (`gh workflow run ai-models.yml --ref <branch>`). When you cannot run
+  them locally, that pull-request run is where an AI change is verified.
+- The AI functional groups (`tests/functional/cases_ai.json`, tier
+  `local`) run in no CI workflow: they boot the server with the full model
+  set (`CRABCROP_FUNC_MODELS_DIR`), which the ai-models workflow does not
+  download, so only a local run with the models verifies them over HTTP.
+  `.github/workflows/functional.yml` runs the other tiers: smoke or full
+  on a pull request (its diff decides), and full on every push to main,
+  on release tags and nightly.
 
 ## Invariants
 
