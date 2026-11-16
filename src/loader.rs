@@ -43,9 +43,10 @@
 //! check's and the HTTP client's own for a fetch the check does
 //! not pin, runs on slots of their own (see [`LOOKUP_SLOTS`]).
 //! Concurrent lookups of one name share one slot and one
-//! answer, and every lookup a fetch starts, on any hop, counts
-//! against the fetch's origin, whose lookups hold at most a
-//! share of the slots (see [`LOOKUP_SLOTS_PER_ORIGIN`]).
+//! answer, and a fetch's lookups of the other hosts its
+//! redirects name count against the fetch's origin, whose
+//! redirects hold at most a share of the slots (see
+//! [`LOOKUP_SLOTS_PER_ORIGIN`]).
 //! A host name that resolves to a non-public address fails the
 //! way a name that does not resolve fails, so the answer never
 //! says which names resolve inside the server's network.
@@ -695,8 +696,8 @@ pub struct Loader {
 /// about 10 seconds, requests that each name a different
 /// such host as their source, at about 13 a second, keep
 /// every slot taken, and other lookups wait and then shed
-/// while they do. One origin's lookups, its redirects'
-/// included, hold no more than its share (see
+/// while they do. The hosts one origin's redirects name
+/// hold no more than its share (see
 /// [`LOOKUP_SLOTS_PER_ORIGIN`]). An allowlist avoids
 /// both, since a host off the list is refused before any
 /// lookup, on every hop. Lookups normally take
@@ -704,21 +705,23 @@ pub struct Loader {
 /// host names a second.
 pub const LOOKUP_SLOTS: usize = 128;
 
-/// How many of the [`LOOKUP_SLOTS`] one origin's lookups
-/// may hold at once: an eighth of them. A fetch's origin
-/// is the host its source URL names, and every lookup the
-/// fetch starts counts against it, on every hop. A
+/// How many of the [`LOOKUP_SLOTS`] the hosts one origin's
+/// redirects name may hold at once: an eighth of them. A
+/// fetch's origin is the host its source URL names. A
 /// redirect names the next host, so the hosts a chain
 /// looks up are the origin's choice, the way the source
 /// host is the client's, and each of those lookups keeps
 /// its slot until the resolver returns, which can be past
-/// the fetch's own timeout: the share bounds the slots
-/// one origin's fetches hold, whatever names their
-/// redirects give. Its own name takes one slot of the
-/// share at most, since concurrent lookups of one name
-/// share one slot, which leaves room for the hosts an
-/// ordinary chain of redirects names, while it takes
-/// eight origins to fill every slot.
+/// the fetch's own timeout. So every lookup a fetch starts
+/// of a host other than its origin, on any hop, counts
+/// against the origin's share, which bounds the slots one
+/// origin's fetches hold, whatever names their redirects
+/// give. The origin's own name takes no share: concurrent
+/// lookups of one name share one slot, so it holds one at
+/// most, and the names its redirects give cannot keep it
+/// from being looked up. The share leaves room for the
+/// hosts an ordinary chain of redirects names, while it
+/// takes eight origins to fill every slot.
 pub const LOOKUP_SLOTS_PER_ORIGIN: usize = LOOKUP_SLOTS / 8;
 
 /// How long a load waits for a host lookup slot, and for
@@ -758,18 +761,19 @@ type Origins = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String,
 ///   get one answer. Nothing outlives the lookup: an ask
 ///   that comes after the answer starts a lookup of its
 ///   own.
-/// - Any other ask takes one of its origin's share of the
-///   slots (see [`LOOKUP_SLOTS_PER_ORIGIN`]), then a slot,
-///   and waits at most [`LOOKUP_WAIT`] for the two. While
-///   it waits it starts nothing: a load that gives up then,
-///   at that wait or at its own source timeout, leaves the
+/// - Any other ask takes a slot, and before it, for a name
+///   other than its origin's own, one of its origin's share
+///   of the slots (see [`LOOKUP_SLOTS_PER_ORIGIN`]). It
+///   waits at most [`LOOKUP_WAIT`] for the two. While it
+///   waits it starts nothing: a load that gives up then, at
+///   that wait or at its own source timeout, leaves the
 ///   queue, and its lookup never starts.
 ///
-/// Once started, a lookup keeps its slot and its origin's
-/// share until the resolver returns, even if every load
-/// that asked for it has given up, because the call cannot
-/// be interrupted; the slot count and the shares are what
-/// bound those.
+/// Once started, a lookup keeps its slot, and its origin's
+/// share when it took one, until the resolver returns, even
+/// if every load that asked for it has given up, because
+/// the call cannot be interrupted; the slot count and the
+/// shares are what bound those.
 #[derive(Clone)]
 struct HostLookups {
     slots: std::sync::Arc<tokio::sync::Semaphore>,
@@ -829,9 +833,12 @@ impl HostLookups {
     }
 
     /// The addresses `host` resolves to, for a fetch of
-    /// `origin`. A lookup failure is [`LoadError::Network`];
-    /// no free slot, or none of `origin`'s share, within the
-    /// wait is [`LoadError::LookupBusy`].
+    /// `origin`. A lookup of a host other than `origin` takes
+    /// one of `origin`'s share of the slots as well as a slot
+    /// (see [`LOOKUP_SLOTS_PER_ORIGIN`]). A lookup failure is
+    /// [`LoadError::Network`]; no free slot, or none of
+    /// `origin`'s share, within the wait is
+    /// [`LoadError::LookupBusy`].
     async fn resolve(&self, host: &str, origin: &str) -> Result<Vec<IpAddr>, LoadError> {
         // DNS names are case-insensitive: one name, one lookup.
         let name = host.to_ascii_lowercase();
@@ -842,7 +849,14 @@ impl HostLookups {
             return answer_of(answer).await;
         }
         let until = tokio::time::Instant::now() + self.wait;
-        let share = self.shares.take(origin, until).await?;
+        // The origin's own name takes no share: its lookups are
+        // shared, so it holds one slot at most, and the hosts its
+        // redirects name must not keep it from being looked up.
+        let share = if name.eq_ignore_ascii_case(origin) {
+            None
+        } else {
+            Some(self.shares.take(origin, until).await?)
+        };
         let slot = match tokio::time::timeout_at(until, self.slots.clone().acquire_owned()).await {
             Ok(Ok(slot)) => slot,
             _ => return Err(LoadError::LookupBusy),
@@ -850,16 +864,17 @@ impl HostLookups {
         answer_of(self.start(name, host, slot, share)).await
     }
 
-    /// Start the lookup of `host` on `slot` and `share`, and
-    /// return where its answer arrives. When another ask has
-    /// started a lookup of the same name meanwhile, `slot` and
-    /// `share` go back, and the answer is that lookup's.
+    /// Start the lookup of `host` on `slot`, and on `share`
+    /// when it took one, and return where its answer arrives.
+    /// When another ask has started a lookup of the same name
+    /// meanwhile, `slot` and `share` go back, and the answer
+    /// is that lookup's.
     fn start(
         &self,
         name: String,
         host: &str,
         slot: tokio::sync::OwnedSemaphorePermit,
-        share: OriginSlot,
+        share: Option<OriginSlot>,
     ) -> tokio::sync::watch::Receiver<Option<Answer>> {
         let mut running = lock(&self.running);
         if let Some(answer) = running.get(&name) {
@@ -1060,8 +1075,8 @@ impl reqwest::dns::Resolve for SlotResolver {
         let host = name.as_str().to_owned();
         // Read while the fetch's request is being polled: the
         // client can finish a connect it started on a task of
-        // its own. A lookup no fetch asked for counts against
-        // its own name.
+        // its own. A lookup no fetch asked for is its own
+        // origin, which takes no share.
         let origin = FETCH_ORIGIN
             .try_with(String::clone)
             .unwrap_or_else(|_| host.clone());
@@ -1228,8 +1243,8 @@ impl Loader {
     /// Resolve host names with `lookup` instead of the system
     /// resolver, on `slots` lookup slots with `wait` for one:
     /// lets tests stand in for DNS without the network. One
-    /// origin may hold [`LOOKUP_SLOTS_PER_ORIGIN`] of them, or
-    /// all of them when there are fewer.
+    /// origin's redirects may hold [`LOOKUP_SLOTS_PER_ORIGIN`]
+    /// of them, or all of them when there are fewer.
     #[cfg(test)]
     pub(crate) fn with_host_lookup(
         self,
@@ -1241,7 +1256,7 @@ impl Loader {
     }
 
     /// [`Loader::with_host_lookup`], with `per_origin` of the
-    /// slots for one origin.
+    /// slots for one origin's redirects.
     #[cfg(test)]
     pub(crate) fn with_host_lookup_shares(
         mut self,
@@ -1430,10 +1445,11 @@ impl Loader {
     ) -> Result<LoadBody, LoadError> {
         let mut parsed =
             Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
-        // Every lookup this fetch starts, on any hop, counts
-        // against the host the caller named (see
-        // `LOOKUP_SLOTS_PER_ORIGIN`). A URL with no host has
-        // no lookup to count: the policy refuses it first.
+        // Every lookup this fetch starts of another host, on
+        // any redirect hop, counts against the host the caller
+        // named (see `LOOKUP_SLOTS_PER_ORIGIN`). A URL with no
+        // host has no lookup to count: the policy refuses it
+        // first.
         let origin = parsed.host_str().unwrap_or_default().to_owned();
         let mut hops = 0;
         loop {
@@ -1919,8 +1935,9 @@ impl Loader {
     /// the caller sent only the name, so the answer must not
     /// tell it what the name resolves to inside the server's
     /// network. Every redirect hop runs through here too, and
-    /// its lookup counts against `origin`, the host the fetch
-    /// began at (see [`LOOKUP_SLOTS_PER_ORIGIN`]).
+    /// a lookup of a host other than `origin`, the host the
+    /// fetch began at, counts against `origin`'s share (see
+    /// [`LOOKUP_SLOTS_PER_ORIGIN`]).
     async fn check_policy(
         &self,
         url: &Url,
@@ -3917,7 +3934,8 @@ mod tests {
     /// `r{n}.relay.test` on this server's port, a name the
     /// stand-in resolvers answer and this server serves too,
     /// then from there to `r{n}.stuck.test`, a name they never
-    /// answer. Returns its port.
+    /// answer. A fetch of `/direct` gets an image instead.
+    /// Returns its port.
     async fn spawn_redirecting_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3929,17 +3947,21 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = socket.read(&mut buf).await;
-                    let location = if buf.starts_with(b"GET /relay ") {
-                        format!("http://r{n}.stuck.test/x.png")
+                    let answer = if buf.starts_with(b"GET /direct ") {
+                        ok_image_response()
                     } else {
-                        format!("http://r{n}.relay.test:{port}/relay")
+                        let location = if buf.starts_with(b"GET /relay ") {
+                            format!("http://r{n}.stuck.test/x.png")
+                        } else {
+                            format!("http://r{n}.relay.test:{port}/relay")
+                        };
+                        response(
+                            "302 Found",
+                            &format!("Location: {location}\r\nContent-Length: 0\r\n"),
+                            b"",
+                        )
                     };
-                    let redirect = response(
-                        "302 Found",
-                        &format!("Location: {location}\r\nContent-Length: 0\r\n"),
-                        b"",
-                    );
-                    let _ = socket.write_all(&redirect).await;
+                    let _ = socket.write_all(&answer).await;
                 });
             }
         });
@@ -3977,10 +3999,11 @@ mod tests {
         // those lookups hold 2 of them. The fetches past the
         // share wait for it holding no slot, and shed without
         // starting a lookup, while a fetch of another host
-        // finds a slot. The same under each policy: the
-        // private-address check's lookups (the default), and
-        // the HTTP client's own for the fetches the check does
-        // not pin.
+        // finds a slot, and so does a fetch of origin.test's
+        // own image: its own name takes no share. The same
+        // under each policy: the private-address check's
+        // lookups (the default), and the HTTP client's own for
+        // the fetches the check does not pin.
         const FLOOD: usize = 6;
         for policy in [
             SourcePolicy::new(vec![], true),
@@ -4016,8 +4039,10 @@ mod tests {
             if pins {
                 serve_pin_locally(&loader, "origin.test", origin, resolved);
                 // The relay names come from the server's connection
-                // count: two connections a fetch at most.
-                for n in 0..2 * FLOOD {
+                // count: two connections a fetch at most, and the
+                // fetch of the origin's own image takes a number
+                // too.
+                for n in 0..=2 * FLOOD {
                     serve_pin_locally(&loader, &format!("r{n}.relay.test"), origin, resolved);
                 }
                 serve_pin_locally(&loader, "other.test", other, resolved);
@@ -4047,6 +4072,20 @@ mod tests {
                 body,
                 Ok(Ok(b"\xff\xd8\xff\xd9".to_vec())),
                 "{policy:?}: the other host found no slot"
+            );
+            // The share holds only the hosts origin.test's
+            // redirects name: a fetch of its own image, which
+            // needs a lookup of its own name and no redirect,
+            // finds a slot while the share is all out.
+            let direct = tokio::time::timeout(
+                Duration::from_secs(1),
+                loader.load(&format!("http://origin.test:{origin}/direct")),
+            )
+            .await;
+            assert_eq!(
+                direct,
+                Ok(Ok(b"\xff\xd8\xff\xd9".to_vec())),
+                "{policy:?}: the origin's own name found no slot"
             );
             assert_eq!(loader.lookup_slots(), (2, 4), "{policy:?}");
             eventually("the fetches past the share to shed", || {
