@@ -744,3 +744,92 @@ async fn an_inline_log_writes_nothing_after_its_last_line() {
     log.line("late");
     assert_eq!(out.text(), "");
 }
+
+/// Line `n` of a test of pieces: 999 bytes, 1000 with its
+/// newline.
+fn kilo(n: usize) -> String {
+    format!("{n:04} {}", "k".repeat(994))
+}
+
+#[tokio::test]
+async fn a_batch_is_written_in_pieces_that_end_with_a_line() {
+    // Issue #707: the writer hands standard output at most
+    // `WRITE_AT_MOST` bytes of a batch at a time, a piece
+    // ending with a line where one ends within it, and a
+    // line longer than a piece in pieces of its own.
+    let (log, out, notes) = queued();
+    out.stall();
+    log.line("first");
+    out.blocked().await;
+    // 300 lines of 1000 bytes behind it, 65 to a piece,
+    // then a line longer than a piece.
+    for n in 0..300 {
+        log.line(&kilo(n));
+    }
+    let long = "l".repeat(WRITE_AT_MOST + 10);
+    log.line(&long);
+    out.resume();
+    assert_eq!(log.finish(None, LONG).await, 0);
+    let sizes: Vec<usize> = out.writes().iter().map(String::len).collect();
+    assert_eq!(
+        sizes,
+        [6, 65_000, 65_000, 65_000, 65_000, 40_000, WRITE_AT_MOST, 11]
+    );
+    let mut expected = vec!["first".to_string()];
+    expected.extend((0..300).map(kilo));
+    expected.push(long);
+    assert_eq!(out.lines(), expected);
+    assert!(notes.all().is_empty(), "{:?}", notes.all());
+}
+
+#[tokio::test]
+async fn a_full_queue_has_room_again_once_standard_output_takes_a_piece_of_its_batch() {
+    // Issue #707: the writer handed standard output its
+    // whole batch in one write, and the room the batch took
+    // came back only once all of it was written. A reader
+    // that was slow, not gone, then kept the queue full,
+    // and every request that logs waiting, for as long as
+    // it took to read the whole batch, and the health check
+    // failed on it. Each piece standard output takes is now
+    // room again.
+    let (log, out, notes) = queued_holding(2 * WRITE_AT_MOST);
+    out.stall();
+    log.line(&kilo(0));
+    out.blocked().await;
+    // Lines 1 to 140 queue behind line 0 and fill the queue.
+    for n in 1..=140 {
+        log.line(&kilo(n));
+    }
+    assert!(log.stats().full);
+    // The stream takes line 0 and stops again: the writer
+    // has lines 1 to 140 in hand, one batch, and is blocked
+    // in its first piece. The queue is still full.
+    out.stall_after(1000);
+    out.resume();
+    out.blocked().await;
+    assert_eq!(out.text(), format!("{}\n", kilo(0)));
+    assert_eq!(log.stats().held_bytes, 140 * 1000);
+    assert!(log.stats().full);
+    let waiting = tokio::spawn(request(log.clone(), "waited".to_string()));
+    until("a request waits for room", || log.stats().waiting == 1).await;
+    // The stream takes one piece's worth and stops again.
+    // What it took is room: the request goes on, though
+    // most of the batch is still to be written.
+    out.stall_after(WRITE_AT_MOST);
+    out.resume();
+    tokio::time::timeout(LONG, waiting).await.unwrap().unwrap();
+    assert!(
+        out.text().len() <= 1000 + WRITE_AT_MOST,
+        "{} bytes written",
+        out.text().len()
+    );
+    // Once the stream is read, everything is there, in
+    // order, the request's line last.
+    out.resume();
+    assert_eq!(log.finish(None, LONG).await, 0);
+    let mut expected: Vec<String> = (0..=140).map(kilo).collect();
+    expected.push("waited".to_string());
+    assert_eq!(out.lines(), expected);
+    assert_eq!(log.stats().dropped, 0);
+    assert!(notes.all().is_empty(), "{:?}", notes.all());
+}

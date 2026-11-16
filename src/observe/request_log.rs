@@ -33,7 +33,13 @@
 //!   queued.
 //! - **Standard output nobody reads.** The queue is full
 //!   at 8 MiB of text ([`QUEUE_BYTES`]), counting what the
-//!   writer has in hand. A handler asks for room before it
+//!   writer has in hand and standard output has not taken
+//!   yet: the writer hands a batch over at most 64 KiB at
+//!   a time ([`WRITE_AT_MOST`]), and each piece standard
+//!   output takes is room again, so a reader that is slow,
+//!   not gone, sets the pace of the requests that log
+//!   instead of holding them all until a whole batch is
+//!   read (issue #707). A handler asks for room before it
 //!   does anything else ([`RequestLog::room`]), and while
 //!   the queue is full that waits: the request is not
 //!   handled, and not answered, until the writer has made
@@ -90,7 +96,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// The text the queue is full at, in bytes: the lines
-/// waiting for the writer and the batch it is writing.
+/// waiting for the writer and what standard output has
+/// not taken yet of the batch it is writing.
 /// A request line is a few hundred bytes, so this is tens
 /// of thousands of requests: room for a reader that falls
 /// behind for a moment, and a bound on what a reader that
@@ -107,23 +114,41 @@ pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// How long the queue may stay full, without a break,
 /// before the log counts as stalled and the health check
-/// fails (issue #707). A standard output that is read
-/// takes a full queue in well under a second (see
-/// [`SHUTDOWN_WAIT`]), so a queue that stays full this
-/// long is one nobody reads, or reads at a pace no
-/// request should wait on: each request that arrives
-/// meanwhile has waited for room as long as a request may
-/// wait for a processing slot or for source buffer budget
-/// before the server sheds it, 5 seconds. A pause in the
-/// reader shorter than that, such as a log shipper that
-/// restarts, does not fail the check. It is well inside
-/// what the bundled liveness probes allow before a
-/// restart, about 45 seconds, so a replica whose log has
-/// stalled restarts within a minute or so of its queue
-/// filling, as it did before the queue (issue #642), when
-/// a standard output nobody read held the whole server,
-/// the health check included.
+/// fails (issue #707). The queue has room again as soon
+/// as standard output takes one piece of the batch in the
+/// writer's hands, at most [`WRITE_AT_MOST`] bytes, so a
+/// queue that stays full this long is one whose standard
+/// output has taken almost nothing meanwhile: nobody
+/// reads it, or it is read at a pace no request should
+/// wait on. Each request that arrives meanwhile has
+/// waited for room as long as a request may wait for a
+/// processing slot or for source buffer budget before the
+/// server sheds it, 5 seconds. A pause in the reader
+/// shorter than that, such as a log shipper that
+/// restarts, does not fail the check. The bundled
+/// liveness probes restart a replica 40 to 60 seconds
+/// after its check starts failing, so a replica whose
+/// log has stalled restarts within a minute or so of its
+/// queue filling, as it did before the queue (issue
+/// #642), when a standard output nobody read held the
+/// whole server, the health check included.
 pub const STALLED_AFTER: Duration = Duration::from_secs(5);
+
+/// The most bytes of a batch the writer hands standard
+/// output in one `write` (issue #707): what a Linux pipe
+/// holds by default. A `write` to a pipe returns once the
+/// reader has taken what did not fit, so a batch handed
+/// over whole held all the room it took in the queue
+/// until its last byte was read, and a reader that was
+/// slow, not gone, kept the queue full, and every request
+/// that logs waiting, for as long as it took to read the
+/// whole batch: 5 seconds for 8 MiB at 1.7 MB/s, enough
+/// to fail the health check. In pieces, the batch gives
+/// its room back as standard output takes it. A batch of
+/// this much or less, which is every batch while standard
+/// output keeps up, is still one `write`, and a piece
+/// ends with a line where one ends within it.
+const WRITE_AT_MOST: usize = 64 * 1024;
 
 /// The writer starts a write no sooner than this after it
 /// started the one before, so lines that arrive close
@@ -294,17 +319,9 @@ impl RequestLog {
     /// for want of room, and nothing waits here.
     pub fn line(&self, line: &str) {
         match &*self.0 {
-            Form::Inline(finished) => {
-                if finished.open() {
-                    println!("{line}");
-                }
-            }
+            Form::Inline(finished) => print_inline(finished, Some(line), false),
             #[cfg(test)]
-            Form::InlineTo(out, finished) => {
-                if finished.open() {
-                    write_inline(out, line);
-                }
-            }
+            Form::InlineTo(out, finished) => write_inline(out, finished, Some(line), false),
             Form::Queued(handle) => {
                 handle.0.push(line, false);
             }
@@ -318,17 +335,9 @@ impl RequestLog {
     /// refused it.
     pub async fn event(&self, line: &str) {
         match &*self.0 {
-            Form::Inline(finished) => {
-                if finished.open() {
-                    println!("{line}");
-                }
-            }
+            Form::Inline(finished) => print_inline(finished, Some(line), false),
             #[cfg(test)]
-            Form::InlineTo(out, finished) => {
-                if finished.open() {
-                    write_inline(out, line);
-                }
-            }
+            Form::InlineTo(out, finished) => write_inline(out, finished, Some(line), false),
             Form::Queued(handle) => {
                 if let Some(number) = handle.0.push(line, true) {
                     handle.0.settled(number).await;
@@ -347,18 +356,12 @@ impl RequestLog {
     pub async fn finish(&self, last: Option<&str>, limit: Duration) -> u64 {
         let queue = match &*self.0 {
             Form::Inline(finished) => {
-                let was_open = finished.end();
-                if let Some(last) = last.filter(|_| was_open) {
-                    println!("{last}");
-                }
+                print_inline(finished, last, true);
                 return 0;
             }
             #[cfg(test)]
             Form::InlineTo(out, finished) => {
-                let was_open = finished.end();
-                if let Some(last) = last.filter(|_| was_open) {
-                    write_inline(out, last);
-                }
+                write_inline(out, finished, last, true);
                 return 0;
             }
             Form::Queued(handle) => &handle.0,
@@ -449,7 +452,7 @@ impl RequestLog {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueState {
     /// Bytes of lines held: queued, and in the writer's
-    /// hands.
+    /// hands but not taken by standard output yet.
     pub held_bytes: usize,
     /// The bytes the queue is full at ([`QUEUE_BYTES`]).
     pub capacity: usize,
@@ -464,7 +467,8 @@ pub struct QueueState {
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stats {
-    /// Bytes queued and in the writer's hands.
+    /// Bytes queued, and in the writer's hands but not
+    /// taken by standard output yet.
     pub(crate) held_bytes: usize,
     /// The queue is full: a request that asks for room
     /// waits.
@@ -479,11 +483,43 @@ pub(crate) struct Stats {
     pub(crate) writer_gone: bool,
 }
 
+/// An inline log's line, with `println!`, while the log
+/// is open; with `last`, the log ends first, and the line
+/// is its last. The look at the log and the write are
+/// made under the lock on standard output, which every
+/// inline line takes, so no line lands after the last
+/// (issue #707). The lock is reentrant: `println!` takes
+/// it again.
+fn print_inline(finished: &Finished, line: Option<&str>, last: bool) {
+    let _out = io::stdout().lock();
+    let open = if last {
+        finished.end()
+    } else {
+        finished.open()
+    };
+    if let Some(line) = line.filter(|_| open) {
+        println!("{line}");
+    }
+}
+
+/// [`print_inline`], to a test's stream.
 #[cfg(test)]
-fn write_inline(out: &Mutex<Box<dyn Write + Send>>, line: &str) {
+fn write_inline(
+    out: &Mutex<Box<dyn Write + Send>>,
+    finished: &Finished,
+    line: Option<&str>,
+    last: bool,
+) {
     let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
-    out.write_all(line.as_bytes()).unwrap();
-    out.write_all(b"\n").unwrap();
+    let open = if last {
+        finished.end()
+    } else {
+        finished.open()
+    };
+    if let Some(line) = line.filter(|_| open) {
+        out.write_all(line.as_bytes()).unwrap();
+        out.write_all(b"\n").unwrap();
+    }
 }
 
 /// The queue between the handlers and the writer.
@@ -521,9 +557,10 @@ struct State {
     text: String,
     /// How many lines `text` holds.
     lines: u64,
-    /// The bytes of the batch the writer took and has not
-    /// finished with. They count as held, so the queue is
-    /// full by all the text held, not by `text` alone.
+    /// The bytes of the batch the writer took that
+    /// standard output has not taken yet. They count as
+    /// held, so the queue is full by all the text held, not
+    /// by `text` alone.
     writing: usize,
     /// How many lines that batch holds.
     writing_lines: u64,
@@ -564,7 +601,7 @@ struct State {
 
 impl State {
     /// The bytes of text held: queued, and in the writer's
-    /// hands.
+    /// hands but not taken by standard output yet.
     fn held(&self) -> usize {
         self.text.len() + self.writing
     }
@@ -694,6 +731,25 @@ impl Queue {
         self.mark_full(&mut state);
         drop(state);
         self.progress.notify_waiters();
+    }
+
+    /// Standard output has taken `bytes` more of the batch
+    /// in the writer's hands, which has more to go (issue
+    /// #707): they are held no longer, so a full queue can
+    /// have room again before the whole batch is written.
+    /// The batch's lines settle when it ends.
+    fn taken(&self, bytes: usize) {
+        let mut state = self.lock();
+        state.writing = state.writing.saturating_sub(bytes);
+        let was_full = state.full_from.is_some();
+        self.mark_full(&mut state);
+        let room = was_full && state.full_from.is_none();
+        drop(state);
+        // Only the requests that wait for room have
+        // anything to look at again.
+        if room {
+            self.progress.notify_waiters();
+        }
     }
 
     /// Wait while the queue is full.
@@ -935,9 +991,10 @@ impl Writer {
     /// many of them were given up on.
     fn write(&mut self, batch: &[u8]) -> u64 {
         let carry = &mut self.carry;
+        let queue = &self.queue;
         let mut outcome = Ok(());
         self.sink.hold(&mut |out| {
-            outcome = write_lines(out, carry, batch);
+            outcome = write_lines(out, carry, batch, &mut |bytes| queue.taken(bytes));
         });
         match outcome {
             Ok(()) => {
@@ -979,16 +1036,20 @@ impl Writer {
 }
 
 /// Write the tail an earlier failure left in `carry`, then
-/// `batch`. On a failure: the error, and how many of the
-/// batch's lines were not written at all. A line the
-/// failure cut is not one of them: its tail goes to
-/// `carry`, which the next write starts with, so the line
-/// is whole once standard output takes writes again and
-/// the line after it starts on its own.
+/// `batch`, in pieces of at most [`WRITE_AT_MOST`] bytes,
+/// telling `taken` how many bytes of the batch each
+/// `write` took while more of it is left to write. On a
+/// failure: the error, and how many of the batch's lines
+/// were not written at all. A line the failure cut is not
+/// one of them: its tail goes to `carry`, which the next
+/// write starts with, so the line is whole once standard
+/// output takes writes again and the line after it starts
+/// on its own.
 fn write_lines(
     out: &mut dyn Write,
     carry: &mut Vec<u8>,
     batch: &[u8],
+    taken: &mut dyn FnMut(usize),
 ) -> Result<(), (io::Error, u64)> {
     let lines_in = |bytes: &[u8]| bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
     let mut done = 0;
@@ -1004,8 +1065,14 @@ fn write_lines(
     carry.clear();
     let mut at = 0;
     while at < batch.len() {
-        match write_some(out, &batch[at..]) {
-            Ok(n) => at += n,
+        match write_some(out, &batch[at..piece_end(batch, at)]) {
+            Ok(n) => {
+                at += n;
+                // The last of the batch is settled with it.
+                if at < batch.len() {
+                    taken(n);
+                }
+            }
             Err(error) => {
                 let rest = &batch[at..];
                 let mut lost = lines_in(rest);
@@ -1028,6 +1095,22 @@ fn write_lines(
             Err(error) => return Err((error, 0)),
         }
     }
+}
+
+/// Where the piece of `batch` that starts at `at` ends:
+/// the end of the batch when that is [`WRITE_AT_MOST`]
+/// bytes away or less, else the end of the last line that
+/// ends within that many bytes, or that many bytes on when
+/// none does.
+fn piece_end(batch: &[u8], at: usize) -> usize {
+    let most = at + WRITE_AT_MOST;
+    if batch.len() <= most {
+        return batch.len();
+    }
+    batch[at..most]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(most, |end| at + end + 1)
 }
 
 /// One `write` of some of `bytes`: how many it took.
