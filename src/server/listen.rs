@@ -120,18 +120,28 @@ pub async fn bind_listener(address: SocketAddr) -> io::Result<TcpListener> {
 /// The other options are the ones tokio's own bind sets.
 #[cfg(unix)]
 fn bind_dual_stack(address: SocketAddr) -> io::Result<TcpListener> {
-    let socket = tokio::net::TcpSocket::new_v6().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "{e}; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
-            ),
-        )
-    })?;
+    let socket = tokio::net::TcpSocket::new_v6().map_err(with_no_ipv6_hint)?;
     socket.set_reuseaddr(true)?;
     rustix::net::sockopt::set_ipv6_v6only(&socket, false)?;
     socket.bind(address)?;
     socket.listen(LISTEN_BACKLOG)
+}
+
+/// An IPv6 socket that could not be made, with what to set
+/// instead when the reason is that the host has no IPv6
+/// (`EAFNOSUPPORT`). Any other failure, such as a full file
+/// table, says nothing about IPv6, and keeps its own message.
+#[cfg(unix)]
+fn with_no_ipv6_hint(e: io::Error) -> io::Error {
+    if rustix::io::Errno::from_io_error(&e) != Some(rustix::io::Errno::AFNOSUPPORT) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{e}; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+        ),
+    )
 }
 
 /// The requests in flight on every connection of one

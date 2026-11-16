@@ -1156,39 +1156,12 @@ fn sigterm_cuts_off_hung_requests_at_the_grace_and_counts_them() {
     // until the platform killed the process. Now the grace
     // bounds it too. Issue #715: the line that says requests
     // were cut off says how many.
-    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let origin_addr = origin.local_addr().unwrap();
-    let (fetched_tx, fetched) = std::sync::mpsc::channel();
-    // An origin that accepts the fetch and never answers.
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in origin.incoming() {
-            let Ok(stream) = stream else { return };
-            let _ = fetched_tx.send(());
-            held.push(stream);
-        }
-    });
     let grace = Duration::from_secs(2);
     let (mut server, port, lines) = serving_unsafe_urls(&[
         ("CRABCROP_SOURCE_TIMEOUT_SECS", "600"),
         ("CRABCROP_SHUTDOWN_GRACE_SECS", &grace.as_secs().to_string()),
     ]);
-    // Two sources, so that the requests are two fetches and
-    // not one shared render.
-    let mut streams = Vec::new();
-    for name in ["hang-one", "hang-two"] {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let request = format!(
-            "GET /unsafe/40x30/http://{origin_addr}/img/{name}.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
-        );
-        stream.write_all(request.as_bytes()).unwrap();
-        streams.push(stream);
-    }
-    for _ in &streams {
-        fetched
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the server fetches each source");
-    }
+    let _streams = hung_requests(port, 2);
     // A request that has finished is not among them.
     assert!(status_line(port, "/health", "").contains("200"));
     let signalled = Instant::now();
@@ -1211,6 +1184,70 @@ fn sigterm_cuts_off_hung_requests_at_the_grace_and_counts_them() {
     assert!(!stderr.contains("background writes"), "{stderr}");
     assert!(!stderr.contains("renders whose client left"), "{stderr}");
     wait_for_line(&lines, "shutdown: done");
+}
+
+/// `count` requests on the server at `port`, each for a
+/// source of its own at an origin that accepts the fetch and
+/// never answers: they hang until the server cuts them off.
+/// Returns once the server has fetched every source, with
+/// the clients' streams, which keep the requests open.
+#[cfg(unix)]
+fn hung_requests(port: u16, count: usize) -> Vec<TcpStream> {
+    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let (fetched_tx, fetched) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in origin.incoming() {
+            let Ok(stream) = stream else { return };
+            let _ = fetched_tx.send(());
+            held.push(stream);
+        }
+    });
+    // A source each, so that the requests are fetches of
+    // their own and not one shared render.
+    let streams: Vec<TcpStream> = (0..count)
+        .map(|n| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let request = format!(
+                "GET /unsafe/40x30/http://{origin_addr}/img/hang-{n}.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            stream
+        })
+        .collect();
+    for _ in &streams {
+        fetched
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the server fetches each source");
+    }
+    streams
+}
+
+#[test]
+#[cfg(unix)]
+fn a_second_signal_counts_the_requests_it_cuts_off() {
+    // Issue #715: a second signal ends the drain at once, and
+    // the requests still in flight are cut off then. Its line
+    // counts them as the deadline's does; nothing used to.
+    let (mut server, port, lines) = serving_unsafe_urls(&[
+        ("CRABCROP_SOURCE_TIMEOUT_SECS", "600"),
+        ("CRABCROP_SHUTDOWN_GRACE_SECS", "120"),
+    ]);
+    let _streams = hung_requests(port, 1);
+    terminate(&server);
+    wait_for_line(&lines, "shutdown: draining");
+    let signalled = Instant::now();
+    signal(&server, rustix::process::Signal::INT);
+    let (status, stderr) = exit_of(&mut server, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(took < Duration::from_secs(5), "exited {took:?} after it");
+    assert!(
+        stderr.contains("shutdown: 1 requests still in flight at the second signal are cut off"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("at the deadline"), "{stderr}");
 }
 
 #[test]

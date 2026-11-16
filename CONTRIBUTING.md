@@ -81,7 +81,10 @@ A unit test that stands a script in for an external tool (FFmpeg,
 pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
 `std::fs::write`. A script written through the test process's own file
 descriptor can fail to start with "Text file busy" when another test thread
-spawns a child at the same moment (issue #523).
+spawns a child at the same moment (issue #523). The binary's unit tests cannot
+see the library's test modules, so they include the function's file,
+`src/test_support/script.rs`, with `#[path]`, and call it as
+`crate::test_script::write_script`.
 
 A test that writes files makes them in a directory of its own from
 `crate::test_support::scratch_dir(tag)`: it starts empty under

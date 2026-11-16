@@ -542,6 +542,29 @@ async fn an_ipv6_listener_takes_ipv4_too_or_says_the_host_has_no_ipv6() {
     assert!(ipv4_only.local_addr().unwrap().is_ipv4());
 }
 
+#[cfg(unix)]
+#[test]
+fn only_a_host_without_ipv6_is_told_to_bind_ipv4() {
+    // Issue #715: the hint is for the one failure that means
+    // the host has no IPv6. A socket refused for another
+    // reason, such as a full file table, keeps its own
+    // message, which a hint about IPv6 would only mislead.
+    let errno = |e: rustix::io::Errno| std::io::Error::from_raw_os_error(e.raw_os_error());
+    let no_ipv6 = super::with_no_ipv6_hint(errno(rustix::io::Errno::AFNOSUPPORT));
+    let plain = errno(rustix::io::Errno::AFNOSUPPORT).to_string();
+    assert_eq!(
+        no_ipv6.to_string(),
+        format!(
+            "{plain}; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+        )
+    );
+    for other in [rustix::io::Errno::MFILE, rustix::io::Errno::NOBUFS] {
+        let e = super::with_no_ipv6_hint(errno(other));
+        assert_eq!(e.raw_os_error(), Some(other.raw_os_error()), "{e}");
+        assert!(!e.to_string().contains("IPv6"), "{e}");
+    }
+}
+
 /// The whole request head the keep-alive tests send.
 const GET_ROOT: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 

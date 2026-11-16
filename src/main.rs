@@ -314,9 +314,9 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
             ((background.running(), disk_left), "at the second signal", std::time::Instant::now())
         }
     };
-    // Requests whose connection is still open: their handler
-    // runs, or their response is still being sent. The
-    // runtime stops them with the rest by `stop_by`.
+    // The requests still in flight: their handler runs, or
+    // their response is still being sent. The runtime stops
+    // them with the rest by `stop_by`.
     let requests = in_flight.count();
     if requests > 0 {
         eprintln!("shutdown: {requests} requests still in flight {when} are cut off");
