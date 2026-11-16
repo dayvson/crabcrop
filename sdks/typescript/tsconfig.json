@@ -3,6 +3,7 @@
     "declaration": true,
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "noUnusedLocals": true,
     "outDir": "dist",
     "rewriteRelativeImportExtensions": true,
     "rootDir": "./src",
