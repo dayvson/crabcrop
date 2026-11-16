@@ -8213,6 +8213,84 @@ fn an_animated_webp_past_the_pixel_budget_is_refused_up_front() {
 }
 
 #[test]
+fn an_animated_webp_past_the_kept_bytes_budget_is_refused_up_front() {
+    // Three frames on a 5000x5000 canvas: 75M decoded pixels, inside
+    // the 100M pixel budget, but the collector keeps every frame at
+    // the canvas's size, 300 MB in all, past the 256 MiB decode
+    // allocation budget it charges them against. The headers say so,
+    // so the animation is refused before its first frame decodes,
+    // with the collector's own message.
+    let bytes = with_webp_canvas(animated_webp_bytes(), 5000, 5000);
+    let err = check_webp_frame_budget(&bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("byte decode allocation limit"),
+        "{err}"
+    );
+    let started = std::time::Instant::now();
+    let got = decode_webp_frames(&bytes, None).unwrap_err();
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+    // Three frames on a 4000x4000 canvas keep 192 MB, inside the
+    // budget, so the header charge admits them.
+    assert!(check_webp_frame_budget(&with_webp_canvas(animated_webp_bytes(), 4000, 4000)).is_ok());
+}
+
+/// A GIF with a `width` x `height` logical screen and `frames`
+/// one-pixel frames at its corner, so each frame decodes from one
+/// coded pixel and comes back composited onto the whole screen.
+fn small_frames_on_a_large_screen_gif(frames: usize, width: u16, height: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder =
+            gif::Encoder::new(&mut out, width, height, &[0, 0, 0, 255, 255, 255]).unwrap();
+        let mut frame = gif::Frame {
+            width: 1,
+            height: 1,
+            buffer: std::borrow::Cow::Owned(vec![0]),
+            ..gif::Frame::default()
+        };
+        frame.make_lzw_pre_encoded();
+        for _ in 0..frames {
+            encoder.write_lzw_pre_encoded_frame(&frame).unwrap();
+        }
+    }
+    out
+}
+
+#[test]
+fn a_gif_past_the_kept_bytes_budget_is_refused_before_any_frame_decodes() {
+    // Two one-pixel frames on a 6000x6000 screen: 72M decoded pixels,
+    // inside the 100M pixel budget, but each frame comes back at the
+    // screen's size, 288 MB kept in all, past the 256 MiB decode
+    // allocation budget. The descriptors say so, so the GIF is
+    // refused before its first frame decodes, with the collector's
+    // own message.
+    let bytes = small_frames_on_a_large_screen_gif(2, 6000, 6000);
+    let err = check_gif_frame_budget(&bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("byte decode allocation limit"),
+        "{err}"
+    );
+    let started = std::time::Instant::now();
+    let got = match decode_gif_frames(&bytes, None) {
+        Ok(frames) => panic!("decoded {} frames past the budget", frames.len()),
+        Err(e) => e,
+    };
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+    // One such frame keeps 144 MB, inside the budget.
+    assert!(check_gif_frame_budget(&small_frames_on_a_large_screen_gif(1, 6000, 6000)).is_ok());
+}
+
+#[test]
 fn a_within_budget_animated_webp_still_decodes_to_its_frames() {
     // The charge does not refuse an animation inside the budget:
     // the fixture (three 40x20 frames) decodes unchanged, and so

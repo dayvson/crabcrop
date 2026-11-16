@@ -2754,6 +2754,7 @@ fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let screen = u64::from(decoder.width()) * u64::from(decoder.height());
     let mut frames: usize = 0;
     let mut total_pixels: u64 = 0;
+    let mut kept_bytes: u64 = 0;
     while let Ok(Some(frame)) = decoder.next_frame_info() {
         frames += 1;
         if frames > MAX_ANIMATED_FRAMES {
@@ -2766,6 +2767,16 @@ fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
         if total_pixels > MAX_ANIMATED_PIXELS {
             return Err(EngineError::Decode(format!(
                 "GIF frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
+            )));
+        }
+        // Each frame comes back composited onto the screen, and the
+        // collector charges the bytes it keeps against
+        // MAX_DECODE_ALLOC, so the screen's bytes per frame are
+        // charged here too, before any frame decodes.
+        kept_bytes += screen * 4;
+        if kept_bytes > MAX_DECODE_ALLOC {
+            return Err(EngineError::Decode(format!(
+                "GIF frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
             )));
         }
     }
@@ -2814,6 +2825,16 @@ fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
     if total_pixels > MAX_ANIMATED_PIXELS {
         return Err(EngineError::Decode(format!(
             "WebP frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
+        )));
+    }
+    // The collector keeps every frame at the canvas's size and
+    // charges the bytes it keeps against MAX_DECODE_ALLOC, frame by
+    // frame. Charging that total here refuses, before any frame
+    // decodes, exactly the animations the collector would refuse
+    // partway through.
+    if total_pixels.saturating_mul(4) > MAX_DECODE_ALLOC {
+        return Err(EngineError::Decode(format!(
+            "WebP frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
         )));
     }
     Ok(())
