@@ -168,6 +168,12 @@ zune-core = "0.5"
 # the turbojpeg crate.
 turbojpeg = { version = "1.5", default-features = false, features = ["cmake"] }
 webp = "0.3"
+# Secret-holding types zero their bytes when they are dropped:
+# the secret settings, the bucket credentials, the signing
+# keyring, and the keys derived from them. Already in the
+# tree through rustls, c2pa and the RustCrypto crates: it adds
+# no crate. Default features only (`alloc`).
+zeroize = "1"
 # GIF writes go through the gif crate directly (already in the
 # tree transitively via image) so quantization can swap from
 # NeuQuant to quantizr (issue #294): at 800x533, quantizr with

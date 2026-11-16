@@ -108,8 +108,9 @@ pub struct AppState {
     /// The bearer token `/metrics` requires (issue #270),
     /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
     /// endpoint: it answers 403 rather than serving the
-    /// exposition unauthenticated.
-    pub metrics_token: Option<String>,
+    /// exposition unauthenticated. Zeroed when the state is
+    /// dropped.
+    pub metrics_token: Option<zeroize::Zeroizing<String>>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
     /// The provider and renderer handles (see

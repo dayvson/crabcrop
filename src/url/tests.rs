@@ -53,6 +53,23 @@ fn keyring_verifies_across_a_rotation_window() {
 }
 
 #[test]
+fn keyring_zeroes_its_keys() {
+    // What dropping a ring runs: both keys are wiped, and the
+    // key IDs, which URLs carry in the clear, are kept.
+    let mut ring = Keyring {
+        current_id: "k-new".to_string(),
+        current: b"new-secret-value".to_vec(),
+        previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+    };
+    zeroize::Zeroize::zeroize(&mut ring);
+    assert!(ring.current.is_empty());
+    let (previous_id, previous) = ring.previous.as_ref().unwrap();
+    assert!(previous.is_empty());
+    assert_eq!(previous_id, "k-old");
+    assert_eq!(ring.current_id, "k-new");
+}
+
+#[test]
 fn keyring_purge_verification_keeps_domain_separation() {
     let ring = Keyring {
         current_id: "k-new".to_string(),

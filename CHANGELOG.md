@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+
+- The types that hold secrets now zero their bytes when they are dropped, with the zeroize crate, already in the tree through rustls and the RustCrypto crates: the secret settings, the bucket credentials, the signing keyring, the stores' entry key, the `/metrics` token, the C2PA key file's bytes once boot has built its signer, and the keys derived from a secret for one purge, purge-group or upload check or one bucket request. `Debug` still prints each of them as `[redacted]`. The process environment keeps its own copy of each variable.
+
 ## [0.13.0] - 2026-11-15
 
 ### Added

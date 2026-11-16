@@ -410,7 +410,9 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // and a secret rotation invalidates the old entries
     // rather than serving content authenticated under a
     // retired key.
-    let entry_key = crate::url::entry_key(&config.keyring.current);
+    // Each store keeps its own copy, zeroed when it is
+    // dropped, and this one is zeroed when boot is done with it.
+    let entry_key = zeroize::Zeroizing::new(crate::url::entry_key(&config.keyring.current));
     // Disk result storage, bounded by its own budget.
     // Opening indexes whatever a previous run left behind.
     let disk = match &config.result_storage {
@@ -418,7 +420,7 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
             let store = crate::storage::DiskStore::open(
                 std::path::Path::new(&storage.dir),
                 storage.max_bytes,
-                entry_key.clone(),
+                entry_key.to_vec(),
             )
             .map_err(|e| ConfigError::build(Some("CRABCROP_RESULT_STORAGE_DIR"), e))?;
             let (entries, bytes) = store.stats();
@@ -441,7 +443,7 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
                 config.sources.s3_endpoint.clone(),
                 config.sources.s3_region.clone(),
                 config.sources.aws_creds.clone(),
-                entry_key,
+                entry_key.to_vec(),
             )
             .map_err(|e| {
                 ConfigError::build(
@@ -543,7 +545,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         metrics_token: config
             .metrics_token
             .as_ref()
-            .map(|token| token.expose().to_string()),
+            .map(|token| zeroize::Zeroizing::new(token.expose().to_string())),
         cache: Arc::new(Cache::new(config.cache_bytes)),
         providers: Arc::new(Providers {
             removebg: ai.removebg,

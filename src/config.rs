@@ -198,7 +198,8 @@ impl std::error::Error for ConfigError {
 }
 
 /// A secret setting's value. `Debug` prints `[redacted]`
-/// (issue #455).
+/// (issue #455), and its bytes are zeroed when it is
+/// dropped.
 #[derive(Clone)]
 pub struct Secret(String);
 
@@ -207,6 +208,20 @@ impl Secret {
         &self.0
     }
 }
+
+impl zeroize::Zeroize for Secret {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Secret {}
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

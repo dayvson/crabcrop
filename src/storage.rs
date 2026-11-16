@@ -445,7 +445,8 @@ pub struct DiskStore {
     /// secret (issue #190): entries are written and
     /// verified under it, so an entry planted in the
     /// directory by anyone without the secret is a miss.
-    entry_key: Vec<u8>,
+    /// Zeroed when the store is dropped.
+    entry_key: zeroize::Zeroizing<Vec<u8>>,
     inner: Mutex<Inner>,
     /// Write failures, counted and logged as they happen
     /// (issue #367): a cache stays best-effort, but a tier
@@ -699,7 +700,7 @@ impl DiskStore {
         let store = Self {
             dir: dir.to_path_buf(),
             max_bytes,
-            entry_key,
+            entry_key: zeroize::Zeroizing::new(entry_key),
             inner: Mutex::new(Inner::new()),
             errors: std::sync::atomic::AtomicU64::new(0),
             permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),

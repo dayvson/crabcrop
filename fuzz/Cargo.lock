@@ -1063,6 +1063,7 @@ dependencies = [
  "turbojpeg",
  "ureq",
  "webp",
+ "zeroize",
  "zune-core",
  "zune-jpeg",
 ]

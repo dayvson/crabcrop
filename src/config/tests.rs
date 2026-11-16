@@ -480,6 +480,14 @@ fn a_value_that_only_contains_a_placeholder_is_not_one() {
 }
 
 #[test]
+fn a_secret_setting_zeroes_its_value() {
+    // What dropping a secret setting runs.
+    let mut token = Secret("a-metrics-token-of-32-bytes-0123".to_string());
+    zeroize::Zeroize::zeroize(&mut token);
+    assert_eq!(token.expose(), "");
+}
+
+#[test]
 fn a_metrics_token_under_16_bytes_warns_without_quoting_it() {
     let warning = metrics_token_warning(&Secret("fifteen-bytes!!".to_string()))
         .expect("a warning for 15 bytes");
