@@ -17,7 +17,8 @@
 //! - `file://...`, local files under a configured root. A path
 //!   with a `..` segment is refused before the filesystem is
 //!   touched, and the rest are canonicalized per request so a
-//!   symlink cannot lead out of the root either.
+//!   symlink cannot lead out of the root either. Only a regular
+//!   file is read: the open cannot wait on a FIFO (issue #708).
 //!
 //! Bucket sources are gated by a bucket allowlist rather than the
 //! host policy: the endpoint is operator configuration, not
@@ -1526,14 +1527,24 @@ impl Loader {
         {
             return Err(LoadError::NotFound);
         }
-        let mut file = tokio::fs::File::open(&canonical)
+        // Opened the way the disk tier opens its entries (issue
+        // #708), on a blocking thread: a plain open of a FIFO
+        // waits in open(2) for a writer that may never come, so
+        // the open does not wait, and what it opened must be a
+        // regular file. Anything else at a path inside the root
+        // (a FIFO, a socket, a device, a directory) is the
+        // read failure a directory always answered.
+        let open = canonical.clone();
+        let (file, meta) = tokio::task::spawn_blocking(move || crate::storage::open_regular(&open))
             .await
+            .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))?
             .map_err(map_file_error)?;
+        let mut file = tokio::fs::File::from_std(file);
         if matches!(mode, BodyMode::Probe(_)) {
             // A probe of a file needs only its head; the
             // total is the file's own size. The size cap
             // keeps the full load's too-large answer.
-            let total = file.metadata().await.map_err(map_file_error)?.len();
+            let total = meta.len();
             if total > self.max_bytes {
                 return Err(LoadError::TooLarge {
                     limit: self.max_bytes,
@@ -1560,7 +1571,7 @@ impl Loader {
         // under the read charges the rest as it arrives.
         let mut part = match mode {
             BodyMode::Full(Some(charged)) => {
-                let total = file.metadata().await.map_err(map_file_error)?.len();
+                let total = meta.len();
                 if total > self.max_bytes {
                     return Err(LoadError::TooLarge {
                         limit: self.max_bytes,
@@ -3161,6 +3172,114 @@ mod tests {
         for url in ["file:///sub", "file:///sub/", "file:///"] {
             let err = loader.load(url).await.unwrap_err();
             assert!(matches!(err, LoadError::Network(_)), "{url}: {err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Make a FIFO at `path`.
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {}: {status}", path.display());
+    }
+
+    /// Await `load`, failing the test if it has not answered
+    /// within 3 seconds, before the test loader's 5 second
+    /// timeout (issue #708). A load stuck opening the FIFO at
+    /// `fifo` for reading waits for a writer, and its blocking
+    /// thread stays stuck past any timeout, so one is then let
+    /// in, until the load ends, and the test fails naming the
+    /// wait instead of hanging, the runtime's drop included.
+    #[cfg(unix)]
+    async fn answers_promptly<T>(fifo: &std::path::Path, load: impl Future<Output = T>) -> T {
+        let mut load = std::pin::pin!(load);
+        if let Ok(answer) = tokio::time::timeout(Duration::from_secs(3), &mut load).await {
+            return answer;
+        }
+        let fifo = fifo.to_path_buf();
+        let release = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                // With a reader waiting in open(2), this opens and
+                // lets it go; closing it is the end of file the
+                // reader then sees. With none it fails at once.
+                use rustix::fs::{Mode, OFlags};
+                drop(rustix::fs::open(
+                    &fifo,
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let _ = load.await;
+        let _ = release.join();
+        panic!("a file source load waited for a writer on a FIFO");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_under_the_root_answers_at_once_as_a_file_that_cannot_be_read() {
+        // Issue #708: a file source was opened with a plain open,
+        // which waits in open(2) until a FIFO has a writer, so a
+        // FIFO under the root held its request, and a thread of
+        // the blocking pool, until one came. The open does not
+        // wait now, and what it opened must be a regular file:
+        // anything else answers at once with the read failure a
+        // directory under the root gets, through a symlink inside
+        // the root too.
+        let (base, root) = make_file_tree();
+        make_fifo(&root.join("pipe.jpg"));
+        std::os::unix::fs::symlink(root.join("pipe.jpg"), root.join("piped.jpg")).unwrap();
+        let fifo = root.join("pipe.jpg");
+        let loader = file_loader(&root, 1024);
+        for url in ["file:///pipe.jpg", "file:///piped.jpg"] {
+            let full = answers_promptly(&fifo, loader.load(url)).await;
+            assert!(
+                matches!(full, Err(LoadError::Network(_))),
+                "{url}: {full:?}"
+            );
+            let probe = answers_promptly(
+                &fifo,
+                loader.load_probe(url, MediaAdmission::default(), &|_: &[u8]| true),
+            )
+            .await;
+            assert!(
+                matches!(probe, Err(LoadError::Network(_))),
+                "probe {url}: {probe:?}"
+            );
+        }
+        let dir = loader.load("file:///sub").await;
+        assert!(matches!(dir, Err(LoadError::Network(_))), "{dir:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_that_resolves_inside_the_root_still_loads() {
+        // Issue #708: the open refuses to follow a symlink, but it
+        // opens the canonical path, which names none, so a link
+        // that resolves inside the root still reads its target,
+        // whether it names the file or a directory on the way.
+        let (base, root) = make_file_tree();
+        std::os::unix::fs::symlink(root.join("pic.jpg"), root.join("alias.jpg")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("subdir")).unwrap();
+        std::os::unix::fs::symlink("pic.jpg", root.join("relative.jpg")).unwrap();
+        let loader = file_loader(&root, 1024);
+        for (url, body) in [
+            ("file:///alias.jpg", &b"rootpic"[..]),
+            ("file:///relative.jpg", b"rootpic"),
+            ("file:///subdir/inner.jpg", b"inner"),
+        ] {
+            assert_eq!(loader.load(url).await.unwrap(), body, "{url}");
+            let probe = loader
+                .load_probe(url, MediaAdmission::default(), &|_: &[u8]| true)
+                .await
+                .unwrap();
+            assert_eq!(probe.head, body, "probe {url}");
+            assert_eq!(probe.total_bytes, Some(body.len() as u64), "probe {url}");
         }
         let _ = std::fs::remove_dir_all(&base);
     }

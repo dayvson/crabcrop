@@ -244,6 +244,36 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     crate::server::start_purge_tombstones(&state).await;
     let background = state.background.clone();
     let disk = state.store.clone();
+    // The disk tier's boot scan has had this long, the binding
+    // and the steps above included (issue #708). One that has
+    // ended serves its entries from the first request; one
+    // that has not goes on in the background, and its watch
+    // logs it from the listening line on.
+    let scanning = match (&disk, &config.result_storage) {
+        (Some(store), Some(storage)) => {
+            let store = store.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                store.wait_scan(store.boot_deadline(), crate::storage::ScanPhase::ended)
+            })
+            .await?;
+            match &report.phase {
+                crate::storage::ScanPhase::Done => {
+                    println!("{}", disk_scan_done(&storage.dir, storage.max_mb, &report));
+                    None
+                }
+                crate::storage::ScanPhase::Failed(e) => {
+                    eprintln!("{}", disk_scan_failed(&storage.dir, e));
+                    None
+                }
+                crate::storage::ScanPhase::Stopped => None,
+                _ => {
+                    eprintln!("warning: {}", disk_scan_running(&storage.dir, &report));
+                    Some((storage.dir.clone(), storage.max_mb))
+                }
+            }
+        }
+        _ => None,
+    };
     // From the listening line on, every line on standard
     // output goes through the request log (issue #642), so
     // the shutdown's lines come after the request lines
@@ -251,6 +281,9 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let log = state.request_log.clone();
     let signalled = shutdown_signal();
     println!("crabcrop listening on port {port}");
+    if let (Some(store), Some((dir, max_mb))) = (&disk, scanning) {
+        watch_disk_scan(store.clone(), log.clone(), dir, max_mb);
+    }
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
     // listener closes, idle connections close, and requests
     // in flight finish; then the background work they and
@@ -288,6 +321,13 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         "shutdown: draining requests and background work for up to {}s",
         shutdown_grace.as_secs()
     ));
+    // A boot scan still running stops at its next file (issue
+    // #708): the next boot scans the directory again.
+    if let Some(purges) = disk.as_ref().and_then(|disk| disk.stop_scan()) {
+        for line in disk_scan_stopped(purges) {
+            eprintln!("{line}");
+        }
+    }
     let drain = async {
         if tokio::time::timeout_at(deadline, serve).await.is_err() {
             eprintln!("shutdown: requests still in flight at the deadline are cut off");
@@ -403,6 +443,9 @@ struct Stores {
 /// the listener, as boot always has, and before
 /// [`build_state`] loads any model: a store that does not
 /// open is a cheap failure, reported ahead of a taken port.
+/// The disk tier's boot scan goes on in the background (issue
+/// #708); `run` waits for it before it serves, up to the
+/// store's boot deadline.
 fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // The entry MAC key for the persistent tiers (issue
     // #190): derived from the current signing secret, so
@@ -412,21 +455,40 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // retired key.
     let entry_key = crate::url::entry_key(&config.keyring.current);
     // Disk result storage, bounded by its own budget.
-    // Opening indexes whatever a previous run left behind.
     let disk = match &config.result_storage {
+        // A budget of 0 is no disk tier (issue #708): the
+        // directory is not created, probed or read.
+        Some(storage) if storage.max_bytes == 0 => {
+            println!("{}", disk_tier_off(&storage.dir));
+            None
+        }
         Some(storage) => {
-            let store = crate::storage::DiskStore::open(
+            // The store checks its directory and indexes what
+            // a previous run left behind on a thread of its own
+            // (issue #708). The check is waited for here, before
+            // the listener binds, so a directory that cannot be
+            // written is a cheap failure, as it always was; one
+            // that does not answer holds the boot for
+            // `BOOT_SCAN_WAIT` at most.
+            let store = crate::storage::DiskStore::start(
                 std::path::Path::new(&storage.dir),
                 storage.max_bytes,
                 entry_key.clone(),
-            )
-            .map_err(|e| ConfigError::build(Some("CRABCROP_RESULT_STORAGE_DIR"), e))?;
-            let (entries, bytes) = store.stats();
-            println!(
-                "result storage at {}: {entries} entries, {bytes} bytes, budget {} MB",
-                storage.dir, storage.max_mb
             );
-            Some(Arc::new(store))
+            let checked = store.wait_scan(store.boot_deadline(), |phase| {
+                *phase != crate::storage::ScanPhase::Checking
+            });
+            if let crate::storage::ScanPhase::Failed(e) = &checked.phase {
+                return Err(ConfigError::build(
+                    Some("CRABCROP_RESULT_STORAGE_DIR"),
+                    e.clone(),
+                ));
+            }
+            println!(
+                "{}",
+                disk_scan_started(&storage.dir, storage.max_mb, &checked.phase)
+            );
+            Some(store)
         }
         None => None,
     };
@@ -458,6 +520,115 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
         None => None,
     };
     Ok(Stores { disk, shared })
+}
+
+/// How often a boot scan that outlasts the boot logs that it
+/// is still running (issue #708).
+const SCAN_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The boot line for a disk tier with a budget of 0 (issue
+/// #708).
+fn disk_tier_off(dir: &str) -> String {
+    format!("result storage: off, CRABCROP_RESULT_STORAGE_MAX_MB is 0, so {dir} is not used")
+}
+
+/// The boot line for a disk tier once its directory answered,
+/// or the boot stopped waiting for it: its budget, and what its
+/// boot scan does (issue #708).
+fn disk_scan_started(dir: &str, max_mb: usize, phase: &crate::storage::ScanPhase) -> String {
+    let doing = match phase {
+        crate::storage::ScanPhase::Checking => "waiting for the directory to answer",
+        _ => "scanning the entries a previous run left",
+    };
+    format!("result storage at {dir}: budget {max_mb} MB, {doing}")
+}
+
+/// The line for a boot scan that ended: what it indexed, and
+/// how long it took to read how many files (issue #708).
+fn disk_scan_done(dir: &str, max_mb: usize, report: &crate::storage::ScanReport) -> String {
+    format!(
+        "result storage at {dir}: {} entries, {} bytes, budget {max_mb} MB; the boot scan read {} files in {:.1}s and skipped {}",
+        report.entries,
+        report.bytes,
+        report.files,
+        report.elapsed.as_secs_f64(),
+        report.skipped()
+    )
+}
+
+/// The line for a directory check that failed once the boot
+/// had gone on without it (issue #708).
+fn disk_scan_failed(dir: &str, error: &str) -> String {
+    format!("result storage at {dir}: {error}; the disk tier stays off until a restart")
+}
+
+/// The line for a boot scan still running (issue #708), at the
+/// boot's deadline and every [`SCAN_PROGRESS_EVERY`] after.
+fn disk_scan_running(dir: &str, report: &crate::storage::ScanReport) -> String {
+    let secs = report.elapsed.as_secs();
+    match report.phase {
+        crate::storage::ScanPhase::Checking => format!(
+            "result storage at {dir}: the directory has not answered after {secs}s; until it does, the disk tier serves and stores nothing"
+        ),
+        _ => format!(
+            "result storage at {dir}: the boot scan is still running after {secs}s, {} files read; until it ends, an entry it has not indexed is a miss",
+            report.files
+        ),
+    }
+}
+
+/// The shutdown's lines for a boot scan it stopped, which held
+/// `purges` purges sent while it ran (issue #708).
+fn disk_scan_stopped(purges: usize) -> Vec<String> {
+    let mut lines = vec![
+        "shutdown: the disk tier's boot scan had not ended and stops; the next boot scans the directory again".to_string(),
+    ];
+    if purges > 0 {
+        lines.push(format!(
+            "shutdown: {purges} purges sent while the boot scan ran have not reached the disk entries it had not indexed; with a shared tier their tombstones stay in force, and without one, send them again after the restart"
+        ));
+    }
+    lines
+}
+
+/// Log a boot scan that outlasted the boot (issue #708): every
+/// [`SCAN_PROGRESS_EVERY`] that it still runs, on stderr, and
+/// what it indexed, through the request log, once it ends. A
+/// thread of its own waits for it, so a scan stuck in the kernel
+/// keeps no runtime worker.
+fn watch_disk_scan(
+    store: Arc<crate::storage::DiskStore>,
+    log: RequestLog,
+    dir: String,
+    max_mb: usize,
+) {
+    let watch = move || {
+        loop {
+            let report = store.wait_scan(
+                std::time::Instant::now() + SCAN_PROGRESS_EVERY,
+                crate::storage::ScanPhase::ended,
+            );
+            match &report.phase {
+                crate::storage::ScanPhase::Done => {
+                    log.line(&disk_scan_done(&dir, max_mb, &report));
+                    return;
+                }
+                crate::storage::ScanPhase::Failed(e) => {
+                    eprintln!("{}", disk_scan_failed(&dir, e));
+                    return;
+                }
+                // The shutdown logs it.
+                crate::storage::ScanPhase::Stopped => return,
+                _ => eprintln!("{}", disk_scan_running(&dir, &report)),
+            }
+        }
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("crabcrop-scan-watch".to_string())
+        .spawn(watch)
+    {
+        eprintln!("result storage: cannot watch the boot scan: {e}");
+    }
 }
 
 /// Build the server state from a validated configuration

@@ -373,6 +373,67 @@ fn boot_output(env: &[(&str, &str)]) -> (Vec<String>, String) {
 }
 
 #[test]
+fn a_disk_budget_of_zero_boots_without_the_tier_whatever_the_directory() {
+    // Issue #708: docs/configuration.md said a budget of 0
+    // disables storage even with a directory set, but boot
+    // created and probed the directory anyway, so an
+    // unwritable one stopped the boot. With a budget of 0 there
+    // is no disk tier: the boot says so, serves, and leaves the
+    // directory alone. /proc is not writable even for root.
+    let workdir = common::scratch_dir("boot-disk-off");
+    let missing = workdir.join("never-made");
+    for dir in [std::path::Path::new("/proc/self"), missing.as_path()] {
+        let dir = dir.display().to_string();
+        let (printed, stderr) = boot_output(&[
+            ("CRABCROP_RESULT_STORAGE_DIR", dir.as_str()),
+            ("CRABCROP_RESULT_STORAGE_MAX_MB", "0"),
+        ]);
+        assert!(
+            printed.contains(&format!(
+                "result storage: off, CRABCROP_RESULT_STORAGE_MAX_MB is 0, so {dir} is not used"
+            )),
+            "{printed:?}"
+        );
+        assert!(
+            !printed
+                .iter()
+                .any(|line| line.starts_with("result storage at")),
+            "{printed:?}"
+        );
+        assert!(!stderr.contains("result storage"), "{stderr}");
+    }
+    assert!(!missing.exists());
+    // With a budget, the unwritable directory still stops the
+    // boot.
+    let stderr = refused_boot(&[("CRABCROP_RESULT_STORAGE_DIR", "/proc/self")]);
+    assert!(
+        stderr.contains("the result storage directory /proc/self is not writable"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_disk_tier_boot_prints_its_scan_and_what_it_indexed() {
+    // Issue #708: the boot scan runs on a thread of its own;
+    // the boot says when it starts and, on a healthy disk,
+    // what it indexed before the server listens.
+    let workdir = common::scratch_dir("boot-disk-scan");
+    let dir = workdir.join("cache").display().to_string();
+    let (printed, _) = boot_output(&[("CRABCROP_RESULT_STORAGE_DIR", dir.as_str())]);
+    let started =
+        format!("result storage at {dir}: budget 512 MB, scanning the entries a previous run left");
+    let done = printed
+        .iter()
+        .position(|line| line.starts_with(&format!("result storage at {dir}: 0 entries, 0 bytes, budget 512 MB; the boot scan read 0 files in ")))
+        .unwrap_or_else(|| panic!("no scan line: {printed:?}"));
+    let begun = printed
+        .iter()
+        .position(|line| *line == started)
+        .unwrap_or_else(|| panic!("no start line: {printed:?}"));
+    assert!(begun < done, "{printed:?}");
+}
+
+#[test]
 fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
     // Issue #590: boot named no part of the request and
     // source posture. One line now names the request mode,

@@ -83,7 +83,7 @@ Operational failures carry these codes:
 | `source_forbidden` | `403` | The source policy refused the source URL from what the URL itself says: a host not in `CRABCROP_ALLOWED_SOURCES`, an IP address in a non-public range, credentials in the URL, or a bucket or file source the configuration does not allow. Never from what a host name resolves to (see `source_fetch_failed`). |
 | `source_not_found` | `404` | The source does not exist. |
 | `source_bad_status` | `502` | The origin answered a non-2xx status other than 404. |
-| `source_fetch_failed` | `502` | The source fetch failed (a DNS, connect, TLS, or stream error). Under `CRABCROP_BLOCK_PRIVATE_SOURCES`, a host name that resolves to a non-public address answers this too, exactly as a name that does not resolve, so the answer does not reveal which names resolve inside the server's network; the server log names the cause. |
+| `source_fetch_failed` | `502` | The source fetch failed (a DNS, connect, TLS, or stream error), or a `file://` path inside the root names something the server cannot read as a file: a directory, a FIFO, a socket, a device, or a file it may not read. Under `CRABCROP_BLOCK_PRIVATE_SOURCES`, a host name that resolves to a non-public address answers this too, exactly as a name that does not resolve, so the answer does not reveal which names resolve inside the server's network; the server log names the cause. |
 | `source_not_an_image` | `502` | The origin answered with a non-image `Content-Type`. |
 | `source_too_large` | `502` | The source is larger than the fetch limit. |
 | `source_timeout` | `504` | The source fetch timed out. |

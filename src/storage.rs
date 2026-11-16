@@ -14,9 +14,9 @@
 //! fails to parse is a miss, is deleted, and is overwritten
 //! by the next store. The byte budget evicts least recently
 //! used entries, with recency tracked in memory and re-seeded
-//! from file times at open. Each entry is charged its file
-//! and the record the in-memory index keeps for it, so the
-//! budget bounds the index's memory as well as the files.
+//! from file times by the boot scan. Each entry is charged its
+//! file and the record the in-memory index keeps for it, so
+//! the budget bounds the index's memory as well as the files.
 //!
 //! The index is the authority on an entry's cache groups
 //! (issue #572). A group learned on a hit goes into the index
@@ -25,12 +25,21 @@
 //! once and the drain deletes their files. Only one writer or
 //! deleter works on an entry file at a time: it holds the
 //! key's claim.
+//!
+//! The server opens the store with [`DiskStore::start`] (issue
+//! #708): the directory check and the boot scan, which reads
+//! and verifies every entry file, run on a thread of their
+//! own, so a slow or hung disk does not keep the server from
+//! listening. Until the scan ends, an entry it has not indexed
+//! is a miss, writes land and evict as always, and the purges
+//! sent meanwhile are applied to the files it indexes (see
+//! [`ScanState`]).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -64,6 +73,9 @@ struct Record {
     /// them was skipped (issue #463): the next disk or shared
     /// hit writes them back.
     owes_shared: bool,
+    /// When the entry was last used: its key's place in
+    /// [`Inner::order`] (issue #708).
+    stamp: u64,
 }
 
 /// Who works on a key's entry file right now (issue #572).
@@ -335,9 +347,21 @@ const STEM_LEN: usize = 64;
 /// What an index record costs besides its strings: its slot in
 /// each of the two maps, doubled for the spare slots a hash map
 /// keeps as it grows, and the allocations behind its two key
-/// copies and its file stem.
-const RECORD_OVERHEAD: usize =
-    2 * (size_of::<(String, Record)>() + size_of::<(String, u64)>()) + 3 * ALLOCATION_OVERHEAD;
+/// copies and its file stem. The two are counted as they were
+/// when the recency order was a second hash map (issue #708): a
+/// key with its record, and a key with a stamp. The stamp a
+/// record now carries is not added, so an entry is charged what
+/// it always was and a budget holds the entries it held.
+const RECORD_OVERHEAD: usize = 2
+    * (size_of::<(String, Record)>() - size_of::<u64>() + size_of::<(String, u64)>())
+    + 3 * ALLOCATION_OVERHEAD;
+
+/// Where the clock of last use starts (issue #708). The boot
+/// scan stamps the entries it indexes below it, from 1 up in
+/// the order of their files' times, so every entry it indexes
+/// is older than every entry used since the store opened, a
+/// write that landed while it ran included.
+const SCAN_STAMPS: u64 = 1 << 62;
 
 /// What one entry is charged against the store's budget: its
 /// file of `file_bytes`, plus the record the index keeps for
@@ -370,11 +394,13 @@ struct Inner {
     next_seq: u64,
     /// Drain tasks running.
     workers: usize,
-    /// Last-access stamp per key (monotonic clock). Eviction
-    /// removes the smallest stamp, the least recently used
-    /// entry: the same order the VecDeque kept, at O(1) per
-    /// access instead of a linear scan per hit.
-    stamps: HashMap<String, u64>,
+    /// The indexed keys in the order they were last used: each
+    /// under its record's stamp, a reading of `clock`, so no
+    /// two are equal. Eviction takes the smallest stamp, the
+    /// least recently used entry, from the front (issue #708).
+    /// While the stamps sat in a hash map, every eviction read
+    /// every entry's stamp to find it, under the index lock.
+    order: BTreeMap<u64, String>,
     clock: u64,
     /// The sum of the indexed entries' charges.
     total_bytes: usize,
@@ -382,6 +408,72 @@ struct Inner {
     /// number of its range: the range's end and the wait's
     /// count. Purge ranges never overlap.
     deletion_waits: BTreeMap<u64, Vec<(u64, Arc<DeletionCount>)>>,
+    /// The boot scan's state from the store's start until the
+    /// scan has indexed what it found, or has stopped (issue
+    /// #708).
+    scan: Option<ScanState>,
+    /// The directory failed its check after the boot went on
+    /// without it (issue #708): nothing is written to it.
+    unusable: bool,
+}
+
+/// What the boot scan needs to know of the work done while it
+/// runs (issue #708). The scan reads every entry file first,
+/// without touching the index, and then indexes what it found
+/// in one step under the index lock. Requests are served
+/// meanwhile, so by then a file it read may be stale: a write
+/// may have replaced it, a purge may cover it. These are what
+/// it checks.
+#[derive(Debug, Default)]
+struct ScanState {
+    /// The directory has been created, probed and opened.
+    /// Until then nothing is written.
+    checked: bool,
+    /// The targets purged since the store started, each once,
+    /// with what the tombstones of each purge of it wait for.
+    /// The scan deletes the files it read that one covers
+    /// instead of indexing them: they were written before the
+    /// store started, so before the purge.
+    purges: Vec<(PurgeTarget, Vec<Arc<ScanPurge>>)>,
+    /// The file stems of the keys a write was begun for. The
+    /// copy a write lands replaces the file the scan may have
+    /// read, and the copy it serves goes into memory with
+    /// groups the scanned file lacks, so the scan indexes no
+    /// such file: it deletes it, unless the write's copy is
+    /// indexed.
+    written: HashSet<String>,
+    /// The stems of the files the scan is deleting by name,
+    /// not knowing their key: files that do not parse, or name
+    /// another key's entry. A write of a key with such a stem
+    /// waits for none and writes nothing, so the deletion never
+    /// removes a file it renamed into place.
+    unlinking: HashSet<String>,
+}
+
+/// A purge sent while the boot scan runs (issue #708): the
+/// deletions of the files the scan found under it, which the
+/// purge's bucket tombstones wait for, as they wait for the
+/// deletions the purge queued itself (see
+/// [`DeletionWait::pending`]). A restart before the files are
+/// gone indexes them again, and the tombstone, still unended,
+/// keeps them misses.
+#[derive(Debug, Default)]
+struct ScanPurge {
+    /// Set once the scan has applied the purge: the sequence
+    /// numbers of the deletions it queued for it. Never set
+    /// when the scan stops or fails first, so the tombstones
+    /// stay in force.
+    applied: OnceLock<Vec<u64>>,
+}
+
+impl ScanPurge {
+    /// Whether the scan has yet to apply the purge, or a
+    /// deletion it queued for it is still queued.
+    fn pending(&self, deletions: &KeyQueue) -> bool {
+        self.applied
+            .get()
+            .is_none_or(|seqs| seqs.iter().any(|seq| deletions.by_seq.contains_key(seq)))
+    }
 }
 
 /// One wait on a purge's deletions (issue #572): how many of
@@ -401,6 +493,8 @@ impl Inner {
                 track_ended: true,
                 ..KeyQueue::default()
             },
+            clock: SCAN_STAMPS,
+            scan: Some(ScanState::default()),
             ..Inner::default()
         }
     }
@@ -473,15 +567,96 @@ pub struct DiskStore {
     /// failed: a disk that refuses them fails each one again
     /// at every retry.
     job_log: StallLog,
+    /// How far the directory check and the boot scan have come
+    /// (issue #708).
+    boot: BootScan,
     /// Test-only: run at every entry read (after the bytes are
     /// in, as a read stuck in the kernel has its file open),
-    /// write and delete, on the blocking thread, with the
-    /// file's path, so a test can hold or fail the
-    /// operation the way a stuck or failing disk would. The
-    /// store refuses FIFOs (issue #545), so a test cannot
-    /// hold a read on one.
+    /// write and delete, the boot scan's and the directory
+    /// probe's included, with the file's path, so a test can
+    /// hold or fail the operation the way a stuck or failing
+    /// disk would. The store refuses FIFOs (issue #545), so a
+    /// test cannot hold a read on one.
     #[cfg(test)]
     hold: Mutex<Option<TestHold>>,
+}
+
+/// How long the boot waits for the directory check and the boot
+/// scan, from the store's start, before the server goes on
+/// without them (issue #708). A scan that ends in time leaves
+/// every entry indexed before the server listens, as boot
+/// always did. One that does not goes on in the background.
+pub const BOOT_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The name of the thread the boot scan runs on.
+pub(crate) const SCAN_THREAD: &str = "crabcrop-disk-scan";
+
+/// Where the boot scan is (issue #708).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanPhase {
+    /// Creating, probing and opening the directory. Nothing is
+    /// read or written yet.
+    Checking,
+    /// Reading the entry files. Writes land meanwhile.
+    Scanning,
+    /// What the scan found is indexed.
+    Done,
+    /// A shutdown stopped the scan before it indexed anything.
+    Stopped,
+    /// The directory check failed, after the boot went on
+    /// without it: the tier stays empty and writes nothing.
+    Failed(String),
+}
+
+/// How far the boot scan has come (issue #708).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    pub phase: ScanPhase,
+    /// How long the scan has run, or ran.
+    pub elapsed: std::time::Duration,
+    /// The entry files it has looked at.
+    pub files: u64,
+    /// The entries it indexed, once done.
+    pub entries: usize,
+    /// What those entries are charged against the budget.
+    pub bytes: usize,
+}
+
+impl ScanPhase {
+    /// Whether the scan is over, however it ended.
+    pub fn ended(&self) -> bool {
+        matches!(
+            self,
+            ScanPhase::Done | ScanPhase::Stopped | ScanPhase::Failed(_)
+        )
+    }
+}
+
+impl ScanReport {
+    /// Whether the scan is over, however it ended.
+    pub fn ended(&self) -> bool {
+        self.phase.ended()
+    }
+
+    /// The entry files it looked at and did not index.
+    pub fn skipped(&self) -> u64 {
+        self.files.saturating_sub(self.entries as u64)
+    }
+}
+
+/// The boot scan's progress, as the boot's wait and the log
+/// lines read it (issue #708).
+#[derive(Debug)]
+struct BootScan {
+    started: std::time::Instant,
+    /// The entry files looked at so far.
+    files: AtomicU64,
+    /// The phase, with what an ended scan indexed and how long
+    /// it took.
+    state: Mutex<(ScanPhase, usize, usize, Option<std::time::Duration>)>,
+    changed: Condvar,
+    /// Set by a shutdown: the scan stops at the next file.
+    stop: AtomicBool,
 }
 
 /// A test hook for [`DiskStore`]'s file operations.
@@ -491,9 +666,11 @@ pub(crate) type TestHold = Arc<dyn Fn(OpKind, &Path) -> std::io::Result<()> + Se
 /// The file operations a test can hold (issue #572).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpKind {
-    /// An entry read: a lookup or a drain rewrite.
+    /// An entry read: a lookup, a drain rewrite or the boot
+    /// scan's.
     Read,
-    /// An entry write and its rename into place.
+    /// An entry write and its rename into place, or the boot's
+    /// directory probe.
     Write,
     /// An entry file's deletion.
     Unlink,
@@ -579,8 +756,8 @@ pub(crate) const MAX_ENTRY_BYTES: usize = 512 * 1024 * 1024;
 /// file, or a path that is not a regular file; all read as
 /// a corrupt entry upstream.
 fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
-    let (file, len) = open_regular(path)?;
-    read_open_capped(file, len, cap)
+    let (file, meta) = open_regular(path).ok()?;
+    read_open_capped(file, meta.len(), cap)
 }
 
 /// [`read_capped`]'s read of the open `file`, which was `len`
@@ -622,36 +799,65 @@ fn read_open_capped(mut file: std::fs::File, len: u64, cap: usize) -> Option<Vec
 /// does not follow a symlink either: the check would then
 /// see the target, and the boot scan skips symlinks.
 ///
-/// Returns the file with the length that check read.
+/// `file://` sources open their canonical path through this
+/// too (issue #708): that path names no symlink, so refusing
+/// one refuses only a link swapped in after the path was
+/// resolved.
+///
+/// Returns the file with the metadata that check read. An
+/// error is the open's own, `NotFound` for a path with nothing
+/// at it, or one of kind `InvalidInput` for a path that is not
+/// a regular file.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> Option<(std::fs::File, u64)> {
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .ok()?;
+    )?;
     let file = std::fs::File::from(fd);
-    let meta = file.metadata().ok()?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
-        return None;
+        return Err(not_regular());
     }
-    let flags = rustix::fs::fcntl_getfl(&file).ok()?;
-    rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK).ok()?;
-    Some((file, meta.len()))
+    let flags = rustix::fs::fcntl_getfl(&file)?;
+    rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK)?;
+    Ok((file, meta))
 }
 
 /// Elsewhere there are no FIFOs whose open waits; the type
 /// check still keeps reads to regular files.
 #[cfg(not(unix))]
-fn open_regular(path: &Path) -> Option<(std::fs::File, u64)> {
-    let file = std::fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
-        return None;
+        return Err(not_regular());
     }
-    Some((file, meta.len()))
+    Ok((file, meta))
+}
+
+/// What [`open_regular`] answers for a path that is not a
+/// regular file.
+fn not_regular() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
+}
+
+/// What the boot scan read at an entry path (issue #708).
+enum ScanRead {
+    /// An entry that verifies under the store's key.
+    Entry {
+        key: String,
+        groups: Vec<String>,
+        written: Option<WriteStamp>,
+        file_bytes: usize,
+        mtime: std::time::SystemTime,
+    },
+    /// Nothing is there any more: a deletion got there first.
+    Gone,
+    /// Something this store cannot trust: deleted on sight.
+    Bad,
 }
 
 /// The temp file a `put` writes before renaming into place.
@@ -666,6 +872,9 @@ fn tmp_name(stem: &str) -> String {
     format!("{stem}.tmp-{}-{n}", std::process::id())
 }
 
+/// The scratch file [`probe_writable`] writes.
+const PROBE_NAME: &str = ".crabcrop-write-probe";
+
 /// One boot-time writability probe (issue #367): write a
 /// scratch file into `dir` and remove it, so a directory
 /// the process cannot write to (a read-only mount, an
@@ -675,7 +884,7 @@ fn tmp_name(stem: &str) -> String {
 /// every put. The scratch name never matches the entry
 /// scan's stem pattern and is removed on success anyway.
 fn probe_writable(dir: &Path) -> Result<(), String> {
-    let probe = dir.join(".crabcrop-write-probe");
+    let probe = dir.join(PROBE_NAME);
     std::fs::write(&probe, b"").map_err(|e| {
         format!(
             "the result storage directory {} is not writable: {e}",
@@ -688,15 +897,39 @@ fn probe_writable(dir: &Path) -> Result<(), String> {
 
 impl DiskStore {
     /// Open (creating if needed) the store rooted at `dir`,
-    /// indexing whatever entries a previous run left behind.
-    /// `entry_key` is the cache entry MAC key (see
-    /// [`crate::url::entry_key`]): files that fail
-    /// verification under it are deleted on sight at scan.
+    /// indexing whatever entries a previous run left behind
+    /// before it returns. `entry_key` is the cache entry MAC
+    /// key (see [`crate::url::entry_key`]): files that fail
+    /// verification under it are deleted on sight at scan. The
+    /// server starts its store with [`DiskStore::start`]
+    /// instead, which does this on a thread of its own.
     pub fn open(dir: &Path, max_bytes: usize, entry_key: Vec<u8>) -> Result<Self, String> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot create the result storage directory: {e}"))?;
-        probe_writable(dir)?;
-        let store = Self {
+        let store = Self::unscanned(dir, max_bytes, entry_key);
+        let read = store.check_dir()?;
+        store.scan(read);
+        Ok(store)
+    }
+
+    /// Start the store rooted at `dir` (issue #708): it is
+    /// returned at once, and a thread of its own creates,
+    /// probes and opens the directory, then scans it as
+    /// [`DiskStore::open`] does. Until the directory has
+    /// answered nothing is written, and until the scan ends an
+    /// entry it has not indexed is a miss. The boot waits for
+    /// both with [`DiskStore::wait_scan`] up to
+    /// [`DiskStore::boot_deadline`], so a slow or hung disk
+    /// holds it for [`BOOT_SCAN_WAIT`] at most.
+    pub fn start(dir: &Path, max_bytes: usize, entry_key: Vec<u8>) -> Arc<Self> {
+        let store = Arc::new(Self::unscanned(dir, max_bytes, entry_key));
+        store.begin_scan();
+        store
+    }
+
+    /// A store over `dir` that has not touched it: it writes
+    /// nothing until a scan, inline or begun with
+    /// [`DiskStore::begin_scan`], has checked the directory.
+    pub(crate) fn unscanned(dir: &Path, max_bytes: usize, entry_key: Vec<u8>) -> Self {
+        Self {
             dir: dir.to_path_buf(),
             max_bytes,
             entry_key,
@@ -708,11 +941,160 @@ impl DiskStore {
             last_job_done_ms: AtomicU64::new(0),
             stall_log: StallLog::new("disk waits ran out"),
             job_log: StallLog::new("background disk jobs failed"),
+            boot: BootScan {
+                started: std::time::Instant::now(),
+                files: AtomicU64::new(0),
+                state: Mutex::new((ScanPhase::Checking, 0, 0, None)),
+                changed: Condvar::new(),
+                stop: AtomicBool::new(false),
+            },
             #[cfg(test)]
             hold: Mutex::new(None),
-        };
-        store.scan()?;
-        Ok(store)
+        }
+    }
+
+    /// Check the directory and scan it on a thread of its own
+    /// (see [`DiskStore::start`]). The thread enters the
+    /// runtime this is called on, if any, so the deletions the
+    /// scan queues start at once.
+    pub(crate) fn begin_scan(self: &Arc<Self>) {
+        let store = self.clone();
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let spawned = std::thread::Builder::new()
+            .name(SCAN_THREAD.to_string())
+            .spawn(move || {
+                let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                match store.check_dir() {
+                    Ok(read) => {
+                        store.scan(read);
+                        store.kick();
+                    }
+                    Err(e) => store.end_scan(ScanPhase::Failed(e)),
+                }
+            });
+        if let Err(e) = spawned {
+            self.end_scan(ScanPhase::Failed(format!(
+                "cannot start the result storage scan: {e}"
+            )));
+        }
+    }
+
+    /// Create, probe and open the directory, with the messages
+    /// a boot that fails on them gives. Once it answers, writes
+    /// may land.
+    fn check_dir(&self) -> Result<std::fs::ReadDir, String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("cannot create the result storage directory: {e}"))?;
+        self.held(OpKind::Write, &self.dir.join(PROBE_NAME))
+            .map_err(|e| {
+                format!(
+                    "the result storage directory {} is not writable: {e}",
+                    self.dir.display()
+                )
+            })?;
+        probe_writable(&self.dir)?;
+        let read = std::fs::read_dir(&self.dir)
+            .map_err(|e| format!("cannot read the result storage directory: {e}"))?;
+        if let Some(scan) = self.inner.lock().unwrap().scan.as_mut() {
+            scan.checked = true;
+        }
+        self.set_phase(ScanPhase::Scanning);
+        Ok(read)
+    }
+
+    /// When the boot stops waiting for the directory check and
+    /// the scan (issue #708).
+    pub fn boot_deadline(&self) -> std::time::Instant {
+        self.boot.started + BOOT_SCAN_WAIT
+    }
+
+    /// How far the boot scan has come.
+    pub fn scan_report(&self) -> ScanReport {
+        let state = self.boot.state.lock().unwrap();
+        self.report(&state)
+    }
+
+    fn report(&self, state: &(ScanPhase, usize, usize, Option<std::time::Duration>)) -> ScanReport {
+        let (phase, entries, bytes, took) = state;
+        ScanReport {
+            phase: phase.clone(),
+            elapsed: took.unwrap_or_else(|| self.boot.started.elapsed()),
+            files: self.boot.files.load(Ordering::Relaxed),
+            entries: *entries,
+            bytes: *bytes,
+        }
+    }
+
+    /// Wait, blocking this thread, until the boot scan's phase
+    /// meets `until` or `deadline` passes, and report how far it
+    /// came (issue #708).
+    pub fn wait_scan(
+        &self,
+        deadline: std::time::Instant,
+        until: impl Fn(&ScanPhase) -> bool,
+    ) -> ScanReport {
+        let mut state = self.boot.state.lock().unwrap();
+        loop {
+            let now = std::time::Instant::now();
+            if until(&state.0) || now >= deadline {
+                return self.report(&state);
+            }
+            state = self
+                .boot
+                .changed
+                .wait_timeout(state, deadline - now)
+                .unwrap()
+                .0;
+        }
+    }
+
+    /// Stop the boot scan if it still runs (issue #708), for a
+    /// shutdown: it indexes nothing more and deletes nothing
+    /// more, and stops at the next file it reaches. A scan
+    /// stuck in the kernel stops once the disk answers. Returns
+    /// how many purges sent while it ran it holds, which it then
+    /// never applies, so their bucket tombstones stay in force;
+    /// `None` when no scan runs.
+    pub fn stop_scan(&self) -> Option<usize> {
+        self.boot.stop.store(true, Ordering::Relaxed);
+        let inner = self.inner.lock().unwrap();
+        inner
+            .scan
+            .as_ref()
+            .map(|scan| scan.purges.iter().map(|(_, holds)| holds.len()).sum())
+    }
+
+    fn set_phase(&self, phase: ScanPhase) {
+        self.boot.state.lock().unwrap().0 = phase;
+        self.boot.changed.notify_all();
+    }
+
+    /// End the scan without indexing anything: stopped, or the
+    /// directory check failed. Its state goes, so writes are no
+    /// longer recorded, and after a failed check they are
+    /// refused for good (see [`refuse_write`]). The purges it
+    /// held are never applied (see [`ScanPurge`]).
+    fn end_scan(&self, phase: ScanPhase) {
+        if matches!(phase, ScanPhase::Failed(_)) {
+            // Counted like a failed write, so a tier that cannot
+            // write shows on /metrics (issue #367). The boot or
+            // its watch logs the error.
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(scan) = inner.scan.take()
+                && !scan.checked
+            {
+                // The directory never answered: nothing may be
+                // written to it.
+                inner.unusable = true;
+            }
+        }
+        let mut state = self.boot.state.lock().unwrap();
+        *state = (phase, 0, 0, Some(self.boot.started.elapsed()));
+        drop(state);
+        self.boot.changed.notify_all();
     }
 
     /// Write failures so far (issue #367), surfaced on
@@ -841,13 +1223,32 @@ impl DiskStore {
     /// order approximates the previous run's. Files that do
     /// not parse are deleted on sight. When the entries found
     /// are charged more than the budget, the oldest are
-    /// deleted until the rest fit, so the budget holds from
-    /// the first request.
-    fn scan(&self) -> Result<(), String> {
+    /// deleted until the rest fit, so the budget holds once the
+    /// scan ends.
+    ///
+    /// Requests may be served while it runs (issue #708), so it
+    /// reads every file first, leaving the index alone, and
+    /// then indexes what it found in one step under the index
+    /// lock, judging each file by what was done meanwhile (see
+    /// [`ScanState`]). A file it deletes by key goes under the
+    /// key's claim, like every other deletion, and one it
+    /// deletes by name only once no write can rename into it,
+    /// so neither removes a file a write put in place.
+    fn scan(&self, read: std::fs::ReadDir) {
         let mut found: Vec<Scanned> = Vec::new();
-        let read = std::fs::read_dir(&self.dir)
-            .map_err(|e| format!("cannot read the result storage directory: {e}"))?;
+        let mut overcharged: Vec<(String, String, Vec<String>)> = Vec::new();
+        // A zero budget disables the store (reads and writes
+        // already refuse); the scan then imposes no size cap of
+        // its own.
+        let cap = if self.max_bytes == 0 {
+            usize::MAX
+        } else {
+            self.max_bytes
+        };
         for entry in read.flatten() {
+            if self.boot.stop.load(Ordering::Relaxed) {
+                return self.end_scan(ScanPhase::Stopped);
+            }
             let path = entry.path();
             let Some(stem) = path
                 .file_stem()
@@ -860,6 +1261,7 @@ impl DiskStore {
             if path.extension().and_then(|s| s.to_str()) != Some("bin") {
                 continue;
             }
+            self.boot.files.fetch_add(1, Ordering::Relaxed);
             let Ok(meta) = entry.metadata() else { continue };
             // Only `put` writes entries, and it writes regular
             // files (issue #545). Anything else here (a FIFO, a
@@ -884,20 +1286,25 @@ impl DiskStore {
             // this build: delete it on sight instead of
             // reading it into memory to find out.
             if self.max_bytes > 0 && meta.len() > self.max_bytes as u64 {
-                let _ = std::fs::remove_file(&path);
+                self.unlink_unknown(&stem, &path);
                 continue;
             }
-            // A zero budget disables the store (reads and
-            // writes already refuse); the scan then imposes
-            // no size cap of its own.
-            let cap = if self.max_bytes == 0 {
-                usize::MAX
-            } else {
-                self.max_bytes
-            };
-            match read_header(&path, cap, &self.entry_key) {
-                Some((key, groups, written)) => {
-                    let file_bytes = meta.len() as usize;
+            match self.read_scanned(&path, cap) {
+                ScanRead::Gone => {}
+                ScanRead::Bad => self.unlink_unknown(&stem, &path),
+                // `put` writes each entry under its own key's
+                // stem, so a copy under another name was put
+                // there by someone else.
+                ScanRead::Entry { key, .. } if key_stem(&key) != stem => {
+                    self.unlink_unknown(&stem, &path);
+                }
+                ScanRead::Entry {
+                    key,
+                    groups,
+                    written,
+                    file_bytes,
+                    mtime,
+                } => {
                     let charge = entry_charge(&key, file_bytes, &groups);
                     // `put` never stores an entry charged more
                     // than the whole budget. One here was
@@ -906,11 +1313,11 @@ impl DiskStore {
                     // keeping it would leave no room for any
                     // other entry.
                     if self.max_bytes > 0 && charge > self.max_bytes {
-                        let _ = std::fs::remove_file(&path);
+                        overcharged.push((key, stem, groups));
                         continue;
                     }
                     found.push(Scanned {
-                        mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        mtime,
                         key,
                         stem,
                         file_bytes,
@@ -919,36 +1326,105 @@ impl DiskStore {
                         written,
                     });
                 }
-                None => {
-                    let _ = std::fs::remove_file(&path);
-                }
             }
         }
+        if self.boot.stop.load(Ordering::Relaxed) {
+            return self.end_scan(ScanPhase::Stopped);
+        }
         found.sort_by_key(|scanned| scanned.mtime);
+        let (unlink, entries, bytes) = self.index_scanned(found, overcharged);
+        for (key, stem) in unlink {
+            let _claim = FileClaim::inline(self, &key);
+            self.unlink(&self.file_for(&stem));
+        }
+        let mut state = self.boot.state.lock().unwrap();
+        *state = (
+            ScanPhase::Done,
+            entries,
+            bytes,
+            Some(self.boot.started.elapsed()),
+        );
+        drop(state);
+        self.boot.changed.notify_all();
+    }
+
+    /// The scan's one step under the index lock (issue #708):
+    /// index what it found, oldest first and below every entry
+    /// used since the store started, unless what was done while
+    /// it read says otherwise (see [`judge_scanned`]), and delete
+    /// the oldest until the budget holds. Returns the files to
+    /// delete under the claims it took, and how many entries it
+    /// indexed, charged how much.
+    fn index_scanned(
+        &self,
+        found: Vec<Scanned>,
+        overcharged: Vec<(String, String, Vec<String>)>,
+    ) -> (Vec<(String, String)>, usize, usize) {
+        let mut unlink = Vec::new();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        // From here on writes are not recorded: what they
+        // replace is indexed.
+        let scan = inner.scan.take().unwrap_or_default();
+        let mut held: Vec<Vec<u64>> = vec![Vec::new(); scan.purges.len()];
+        for (key, stem, groups) in overcharged {
+            if !matches!(
+                judge_scanned(inner, &scan, &mut held, &key, &stem, &groups),
+                Judged::Leave
+            ) && let Some(stem) = claim_or_queue(inner, &key, &stem, &groups)
+            {
+                unlink.push((key, stem));
+            }
+        }
+        let mut kept = Vec::with_capacity(found.len());
+        for scanned in found {
+            let judged = judge_scanned(
+                inner,
+                &scan,
+                &mut held,
+                &scanned.key,
+                &scanned.stem,
+                &scanned.groups,
+            );
+            match judged {
+                Judged::Keep => kept.push(scanned),
+                Judged::Delete => {
+                    if let Some(stem) =
+                        claim_or_queue(inner, &scanned.key, &scanned.stem, &scanned.groups)
+                    {
+                        unlink.push((scanned.key, stem));
+                    }
+                }
+                Judged::Leave => {}
+            }
+        }
         // A directory filled under a larger budget, or by a
         // build that charged each entry its file alone, can
         // hold more than the budget. The oldest entries are
         // the ones `put` would evict first: delete them until
-        // the rest fit, in one pass over the sorted list.
-        let mut total: usize = found.iter().map(|scanned| scanned.charge).sum();
+        // the rest fit beside what was written since the store
+        // started, in one pass over the sorted list.
+        let mut total: usize = kept.iter().map(|scanned| scanned.charge).sum();
         let mut over = 0;
         if self.max_bytes > 0 {
-            while total > self.max_bytes && over < found.len() {
-                total -= found[over].charge;
+            while inner.total_bytes + total > self.max_bytes && over < kept.len() {
+                total -= kept[over].charge;
                 over += 1;
             }
         }
-        for scanned in found.drain(..over) {
-            let _ = std::fs::remove_file(self.file_for(&scanned.stem));
+        for scanned in kept.drain(..over) {
+            if let Some(stem) = claim_or_queue(inner, &scanned.key, &scanned.stem, &scanned.groups)
+            {
+                unlink.push((scanned.key, stem));
+            }
         }
-        let mut inner = self.inner.lock().unwrap();
-        for scanned in found {
+        let entries = kept.len();
+        for (n, scanned) in kept.into_iter().enumerate() {
+            let stamp = n as u64 + 1;
             inner.total_bytes += scanned.charge;
-            inner.clock += 1;
-            let stamp = inner.clock;
-            inner.stamps.insert(scanned.key.clone(), stamp);
             inner.next_id += 1;
             let id = inner.next_id;
+            inner.order.insert(stamp, scanned.key.clone());
             inner.entries.insert(
                 scanned.key,
                 Record {
@@ -959,10 +1435,77 @@ impl DiskStore {
                     written: scanned.written,
                     id,
                     owes_shared: false,
+                    stamp,
                 },
             );
         }
-        Ok(())
+        for ((_, holds), seqs) in scan.purges.iter().zip(held) {
+            for hold in holds {
+                let _ = hold.applied.set(seqs.clone());
+            }
+        }
+        (unlink, entries, total)
+    }
+
+    /// Read the file at an entry path for the boot scan, with
+    /// the read hook a lookup runs. The read is capped like any
+    /// other entry read: the header parse validates against the
+    /// whole file, so the file has to be in memory, but never
+    /// more than `cap`. The MAC is verified: a file planted in
+    /// the directory is dropped at scan, not indexed. A file
+    /// that is gone by the time it is opened is not deleted
+    /// (issue #708): a write may have renamed one into place
+    /// since.
+    fn read_scanned(&self, path: &Path, cap: usize) -> ScanRead {
+        let (file, meta) = match open_regular(path) {
+            Ok(opened) => opened,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanRead::Gone,
+            Err(_) => return ScanRead::Bad,
+        };
+        let data = read_open_capped(file, meta.len(), cap);
+        if self.held(OpKind::Read, path).is_err() {
+            return ScanRead::Bad;
+        }
+        let Some(data) = data else {
+            return ScanRead::Bad;
+        };
+        let Some(header) = parse_header_bytes(&data, data.len()) else {
+            return ScanRead::Bad;
+        };
+        if !verify_entry_mac(&self.entry_key, &data[header.covered_start..], &header.mac) {
+            return ScanRead::Bad;
+        }
+        ScanRead::Entry {
+            key: header.key,
+            groups: header.groups,
+            written: header.written,
+            file_bytes: data.len(),
+            mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    /// Delete the file at `path`, an entry path whose key the
+    /// boot scan does not know (issue #708): one that does not
+    /// verify, or that cannot be an entry. While it goes, a
+    /// write of a key with its stem writes nothing, so the
+    /// deletion cannot remove a file the write renamed into
+    /// place. A file at the stem of a key a write was begun for
+    /// may be that write's, so it stays: a landed write replaced
+    /// it, and otherwise the next boot deletes it.
+    fn unlink_unknown(&self, stem: &str, path: &Path) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(scan) = inner.scan.as_mut() {
+                if scan.written.contains(stem) {
+                    return;
+                }
+                scan.unlinking.insert(stem.to_string());
+            }
+        }
+        self.unlink(path);
+        if let Some(scan) = self.inner.lock().unwrap().scan.as_mut() {
+            scan.unlinking.remove(stem);
+        }
     }
 
     /// Run `hold` ahead of every entry read from now on, or
@@ -1051,8 +1594,9 @@ impl DiskStore {
                 Some((image, id))
             }
             _ => {
-                let claimed = evict_entry(&mut inner, key)
-                    .and_then(|record| claim_or_queue(&mut inner, key, &record));
+                let claimed = evict_entry(&mut inner, key).and_then(|record| {
+                    claim_or_queue(&mut inner, key, &record.stem, &record.groups)
+                });
                 drop(inner);
                 if let Some(stem) = claimed {
                     let _claim = FileClaim::inline(self, key);
@@ -1162,6 +1706,9 @@ impl DiskStore {
         }
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
+        if let Some(refused) = refuse_write(inner, key) {
+            return refused;
+        }
         if inner.entries.contains_key(key) {
             return WritePlan::Held(learn_locked(inner, key, groups, bucket));
         }
@@ -1256,15 +1803,15 @@ impl DiskStore {
                         inner.rewrites.push(key, &stem, &mut inner.next_seq);
                     }
                     let charge = entry_charge(key, data.len(), &groups);
+                    // The least recently used entry is the first
+                    // in the order (issue #708).
                     while inner.total_bytes + charge > self.max_bytes {
-                        let oldest = inner
-                            .stamps
-                            .iter()
-                            .min_by_key(|(_, stamp)| *stamp)
-                            .map(|(k, _)| k.clone());
-                        let Some(oldest) = oldest else { break };
+                        let Some((_, oldest)) = inner.order.pop_first() else {
+                            break;
+                        };
                         if let Some(record) = evict_entry(inner, &oldest)
-                            && let Some(stem) = claim_or_queue(inner, &oldest, &record)
+                            && let Some(stem) =
+                                claim_or_queue(inner, &oldest, &record.stem, &record.groups)
                         {
                             evicted.push((oldest, stem));
                         }
@@ -1274,7 +1821,7 @@ impl DiskStore {
                     inner.total_bytes += charge;
                     inner.clock += 1;
                     let stamp = inner.clock;
-                    inner.stamps.insert(key.to_string(), stamp);
+                    inner.order.insert(stamp, key.to_string());
                     inner.entries.insert(
                         key.to_string(),
                         Record {
@@ -1285,6 +1832,7 @@ impl DiskStore {
                             written: entry.written,
                             id,
                             owes_shared: false,
+                            stamp,
                         },
                     );
                     Some(Landed { id, groups })
@@ -1322,7 +1870,7 @@ impl DiskStore {
         }
         {
             let mut inner = self.inner.lock().unwrap();
-            if inner.claims.contains_key(key) {
+            if refuse_write(&mut inner, key).is_some() || inner.claims.contains_key(key) {
                 return;
             }
             let groups = evict_entry(&mut inner, key)
@@ -1349,7 +1897,7 @@ impl DiskStore {
                 return false;
             }
             let record = evict_entry(&mut inner, key);
-            record.and_then(|record| claim_or_queue(&mut inner, key, &record))
+            record.and_then(|record| claim_or_queue(&mut inner, key, &record.stem, &record.groups))
         };
         if let Some(stem) = claimed {
             let _claim = FileClaim::inline(self, key);
@@ -1383,7 +1931,7 @@ impl DiskStore {
     /// [`DiskStore::wait_deletions`]. The caller kicks the
     /// drain.
     pub fn purge(&self, target: &PurgeTarget) -> (usize, Range<u64>) {
-        let (removed, seqs, _) = self.purge_queued(target);
+        let (removed, seqs, _, _) = self.purge_queued(target);
         (removed, seqs)
     }
 
@@ -1396,14 +1944,17 @@ impl DiskStore {
     /// a restart, removes it and queues its deletion before the
     /// purge gets here; the purge takes that deletion over, so
     /// its tombstones stay in force until the file is gone.
+    /// A purge sent while the boot scan runs waits for the scan
+    /// to delete the files it covers too (issue #708).
     pub fn purge_waiting(self: &Arc<Self>, target: &PurgeTarget) -> (usize, DeletionWait) {
-        let (removed, seqs, earlier) = self.purge_queued(target);
+        let (removed, seqs, earlier, scan) = self.purge_queued(target);
         (
             removed,
             DeletionWait {
                 store: self.clone(),
                 seqs,
                 earlier,
+                scan,
             },
         )
     }
@@ -1414,8 +1965,14 @@ impl DiskStore {
     /// covers that no purge held yet, which it takes over. A
     /// key has one deletion queued at a time, so when it has
     /// one already, that one deletes the file the write renames
-    /// into place, and the purge queues none of its own.
-    fn purge_queued(&self, target: &PurgeTarget) -> (usize, Range<u64>, Vec<u64>) {
+    /// into place, and the purge queues none of its own. While
+    /// the boot scan runs, the purge is also handed to it, for
+    /// the files it has not indexed yet (issue #708), and the
+    /// last value is what the scan does for it.
+    fn purge_queued(
+        &self,
+        target: &PurgeTarget,
+    ) -> (usize, Range<u64>, Vec<u64>, Option<Arc<ScanPurge>>) {
         let mut earlier = Vec::new();
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
@@ -1426,7 +1983,7 @@ impl DiskStore {
             .collect();
         for (key, record) in &removed {
             inner.total_bytes -= record.charge;
-            inner.stamps.remove(key);
+            inner.order.remove(&record.stamp);
             if inner
                 .rewrites
                 .jobs
@@ -1463,7 +2020,15 @@ impl DiskStore {
                 earlier.push(job.seq);
             }
         }
-        (removed.len(), first..inner.next_seq + 1, earlier)
+        let scan = inner.scan.as_mut().map(|scan| {
+            let hold = Arc::new(ScanPurge::default());
+            match scan.purges.iter_mut().find(|(sent, _)| sent == target) {
+                Some((_, holds)) => holds.push(hold.clone()),
+                None => scan.purges.push((target.clone(), vec![hold.clone()])),
+            }
+            hold
+        });
+        (removed.len(), first..inner.next_seq + 1, earlier, scan)
     }
 
     /// Remove every entry for `base`: the bare key plus its
@@ -1914,11 +2479,17 @@ pub(crate) fn key_stem(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
 }
 
+/// Mark `key`'s entry, if there is one, as used now: its key
+/// moves to a new stamp at the back of the order (issue #708).
 fn touch(inner: &mut Inner, key: &str) {
     inner.clock += 1;
     let stamp = inner.clock;
-    if let Some(s) = inner.stamps.get_mut(key) {
-        *s = stamp;
+    let Inner { entries, order, .. } = inner;
+    if let Some(record) = entries.get_mut(key) {
+        let before = std::mem::replace(&mut record.stamp, stamp);
+        if let Some(key) = order.remove(&before) {
+            order.insert(stamp, key);
+        }
     }
 }
 
@@ -1927,7 +2498,7 @@ fn touch(inner: &mut Inner, key: &str) {
 fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     let record = inner.entries.remove(key)?;
     inner.total_bytes -= record.charge;
-    inner.stamps.remove(key);
+    inner.order.remove(&record.stamp);
     if inner
         .rewrites
         .jobs
@@ -1939,18 +2510,107 @@ fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     Some(record)
 }
 
-/// Claim the file of `record`, just evicted from `key`, for an
-/// inline delete and return its stem, or, when another job
-/// holds it, queue the deletion.
-fn claim_or_queue(inner: &mut Inner, key: &str, record: &Record) -> Option<String> {
+/// Claim the file at `stem` of a copy of `key` in `groups`,
+/// just evicted or never indexed, for an inline delete and
+/// return its stem, or, when another job holds it, queue the
+/// deletion.
+fn claim_or_queue(inner: &mut Inner, key: &str, stem: &str, groups: &[String]) -> Option<String> {
     if inner.claims.contains_key(key) {
         inner
             .deletions
-            .push_unheld(key, &record.stem, &record.groups, &mut inner.next_seq);
+            .push_unheld(key, stem, groups, &mut inner.next_seq);
         return None;
     }
     inner.claims.insert(key.to_string(), Claim::File);
-    Some(record.stem.clone())
+    Some(stem.to_string())
+}
+
+/// Why a write of `key` may not go on (issue #708), recording
+/// it for the boot scan when it may: [`WritePlan::Off`] for a
+/// directory that never answered or failed its check, and
+/// [`WritePlan::Busy`] before the directory has answered or
+/// while the scan deletes a file at the key's stem by name.
+fn refuse_write(inner: &mut Inner, key: &str) -> Option<WritePlan> {
+    if inner.unusable {
+        return Some(WritePlan::Off);
+    }
+    let scan = inner.scan.as_mut()?;
+    if !scan.checked {
+        return Some(WritePlan::Busy);
+    }
+    let stem = key_stem(key);
+    if scan.unlinking.contains(&stem) {
+        return Some(WritePlan::Busy);
+    }
+    scan.written.insert(stem);
+    None
+}
+
+/// What the boot scan does with a file it read (issue #708).
+enum Judged {
+    /// Index it.
+    Keep,
+    /// Delete it under its key's claim.
+    Delete,
+    /// Nothing: another copy or a queued deletion has it.
+    Leave,
+}
+
+/// Judge the file the boot scan read at `stem` for a copy of
+/// `key` in `groups` by what was done while the scan read
+/// (issue #708), under the index lock. An indexed key's
+/// record is a write's copy, which replaced the file. A purge
+/// sent since the store started that covers the copy gets the
+/// file's deletion queued, and its tombstones wait for it,
+/// in `held` by purge. A key whose deletion is queued already
+/// goes with that. A key a write was begun for, or that a job
+/// holds, has a copy that counts more than this one, landed,
+/// in flight, or in memory with groups this file lacks: the
+/// file goes.
+fn judge_scanned(
+    inner: &mut Inner,
+    scan: &ScanState,
+    held: &mut [Vec<u64>],
+    key: &str,
+    stem: &str,
+    groups: &[String],
+) -> Judged {
+    if inner.entries.contains_key(key) {
+        return Judged::Leave;
+    }
+    let mut seq = None;
+    for (n, (target, _)) in scan.purges.iter().enumerate() {
+        if target.covers(key, groups) {
+            let seq = *seq.get_or_insert_with(|| queue_held_deletion(inner, key, stem));
+            held[n].push(seq);
+        }
+    }
+    if seq.is_some() || inner.deletions.jobs.contains_key(key) {
+        return Judged::Leave;
+    }
+    if scan.written.contains(stem) || inner.claims.contains_key(key) {
+        return Judged::Delete;
+    }
+    Judged::Keep
+}
+
+/// Queue the deletion of `key`'s file at `stem` for a purge
+/// that holds its tombstones for it, and return its sequence
+/// number: that of the deletion queued already, if any, which
+/// the purge then holds instead.
+fn queue_held_deletion(inner: &mut Inner, key: &str, stem: &str) -> u64 {
+    let Inner {
+        deletions,
+        next_seq,
+        ..
+    } = inner;
+    if let Some(job) = deletions.jobs.get(key) {
+        let seq = job.seq;
+        deletions.unheld.remove(key);
+        return seq;
+    }
+    deletions.push(key, stem, next_seq);
+    *next_seq
 }
 
 /// `existing` with `extra` added. Unchanged, order and all,
@@ -1978,10 +2638,12 @@ fn learn_locked(inner: &mut Inner, key: &str, groups: &[String], bucket: Bucket<
                 record.owes_shared = true;
             }
             inner.rewrites.push(key, &record.stem, &mut inner.next_seq);
+            // A record that grows is used now.
             inner.clock += 1;
             let stamp = inner.clock;
-            if let Some(s) = inner.stamps.get_mut(key) {
-                *s = stamp;
+            let before = std::mem::replace(&mut record.stamp, stamp);
+            if let Some(key) = inner.order.remove(&before) {
+                inner.order.insert(stamp, key);
             }
         }
         if let Bucket::Carries(carried) = bucket
@@ -2475,11 +3137,16 @@ pub struct DeletionWait {
     /// which deletes the file that write renames into place,
     /// and of copies it covers that no purge held.
     pub earlier: Vec<u64>,
+    /// For a purge sent while the boot scan ran (issue #708):
+    /// what the scan does for it.
+    scan: Option<Arc<ScanPurge>>,
 }
 
 impl DeletionWait {
     /// Whether any of the deletions, the earlier ones
-    /// included, is still queued, failed or not.
+    /// included, is still queued, failed or not, or, for a
+    /// purge sent while the boot scan ran, whether the scan
+    /// has yet to delete the files it covers (issue #708).
     pub fn pending(&self) -> bool {
         let inner = self.store.inner.lock().unwrap();
         inner.deletions.any_in(&self.seqs)
@@ -2487,6 +3154,10 @@ impl DeletionWait {
                 .earlier
                 .iter()
                 .any(|seq| inner.deletions.by_seq.contains_key(seq))
+            || self
+                .scan
+                .as_ref()
+                .is_some_and(|scan| scan.pending(&inner.deletions))
     }
 
     /// Wait while the deletions make progress (see
@@ -2838,25 +3509,6 @@ pub(crate) fn parse_entry_header(data: &[u8], total_len: usize) -> Option<Header
         groups: header.groups,
         written: header.written,
     })
-}
-
-/// Just the header of a stored file, for the boot scan.
-/// The read is capped like any other entry read: the
-/// header parse validates against the whole file, so the
-/// file has to be in memory, but never more than `cap`.
-/// The MAC is verified: a file planted in the directory
-/// is dropped at scan, not indexed.
-fn read_header(
-    path: &Path,
-    cap: usize,
-    entry_key: &[u8],
-) -> Option<(String, Vec<String>, Option<WriteStamp>)> {
-    let data = read_capped(path, cap)?;
-    let header = parse_header_bytes(&data, data.len())?;
-    if !verify_entry_mac(entry_key, &data[header.covered_start..], &header.mac) {
-        return None;
-    }
-    Some((header.key, header.groups, header.written))
 }
 
 /// The purge tombstone format (issue #461): what a purge
@@ -3677,20 +4329,23 @@ mod tests {
         };
         // Grown past the cap.
         std::fs::write(&path, vec![1u8; CAP - 100]).unwrap();
-        let (file, len) = open_regular(&path).unwrap();
+        let (file, meta) = open_regular(&path).unwrap();
+        let len = meta.len();
         assert_eq!(len, (CAP - 100) as u64);
         append(101);
         assert_eq!(read_open_capped(file, len, CAP), None);
         // Grown, but within the cap.
         std::fs::write(&path, vec![1u8; 4_000]).unwrap();
-        let (file, len) = open_regular(&path).unwrap();
+        let (file, meta) = open_regular(&path).unwrap();
+        let len = meta.len();
         append(5_000);
         let data = read_open_capped(file, len, CAP).unwrap();
         assert_eq!(data.len(), 9_000);
         assert_eq!(data, std::fs::read(&path).unwrap());
         // Shrunk.
         std::fs::write(&path, vec![1u8; 4_000]).unwrap();
-        let (file, len) = open_regular(&path).unwrap();
+        let (file, meta) = open_regular(&path).unwrap();
+        let len = meta.len();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -4797,7 +5452,7 @@ mod tests {
             let charge = entry_charge(&key, 10, &groups);
             inner.next_id += 1;
             inner.clock += 1;
-            inner.stamps.insert(key.clone(), inner.clock);
+            inner.order.insert(inner.clock, key.clone());
             inner.total_bytes += charge;
             let record = Record {
                 stem: key_stem(&key),
@@ -4807,6 +5462,7 @@ mod tests {
                 written: None,
                 id: inner.next_id,
                 owes_shared: false,
+                stamp: inner.clock,
             };
             inner.entries.insert(key, record);
         }
@@ -5295,5 +5951,737 @@ mod tests {
             store.backlog()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Issue #708: the boot scan on a thread of its own, and the
+    // index ordered by last use.
+
+    /// Holds the boot scan's file operations of the given kinds,
+    /// on the scan's own thread only, so the test's lookups and
+    /// writes go on meanwhile (issue #708). Each operation held
+    /// is reported with its path and waits until the gate opens
+    /// or drops, or a backstop passes, so a failed test cannot
+    /// leave the scan thread waiting.
+    struct ScanGate {
+        open: Arc<(Mutex<bool>, Condvar)>,
+        held: std::sync::mpsc::Receiver<(OpKind, PathBuf)>,
+    }
+
+    impl ScanGate {
+        fn hold(store: &DiskStore, kinds: &[OpKind]) -> Self {
+            let open = Arc::new((Mutex::new(false), Condvar::new()));
+            let (held_tx, held) = std::sync::mpsc::channel();
+            let held_tx = Mutex::new(held_tx);
+            let kinds = kinds.to_vec();
+            let gate = open.clone();
+            store.set_hold(Some(Arc::new(move |kind, path| {
+                if kinds.contains(&kind) && std::thread::current().name() == Some(SCAN_THREAD) {
+                    let _ = held_tx.lock().unwrap().send((kind, path.to_path_buf()));
+                    let (flag, wake) = &*gate;
+                    let opened = flag.lock().unwrap();
+                    let _ = wake
+                        .wait_timeout_while(opened, std::time::Duration::from_secs(20), |open| {
+                            !*open
+                        })
+                        .unwrap();
+                }
+                Ok(())
+            })));
+            ScanGate { open, held }
+        }
+
+        /// The next operation the scan is held at.
+        fn next(&self) -> (OpKind, PathBuf) {
+            self.held
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the boot scan reached no operation the gate holds")
+        }
+
+        fn release(&self) {
+            let (flag, wake) = &*self.open;
+            *flag.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    impl Drop for ScanGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// A store over `dir` whose boot scan runs on its own thread
+    /// under a gate that holds the given operations.
+    fn started_under_gate(
+        dir: &Path,
+        max_bytes: usize,
+        kinds: &[OpKind],
+    ) -> (Arc<DiskStore>, ScanGate) {
+        let store = Arc::new(DiskStore::unscanned(dir, max_bytes, test_entry_key()));
+        let gate = ScanGate::hold(&store, kinds);
+        store.begin_scan();
+        (store, gate)
+    }
+
+    fn scan_ended(store: &DiskStore) -> ScanReport {
+        store.wait_scan(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            ScanPhase::ended,
+        )
+    }
+
+    /// Store `keys` with `payload` through a store that is then
+    /// dropped, as a previous run leaves them, and give their
+    /// files modification times in that order, oldest first.
+    fn left_by_a_previous_run(dir: &Path, keys: &[String], payload: &[u8]) {
+        let store = DiskStore::open(dir, 1_000_000, test_entry_key()).unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            store.put(key, &image(payload));
+            let when = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + i as u64);
+            std::fs::File::options()
+                .write(true)
+                .open(store.file_for(&key_stem(key)))
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+    }
+
+    /// The indexed keys from the least recently used, checking
+    /// on the way that the order and the records name each other
+    /// and that the total is the sum of the charges.
+    fn lru_order(store: &DiskStore) -> Vec<String> {
+        let inner = store.inner.lock().unwrap();
+        assert_eq!(inner.order.len(), inner.entries.len());
+        for (stamp, key) in &inner.order {
+            assert_eq!(inner.entries[key].stamp, *stamp, "{key}");
+        }
+        assert_eq!(
+            inner.total_bytes,
+            inner.entries.values().map(|r| r.charge).sum::<usize>()
+        );
+        inner.order.values().cloned().collect()
+    }
+
+    #[test]
+    fn a_held_boot_scan_lets_the_store_miss_and_write_and_then_indexes_below_those_writes() {
+        // Issue #708: the scan read and verified every entry
+        // before the server listened, so a slow or hung disk
+        // kept it from listening. It runs on a thread of its own
+        // now. While it is held, the boot's wait ends at its
+        // deadline, an entry the scan has not indexed is a miss,
+        // and a write lands and serves. Once the scan ends, what
+        // it found is indexed, oldest first, as older than that
+        // write.
+        let dir = temp_dir("scan-held");
+        let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
+        left_by_a_previous_run(&dir, &old, b"old");
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Read]);
+        gate.next();
+        let started = std::time::Instant::now();
+        let report = store.wait_scan(
+            started + std::time::Duration::from_millis(200),
+            ScanPhase::ended,
+        );
+        assert_eq!(report.phase, ScanPhase::Scanning);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        for key in &old {
+            assert!(store.get(key).is_none(), "{key} is a miss until indexed");
+        }
+        store.put("new", &image(b"fresh"));
+        assert_eq!(store.get("new").unwrap().bytes.as_ref(), b"fresh");
+        gate.release();
+        let report = scan_ended(&store);
+        assert_eq!(report.phase, ScanPhase::Done);
+        assert_eq!(report.entries, 3);
+        assert!(report.files >= 3, "{report:?}");
+        let mut expected = old.clone();
+        expected.push("new".to_string());
+        assert_eq!(lru_order(&store), expected);
+        for key in &old {
+            assert_eq!(store.get(key).unwrap().bytes.as_ref(), b"old");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_purge_sent_while_the_boot_scan_runs_deletes_the_files_it_covers_instead_of_indexing_them()
+    {
+        // Issue #708: an entry purged before the scan reaches it
+        // must not come back. The purge finds nothing indexed;
+        // the scan, which read the files first, deletes the ones
+        // it covers instead of indexing them, and the purge's
+        // tombstones wait for those deletions, so a restart
+        // before they are done finds the purge still in force.
+        let dir = temp_dir("scan-purge");
+        {
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.put("a", &grouped_image(b"a", &["g"]));
+            store.put("b", &image(b"b"));
+            store.put("c", &grouped_image(b"c", &["g"]));
+        }
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Read]);
+        gate.next();
+        let (removed, wait) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        assert_eq!(removed, 0, "nothing is indexed yet");
+        assert!(wait.pending(), "the scan has yet to apply the purge");
+        let (_, again) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        assert_eq!(store.keys(), vec!["b".to_string()]);
+        assert!(store.get("a").is_none() && store.get("c").is_none());
+        assert!(wait.pending(), "the purge waits for the scan's deletions");
+        assert!(again.pending(), "so does the same purge sent again");
+        store.drain_now();
+        assert!(!wait.pending() && !again.pending());
+        for key in ["a", "c"] {
+            assert!(!store.file_for(&key_stem(key)).exists(), "{key}");
+        }
+        drop(store);
+        let reopened = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert_eq!(reopened.keys(), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_while_the_boot_scan_runs_keep_their_copies_and_the_budget_holds_once_it_ends() {
+        // Issue #708: a write that lands while the scan runs
+        // replaces the file the scan read for its key, and evicts
+        // as a write always does. The scan does not index what
+        // it read for that key, indexes the rest below the
+        // writes, and deletes the oldest until the budget holds
+        // beside them.
+        let dir = temp_dir("scan-writes");
+        let payload = [7u8; 200];
+        let old: Vec<String> = (0..5).map(|i| format!("old/{i}")).collect();
+        left_by_a_previous_run(&dir, &old, &payload);
+        let file = serialize_entry(&old[0], &image(&payload), &test_entry_key()).len();
+        let one = entry_charge(&old[0], file, &[]);
+        let budget = 4 * one + one / 2;
+        let (store, gate) = started_under_gate(&dir, budget, &[OpKind::Read]);
+        let (_, held) = gate.next();
+        let rewritten = old
+            .iter()
+            .find(|key| store.file_for(&key_stem(key)) == held)
+            .unwrap()
+            .clone();
+        // The scan has read this key's file and waits; a fresh
+        // copy replaces it, and a new key lands beside it.
+        store.put(&rewritten, &image(b"fresh copy"));
+        store.put("new", &image(&payload));
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        let order = lru_order(&store);
+        let (entries, total) = store.stats();
+        assert!(total <= budget, "{entries} entries, {total} over {budget}");
+        // The newest of the other files fill what the writes
+        // leave, and the older ones are deleted.
+        let others: Vec<&String> = old.iter().filter(|key| **key != rewritten).collect();
+        let mut expected: Vec<String> = others[2..].iter().map(|key| key.to_string()).collect();
+        expected.push(rewritten.clone());
+        expected.push("new".to_string());
+        assert_eq!(order, expected);
+        for key in &others[..2] {
+            assert!(!store.file_for(&key_stem(key)).exists(), "{key}");
+        }
+        assert_eq!(store.get(&rewritten).unwrap().bytes.as_ref(), b"fresh copy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_evicted_while_the_boot_scan_runs_does_not_come_back_from_the_file_it_read() {
+        // Issue #708: writes that land while the scan runs evict
+        // as always. A key the scan read a file for, written
+        // afresh and then evicted, has no file left, and the scan
+        // must not index the copy it read: it would charge the
+        // budget for a file that is gone. The files left are
+        // small and the writes large, so every file the scan
+        // read would fit beside the writes.
+        let dir = temp_dir("scan-evict");
+        let small = [7u8; 10];
+        let large = [7u8; 2_000];
+        let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
+        left_by_a_previous_run(&dir, &old, &small);
+        let charge = |payload: &[u8]| {
+            let file = serialize_entry(&old[0], &image(payload), &test_entry_key()).len();
+            entry_charge(&old[0], file, &[])
+        };
+        let budget = 2 * charge(&large) + 3 * charge(&small) + charge(&small) / 2;
+        assert!(3 * charge(&large) > budget);
+        let (store, gate) = started_under_gate(&dir, budget, &[OpKind::Read]);
+        let (_, held) = gate.next();
+        let evicted = old
+            .iter()
+            .find(|key| store.file_for(&key_stem(key)) == held)
+            .unwrap()
+            .clone();
+        store.put(&evicted, &image(&large));
+        store.put("new/1", &image(&large));
+        store.put("new/2", &image(&large));
+        assert!(
+            !store.contains(&evicted),
+            "the third write evicted the first"
+        );
+        assert!(!held.exists());
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        let mut expected: Vec<String> =
+            old.iter().filter(|key| **key != evicted).cloned().collect();
+        expected.push("new/1".to_string());
+        expected.push("new/2".to_string());
+        assert_eq!(lru_order(&store), expected);
+        assert!(store.get(&evicted).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_the_boot_scan_cannot_trust_is_deleted_only_while_no_write_can_land_over_it() {
+        // Issue #708: the scan deletes a file that does not
+        // verify by name, not knowing its key, while writes run.
+        // A write of that key that lands first renamed a good
+        // copy over it, so the scan leaves the file of a key a
+        // write was begun for, and while it deletes one, a write
+        // of its key writes nothing.
+        let bad = |dir: &Path, key: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{}.bin", key_stem(key))),
+                b"CRABDISK6\nnot an entry",
+            )
+            .unwrap();
+        };
+        // The scan has read the bad file when the write lands.
+        let dir = temp_dir("scan-bad-landed");
+        bad(&dir, "k");
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Read]);
+        gate.next();
+        store.put("k", &image(b"fresh"));
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        assert_eq!(store.get("k").unwrap().bytes.as_ref(), b"fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        // The scan deletes the bad file when the write begins.
+        let dir = temp_dir("scan-bad-deleting");
+        bad(&dir, "k");
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Unlink]);
+        gate.next();
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Busy
+        ));
+        store.put("k", &image(b"fresh"));
+        assert!(!store.contains("k"), "nothing was written");
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        assert!(!store.file_for(&key_stem("k")).exists());
+        store.put("k", &image(b"fresh"));
+        assert_eq!(store.get("k").unwrap().bytes.as_ref(), b"fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shutdown_stops_the_boot_scan_and_leaves_the_purges_it_held_pending() {
+        // Issue #708: a shutdown during the scan stops it at its
+        // next file. It indexes and deletes nothing more, the
+        // files stay for the next boot's scan, and the purges
+        // sent while it ran stay pending, so their bucket
+        // tombstones are never marked ended.
+        let dir = temp_dir("scan-stop");
+        {
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.put("a", &grouped_image(b"a", &["g"]));
+            store.put("b", &image(b"b"));
+        }
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Read]);
+        gate.next();
+        let (_, wait) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        let (_, again) = store.purge_waiting(&PurgeTarget::Group("g".into()));
+        assert_eq!(store.stop_scan(), Some(2));
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Stopped);
+        assert!(store.keys().is_empty());
+        assert!(wait.pending() && again.pending());
+        assert_eq!(store.stop_scan(), None);
+        for key in ["a", "b"] {
+            assert!(store.file_for(&key_stem(key)).exists(), "{key}");
+        }
+        store.put("c", &image(b"c"));
+        assert_eq!(store.get("c").unwrap().bytes.as_ref(), b"c");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_that_does_not_answer_holds_every_write_until_it_does() {
+        // Issue #708: the boot waits for the directory check up
+        // to its deadline only. Until the directory answers,
+        // nothing is written to it.
+        let dir = temp_dir("scan-check");
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Write]);
+        let (kind, path) = gate.next();
+        assert_eq!(kind, OpKind::Write);
+        assert!(path.ends_with(PROBE_NAME), "{}", path.display());
+        let report = store.wait_scan(
+            std::time::Instant::now() + std::time::Duration::from_millis(200),
+            |phase| *phase != ScanPhase::Checking,
+        );
+        assert_eq!(report.phase, ScanPhase::Checking);
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Busy
+        ));
+        store.put("k", &image(b"k"));
+        assert!(!store.contains("k"));
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        store.put("k", &image(b"k"));
+        assert_eq!(store.get("k").unwrap().bytes.as_ref(), b"k");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_check_that_fails_in_the_background_leaves_the_tier_off_and_counted() {
+        // Issue #708: a check that fails once the boot went on
+        // without it writes nothing, ever, and counts as an
+        // error, so /metrics shows the tier failing.
+        let dir = temp_dir("scan-check-fails");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), b"").unwrap();
+        let store = Arc::new(DiskStore::unscanned(
+            &dir.join("file").join("cache"),
+            1_000_000,
+            test_entry_key(),
+        ));
+        store.begin_scan();
+        let report = scan_ended(&store);
+        assert!(
+            matches!(&report.phase, ScanPhase::Failed(e) if e.contains("cannot create the result storage directory")),
+            "{report:?}"
+        );
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Off
+        ));
+        assert_eq!(store.errors(), 1);
+    }
+
+    #[test]
+    fn the_boot_scan_deletes_an_entry_stored_under_another_keys_name() {
+        // Issue #708: `put` writes each entry under its own key's
+        // stem. A verified entry under another name was copied
+        // there by someone else; the scan deletes it like a file
+        // that does not verify, so every record's file is the
+        // one a write of its key replaces.
+        let dir = temp_dir("scan-misnamed");
+        let copy = {
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.put("k", &image(b"payload"));
+            let copy = store.file_for(&key_stem("other"));
+            std::fs::copy(store.file_for(&key_stem("k")), &copy).unwrap();
+            copy
+        };
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert_eq!(store.keys(), vec!["k".to_string()]);
+        assert!(!copy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The index's bookkeeping as it was before issue #708: the
+    /// stamps in a hash map, and each eviction a scan of them
+    /// all for the smallest. Only what decides which entries
+    /// stay and what each is charged.
+    mod min_scan {
+        use super::super::{ALLOCATION_OVERHEAD, entry_charge, with_groups};
+        use crate::cache::{PurgeTarget, WriteStamp};
+        use std::collections::HashMap;
+
+        /// The record as it was, for its size.
+        #[allow(dead_code)]
+        pub struct Record {
+            stem: String,
+            file_bytes: usize,
+            charge: usize,
+            groups: Vec<String>,
+            written: Option<WriteStamp>,
+            id: u64,
+            owes_shared: bool,
+        }
+
+        pub const RECORD_OVERHEAD: usize = 2
+            * (size_of::<(String, Record)>() + size_of::<(String, u64)>())
+            + 3 * ALLOCATION_OVERHEAD;
+
+        pub struct Entry {
+            pub file_bytes: usize,
+            pub charge: usize,
+            pub groups: Vec<String>,
+        }
+
+        #[derive(Default)]
+        pub struct Index {
+            max_bytes: usize,
+            pub entries: HashMap<String, Entry>,
+            stamps: HashMap<String, u64>,
+            clock: u64,
+            pub total_bytes: usize,
+        }
+
+        impl Index {
+            pub fn new(max_bytes: usize) -> Self {
+                Index {
+                    max_bytes,
+                    ..Default::default()
+                }
+            }
+
+            /// The keys, from the least recently used.
+            pub fn order(&self) -> Vec<String> {
+                let mut stamped: Vec<(u64, &String)> = self
+                    .stamps
+                    .iter()
+                    .map(|(key, stamp)| (*stamp, key))
+                    .collect();
+                stamped.sort();
+                stamped.into_iter().map(|(_, key)| key.clone()).collect()
+            }
+
+            fn touch(&mut self, key: &str) {
+                self.clock += 1;
+                let stamp = self.clock;
+                if let Some(s) = self.stamps.get_mut(key) {
+                    *s = stamp;
+                }
+            }
+
+            pub fn get(&mut self, key: &str) -> bool {
+                if self.max_bytes == 0 || !self.entries.contains_key(key) {
+                    return false;
+                }
+                self.touch(key);
+                true
+            }
+
+            /// `None` for a key not held, else whether it grew.
+            pub fn learn(&mut self, key: &str, groups: &[String]) -> Option<bool> {
+                if self.max_bytes == 0 {
+                    return None;
+                }
+                let entry = self.entries.get_mut(key)?;
+                let merged = with_groups(&entry.groups, groups);
+                let grew = merged.len() > entry.groups.len();
+                if grew {
+                    entry.groups = merged;
+                    let charge = entry_charge(key, entry.file_bytes, &entry.groups);
+                    self.total_bytes = self.total_bytes - entry.charge + charge;
+                    entry.charge = charge;
+                    self.clock += 1;
+                    let stamp = self.clock;
+                    if let Some(s) = self.stamps.get_mut(key) {
+                        *s = stamp;
+                    }
+                }
+                Some(grew)
+            }
+
+            pub fn remove(&mut self, key: &str) -> Option<Entry> {
+                let entry = self.entries.remove(key)?;
+                self.total_bytes -= entry.charge;
+                self.stamps.remove(key);
+                Some(entry)
+            }
+
+            /// [`super::super::DiskStore::put`] of a copy in
+            /// `groups` whose file, in the groups it lands with,
+            /// is `file_bytes` long. Returns how many entries it
+            /// evicted.
+            pub fn put(
+                &mut self,
+                key: &str,
+                groups: &[String],
+                file_bytes: impl Fn(&[String]) -> usize,
+            ) -> usize {
+                if self.max_bytes == 0 {
+                    return 0;
+                }
+                let held = self
+                    .remove(key)
+                    .map(|entry| entry.groups)
+                    .unwrap_or_default();
+                let groups = with_groups(groups, &held);
+                let file_bytes = file_bytes(&groups);
+                let charge = entry_charge(key, file_bytes, &groups);
+                if charge > self.max_bytes {
+                    return 0;
+                }
+                let mut evicted = 0;
+                while self.total_bytes + charge > self.max_bytes {
+                    let oldest = self
+                        .stamps
+                        .iter()
+                        .min_by_key(|(_, stamp)| *stamp)
+                        .map(|(k, _)| k.clone());
+                    let Some(oldest) = oldest else { break };
+                    self.remove(&oldest);
+                    evicted += 1;
+                }
+                self.total_bytes += charge;
+                self.clock += 1;
+                self.stamps.insert(key.to_string(), self.clock);
+                self.entries.insert(
+                    key.to_string(),
+                    Entry {
+                        file_bytes,
+                        charge,
+                        groups,
+                    },
+                );
+                evicted
+            }
+
+            pub fn purge(&mut self, target: &PurgeTarget) -> usize {
+                let covered: Vec<String> = self
+                    .entries
+                    .iter()
+                    .filter(|(key, entry)| target.covers(key, &entry.groups))
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in &covered {
+                    self.remove(key);
+                }
+                covered.len()
+            }
+        }
+    }
+
+    #[test]
+    fn an_index_record_is_charged_what_it_was_before_the_order_was_a_map() {
+        // Issue #708: the record gained a stamp, and the charge
+        // did not move with it. A budget holds the entries it
+        // held, whatever their keys, groups and files.
+        assert_eq!(RECORD_OVERHEAD, min_scan::RECORD_OVERHEAD);
+    }
+
+    #[test]
+    fn the_index_evicts_what_the_min_scan_evicted_in_every_order_of_operations() {
+        // Issue #708: eviction takes its victim from the front of
+        // an ordered map and no longer reads every stamp to find
+        // it. Whatever is done to the store (writes that replace
+        // and writes that evict, hits, misses, learned groups that
+        // grow an entry, removals and the three purges), it must
+        // hold the same entries, in the same order of use, under
+        // the same charges, and give every call the same answer,
+        // as the bookkeeping that scanned.
+        let ops = ["100x100", "200x0", "filters:blur(2)"];
+        let sources = ["http://x/a.png", "http://x/b.png", "http://y/a.png"];
+        let variants = ["", "#avif", "#webp#w300"];
+        let mut keys = Vec::new();
+        for op in ops {
+            for source in sources {
+                for variant in variants {
+                    keys.push(format!("{op}/{source}{variant}"));
+                }
+            }
+        }
+        let names = ["thumb", "card", "hero"];
+        let some_groups = |rng: &mut crate::test_support::Rng| -> Vec<String> {
+            let mut some = Vec::new();
+            for name in names {
+                if rng.below(4) == 0 {
+                    some.push(name.to_string());
+                }
+            }
+            some
+        };
+        let one = entry_charge(
+            &keys[0],
+            serialize_entry(&keys[0], &image(&[7; 900]), &test_entry_key()).len(),
+            &[],
+        );
+        let mut steps = 0;
+        let mut evictions = 0;
+        // A budget of about six entries, one of sixty, one that
+        // holds everything, and none.
+        for budget in [6 * one, 60 * one, usize::MAX / 4, 0] {
+            for seed in 0..20 {
+                let dir = temp_dir(&format!("min-scan-{budget}-{seed}"));
+                let mut rng = crate::test_support::Rng::new(seed);
+                let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+                let mut model = min_scan::Index::new(budget);
+                for step in 0..300 {
+                    let key = rng.pick(&keys).clone();
+                    let what = match rng.below(100) {
+                        0..35 => {
+                            let len = [10, 300, 900, 2_500, 7_000][rng.below(5)];
+                            let copy = CachedImage {
+                                groups: some_groups(&mut rng),
+                                ..image(&vec![7; len])
+                            };
+                            let file_bytes = |groups: &[String]| {
+                                let landed = CachedImage {
+                                    groups: groups.to_vec(),
+                                    ..copy.clone()
+                                };
+                                serialize_entry(&key, &landed, &test_entry_key()).len()
+                            };
+                            store.put(&key, &copy);
+                            evictions += model.put(&key, &copy.groups, file_bytes);
+                            "put"
+                        }
+                        35..65 => {
+                            assert_eq!(store.get(&key).is_some(), model.get(&key));
+                            "get"
+                        }
+                        65..77 => {
+                            let more = some_groups(&mut rng);
+                            let grew = match store.learn_groups(&key, &more, Bucket::Unknown) {
+                                Learned::Indexed { grew, .. } => Some(grew),
+                                _ => None,
+                            };
+                            assert_eq!(grew, model.learn(&key, &more));
+                            "learn_groups"
+                        }
+                        77..85 => {
+                            assert_eq!(store.remove(&key), model.remove(&key).is_some());
+                            "remove"
+                        }
+                        85..90 => {
+                            let base = key.split('#').next().unwrap().to_string();
+                            let target = PurgeTarget::Key(base);
+                            assert_eq!(store.purge(&target).0, model.purge(&target));
+                            "purge key"
+                        }
+                        90..95 => {
+                            let target = PurgeTarget::Group(rng.pick(&names).to_string());
+                            assert_eq!(store.purge(&target).0, model.purge(&target));
+                            "purge group"
+                        }
+                        _ => {
+                            let target = PurgeTarget::Source(rng.pick(&sources).to_string());
+                            assert_eq!(store.purge(&target).0, model.purge(&target));
+                            "purge source"
+                        }
+                    };
+                    let at = format!("budget {budget}, seed {seed}, step {step}: {what} {key}");
+                    assert_eq!(lru_order(&store), model.order(), "{at}");
+                    let inner = store.inner.lock().unwrap();
+                    for (key, record) in &inner.entries {
+                        let entry = &model.entries[key];
+                        assert_eq!(
+                            (record.charge, record.file_bytes, &record.groups),
+                            (entry.charge, entry.file_bytes, &entry.groups),
+                            "{at}: {key}"
+                        );
+                    }
+                    assert_eq!(inner.total_bytes, model.total_bytes, "{at}");
+                    assert!(inner.total_bytes <= budget, "{at}");
+                    drop(inner);
+                    steps += 1;
+                }
+                drop(store);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        assert_eq!(steps, 4 * 20 * 300);
+        assert!(evictions > 1_000, "{evictions} evictions");
     }
 }
