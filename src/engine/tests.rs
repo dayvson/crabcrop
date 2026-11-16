@@ -10660,10 +10660,13 @@ fn debug_focal_objects_crop_marks_the_objects_and_the_union() {
 }
 
 #[test]
+#[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
 fn objects_crop_with_a_real_model_frames_the_dog() {
-    // Env-gated like the ai.rs live checks: without the
-    // ONNX runtime and a detection model the test skips
-    // (the CI ai-models workflow provisions both).
+    // Ignored like the src/ai/ live checks, so the ai-models
+    // workflow's `cargo test -- --ignored` runs it with the
+    // runtime and the detection model it provisions (issue
+    // #710); it never ran while it sat in the plain gate,
+    // which has neither. Without them it skips.
     use crate::ai::DetectionProvider as _;
     let (Some(dylib), Some(model)) = (
         crate::ai::env_or_skip("CRABCROP_TEST_ORT_DYLIB"),

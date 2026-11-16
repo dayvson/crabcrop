@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::env_or_skip;
 use crate::ai::moderation::VIT_STATS;
 use crate::ai::test_support::{layouts, noise_rgb, same_bits};
 
@@ -300,6 +301,18 @@ fn assert_clip_reference_ids(tokenizer_path: &str) {
     );
 }
 
+/// The values of the CRABCROP_TEST_* variables `names`, or
+/// `None` when one is not set: the real-model test that asked
+/// returns and skips, like the other real-model tests, instead
+/// of panicking on the first one missing (issue #710).
+fn clip_vars<const N: usize>(names: [&str; N]) -> Option<[String; N]> {
+    let mut values = names.map(|_| String::new());
+    for (value, name) in values.iter_mut().zip(names) {
+        *value = env_or_skip(name)?;
+    }
+    Some(values)
+}
+
 /// The tokenizer half of the live CLIP check, runnable
 /// without the runtime or the models. Ignored: needs
 /// the export's tokenizer file:
@@ -307,7 +320,10 @@ fn assert_clip_reference_ids(tokenizer_path: &str) {
 #[test]
 #[ignore = "needs the CLIP tokenizer.json (env-configured)"]
 fn clip_tokenizer_matches_the_reference_ids() {
-    assert_clip_reference_ids(&std::env::var("CRABCROP_TEST_CLIP_TOKENIZER").unwrap());
+    let Some([tokenizer]) = clip_vars(["CRABCROP_TEST_CLIP_TOKENIZER"]) else {
+        return;
+    };
+    assert_clip_reference_ids(&tokenizer);
 }
 
 /// The labels of the ai-models workflow's set that
@@ -338,20 +354,24 @@ const CLIP_FIXTURE_TOP_LABELS: &[&str] = &[
 #[test]
 #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
 fn clip_live_tags_a_photo() {
-    let var = |name: &str| std::env::var(name).unwrap();
+    let Some([dylib, image_model, text_model, tokenizer, labels, photo]) = clip_vars([
+        "CRABCROP_TEST_ORT_DYLIB",
+        "CRABCROP_TEST_CLIP_IMAGE_MODEL",
+        "CRABCROP_TEST_CLIP_TEXT_MODEL",
+        "CRABCROP_TEST_CLIP_TOKENIZER",
+        "CRABCROP_TEST_CLIP_LABELS",
+        "CRABCROP_TEST_IMAGE",
+    ]) else {
+        return;
+    };
     // The labels are embedded from these ids at load, so
     // a tokenizer regression fails here by name instead of
     // as quietly shifted scores.
-    assert_clip_reference_ids(&var("CRABCROP_TEST_CLIP_TOKENIZER"));
-    let provider = OnnxClipProvider::load(
-        Some(&var("CRABCROP_TEST_ORT_DYLIB")),
-        &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
-        &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
-        &var("CRABCROP_TEST_CLIP_TOKENIZER"),
-        &var("CRABCROP_TEST_CLIP_LABELS"),
-    )
-    .unwrap();
-    let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
+    assert_clip_reference_ids(&tokenizer);
+    let provider =
+        OnnxClipProvider::load(Some(&dylib), &image_model, &text_model, &tokenizer, &labels)
+            .unwrap();
+    let img = image::open(photo).unwrap();
     let scores = provider.scores(&img).unwrap();
     assert_eq!(scores.len(), provider.label_count());
     assert!(scores.iter().all(|s| s.score.is_finite()), "{scores:?}");
@@ -460,13 +480,20 @@ fn clip_load_garbage_tokenizer_file_is_a_load_error() {
 #[test]
 #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
 fn clip_load_missing_text_model_is_a_load_error() {
-    let var = |name: &str| std::env::var(name).unwrap();
+    let Some([dylib, image_model, tokenizer, labels]) = clip_vars([
+        "CRABCROP_TEST_ORT_DYLIB",
+        "CRABCROP_TEST_CLIP_IMAGE_MODEL",
+        "CRABCROP_TEST_CLIP_TOKENIZER",
+        "CRABCROP_TEST_CLIP_LABELS",
+    ]) else {
+        return;
+    };
     let message = expect_load(OnnxClipProvider::load(
-        Some(&var("CRABCROP_TEST_ORT_DYLIB")),
-        &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
+        Some(&dylib),
+        &image_model,
         &missing_path("clip-text"),
-        &var("CRABCROP_TEST_CLIP_TOKENIZER"),
-        &var("CRABCROP_TEST_CLIP_LABELS"),
+        &tokenizer,
+        &labels,
     ));
     assert!(message.contains("cannot load the model"), "{message}");
 }
@@ -478,14 +505,21 @@ fn clip_load_missing_text_model_is_a_load_error() {
 #[test]
 #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
 fn clip_load_garbage_text_model_is_a_load_error() {
-    let var = |name: &str| std::env::var(name).unwrap();
+    let Some([dylib, image_model, tokenizer, labels]) = clip_vars([
+        "CRABCROP_TEST_ORT_DYLIB",
+        "CRABCROP_TEST_CLIP_IMAGE_MODEL",
+        "CRABCROP_TEST_CLIP_TOKENIZER",
+        "CRABCROP_TEST_CLIP_LABELS",
+    ]) else {
+        return;
+    };
     let (_model, garbage) = temp_file("clip-text-garbage", b"this is not an onnx model at all");
     let message = expect_load(OnnxClipProvider::load(
-        Some(&var("CRABCROP_TEST_ORT_DYLIB")),
-        &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
+        Some(&dylib),
+        &image_model,
         &garbage,
-        &var("CRABCROP_TEST_CLIP_TOKENIZER"),
-        &var("CRABCROP_TEST_CLIP_LABELS"),
+        &tokenizer,
+        &labels,
     ));
     assert!(message.contains("cannot load the model"), "{message}");
 }
@@ -498,13 +532,20 @@ fn clip_load_garbage_text_model_is_a_load_error() {
 #[test]
 #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
 fn clip_load_missing_image_model_is_a_load_error() {
-    let var = |name: &str| std::env::var(name).unwrap();
+    let Some([dylib, text_model, tokenizer, labels]) = clip_vars([
+        "CRABCROP_TEST_ORT_DYLIB",
+        "CRABCROP_TEST_CLIP_TEXT_MODEL",
+        "CRABCROP_TEST_CLIP_TOKENIZER",
+        "CRABCROP_TEST_CLIP_LABELS",
+    ]) else {
+        return;
+    };
     let message = expect_load(OnnxClipProvider::load(
-        Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+        Some(&dylib),
         &missing_path("clip-image"),
-        &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
-        &var("CRABCROP_TEST_CLIP_TOKENIZER"),
-        &var("CRABCROP_TEST_CLIP_LABELS"),
+        &text_model,
+        &tokenizer,
+        &labels,
     ));
     assert!(message.contains("cannot load the model"), "{message}");
 }
@@ -520,12 +561,20 @@ fn clip_load_missing_image_model_is_a_load_error() {
 #[test]
 #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
 fn clip_load_swapped_model_pair_is_a_load_error() {
-    let var = |name: &str| std::env::var(name).unwrap();
+    let Some([dylib, image_model, text_model, tokenizer, labels]) = clip_vars([
+        "CRABCROP_TEST_ORT_DYLIB",
+        "CRABCROP_TEST_CLIP_IMAGE_MODEL",
+        "CRABCROP_TEST_CLIP_TEXT_MODEL",
+        "CRABCROP_TEST_CLIP_TOKENIZER",
+        "CRABCROP_TEST_CLIP_LABELS",
+    ]) else {
+        return;
+    };
     expect_load(OnnxClipProvider::load(
-        Some(&var("CRABCROP_TEST_ORT_DYLIB")),
-        &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
-        &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
-        &var("CRABCROP_TEST_CLIP_TOKENIZER"),
-        &var("CRABCROP_TEST_CLIP_LABELS"),
+        Some(&dylib),
+        &text_model,
+        &image_model,
+        &tokenizer,
+        &labels,
     ));
 }
