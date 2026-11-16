@@ -8520,6 +8520,74 @@ fn overlay_blend_honors_the_deadline() {
 }
 
 #[test]
+fn a_scaled_overlay_stops_at_the_deadline_while_it_scales() {
+    // A 500 px overlay at 100% of a 2000 px base lands whole,
+    // 2000x2000. Scaled in one call, it ran to the end before
+    // the deadline was looked at again; scaled a row at a
+    // time, it stops within a row of the deadline.
+    let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        2000,
+        2000,
+        image::Rgb([255, 0, 0]),
+    ));
+    let ov = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        500,
+        500,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 7]),
+    )));
+    let started = std::time::Instant::now();
+    let ctx = ProcessContext {
+        deadline: Some(started + std::time::Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let err = blend_overlay(
+        &ctx,
+        &base,
+        &ov,
+        0,
+        0,
+        100,
+        crate::url::BlendMode::Normal,
+        Some(100),
+    )
+    .unwrap_err();
+    assert!(matches!(err, EngineError::Timeout), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the scale ran {:?} past a 50 ms deadline",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_scaled_part_is_computed_a_row_at_a_time() {
+    // The callback runs once before each row of the part, and
+    // the first error ends the scale there.
+    let ov = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        30,
+        20,
+        image::Rgba([10, 20, 30, 40]),
+    ));
+    let size = overlay_scale::scaled_size((30, 20), 90);
+    assert_eq!(size, (90, 60));
+    let mut rows = 0;
+    let part = overlay_scale::scaled_part(&ov, size, (10, 5, 40, 12), || {
+        rows += 1;
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(part.dimensions(), (40, 12));
+    assert_eq!(rows, 12);
+    let mut rows = 0;
+    let stopped = overlay_scale::scaled_part(&ov, size, (0, 0, 90, 60), || {
+        rows += 1;
+        if rows == 3 { Err("deadline") } else { Ok(()) }
+    });
+    assert_eq!(stopped.unwrap_err(), "deadline");
+    assert_eq!(rows, 3);
+}
+
+#[test]
 fn unresolved_overlay_is_an_error() {
     let engine = Engine;
     let err = engine
