@@ -320,8 +320,17 @@ fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
         &default_policy,
     )
     .expect("a warning under the default policy");
-    assert!(warning.contains("(HTTPS_PROXY)"), "{warning}");
-    assert!(warning.contains("CRABCROP_ALLOWED_SOURCES"), "{warning}");
+    // Word for word what boot printed before the allowlist
+    // opt-in gave the warning a second form.
+    assert_eq!(
+        warning,
+        "a proxy is configured (HTTPS_PROXY), but source fetches bypass it: with \
+         private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
+         CRABCROP_ALLOWED_SOURCES, each source host is pinned to the address the check \
+         validated and connected to directly, so under proxy-only egress those fetches \
+         fail. List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through \
+         the proxy (see docs/configuration.md)"
+    );
     // The value is never echoed: a proxy URL can carry
     // credentials.
     assert!(!warning.contains("hunter2"), "{warning}");

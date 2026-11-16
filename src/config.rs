@@ -1577,7 +1577,7 @@ pub fn proxy_bypass_warning(
     let (why, fix) = if policy.allowed_suffixes.is_empty() {
         (
             "with private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
-             CRABCROP_ALLOWED_SOURCES",
+             CRABCROP_ALLOWED_SOURCES,",
             "List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy",
         )
     } else {

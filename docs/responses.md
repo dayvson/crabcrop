@@ -106,7 +106,7 @@ Operational failures carry these codes:
 | `invalid_upload_name` | `400` | The upload name is not valid. |
 | `upload_too_large` | `413` | The upload body is larger than the cap. |
 | `upload_unreadable` | `400` | The upload body could not be read to its end: the client aborted it, or its chunked framing is malformed. |
-| `upload_too_slow` | `408` | The upload body arrived too slowly: past its first 10 seconds, it had sent less than 64 KiB for each further second (see [Upload an original](endpoints.md#upload-an-original)). Nothing is stored, and the connection closes. |
+| `upload_too_slow` | `408` | The upload body arrived too slowly: past its first 10 seconds, it had sent less than 64 KiB for each further second (see [Upload an original](endpoints.md#upload-an-original)). Nothing is stored, and the rest of the body is not read: an HTTP/1.1 connection closes, and an HTTP/2 stream is reset. |
 | `upload_not_an_image` | `415` | The upload body is empty or does not decode as an image. |
 | `upload_media_mismatch` | `415` | The upload name's extension does not match the body's media kind. |
 | `upload_already_exists` | `409` | An upload to a name that already exists, while overwriting is off. |

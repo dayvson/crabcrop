@@ -5518,9 +5518,10 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 /// effective alpha is the overlay pixel's alpha times the
 /// opacity, and the base alpha channel is preserved, so
 /// `Normal` reproduces a watermark exactly. A scaled overlay
-/// is scaled only where it lands, a row at a time with the
-/// deadline checked before each row (see `overlay_scale`):
-/// the same pixels the whole scale gave there.
+/// is scaled only where it lands, a row at a time, with the
+/// deadline checked before each row and within a row that
+/// reads many source samples (see `overlay_scale`): the same
+/// pixels the whole scale gave there.
 #[allow(clippy::too_many_arguments)]
 fn blend_overlay(
     ctx: &ProcessContext<'_>,

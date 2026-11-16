@@ -390,6 +390,27 @@ if ($GROUP === 'config_constants') {
     eq(true, $config['disable_sizes'], 'constant supplies disable sizes');
     eq('CRABCROP_WP_BASE_URL', crabcrop_wp_constant_for('base_url'), 'constant_for names the base URL constant');
     eq(null, crabcrop_wp_constant_for('key_id'), 'constant_for: key id has no settings field');
+
+    // With the secret set by its constant, the page holds neither
+    // the constant's secret nor the stored one, and the disabled
+    // field, which the browser does not submit, keeps the stored
+    // secret on save.
+    ob_start();
+    crabcrop_wp_settings_page();
+    $page = ob_get_clean();
+    check(strpos($page, 'option-secret') === false, 'settings page: a constant set, the stored secret is not in the page');
+    check(strpos($page, 'const-secret') === false, "settings page: the constant's secret is not in the page");
+    check(
+        preg_match('/name="crabcrop_settings\[secret\]"\s+value=""[^>]*disabled="disabled"/', $page) === 1,
+        'settings page: a constant set, the secret field is empty and disabled'
+    );
+    check(strpos($page, 'A secret is stored') === false, 'settings page: a constant set, no claim of a stored secret');
+    check(strpos($page, 'crabcrop_settings[clear_secret]') === false, 'settings page: a constant set, nothing to remove');
+    eq(
+        'option-secret',
+        crabcrop_wp_sanitize_settings(array('base_url' => 'https://options.example.com'))['secret'],
+        'sanitize: a constant set, saving keeps the stored secret'
+    );
 }
 
 if ($GROUP === 'rewrite') {

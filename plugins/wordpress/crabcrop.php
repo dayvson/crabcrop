@@ -519,7 +519,7 @@ function crabcrop_wp_settings_page()
                 name="crabcrop_settings[secret]"
                 value=""
                 autocomplete="new-password"
-                <?php if ($values['has_secret']) : ?>placeholder="A secret is stored"<?php endif; ?>
+                <?php if ($values['has_secret'] && crabcrop_wp_constant_for('secret') === null) : ?>placeholder="A secret is stored"<?php endif; ?>
                 <?php disabled(crabcrop_wp_constant_for('secret') !== null); ?>>
               <?php if (crabcrop_wp_constant_for('secret')) : ?>
                 <p class="description">Set by the

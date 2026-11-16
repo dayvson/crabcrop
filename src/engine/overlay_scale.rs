@@ -1,6 +1,8 @@
 //! The scale behind `overlay(...,width)`: only the part of the
 //! scaled overlay that lands on the image below is computed,
-//! a row at a time, with the deadline checked before each row.
+//! a row at a time, with the deadline checked before each row
+//! and, within a row that reads many source samples, every
+//! [`CHECK_EVERY`] samples.
 //!
 //! The overlay used to be scaled whole by the image crate's
 //! Lanczos3 resize, one call that nothing could interrupt,
@@ -21,6 +23,15 @@
 //! in every layout.
 
 use image::{DynamicImage, ImageBuffer, Pixel, RgbaImage};
+
+/// The most source samples the vertical pass reads between
+/// two deadline checks within one row. A row of an overlay
+/// scaled far down reads many source rows, up to the whole
+/// overlay for a scale to a pixel or two, so a check before
+/// each row alone would leave that row's work unbounded by
+/// the deadline. About a million samples is a millisecond or
+/// two of work, and a check costs a clock read.
+pub(super) const CHECK_EVERY: usize = 1 << 20;
 
 /// The size the image crate's
 /// `resize(width, u32::MAX, Lanczos3)` gives an image of
@@ -49,14 +60,15 @@ pub(super) fn scaled_size((w, h): (u32, u32), width: u32) -> (u32, u32) {
 /// `size` with the image crate's Lanczos3 resize, in RGBA:
 /// the pixels of `image.resize_exact(size.0, size.1,
 /// Lanczos3)` in that part, converted the way `into_rgba8`
-/// converts them. `each_row` runs before each row of the
-/// part, where the caller checks the deadline; its error
-/// stops the scale.
+/// converts them. `check` runs before each row of the part,
+/// and within a row every [`CHECK_EVERY`] source samples its
+/// vertical pass reads, where the caller checks the deadline;
+/// its error stops the scale.
 pub(super) fn scaled_part<E>(
     image: &DynamicImage,
     size: (u32, u32),
     part: crate::filters::Rect,
-    each_row: impl FnMut() -> Result<(), E>,
+    check: impl FnMut() -> Result<(), E>,
 ) -> Result<RgbaImage, E> {
     let (x, y, w, h) = part;
     if size == (image.width(), image.height()) {
@@ -69,33 +81,33 @@ pub(super) fn scaled_part<E>(
         return Ok(whole.crop_imm(x, y, w, h).into_rgba8());
     }
     Ok(match image {
-        DynamicImage::ImageRgba8(src) => scale(src, size, part, each_row)?,
+        DynamicImage::ImageRgba8(src) => scale(src, size, part, check)?,
         DynamicImage::ImageRgb8(src) => {
-            DynamicImage::ImageRgb8(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageRgb8(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageLuma8(src) => {
-            DynamicImage::ImageLuma8(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageLuma8(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageLumaA8(src) => {
-            DynamicImage::ImageLumaA8(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageLumaA8(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageRgb16(src) => {
-            DynamicImage::ImageRgb16(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageRgb16(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageRgba16(src) => {
-            DynamicImage::ImageRgba16(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageRgba16(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageLuma16(src) => {
-            DynamicImage::ImageLuma16(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageLuma16(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageLumaA16(src) => {
-            DynamicImage::ImageLumaA16(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageLumaA16(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageRgb32F(src) => {
-            DynamicImage::ImageRgb32F(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageRgb32F(scale(src, size, part, check)?).into_rgba8()
         }
         DynamicImage::ImageRgba32F(src) => {
-            DynamicImage::ImageRgba32F(scale(src, size, part, each_row)?).into_rgba8()
+            DynamicImage::ImageRgba32F(scale(src, size, part, check)?).into_rgba8()
         }
         // A layout this module does not know: the crate's own
         // resize, whole, as before.
@@ -209,7 +221,7 @@ fn scale<P, E>(
     src: &ImageBuffer<P, Vec<P::Subpixel>>,
     (new_w, new_h): (u32, u32),
     (x0, y0, w, h): crate::filters::Rect,
-    mut each_row: impl FnMut() -> Result<(), E>,
+    mut check: impl FnMut() -> Result<(), E>,
 ) -> Result<ImageBuffer<P, Vec<P::Subpixel>>, E>
 where
     P: Pixel + 'static,
@@ -225,20 +237,28 @@ where
         (Some(first), Some(last)) => (first.first, last.end()),
         _ => (0, 0),
     };
-    let mut row = vec![0f32; (right - left) as usize * channels];
+    let span = (right - left) as usize * channels;
+    let mut row = vec![0f32; span];
     let mut out = Vec::with_capacity(w as usize * h as usize * channels);
     for y in y0..y0 + h {
-        each_row()?;
-        // The vertical pass for this row, over those columns.
+        check()?;
+        // The vertical pass for this row, over those columns,
+        // one source row at a time: each sum still takes its
+        // taps in the crate's order, first to last, so the
+        // sums are the crate's.
         let taps = Taps::of(y, src_h, new_h);
-        for (column, sums) in (left..right).zip(row.chunks_exact_mut(channels)) {
-            sums.fill(0.0);
-            for (i, &weight) in taps.weights.iter().enumerate() {
-                let at = ((taps.first as usize + i) * src_w as usize + column as usize) * channels;
-                for (sum, &sample) in sums.iter_mut().zip(&samples[at..at + channels]) {
-                    *sum += sample.read() * weight;
-                }
+        row.fill(0.0);
+        let mut unchecked = 0;
+        for (i, &weight) in taps.weights.iter().enumerate() {
+            if unchecked >= CHECK_EVERY {
+                check()?;
+                unchecked = 0;
             }
+            let at = ((taps.first as usize + i) * src_w as usize + left as usize) * channels;
+            for (sum, &sample) in row.iter_mut().zip(&samples[at..at + span]) {
+                *sum += sample.read() * weight;
+            }
+            unchecked += span;
         }
         // The horizontal pass for the part's columns.
         for taps in &columns {

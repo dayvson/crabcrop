@@ -8588,6 +8588,41 @@ fn a_scaled_part_is_computed_a_row_at_a_time() {
 }
 
 #[test]
+fn a_scaled_row_that_reads_many_source_rows_checks_the_deadline_within_it() {
+    // Scaled down to one row, a tall overlay's every source
+    // row feeds that row: 64 columns of 65,536 rows, 4M
+    // samples. The check runs before the row and again for
+    // each further `CHECK_EVERY` samples (1M) it reads, so a
+    // row's work is bounded by the deadline too, and the
+    // pixels are still the crate's.
+    let (w, h) = (64, 1 << 16);
+    let ov = DynamicImage::ImageLuma8(image::GrayImage::from_fn(w, h, |x, y| {
+        image::Luma([((x * 31 + y * 7) % 256) as u8])
+    }));
+    assert_eq!(overlay_scale::CHECK_EVERY, 1 << 20);
+    let mut checks = 0;
+    let part = overlay_scale::scaled_part(&ov, (w, 1), (0, 0, w, 1), || {
+        checks += 1;
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(checks, 4);
+    let whole = ov
+        .resize_exact(w, 1, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    assert_eq!(part.as_raw(), whole.as_raw());
+    // An error from a check inside the row stops the scale
+    // there.
+    let mut checks = 0;
+    let stopped = overlay_scale::scaled_part(&ov, (w, 1), (0, 0, w, 1), || {
+        checks += 1;
+        if checks == 2 { Err("deadline") } else { Ok(()) }
+    });
+    assert_eq!(stopped.unwrap_err(), "deadline");
+    assert_eq!(checks, 2);
+}
+
+#[test]
 fn unresolved_overlay_is_an_error() {
     let engine = Engine;
     let err = engine

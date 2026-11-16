@@ -424,7 +424,10 @@ fn put_local_checked(
 /// many of the name's directories that covers.
 struct Inside {
     root: PathBuf,
+    // Only the descriptor-relative write (Unix) walks these.
+    #[cfg_attr(not(unix), allow(dead_code))]
     beneath: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     existing: usize,
 }
 
