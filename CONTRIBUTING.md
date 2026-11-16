@@ -147,8 +147,8 @@ Moving to a newer stable release is a pull request of its own:
    and fix what the new lints find in the same pull request, so main never
    carries a toolchain its lint step fails on.
 3. Run the tests (`cargo test --locked --workspace`, and
-   `scripts/test_all.sh`): a new compiler can change a test's outcome, never
-   a render's bytes, which `scripts/check_rendering_version.py` watches.
+   `scripts/test_all.sh`). The render corpus must pass unchanged: a new
+   compiler is no reason to re-baseline it.
 4. Check `rust.yml`'s `semver` job: cargo-semver-checks reads the
    toolchain's rustdoc output, and a newer toolchain can need a newer
    release of it, pinned there with its checksum.

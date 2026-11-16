@@ -17,6 +17,7 @@ prints only what cannot carry the input:
   are;
 - where a panic happened (the `panicked at <file>:<line>:<column>:`
   line, never the message after it) and the stack frames;
+- cargo-fuzz's own `Error:` line, which says how the run ended;
 - each input the run left in the artifacts directory, by its kind
   (crash, leak, timeout, oom, slow-unit), SHA-256 and size.
 
@@ -47,6 +48,8 @@ KEEP = [
     # Where a panic happened; its message is on the lines after it.
     re.compile(r"thread '[^']*'(?: \(\d+\))? panicked at [^\s'\"]+:\d+:\d+:"),
     re.compile(r"artifact_prefix='[^']*'; Test unit written to \S+"),
+    # cargo-fuzz's own error, such as the exit status it reports.
+    re.compile(r"Error: .*"),
 ]
 # libFuzzer's hex dump of an input: `0x2f,0x75,...,`. The line after it
 # prints the same bytes as text.

@@ -123,6 +123,7 @@ class Report(unittest.TestCase):
             "SUMMARY: libFuzzer: deadly signal",
             f"Test unit written to fuzz/artifacts/parse_request/crash-{SHA1}",
             f"failing input (crash): sha256 {hashlib.sha256(INPUT).hexdigest()}, {len(INPUT)} bytes",
+            "Error: Fuzz target exited with exit status: 77",
         ):
             self.assertIn(kept, out)
         self.assertNotIn("NEW    cov", out)

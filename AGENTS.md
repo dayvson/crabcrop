@@ -73,12 +73,13 @@ both SDKs must all pass.
   the first CI run fails on style alone.
 - The real-model AI tests are `#[ignore]`d in the normal gate: they need
   model files and an ONNX Runtime library, which are deployment artifacts,
-  never repo content. Each one skips when its `CRABCROP_TEST_*` variable
-  is unset (`crate::ai::env_or_skip`), so a local run tests the models it
-  has. `.github/workflows/ai-models.yml` downloads the pinned artifacts and
-  runs every ignored test (`cargo test -- --ignored`), the ones in
-  `src/main.rs` and `src/engine.rs` included, with every variable set and
-  `CRABCROP_TEST_REQUIRE_MODELS=1`, which turns a skip into a failure. It
+  never repo content. A test that reads its `CRABCROP_TEST_*` variables
+  through `crate::ai::env_or_skip` skips when one is unset, so a local run
+  tests the models it has. `.github/workflows/ai-models.yml` downloads the
+  pinned artifacts and runs every ignored test (`cargo test -- --ignored`),
+  the ones in `src/main.rs` and `src/engine.rs` included, with every
+  variable set and `CRABCROP_TEST_REQUIRE_MODELS=1`, which turns such a
+  skip into a failure. It
   runs on pull requests and main pushes that touch anything under `src/`,
   the manifests, `Cargo.lock` (an `ort` bump), `rust-toolchain.toml`, the
   fixture photos the tests embed, its hash-locked Python requirements

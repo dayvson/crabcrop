@@ -6,7 +6,8 @@
 //! targets. Bounded and fast, so it belongs on the local
 //! checklist (scripts/test_all.sh); the open-ended fuzzing
 //! itself runs under cargo-fuzz on a nightly toolchain, every
-//! night in .github/workflows/fuzz.yml (see fuzz/README.md).
+//! night in .github/workflows/fuzz.yml once the owner enables
+//! that workflow (see fuzz/README.md, issue #710).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
