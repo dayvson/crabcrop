@@ -9,24 +9,30 @@
 # Go toolchain goes under ~/.local (no sudo for that step).
 #
 # Pinned versions (the single place to change them):
-GO_VERSION=1.26.5
-GO_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+GO_VERSION=1.27.4
+GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
 LIBVIPS_APT_VERSION=8.15.1
-IMGPROXY_VERSION=3.31.4
-IMGPROXY_TAG=v3.31.4
-IMGPROXY_COMMIT=8b0aa78279f191081054ba709b39f317f66ace78
+IMGPROXY_VERSION=4.0.24
+IMGPROXY_TAG=v4.0.24
+IMGPROXY_COMMIT=4735a54944a53a3d572c166b38649c841862520c
 THUMBOR_VERSION=7.8.0
 CRABCROP_VERSION=0.13.0
 CRABCROP_TAG=v0.13.0
 CRABCROP_COMMIT=06af7c7e7656c6877d8e3c6b2d74e9ab1ff1ca61
 
-# Why imgproxy 3.31.4 and not the newer 4.0.x line: imgproxy 4.0.x
-# needs Go 1.27 and a newer libvips than Ubuntu 24.04 ships. The
-# 3.31.4 release is the newest release whose CI tests libvips
-# 8.14, 8.15, and 8.16 (see .github/ci-docker in its tree), and
-# Ubuntu 24.04 apt provides libvips 8.15.1. That pairing builds
-# and runs unmodified. See results/2026-10-31.md for the full
-# version table and the fidelity caveat.
+# imgproxy 4.0.24 is the current imgproxy release. Its go.mod
+# requires Go 1.27, which the pin above provides. It builds
+# against libvips 8.15.1 (the Ubuntu 24.04 apt version) with
+# one adjustment: Go 1.27's external link refuses the
+# unresolved private dependencies of the shared libvips, so
+# the build passes -Wl,--allow-shlib-undefined, the semantics
+# the 3.31.4 build linked with under Go 1.26. The official
+# Docker image instead builds from the imgproxy-base image
+# (v4.0.15 for this release), which carries its own newer
+# libvips built from source, so encoder behavior could differ
+# slightly from this source build. See
+# results/2026-11-15-imgproxy4.md for the full version table
+# and the fidelity caveat.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,11 +71,15 @@ if [ ! -x "$WORK/imgproxy" ]; then
   git clone --depth 1 --branch "$IMGPROXY_TAG" https://github.com/imgproxy/imgproxy.git "$src"
   test "$(git -C "$src" rev-parse HEAD)" = "$IMGPROXY_COMMIT"
   # GOTMPDIR points into .work because Go builds spill gigabytes of
-  # temp files and some hosts mount a small /tmp.
+  # temp files and some hosts mount a small /tmp. The main package
+  # is ./cli in imgproxy 4.x, and the extldflags entry is the
+  # libvips link adjustment described with the pins above.
   mkdir -p "$WORK/gotmp"
   (cd "$src" && PATH="$GO_DIR/bin:$PATH" CGO_ENABLED=1 \
+    CGO_LDFLAGS_ALLOW='-Wl,--allow-shlib-undefined' \
     GOPATH="$WORK/gopath" GOCACHE="$WORK/gocache" GOTMPDIR="$WORK/gotmp" \
-    go build -ldflags "-s -w" -o "$WORK/imgproxy" .)
+    go build -ldflags "-s -w -extldflags '-Wl,--allow-shlib-undefined'" \
+    -o "$WORK/imgproxy" ./cli)
 fi
 "$WORK/imgproxy" --version || true
 

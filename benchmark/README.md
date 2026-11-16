@@ -5,7 +5,7 @@ same host, the same origin, and the same operations:
 
 - crabcrop 0.13.0 (release build from the `v0.13.0` tag)
 - Thumbor 7.8.0 (pip, venv)
-- imgproxy 3.31.4 (official source build, see the version notes)
+- imgproxy 4.0.24 (official source build, see the version notes)
 
 A second script, `bench_cache.py`, measures crabcrop's result
 cache under churn and accounts for its memory; see the cache
@@ -184,18 +184,21 @@ tier that the budget configures. Results are written up in
   06af7c7e7656c6877d8e3c6b2d74e9ab1ff1ca61. Built with
   `cargo build --release --locked` from the tag.
 - Thumbor 7.8.0, pip package `thumbor==7.8.0`, Python venv.
-- imgproxy 3.31.4, tag `v3.31.4`, commit
-  8b0aa78279f191081054ba709b39f317f66ace78, built from the
-  official source with Go 1.26.5 against libvips 8.15.1
-  (Ubuntu 24.04 apt). Why not the newer imgproxy 4.0.x line:
-  4.0.x needs Go 1.27 and a newer libvips than Ubuntu 24.04
-  ships; 3.31.4 is the newest release whose CI tests libvips
-  8.14, 8.15, and 8.16, so 8.15.1 is inside its supported
-  range. The official Docker image instead builds from the
-  imgproxy-base image (v3.15.9 for this release), which carries
-  its own newer libvips built from source, so encoder behavior
-  could differ slightly from this source build. The results
-  document repeats this caveat with the numbers.
+- imgproxy 4.0.24, tag `v4.0.24`, commit
+  4735a54944a53a3d572c166b38649c841862520c, built from the
+  official source with Go 1.27.4 against libvips 8.15.1
+  (Ubuntu 24.04 apt). Its go.mod requires Go 1.27, and
+  Go 1.27's external link needs
+  `-Wl,--allow-shlib-undefined` for the shared libvips's
+  private dependencies, which the build passes (setup.sh
+  carries the details). The official Docker image instead
+  builds from the imgproxy-base image (v4.0.15 for this
+  release), which carries its own newer libvips built from
+  source, so encoder behavior could differ slightly from
+  this source build. The results document repeats this
+  caveat with the numbers. Earlier runs in this series
+  measured imgproxy 3.31.4; their write-ups record why the
+  pin moved.
 
 ## Limits
 

@@ -52,6 +52,8 @@ EXAMPLES = {
     "benchmark/results/2026-11-15.md": "a dated benchmark record",
     "benchmark/results/2026-11-15.json": "a dated benchmark record",
     "benchmark/results/2026-11-15-cache.json": "a dated benchmark record",
+    "benchmark/results/2026-11-15-imgproxy4.md": "a dated benchmark record",
+    "benchmark/results/2026-11-15-imgproxy4.json": "a dated benchmark record",
 }
 
 
