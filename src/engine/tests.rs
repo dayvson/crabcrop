@@ -12738,3 +12738,77 @@ fn quality_in_force_resolves_each_form() {
     );
     assert_eq!(quality_in_force(None, false, never), in_force(None, None));
 }
+
+/// The parser now reads a negative zero as zero (issue #712).
+/// Each value it used to keep as `-0.0` renders the same bytes
+/// as `0.0`, so a URL that spells `-0` serves what it served
+/// before, now under the cache key of its `0` spelling: every
+/// float filter argument whose range holds zero, and the focal
+/// point a crop centers on.
+#[test]
+fn negative_zero_arguments_render_as_zero() {
+    fn chain(filter: Filter) -> Vec<Operation> {
+        vec![Operation::Filters(vec![
+            filter,
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+        ])]
+    }
+    fn focal(x: f32, y: f32) -> Vec<Operation> {
+        vec![
+            Operation::FocalPoint { x, y, zoom: 1.0 },
+            Operation::Crop {
+                size: ImageSize {
+                    width: Dimension::Pixels(60),
+                    height: Dimension::Pixels(100),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                align: Align::Center,
+            },
+        ]
+    }
+    type Build = fn(f32) -> Vec<Operation>;
+    let builds: [(&str, Build); 9] = [
+        ("contrast", |v| chain(Filter::Contrast(v))),
+        ("exposure", |v| chain(Filter::Exposure(v))),
+        ("highlights", |v| chain(Filter::HighlightsShadows(v, 30.0))),
+        ("shadows", |v| chain(Filter::HighlightsShadows(-30.0, v))),
+        ("both", |v| chain(Filter::HighlightsShadows(v, v))),
+        ("saturation", |v| chain(Filter::Saturation(v))),
+        ("vibrance", |v| chain(Filter::Vibrance(v))),
+        ("facepad", |v| chain(Filter::FacePad(v))),
+        ("focalpoint", |v| focal(v, v)),
+    ];
+    let engine = Engine;
+    for source in [photo_like_png(), gradient_png()] {
+        for (name, build) in builds {
+            let render = |v: f32| engine.process(&source, &build(v)).unwrap().bytes;
+            assert_eq!(render(-0.0), render(0.0), "{name}");
+        }
+        let point = |x: f32, y: f32| engine.process(&source, &focal(x, y)).unwrap().bytes;
+        assert_eq!(point(-0.0, 0.5), point(0.0, 0.5), "focalpoint x");
+        assert_eq!(point(0.5, -0.0), point(0.5, 0.0), "focalpoint y");
+    }
+    // The face crop's padding, which `facepad` sets, frames the
+    // same window at either zero.
+    let canvas = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 120, |x, y| {
+        image::Rgb([(x % 251) as u8, (y * 2 % 251) as u8, ((x + y) % 251) as u8])
+    }));
+    let face = crate::ai::FaceBox {
+        x: 70,
+        y: 30,
+        w: 40,
+        h: 40,
+        score: 0.9,
+    };
+    let crop = |padding: f32| {
+        png_bytes(&crate::crop::crop_around_face(
+            canvas.clone(),
+            3,
+            2,
+            &face,
+            padding,
+        ))
+    };
+    assert_eq!(crop(-0.0), crop(0.0));
+}

@@ -6,6 +6,8 @@ filters:<name>(<params>):<name>(<params>):...
 
 Filters chain inside one `filters:` segment, separated by `:`, and run in the order written. A filter with no parameters may omit the parentheses: `grayscale` and `grayscale()` are the same. You may also repeat the `filters:` segment in a path. When a directive repeats, the last one wins.
 
+Numbers are written in digits, with an optional `+`, and with a `-` only where the parameter's range goes negative: `trim(-0)` is refused. The parameters of `blur`, `sharpen`, `contrast`, `gamma`, `exposure`, `highlights_shadows`, `vibrance`, `saturation`, `facepad` and `dpr` may also take a fraction and an exponent (`2.5`, `.5`, `2e1`). Each is read as a 32-bit float, and its range applies to the rounded value: `blur(512.00001)` is `blur(512)`. Colors are hex digits only, and an encoded parameter escapes a byte as `%` and two hex digits. All the spellings of one value share one cache entry: `blur(+2)`, `blur(2e0)` and `blur(2)` are one render, and so are `saturation(-0)` and `saturation(0)`. [Argument spellings](../spec/url-signing.md#argument-spellings) has the full rules.
+
 **Pixel filters** change the image itself:
 
 | Filter | Parameters | Description | Example |

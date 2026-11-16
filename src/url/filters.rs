@@ -38,10 +38,10 @@ use std::str::FromStr;
 use super::{
     Anchor, BlendMode, CurveChannel, Filter, FlipDirection, FormatSpec, ImageFormat,
     MAX_BLUR_SIGMA, MAX_DIMENSION, MAX_EXPOSURE, MAX_GAMMA, MAX_TEXT_EXTENT, MAX_TEXT_GLYPHS,
-    MaskShape, ParseError, Quality, QualityValue, StudioMode, StudioSpec, anchor_text, encode_arg,
-    format_angle, format_kernel_value, format_text, hex3, parse_angle, parse_class_name,
-    parse_format_spec, parse_hex6, parse_kernel_value, parse_quality, parse_studio,
-    parse_text_color, percent_decode, quality_value_text,
+    MaskShape, ParseError, Quality, QualityValue, StudioMode, StudioSpec, anchor_text, decode_arg,
+    encode_arg, format_angle, format_kernel_value, format_text, hex3, parse_angle,
+    parse_class_name, parse_format_spec, parse_hex6, parse_kernel_value, parse_quality,
+    parse_studio, parse_text_color, positive_zero, quality_value_text,
 };
 
 /// How one argument is read from the URL and written in the
@@ -62,7 +62,11 @@ trait Kind {
 /// the field's own type keeps each filter's spellings
 /// exact: an unsigned argument refuses a minus sign, `-0`
 /// included, and a float bound refuses NaN and the
-/// infinities.
+/// infinities. A float is the decimal rounded to the
+/// nearest `f32`, and the bounds apply to that value, so
+/// `blur(512.00001)` is `blur(512)`; a negative zero reads
+/// as zero (see [`Stored`]). `spec/url-signing.md` states
+/// these spellings for every implementation (issue #712).
 struct Number<T> {
     min: T,
     max: T,
@@ -89,11 +93,36 @@ impl<T> Number<T> {
     }
 }
 
-impl<T: FromStr + PartialOrd + Display> Kind for Number<T> {
+/// The value a parsed number is stored as: the number
+/// itself, except that a float's negative zero is zero
+/// (issue #712). `-0`, `0`, and a negative decimal too
+/// small for an `f32` then read as one value, spell one
+/// canonical way, and share one cache key. The engine
+/// renders the two zeros alike, so the URLs that spelled
+/// `-0` serve the same bytes as before.
+trait Stored: Sized {
+    fn stored(self) -> Self {
+        self
+    }
+}
+
+impl Stored for u8 {}
+impl Stored for u16 {}
+impl Stored for u32 {}
+impl Stored for u64 {}
+impl Stored for i32 {}
+
+impl Stored for f32 {
+    fn stored(self) -> Self {
+        positive_zero(self)
+    }
+}
+
+impl<T: FromStr + PartialOrd + Display + Stored> Kind for Number<T> {
     type Value = T;
 
     fn read(&self, text: &str) -> Option<T> {
-        let value: T = text.parse().ok()?;
+        let value = text.parse::<T>().ok()?.stored();
         let above_min = if self.open {
             value > self.min
         } else {
@@ -171,7 +200,7 @@ impl Kind for ClassName {
     type Value = String;
 
     fn read(&self, text: &str) -> Option<String> {
-        parse_class_name(&percent_decode(text)?)
+        parse_class_name(&decode_arg(text)?)
     }
 
     fn spell(&self, value: &String) -> String {
@@ -602,7 +631,7 @@ fn read_watermark(p: &str) -> Option<Filter> {
     let alpha = OPACITY.read(alpha)?;
     let y = OFFSET.read(y)?;
     let x = OFFSET.read(x)?;
-    let url = percent_decode(url)?;
+    let url = decode_arg(url)?;
     if url.is_empty() {
         return None;
     }
@@ -630,7 +659,7 @@ fn read_overlay(p: &str) -> Option<Filter> {
     let alpha = OPACITY.read(alpha)?;
     let y = OFFSET.read(y)?;
     let x = OFFSET.read(x)?;
-    let url = percent_decode(url)?;
+    let url = decode_arg(url)?;
     if url.is_empty() {
         return None;
     }
@@ -671,7 +700,7 @@ fn read_text(p: &str) -> Option<Filter> {
     let anchor = Anchor::parse(anchor)?;
     let color = parse_text_color(color)?;
     let size = TEXT_SIZE.read(size)?;
-    let text = percent_decode(text)?;
+    let text = decode_arg(text)?;
     let glyphs = text.chars().count();
     if glyphs == 0 || glyphs > MAX_TEXT_GLYPHS || glyphs as u64 * size as u64 > MAX_TEXT_EXTENT {
         return None;

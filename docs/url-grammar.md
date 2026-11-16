@@ -43,7 +43,7 @@ Signing proves a URL was minted by someone holding the secret, but it hides noth
 https://images.example.com/s1.AAECAwQFBgcICQoL4rtOMQ/.../photo.jpg
 ```
 
-The token is `s1.` plus base64url(nonce, ciphertext, tag): AES-256-GCM over the whole remainder, under a key derived from the same secret, so there is no second secret to manage. The text after the token (`photo.jpg` above) is a friendly name: purely cosmetic, never parsed or authenticated, present so sealed URLs still read as images in logs, analytics, and page source. A sealed URL serves exactly what its plain spelling serves: the server decrypts the remainder and runs the same pipeline, so both forms share one cache entry, one ETag, and one purge target. Mint one with the builders (`build_sealed_url` in Rust, `buildSealedURL` in TypeScript, `build_sealed_url` in Python, where sealing alone needs the `crabcrop-url[seal]` extra) or the CLI:
+The token is `s1.` plus base64url(nonce, ciphertext, tag): AES-256-GCM over the whole remainder, under a key derived from the same secret, so there is no second secret to manage. The text after the token (`photo.jpg` above) is a friendly name: purely cosmetic, never parsed or authenticated, present so sealed URLs still read as images in logs, analytics, and page source. A sealed URL serves exactly what its plain spelling serves: the server decrypts the remainder and runs the same pipeline, so both forms share one cache entry, one ETag, and one purge target. Mint one with the builders (`SealedUrl` in Rust, `buildSealedURL` in TypeScript, `build_sealed_url` in Python, where sealing alone needs the `crabcrop-url[seal]` extra) or the CLI:
 
 ```bash
 crabcrop seal 'filters:format(webp):quality(80)/https://media.example.com/heroes/dog.jpg' dog.jpg

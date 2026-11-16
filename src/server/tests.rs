@@ -3049,6 +3049,28 @@ fn load_spec(name: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap()
 }
 
+/// What the server answers a remainder with no presets, no
+/// default operations and no source roots, as far as the
+/// grammar decides it: the source it parses to, or the code it
+/// is refused with. The same refusals in the same order as
+/// [`resolve_request`] and the explain route: the reserved
+/// segments before the parse, the caps after it (issue #712).
+fn grammar_verdict(remainder: &str) -> Result<&str, &'static str> {
+    if crabcrop_url::is_reserved_remainder(remainder)
+        || matches!(
+            remainder.split('/').next(),
+            Some("purge" | "purge-group" | "upload")
+        )
+    {
+        return Err("reserved_segment");
+    }
+    let (ops, source, _, _) =
+        crate::url::parse_operations_with_expiry(remainder).map_err(|e| e.code())?;
+    crate::url::check_operation_count(&ops).map_err(|e| e.code())?;
+    crate::url::check_watermark_count(&ops).map_err(|e| e.code())?;
+    Ok(source)
+}
+
 #[test]
 fn differential_verdict_corpus_agrees_with_the_parser() {
     let doc = load_spec("explain-verdicts.json");
@@ -3057,8 +3079,8 @@ fn differential_verdict_corpus_agrees_with_the_parser() {
         let remainder = case["remainder"].as_str().unwrap();
         let expect_error = case["error"].as_bool().unwrap();
         let expect_source = case["source"].as_str().unwrap();
-        match crate::url::parse_operations_with_expiry(remainder) {
-            Ok((_, source, _, _)) => {
+        match grammar_verdict(remainder) {
+            Ok(source) => {
                 if expect_error {
                     bad.push(format!("{remainder}: corpus says error, parser accepts"));
                 } else if source != expect_source {
@@ -3067,12 +3089,9 @@ fn differential_verdict_corpus_agrees_with_the_parser() {
                     ));
                 }
             }
-            Err(e) => {
+            Err(code) => {
                 if !expect_error {
-                    bad.push(format!(
-                        "{remainder}: corpus says ok, parser errors {}",
-                        e.code()
-                    ));
+                    bad.push(format!("{remainder}: corpus says ok, parser errors {code}"));
                 }
             }
         }

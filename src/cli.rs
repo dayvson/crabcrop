@@ -303,7 +303,7 @@ fn split_signed(input: &str, base: &str) -> (Option<Signature>, Option<String>, 
     // path really starts with a signature segment: a bare
     // remainder also contains "://" (in its source), so
     // anything less strict would mangle it.
-    if let Some((_, after_scheme)) = input.split_once("://") {
+    if let Some(after_scheme) = after_url_scheme(input) {
         let path = after_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
         if let Ok((sig, kid, remainder)) = crate::url::parse_signature(path) {
             return (Some(sig), kid, remainder.to_string());
@@ -317,6 +317,38 @@ fn split_signed(input: &str, base: &str) -> (Option<Signature>, Option<String>, 
     }
 }
 
+/// The text after `<scheme>://` when `input` opens with a URL
+/// scheme (RFC 3986: a letter, then letters, digits, `+`, `-`
+/// or `.`), as a full URL does. A path or a bare remainder
+/// holds a `://` too, in its source
+/// (`/unsafe/filters:blur(2)/http://x/a.png`), and the text
+/// before it there is no scheme (issue #712).
+fn after_url_scheme(input: &str) -> Option<&str> {
+    let (scheme, after) = input.split_once("://")?;
+    let mut chars = scheme.chars();
+    let is_scheme = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    is_scheme.then_some(after)
+}
+
+/// Why the server refuses `rest` before it reads an operation,
+/// whatever the signature: its first segment is the one key
+/// derivation owns, or one of the purge and upload endpoints'
+/// own (the server's `resolve_request`).
+fn refused_remainder(rest: &str) -> Option<String> {
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Some(format!(
+            "an image URL may not begin with the reserved segment {}",
+            crabcrop_url::RESERVED_SEGMENT
+        ));
+    }
+    matches!(
+        rest.split('/').next(),
+        Some("purge" | "purge-group" | "upload")
+    )
+    .then(|| "an image URL may not begin with a purge or upload segment".to_string())
+}
+
 /// What validating a CLI remainder yields: how many leading
 /// segments preset expansion dropped, then the parse (the
 /// operations, the source, and the `exp:` / `maxage:`
@@ -328,8 +360,18 @@ type PresetParse = (usize, Vec<Operation>, String, Option<u64>, Option<u32>);
 /// rest, returning how many were dropped. Server presets
 /// expand before parsing, so the CLI cannot parse them
 /// itself; it can only step aside. A remainder that parses
-/// no way fails with the error of the whole remainder.
+/// no way fails with the error of the whole remainder. The
+/// operations that parse are held to the server's caps
+/// (issue #712): a dropped reference only adds operations,
+/// so a parse past either cap is one the server refuses.
 fn parse_with_presets(rest: &str) -> Result<PresetParse, ParseError> {
+    let parsed = parse_past_presets(rest)?;
+    crate::url::check_operation_count(&parsed.1)?;
+    crate::url::check_watermark_count(&parsed.1)?;
+    Ok(parsed)
+}
+
+fn parse_past_presets(rest: &str) -> Result<PresetParse, ParseError> {
     let first_error = match crate::url::parse_operations_with_expiry(rest) {
         Ok((ops, source, expiry, max_age)) => {
             return Ok((0, ops, source.to_string(), expiry, max_age));
@@ -518,8 +560,8 @@ fn unseal_cmd(config: &Config, positional: &[String]) -> Result<String, CliError
     let input = input.trim();
     let path = match input.strip_prefix(&format!("{}/", config.base)) {
         Some(rest) => rest.to_string(),
-        None => match input.split_once("://") {
-            Some((_, after_scheme)) => after_scheme
+        None => match after_url_scheme(input) {
+            Some(after_scheme) => after_scheme
                 .split_once('/')
                 .map(|(_, p)| p.to_string())
                 .unwrap_or_default(),
@@ -569,7 +611,13 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, CliError> {
         None => lines.push("signature: none (bare remainder)".to_string()),
     }
     let segments: Vec<&str> = rest.split('/').collect();
-    match parse_with_presets(&rest) {
+    // The server refuses these before it reads an operation,
+    // so the verdict is the server's whatever the grammar says.
+    let parsed = match refused_remainder(&rest) {
+        Some(reason) => Err(reason),
+        None => parse_with_presets(&rest).map_err(|e| e.to_string()),
+    };
+    match parsed {
         Ok((dropped, ops, source, expiry, max_age)) => {
             for seg in &segments[..dropped] {
                 lines.push(format!(
@@ -2415,6 +2463,90 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("DOES NOT MATCH"), "{out}");
+    }
+
+    /// `explain` gives the server's verdict (issue #712): on a
+    /// path whose source carries a scheme, on the remainders the
+    /// server refuses before it reads an operation, on the
+    /// operation and watermark caps, and on each number spelling.
+    #[tokio::test]
+    async fn explain_gives_the_server_verdict() {
+        let explain = |input: String| async move {
+            exec(&args(&["explain", "--base", "http://img.test", &input]))
+                .await
+                .unwrap()
+        };
+        let out = explain("/unsafe/filters:blur(2)/http://x/a.png".to_string()).await;
+        assert!(out.contains("signature: unsafe"), "{out}");
+        assert!(out.contains("source: http://x/a.png"), "{out}");
+        assert!(out.contains("verdict: valid, 1 operation"), "{out}");
+        let watermarks = (0..17)
+            .map(|i| format!("watermark(w{i}.png,0,0,50)"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let refused: [(String, &str); 8] = [
+            (
+                "crabcrop/x".into(),
+                "an image URL may not begin with the reserved segment crabcrop",
+            ),
+            (
+                "crabcrop".into(),
+                "an image URL may not begin with the reserved segment crabcrop",
+            ),
+            (
+                "purge/300x200/x.jpg".into(),
+                "an image URL may not begin with a purge or upload segment",
+            ),
+            (
+                "upload/x.jpg".into(),
+                "an image URL may not begin with a purge or upload segment",
+            ),
+            (
+                format!("filters:{}/x.jpg", ["invert"; 101].join(":")),
+                "request has 101 operations, over the 100 operation limit",
+            ),
+            (
+                format!("filters:{watermarks}/x.jpg"),
+                "request names 17 distinct watermark and overlay URLs",
+            ),
+            (
+                "filters:text(Hi,12,+fffff,center)/x.jpg".into(),
+                "invalid filters segment",
+            ),
+            (
+                "filters:text(%+1Hi,12,ffffff,center)/x.jpg".into(),
+                "invalid filters segment",
+            ),
+        ];
+        for (remainder, reason) in refused {
+            let out = explain(format!("/unsafe/{remainder}")).await;
+            assert!(
+                out.contains(&format!("verdict: invalid: {reason}")),
+                "{out}"
+            );
+        }
+        // The caps leave room up to them.
+        let at_cap = format!("/unsafe/filters:{}/x.jpg", ["invert"; 100].join(":"));
+        assert!(explain(at_cap).await.contains("verdict: valid"));
+        // A negative zero reads as zero, in the gloss as in
+        // the canonical form.
+        let out = explain("/unsafe/filters:contrast(-0)/x.jpg".to_string()).await;
+        assert!(out.contains("contrast(0): adjust contrast"), "{out}");
+        // Signing holds the caps too, before it mints a URL the
+        // server would refuse.
+        let err = exec(&args(&[
+            "sign",
+            "--secret",
+            "cli-cap-secret",
+            &format!("filters:{}/x.jpg", ["invert"; 101].join(":")),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("request has 101 operations, over the 100 operation limit"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -1046,6 +1046,561 @@
    "remainder": "crop:100x100:objects(%C2%85person%C2%85)/https://example.com/a.jpg",
    "error": false,
    "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(512.00001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:contrast(100.000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(10.0000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:facepad(3.0000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(10.0000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(255.000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(-100.000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(100.000001,-100.000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(1.50000001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:1.00000001x0.5/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.5x0.5:100.000001/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person):100.000001/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:rotate(36000.001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:rotate(-36000.001)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(1.1754944e-38)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(1e-40)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:sharpen(3.4028235e38)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(512.0000305175781249999999999999999)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(512.0001)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(512.0000305175781250000000000000001)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(1e-40)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(1e-46)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(1e-46)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:sharpen(1e-46)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:sharpen(1e39)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:sharpen(3.4028236e38)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:contrast(100.00001)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(1.5000001)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:1.0000001x0.5/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:rotate(36000.002)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:contrast(inf)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(NaN)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(+2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(2e0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(2.)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(+.5e1)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(+2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(2e0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(02)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:upscale(+2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:upscale(04)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webp,method:+6)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webp,method:06)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webp,sns:+50)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webp,sns:050)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop-rect:+0x+0:+10x010/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(a.png,-0,-0,50)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:brighten(-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:rgb(-0,+0,0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:contrast(-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(-1e-50)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(-0,-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:facepad(-0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:-0x-0/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:trim(-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:trim(20,-0,0,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:radius(-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:radius(1,2,3,-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:border(-0,000000)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur_region(-0,0,10,10)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,-0,0,255,255)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(a.png,0,0,-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(a.png,0,0,-0,normal)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop-rect:-0x0:10x10/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focal:-0x0:10x10/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:upscale(-2)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webp,method:-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(%01Hi,12,ffffff,center)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%09person)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(%+1Hi,12,ffffff,center)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(Hi,12,+fffff,center)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(Hi,12,+fffffff,center)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%+9person)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(%+9person)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(%+1a.png,0,0,50)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%E0%A4%B9%E0%A4%BF%E0%A4%82%E0%A4%A6%E0%A5%80)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(a%CD%85)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:pixelateclass(%E2%92%B6)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:recolorclass(%E2%85%A0,ff0000)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(%E0%A4%B9%E0%A4%BF%E0%A4%82%E0%A4%A6%E0%A5%80)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(%E2%9C%93)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(a%E2%80%8Db)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "300x200/filters:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "300x200/filters:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "exp:1893456000/maxage:60/filters:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert:invert/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(w0.png,0,0,50):watermark(w1.png,0,0,50):watermark(w2.png,0,0,50):watermark(w3.png,0,0,50):watermark(w4.png,0,0,50):watermark(w5.png,0,0,50):watermark(w6.png,0,0,50):watermark(w7.png,0,0,50):watermark(w8.png,0,0,50):watermark(w9.png,0,0,50):watermark(w10.png,0,0,50):watermark(w11.png,0,0,50):watermark(w12.png,0,0,50):watermark(w13.png,0,0,50):watermark(w14.png,0,0,50):watermark(w15.png,0,0,50)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(w0.png,0,0,50):watermark(w1.png,0,0,50):watermark(w2.png,0,0,50):watermark(w3.png,0,0,50):watermark(w4.png,0,0,50):watermark(w5.png,0,0,50):watermark(w6.png,0,0,50):watermark(w7.png,0,0,50):watermark(w8.png,0,0,50):watermark(w9.png,0,0,50):watermark(w10.png,0,0,50):watermark(w11.png,0,0,50):watermark(w12.png,0,0,50):watermark(w13.png,0,0,50):watermark(w14.png,0,0,50):watermark(w15.png,0,0,50):watermark(w16.png,0,0,50)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(w0.png,0,0,50):watermark(w1.png,0,0,50):watermark(w2.png,0,0,50):watermark(w3.png,0,0,50):watermark(w4.png,0,0,50):watermark(w5.png,0,0,50):watermark(w6.png,0,0,50):watermark(w7.png,0,0,50):watermark(w8.png,0,0,50):watermark(w9.png,0,0,50):watermark(w10.png,0,0,50):watermark(w11.png,0,0,50):watermark(w12.png,0,0,50):watermark(w13.png,0,0,50):watermark(w14.png,0,0,50):watermark(w15.png,0,0,50):watermark(w0.png,5,5,50):overlay(w1.png,0,0,50,multiply)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(w0.png,0,0,50):watermark(w1.png,0,0,50):watermark(w2.png,0,0,50):watermark(w3.png,0,0,50):watermark(w4.png,0,0,50):watermark(w5.png,0,0,50):watermark(w6.png,0,0,50):watermark(w7.png,0,0,50):watermark(w8.png,0,0,50):watermark(w9.png,0,0,50):watermark(w10.png,0,0,50):watermark(w11.png,0,0,50):watermark(w12.png,0,0,50):watermark(w13.png,0,0,50):watermark(w14.png,0,0,50):watermark(w15.png,0,0,50):overlay(w16.png,0,0,50,multiply)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:watermark(w0.png,0,0,50):watermark(w1.png,0,0,50):watermark(w2.png,0,0,50):watermark(w3.png,0,0,50):watermark(w4.png,0,0,50):watermark(w5.png,0,0,50):watermark(w6.png,0,0,50):watermark(w7.png,0,0,50):watermark(w8.png,0,0,50):watermark(w9.png,0,0,50):watermark(w10.png,0,0,50):watermark(w11.png,0,0,50):watermark(w12.png,0,0,50):watermark(w13.png,0,0,50):watermark(w14.png,0,0,50):watermark(w15.png,0,0,50):watermark(w%30.png,0,0,50)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crabcrop",
+   "error": true,
+   "source": "crabcrop"
+  },
+  {
+   "remainder": "crabcrop/x",
+   "error": true,
+   "source": "crabcrop/x"
+  },
+  {
+   "remainder": "crabcrop/purge-key",
+   "error": true,
+   "source": "crabcrop/purge-key"
+  },
+  {
+   "remainder": "purge/300x200/x.jpg",
+   "error": true,
+   "source": "purge/300x200/x.jpg"
+  },
+  {
+   "remainder": "purge-group/thumb",
+   "error": true,
+   "source": "purge-group/thumb"
+  },
+  {
+   "remainder": "upload/x.jpg",
+   "error": true,
+   "source": "upload/x.jpg"
+  },
+  {
+   "remainder": "crabcrop-assets/a.jpg",
+   "error": false,
+   "source": "crabcrop-assets/a.jpg"
+  },
+  {
+   "remainder": "CRABCROP/x",
+   "error": false,
+   "source": "CRABCROP/x"
+  },
+  {
+   "remainder": "purges/x.jpg",
+   "error": false,
+   "source": "purges/x.jpg"
+  },
+  {
+   "remainder": "300x200/crabcrop/x.jpg",
+   "error": false,
+   "source": "crabcrop/x.jpg"
+  },
+  {
+   "remainder": "filters:sharpen(3.4028235677973366e38)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:sharpen(3.4028235677973367e38)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
   }
  ]
 }
