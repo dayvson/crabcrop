@@ -41,8 +41,11 @@
 //! the damage, the answer is libwebp's, as it is for a still
 //! WebP in the same state.
 //!
-//! The limits are the caller's and unchanged: the image crate's
-//! decoder opens the file first, with the decode limits, and
+//! The limits are the caller's and unchanged: the caller charges
+//! the canvas and the frame count from the headers before any
+//! frame decodes (`super::check_webp_frame_budget`, the WebP
+//! counterpart of `check_gif_frame_budget`), the image crate's
+//! decoder opens the file, with the decode limits, and
 //! `collect_frames` charges the frame cap, the pixel and
 //! allocation budgets and the deadline on the frames this walk
 //! yields exactly as on the iterator's. The walk itself holds
@@ -121,50 +124,87 @@ fn chunk_header(bytes: &[u8], at: usize) -> Option<([u8; 4], usize, usize)> {
     Some((fourcc, size, size.checked_add(size & 1)?))
 }
 
+/// An animated WebP's canvas size, alpha flag, ANMF frame count,
+/// and the offset of its first ANMF chunk, read the way
+/// image-webp reads them (`read_data`). `None` when the file is
+/// not a plain animated one. The engine's budget charge
+/// ([`super::check_webp_frame_budget`]) and [`Animation::open`]
+/// read the canvas and the frame count through here, so the
+/// pixels charged before a decode are the pixels the decoder
+/// allocates.
+pub(super) struct Header {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    has_alpha: bool,
+    pub(super) frames: u32,
+    first_anmf: Option<usize>,
+}
+
+pub(super) fn header(bytes: &[u8]) -> Option<Header> {
+    if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
+        return None;
+    }
+    let riff_size = usize::try_from(u32le(bytes, 4)?).ok()?;
+    let (first, size, rounded) = chunk_header(bytes, 12)?;
+    if &first != b"VP8X" || size < 10 {
+        return None;
+    }
+    let flags = *bytes.get(20)?;
+    let has_alpha = flags & 0b0001_0000 != 0;
+    if flags & 0b0000_0010 == 0 {
+        return None;
+    }
+    let width = u24(bytes, 24)? + 1;
+    let height = u24(bytes, 27)? + 1;
+    // The ANMF chunks, counted the way image-webp counts them:
+    // every chunk after VP8X, up to the RIFF size past it or the
+    // end of the bytes.
+    let mut at = 20usize.checked_add(rounded)?;
+    let end = at.checked_add(riff_size.saturating_sub(12))?;
+    let mut first_anmf = None;
+    let mut frames = 0u32;
+    while at < end {
+        let Some((fourcc, _, rounded)) = chunk_header(bytes, at) else {
+            break;
+        };
+        if &fourcc == b"ANMF" {
+            first_anmf.get_or_insert(at);
+            frames = frames.checked_add(1)?;
+        }
+        at = at.checked_add(8)?.checked_add(rounded)?;
+    }
+    Some(Header {
+        width,
+        height,
+        has_alpha,
+        frames,
+        first_anmf,
+    })
+}
+
 impl<'a> Animation<'a> {
     /// Start the walk over a file the image crate's decoder has
     /// already opened, so the container has passed its checks,
     /// which this repeats none of. `background` is the colour
     /// set on that decoder. The canvas size, the alpha flag, the
-    /// first frame and the frame count are read the way
-    /// image-webp reads them. `None` when the file is not a plain
-    /// animated one.
+    /// first frame and the frame count are read by [`header`],
+    /// the way image-webp reads them. `None` when the file is not
+    /// a plain animated one.
     pub(super) fn open(bytes: &'a [u8], background: Option<[u8; 4]>) -> Option<Self> {
-        if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
-            return None;
-        }
-        let riff_size = usize::try_from(u32le(bytes, 4)?).ok()?;
-        let (first, size, rounded) = chunk_header(bytes, 12)?;
-        if &first != b"VP8X" || size < 10 {
-            return None;
-        }
-        let flags = *bytes.get(20)?;
-        let has_alpha = flags & 0b0001_0000 != 0;
-        if flags & 0b0000_0010 == 0 {
-            return None;
-        }
-        let width = u24(bytes, 24)? + 1;
-        let height = u24(bytes, 27)? + 1;
-        // The ANMF chunks, counted the way image-webp counts
-        // them: every chunk after VP8X, up to the RIFF size past
-        // it or the end of the bytes.
-        let mut at = 20usize.checked_add(rounded)?;
-        let end = at.checked_add(riff_size.saturating_sub(12))?;
-        let mut first_anmf = None;
-        let mut frames = 0u32;
-        while at < end {
-            let Some((fourcc, _, rounded)) = chunk_header(bytes, at) else {
-                break;
-            };
-            if &fourcc == b"ANMF" {
-                first_anmf.get_or_insert(at);
-                frames = frames.checked_add(1)?;
-            }
-            at = at.checked_add(8)?.checked_add(rounded)?;
-        }
+        let Header {
+            width,
+            height,
+            has_alpha,
+            frames,
+            first_anmf,
+        } = header(bytes)?;
         // The canvas must fit the allocation budget the frame
-        // collector charges each frame to; past it the image
-        // crate's path decides, as it always has.
+        // collector charges each frame to. The engine charges
+        // this from the header before any frame decodes
+        // ([`super::check_webp_frame_budget`]), so an over-budget
+        // canvas is refused there and never reaches the walk;
+        // this guard keeps the walk from allocating one should it
+        // ever be opened directly.
         let canvas_bytes = u64::from(width) * u64::from(height) * 4;
         if canvas_bytes > super::MAX_DECODE_ALLOC {
             return None;
