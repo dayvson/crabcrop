@@ -824,34 +824,18 @@ fn a_standard_output_nobody_reads_fails_the_health_check_until_it_is_read() {
     assert_eq!(lines[answered + 3], "shutdown: done");
 }
 
-/// The TCP port process `pid` listens on, from its sockets
-/// in `/proc`, or `None` while it has no listening socket.
+/// A TCP port on 127.0.0.1 that nothing listens on right now,
+/// for a server whose listening line cannot reach the test.
+/// The server's own sockets cannot be read from `/proc`
+/// instead: it marks itself non-dumpable at startup (issue
+/// #605), so `/proc/<pid>/fd` is readable by root alone, and a
+/// test run as any other user would never find the port.
 #[cfg(target_os = "linux")]
-fn listening_port(pid: u32) -> Option<u16> {
-    let inodes: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .ok()?
-        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-        .filter_map(|link| {
-            let link = link.to_string_lossy().into_owned();
-            Some(
-                link.strip_prefix("socket:[")?
-                    .strip_suffix(']')?
-                    .to_string(),
-            )
-        })
-        .collect();
-    let table = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).ok()?;
-    table.lines().skip(1).find_map(|row| {
-        let fields: Vec<&str> = row.split_whitespace().collect();
-        // A listening socket of the process: state 0A.
-        if fields.get(3) != Some(&"0A")
-            || !inodes.iter().any(|i| Some(&i.as_str()) == fields.get(9))
-        {
-            return None;
-        }
-        let (_, port) = fields.get(1)?.split_once(':')?;
-        u16::from_str_radix(port, 16).ok()
-    })
+fn unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port on 127.0.0.1")
+        .port()
 }
 
 #[test]
@@ -865,11 +849,12 @@ fn a_server_whose_standard_output_reader_left_during_boot_serves_on() {
     // with one line on stderr, and the server serves; the
     // request log counts the lines it cannot write, as it
     // does once the server serves. The reader here is gone
-    // before the first line, so the server's port, which
-    // its listening line would have named, is read from
-    // the socket it listens on.
+    // before the first line, which would have named the
+    // server's port, so the test picks the port and waits
+    // until the server accepts on it.
+    let port = unused_port();
     let mut child = binary()
-        .env("PORT", "0")
+        .env("PORT", port.to_string())
         .env("CRABCROP_BIND", "127.0.0.1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -887,18 +872,18 @@ fn a_server_whose_standard_output_reader_left_during_boot_serves_on() {
     });
     let said = || String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
     let mut server = ServerGuard::new(child);
-    let pid = server.0.id();
     let deadline = Instant::now() + LONG;
-    let port = loop {
-        if let Some(port) = listening_port(pid) {
-            break port;
-        }
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
         if let Some(exit) = server.0.try_wait().unwrap() {
             panic!("crabcrop exited before it listened: {exit}\n{}", said());
         }
-        assert!(Instant::now() < deadline, "crabcrop never listened");
+        assert!(
+            Instant::now() < deadline,
+            "crabcrop never listened on {port}\n{}",
+            said()
+        );
         std::thread::sleep(Duration::from_millis(10));
-    };
+    }
     // It answers: the health check, and an image request,
     // whose line cannot be written.
     let (health, _) = try_get_body(port, "/health", "")
