@@ -605,6 +605,90 @@ if ($GROUP === 'settings') {
         'parse: tight spacing works'
     );
 
+    // The stored secret: never written into the page, kept when
+    // the field comes back empty or absent (a field a constant
+    // disables is not submitted), replaced by a new value, and
+    // removed only when asked.
+    set_options(array(
+        'base_url' => 'https://images.example.com',
+        'mode' => 'signed',
+        'secret' => 'stored-s3cret-value',
+        'size_map' => array('thumbnail' => 'crop:150x150:smart'),
+    ));
+    ob_start();
+    crabcrop_wp_settings_page();
+    $page = ob_get_clean();
+    check(strpos($page, 'stored-s3cret-value') === false, 'settings page: the stored secret is not in the page');
+    check(strpos($page, 'A secret is stored') !== false, 'settings page: says a secret is stored');
+    check(
+        preg_match('/name="crabcrop_settings\[secret\]"\s+value=""/', $page) === 1,
+        'settings page: the secret field starts empty'
+    );
+    check(strpos($page, 'crabcrop_settings[clear_secret]') !== false, 'settings page: offers to remove the stored secret');
+    $form = array(
+        'base_url' => 'https://images.example.com',
+        'mode' => 'signed',
+        'size_map_text' => 'thumbnail = crop:150x150:smart',
+    );
+    eq(
+        'stored-s3cret-value',
+        crabcrop_wp_sanitize_settings($form + array('secret' => ''))['secret'],
+        'sanitize: an empty secret field keeps the stored secret'
+    );
+    eq(
+        'stored-s3cret-value',
+        crabcrop_wp_sanitize_settings($form)['secret'],
+        'sanitize: a missing secret field keeps the stored secret'
+    );
+    eq(
+        'new-s3cret',
+        crabcrop_wp_sanitize_settings($form + array('secret' => 'new-s3cret'))['secret'],
+        'sanitize: a new secret replaces the stored one'
+    );
+    eq(
+        '',
+        crabcrop_wp_sanitize_settings($form + array('secret' => '', 'clear_secret' => '1'))['secret'],
+        'sanitize: the remove checkbox clears the stored secret'
+    );
+    eq(
+        '',
+        crabcrop_wp_sanitize_settings($form + array('secret' => 'ignored', 'clear_secret' => '1'))['secret'],
+        'sanitize: removing wins over a value typed at the same time'
+    );
+    // With no secret stored, the page says nothing is stored.
+    set_options(array('base_url' => 'https://images.example.com', 'mode' => 'presets'));
+    ob_start();
+    crabcrop_wp_settings_page();
+    $page = ob_get_clean();
+    check(strpos($page, 'A secret is stored') === false, 'settings page: no stored secret, no claim of one');
+    check(strpos($page, 'crabcrop_settings[clear_secret]') === false, 'settings page: nothing to remove');
+
+    // WordPress sanitizes twice on the first save, the second time
+    // over the first pass's output: the second pass changes
+    // nothing, the size map and the secret included.
+    set_options(array());
+    $first = crabcrop_wp_sanitize_settings(array(
+        'base_url' => 'https://images.example.com',
+        'mode' => 'signed',
+        'secret' => 'first-s3cret',
+        'size_map_text' => "thumbnail = crop:150x150:smart\nmedium = preset:card",
+        'disable_sizes' => '1',
+    ));
+    eq($first, crabcrop_wp_sanitize_settings($first), 'sanitize: a second pass over its own output changes nothing');
+    eq(
+        array('thumbnail' => 'crop:150x150:smart', 'medium' => 'preset:card'),
+        crabcrop_wp_sanitize_settings($first)['size_map'],
+        'sanitize: the second pass keeps the size map'
+    );
+    eq(
+        array('thumbnail' => 'wp-thumb'),
+        crabcrop_wp_sanitize_settings(array(
+            'mode' => 'presets',
+            'size_map' => array('thumbnail' => 'wp-thumb', 'medium' => 'not a preset'),
+        ))['size_map'],
+        'sanitize: a parsed map is checked again, not trusted'
+    );
+
     // Admin wiring: the actions register the setting and the page.
     do_action('admin_init');
     check(isset($GLOBALS['wp_stub']['settings']['crabcrop_settings']), 'admin_init registers the setting');
