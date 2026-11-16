@@ -1633,8 +1633,9 @@ fn recipes_let_a_slow_boot_finish_before_a_restart() {
     // preload and answers nothing, /health included, until
     // boot is done. The Kubernetes recipes had liveness and
     // readiness probes only, so a pod whose preload ran past
-    // about 45 seconds (a first probe at 5 s, two more 20 s
-    // apart) was restarted before it served, and the images'
+    // about a minute (three misses 20 s apart, the first at
+    // the kubelet's first tick from 5 s on, 45 to 65 s in
+    // all) was restarted before it served, and the images'
     // health check counted its misses from the start. Now a
     // startup probe holds the other two until /health first
     // answers, and the health check has a start period, of
