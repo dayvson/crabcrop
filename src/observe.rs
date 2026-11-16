@@ -5,7 +5,11 @@
 //! summary (the path segments between the signature and the source).
 //! `cache_hit` records whether the result cache answered the
 //! request, as reported by the handler. The lines reach standard
-//! output through a [`RequestLog`] (issue #642).
+//! output through a [`RequestLog`] (issue #642). A request whose
+//! client goes away before its answer still leaves its line and
+//! its metrics update, with the status [`CLIENT_CLOSED`] (issue
+//! #707): the server's record of the request files them when it
+//! is dropped unfiled.
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,7 +18,14 @@ mod request_log;
 
 #[cfg(test)]
 pub(crate) use request_log::fake::FakeStdout;
-pub use request_log::{QUEUE_BYTES, RequestLog, SHUTDOWN_WAIT};
+pub use request_log::{QUEUE_BYTES, QueueState, RequestLog, SHUTDOWN_WAIT, STALLED_AFTER};
+
+/// The status recorded for an image request whose client went away
+/// before it was answered (issue #707): 499, the "client closed
+/// request" of nginx and the log tools built around it. No response
+/// carries it, since nobody is left to receive one. It is a 4xx, and
+/// the metrics count it as one.
+pub const CLIENT_CLOSED: u16 = 499;
 
 /// Which stage failed, for the error counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +40,13 @@ pub enum FailStage {
 /// stages.
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
+    /// The request's method: `GET`, or `HEAD`, which the image
+    /// route answers too (issue #707).
+    pub method: &'static str,
     /// Operation summary: path segments between signature and source.
     pub ops: String,
-    /// HTTP status of the response actually sent.
+    /// HTTP status of the response actually sent, or
+    /// [`CLIENT_CLOSED`] when the client went away first.
     pub status: u16,
     pub verify: Duration,
     pub load: Duration,
@@ -60,6 +75,7 @@ pub struct RequestRecord {
 impl Default for RequestRecord {
     fn default() -> Self {
         Self {
+            method: "GET",
             ops: String::new(),
             status: 0,
             verify: Duration::ZERO,
@@ -108,10 +124,11 @@ impl RequestRecord {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         format!(
-            "{{\"ts\":{ts},\"method\":\"GET\",\"ops\":\"{}\",\"status\":{},\
+            "{{\"ts\":{ts},\"method\":\"{}\",\"ops\":\"{}\",\"status\":{},\
              \"verify_ms\":{:.1},\"load_ms\":{:.1},\"process_ms\":{:.1},\"total_ms\":{:.1},\
              \"cache\":\"{}\",\"fallback\":{},\"bytes_in\":{},\"bytes_out\":{},\
              \"request_id\":\"{}\"}}",
+            escape_json(self.method),
             escape_json(&self.ops),
             self.status,
             ms(self.verify),
@@ -135,6 +152,7 @@ const BUCKETS_MS: [f64; 10] = [
 #[derive(Debug, Default)]
 struct Inner {
     requests_2xx: u64,
+    requests_3xx: u64,
     requests_4xx: u64,
     requests_5xx: u64,
     requests_other: u64,
@@ -167,6 +185,9 @@ impl Metrics {
         let mut m = self.inner.lock().unwrap();
         match r.status {
             200..=299 => m.requests_2xx += 1,
+            // A revalidation's `304` (issue #707).
+            300..=399 => m.requests_3xx += 1,
+            // `CLIENT_CLOSED` among them.
             400..=499 => m.requests_4xx += 1,
             500..=599 => m.requests_5xx += 1,
             _ => m.requests_other += 1,
@@ -241,6 +262,11 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "crabcrop_requests_total{{status_class=\"3xx\"}} {}",
+            m.requests_3xx
+        );
+        let _ = writeln!(
+            out,
             "crabcrop_requests_total{{status_class=\"4xx\"}} {}",
             m.requests_4xx
         );
@@ -294,16 +320,25 @@ impl Metrics {
             "crabcrop_process_duration_ms_count {}",
             m.process_count
         );
+        // These six had no HELP line before issue #707.
+        out.push_str(
+            "# HELP crabcrop_loader_errors_total Image requests whose source or watermark failed to load.\n",
+        );
         out.push_str("# TYPE crabcrop_loader_errors_total counter\n");
         let _ = writeln!(out, "crabcrop_loader_errors_total {}", m.load_errors);
+        out.push_str("# HELP crabcrop_engine_errors_total Image requests whose render failed.\n");
         out.push_str("# TYPE crabcrop_engine_errors_total counter\n");
         let _ = writeln!(out, "crabcrop_engine_errors_total {}", m.engine_errors);
+        out.push_str("# HELP crabcrop_bytes_received_total Source bytes image requests loaded.\n");
         out.push_str("# TYPE crabcrop_bytes_received_total counter\n");
         let _ = writeln!(out, "crabcrop_bytes_received_total {}", m.bytes_in);
+        out.push_str("# HELP crabcrop_bytes_served_total Response body bytes of image requests.\n");
         out.push_str("# TYPE crabcrop_bytes_served_total counter\n");
         let _ = writeln!(out, "crabcrop_bytes_served_total {}", m.bytes_served);
+        out.push_str("# HELP crabcrop_cache_hits_total Image requests a cache tier answered.\n");
         out.push_str("# TYPE crabcrop_cache_hits_total counter\n");
         let _ = writeln!(out, "crabcrop_cache_hits_total {}", m.cache_hits);
+        out.push_str("# HELP crabcrop_cache_misses_total Image requests no cache tier answered.\n");
         out.push_str("# TYPE crabcrop_cache_misses_total counter\n");
         let _ = writeln!(out, "crabcrop_cache_misses_total {}", m.cache_misses);
         out.push_str("# HELP crabcrop_purges_total Purge requests, accepted or rejected.\n");
@@ -313,6 +348,41 @@ impl Metrics {
         out.push_str("# TYPE crabcrop_uploads_total counter\n");
         let _ = writeln!(out, "crabcrop_uploads_total {}", m.uploads);
     }
+}
+
+/// The series in a Prometheus exposition that lack a `# HELP` or a
+/// `# TYPE` line, each named once, in order (issue #707). A
+/// histogram's and a summary's `_bucket`, `_sum` and `_count`
+/// samples belong to the series their TYPE line names.
+#[cfg(test)]
+pub(crate) fn undescribed_series(exposition: &str) -> Vec<String> {
+    let mut helped = std::collections::HashSet::new();
+    let mut typed = std::collections::HashSet::new();
+    let mut missing = Vec::new();
+    for line in exposition.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            helped.insert(rest.split(' ').next().unwrap_or("").to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            typed.insert(rest.split(' ').next().unwrap_or("").to_string());
+            continue;
+        }
+        let name = line.split(['{', ' ']).next().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let series = ["_bucket", "_sum", "_count"]
+            .iter()
+            .filter_map(|suffix| name.strip_suffix(suffix))
+            .find(|base| typed.contains(*base))
+            .unwrap_or(name);
+        let described = helped.contains(series) && typed.contains(series);
+        if !described && !missing.iter().any(|m| m == series) {
+            missing.push(series.to_string());
+        }
+    }
+    missing
 }
 
 #[cfg(test)]
@@ -437,6 +507,10 @@ mod tests {
             m.requests_2xx
         ));
         out.push_str(&format!(
+            "crabcrop_requests_total{{status_class=\"3xx\"}} {}\n",
+            m.requests_3xx
+        ));
+        out.push_str(&format!(
             "crabcrop_requests_total{{status_class=\"4xx\"}} {}\n",
             m.requests_4xx
         ));
@@ -488,19 +562,27 @@ mod tests {
             "crabcrop_process_duration_ms_count {}\n",
             m.process_count
         ));
+        out.push_str(
+            "# HELP crabcrop_loader_errors_total Image requests whose source or watermark failed to load.\n",
+        );
         out.push_str("# TYPE crabcrop_loader_errors_total counter\n");
         out.push_str(&format!("crabcrop_loader_errors_total {}\n", m.load_errors));
+        out.push_str("# HELP crabcrop_engine_errors_total Image requests whose render failed.\n");
         out.push_str("# TYPE crabcrop_engine_errors_total counter\n");
         out.push_str(&format!(
             "crabcrop_engine_errors_total {}\n",
             m.engine_errors
         ));
+        out.push_str("# HELP crabcrop_bytes_received_total Source bytes image requests loaded.\n");
         out.push_str("# TYPE crabcrop_bytes_received_total counter\n");
         out.push_str(&format!("crabcrop_bytes_received_total {}\n", m.bytes_in));
+        out.push_str("# HELP crabcrop_bytes_served_total Response body bytes of image requests.\n");
         out.push_str("# TYPE crabcrop_bytes_served_total counter\n");
         out.push_str(&format!("crabcrop_bytes_served_total {}\n", m.bytes_served));
+        out.push_str("# HELP crabcrop_cache_hits_total Image requests a cache tier answered.\n");
         out.push_str("# TYPE crabcrop_cache_hits_total counter\n");
         out.push_str(&format!("crabcrop_cache_hits_total {}\n", m.cache_hits));
+        out.push_str("# HELP crabcrop_cache_misses_total Image requests no cache tier answered.\n");
         out.push_str("# TYPE crabcrop_cache_misses_total counter\n");
         out.push_str(&format!("crabcrop_cache_misses_total {}\n", m.cache_misses));
         out.push_str("# HELP crabcrop_purges_total Purge requests, accepted or rejected.\n");
@@ -540,7 +622,9 @@ mod tests {
         metrics.record_upload();
         let expected = render_by_formatting(&metrics.inner.lock().unwrap());
         assert_eq!(metrics.render(), expected);
-        assert!(expected.contains("crabcrop_requests_total{status_class=\"other\"} 3\n"));
+        // 304 is a 3xx since issue #707; 101 alone is other.
+        assert!(expected.contains("crabcrop_requests_total{status_class=\"3xx\"} 2\n"));
+        assert!(expected.contains("crabcrop_requests_total{status_class=\"other\"} 1\n"));
         assert!(expected.contains("crabcrop_request_duration_ms_bucket{le=\"+Inf\"} 13\n"));
         assert!(expected.contains("crabcrop_request_duration_ms_sum 16241.0\n"));
         assert!(expected.contains("crabcrop_purges_total 2\n"));
@@ -554,5 +638,65 @@ mod tests {
             idle.render(),
             render_by_formatting(&idle.inner.lock().unwrap())
         );
+    }
+
+    #[test]
+    fn each_status_counts_in_its_class() {
+        // Issue #707: a 304 counted as "other", for want of a
+        // 3xx class, and a client that left counts as the
+        // 4xx it is recorded as.
+        let metrics = Metrics::default();
+        for status in [200, 206, 304, 301, 400, CLIENT_CLOSED, 500, 503, 101, 600] {
+            metrics.record(&record(status));
+        }
+        let out = metrics.render();
+        for class in ["2xx", "3xx", "4xx", "5xx", "other"] {
+            assert!(
+                out.contains(&format!(
+                    "crabcrop_requests_total{{status_class=\"{class}\"}} 2\n"
+                )),
+                "{class}: {out}"
+            );
+        }
+        // In the order of the classes.
+        let classes: Vec<&str> = out
+            .lines()
+            .filter_map(|line| line.strip_prefix("crabcrop_requests_total{status_class=\""))
+            .map(|rest| &rest[..rest.find('"').unwrap()])
+            .collect();
+        assert_eq!(classes, ["2xx", "3xx", "4xx", "5xx", "other"]);
+    }
+
+    #[test]
+    fn the_log_line_names_the_method() {
+        // Issue #707: it said GET for a HEAD request too.
+        let get: serde_json::Value = serde_json::from_str(&record(200).to_json()).unwrap();
+        assert_eq!(get["method"], "GET");
+        let head = RequestRecord {
+            method: "HEAD",
+            ..record(200)
+        };
+        let head: serde_json::Value = serde_json::from_str(&head.to_json()).unwrap();
+        assert_eq!(head["method"], "HEAD");
+    }
+
+    #[test]
+    fn every_counter_has_help_and_type() {
+        // Issue #707: six series had a TYPE line and no HELP.
+        let metrics = Metrics::default();
+        metrics.record(&record(200));
+        let out = metrics.render();
+        assert_eq!(undescribed_series(&out), Vec::<String>::new(), "{out}");
+        assert!(
+            out.contains(
+                "# HELP crabcrop_cache_misses_total Image requests no cache tier answered.\n\
+                 # TYPE crabcrop_cache_misses_total counter\n"
+            ),
+            "{out}"
+        );
+        // The check finds a series with no HELP, and one with
+        // neither.
+        let bare = "# TYPE a_total counter\na_total 1\nb 2\n";
+        assert_eq!(undescribed_series(bare), ["a_total", "b"]);
     }
 }
