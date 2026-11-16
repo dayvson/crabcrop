@@ -5,7 +5,7 @@ use image::{DynamicImage, GrayImage};
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, fir_resize, rgb8_view};
+use super::session::{build_session, fir_resize, lock_model, rgb8_view};
 use super::{AiError, SegmentEmbedding, SegmentProvider};
 
 /// The SAM encoder's fixed input edge.
@@ -455,7 +455,7 @@ impl SegmentProvider for OnnxSegmentProvider {
         let input = segment_preprocess(img);
         let tensor = ort::value::Tensor::from_array(([1, 3, size, size], input.into_boxed_slice()))
             .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.encoder.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.encoder, "the segment encoder model's session");
         let outputs = session
             .run(ort::inputs![self.encoder_input.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
@@ -544,7 +544,7 @@ impl OnnxSegmentProvider {
             vec![prompt.mask_h as f32, prompt.mask_w as f32].into_boxed_slice(),
         ))
         .map_err(|e| AiError::Inference(format!("cannot build the size tensor: {e}")))?;
-        let mut session = self.decoder.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.decoder, "the segment decoder model's session");
         let outputs = session
             .run(ort::inputs![
                 self.embeddings_input.as_str() => embeddings_tensor,

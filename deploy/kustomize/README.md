@@ -36,6 +36,10 @@ kubectl create secret generic crabcrop \
   render it. Deployment (one replica, `/health` probes,
   `PORT`, the secret reference, modest resource requests
   and no limits, and the security context) and Service.
+  Its startup probe gives boot 5 minutes, 150 tries 2
+  seconds apart, before a restart, as the chart's does:
+  patch its `failureThreshold` up for a model set that
+  loads more slowly.
   The pod passes the Pod Security "restricted" profile: it
   runs as user and group 65534 (`runAsNonRoot`) with the
   `RuntimeDefault` seccomp profile, no privilege

@@ -6,7 +6,7 @@ use image::{DynamicImage, GrayImage};
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, fir_resize, rgb8_view};
+use super::session::{build_session, fir_resize, lock_model, rgb8_view};
 use super::{AiError, MaskProvider};
 
 /// Background removal backed by a U²-Net-family ONNX model
@@ -51,7 +51,7 @@ impl MaskProvider for OnnxMaskProvider {
         let tensor =
             ort::value::Tensor::from_array(([1, 3, 320, 320], input.into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.session, "the background-removal model's session");
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;

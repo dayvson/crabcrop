@@ -194,10 +194,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # (issue #545), which must not wait on a FIFO at an entry
 # path, and for the tests that open such a FIFO's write end
 # without blocking. `pipe` is for the capacity of the pipes
-# to the SVG and AVIF worker (issue #650). Neither adds a
-# crate.
+# to the SVG and AVIF worker (issue #650). `net` is for
+# `IPV6_V6ONLY`, which an IPv6 listener turns off to take
+# IPv4 connections too (issue #715). None adds a crate.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process", "fs", "pipe"] }
+rustix = { version = "1", features = ["process", "fs", "pipe", "net"] }
 
 # libjpeg-turbo's vector code (issue #668) is required on
 # the architectures the release binaries and images are

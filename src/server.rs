@@ -60,7 +60,8 @@ mod background;
 pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PUTS_AT_ONCE};
 mod listen;
 pub use listen::{
-    ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, serve_connections,
+    ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, RequestsInFlight,
+    bind_listener, serve_connections,
 };
 mod process;
 pub(in crate::server) use process::{
