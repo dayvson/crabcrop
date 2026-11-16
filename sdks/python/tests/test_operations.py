@@ -8,6 +8,7 @@ import json
 import re
 import struct
 import sys
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -301,6 +302,44 @@ class TestTypedSpellings(unittest.TestCase):
                 filter.blur_class(kept)
         # Only A to Z fold: the Kelvin sign is its own class.
         self.assertEqual(ops.crop_objects(1, 1, ["K", "k", "K"]), "crop:1x1:objects(%E2%84%AA,k):1")
+
+    def test_class_names_take_the_letters_and_digits_the_server_takes(self):
+        # The server's test is Rust's char::is_alphanumeric, so a
+        # letter is any Alphabetic character: beside the categories L
+        # and N, the vowel signs of Indic scripts, the points of
+        # Hebrew, combining marks such as U+0345, and circled letters.
+        hindi = "\u0939\u093f\u0902\u0926\u0940"  # हिंदी: two vowel signs and a nasal sign
+        shalom = "\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd"  # שָׁלוֹם, pointed
+        cases = [
+            (filter.blur_class(hindi), "blurclass(%E0%A4%B9%E0%A4%BF%E0%A4%82%E0%A4%A6%E0%A5%80)"),
+            (ops.crop_objects(100, 100, ["Ⓐ"]), "crop:100x100:objects(%E2%92%B6):1"),
+            (filter.pixelate_class("\u03b1\u0345"), "pixelateclass(%CE%B1%CD%85)"),
+            (filter.recolor_class(shalom, "FF0000"), "recolorclass(%D7%A9%D6%B8%D7%81%D7%9C%D7%95%D6%B9%D7%9D,ff0000)"),
+        ]
+        for got, want in cases:
+            self.assertEqual(got, want)
+        # A mark that is not Alphabetic is no letter: the server
+        # refuses a decomposed é (e, then U+0301) and a lone mark.
+        for refused in ("e\u0301", "\u0301", "a\u20dd"):
+            with self.assertRaises(ValueError, msg=repr(refused)):
+                filter.blur_class(refused)
+
+    def test_the_alphabetic_table_holds_only_what_the_categories_miss(self):
+        # The written-out ranges are sorted, apart, and hold no
+        # character this Python already reads as L or N.
+        starts, ends = _grammar._MORE_STARTS, _grammar._MORE_ENDS
+        self.assertGreater(len(starts), 200)
+        for index, (start, end) in enumerate(zip(starts, ends)):
+            self.assertLessEqual(start, end)
+            if index:
+                self.assertLess(ends[index - 1] + 1, start)
+            for code in range(start, end + 1):
+                self.assertNotIn(unicodedata.category(chr(code))[0], "LN", hex(code))
+                self.assertTrue(_grammar.is_alphanumeric(chr(code)), hex(code))
+        for char in "aZ\u0663\u2160\u00bd":
+            self.assertTrue(_grammar.is_alphanumeric(char), repr(char))
+        for char in " _;\u0301\u20dd\u200b\U0001f600":
+            self.assertFalse(_grammar.is_alphanumeric(char), repr(char))
 
     def test_builders_refuse_what_the_server_refuses(self):
         bad = [
