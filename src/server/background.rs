@@ -40,11 +40,12 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 pub const SHARED_PUTS_AT_ONCE: usize = 64;
 
 /// How many tier hits' group write-backs may wait for a write
-/// slot at once (issue #709), each for a distinct copy: they
-/// are deduplicated per key, snapshot, ETag and groups. Each
-/// one waiting holds its entry, so while a stalled bucket
-/// kept every slot taken, they piled up with every newly
-/// learned group, without limit. Past this many, a write-back
+/// slot at once (issue #709). One that a queued write-back
+/// already carries (the same key, snapshot, ETag and groups)
+/// is not queued again, but each one waiting holds its entry,
+/// so while a stalled bucket kept every slot taken, they piled
+/// up with every distinct copy and newly learned group,
+/// without limit. Past this many, a write-back
 /// is skipped and counted, as a render's write-through is
 /// when every slot is taken. A skipped one leaves the bucket
 /// copy without the groups it was to carry: the disk tier

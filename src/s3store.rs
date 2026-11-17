@@ -1153,7 +1153,7 @@ impl S3Store {
             return HeaderRead::Failed;
         };
         if !resp.status().is_success() {
-            return HeaderRead::unanswered(resp.status());
+            return HeaderRead::of_error(resp, started).await;
         }
         // A ranged GET reports the whole object's ETag.
         let etag = response_etag(&resp);
@@ -1206,7 +1206,7 @@ impl S3Store {
                     return HeaderRead::Failed;
                 };
                 if !resp.status().is_success() {
-                    return HeaderRead::unanswered(resp.status());
+                    return HeaderRead::of_error(resp, started).await;
                 }
                 let etag = response_etag(&resp);
                 match self.read_capped(resp, started).await {
@@ -1319,8 +1319,13 @@ impl S3Store {
             HeaderRead::Entry(probed) => probed,
             HeaderRead::Nothing => return ObjectPurge::Kept,
             HeaderRead::Failed => return ObjectPurge::Failed,
-            HeaderRead::Refused(status) => {
-                self.note_refused(Refused::Purge, "a purge walk's read", status, None);
+            HeaderRead::Refused(status, code) => {
+                self.note_refused(
+                    Refused::Purge,
+                    "a purge walk's read",
+                    status,
+                    code.as_deref(),
+                );
                 return ObjectPurge::Refused;
             }
         };
@@ -2299,8 +2304,11 @@ enum HeaderRead {
     /// The store did not answer (see [`store_failed`]).
     Failed,
     /// The store refused the read with this status (issue
-    /// #709).
-    Refused(reqwest::StatusCode),
+    /// #709), and the error code its answer named, if any: an
+    /// `AccessDenied` for the credentials, an
+    /// `InvalidObjectState` for an object in an archive
+    /// storage class.
+    Refused(reqwest::StatusCode, Option<String>),
 }
 
 impl HeaderRead {
@@ -2320,7 +2328,20 @@ impl HeaderRead {
         ) {
             HeaderRead::Nothing
         } else {
-            HeaderRead::Refused(status)
+            HeaderRead::Refused(status, None)
+        }
+    }
+
+    /// [`HeaderRead::unanswered`] for the error answer `resp`,
+    /// with a refusal's error code read from the front of its
+    /// body (see [`refusal_code`]), so the line it logs says
+    /// why.
+    async fn of_error(resp: reqwest::Response, started: Instant) -> Self {
+        match Self::unanswered(resp.status()) {
+            HeaderRead::Refused(status, _) => {
+                HeaderRead::Refused(status, refusal_code(resp, started).await)
+            }
+            other => other,
         }
     }
 }
@@ -6418,6 +6439,43 @@ mod tests {
             &format!("{}<Error><Code>Late</Code></Error>", " ".repeat(8192)),
         ] {
             assert_eq!(refusal_code(refusal(body), Instant::now()).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purge_reads_error_answers_sort_into_nothing_unanswered_and_refused() {
+        // Issue #709: a purge walk's header read that the store
+        // refuses has not judged its object, and its line names
+        // the code: an AccessDenied is the credentials, an
+        // InvalidObjectState an entry a lifecycle rule archived.
+        // A 404 or a 416 holds nothing to purge, and a store
+        // failure is no answer.
+        let answer = |status: u16, body: &str| {
+            reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body(body.to_string())
+                    .unwrap(),
+            )
+        };
+        let archived = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+                        <Code>InvalidObjectState</Code><Message>The operation is not \
+                        valid for the object's storage class</Message></Error>";
+        let read = HeaderRead::of_error(answer(403, archived), Instant::now()).await;
+        assert!(
+            matches!(&read, HeaderRead::Refused(status, Some(code))
+                if *status == reqwest::StatusCode::FORBIDDEN && code == "InvalidObjectState"),
+            "an archived entry's read is a refusal that names its code"
+        );
+        let read = HeaderRead::of_error(answer(400, ""), Instant::now()).await;
+        assert!(matches!(read, HeaderRead::Refused(_, None)));
+        for status in [404, 416] {
+            let read = HeaderRead::of_error(answer(status, "<Error/>"), Instant::now()).await;
+            assert!(matches!(read, HeaderRead::Nothing), "{status}");
+        }
+        for status in [500, 503, 429, 408] {
+            let read = HeaderRead::of_error(answer(status, "<Error/>"), Instant::now()).await;
+            assert!(matches!(read, HeaderRead::Failed), "{status}");
         }
     }
 

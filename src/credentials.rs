@@ -853,6 +853,8 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = elsewhere.accept().await {
                 seen.store(true, Ordering::SeqCst);
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
                 let body = r#"{"AccessKeyId":"ASIAELSEWHERE","SecretAccessKey":"s"}"#;
                 let answer = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
