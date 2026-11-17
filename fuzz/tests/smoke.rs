@@ -418,7 +418,7 @@ fn the_decode_corpus_reaches_the_scaled_jpeg_decode() {
     let seeds = jpeg_seeds();
     let decoded = seeds.iter().filter(|s| scaled_frames(s) == 3).count();
     let refused = seeds.iter().filter(|s| scaled_frames(s) == 0).count();
-    assert!(decoded >= 3, "{decoded} JPEG seeds decode at every scale");
+    assert!(decoded >= 4, "{decoded} JPEG seeds decode at every scale");
     assert!(
         refused >= 10,
         "{refused} JPEG seeds are refused at every scale"

@@ -254,7 +254,9 @@ screen refuses before decoding (issue #522): one whose
 two length-0 extents each run to the end of the same `mdat`,
 one with more extents than the cap, and one whose primary `ispe`
 declares a size past the decode limits; and JPEGs around the
-scaled decode (issue #653): a progressive file it decodes, and
+scaled decode (issue #653): progressive files it decodes, one
+written by libjpeg-turbo and one with a DC scan per component
+as mozjpeg writes them (issue #713), and
 one for each way it stands down and leaves the file to the
 full-size decoder: a grayscale, a CMYK, an arithmetic-coded
 and a lossless file, a header that declares 12-bit samples,

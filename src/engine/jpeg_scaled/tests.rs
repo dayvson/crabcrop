@@ -1613,6 +1613,199 @@ fn the_first_scan_is_read_as_zune_jpeg_reads_it() {
     );
 }
 
+/// Entropy-coded bits, the first in the highest bit of each
+/// byte, with a zero stuffed after each 0xFF.
+#[derive(Default)]
+struct BitWriter {
+    out: Vec<u8>,
+    held: u32,
+    count: u32,
+}
+
+impl BitWriter {
+    fn put(&mut self, value: u32, length: u32) {
+        for bit in (0..length).rev() {
+            self.held = self.held << 1 | (value >> bit & 1);
+            self.count += 1;
+            if self.count == 8 {
+                self.out.push(self.held as u8);
+                if self.held == 0xFF {
+                    self.out.push(0x00);
+                }
+                (self.held, self.count) = (0, 0);
+            }
+        }
+    }
+
+    /// The bytes, the last one padded with ones.
+    fn finish(mut self) -> Vec<u8> {
+        while self.count != 0 {
+            self.put(1, 1);
+        }
+        self.out
+    }
+}
+
+/// A progressive JPEG of DC scans only, `width` by `height`,
+/// with luma sampled `luma` (chroma at 1x1), and the DC table
+/// of the JPEG standard (Annex K.3). Its scans carry the
+/// components `scans` names in turn (1 is luma, 2 and 3
+/// chroma): a scan of one component walks that component's
+/// own blocks, and one of more walks the frame's MCUs. The DC
+/// values vary from block to block, so each code is 2 to 9
+/// bits with up to 11 more after it.
+fn dc_only_progressive(width: u16, height: u16, luma: (u8, u8), scans: &[&[u8]]) -> Vec<u8> {
+    const BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+    // The code, and its length, of each size of difference.
+    let mut codes = [(0u32, 0u32); 12];
+    let (mut code, mut size) = (0u32, 0usize);
+    for (length, count) in (1..=16u32).zip(BITS) {
+        for _ in 0..count {
+            codes[size] = (code, length);
+            code += 1;
+            size += 1;
+        }
+        code <<= 1;
+    }
+    let sampling = [luma, (1, 1), (1, 1)];
+    let (h_max, v_max) = (u32::from(luma.0), u32::from(luma.1));
+    let (w, h) = (u32::from(width), u32::from(height));
+    let mut out = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+    out.extend_from_slice(&[1; 64]);
+    out.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x11, 8]);
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.push(3);
+    for (id, (across, down)) in (1u8..).zip(sampling) {
+        out.extend_from_slice(&[id, across << 4 | down, 0]);
+    }
+    out.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x1F, 0x00]);
+    out.extend_from_slice(&BITS);
+    out.extend(0..12u8);
+    for scan in scans {
+        out.extend_from_slice(&[0xFF, 0xDA, 0, 6 + 2 * scan.len() as u8, scan.len() as u8]);
+        for id in *scan {
+            out.extend_from_slice(&[*id, 0x00]);
+        }
+        out.extend_from_slice(&[0, 0, 0]);
+        let mut blocks = Vec::new();
+        if let [id] = scan {
+            let (across, down) = sampling[usize::from(id - 1)];
+            for row in 0..(h * u32::from(down)).div_ceil(8 * v_max) {
+                for col in 0..(w * u32::from(across)).div_ceil(8 * h_max) {
+                    blocks.push((*id, row, col));
+                }
+            }
+        } else {
+            for mcu_row in 0..h.div_ceil(8 * v_max) {
+                for mcu_col in 0..w.div_ceil(8 * h_max) {
+                    for id in *scan {
+                        let (across, down) = sampling[usize::from(id - 1)];
+                        let (across, down) = (u32::from(across), u32::from(down));
+                        for v in 0..down {
+                            for u in 0..across {
+                                blocks.push((*id, mcu_row * down + v, mcu_col * across + u));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut bits = BitWriter::default();
+        let mut previous = [0i32; 3];
+        for (id, row, col) in blocks {
+            let hash = (u32::from(id) * 7919 + row * 104_729 + col * 1_299_709)
+                .wrapping_mul(2_654_435_761);
+            let value = (hash >> 16) as i32 % 2001 - 1000;
+            let diff = value - previous[usize::from(id - 1)];
+            previous[usize::from(id - 1)] = value;
+            let size = 32 - diff.unsigned_abs().leading_zeros();
+            let (code, length) = codes[size as usize];
+            bits.put(code, length);
+            if size > 0 {
+                let extra = if diff >= 0 { diff } else { diff - 1 };
+                bits.put(extra as u32 & ((1 << size) - 1), size);
+            }
+        }
+        out.extend(bits.finish());
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+#[test]
+fn a_first_scan_of_one_or_two_components_is_read_as_zune_jpeg_reads_it() {
+    // Issue #713. libjpeg-turbo writes a progressive file's
+    // first scan with all three components; mozjpeg, which
+    // writes many of the progressive JPEGs served on the web,
+    // gives each component a DC scan of its own by default, so
+    // its first scan is luma alone, which walks the luma
+    // blocks' own grid instead of the frame's MCUs. Such files
+    // are written here in every chroma layout, at sizes off
+    // the block grid: one DC scan per component, two
+    // components interleaved and the third alone, and a chroma
+    // component first. Each is read to its marker, decodes,
+    // and takes the scaled decode; damaged after its first
+    // scan's data or in a bit of it, the reading gives
+    // zune-jpeg's own answer wherever it follows the scan.
+    let (mut comes, mut misses, mut unread) = (0, 0, 0);
+    let plans: [&[&[u8]]; 3] = [&[&[1], &[2], &[3]], &[&[1, 2], &[3]], &[&[2], &[1], &[3]]];
+    for luma in [(1, 1), (2, 1), (2, 2), (1, 2), (4, 1)] {
+        for (width, height) in [(16, 16), (40, 24), (61, 37), (97, 61)] {
+            for scans in plans {
+                let bytes = dc_only_progressive(width, height, luma, scans);
+                let kind = format!("{width}x{height}, luma {luma:?}, scans {scans:?}");
+                assert_eq!(
+                    first_scan::marker_in_first_scan(&bytes),
+                    Some(true),
+                    "{kind}"
+                );
+                assert!(decode_image(&bytes).is_ok(), "{kind}");
+                assert!(
+                    plan_for(&bytes, &format!("{}x0", width / 3)).is_some(),
+                    "{kind}"
+                );
+                let data = first_scan_data(&bytes);
+                let mut damaged = Vec::new();
+                for extra in 1..=9 {
+                    for fill in [&[0x00][..], &[0x5A], &[0xFF, 0x00]] {
+                        let mut longer = bytes[..data.end].to_vec();
+                        for _ in 0..extra {
+                            longer.extend_from_slice(fill);
+                        }
+                        longer.extend_from_slice(&bytes[data.end..]);
+                        damaged.push((format!("{kind}, {extra} x {fill:02X?} added"), longer));
+                    }
+                }
+                for at in data.clone() {
+                    for bit in 0..8 {
+                        let mut flipped = bytes.clone();
+                        flipped[at] ^= 1 << bit;
+                        damaged.push((format!("{kind}, byte {at} bit {bit} flipped"), flipped));
+                    }
+                }
+                for (what, file) in &damaged {
+                    match first_scan::marker_in_first_scan(file) {
+                        Some(reached) => {
+                            assert_eq!(reached, !zune_misses_the_marker(file), "{what}");
+                            if reached {
+                                comes += 1;
+                            } else {
+                                misses += 1;
+                            }
+                        }
+                        None => unread += 1,
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        comes > 2000 && misses > 150 && unread * 4 < comes + misses,
+        "{comes} come to the marker, {misses} miss it, {unread} unread"
+    );
+}
+
 #[test]
 fn a_file_that_declares_another_size_than_it_carries_is_answered_as_before() {
     let img = picture(120, 80);
@@ -2411,10 +2604,21 @@ fn the_fuzz_seeds_are_the_shapes_they_are_named_for() {
             .filter(|d| decode_at(bytes, *d).is_some())
             .count()
     };
-    // Decoded at every scale: baseline and progressive.
-    for name in ["jpeg-small", "jpeg-blue", "jpeg-progressive"] {
+    // Decoded at every scale: baseline and progressive, the
+    // last with a DC scan per component, as mozjpeg writes
+    // them, so its first scan holds luma alone (issue #713).
+    for name in [
+        "jpeg-small",
+        "jpeg-blue",
+        "jpeg-progressive",
+        "jpeg-progressive-scan-per-component",
+    ] {
         assert_eq!(frames(&seed(name)), 3, "{name}");
     }
+    assert_eq!(
+        seed("jpeg-progressive-scan-per-component"),
+        dc_only_progressive(61, 37, (2, 2), &[&[1], &[2], &[3]])
+    );
     assert!(
         turbojpeg::read_header(&seed("jpeg-progressive"))
             .unwrap()
