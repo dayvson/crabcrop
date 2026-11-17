@@ -236,6 +236,12 @@ few hundred bytes, so the frame walk of issue #646 is
 reached from its first input: one-pixel frames on a 3x3
 canvas, blended frames with alpha on part of the canvas,
 and lossy and lossless frames side by side);
+`corpus/decode/` also seeds two animated WebP files of a
+hundred-odd bytes charged from their headers before any
+frame decodes, as the GIF budget seeds are: one whose
+VP8X canvas is past the decode allocation budget, and one
+whose frame count times its canvas is past the
+decoded-pixel budget.
 `corpus/decode/` also seeds shapes
 the server refuses: an OpenEXR file, whose
 decoder is not compiled in, and an AV1 still under a

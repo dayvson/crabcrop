@@ -27,7 +27,43 @@ use crabcrop::{
     sigv4, storage, text, upload, url, video,
 };
 
+/// Print one boot line on standard output, as `println!` does,
+/// without its panic (issue #707). Defined before `mod config` so
+/// that the configuration's own boot lines use it too.
+macro_rules! boot_line {
+    ($($arg:tt)*) => {
+        $crate::print_boot_line(format_args!($($arg)*))
+    };
+}
+
 mod config;
+
+/// What [`boot_line!`] prints with. `println!` panics when a write
+/// to standard output fails, and the boot lines are written before
+/// the server serves, so a reader of the pipe that went away during
+/// boot (a log collector that exited) ended the server there, where
+/// the request log only counts the lines it could not write. A boot
+/// line that fails is lost instead, stderr says so once, and the
+/// boot goes on. In the tests, `println!` keeps the lines in the
+/// test's captured output.
+fn print_boot_line(line: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    println!("{line}");
+    #[cfg(not(test))]
+    {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if let Err(e) = writeln!(std::io::stdout().lock(), "{line}")
+            && !TOLD.swap(true, Ordering::Relaxed)
+        {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "crabcrop: cannot write the boot lines to standard output: {e}"
+            );
+        }
+    }
+}
 
 use std::env;
 use std::sync::Arc;
@@ -225,18 +261,18 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let state = build_state(&config, stores)?;
     // The request and source posture (issue #590), with a
     // warning when unsigned URLs may fetch from any host.
-    println!("{}", config.posture_line());
+    boot_line!("{}", config.posture_line());
     if let Some(warning) = config.posture_warning() {
         eprintln!("warning: {warning}");
     }
-    println!(
+    boot_line!(
         "source fetch: cap {} MB, timeout {}s, buffer budget {} MB",
         config.fetch_cap_mb,
         config.fetch_timeout_secs,
         config.source_buffer_bytes / (1024 * 1024)
     );
-    println!("{}", config.connections_line());
-    println!("configuration fingerprint: {}", state.config_fingerprint);
+    boot_line!("{}", config.connections_line());
+    boot_line!("configuration fingerprint: {}", state.config_fingerprint);
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461). A slow or hanging
     // store holds the first request, and the listening line,
@@ -250,7 +286,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // logged before them.
     let log = state.request_log.clone();
     let signalled = shutdown_signal();
-    println!("crabcrop listening on port {port}");
+    boot_line!("crabcrop listening on port {port}");
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
     // listener closes, idle connections close, and requests
     // in flight finish; then the background work they and
@@ -422,9 +458,10 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
             )
             .map_err(|e| ConfigError::build(Some("CRABCROP_RESULT_STORAGE_DIR"), e))?;
             let (entries, bytes) = store.stats();
-            println!(
+            boot_line!(
                 "result storage at {}: {entries} entries, {bytes} bytes, budget {} MB",
-                storage.dir, storage.max_mb
+                storage.dir,
+                storage.max_mb
             );
             Some(Arc::new(store))
         }
@@ -452,7 +489,7 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
                     ),
                 )
             })?;
-            println!("shared result storage: bucket {}", shared.bucket);
+            boot_line!("shared result storage: bucket {}", shared.bucket);
             Some(Arc::new(store))
         }
         None => None,
@@ -484,7 +521,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
                     format!("cannot load the overlay font: {e}"),
                 )
             })?;
-            println!("overlay font loaded from {path}");
+            boot_line!("overlay font loaded from {path}");
             Some(Arc::new(renderer))
         }
         None => None,
@@ -500,19 +537,19 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     let pdf_renderer = build_pdf_renderer(&config.pdf)?;
     let provenance_signer = build_provenance_signer(config.provenance.as_ref())?;
     if config.meta_enabled {
-        println!("meta mode: on");
+        boot_line!("meta mode: on");
     }
     if !config.client_hints {
-        println!("client hints: off");
+        boot_line!("client hints: off");
     }
     if !config.explain_enabled {
-        println!("explain: off");
+        boot_line!("explain: off");
     }
     // The request log (issue #642): a queue and its writer
     // thread, or with `CRABCROP_LOG_SYNC` a line written
     // where it is logged.
     let request_log = if config.log_sync {
-        println!("request log: synchronous");
+        boot_line!("request log: synchronous");
         RequestLog::inline()
     } else {
         RequestLog::to_stdout().map_err(|e| {
@@ -571,7 +608,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         shared_store: stores.shared,
         upload: config.upload.clone(),
         meta_enabled: config.meta_enabled,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(AI_GATE_PERMITS)),
+        ai_gate: Arc::new(crate::server::Gate::new(AI_GATE_PERMITS)),
         process_gate: Arc::new(crate::server::Gate::new(config.process_permits)),
         slow_gate: Arc::new(crate::server::Gate::new(config.slow_lane_permits)),
         ssim_target: config.ssim_target,
@@ -587,9 +624,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         only_presets: config.only_presets,
         source_roots: config.source_roots.clone(),
         default_ops: config.default_ops.clone(),
-        video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(ANIM_GATE_PERMITS)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(PROBE_GATE_PERMITS)),
+        video_gate: Arc::new(crate::server::Gate::new(crate::video::GATE_PERMITS)),
+        anim_gate: Arc::new(crate::server::Gate::new(ANIM_GATE_PERMITS)),
+        probe_gate: Arc::new(crate::server::Gate::new(PROBE_GATE_PERMITS)),
         inflight: Arc::new(crate::server::Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         background: crate::server::Background::default(),
@@ -1058,7 +1095,7 @@ fn build_ai_providers(config: &AiConfig) -> Result<AiProviders, ConfigError> {
                     format!("cannot load the background-removal model: {e}"),
                 )
             })?;
-            println!("background removal model loaded from {path}");
+            boot_line!("background removal model loaded from {path}");
             Some(Arc::new(provider))
         }
         None => None,
@@ -1071,7 +1108,7 @@ fn build_ai_providers(config: &AiConfig) -> Result<AiProviders, ConfigError> {
                     format!("cannot load the upscale model: {e}"),
                 )
             })?;
-            println!(
+            boot_line!(
                 "upscale model loaded from {path} (native factor {}x)",
                 provider.factor()
             );
@@ -1087,7 +1124,7 @@ fn build_ai_providers(config: &AiConfig) -> Result<AiProviders, ConfigError> {
                     format!("cannot load the inpainting model: {e}"),
                 )
             })?;
-            println!("inpainting model loaded from {path}");
+            boot_line!("inpainting model loaded from {path}");
             Some(Arc::new(provider))
         }
         None => None,
@@ -1114,7 +1151,7 @@ fn build_ai_providers(config: &AiConfig) -> Result<AiProviders, ConfigError> {
                     format!("cannot load the face detection model: {e}"),
                 )
             })?;
-            println!("face detection model loaded from {path}");
+            boot_line!("face detection model loaded from {path}");
             Some(Arc::new(provider))
         }
         None => None,
@@ -1148,7 +1185,7 @@ fn build_fallback(value: Option<&str>) -> Result<Option<server::Fallback>, Confi
     match value {
         Some(v) => {
             if v.starts_with("http://") || v.starts_with("https://") {
-                println!("fallback image will be fetched from {v}");
+                boot_line!("fallback image will be fetched from {v}");
                 Ok(Some(server::Fallback::Url(v.to_string())))
             } else {
                 let bytes = std::fs::read(v).map_err(|e| {
@@ -1157,7 +1194,7 @@ fn build_fallback(value: Option<&str>) -> Result<Option<server::Fallback>, Confi
                         format!("cannot read the fallback image {v}: {e}"),
                     )
                 })?;
-                println!("fallback image loaded from {v} ({} bytes)", bytes.len());
+                boot_line!("fallback image loaded from {v} ({} bytes)", bytes.len());
                 Ok(Some(server::Fallback::Bytes(Arc::new(bytes))))
             }
         }
@@ -1185,9 +1222,10 @@ fn build_video_encoder(
                     format!("cannot use CRABCROP_VIDEO_ENCODER ({path}): {e}"),
                 )
             })?;
-            println!(
+            boot_line!(
                 "video encoder: {path} (timeout {}s, output cap {} MB)",
-                config.timeout_secs, config.max_mb
+                config.timeout_secs,
+                config.max_mb
             );
             Ok(Some(Arc::new(encoder)))
         }
@@ -1216,7 +1254,7 @@ fn build_video_decoder(
                     format!("cannot use CRABCROP_VIDEO_DECODER ({path}): {e}"),
                 )
             })?;
-            println!("video decoder: {path} (timeout {}s)", config.timeout_secs);
+            boot_line!("video decoder: {path} (timeout {}s)", config.timeout_secs);
             Ok(Some(Arc::new(extractor)))
         }
         None => Ok(None),
@@ -1246,7 +1284,7 @@ fn build_provenance_signer(
         )
     })?;
     let (line, warning) = provenance_boot_lines(&signer.name, signer.alg(), &config.cert);
-    println!("{line}");
+    boot_line!("{line}");
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
     }
@@ -1309,7 +1347,7 @@ fn build_pdf_renderer(
                     format!("cannot use CRABCROP_PDF_RENDERER ({path}): {e}"),
                 )
             })?;
-            println!("PDF renderer: {path} (timeout {}s)", config.timeout_secs);
+            boot_line!("PDF renderer: {path} (timeout {}s)", config.timeout_secs);
             Ok(Some(Arc::new(renderer)))
         }
         None => Ok(None),
@@ -1333,7 +1371,7 @@ fn build_segment(
                 format!("cannot load the segment model pair: {e}"),
             )
         })?;
-    println!("segment models loaded from {encoder} (encoder) and {decoder} (decoder)");
+    boot_line!("segment models loaded from {encoder} (encoder) and {decoder} (decoder)");
     Ok(Some(Arc::new(provider)))
 }
 
@@ -1361,7 +1399,7 @@ fn build_detector(
             format!("cannot load the detection model: {e}"),
         )
     })?;
-    println!(
+    boot_line!(
         "detection model loaded from {} ({} classes, threshold {})",
         config.model,
         crate::ai::DetectionProvider::describe(&provider).len(),
@@ -1440,7 +1478,7 @@ fn build_declared_detectors(
                         decl.name, decl.model
                     ))
                 })?;
-                println!(
+                boot_line!(
                     "declared detector {} (boxes) loaded from {} ({} classes, threshold {})",
                     decl.name,
                     decl.model,
@@ -1461,14 +1499,15 @@ fn build_declared_detectors(
                         ))
                     })?;
                 if focal.is_none() {
-                    println!(
+                    boot_line!(
                         "declared detector {} (focal) loaded from {}",
-                        decl.name, decl.model
+                        decl.name,
+                        decl.model
                     );
                     focal = Some(Arc::new(provider));
                     active_focal = Some(decl.name.clone());
                 } else {
-                    println!(
+                    boot_line!(
                         "declared detector {} (focal) loaded from {} (standby: {} is the active focal provider)",
                         decl.name,
                         decl.model,
@@ -1513,7 +1552,7 @@ fn build_tagger(
             format!("cannot load the CLIP tagging models: {e}"),
         )
     })?;
-    println!(
+    boot_line!(
         "CLIP tagging loaded ({} labels, threshold {})",
         provider.label_count(),
         config.threshold
@@ -1570,7 +1609,7 @@ fn build_moderation(
                         format!("cannot load the moderation model: {e}"),
                     )
                 })?;
-            println!(
+            boot_line!(
                 "moderation verdicts loaded from {model} ({} categories)",
                 provider.labels().len()
             );
@@ -1593,7 +1632,7 @@ fn build_moderation(
                     format!("cannot load the CLIP moderation fallback: {e}"),
                 )
             })?;
-            println!(
+            boot_line!(
                 "moderation review signals loaded from {} ({} prompt labels)",
                 clip.image_model,
                 tagger.label_count()
@@ -1625,7 +1664,7 @@ fn build_aesthetic(
             format!("cannot load the aesthetic head: {e}"),
         )
     })?;
-    println!(
+    boot_line!(
         "aesthetic head loaded from {path} (expects a {}-dimensional embedding)",
         head.expected_dim()
     );
@@ -1656,7 +1695,7 @@ fn build_ocr(
             format!("cannot load the OCR models: {e}"),
         )
     })?;
-    println!(
+    boot_line!(
         "OCR loaded from {detect} (detection) and {recognize} (recognition), \
          dictionary {dict} ({} characters), language {language}",
         provider.dict_len()
