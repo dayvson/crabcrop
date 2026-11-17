@@ -388,7 +388,9 @@ fn a_video_s_frames_share_one_smart_crop_window() {
     assert_eq!(samples.len(), 3, "one sample a frame at 10 fps");
     let spread = |frame: &[u8]| {
         let (min, max) = frame
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| p[0])
             .fold((255, 0), |(lo, hi), v| (v.min(lo), v.max(hi)));
         max - min
