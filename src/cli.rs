@@ -2575,13 +2575,13 @@ mod tests {
         );
     }
 
-    /// A bare remainder stays whole, signature and all, though
-    /// its first segment parses as a keyed signature (`exp:`,
-    /// `maxage:`, `page:`, `frame:`, `preset:`), whatever its
-    /// source: without a leading slash the text is a path only
-    /// when it opens with `unsafe` or a whole tag. `explain`,
-    /// `purge` and `meta` all read their target this way, so a
-    /// misread one would purge, or fetch, another render.
+    /// A bare remainder stays whole when its first segment
+    /// parses as a keyed signature (`exp:`, `maxage:`, `page:`,
+    /// `frame:`, `preset:`), whatever its source: without a
+    /// leading slash the text is a path only when it opens with
+    /// `unsafe` or a whole tag. `explain`, `purge` and `meta`
+    /// all read their target this way, so a misread one would
+    /// purge, or fetch, another render.
     #[tokio::test]
     async fn bare_remainders_keep_their_first_segment() {
         let base = "http://img.test";
