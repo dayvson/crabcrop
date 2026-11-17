@@ -217,7 +217,7 @@ fn test_state() -> AppState {
         shared_store: None,
         upload: None,
         meta_enabled: true,
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        ai_gate: Arc::new(Gate::new(2)),
         process_gate: Arc::new(Gate::new(4)),
         ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
@@ -232,9 +232,9 @@ fn test_state() -> AppState {
         only_presets: false,
         source_roots: std::collections::HashMap::new(),
         default_ops: Vec::new(),
-        video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        video_gate: Arc::new(Gate::new(2)),
+        anim_gate: Arc::new(Gate::new(1)),
+        probe_gate: Arc::new(Gate::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -339,7 +339,7 @@ async fn metrics_text(base: &str) -> String {
     resp.text().await.unwrap()
 }
 
-async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> String {
+async fn spawn_app_with_anim_gate(anim_gate: Arc<Gate>) -> String {
     let state = AppState {
         anim_gate,
         ..test_state()
@@ -352,7 +352,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
     format!("http://{addr}")
 }
 
-async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String {
+async fn spawn_app_with_ai_gate(ai_gate: Arc<Gate>) -> String {
     let state = AppState {
         ai_gate,
         ..test_state()
@@ -5982,7 +5982,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
             detect: Some(Arc::new(FakeDetector)),
             ..Providers::default()
         }),
-        ai_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        ai_gate: Arc::new(Gate::new(1)),
         ..test_state()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11157,7 +11157,7 @@ async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
     // stack onto a provider the gate believes idle.
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
-    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.ai_gate = Arc::new(Gate::new(1));
     providers_mut(&mut state).tagger = Some(Arc::new(BlockingTagger {
         release: release.clone(),
     }));
@@ -11178,7 +11178,7 @@ async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
     // hold their permits in the same shape).
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
-    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.ai_gate = Arc::new(Gate::new(1));
     providers_mut(&mut state).moderation = Some(Arc::new(BlockingModeration {
         release: release.clone(),
     }));
@@ -11198,7 +11198,7 @@ async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
     // is shared across a sequence of provider tasks.
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
-    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.ai_gate = Arc::new(Gate::new(1));
     providers_mut(&mut state).detect = Some(Arc::new(BlockingDetector {
         release: release.clone(),
     }));
@@ -11223,7 +11223,7 @@ async fn meta_sections_never_run_inference_without_an_ai_permit() {
     // "busy". Once the permit returns, the same sections
     // answer, so the degrade is the gate's doing.
     let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
-    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.ai_gate = Arc::new(Gate::new(1));
     providers_mut(&mut state).tagger = Some(Arc::new(FakeTagger));
     providers_mut(&mut state).detect = Some(Arc::new(FakeDetector));
     providers_mut(&mut state).moderation = Some(Arc::new(FakeModeration));
@@ -11552,6 +11552,45 @@ async fn metrics_expose_per_lane_occupancy() {
 }
 
 #[tokio::test]
+async fn metrics_expose_each_gates_occupancy() {
+    // Issue #707: only the lanes were exposed. The AI,
+    // video, animation and probe gates report their
+    // permits in use against their capacity the same way,
+    // read live: holding permits by hand moves the gauges.
+    let state = Arc::new(AppState {
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        ai_gate: Arc::new(Gate::new(3)),
+        ..test_state()
+    });
+    let base = serve_state(&state).await;
+    let held_ai = state.ai_gate.clone().acquire_owned().await.unwrap();
+    let _held_ai2 = state.ai_gate.clone().acquire_owned().await.unwrap();
+    let _held_video = state.video_gate.clone().acquire_owned().await.unwrap();
+    let _held_anim = state.anim_gate.clone().acquire_owned().await.unwrap();
+    let body = metrics_text(&base).await;
+    for (gate, in_use, capacity) in [
+        ("ai", 2, 3),
+        ("video", 1, 2),
+        ("animation", 1, 1),
+        ("probe", 0, 2),
+    ] {
+        assert_eq!(
+            metric(&body, &format!("crabcrop_gate_in_use{{gate=\"{gate}\"}}")),
+            in_use,
+            "{gate}: {body}"
+        );
+        assert_eq!(
+            metric(&body, &format!("crabcrop_gate_capacity{{gate=\"{gate}\"}}")),
+            capacity,
+            "{gate}: {body}"
+        );
+    }
+    drop(held_ai);
+    let body = metrics_text(&base).await;
+    assert_eq!(metric(&body, "crabcrop_gate_in_use{gate=\"ai\"}"), 1);
+}
+
+#[tokio::test]
 async fn slow_lane_saturation_sheds_slow_requests_and_serves_stills() {
     // Issue #324 at the HTTP seam: with the slow lane
     // saturated (its only permit held, as a long
@@ -11806,7 +11845,7 @@ async fn animation_gate_sheds_a_second_animated_render() {
     // WebP request waits out the gate wait and sheds
     // with the animation-queue 503 instead of stacking
     // a second encode behind the first.
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let gate = Arc::new(Gate::new(1));
     let base = spawn_app_with_anim_gate(gate.clone()).await;
     let src = spawn_bytes_server(animated_webp_bytes()).await;
     let _held = gate.acquire_owned().await.unwrap();
@@ -11836,7 +11875,7 @@ async fn animation_gate_sheds_gif_to_webp_renders() {
     // does, whether the WebP came from an unsigned
     // Accept header or an explicit format(webp). Before
     // the fix both ran at once on the stills lane.
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let gate = Arc::new(Gate::new(1));
     let base = spawn_app_with_anim_gate(gate.clone()).await;
     let src = spawn_bytes_server(animated_gif_bytes()).await;
     let _held = gate.acquire_owned().await.unwrap();
@@ -11889,7 +11928,7 @@ async fn animation_gate_leaves_still_renders_unaffected() {
     // gate is saturated (one long encode running), an
     // unrelated still render still succeeds promptly
     // instead of shedding behind the animation work.
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let gate = Arc::new(Gate::new(1));
     let base = spawn_app_with_anim_gate(gate.clone()).await;
     let _held = gate.acquire_owned().await.unwrap();
     let src = spawn_image_server().await;
@@ -11916,7 +11955,7 @@ async fn animated_webp_renders_through_the_gate_when_free() {
     // The gated path still delivers the feature: with
     // the animation permit free, a bare animated WebP
     // request renders the full animation.
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let gate = Arc::new(Gate::new(1));
     let base = spawn_app_with_anim_gate(gate).await;
     let src = spawn_bytes_server(animated_webp_bytes()).await;
     let sig = sign(&src);
@@ -13222,7 +13261,7 @@ async fn a_provider_free_smart_crop_never_touches_the_ai_gate() {
     // shed. The smart crop runs on built-in saliency
     // and answers at once.
     let src = spawn_bytes_server(test_png()).await;
-    let base = spawn_app_with_ai_gate(Arc::new(tokio::sync::Semaphore::new(0))).await;
+    let base = spawn_app_with_ai_gate(Arc::new(Gate::new(0))).await;
     let remainder = format!("crop:20x20:smart/{src}");
     let url = format!("{base}/{}/{remainder}", sign(&remainder));
     let started = std::time::Instant::now();
@@ -13533,6 +13572,168 @@ fn start_request(
 async fn disconnect(request: tokio::task::JoinHandle<Response>) {
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
+}
+
+/// [`start_request`] with request headers of the test's own
+/// and no hint.
+fn start_request_with(
+    state: &Arc<AppState>,
+    remainder: &str,
+    headers: &[(&str, &str)],
+) -> tokio::task::JoinHandle<Response> {
+    let mut request =
+        axum::http::Request::builder().uri(format!("/{}/{remainder}", sign(remainder)));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request.body(axum::body::Body::empty()).unwrap();
+    tokio::spawn(handle(State(state.clone()), request))
+}
+
+/// The request lines `out` holds, by request ID.
+fn logged(
+    out: &crate::observe::FakeStdout,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    out.lines()
+        .iter()
+        .map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            (record["request_id"].as_str().unwrap().to_string(), record)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn requests_whose_clients_left_still_leave_their_line_and_metrics() {
+    // Issue #707: since #622 a render that has started
+    // outlives its client and is stored, but the request
+    // was dropped with its record, so it left no line and
+    // no metrics update, and neither did a follower whose
+    // client gave up. Each record now files itself with the
+    // client-closed status: a follower's at once, where it
+    // waited, and the leader's once its render has ended,
+    // with the render's times. Nothing counts as served.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(2);
+    let out = crate::observe::FakeStdout::default();
+    state.request_log = RequestLog::inline_to(out.clone());
+    let state = Arc::new(state);
+    let _open = OpenOnDrop(release.clone());
+    let remainder = format!("filters:upscale(2)/{src}");
+    let leader = start_request_with(&state, &remainder, &[("x-request-id", "leader")]);
+    wait_until("the leader's render started", || {
+        calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let follower = start_request_with(&state, &remainder, &[("x-request-id", "follower")]);
+    wait_until("the follower waits on the leader's flight", || {
+        state.inflight.image_flights().iter().any(|(_, n)| *n == 1)
+    })
+    .await;
+    disconnect(follower).await;
+    let lines = logged(&out);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let follower = &lines["follower"];
+    assert_eq!(follower["status"], crate::observe::CLIENT_CLOSED);
+    assert_eq!(follower["ops"], "filters:upscale(2)");
+    assert_eq!(follower["cache"], "miss");
+    assert_eq!(follower["process_ms"], 0.0);
+    assert_eq!(follower["bytes_out"], 0);
+    // The leader's client leaves: its render goes on, and
+    // its line waits for it.
+    disconnect(leader).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(logged(&out).len(), 1);
+    open_release(&release);
+    wait_until("the leader's line", || logged(&out).len() == 2).await;
+    let leader = &logged(&out)["leader"];
+    assert_eq!(leader["status"], crate::observe::CLIENT_CLOSED);
+    assert_eq!(leader["method"], "GET");
+    assert!(leader["bytes_in"].as_u64().unwrap() > 0, "{leader}");
+    assert_eq!(leader["bytes_out"], 0);
+    assert!(
+        leader["total_ms"].as_f64().unwrap() >= 100.0,
+        "the leader's time ends with its render: {leader}"
+    );
+    let metrics = state.metrics.render();
+    assert_eq!(
+        metric(&metrics, "crabcrop_requests_total{status_class=\"4xx\"}"),
+        2
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_requests_total{status_class=\"2xx\"}"),
+        0
+    );
+    assert_eq!(metric(&metrics, "crabcrop_process_duration_ms_count"), 1);
+    assert_eq!(metric(&metrics, "crabcrop_bytes_served_total"), 0);
+    // The render was stored, as before: the replay is a
+    // hit, logged as one.
+    let replay = start_request_with(&state, &remainder, &[("x-request-id", "replay")])
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = &logged(&out)["replay"];
+    assert_eq!(replay["status"], 200);
+    assert_eq!(replay["cache"], "hit");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_request_dropped_where_it_waits_leaves_its_line_at_once() {
+    // Issue #707: a miss whose client leaves before its
+    // render starts stops where it is (here, waiting for
+    // the only lane), and a meta request stops where it is
+    // whatever it was doing, render included, as both
+    // always have. Each leaves its line and its metrics
+    // update when it stops.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (mut state, release, calls) = held_upscale_state(1);
+    let out = crate::observe::FakeStdout::default();
+    state.request_log = RequestLog::inline_to(out.clone());
+    let state = Arc::new(state);
+    let _open = OpenOnDrop(release.clone());
+    let held = state.process_gate.clone().acquire_owned().await.unwrap();
+    let remainder = format!("filters:upscale(2)/{src}");
+    let request = start_request_with(&state, &remainder, &[("x-request-id", "waiting")]);
+    wait_until("the request waits for a lane", || {
+        state.ai_gate.available_permits() == 1
+    })
+    .await;
+    disconnect(request).await;
+    // Its miss runs on a task of its own, which drops it
+    // there once it sees the client gone.
+    wait_until("the dropped request's line", || {
+        logged(&out).contains_key("waiting")
+    })
+    .await;
+    let lines = logged(&out);
+    assert_eq!(lines["waiting"]["status"], crate::observe::CLIENT_CLOSED);
+    assert_eq!(lines["waiting"]["cache"], "miss");
+    assert_eq!(lines["waiting"]["process_ms"], 0.0);
+    drop(held);
+    // A meta request whose render has started is dropped
+    // with its client, render and all: never finished, never
+    // stored, and its line is there at once.
+    let meta = start_request_with(
+        &state,
+        &remainder,
+        &[("accept", "application/json"), ("x-request-id", "meta")],
+    );
+    wait_until("the meta render started", || {
+        calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    disconnect(meta).await;
+    let lines = logged(&out);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines["meta"]["status"], crate::observe::CLIENT_CLOSED);
+    open_release(&release);
+    let metrics = state.metrics.render();
+    assert_eq!(
+        metric(&metrics, "crabcrop_requests_total{status_class=\"4xx\"}"),
+        2
+    );
 }
 
 #[tokio::test]
@@ -17749,15 +17950,18 @@ async fn scrape(base: &str, token: &str) -> String {
 #[tokio::test]
 async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     // Issue #643: `/metrics` is written into one buffer,
-    // section after section. With a disk tier and a shared
-    // tier every section is there, and at rest every value
-    // is known: the request counters as `Metrics::render`
-    // gives them, then the lanes, the source buffer, the
-    // lookups and the tiers, each line the text it was when
-    // a string was formatted for it.
+    // section after section. With a disk tier, a shared
+    // tier and the request log's queue every section is
+    // there, and at rest every value is known: the request
+    // counters as `Metrics::render` gives them, then the
+    // lanes, the gates and the request log (issue #707),
+    // the source buffer, the lookups and the tiers, each
+    // line the text it was when a string was formatted for
+    // it.
     let dir = crate::test_support::scratch_dir("metrics-one-buffer");
     let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
     state.metrics_token = Some("metrics-token".to_string());
+    state.request_log = RequestLog::queued_to(crate::observe::FakeStdout::default());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     state.metrics.record(&RequestRecord {
@@ -17776,6 +17980,7 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     let source_buffer = state.loader.source_budget().capacity();
     let (_, lookup_slots) = state.loader.lookup_slots();
     let puts = SHARED_PUTS_AT_ONCE;
+    let queue = crate::observe::QUEUE_BYTES;
     let expected = format!(
         r#"# HELP crabcrop_lane_in_use Processing lane permits currently in use.
 # TYPE crabcrop_lane_in_use gauge
@@ -17785,6 +17990,30 @@ crabcrop_lane_in_use{{lane="slow"}} 0
 # TYPE crabcrop_lane_capacity gauge
 crabcrop_lane_capacity{{lane="process"}} 4
 crabcrop_lane_capacity{{lane="slow"}} 2
+# HELP crabcrop_gate_in_use Gate permits currently in use.
+# TYPE crabcrop_gate_in_use gauge
+crabcrop_gate_in_use{{gate="ai"}} 0
+crabcrop_gate_in_use{{gate="video"}} 0
+crabcrop_gate_in_use{{gate="animation"}} 0
+crabcrop_gate_in_use{{gate="probe"}} 0
+# HELP crabcrop_gate_capacity Gate permit capacity.
+# TYPE crabcrop_gate_capacity gauge
+crabcrop_gate_capacity{{gate="ai"}} 2
+crabcrop_gate_capacity{{gate="video"}} 2
+crabcrop_gate_capacity{{gate="animation"}} 1
+crabcrop_gate_capacity{{gate="probe"}} 2
+# HELP crabcrop_request_log_queue_bytes Bytes of request log lines held for standard output, queued or being written.
+# TYPE crabcrop_request_log_queue_bytes gauge
+crabcrop_request_log_queue_bytes 0
+# HELP crabcrop_request_log_queue_capacity_bytes The bytes the request log holds before requests wait for room.
+# TYPE crabcrop_request_log_queue_capacity_bytes gauge
+crabcrop_request_log_queue_capacity_bytes {queue}
+# HELP crabcrop_request_log_requests_waiting Requests waiting for room in the request log.
+# TYPE crabcrop_request_log_requests_waiting gauge
+crabcrop_request_log_requests_waiting 0
+# HELP crabcrop_request_log_queue_full_seconds_total Seconds the request log's queue has spent full, when requests that log wait for room.
+# TYPE crabcrop_request_log_queue_full_seconds_total counter
+crabcrop_request_log_queue_full_seconds_total 0.000
 # HELP crabcrop_source_buffer_bytes Source bytes cache misses hold against the source buffer budget.
 # TYPE crabcrop_source_buffer_bytes gauge
 crabcrop_source_buffer_bytes 0
@@ -17828,6 +18057,11 @@ crabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000
 "#
     );
     assert_eq!(sections, expected);
+    // Every series says what it is (issue #707).
+    assert_eq!(
+        crate::observe::undescribed_series(&scraped),
+        Vec::<String>::new()
+    );
 }
 
 #[tokio::test]

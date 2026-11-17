@@ -8152,6 +8152,193 @@ fn webp_frame_cap_rejects_frame_bombs() {
     assert!(decode_webp_frames(&bomb, None).is_err());
 }
 
+/// The same animation with its VP8X canvas declaring `w` x `h`:
+/// the frames stay where they are, so the file still parses as a
+/// `w` x `h` animation with the frames as sub-rectangles.
+fn with_webp_canvas(mut bytes: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+    let vp8x = bytes
+        .windows(4)
+        .position(|c| c == b"VP8X")
+        .expect("an animated WebP has a VP8X chunk");
+    let body = vp8x + 8;
+    bytes[body + 4..body + 7].copy_from_slice(&(w - 1).to_le_bytes()[..3]);
+    bytes[body + 7..body + 10].copy_from_slice(&(h - 1).to_le_bytes()[..3]);
+    bytes
+}
+
+#[test]
+fn an_over_budget_animated_webp_canvas_is_charged_before_any_frame_decodes() {
+    // A three-frame animation whose VP8X canvas declares
+    // 12000x12000: 576 MiB at four bytes a pixel, past the
+    // 256 MiB decode allocation budget. The real frames are
+    // tiny, so the point is that the canvas is charged from the
+    // header and refused before either decoder allocates it.
+    let bytes = with_webp_canvas(animated_webp_bytes(), 12000, 12000);
+    // The charge is a header computation; it opens no decoder.
+    let err = check_webp_frame_budget(&bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("canvas") && err.to_string().contains("decode allocation limit"),
+        "{err}"
+    );
+    // And the decode refuses with it, before any frame decodes,
+    // rather than falling back to the image crate's iterator.
+    let started = std::time::Instant::now();
+    let got = decode_webp_frames(&bytes, None).unwrap_err();
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn an_animated_webp_past_the_pixel_budget_is_refused_up_front() {
+    // A canvas inside the allocation budget (6000x6000 = 144 MiB
+    // at four bytes a pixel) but three frames, 108M decoded
+    // pixels in total, past the 100M decoded-pixel budget. The
+    // frame count times the canvas is charged from the headers
+    // before any frame decodes, as a GIF's frames are.
+    let bytes = with_webp_canvas(animated_webp_bytes(), 6000, 6000);
+    let err = check_webp_frame_budget(&bytes).unwrap_err();
+    assert!(err.to_string().contains("decoded-pixel limit"), "{err}");
+    let started = std::time::Instant::now();
+    let got = decode_webp_frames(&bytes, None).unwrap_err();
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn an_animated_webp_past_the_kept_bytes_budget_is_refused_up_front() {
+    // Three frames on a 5000x5000 canvas: 75M decoded pixels, inside
+    // the 100M pixel budget, but the collector keeps every frame at
+    // the canvas's size, 300 MB in all, past the 256 MiB decode
+    // allocation budget it charges them against. The headers say so,
+    // so the animation is refused before its first frame decodes,
+    // with the collector's own message.
+    let bytes = with_webp_canvas(animated_webp_bytes(), 5000, 5000);
+    let err = check_webp_frame_budget(&bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("byte decode allocation limit"),
+        "{err}"
+    );
+    let started = std::time::Instant::now();
+    let got = decode_webp_frames(&bytes, None).unwrap_err();
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+    // Three frames on a 4000x4000 canvas keep 192 MB, inside the
+    // budget, so the header charge admits them.
+    assert!(check_webp_frame_budget(&with_webp_canvas(animated_webp_bytes(), 4000, 4000)).is_ok());
+}
+
+/// A GIF with a `width` x `height` logical screen and `frames`
+/// one-pixel frames at its corner, so each frame decodes from one
+/// coded pixel and comes back composited onto the whole screen.
+fn small_frames_on_a_large_screen_gif(frames: usize, width: u16, height: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder =
+            gif::Encoder::new(&mut out, width, height, &[0, 0, 0, 255, 255, 255]).unwrap();
+        let mut frame = gif::Frame {
+            width: 1,
+            height: 1,
+            buffer: std::borrow::Cow::Owned(vec![0]),
+            ..gif::Frame::default()
+        };
+        frame.make_lzw_pre_encoded();
+        for _ in 0..frames {
+            encoder.write_lzw_pre_encoded_frame(&frame).unwrap();
+        }
+    }
+    out
+}
+
+#[test]
+fn a_gif_past_the_kept_bytes_budget_is_refused_before_any_frame_decodes() {
+    // Two one-pixel frames on a 6000x6000 screen: 72M decoded pixels,
+    // inside the 100M pixel budget, but each frame comes back at the
+    // screen's size, 288 MB kept in all, past the 256 MiB decode
+    // allocation budget. The descriptors say so, so the GIF is
+    // refused before its first frame decodes, with the collector's
+    // own message.
+    let bytes = small_frames_on_a_large_screen_gif(2, 6000, 6000);
+    let err = check_gif_frame_budget(&bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("byte decode allocation limit"),
+        "{err}"
+    );
+    let started = std::time::Instant::now();
+    let got = match decode_gif_frames(&bytes, None) {
+        Ok(frames) => panic!("decoded {} frames past the budget", frames.len()),
+        Err(e) => e,
+    };
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+    // One such frame keeps 144 MB, inside the budget.
+    assert!(check_gif_frame_budget(&small_frames_on_a_large_screen_gif(1, 6000, 6000)).is_ok());
+}
+
+#[test]
+fn a_within_budget_animated_webp_still_decodes_to_its_frames() {
+    // The charge does not refuse an animation inside the budget:
+    // the fixture (three 40x20 frames) decodes unchanged, and so
+    // does a 2000x2000 two-frame animation (16 MiB canvas, 8M
+    // pixels), well within both bounds.
+    assert!(check_webp_frame_budget(&animated_webp_bytes()).is_ok());
+    let frames = decode_webp_frames(&animated_webp_bytes(), None).unwrap();
+    assert_eq!(frames.len(), 3);
+    let big_but_ok = with_webp_canvas(animated_webp_bytes(), 2000, 2000);
+    assert!(check_webp_frame_budget(&big_but_ok).is_ok());
+}
+
+/// A minimal lossless still WebP whose header declares `w` x `h`
+/// and codes one transparent colour in eight bytes, so libwebp
+/// reads its size without decoding `w` x `h` pixels.
+fn one_colour_still_webp(w: u32, h: u32) -> Vec<u8> {
+    let header = (w - 1) | (h - 1) << 14 | 1 << 28;
+    let mut stream = vec![0x2f];
+    stream.extend_from_slice(&header.to_le_bytes());
+    stream.extend_from_slice(&[0x88, 0x88, 0x08]);
+    let mut file = b"RIFF\0\0\0\0WEBPVP8L".to_vec();
+    file.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+    file.extend_from_slice(&stream);
+    if stream.len() % 2 == 1 {
+        file.push(0);
+    }
+    let riff = (file.len() - 8) as u32;
+    file[4..8].copy_from_slice(&riff.to_le_bytes());
+    file
+}
+
+#[test]
+fn the_libwebp_still_fast_path_holds_the_decode_limits() {
+    // libwebp reads a still's declared size from its header, so
+    // the fast path reads it too and stands down (None) for a
+    // still past the decode allocation budget, before libwebp
+    // decodes it. A probe that could not read the header then
+    // leaves the file to the bounded generic decode, which
+    // refuses it, rather than letting libwebp decode it whole.
+    let over_alloc = one_colour_still_webp(9000, 9000); // 81M px, 324 MiB at RGBA
+    assert!(decode_webp_direct(&over_alloc).is_none());
+    assert!(decode_image(&over_alloc).is_err());
+    // A still inside the budget still takes the fast path.
+    let small = one_colour_still_webp(64, 48);
+    assert!(decode_webp_direct(&small).is_some());
+    assert!(decode_image(&small).is_ok());
+}
+
 #[test]
 fn placeholders_are_computed_only_on_request() {
     let engine = Engine;

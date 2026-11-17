@@ -23,6 +23,9 @@ struct FakeState {
     stalled: bool,
     /// A `write` is blocked on `stalled`.
     blocked: bool,
+    /// Stop reading again once the stream has taken this
+    /// many more bytes.
+    stall_after: Option<usize>,
     /// The most bytes one `write` takes; 0 for all it is
     /// given.
     at_most: usize,
@@ -66,10 +69,26 @@ impl FakeStdout {
         self.state().stalled = true;
     }
 
-    /// Read again.
+    /// Read again. A `write` that was blocked goes on, so
+    /// none is blocked until the stream stops again.
     pub(crate) fn resume(&self) {
-        self.state().stalled = false;
+        let mut state = self.state();
+        state.stalled = false;
+        state.blocked = false;
+        drop(state);
         self.0.changed.notify_all();
+    }
+
+    /// Stop reading again once the stream has taken `bytes`
+    /// more bytes: the `write` that takes the last of them
+    /// takes no more, and the next one blocks.
+    pub(crate) fn stall_after(&self, bytes: usize) {
+        let mut state = self.state();
+        if bytes == 0 {
+            state.stalled = true;
+        } else {
+            state.stall_after = Some(bytes);
+        }
     }
 
     /// Wait until a `write` is blocked on a stream nobody
@@ -147,6 +166,11 @@ impl Write for FakeStdout {
             take = take.min(state.before_failing);
             state.before_failing -= take;
         }
+        if let Some(left) = state.stall_after {
+            take = take.min(left);
+            state.stall_after = Some(left - take).filter(|left| *left > 0);
+            state.stalled = state.stall_after.is_none();
+        }
         state.writes.push(bytes[..take].to_vec());
         Ok(take)
     }
@@ -171,10 +195,17 @@ impl RequestLog {
     /// A queued log that writes to `out`, holds `cap` bytes,
     /// and reports what it drops to the notes it returns.
     pub(crate) fn over(out: &FakeStdout, cap: usize) -> (Self, Notes) {
+        Self::over_stalling(out, cap, STALLED_AFTER)
+    }
+
+    /// [`RequestLog::over`], counting as stalled once its
+    /// queue has been full for `after` (issue #707), so a
+    /// test need not wait out [`STALLED_AFTER`].
+    pub(crate) fn over_stalling(out: &FakeStdout, cap: usize, after: Duration) -> (Self, Notes) {
         let notes = Notes::default();
         let sink = notes.clone();
         let note: Note = Box::new(move |text| sink.0.lock().unwrap().push(text.to_string()));
-        let log = Self::queued(Box::new(out.clone()), cap, note).unwrap();
+        let log = Self::queued(Box::new(out.clone()), cap, after, note).unwrap();
         (log, notes)
     }
 }

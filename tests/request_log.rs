@@ -236,7 +236,10 @@ impl Unread {
     /// Send [`long_line_request`]s, one after the other,
     /// until one waits (see [`HEALTH_CHECKS`]): how many
     /// were answered, and the one that waits. `most` is
-    /// more than can fit.
+    /// more than can fit. The health checks only have to
+    /// be answered: once the queue has stayed full for 5
+    /// seconds, which a slow machine can take to run them,
+    /// they answer 503 (issue #707).
     fn fill(&self, most: usize) -> (usize, std::thread::JoinHandle<Option<String>>) {
         let port = self.port;
         for n in 0..most {
@@ -248,7 +251,8 @@ impl Unread {
             });
             let mut checks = 0;
             while answered.recv_timeout(Duration::from_millis(1)).is_err() {
-                assert_eq!(status(port, "/health", ""), 200);
+                let health = status(port, "/health", "");
+                assert!(health == 200 || health == 503, "/health answered {health}");
                 checks += 1;
                 if checks == HEALTH_CHECKS {
                     return (n, request);
@@ -658,4 +662,267 @@ fn the_writer_thread_has_a_name_and_does_nothing_at_rest() {
     assert_eq!(status(port, &unsigned, ""), 403);
     lines.recv_timeout(LONG).unwrap();
     assert_eq!(writer_thread(server.0.id()), None);
+}
+
+/// The `/metrics` token the stalled-log tests configure.
+const METRICS_TOKEN: &str = "request-log-metrics-token-0123456789";
+
+/// One HTTP/1.0 GET on `port`: the answer's status and body.
+fn get_body(port: u16, path: &str, headers: &str) -> (u16, String) {
+    try_get_body(port, path, headers).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// [`get_body`], or the error that kept the answer away.
+fn try_get_body(port: u16, path: &str, headers: &str) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(LONG))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{headers}\r\n"
+    )?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("{path}: no head in {response:?}"));
+    Ok((status_of(head), body.to_string()))
+}
+
+/// The exposition, scraped with [`METRICS_TOKEN`].
+fn scrape(port: u16) -> String {
+    let (status, body) = get_body(
+        port,
+        "/metrics",
+        &format!("Authorization: Bearer {METRICS_TOKEN}\r\n"),
+    );
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// The value of the metric `name` in `exposition`.
+fn metric(exposition: &str, name: &str) -> f64 {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in:\n{exposition}"))
+}
+
+/// How long the server keeps its queue full before its
+/// health check fails: `STALLED_AFTER`.
+const STALLED_AFTER: Duration = Duration::from_secs(5);
+
+#[test]
+fn a_standard_output_nobody_reads_fails_the_health_check_until_it_is_read() {
+    // Issue #707: with standard output a pipe nobody reads,
+    // the queue fills and every image request waits, and
+    // the health check kept answering 200, so a liveness
+    // probe never restarted a replica that served no
+    // image. Now it answers 503 once the queue has stayed
+    // full for 5 seconds, `/metrics` shows the queue, and
+    // everything goes on once the pipe is read: the
+    // request that waited is answered, no line is lost,
+    // and the check passes again.
+    let mut server = Unread::boot(&[
+        ("CRABCROP_ALLOW_UNSAFE", "1"),
+        ("CRABCROP_METRICS_TOKEN", METRICS_TOKEN),
+    ]);
+    let port = server.port;
+    let before_filling = Instant::now();
+    let (answered, waiting) = server.fill(200);
+    let metrics = scrape(port);
+    assert!(
+        metric(&metrics, "crabcrop_request_log_queue_bytes") >= (8 * 1024 * 1024) as f64,
+        "{metrics}"
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_request_log_queue_capacity_bytes"),
+        (8 * 1024 * 1024) as f64
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_request_log_requests_waiting"),
+        1.0
+    );
+    let scraped = Instant::now();
+    // The health check is answered all along, 200 and
+    // then 503 once the queue has been full for 5 seconds.
+    let stalled = loop {
+        let (health, body) = get_body(port, "/health", "Accept: application/json\r\n");
+        if health == 503 {
+            break body;
+        }
+        assert_eq!((health, body.as_str()), (200, "ok"));
+        assert!(scraped.elapsed() < LONG, "the health check never failed");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let error: serde_json::Value = serde_json::from_str(&stalled).unwrap();
+    assert_eq!(error["error"]["code"], "request_log_stalled");
+    // No sooner than the bound after the queue filled,
+    // which was after `before_filling`.
+    assert!(
+        before_filling.elapsed() >= STALLED_AFTER,
+        "it failed {:?} after the queue began to fill",
+        before_filling.elapsed()
+    );
+    let metrics = scrape(port);
+    assert!(
+        metric(&metrics, "crabcrop_request_log_queue_full_seconds_total")
+            >= STALLED_AFTER.as_secs_f64(),
+        "{metrics}"
+    );
+    assert_eq!(
+        metric(&metrics, "crabcrop_request_log_requests_waiting"),
+        1.0
+    );
+    // The images' HEALTHCHECK fails with it.
+    let check = binary()
+        .env("PORT", port.to_string())
+        .arg("health")
+        .output()
+        .unwrap();
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let said = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        said.contains("HTTP 503 Service Unavailable: request log stalled"),
+        "{said}"
+    );
+    // The request still waits: it is not dropped.
+    assert!(!waiting.is_finished());
+    // The pipe is read: the request is answered, the queue
+    // drains, and the check passes again. (The writer takes
+    // the whole queue as one write when the reader comes
+    // back, so the bytes it holds fall when that write
+    // ends.)
+    let lines = server.read();
+    assert_eq!(status_of(&waiting.join().unwrap().unwrap()), 403);
+    let drained = Instant::now();
+    loop {
+        let metrics = scrape(port);
+        if metric(&metrics, "crabcrop_request_log_queue_bytes") < (8 * 1024 * 1024) as f64 {
+            assert_eq!(
+                metric(&metrics, "crabcrop_request_log_requests_waiting"),
+                0.0
+            );
+            break;
+        }
+        assert!(drained.elapsed() < LONG, "the queue never drained");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(get_body(port, "/health", ""), (200, "ok".to_string()));
+    // Requests are answered at once again.
+    assert_eq!(status(port, &long_line_request(9999), ""), 403);
+    server.terminate();
+    assert_eq!(server.exit().0.code(), Some(0), "{}", server.stderr());
+    // Every line is there, once: the requests that filled
+    // the queue, the one that waited, the one after, and
+    // the shutdown's two.
+    let lines = rest_of(&lines);
+    assert_eq!(lines.len(), answered + 4, "{} lines", lines.len());
+    let numbers: Vec<usize> = lines[..answered + 2].iter().map(|l| number_in(l)).collect();
+    let mut expected: Vec<usize> = (0..=answered).collect();
+    expected.push(9999);
+    assert_eq!(numbers, expected);
+    assert_eq!(lines[answered + 3], "shutdown: done");
+}
+
+/// A TCP port on 127.0.0.1 that nothing listens on right now,
+/// for a server whose listening line cannot reach the test.
+/// The server's own sockets cannot be read from `/proc`
+/// instead: it marks itself non-dumpable at startup (issue
+/// #605), so `/proc/<pid>/fd` is readable by root alone, and a
+/// test run as any other user would never find the port.
+#[cfg(target_os = "linux")]
+fn unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port on 127.0.0.1")
+        .port()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_server_whose_standard_output_reader_left_during_boot_serves_on() {
+    // Issue #707: the boot lines were written with
+    // `println!`, which panics when a write fails, so a
+    // reader of the pipe that had gone before boot was
+    // done (a log collector that exited) ended the server
+    // before it served. A boot line that fails is now lost,
+    // with one line on stderr, and the server serves; the
+    // request log counts the lines it cannot write, as it
+    // does once the server serves. The reader here is gone
+    // before the first line, which would have named the
+    // server's port, so the test picks the port and waits
+    // until the server accepts on it.
+    let port = unused_port();
+    let mut child = binary()
+        .env("PORT", port.to_string())
+        .env("CRABCROP_BIND", "127.0.0.1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning crabcrop");
+    drop(child.stdout.take());
+    let mut pipe = child.stderr.take().unwrap();
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&stderr);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+            sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+        }
+    });
+    let said = || String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
+    let mut server = ServerGuard::new(child);
+    let deadline = Instant::now() + LONG;
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(exit) = server.0.try_wait().unwrap() {
+            panic!("crabcrop exited before it listened: {exit}\n{}", said());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "crabcrop never listened on {port}\n{}",
+            said()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // It answers: the health check, and an image request,
+    // whose line cannot be written.
+    let (health, _) = try_get_body(port, "/health", "")
+        .unwrap_or_else(|e| panic!("no answer: {e}\nstderr: {}", said()));
+    assert_eq!(health, 200, "{}", said());
+    let unsigned = format!("/{}/40x30/http://127.0.0.1:9/a.png", "0".repeat(64));
+    assert_eq!(get_body(port, &unsigned, "").0, 403);
+    let deadline = Instant::now() + LONG;
+    while !said().contains("request log: cannot write to standard output") {
+        assert!(
+            Instant::now() < deadline,
+            "no request log failure in {}",
+            said()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stderr_text = said();
+    assert_eq!(
+        stderr_text
+            .matches("crabcrop: cannot write the boot lines to standard output: Broken pipe")
+            .count(),
+        1,
+        "{stderr_text}"
+    );
+    assert!(!stderr_text.contains("panicked"), "{stderr_text}");
+    // And it stops cleanly.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&server.0),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let waited = Instant::now();
+    let exit = loop {
+        if let Some(exit) = server.0.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(waited.elapsed() < LONG, "the server did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(exit.code(), Some(0), "{}", said());
 }

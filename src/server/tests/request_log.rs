@@ -203,6 +203,10 @@ async fn a_replay_logs_the_same_lines_in_the_same_order_queued_or_inline() {
     );
     assert_eq!(records[0]["cache"], "miss");
     assert_eq!(records[1]["cache"], "hit");
+    // The fourth is the HEAD request, and says so (issue
+    // #707).
+    assert_eq!(records[2]["method"], "GET");
+    assert_eq!(records[3]["method"], "HEAD");
     assert_eq!(records[0]["ops"], "50x30/filters:format(jpeg)");
     assert_eq!(records[8]["request_id"], "chosen-by-client");
     assert_eq!(records[9]["rejected"], true);
@@ -462,4 +466,302 @@ async fn requests_served_at_once_each_leave_their_line_once() {
     }
     assert_eq!(next, [EACH; CLIENTS]);
     assert!(notes.all().is_empty(), "{:?}", notes.all());
+}
+
+/// An image request to `base` that is refused at once, with
+/// request ID `id`: its line is a few hundred bytes.
+async fn refused_request(base: String, id: String) -> reqwest::Response {
+    let url = format!("{base}/{}/20x15/http://127.0.0.1:9/a.png", "0".repeat(64));
+    tokio::time::timeout(LONG, client().get(url).header("X-Request-Id", id).send())
+        .await
+        .expect("an answer")
+        .unwrap()
+}
+
+/// Send refused requests to `base` while nobody reads `log`,
+/// one after the other, until the queue is full: how many
+/// were answered, and when the one that filled it was sent,
+/// which is no later than the queue filled.
+async fn fill_queue(base: &str, log: &RequestLog) -> (usize, std::time::Instant) {
+    let mut answered = 0;
+    let mut filled_by = std::time::Instant::now();
+    while !log.stats().full {
+        filled_by = std::time::Instant::now();
+        let resp = refused_request(base.to_string(), format!("request-{answered}")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        answered += 1;
+        assert!(answered < 10, "the queue never filled");
+    }
+    (answered, filled_by)
+}
+
+/// The value of the metric `name` in `exposition`.
+fn metric_value(exposition: &str, name: &str) -> f64 {
+    exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in:\n{exposition}"))
+}
+
+#[tokio::test]
+async fn the_health_check_fails_while_the_queue_stays_full_and_passes_again_after() {
+    // Issue #707: with the queue full every request that
+    // logs waits, so the server answers none of them, and
+    // the health check still answered 200: a liveness
+    // probe never restarted a replica in that state. Now it
+    // answers 503 once the queue has stayed full for the
+    // log's bound (5 s in the server; 1 s here), without
+    // ever waiting on the queue, and 200 again once
+    // standard output is read. `/metrics` shows the queue.
+    let bound = Duration::from_secs(1);
+    let out = FakeStdout::default();
+    let (log, notes) = RequestLog::over_stalling(&out, 600, bound);
+    let dir = upload_dir("log-stalled-health");
+    let base = spawn_logging(log.clone(), &dir).await;
+    let health = |accept: &'static str| {
+        let url = format!("{base}/health");
+        async move {
+            tokio::time::timeout(LONG, client().get(url).header("Accept", accept).send())
+                .await
+                .expect("the health check waits on the queue")
+                .unwrap()
+        }
+    };
+    let resp = health("*/*").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "ok");
+    out.stall();
+    let (answered, filled_by) = fill_queue(&base, &log).await;
+    // Full, but not for long yet: the check passes, and
+    // the queue holds its cap. (On a machine slow enough
+    // to spend the bound on the request, it may already
+    // fail, which the loop below expects anyway.)
+    let early = health("*/*").await.status();
+    if filled_by.elapsed() < bound {
+        assert_eq!(early, StatusCode::OK);
+    }
+    let metrics = metrics_text(&base).await;
+    assert!(metric_value(&metrics, "crabcrop_request_log_queue_bytes") >= 600.0);
+    assert_eq!(
+        metric_value(&metrics, "crabcrop_request_log_queue_capacity_bytes"),
+        600.0
+    );
+    assert_eq!(
+        metric_value(&metrics, "crabcrop_request_log_requests_waiting"),
+        0.0
+    );
+    // The next request waits for room.
+    let waiting = tokio::spawn(refused_request(base.clone(), "waited".to_string()));
+    until("the request waits for room", || log.stats().waiting == 1).await;
+    // The check answers at once all along, and fails once
+    // the queue has been full for the bound.
+    let stalled = loop {
+        let resp = health("application/json").await;
+        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+            break resp;
+        }
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(filled_by.elapsed() < LONG, "the health check never failed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        filled_by.elapsed() >= bound,
+        "it failed {:?} after the queue filled",
+        filled_by.elapsed()
+    );
+    assert_eq!(header(&stalled, "cache-control"), "no-store");
+    let body: serde_json::Value = serde_json::from_str(&stalled.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "request_log_stalled");
+    let plain = health("*/*").await;
+    assert_eq!(plain.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = plain.text().await.unwrap();
+    assert!(
+        text.starts_with("request log stalled: its queue has been full for "),
+        "{text}"
+    );
+    let head = client()
+        .head(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let metrics = metrics_text(&base).await;
+    assert_eq!(
+        metric_value(&metrics, "crabcrop_request_log_requests_waiting"),
+        1.0
+    );
+    assert!(
+        metric_value(&metrics, "crabcrop_request_log_queue_full_seconds_total")
+            >= bound.as_secs_f64(),
+        "{metrics}"
+    );
+    // The request still waits: nothing was dropped.
+    assert!(!waiting.is_finished());
+    // Standard output is read again: the request is
+    // answered, the check passes, and the time spent full
+    // stops growing.
+    out.resume();
+    let resp = tokio::time::timeout(LONG, waiting).await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    until("the queue has room again", || !log.stats().full).await;
+    assert_eq!(health("*/*").await.status(), StatusCode::OK);
+    let metrics = metrics_text(&base).await;
+    assert_eq!(
+        metric_value(&metrics, "crabcrop_request_log_requests_waiting"),
+        0.0
+    );
+    let spent = metric_value(&metrics, "crabcrop_request_log_queue_full_seconds_total");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let metrics = metrics_text(&base).await;
+    assert_eq!(
+        metric_value(&metrics, "crabcrop_request_log_queue_full_seconds_total"),
+        spent
+    );
+    // Every line is there, the waiting request's included.
+    assert_eq!(log.finish(None, LONG).await, 0);
+    let ids: Vec<String> = out
+        .lines()
+        .iter()
+        .map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["request_id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    let mut expected: Vec<String> = (0..answered).map(|n| format!("request-{n}")).collect();
+    expected.push("waited".to_string());
+    assert_eq!(ids, expected);
+    assert!(notes.all().is_empty(), "{:?}", notes.all());
+}
+
+#[tokio::test]
+async fn a_request_that_waited_for_room_counts_the_wait_in_its_time() {
+    // Issue #707: the request's timer started after its
+    // wait for room, so neither its line nor the latency
+    // metrics showed the wait.
+    let out = FakeStdout::default();
+    let (log, _) = RequestLog::over(&out, 600);
+    let dir = upload_dir("log-wait-timed");
+    let base = spawn_logging(log.clone(), &dir).await;
+    out.stall();
+    fill_queue(&base, &log).await;
+    let waiting = tokio::spawn(refused_request(base.clone(), "waited".to_string()));
+    until("the request waits for room", || log.stats().waiting == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    out.resume();
+    let resp = tokio::time::timeout(LONG, waiting).await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(log.finish(None, LONG).await, 0);
+    let waited: serde_json::Value = out
+        .lines()
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["request_id"] == "waited")
+        .expect("the waiting request's line");
+    let total = waited["total_ms"].as_f64().unwrap();
+    assert!(total >= 300.0, "{waited}");
+    let metrics = metrics_text(&base).await;
+    assert!(
+        metric_value(&metrics, "crabcrop_request_duration_ms_sum") >= 300.0,
+        "{metrics}"
+    );
+    assert!(
+        metric_value(&metrics, "crabcrop_request_duration_ms_bucket{le=\"250\"}")
+            < metric_value(&metrics, "crabcrop_request_duration_ms_bucket{le=\"+Inf\"}"),
+        "{metrics}"
+    );
+}
+
+/// A record of an image request that got as far as a render,
+/// owed to a fresh state whose request log writes inline to a
+/// stand-in for standard output.
+fn owed() -> (OwedRecord, Arc<AppState>, FakeStdout) {
+    let out = FakeStdout::default();
+    let state = Arc::new(AppState {
+        request_log: RequestLog::inline_to(out.clone()),
+        ..test_state()
+    });
+    let record = RequestRecord {
+        ops: "300x50/filters:format(jxl)".to_string(),
+        load: Duration::from_millis(3),
+        process: Duration::from_millis(1),
+        load_ran: true,
+        process_ran: true,
+        cache_looked_up: true,
+        bytes_in: 1200,
+        bytes_out: 300,
+        request_id: "owed".to_string(),
+        ..RequestRecord::default()
+    };
+    let owed = OwedRecord::new(record, std::time::Instant::now(), Arc::clone(&state));
+    (owed, state, out)
+}
+
+/// The lines `out` holds, parsed.
+fn lines_of(out: &FakeStdout) -> Vec<serde_json::Value> {
+    out.lines()
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_record_filed_with_its_answer_is_recorded_once() {
+    let (owed, state, out) = owed();
+    owed.file(304);
+    let lines = lines_of(&out);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["status"], 304);
+    assert_eq!(lines[0]["bytes_out"], 300);
+    assert_eq!(lines[0]["request_id"], "owed");
+    let exposition = state.metrics.render();
+    assert!(exposition.contains("crabcrop_requests_total{status_class=\"3xx\"} 1\n"));
+    assert!(exposition.contains("crabcrop_request_duration_ms_count 1\n"));
+}
+
+#[test]
+fn a_record_dropped_unfiled_is_recorded_as_client_closed() {
+    // Issue #707: a request whose client left was dropped
+    // with its record, and left neither a line nor a metrics
+    // update. Its record now files itself.
+    let (owed, state, out) = owed();
+    std::thread::sleep(Duration::from_millis(20));
+    drop(owed);
+    let lines = lines_of(&out);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert_eq!(line["status"], crate::observe::CLIENT_CLOSED);
+    // What it got through is kept, and it served nothing.
+    assert_eq!(line["ops"], "300x50/filters:format(jxl)");
+    assert_eq!(line["load_ms"], 3.0);
+    assert_eq!(line["bytes_in"], 1200);
+    assert_eq!(line["bytes_out"], 0);
+    assert_eq!(line["request_id"], "owed");
+    // Its time runs to the drop.
+    assert!(line["total_ms"].as_f64().unwrap() >= 20.0, "{line}");
+    let exposition = state.metrics.render();
+    assert!(exposition.contains("crabcrop_requests_total{status_class=\"4xx\"} 1\n"));
+    assert!(exposition.contains("crabcrop_bytes_served_total 0\n"));
+    assert!(exposition.contains("crabcrop_cache_misses_total 1\n"));
+}
+
+#[test]
+fn a_record_dropped_in_a_panic_or_owed_nowhere_records_nothing() {
+    let (owed, state, out) = owed();
+    // Unwinds like a panic, without the message a panic
+    // prints.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owed = owed;
+        std::panic::resume_unwind(Box::new("a request that panics"));
+    }));
+    assert!(unwound.is_err());
+    assert!(out.lines().is_empty());
+    assert!(
+        state
+            .metrics
+            .render()
+            .contains("crabcrop_request_duration_ms_count 0\n")
+    );
+    // A settled record files nothing either way.
+    OwedRecord::settled().file(200);
+    drop(OwedRecord::settled());
 }

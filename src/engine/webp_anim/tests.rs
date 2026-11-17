@@ -1256,14 +1256,22 @@ fn files_that_are_no_plain_animation_are_not_walked() {
     let mut short = whole.clone();
     short[16..20].copy_from_slice(&8u32.to_le_bytes());
     assert!(Animation::open(&short, None).is_none());
-    // A canvas past the decode allocation budget is the image
-    // crate's to refuse, as it always has been: the walk
-    // allocates no canvas for it.
+    // A canvas past the decode allocation budget is charged from
+    // the header and refused before any frame decodes (see
+    // `check_webp_frame_budget`), not handed to the image crate's
+    // iterator: the walk allocates no canvas for it, and
+    // `decode_webp_frames` answers the allocation error itself.
     assert_eq!(MAX_DECODE_ALLOC, 256 << 20);
     let mut vast = whole.clone();
     vast[24..27].copy_from_slice(&u24_le(8192));
     vast[27..30].copy_from_slice(&u24_le(8191));
     assert!(Animation::open(&vast, None).is_none());
+    let err = decode_webp_frames(&vast, None).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Decode(why)
+            if why.contains("canvas") && why.contains("decode allocation limit")),
+        "{err:?}"
+    );
     let mut fits = whole;
     fits[24..27].copy_from_slice(&u24_le(8191));
     fits[27..30].copy_from_slice(&u24_le(8191));

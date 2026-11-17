@@ -147,8 +147,12 @@ pub struct AppState {
     /// turned it on.
     pub meta_enabled: bool,
     /// Bounds concurrent AI inference so it cannot starve the
-    /// transform pipeline.
-    pub ai_gate: Arc<tokio::sync::Semaphore>,
+    /// transform pipeline. This gate and the video,
+    /// animation and probe gates below are [`Gate`]s, which
+    /// know their capacity, so `/metrics` reports each as in
+    /// use against capacity, as it does the lanes (issue
+    /// #707).
+    pub ai_gate: Arc<Gate>,
     /// Bounds concurrent engine runs (audit E-5): cache misses
     /// process on blocking threads under this gate, sized to
     /// the core count at boot. This is the stills lane
@@ -220,21 +224,21 @@ pub struct AppState {
     /// the server's most expensive and least predictable
     /// work, so it gets its own small gate (2 permits, like
     /// the AI gate) on top of the slow lane (issue #324).
-    pub video_gate: Arc<tokio::sync::Semaphore>,
+    pub video_gate: Arc<Gate>,
     /// Bounds concurrent animated WebP encodes to one
     /// (issue #231): the animation encode is among the
     /// slowest work the engine does, minutes for a modest
     /// file, so it gets a single-permit gate of its own on
     /// top of the slow lane (issue #324), which is what
     /// keeps it from holding stills permits while it runs.
-    pub anim_gate: Arc<tokio::sync::Semaphore>,
+    pub anim_gate: Arc<Gate>,
     /// Bounds concurrent heavy `/explain` probes (an SVG's
     /// parse in the worker, an AVIF's decode, a HEIC's item
     /// graph walk), which run on blocking threads (see
     /// `explain_probe`): a burst of them waits here, or
     /// sheds with a 503, instead of occupying the async
     /// runtime or starting a worker process per request.
-    pub probe_gate: Arc<tokio::sync::Semaphore>,
+    pub probe_gate: Arc<Gate>,
     /// In-flight miss coalescing (audit R2-09): concurrent
     /// misses for one cache key share one fetch and one
     /// encode instead of stampeding the origin and the
@@ -635,8 +639,31 @@ fn has_directive(cache_control: &str, directive: &str) -> bool {
     })
 }
 
-async fn health() -> &'static str {
-    "ok"
+/// The health check: `200 ok`, unless the request log has
+/// stalled (issue #707). Its queue has then been full for
+/// [`crate::observe::STALLED_AFTER`], so every image
+/// request, purge and upload since has waited for a
+/// standard output nobody reads, and the replica serves
+/// none of them: the check answers `503
+/// request_log_stalled`, so a liveness probe restarts the
+/// replica, as it did before the queue (issue #642), when
+/// such a standard output held the whole server, this
+/// check included. The requests keep waiting and no line is
+/// dropped. The check reads two atomics and never waits on
+/// the queue.
+async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(full) = state.request_log.stalled() else {
+        return "ok".into_response();
+    };
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "request_log_stalled",
+        format!(
+            "request log stalled: its queue has been full for {}s, and requests wait for standard output to be read",
+            full.as_secs()
+        ),
+        accept_of(&headers).as_deref(),
+    )
 }
 
 /// Equality for a bearer token that leaks nothing about it
@@ -692,6 +719,8 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     let mut out = String::with_capacity(4096);
     state.metrics.render_into(&mut out);
     lane_metrics(&state, &mut out);
+    gate_metrics(&state, &mut out);
+    request_log_metrics(&state, &mut out);
     source_buffer_metrics(&state, &mut out);
     source_lookup_metrics(&state, &mut out);
     tier_metrics(&state, &mut out);
@@ -728,6 +757,77 @@ fn lane_metrics(state: &AppState, out: &mut String) {
         out,
         "crabcrop_lane_capacity{{lane=\"slow\"}} {}",
         state.slow_gate.capacity()
+    );
+}
+
+/// Gate occupancy for `/metrics` (issue #707): how many
+/// permits of the AI, video, animation and `/explain` probe
+/// gates are in use, against each gate's capacity, read live
+/// at scrape time as the lanes are. A gate at capacity while
+/// requests shed with `server_busy` names the work they
+/// waited for.
+fn gate_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
+    let gates = [
+        ("ai", &state.ai_gate),
+        ("video", &state.video_gate),
+        ("animation", &state.anim_gate),
+        ("probe", &state.probe_gate),
+    ];
+    out.push_str("# HELP crabcrop_gate_in_use Gate permits currently in use.\n");
+    out.push_str("# TYPE crabcrop_gate_in_use gauge\n");
+    for (name, gate) in gates {
+        let _ = writeln!(
+            out,
+            "crabcrop_gate_in_use{{gate=\"{name}\"}} {}",
+            gate.in_use()
+        );
+    }
+    out.push_str("# HELP crabcrop_gate_capacity Gate permit capacity.\n");
+    out.push_str("# TYPE crabcrop_gate_capacity gauge\n");
+    for (name, gate) in gates {
+        let _ = writeln!(
+            out,
+            "crabcrop_gate_capacity{{gate=\"{name}\"}} {}",
+            gate.capacity()
+        );
+    }
+}
+
+/// The request log's queue for `/metrics` (issue #707): the
+/// bytes of lines it holds against what it holds before
+/// requests wait, the requests waiting for room, and the
+/// seconds it has spent full. A queue that stays full is a
+/// standard output nobody reads, and the health check fails
+/// on it after `STALLED_AFTER`; bytes held that never fall
+/// to 0 between scrapes are one whose reader has stopped,
+/// even before the queue fills. With `CRABCROP_LOG_SYNC`
+/// there is no queue, and none of these series.
+fn request_log_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(queue) = state.request_log.queue_state() else {
+        return;
+    };
+    let full_ms = queue.full_time.as_millis();
+    let _ = write!(
+        out,
+        "# HELP crabcrop_request_log_queue_bytes Bytes of request log lines held for standard output, queued or being written.\n\
+         # TYPE crabcrop_request_log_queue_bytes gauge\n\
+         crabcrop_request_log_queue_bytes {}\n\
+         # HELP crabcrop_request_log_queue_capacity_bytes The bytes the request log holds before requests wait for room.\n\
+         # TYPE crabcrop_request_log_queue_capacity_bytes gauge\n\
+         crabcrop_request_log_queue_capacity_bytes {}\n\
+         # HELP crabcrop_request_log_requests_waiting Requests waiting for room in the request log.\n\
+         # TYPE crabcrop_request_log_requests_waiting gauge\n\
+         crabcrop_request_log_requests_waiting {}\n\
+         # HELP crabcrop_request_log_queue_full_seconds_total Seconds the request log's queue has spent full, when requests that log wait for room.\n\
+         # TYPE crabcrop_request_log_queue_full_seconds_total counter\n\
+         crabcrop_request_log_queue_full_seconds_total {}.{:03}\n",
+        queue.held_bytes,
+        queue.capacity,
+        queue.waiting,
+        full_ms / 1000,
+        full_ms % 1000
     );
 }
 
@@ -2705,7 +2805,106 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
     .then(|| value.to_string())
 }
 
+/// One image request's record while the request is under way,
+/// owed to the request log and the metrics (issue #707).
+///
+/// Every image request the server handles leaves one line and
+/// one metrics update. [`OwedRecord::file`] leaves them with the
+/// status of the answer. A request whose client goes away is
+/// dropped where it is, and so is its record, which then files
+/// itself with [`crate::observe::CLIENT_CLOSED`]: at once when the
+/// request stops where it was (a follower waiting on another
+/// request's render, a miss whose render has not started, a meta
+/// or debug request), and when the render ends for a render that
+/// outlives its client and is stored (see [`finish_started_miss`]).
+/// The record's own fields say how far the request got; it served
+/// no bytes, whatever it rendered.
+///
+/// It holds the request's handle on the served state, as every
+/// task a request starts does (issue #475), not clones of the
+/// metrics and the log. Its time runs from `started`, which the
+/// handler takes before its wait for room in the request log, so
+/// the wait counts. A record dropped while its thread panics files
+/// nothing, as a request that panicked left no line before.
+struct OwedRecord {
+    record: RequestRecord,
+    started: Instant,
+    /// The state it is owed to: `None` once it is filed, and for
+    /// a record owed nowhere.
+    state: Option<Arc<AppState>>,
+}
+
+impl OwedRecord {
+    /// `record`, for a request that started at `started`, owed
+    /// to `state`'s metrics and request log.
+    fn new(record: RequestRecord, started: Instant, state: Arc<AppState>) -> Self {
+        Self {
+            record,
+            started,
+            state: Some(state),
+        }
+    }
+
+    /// A record owed nowhere: filing or dropping it records
+    /// nothing. For a request whose own record was filed where
+    /// it was dropped.
+    fn settled() -> Self {
+        Self {
+            record: RequestRecord::default(),
+            started: Instant::now(),
+            state: None,
+        }
+    }
+
+    /// File the record: the request was answered with `status`.
+    fn file(mut self, status: u16) {
+        self.record.status = status;
+        self.file_now();
+    }
+
+    /// Record the request in the metrics and log its line, once.
+    fn file_now(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        self.record.total = self.started.elapsed();
+        state.metrics.record(&self.record);
+        state.request_log.line(&self.record.to_json());
+    }
+}
+
+impl Drop for OwedRecord {
+    fn drop(&mut self) {
+        if self.state.is_none() || std::thread::panicking() {
+            return;
+        }
+        // The client went away before the answer: nothing was
+        // sent.
+        self.record.status = crate::observe::CLIENT_CLOSED;
+        self.record.bytes_out = 0;
+        self.file_now();
+    }
+}
+
+impl std::ops::Deref for OwedRecord {
+    type Target = RequestRecord;
+
+    fn deref(&self) -> &RequestRecord {
+        &self.record
+    }
+}
+
+impl std::ops::DerefMut for OwedRecord {
+    fn deref_mut(&mut self) -> &mut RequestRecord {
+        &mut self.record
+    }
+}
+
 async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    // The request's time runs from here, before its wait for
+    // room in the request log, so its line and the latency
+    // metrics count that wait (issue #707).
+    let started = Instant::now();
     // Every request here leaves a log line, so it waits here
     // while the request log's queue is full (issue #642):
     // before anything is done for it, so a client that gives
@@ -2727,25 +2926,26 @@ async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Requ
     // parser rejects, instead of silently serving the same
     // content under a second spelling.
     let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
-    let started = Instant::now();
-    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let chosen_id = client_request_id(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
     let chose_id = chosen_id.is_some();
-    let request_id = chosen_id.unwrap_or_else(generate_request_id);
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok());
-    // With client hints off, no hint header is read at all:
-    // every request for a URL gets the same bytes, the one
-    // answer a cache that keys on the URL alone can hold.
-    let hints = state.client_hints;
-    let dpr = dpr_hint(headers).filter(|_| hints);
-    let width = width_hint(headers).filter(|_| hints);
-    let save_data = hints && save_data_hint(headers);
-    let (mut response, mut record) =
-        serve(&state, path, accept, if_none_match, dpr, width, save_data).await;
-    record.status = response.status().as_u16();
-    record.total = started.elapsed();
+    // From here the request owes its line and its metrics
+    // update (issue #707): its record files them when it is
+    // answered, below, or when it is dropped, should the
+    // client go away first (see `OwedRecord`).
+    let record = OwedRecord::new(
+        RequestRecord {
+            method: if parts.method == axum::http::Method::HEAD {
+                "HEAD"
+            } else {
+                "GET"
+            },
+            request_id: chosen_id.unwrap_or_else(generate_request_id),
+            ..RequestRecord::default()
+        },
+        started,
+        Arc::clone(&state),
+    );
+    let (mut response, record) = serve(&state, record, path, headers).await;
     // Every answer on this route, errors and meta included,
     // names the request headers it may depend on.
     response
@@ -2767,15 +2967,13 @@ async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Requ
     if !shared {
         response.headers_mut().insert(
             axum::http::HeaderName::from_static("x-request-id"),
-            request_id.parse().unwrap(),
+            record.request_id.parse().unwrap(),
         );
     }
-    record.request_id = request_id;
-    state.metrics.record(&record);
     // The line goes to the request log (issue #642), which
     // by default queues it for its writer thread: the
     // response does not wait for a `write`.
-    state.request_log.line(&record.to_json());
+    record.file(response.status().as_u16());
     response
 }
 
@@ -2824,7 +3022,8 @@ impl Refusal {
     }
 }
 
-/// Run one image request, timing each stage into the returned record.
+/// Run one image request, timing each stage into its record,
+/// which comes back with the answer.
 ///
 /// The request runs in stages (issue #479):
 /// [`authenticate`], [`resolve_request`] and [`negotiate`]
@@ -2834,27 +3033,27 @@ impl Refusal {
 /// from the tiers or the miss path.
 async fn serve(
     state: &Arc<AppState>,
+    mut record: OwedRecord,
     path: &str,
-    accept: Option<&str>,
-    if_none_match: Option<&str>,
-    dpr_hint: Option<f32>,
-    width_hint: Option<u32>,
-    save_data: bool,
-) -> (Response, RequestRecord) {
-    let mut record = RequestRecord::default();
+    headers: &HeaderMap,
+) -> (Response, OwedRecord) {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    // With client hints off, no hint header is read at all:
+    // every request for a URL gets the same bytes, the one
+    // answer a cache that keys on the URL alone can hold.
+    let hints = state.client_hints;
+    let dpr = dpr_hint(headers).filter(|_| hints);
+    let width = width_hint(headers).filter(|_| hints);
+    let save_data = hints && save_data_hint(headers);
     let full = format!("/{path}");
     let opened = authenticate(state, &full, &mut record);
     let sealed = opened.as_ref().is_ok_and(|opened| opened.sealed);
     let admitted = opened.and_then(|opened| {
         let resolved = resolve_request(state, &opened.remainder, &mut record)?;
-        let negotiated = negotiate(
-            state,
-            &resolved.ops,
-            accept,
-            dpr_hint,
-            width_hint,
-            save_data,
-        )?;
+        let negotiated = negotiate(state, &resolved.ops, accept, dpr, width, save_data)?;
         Ok((resolved, negotiated))
     });
     let (resolved, negotiated) = match admitted {
@@ -2889,7 +3088,7 @@ async fn serve(
         debug: negotiated.debug,
         placeholders: negotiated.placeholders,
         hinted_width: negotiated.hinted_width,
-        dpr_hint,
+        dpr_hint: dpr,
         // The engine steps on the same decision the key and
         // the private marking take, never on the raw header:
         // a render the header stepped where the key does not
@@ -3412,8 +3611,8 @@ async fn run_flight(
     path: &str,
     mut work: MissWork,
     if_none_match: Option<&str>,
-    mut record: RequestRecord,
-) -> (Response, RequestRecord) {
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
     // The miss path is boxed at each of the four places this
     // function reaches it (issue #638). Its future holds the
     // loader's and the engine runner's state, about 20 KB.
@@ -3655,6 +3854,12 @@ async fn run_flight(
 /// debug views are never stored, so a render made for one
 /// has nothing to keep once its client is gone.
 ///
+/// The request's record travels with the miss, so a miss
+/// that is dropped files its record as one whose client
+/// left, and one that finishes for nobody files it when
+/// the render and its tier writes are done, with the load
+/// and render times they took (issue #707).
+///
 /// A miss whose client is still there is part of a
 /// request in flight, which the shutdown drain counts as
 /// such; one whose client has gone is counted as a render
@@ -3663,9 +3868,9 @@ async fn finish_started_miss<F>(
     state: &AppState,
     progress: MissProgress,
     miss: F,
-) -> (Response, RequestRecord, Option<String>)
+) -> (Response, OwedRecord, Option<String>)
 where
-    F: std::future::Future<Output = (Response, RequestRecord, Option<String>)> + Send + 'static,
+    F: std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
 {
     // Never sent on: dropping the sender, with this
     // future, is the signal.
@@ -3683,10 +3888,17 @@ where
                 if progress.render_started() {
                     progress.mark_client_gone();
                     let _left = background.client_left();
-                    Some(miss.await)
-                } else {
-                    None
+                    // The render finishes for nobody. Its
+                    // request's record files itself here, as
+                    // one whose client left, while the drain
+                    // still counts the render (issue #707).
+                    let (_, record, _) = miss.await;
+                    drop(record);
                 }
+                // Otherwise the miss drops where it is, and
+                // its record with it, which files the same
+                // way.
+                None
             }
             answer = &mut miss => Some(answer),
         }
@@ -3699,10 +3911,11 @@ where
         // The task gives up only once this future is gone,
         // and is cancelled only by a runtime that is
         // shutting down, which drops this request too: no
-        // client receives this answer.
+        // client receives this answer. The request's record
+        // went with the task, and filed itself there.
         _ => (
             StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            RequestRecord::default(),
+            OwedRecord::settled(),
             None,
         ),
     }
@@ -3754,9 +3967,9 @@ const META_SHARE_CAP: usize = 4 * 1024 * 1024;
 async fn serve_meta_flight(
     state: &AppState,
     work: MissWork,
-    mut record: RequestRecord,
+    mut record: OwedRecord,
     key: &str,
-) -> (Response, RequestRecord) {
+) -> (Response, OwedRecord) {
     let mut waits = 0;
     loop {
         match state.inflight.lead_meta(key) {
@@ -4735,7 +4948,7 @@ impl Busy {
 
 /// One permit from `gate`, waiting at most `wait` for it.
 async fn acquire_gate(
-    gate: &Arc<tokio::sync::Semaphore>,
+    gate: &Arc<Gate>,
     wait: std::time::Duration,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     match tokio::time::timeout(wait, gate.clone().acquire_owned()).await {
@@ -4843,8 +5056,8 @@ struct Rendered {
 async fn serve_miss(
     state: &AppState,
     work: MissWork,
-    mut record: RequestRecord,
-) -> (Response, RequestRecord, Option<String>) {
+    mut record: OwedRecord,
+) -> (Response, OwedRecord, Option<String>) {
     // The purge generation this render starts under
     // (issue #350), taken before the load: a purge that
     // lands while the render runs must not be undone by
