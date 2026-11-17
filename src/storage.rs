@@ -441,14 +441,74 @@ struct ScanState {
     /// copy it was for serves from memory, refused or not, with
     /// groups the scanned file lacks, so the scan indexes no
     /// such file: it deletes it, unless the write's copy is
-    /// indexed.
-    written: HashSet<String>,
+    /// indexed. Kept in a filter of fixed size (see
+    /// [`StemFilter`]): on a disk that hangs, the scan lasts as
+    /// long as the hang, and every key rendered meanwhile is
+    /// written.
+    written: StemFilter,
     /// The stems of the files the scan is deleting by name,
     /// not knowing their key: files that do not parse, or name
     /// another key's entry. A write of a key with such a stem
     /// waits for none and writes nothing, so the deletion never
     /// removes a file it renamed into place.
     unlinking: HashSet<String>,
+}
+
+/// A set of file stems in a fixed amount of memory (issue
+/// #708): a Bloom filter of [`StemFilter::BITS`] bits, 2 MiB,
+/// allocated at the first stem. A stem is a hex SHA-256, so its
+/// first four groups of eight hex digits are four independent,
+/// uniform numbers, and each picks one bit. The filter never
+/// misses a stem it holds. Once it holds many, it can also
+/// claim one it does not: the boot scan then deletes that key's
+/// file instead of indexing it, or leaves a file that does not
+/// verify for the next boot to delete. Either costs a render at
+/// most, never a stale copy. A million stems make about one in
+/// 500 of the others look held; ten thousand, about one in 30
+/// billion.
+#[derive(Default)]
+struct StemFilter {
+    bits: Vec<u64>,
+}
+
+impl StemFilter {
+    const BITS: usize = 1 << 24;
+
+    /// The bits `stem` sets. Whatever the text, the same stem
+    /// always gives the same bits, so nothing it holds is
+    /// missed.
+    fn bits_of(stem: &str) -> [usize; 4] {
+        std::array::from_fn(|n| {
+            stem.get(8 * n..8 * n + 8)
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .map_or(0, |value| value as usize % Self::BITS)
+        })
+    }
+
+    fn insert(&mut self, stem: &str) {
+        if self.bits.is_empty() {
+            self.bits = vec![0; Self::BITS / 64];
+        }
+        for bit in Self::bits_of(stem) {
+            self.bits[bit / 64] |= 1 << (bit % 64);
+        }
+    }
+
+    fn contains(&self, stem: &str) -> bool {
+        !self.bits.is_empty()
+            && Self::bits_of(stem)
+                .into_iter()
+                .all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
+    }
+}
+
+impl std::fmt::Debug for StemFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set: u32 = self.bits.iter().map(|word| word.count_ones()).sum();
+        f.debug_struct("StemFilter")
+            .field("bits_set", &set)
+            .finish()
+    }
 }
 
 /// A purge sent while the boot scan runs (issue #708): the
@@ -1500,7 +1560,11 @@ impl DiskStore {
                     if let Some(stem) =
                         claim_or_queue(inner, &scanned.key, &scanned.stem, &scanned.groups)
                     {
-                        unlink.push((scanned.key, stem, "its key was written since the boot"));
+                        unlink.push((
+                            scanned.key,
+                            stem,
+                            "a copy of its key may have been written since the boot",
+                        ));
                     }
                 }
                 Judged::Leave => {}
@@ -2679,7 +2743,7 @@ fn refuse_write(inner: &mut Inner, key: &str) -> Option<WritePlan> {
     let scan = inner.scan.as_mut()?;
     let stem = key_stem(key);
     let busy = !scan.checked || scan.unlinking.contains(&stem);
-    scan.written.insert(stem);
+    scan.written.insert(&stem);
     busy.then_some(WritePlan::Busy)
 }
 
@@ -6552,6 +6616,73 @@ mod tests {
         assert_eq!(store.keys(), vec!["other".to_string()]);
         assert!(!store.file_for(&key_stem("k")).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the boot scan holds, in bytes, for the keys written
+    /// while it runs.
+    fn written_bytes(store: &DiskStore) -> usize {
+        let inner = store.inner.lock().unwrap();
+        let written = &inner.scan.as_ref().unwrap().written;
+        written.bits.capacity() * size_of::<u64>()
+    }
+
+    #[test]
+    fn a_scan_that_outlasts_many_writes_holds_a_fixed_amount_of_memory_for_them() {
+        // Issue #708: the scan remembers every key written while
+        // it runs, refused writes included. On a disk that hangs
+        // it runs as long as the hang, and every key rendered
+        // meanwhile is written, so what it holds for them must
+        // not grow with their number. It still finds each one.
+        let dir = temp_dir("scan-many-writes");
+        left_by_a_previous_run(&dir, &["kept".to_string(), "w/77777".to_string()], b"old");
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Write]);
+        gate.next();
+        let write = |key: &str| {
+            assert!(matches!(
+                store.begin_write(key, &[], Bucket::Unknown, true),
+                WritePlan::Busy
+            ));
+        };
+        write("w/0");
+        let first = written_bytes(&store);
+        assert!(first <= 2 << 20, "{first} bytes for one key");
+        for n in 1..100_000 {
+            write(&format!("w/{n}"));
+        }
+        assert_eq!(written_bytes(&store), first);
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        assert_eq!(store.keys(), vec!["kept".to_string()]);
+        assert!(!store.file_for(&key_stem("w/77777")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stem_filter_never_misses_a_stem_and_seldom_claims_another() {
+        // Issue #708: the filter that keeps the stems written
+        // while the scan runs answers yes for every stem it
+        // holds, so the scan never indexes a written key's old
+        // file. It may answer yes for a stem it does not hold,
+        // which only costs that file; at 100,000 stems that
+        // happens about once in three million.
+        let mut filter = StemFilter::default();
+        assert!(!filter.contains(&key_stem("k")));
+        assert!(filter.bits.is_empty(), "nothing is held before a stem");
+        let held: Vec<String> = (0..100_000)
+            .map(|n| key_stem(&format!("held/{n}")))
+            .collect();
+        for stem in &held {
+            filter.insert(stem);
+        }
+        assert_eq!(filter.bits.len() * 64, StemFilter::BITS);
+        assert!(held.iter().all(|stem| filter.contains(stem)));
+        let claimed = (0..100_000)
+            .filter(|n| filter.contains(&key_stem(&format!("other/{n}"))))
+            .count();
+        assert!(claimed <= 2, "{claimed} of 100000 others claimed");
+        // A stem in capitals, as a file name can spell one, is
+        // the same stem.
+        assert!(filter.contains(&held[0].to_uppercase()));
     }
 
     #[test]
