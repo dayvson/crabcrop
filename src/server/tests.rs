@@ -18120,7 +18120,7 @@ crabcrop_cache_disk_groups_behind 0
 # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.
 # TYPE crabcrop_cache_disk_deletions_queued gauge
 crabcrop_cache_disk_deletions_queued 0
-# HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete failed to remove, left on disk out of the index.
+# HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete or the boot scan failed to remove, left on disk out of the index.
 # TYPE crabcrop_cache_disk_unlinks_failed_total counter
 crabcrop_cache_disk_unlinks_failed_total 0
 # HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.

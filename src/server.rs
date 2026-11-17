@@ -943,7 +943,7 @@ fn tier_metrics(state: &AppState, out: &mut String) {
              # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.\n\
              # TYPE crabcrop_cache_disk_deletions_queued gauge\n\
              crabcrop_cache_disk_deletions_queued {deletions}\n\
-             # HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete failed to remove, left on disk out of the index.\n\
+             # HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete or the boot scan failed to remove, left on disk out of the index.\n\
              # TYPE crabcrop_cache_disk_unlinks_failed_total counter\n\
              crabcrop_cache_disk_unlinks_failed_total {}\n",
             store.ops_in_flight(),
