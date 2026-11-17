@@ -312,7 +312,25 @@ pub fn decode_jpeg_scaled(bytes: &[u8], denominator: u32) -> Option<DynamicImage
 /// which keeps animated sources on the generic path, and its
 /// DynamicImage variant matches the generic path (Rgba8 only
 /// when the file has alpha).
+///
+/// libwebp ignores the image crate's decode limits, and the
+/// dimension probe ahead of this fast path is not fatal (some
+/// valid files have headers the probe cannot read), so the size
+/// libwebp will decode is read from the bitstream header and
+/// held to the same dimension and allocation budgets here,
+/// before any decode. Over either, the fast path stands down to
+/// the bounded generic decode, which refuses the file: image-webp
+/// fails on the same header the probe could not read, or the
+/// probe already charged the budget on one it could.
 fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
+    let features = webp::BitstreamFeatures::new(bytes)?;
+    let (width, height) = (u64::from(features.width()), u64::from(features.height()));
+    if width > MAX_DECODE_DIMENSION as u64
+        || height > MAX_DECODE_DIMENSION as u64
+        || width * height * 4 > MAX_DECODE_ALLOC
+    {
+        return None;
+    }
     let decoded = webp::Decoder::new(bytes).decode()?;
     Some(decoded.to_image())
 }
@@ -2736,6 +2754,7 @@ fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let screen = u64::from(decoder.width()) * u64::from(decoder.height());
     let mut frames: usize = 0;
     let mut total_pixels: u64 = 0;
+    let mut kept_bytes: u64 = 0;
     while let Ok(Some(frame)) = decoder.next_frame_info() {
         frames += 1;
         if frames > MAX_ANIMATED_FRAMES {
@@ -2750,6 +2769,73 @@ fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
                 "GIF frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
             )));
         }
+        // Each frame comes back composited onto the screen, and the
+        // collector charges the bytes it keeps against
+        // MAX_DECODE_ALLOC, so the screen's bytes per frame are
+        // charged here too, before any frame decodes.
+        kept_bytes += screen * 4;
+        if kept_bytes > MAX_DECODE_ALLOC {
+            return Err(EngineError::Decode(format!(
+                "GIF frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Charge an animated WebP's frames to the animation budgets
+/// from its VP8X canvas and its ANMF headers, before any frame
+/// decodes, as [`check_gif_frame_budget`] charges a GIF from its
+/// descriptors. Every frame composites onto the full canvas, so
+/// the frame count times the canvas pixels is the animation's
+/// decoded-pixel total, charged against [`MAX_ANIMATED_PIXELS`]
+/// as the collector charges the frames it retains; the walk and
+/// the image crate's decoder each hold a canvas-sized working
+/// buffer and a per-frame copy of it, so the canvas is charged
+/// against [`MAX_DECODE_ALLOC`] at four bytes a pixel. The image
+/// crate's WebP decoder enforces only the per-axis dimension
+/// limit, not the allocation budget, so without this charge an
+/// over-budget canvas would be allocated before the collector
+/// could refuse it. The canvas and the frame count are read by
+/// [`webp_anim::header`], the way image-webp reads them, so the
+/// pixels charged here are the pixels it allocates. A container
+/// that does not parse this far states no canvas; the decoder
+/// then opens it and fails before it allocates a canvas.
+fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
+    let Some(header) = webp_anim::header(bytes) else {
+        return Ok(());
+    };
+    // A canvas past the per-axis dimension limit is refused by the
+    // image crate's decoder (`set_limits` in `open_webp_animation`)
+    // before it allocates, so it is left that error. This charge is
+    // for a canvas within the dimension limit, which that decoder
+    // admits and would then allocate past the allocation budget it
+    // does not enforce.
+    if header.width > MAX_DECODE_DIMENSION || header.height > MAX_DECODE_DIMENSION {
+        return Ok(());
+    }
+    let canvas = u64::from(header.width) * u64::from(header.height);
+    if canvas.saturating_mul(4) > MAX_DECODE_ALLOC {
+        return Err(EngineError::Decode(format!(
+            "WebP canvas {}x{} exceeds the {MAX_DECODE_ALLOC} byte decode allocation limit",
+            header.width, header.height
+        )));
+    }
+    let total_pixels = u64::from(header.frames).saturating_mul(canvas);
+    if total_pixels > MAX_ANIMATED_PIXELS {
+        return Err(EngineError::Decode(format!(
+            "WebP frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
+        )));
+    }
+    // The collector keeps every frame at the canvas's size and
+    // charges the bytes it keeps against MAX_DECODE_ALLOC, frame by
+    // frame. Charging that total here refuses, before any frame
+    // decodes, exactly the animations the collector would refuse
+    // partway through.
+    if total_pixels.saturating_mul(4) > MAX_DECODE_ALLOC {
+        return Err(EngineError::Decode(format!(
+            "WebP frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
+        )));
     }
     Ok(())
 }
@@ -2887,6 +2973,11 @@ fn decode_webp_frames(
     deadline: Option<std::time::Instant>,
 ) -> Result<Frames, EngineError> {
     use image::AnimationDecoder;
+    // Charge the canvas and the frame count from the headers
+    // before either decoder opens the file, as the GIF path does
+    // (see [`check_webp_frame_budget`]). An over-budget canvas is
+    // refused here, never handed to the image crate's iterator.
+    check_webp_frame_budget(bytes)?;
     let (decoder, background) = open_webp_animation(bytes)?;
     if let Some(frames) = webp_frames_through_libwebp(bytes, background, deadline) {
         return frames;
