@@ -234,7 +234,7 @@ async fn a_section_takes_its_permit_before_it_asks_for_the_frame() {
     // from one decode.
     let log = FrameLog::default();
     let mut state = logging_state(&log);
-    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.ai_gate = Arc::new(Gate::new(1));
     let processed = still_processed(test_png(), ImageFormat::Png);
     let frame = DocumentFrame::with_decoder(&processed, decode_behind_the_gate);
     let deadline = Instant::now() + std::time::Duration::from_secs(60);

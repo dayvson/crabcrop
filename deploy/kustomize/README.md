@@ -47,7 +47,11 @@ kubectl create secret generic crabcrop \
   R2-40): create the one from The signing secret above
   before applying; until it exists, the pod cannot start.
   The Helm chart's equivalent is its `existingSecret`
-  value.
+  value. `/health` answers `503` once the request log has
+  stalled, its queue full for 5 seconds because nothing
+  reads the pod's standard output, so the liveness probe
+  restarts a replica that can serve no image (see
+  [The request log](../../docs/deployment.md#the-request-log)).
 - `components/`: the chart's toggles, as kustomize
   components an overlay composes in:
   - `presets`: the presets ConfigMap plus its mount and

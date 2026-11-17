@@ -34,7 +34,7 @@ from ._operations import FormatOptions, StudioOptions, filter, join_ops, ops
 
 #: The package version, the release version every crabcrop artifact
 #: shares; scripts/bump_version.py moves it with pyproject.toml.
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 __all__ = [
     "MAX_DIMENSION",
