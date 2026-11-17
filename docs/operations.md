@@ -21,7 +21,7 @@ A factor from the `DPR` client hint is the exception: it steps down to the large
 | `-300x200` | Resize to 300×200 and flip horizontally. |
 | `300x-200` | Resize to 300×200 and flip vertically. |
 
-On a baseline JPEG source, a resize that comes first and takes the image to a third of its size or less decodes the source at reduced scale, which is faster and gives the same output size; see [Source images](url-grammar.md#source-images).
+On a JPEG source, a resize that comes first and takes the image to a third of its size or less decodes the source at reduced scale, which is faster and gives the same output size; see [Source images](url-grammar.md#source-images).
 
 ```bash
 curl "http://localhost:3000/unsafe/300x0/https://example.com/photo.jpg"

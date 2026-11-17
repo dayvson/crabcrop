@@ -8,9 +8,9 @@
 //! such mode. libjpeg-turbo, which already writes the JPEG
 //! output (issue #668), has one, with vector code for it. So
 //! where the first operation of a request is a plain resize
-//! that shrinks a baseline JPEG far enough, the source is
-//! decoded through libjpeg-turbo at reduced scale and the
-//! resize finishes from the reduced frame.
+//! that shrinks a JPEG far enough, the source is decoded
+//! through libjpeg-turbo at reduced scale and the resize
+//! finishes from the reduced frame.
 //!
 //! The pixels of such a render differ from the ones a
 //! full-size decode and the same resize give, so the rule is
@@ -37,8 +37,9 @@
 //! full-size path refuses it as it always did, before anything
 //! is decoded. A scaled decode holds a frame of a quarter of
 //! the pixels or fewer where the full one holds them all, and
-//! its scans are capped where zune-jpeg caps a progressive
-//! file's ([`MAX_SCANS`]).
+//! for a progressive file the same coefficients zune-jpeg
+//! holds; its scans are capped where zune-jpeg caps them
+//! ([`MAX_SCANS`]).
 //!
 //! Two decoders reading one file is the hazard, and the answer
 //! to it is the same everywhere: where libjpeg-turbo and
@@ -53,18 +54,22 @@
 //! errors come back as values through the `turbojpeg` crate;
 //! the library does not print or exit.
 //!
-//! What no header shows is damage inside the coded data, and
-//! there the two decoders do part on progressive files:
-//! libjpeg-turbo reads some damaged progressive scans without
-//! a warning where zune-jpeg stops (9 of 42,000 mutated files
-//! in a differential run, all progressive). Such a file
-//! rendered at the sizes that took this path and failed at
-//! full size, so its answer hung on the size asked for. A
-//! progressive file therefore always decodes at full size
-//! (issue #713): zune-jpeg's answer, the pixels or the error,
-//! is its answer at every size. A damaged baseline file both
-//! decoders read can still show its damage differently on the
-//! two paths, as any scaled render's pixels differ a little
+//! What no header shows is damage inside the coded data. The
+//! one place a differential run found the two decoders
+//! parting there is the first scan of a progressive file:
+//! zune-jpeg refuses a file whose first scan its reader is
+//! done with before it comes to the marker that ends the
+//! scan, where libjpeg-turbo reads the scan without a
+//! warning, so such a file rendered at the sizes that took
+//! this path and failed at full size. A progressive file is
+//! therefore taken only where zune-jpeg's reader comes to
+//! that marker (issue #713, [`first_scan`]): the check
+//! follows the reader through the first scan, a table lookup
+//! a block, and leaves whatever it does not follow to the
+//! full-size path, whose answer, the picture or the error, is
+//! then the answer at every size. A damaged file both
+//! decoders read still shows its damage differently on the
+//! two paths, as every scaled render's pixels differ a little
 //! from the full-size render's.
 
 use image::DynamicImage;
@@ -74,14 +79,15 @@ use super::{
     check_decoded_dimensions, exif_orientation, has_zero_side, resize_target, zune_jpeg_options,
 };
 
-/// The most scans a file the scaled decode takes may carry.
-/// A scan can be a few bytes that make the decoder walk every
-/// block of the image, so a small file with thousands of them
-/// is hours of work. This is zune-jpeg's own cap on a
-/// progressive file (its default, which every JPEG decode
-/// here runs under). A progressive file never reaches this
-/// decode (issue #713), and a sequential one names each
-/// component in one scan, so the cap is a second line here.
+mod first_scan;
+
+/// The most scans a progressive file may carry. A scan can be
+/// a few bytes that make the decoder walk every block of the
+/// image, so a small file with thousands of them is hours of
+/// work. This is zune-jpeg's own cap (its default, which every
+/// JPEG decode here runs under): a file past it is refused by
+/// both decoders, so the full-size path gives it the refusal
+/// it always got.
 const MAX_SCANS: u32 = 100;
 
 /// The scales tried, as denominators, from the smallest frame
@@ -190,9 +196,8 @@ fn turn((width, height): (u32, u32), orientation: Option<u32>) -> (u32, u32) {
 /// The scaled decode `ops` make `bytes` eligible for, or
 /// `None` for the full-size decode every other request gets.
 ///
-/// Eligible is: the source is a baseline or extended YCbCr
-/// JPEG ([`eligible_size`]), never a progressive one, the
-/// first operation is a plain resize, and one of a half, a
+/// Eligible is: the source is a YCbCr JPEG ([`eligible_size`]),
+/// the first operation is a plain resize, and one of a half, a
 /// quarter and an eighth leaves a frame at least one and a half
 /// times the resize's target on both axes. The smallest such
 /// frame is taken.
@@ -305,7 +310,8 @@ struct Glance {
     /// taken only when its first scan names tables that are
     /// there; a first scan of fewer components has more scans
     /// behind it, which are not read here. A progressive file
-    /// is not taken at all (see [`eligible_size`]).
+    /// needs no such care: libjpeg fills nothing in for it,
+    /// and refuses a scan that names a missing table.
     names_its_tables: bool,
     /// The orientation tag of the first EXIF segment.
     orientation: Option<u32>,
@@ -444,12 +450,6 @@ fn tiff_orientation(tiff: &[u8]) -> Option<u32> {
 /// The declared size of a JPEG the scaled decode takes, or
 /// `None` for a file it leaves to the full-size path.
 ///
-/// A progressive file is left to it before either decoder
-/// reads its header (issue #713): the two decoders can part
-/// on its scans, past anything a header shows, and the
-/// full-size decode's reading is the one every size must get
-/// (see the module docs).
-///
 /// Both decoders read the header, and both must read the same
 /// thing as each other and as the first look (`glance`): an
 /// 8-bit, Huffman-coded, lossy YCbCr frame of one size.
@@ -468,11 +468,14 @@ fn tiff_orientation(tiff: &[u8]) -> Option<u32> {
 /// of any decode: a file past them is not eligible, and the
 /// full-size path refuses it by the same two checks before it
 /// decodes anything.
+///
+/// Last, a progressive file's first scan must be one
+/// zune-jpeg reads to the marker that ends it
+/// ([`first_scan::reaches_its_marker`]), or zune-jpeg refuses
+/// the file at every size. That reading walks the scan's
+/// data, so it comes after every check of the header.
 fn eligible_size(bytes: &[u8], glance: &Glance) -> Option<(u32, u32)> {
     use zune_core::colorspace::ColorSpace;
-    if glance.progressive {
-        return None;
-    }
     #[cfg(test)]
     HEADER_READS.set(HEADER_READS.get() + 1);
     // The header only, through a reader of its own: the
@@ -499,8 +502,9 @@ fn eligible_size(bytes: &[u8], glance: &Glance) -> Option<(u32, u32)> {
         && header.colorspace == turbojpeg::Colorspace::YCbCr
         && !header.is_lossless
         && !header.is_arithmetic
-        && !header.is_progressive
-        && glance.names_its_tables;
+        && header.is_progressive == glance.progressive
+        && (glance.progressive || glance.names_its_tables)
+        && (!glance.progressive || first_scan::reaches_its_marker(bytes));
     agrees.then_some((width, height))
 }
 

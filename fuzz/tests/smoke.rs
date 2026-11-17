@@ -404,22 +404,23 @@ fn scaled_frames(bytes: &[u8]) -> usize {
 
 #[test]
 fn the_decode_corpus_reaches_the_scaled_jpeg_decode() {
-    // Issue #653: a baseline JPEG source whose first resize
-    // shrinks it far enough is decoded by libjpeg-turbo, in
-    // the server process. The corpus holds JPEGs it decodes at
-    // every scale, so the decode target fuzzes that decoder,
-    // and JPEGs it stands down for, one for each way: by the
+    // Issue #653: a JPEG source whose first resize shrinks it
+    // far enough is decoded by libjpeg-turbo, in the server
+    // process. The corpus holds JPEGs it decodes at every
+    // scale, so the decode target fuzzes that decoder, and
+    // JPEGs it stands down for, one for each way: by the
     // header (grayscale, CMYK, arithmetic, lossless, 12-bit,
-    // a declared size past the limits, and since issue #713
-    // every progressive file: a clean one, a truncated one,
-    // scans past the limit and a damaged scan) and by the data
-    // (a truncated scan, restart markers out of turn).
+    // a declared size past the limits) and by the data (a
+    // truncated scan, scans past the limit, restart markers
+    // out of turn, and since issue #713 a progressive first
+    // scan zune-jpeg's reader is done with short of its
+    // marker).
     let seeds = jpeg_seeds();
     let decoded = seeds.iter().filter(|s| scaled_frames(s) == 3).count();
     let refused = seeds.iter().filter(|s| scaled_frames(s) == 0).count();
     assert!(decoded >= 3, "{decoded} JPEG seeds decode at every scale");
     assert!(
-        refused >= 12,
+        refused >= 10,
         "{refused} JPEG seeds are refused at every scale"
     );
     assert_eq!(
@@ -431,11 +432,11 @@ fn the_decode_corpus_reaches_the_scaled_jpeg_decode() {
 
 #[test]
 fn jpeg_truncations_and_mutations_satisfy_the_invariants() {
-    // The smallest JPEG seed the scaled decode takes:
-    // truncations land in its header, its tables and its
-    // scan, and each byte in turn becomes a zero, a fill byte
-    // or the marker of a scan, the three taking turns along
-    // the file.
+    // The smallest JPEG seed the scaled decode takes, a
+    // progressive one: truncations land in its header, its
+    // tables and every scan, and each byte in turn becomes a
+    // zero, a fill byte or the marker of a scan, the three
+    // taking turns along the file.
     let seed = jpeg_seeds()
         .into_iter()
         .filter(|s| scaled_frames(s) == 3)

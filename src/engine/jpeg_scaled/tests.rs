@@ -697,11 +697,10 @@ fn a_dpr_directive_and_a_dpr_hint_both_scale_the_target() {
 }
 
 #[test]
-fn only_a_baseline_ycbcr_jpeg_is_eligible() {
+fn only_a_ycbcr_jpeg_is_eligible() {
     let img = picture(240, 160);
     // Every chroma layout libjpeg-turbo writes, baseline and
-    // progressive: a progressive file decodes at full size
-    // (issue #713).
+    // progressive.
     for subsamp in [
         turbojpeg::Subsamp::None,
         turbojpeg::Subsamp::Sub2x1,
@@ -716,7 +715,7 @@ fn only_a_baseline_ycbcr_jpeg_is_eligible() {
             });
             assert_eq!(
                 scale_for(&bytes, "80x0"),
-                (!progressive).then_some(2),
+                Some(2),
                 "{subsamp:?}, progressive {progressive}"
             );
         }
@@ -910,9 +909,8 @@ fn the_image_fills_a_frame_short_of_its_last_column_and_row() {
 #[test]
 fn a_frame_is_the_picture_at_reduced_scale_for_every_size_and_layout() {
     // Sizes on and off the 8-pixel block grid and off every
-    // scale, down to one pixel; each chroma layout; baseline,
-    // and progressive, which makes no frame at any scale
-    // (issue #713). The frame is libjpeg's size for the
+    // scale, down to one pixel; each chroma layout; baseline
+    // and progressive. The frame is libjpeg's size for the
     // scale, and it is the picture, to its last row and
     // column: its brightness is the full-size decode's,
     // averaged down by the same factor. (Brightness, because
@@ -954,10 +952,6 @@ fn a_frame_is_the_picture_at_reduced_scale_for_every_size_and_layout() {
                     let what = format!(
                         "{width}x{height} {subsamp:?} progressive {progressive} at 1/{denominator}"
                     );
-                    if progressive {
-                        assert!(decode_at(&bytes, denominator).is_none(), "{what}");
-                        continue;
-                    }
                     let frame = decode_at(&bytes, denominator)
                         .unwrap_or_else(|| panic!("{what}: no frame"))
                         .to_rgb8();
@@ -991,7 +985,7 @@ fn a_frame_is_the_picture_at_reduced_scale_for_every_size_and_layout() {
             }
         }
     }
-    assert_eq!(frames, 10 * 5 * 3);
+    assert_eq!(frames, 10 * 5 * 2 * 3);
     assert!(worst < 4.0, "{worst:.1} levels from the averaged picture");
 }
 
@@ -1194,16 +1188,16 @@ fn the_url_test_vectors_render_at_the_sizes_they_did() {
 #[test]
 fn a_scaled_render_is_the_full_size_render_s_picture() {
     // The same picture, to well within what the eye sees, at
-    // every scale and orientation, for a size every scale
-    // divides and for one a pixel past it, whose frames end in
-    // a column and a row that are mostly padding. A frame
-    // turned the wrong way, mirrored, cut short, or resampled
-    // a fraction of a pixel out of place would be many
-    // decibels away.
+    // every scale and orientation, baseline and progressive,
+    // for a size every scale divides and for one a pixel past
+    // it, whose frames end in a column and a row that are
+    // mostly padding. A frame turned the wrong way, mirrored,
+    // cut short, or resampled a fraction of a pixel out of
+    // place would be many decibels away.
     let mut worst = f64::INFINITY;
     for (width, height) in [(240, 160), (241, 161)] {
         let img = picture(width, height);
-        for bytes in [jpeg(&img)] {
+        for bytes in [jpeg(&img), progressive_jpeg(&img)] {
             for orientation in 1..=8u16 {
                 let bytes = with_orientation(&bytes, orientation);
                 let remainders = if orientation >= 5 {
@@ -1440,20 +1434,12 @@ fn assert_survives(what: &str, bytes: &[u8], remainder: &str) -> bool {
 
 #[test]
 fn a_truncated_file_gets_the_full_size_path_s_answer() {
-    // A progressive file is never planned (issue #713), so
-    // each of its cuts gets the full-size answer by the plan
-    // alone.
     let img = picture(120, 80);
     for (kind, bytes) in [
         ("baseline", jpeg(&img)),
         ("progressive", progressive_jpeg(&img)),
     ] {
-        let progressive = kind == "progressive";
-        assert_eq!(
-            scale_for(&bytes, "40x0"),
-            (!progressive).then_some(2),
-            "{kind}"
-        );
+        assert_eq!(scale_for(&bytes, "40x0"), Some(2), "{kind}");
         let scan = header_segments(&bytes).last().unwrap().1;
         // Cut inside the header, at the scan's start, and
         // through the entropy-coded data to the last byte.
@@ -1474,38 +1460,157 @@ fn a_truncated_file_gets_the_full_size_path_s_answer() {
                 assert_survives(&what, cut, "40x0");
             }
         }
-        assert!(cut_count > 20, "{kind}: {cut_count} cuts");
-        if progressive {
-            assert_eq!(planned, 0, "{kind}: {planned} of {cut_count}");
-        } else {
-            assert!(planned > 15, "{kind}: {planned} of {cut_count}");
-        }
+        assert!(
+            cut_count > 20 && planned > 15,
+            "{kind}: {planned} of {cut_count}"
+        );
     }
+}
+
+/// The seed of the decode target's corpus (fuzz/corpus/decode)
+/// named `name`.
+fn fuzz_seed(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz/corpus/decode")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 #[test]
 fn a_damaged_progressive_file_gets_one_answer_at_every_size() {
     // Issue #713: one of the progressive files a differential
     // run found libjpeg-turbo reading without a warning where
-    // zune-jpeg stops. It rendered at the sizes that took the
-    // scaled decode and failed at full size. A progressive
-    // file now decodes at full size whatever the request, so
-    // every size gets zune-jpeg's answer: the error.
-    let bytes = std::fs::read(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fuzz/corpus/decode/jpeg-progressive-damaged-scan"),
-    )
-    .unwrap();
-    assert!(glance(&bytes).unwrap().progressive);
+    // zune-jpeg stops, at the end of its first scan. It
+    // rendered at the sizes that took the scaled decode and
+    // failed at full size. The scaled decode now leaves it to
+    // the full-size path, so every size gets zune-jpeg's
+    // answer: the error.
+    let bytes = fuzz_seed("jpeg-progressive-damaged-scan");
+    let look = glance(&bytes).unwrap();
+    assert!(look.progressive);
+    for denominator in DENOMINATORS {
+        let scaled = ScaledDecode {
+            denominator,
+            stored: look.size,
+            orientation: None,
+        };
+        assert!(decode(&bytes, &scaled).is_some(), "1/{denominator}");
+    }
+    assert_eq!(first_scan::marker_in_first_scan(&bytes), Some(false));
     let full = answer(at_full_size(|| render(&bytes, "97x0")));
     assert!(
-        full.as_ref().is_err_and(|e| e.starts_with("Decode(")),
+        full.as_ref()
+            .is_err_and(|e| e.starts_with("Decode(") && e.contains("Marker missing")),
         "{full:?}"
     );
     for remainder in ["12x8", "16x0", "32x0", "49x0", "97x0", "crop:20x20", "0x0"] {
         assert_eq!(plan_for(&bytes, remainder), None, "{remainder}");
         assert_eq!(answer(render(&bytes, remainder)), full, "{remainder}");
     }
+}
+
+/// The data of a progressive file's first scan: from the end
+/// of its header to the marker that ends it.
+fn first_scan_data(bytes: &[u8]) -> std::ops::Range<usize> {
+    let start = header_segments(bytes).last().unwrap().2;
+    let end = (start..bytes.len() - 1)
+        .find(|&at| bytes[at] == 0xFF && bytes[at + 1] != 0x00)
+        .expect("a marker after the first scan");
+    start..end
+}
+
+/// Whether zune-jpeg refuses `bytes` because its reader did
+/// not come to the marker that ends the first scan.
+fn zune_misses_the_marker(bytes: &[u8]) -> bool {
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
+        zune_core::bytestream::ZCursor::new(bytes),
+        zune_jpeg_options(),
+    );
+    decoder
+        .decode()
+        .is_err_and(|e| format!("{e:?}").contains("Marker missing where expected"))
+}
+
+#[test]
+fn the_first_scan_is_read_as_zune_jpeg_reads_it() {
+    // Issue #713. zune-jpeg refuses a progressive file whose
+    // first scan its reader is done with before it comes to
+    // the marker that ends the scan, and the scaled decode
+    // leaves those to the full-size path (see `first_scan`).
+    // The files here are damaged where that turns: bytes
+    // added at the end of the first scan's data, which a
+    // reader that fills four bytes at a time may or may not
+    // come past, and each bit of the scan's data flipped in
+    // turn, which makes codes read shorter or longer. Wherever
+    // the reading follows the scan, it gives zune-jpeg's own
+    // answer; and a request gets one answer at every size,
+    // the scaled decode's or the full-size path's.
+    let (mut comes, mut misses, mut unread, mut rendered) = (0, 0, 0, 0);
+    for (width, height) in [(16, 16), (40, 24), (61, 37)] {
+        let img = picture(width, height);
+        let remainder = format!("{}x0", width / 3);
+        for subsamp in [
+            turbojpeg::Subsamp::None,
+            turbojpeg::Subsamp::Sub2x1,
+            turbojpeg::Subsamp::Sub2x2,
+            turbojpeg::Subsamp::Sub1x2,
+            turbojpeg::Subsamp::Sub4x1,
+        ] {
+            let bytes = jpeg_with(&img, |c| {
+                c.set_subsamp(subsamp).unwrap();
+                c.set_progressive(true).unwrap();
+            });
+            let kind = format!("{width}x{height} {subsamp:?}");
+            assert_eq!(
+                first_scan::marker_in_first_scan(&bytes),
+                Some(true),
+                "{kind}"
+            );
+            assert!(plan_for(&bytes, &remainder).is_some(), "{kind}");
+            let data = first_scan_data(&bytes);
+            let mut damaged = Vec::new();
+            for extra in 1..=9 {
+                for fill in [&[0x00][..], &[0x5A], &[0xFF, 0x00]] {
+                    let mut longer = bytes[..data.end].to_vec();
+                    for _ in 0..extra {
+                        longer.extend_from_slice(fill);
+                    }
+                    longer.extend_from_slice(&bytes[data.end..]);
+                    damaged.push((format!("{kind}, {extra} x {fill:02X?} added"), longer));
+                }
+            }
+            for at in data.clone() {
+                for bit in 0..8 {
+                    let mut flipped = bytes.clone();
+                    flipped[at] ^= 1 << bit;
+                    damaged.push((format!("{kind}, byte {at} bit {bit} flipped"), flipped));
+                }
+            }
+            for (n, (what, file)) in damaged.iter().enumerate() {
+                match first_scan::marker_in_first_scan(file) {
+                    Some(reached) => {
+                        assert_eq!(reached, !zune_misses_the_marker(file), "{what}");
+                        if reached {
+                            comes += 1;
+                        } else {
+                            misses += 1;
+                        }
+                    }
+                    None => unread += 1,
+                }
+                // Each added run, and every seventh flip:
+                // rendered on both paths.
+                if n < 27 || n % 7 == 0 {
+                    assert_survives(what, file, &remainder);
+                    rendered += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        comes > 2000 && misses > 150 && unread * 4 < comes + misses && rendered > 600,
+        "{comes} come to the marker, {misses} miss it, {unread} unread, {rendered} rendered"
+    );
 }
 
 #[test]
@@ -1528,13 +1633,25 @@ fn a_file_that_declares_another_size_than_it_carries_is_answered_as_before() {
         ] {
             let what = format!("{kind} declaring {width}x{height}");
             let lying = declaring(&bytes, width, height);
-            // A progressive file is never planned (issue
-            // #713).
-            assert_eq!(
-                plan_for(&lying, "1x1").is_some(),
-                kind == "baseline",
-                "{what}"
-            );
+            // A progressive file that declares fewer blocks
+            // (16 by 16 pixels each, in 4:2:0) than it holds
+            // leaves its reader short of the marker that ends
+            // its first scan, and zune-jpeg refuses it: it is
+            // not planned (issue #713), and every size gets
+            // that refusal.
+            let fewer = width.div_ceil(16) * height.div_ceil(16) < 8 * 5;
+            if kind == "progressive" && fewer {
+                assert_eq!(plan_for(&lying, "1x1"), None, "{what}");
+                let refused = answer(at_full_size(|| render(&lying, "1x1")));
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|e| e.contains("Marker missing")),
+                    "{what}: {refused:?}"
+                );
+            } else {
+                assert!(plan_for(&lying, "1x1").is_some(), "{what}");
+            }
             assert_survives(&what, &lying, "1x1");
         }
     }
@@ -1698,12 +1815,6 @@ fn the_files_written_by_hand_are_files_both_decoders_read() {
             .unwrap_or_else(|e| panic!("{what}: libjpeg-turbo: {e}"));
         assert!(theirs.pixels.iter().all(|v| *v == 128), "{what}");
         for denominator in DENOMINATORS {
-            // The scaled decode leaves a progressive file to
-            // the full-size path (issue #713).
-            if what == "progressive" {
-                assert!(decode_at(&bytes, denominator).is_none(), "{what}");
-                continue;
-            }
             let frame = decode_at(&bytes, denominator)
                 .unwrap_or_else(|| panic!("{what} at 1/{denominator}"))
                 .to_rgb8();
@@ -1715,28 +1826,33 @@ fn the_files_written_by_hand_are_files_both_decoders_read() {
 
 #[test]
 fn a_progressive_file_past_the_scan_limit_is_refused_as_zune_jpeg_refuses_it() {
-    // A progressive file is never planned (issue #713), so
-    // zune-jpeg answers at every size: at the limit it
-    // renders, and one scan more is its refusal.
+    // At the limit both decoders read the file, and it takes
+    // the scaled decode.
     let at_limit = flat_progressive(100);
-    assert_eq!(scale_for(&at_limit, "1x1"), None);
+    assert_eq!(scale_for(&at_limit, "1x1"), Some(8));
+    let frame = decode(&at_limit, &plan_for(&at_limit, "1x1").unwrap());
+    assert!(frame.is_some(), "100 scans");
     assert!(decode_image(&at_limit).is_ok(), "100 scans at full size");
     let out = render(&at_limit, "1x1").unwrap();
     assert_eq!((out.width, out.height), (1, 1));
+    // One scan more and both refuse it. The scaled decode
+    // stops at the scan past the limit, and the request gets
+    // the full-size path's refusal: zune-jpeg's.
     for scans in [101, 190, 191, 3000] {
         let bytes = flat_progressive(scans);
         let what = format!("{scans} scans");
-        assert_eq!(plan_for(&bytes, "1x1"), None, "{what}");
-        for remainder in ["1x1", "8x8", "crop:4x4"] {
-            let refused = answer(render(&bytes, remainder));
-            assert!(
-                refused
-                    .as_ref()
-                    .is_err_and(|e| e.starts_with("Decode(") && e.contains("Too many scans")),
-                "{what}, {remainder}: {refused:?}"
-            );
-        }
+        assert_refused_and_answered_as_before(&what, &bytes, "1x1");
+        let refused = answer(render(&bytes, "1x1"));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.starts_with("Decode(") && e.contains("Too many scans")),
+            "{what}: {refused:?}"
+        );
     }
+    // Without its limit libjpeg-turbo reads all of them: the
+    // limit is what refuses the file, not its structure.
+    assert!(turbojpeg::decompress(&flat_progressive(191), turbojpeg::PixelFormat::RGB).is_ok());
 }
 
 #[test]
@@ -1957,13 +2073,15 @@ fn a_file_that_leaves_its_huffman_tables_out_is_refused_as_before() {
             );
         }
     }
-    // A progressive file is never planned (issue #713): one
-    // that leaves its tables out is the full-size path's to
-    // answer, and libjpeg-turbo, which fills nothing in for
-    // it, would refuse it too.
+    // A progressive file gets no tables filled in: one that
+    // leaves them out is refused by libjpeg-turbo too. The
+    // reading of its first scan (issue #713) finds no table
+    // to read it with, so it is not planned at all, and the
+    // full-size path answers.
     let progressive = progressive_jpeg(&picture(120, 80));
     let bare = without_segments(&progressive, |m, _| m == 0xC4);
     assert!(read(&bare).is_err());
+    assert_eq!(first_scan::marker_in_first_scan(&bare), None);
     assert_eq!(plan_for(&bare, "40x0"), None);
     assert_eq!(
         answer(render(&bare, "40x0")),
@@ -2068,10 +2186,7 @@ fn the_first_look_reads_the_frame_and_the_orientation_as_the_decoders_do() {
             (upright.size, upright.progressive, upright.orientation),
             ((97, 61), progressive, None)
         );
-        // The look reads a progressive file, which the scaled
-        // decode then leaves to the full-size path (issue
-        // #713).
-        assert_eq!(eligible(&bytes), (!progressive).then_some((97, 61)));
+        assert_eq!(eligible(&bytes), Some((97, 61)));
         for orientation in 1..=8u16 {
             for turned in [
                 with_orientation(&bytes, orientation),
@@ -2296,28 +2411,15 @@ fn the_fuzz_seeds_are_the_shapes_they_are_named_for() {
             .filter(|d| decode_at(bytes, *d).is_some())
             .count()
     };
-    // Decoded at every scale.
-    for name in ["jpeg-small", "jpeg-blue", "jpeg-tiny"] {
+    // Decoded at every scale: baseline and progressive.
+    for name in ["jpeg-small", "jpeg-blue", "jpeg-progressive"] {
         assert_eq!(frames(&seed(name)), 3, "{name}");
     }
-    // Progressive, so left to the full-size decode before
-    // either decoder reads them (issue #713): a clean file, a
-    // scan cut short, more scans than the limit, and one of
-    // the damaged files a differential run found libjpeg-turbo
-    // reading without a warning where zune-jpeg refuses it.
-    for name in [
-        "jpeg-progressive",
-        "jpeg-truncated",
-        "jpeg-scans-past-the-limit",
-        "jpeg-progressive-damaged-scan",
-    ] {
-        let bytes = seed(name);
-        assert!(glance(&bytes).unwrap().progressive, "{name}");
-        assert_eq!(eligible(&bytes), None, "{name}");
-        assert_eq!(frames(&bytes), 0, "{name}");
-    }
-    assert!(decode_image(&seed("jpeg-progressive")).is_ok());
-    assert!(decode_image(&seed("jpeg-progressive-damaged-scan")).is_err());
+    assert!(
+        turbojpeg::read_header(&seed("jpeg-progressive"))
+            .unwrap()
+            .is_progressive
+    );
     // Turned away by their headers, before any decode.
     for name in [
         "jpeg-gray",
@@ -2340,13 +2442,27 @@ fn the_fuzz_seeds_are_the_shapes_they_are_named_for() {
     let past = header("jpeg-size-past-the-limit");
     assert_eq!((past.width, past.height), (16_384, 4097));
     // Eligible by their headers, and refused by libjpeg-turbo:
-    // a scan cut short, and restart markers that count the
-    // wrong way.
-    for name in ["jpeg-truncated-baseline", "jpeg-restart-out-of-turn"] {
+    // a scan cut short, a scan past the limit, and restart
+    // markers that count the wrong way.
+    for name in [
+        "jpeg-truncated",
+        "jpeg-scans-past-the-limit",
+        "jpeg-restart-out-of-turn",
+    ] {
         let bytes = seed(name);
         assert!(eligible(&bytes).is_some(), "{name}");
         assert_eq!(frames(&bytes), 0, "{name}");
     }
+    // A progressive file whose first scan zune-jpeg reads
+    // short of its marker, and libjpeg-turbo reads without a
+    // warning (issue #713): turned away before the decode, as
+    // the full-size decode refuses it.
+    let damaged = seed("jpeg-progressive-damaged-scan");
+    assert!(glance(&damaged).unwrap().progressive);
+    assert_eq!(first_scan::marker_in_first_scan(&damaged), Some(false));
+    assert_eq!(eligible(&damaged), None);
+    assert_eq!(frames(&damaged), 0);
+    assert!(decode_image(&damaged).is_err());
     // The two written by hand are the files these tests write.
     assert_eq!(seed("jpeg-scans-past-the-limit"), flat_progressive(191));
     assert_eq!(
@@ -2362,9 +2478,8 @@ fn the_fuzz_seeds_are_the_shapes_they_are_named_for() {
 /// widths on both sides of the 8, 16 and 32 pixel steps its
 /// loops take, so every loop's tail runs; each chroma layout,
 /// which decides the block sizes its inverse DCT runs at and
-/// whether chroma is upsampled; and the three scales. Only
-/// baseline files: a progressive one never takes the scaled
-/// decode (issue #713).
+/// whether chroma is upsampled; baseline and progressive; and
+/// the three scales.
 fn frame_digest_lines() -> String {
     use sha2::Digest;
     let mut lines = String::new();
@@ -2376,21 +2491,23 @@ fn frame_digest_lines() -> String {
             turbojpeg::Subsamp::Sub1x2,
             turbojpeg::Subsamp::Sub4x1,
         ] {
-            let progressive = false;
-            let bytes = jpeg_with(img, |c| {
-                c.set_quality(quality).unwrap();
-                c.set_subsamp(subsamp).unwrap();
-            });
-            for denominator in DENOMINATORS {
-                let frame = decode_at(&bytes, denominator).expect("a frame");
-                lines.push_str(&format!(
-                    "{}x{} quality {quality} {subsamp:?} progressive {progressive} at 1/{denominator}: {}x{} {}\n",
-                    img.width(),
-                    img.height(),
-                    frame.width(),
-                    frame.height(),
-                    hex::encode(sha2::Sha256::digest(frame.as_bytes()))
-                ));
+            for progressive in [false, true] {
+                let bytes = jpeg_with(img, |c| {
+                    c.set_quality(quality).unwrap();
+                    c.set_subsamp(subsamp).unwrap();
+                    c.set_progressive(progressive).unwrap();
+                });
+                for denominator in DENOMINATORS {
+                    let frame = decode_at(&bytes, denominator).expect("a frame");
+                    lines.push_str(&format!(
+                        "{}x{} quality {quality} {subsamp:?} progressive {progressive} at 1/{denominator}: {}x{} {}\n",
+                        img.width(),
+                        img.height(),
+                        frame.width(),
+                        frame.height(),
+                        hex::encode(sha2::Sha256::digest(frame.as_bytes()))
+                    ));
+                }
             }
         }
     };
@@ -2437,7 +2554,7 @@ fn frames_are_the_same_with_and_without_vector_code() {
     use sha2::Digest;
     use std::process::{Command, Stdio};
     let here = frame_digest_lines();
-    assert_eq!(here.lines().count(), 22 * 5 * 3);
+    assert_eq!(here.lines().count(), 22 * 5 * 2 * 3);
     let dir = crate::test_support::scratch_dir("jpeg-frame-digests");
     for switch in ["JSIMD_FORCENONE", "JSIMD_FORCESSE2"] {
         let path = dir.join(switch);
@@ -2461,7 +2578,7 @@ fn frames_are_the_same_with_and_without_vector_code() {
     }
     assert_eq!(
         hex::encode(sha2::Sha256::digest(here.as_bytes())),
-        "03cda3ad6b8fcf8fb7fbe8a78dd95893d86a85ffaf427bd4d546674b62151f32",
+        "d37684112d316b4e2640e84ac28422ddca859d5c99044d0664929a4f7a7cffe3",
         "the scaled decode's frames changed:\n{here}"
     );
 }
