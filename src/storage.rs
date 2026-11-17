@@ -3543,7 +3543,8 @@ pub(crate) struct HeaderProbe {
 /// header bytes, which is all this function touches. The
 /// MAC is parsed but not verified here: verification needs
 /// the whole entry, payload included, and happens in
-/// [`parse_entry`] and [`read_header`], the serving paths.
+/// [`parse_entry`] and [`DiskStore::read_scanned`], the serving
+/// path and the boot scan.
 fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
     let mut pos = 0;
     // (carries an ETag line, carries a stamp line)
