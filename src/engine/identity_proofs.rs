@@ -1328,7 +1328,7 @@ fn blend_overlay_as_it_was(
 ) -> DynamicImage {
     let target = width_pct.map(|pct| ((base.width() as u64 * pct as u64) / 100).max(1) as u32);
     if !lands_on((base.width(), base.height()), (x, y)) {
-        return DynamicImage::ImageRgba8(base.to_rgba8());
+        return base.clone();
     }
     let scaled = target.map(|target| {
         ov.image()
@@ -1339,7 +1339,7 @@ fn blend_overlay_as_it_was(
         None => (ov.image().width(), ov.image().height()),
     };
     let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
-        return DynamicImage::ImageRgba8(base.to_rgba8());
+        return base.clone();
     };
     let top = match &scaled {
         Some(scaled) => crate::filters::RgbaPart::of(scaled, part.0),
