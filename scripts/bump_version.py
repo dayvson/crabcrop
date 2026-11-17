@@ -66,7 +66,8 @@ def main(argv=None):
             (version_sites.ROOT / rel).write_text(text, encoding="utf-8")
             print(f"updated {rel}")
     for site in pinned:
-        if site.path in changed:
+        text = changed.get(site.path)
+        if text is not None and not any(text[start:end] for start, end in site.locate(text)):
             print(
                 f"{'would empty' if args.dry_run else 'emptied'} {site.what} in {site.path}: "
                 "pin the tag's commit there once it exists"

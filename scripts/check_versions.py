@@ -12,7 +12,8 @@ It also reads the dav1d pin in scripts/build_dav1d.sh, which no release
 bump moves, and fails when a doc that names the shipped dav1d names
 another version (version_sites.DAV1D_MENTIONS, issue #596), and the
 release commit pins (version_sites.RELEASE_COMMITS, issue #711), which
-must hold nothing, as a bump leaves them, or a full commit SHA.
+must hold nothing, as a bump leaves them, or a full commit SHA, and in a
+clone that has that commit, one of the release the tree carries.
 """
 import sys
 
@@ -22,7 +23,7 @@ import version_sites
 def main():
     version, rows, problems = version_sites.check()
     dav1d, dav1d_rows, dav1d_problems = version_sites.check_dav1d()
-    commit_rows, commit_problems = version_sites.check_commits()
+    commit_rows, commit_problems = version_sites.check_commits(version=version)
     problems += dav1d_problems + commit_problems
     for values, site in rows + dav1d_rows:
         shown = ",".join(dict.fromkeys(values)) if values else "MISSING"

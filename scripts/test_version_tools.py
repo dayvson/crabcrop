@@ -41,6 +41,8 @@ EXAMPLES = {
     ".github/workflows/release.yml": "cargo-dist's comment on tag formats",
     "docs/release-workflow.yml": "the mirror of release.yml",
     "scripts/test_check_locks.py": "made-up lockfile entries, third-party crates included",
+    "scripts/test_publish_crates.py": "made-up crates.io index entries",
+    "scripts/test_publish_mcp_registry.py": "made-up MCP registry listings",
     # Generated from Cargo.lock, the workspace's own crates left out, so
     # every version in it is a third-party crate's (issue #682).
     "THIRD-PARTY-NOTICES.md": "third-party crates' own versions",
@@ -415,6 +417,48 @@ class VersionToolsTest(unittest.TestCase):
         text = (self.tree / BENCHMARK_SETUP).read_text(encoding="utf-8")
         (value,) = re.findall(r"(?m)^CRABCROP_COMMIT=(.*)$", text)
         return value
+
+    def set_benchmark_commit(self, commit):
+        path = self.tree / BENCHMARK_SETUP
+        text, count = re.subn(r"(?m)^CRABCROP_COMMIT=.*$", f"CRABCROP_COMMIT={commit}", path.read_text(encoding="utf-8"))
+        self.assertEqual(count, 1)
+        path.write_text(text, encoding="utf-8")
+
+    def test_the_check_fails_on_a_commit_pin_of_another_release(self):
+        # Where git can read the pinned commit, it must be one of the
+        # release the tree carries. A release commit made with the bump
+        # from before issue #711 moved the version and kept the previous
+        # release's commit, which setup.sh refuses; so does the check.
+        def git(*args):
+            done = subprocess.run(
+                ["git", "-C", str(self.tree), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.strip()
+
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", f"Release v{self.version}")
+        released = git("rev-parse", "HEAD")
+        self.set_benchmark_commit(released)
+        self.check_passes(self.version)
+        new = bumped(self.version, "patch")
+        self.bump(new)
+        self.set_benchmark_commit(released)
+        what = "CRABCROP_COMMIT (the commit CRABCROP_TAG names)"
+        self.assert_reported(
+            *self.run_tool("check_versions.py"),
+            [
+                f"{BENCHMARK_SETUP}: {what} is {released}, a commit of {self.version}, not {new}; empty it, as a "
+                f"bump does, or pin the commit v{new} names"
+            ],
+        )
+        # A commit this clone does not have is left to setup.sh, which
+        # refuses it; a shallow checkout lacks the commit it pins.
+        self.set_benchmark_commit("0" * 40)
+        self.check_passes(new)
 
     def test_a_bump_empties_the_benchmark_commit_pin(self):
         # The tree pins the commit of the release it measures. A bump

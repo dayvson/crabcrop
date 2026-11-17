@@ -18,10 +18,13 @@ traceback.
 
 RELEASE_COMMITS lists the pins of the release's commit, which no bump can
 know: the bump empties them, and the check accepts nothing or a full
-commit SHA there (issue #711).
+commit SHA there, and where git can read that commit, only one whose
+Cargo.toml carries the release's version (issue #711).
 """
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -311,7 +314,10 @@ SITES = [
 # version it names. The bump used to leave the previous release's
 # commit here, and setup.sh, which fell back to the pin when the new
 # tag was missing, built the previous release under the new tag's
-# name. The refresh that lands new results pins the commit again.
+# name. The refresh that lands new results pins the commit again. Where
+# git can read the pinned commit, the check also wants its Cargo.toml at
+# the release's version: a release commit made with the bump from before
+# that change moved the version and kept the previous commit.
 COMMIT = re.compile(r"[0-9a-f]{40}")
 RELEASE_COMMITS = [
     pattern("benchmark/setup.sh", "CRABCROP_COMMIT (the commit CRABCROP_TAG names)", r"^CRABCROP_COMMIT=(.*)$", re.M),
@@ -411,12 +417,37 @@ def check(root=ROOT):
     return version, rows, problems
 
 
-def check_commits(root=ROOT):
+def commit_version(root, commit):
+    """The version Cargo.toml's [package] has at `commit`, or None when git
+    cannot read that commit at `root`: no repository there, or a clone
+    without it, such as a shallow checkout."""
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(Path(root).resolve().parent), "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{SITES[0].path}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        ((start, end),) = SITES[0].locate(done.stdout)
+    except (SiteError, ValueError):
+        return None
+    return done.stdout[start:end]
+
+
+def check_commits(root=ROOT, version=None):
     """Read every release commit pin (RELEASE_COMMITS).
 
     Returns (rows, problems) like check(): one (values, site) row per
     pin, and one message per pin that is unreadable or holds neither
-    nothing nor a full lowercase commit SHA.
+    nothing nor a full lowercase commit SHA. Given the release
+    `version`, a pinned commit git can read must carry it too.
     """
     rows, problems = [], []
     for site in RELEASE_COMMITS:
@@ -431,6 +462,13 @@ def check_commits(root=ROOT):
         for value in values:
             if value and not COMMIT.fullmatch(value):
                 problems.append(f"{site.path}: {site.what} is {value!r}, expected a full commit SHA or nothing")
+            elif value and version:
+                found = commit_version(root, value)
+                if found is not None and found != version:
+                    problems.append(
+                        f"{site.path}: {site.what} is {value}, a commit of {found}, not {version}; empty it, as a bump "
+                        f"does, or pin the commit v{version} names"
+                    )
     return rows, problems
 
 

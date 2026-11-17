@@ -10,10 +10,11 @@ pinned by version and SHA-256, so the listing follows every release
 instead of the one version submitted by hand.
 
 - A prerelease is not listed. The registry marks the newest version of
-  an entry as its latest, and a prerelease such as 0.14.0-rc.1 sorts
-  above 0.13.0, so clients that install the latest listing would get the
-  release candidate, which npm keeps under its `next` dist-tag
-  (scripts/npm_dist_tag.sh applies the same rule).
+  an entry as its latest, and the next version's release candidate
+  (X.Y.Z-rc.1) sorts above every release before it, so clients that
+  install the latest listing would get the release candidate, which npm
+  keeps under its `next` dist-tag (scripts/npm_dist_tag.sh applies the
+  same rule).
 - server.json must describe the release: its version and its npm
   package's version are the tag's, the package is the one
   sdks/mcp/package.json builds, and that package's `mcpName` is the
