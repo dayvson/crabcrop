@@ -823,6 +823,14 @@ async fn a_full_queue_has_room_again_once_standard_output_takes_a_piece_of_its_b
         "{} bytes written",
         out.text().len()
     );
+    // The writer cuts its pieces at line ends, so its first
+    // piece is 65 lines, 536 bytes short of WRITE_AT_MOST,
+    // and the stream stops only once the next write has
+    // taken those 536 bytes. That write can still be on its
+    // way: wait until it has stopped the stream, or it could
+    // stop it again after the resume below, with nothing
+    // left to read it.
+    out.blocked().await;
     // Once the stream is read, everything is there, in
     // order, the request's line last.
     out.resume();
