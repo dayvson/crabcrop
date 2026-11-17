@@ -1491,7 +1491,8 @@ fn open_stores_starts_the_disk_tier_and_its_scan_indexes_what_a_previous_run_lef
 #[test]
 fn the_disk_tier_boot_lines_say_what_the_scan_did() {
     // Issue #708: the boot logs when the scan starts, when it
-    // is slow, and what it found once it ends.
+    // is slow, and what it found once it ends, the files it
+    // deleted included.
     use crate::storage::{ScanPhase, ScanReport};
     let report = |phase: ScanPhase, secs: u64| ScanReport {
         phase,
@@ -1499,6 +1500,8 @@ fn the_disk_tier_boot_lines_say_what_the_scan_did() {
         files: 12,
         entries: 9,
         bytes: 4096,
+        deleted: 2,
+        undeleted: 0,
     };
     assert_eq!(
         disk_tier_off("/var/cache/crabcrop"),
@@ -1514,7 +1517,19 @@ fn the_disk_tier_boot_lines_say_what_the_scan_did() {
     );
     assert_eq!(
         disk_scan_done("/c", 512, &report(ScanPhase::Done, 3)),
-        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s and skipped 3"
+        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s, deleted 2 and skipped 1"
+    );
+    assert_eq!(
+        disk_scan_done(
+            "/c",
+            512,
+            &ScanReport {
+                deleted: 1,
+                undeleted: 1,
+                ..report(ScanPhase::Done, 3)
+            }
+        ),
+        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s, deleted 1, could not delete 1 and skipped 1"
     );
     assert_eq!(
         disk_scan_running("/c", &report(ScanPhase::Scanning, 35)),

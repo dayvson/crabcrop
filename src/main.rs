@@ -543,15 +543,21 @@ fn disk_scan_started(dir: &str, max_mb: usize, phase: &crate::storage::ScanPhase
     format!("result storage at {dir}: budget {max_mb} MB, {doing}")
 }
 
-/// The line for a boot scan that ended: what it indexed, and
-/// how long it took to read how many files (issue #708).
+/// The line for a boot scan that ended: what it indexed, how
+/// long it took to read how many files, and how many it
+/// deleted, could not delete and skipped (issue #708).
 fn disk_scan_done(dir: &str, max_mb: usize, report: &crate::storage::ScanReport) -> String {
+    let undeleted = match report.undeleted {
+        0 => String::new(),
+        n => format!(", could not delete {n}"),
+    };
     format!(
-        "result storage at {dir}: {} entries, {} bytes, budget {max_mb} MB; the boot scan read {} files in {:.1}s and skipped {}",
+        "result storage at {dir}: {} entries, {} bytes, budget {max_mb} MB; the boot scan read {} files in {:.1}s, deleted {}{undeleted} and skipped {}",
         report.entries,
         report.bytes,
         report.files,
         report.elapsed.as_secs_f64(),
+        report.deleted,
         report.skipped()
     )
 }

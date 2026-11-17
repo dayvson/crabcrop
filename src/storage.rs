@@ -429,15 +429,16 @@ struct ScanState {
     /// The directory has been created, probed and opened.
     /// Until then nothing is written.
     checked: bool,
-    /// The targets purged since the store started, each once,
-    /// with what the tombstones of each purge of it wait for.
-    /// The scan deletes the files it read that one covers
-    /// instead of indexing them: they were written before the
-    /// store started, so before the purge.
-    purges: Vec<(PurgeTarget, Vec<Arc<ScanPurge>>)>,
-    /// The file stems of the keys a write was begun for. The
-    /// copy a write lands replaces the file the scan may have
-    /// read, and the copy it serves goes into memory with
+    /// The purges sent since the store started. The scan
+    /// deletes the files it read that one covers instead of
+    /// indexing them: they were written before the store
+    /// started, so before the purge.
+    purges: ScanPurges,
+    /// The file stems of the keys a write was begun for, or
+    /// refused because the directory had not answered or the
+    /// scan was deleting a file at the stem. The copy a write
+    /// lands replaces the file the scan may have read, and the
+    /// copy it was for serves from memory, refused or not, with
     /// groups the scanned file lacks, so the scan indexes no
     /// such file: it deletes it, unless the write's copy is
     /// indexed.
@@ -473,6 +474,83 @@ impl ScanPurge {
         self.applied
             .get()
             .is_none_or(|seqs| seqs.iter().any(|seq| deletions.by_seq.contains_key(seq)))
+    }
+}
+
+/// The purges sent while the boot scan runs (issue #708): one
+/// [`ScanPurge`] per target, which every purge of that target
+/// shares, filed by the name its kind matches on. The scan
+/// judges every file it read against them under the index
+/// lock, so it looks up the few names that could cover a file
+/// instead of trying every target: a slow scan of a large
+/// directory during many purges does not hold the lock for
+/// files times targets.
+#[derive(Debug, Default)]
+struct ScanPurges {
+    /// How many purges were sent, repeats included.
+    sent: usize,
+    /// One per target.
+    holds: Vec<Arc<ScanPurge>>,
+    /// Where each target's hold is in `holds`: a per-URL
+    /// purge's by its base key, a group purge's by its group,
+    /// a source purge's by its source.
+    keys: HashMap<String, usize>,
+    groups: HashMap<String, usize>,
+    sources: HashMap<String, usize>,
+}
+
+impl ScanPurges {
+    /// Record a purge of `target`, and return the hold its
+    /// tombstones wait on.
+    fn add(&mut self, target: &PurgeTarget) -> Arc<ScanPurge> {
+        self.sent += 1;
+        let (filed, name) = match target {
+            PurgeTarget::Key(base) => (&mut self.keys, base),
+            PurgeTarget::Group(group) => (&mut self.groups, group),
+            PurgeTarget::Source(source) => (&mut self.sources, source),
+        };
+        let holds = &mut self.holds;
+        let at = *filed.entry(name.clone()).or_insert_with(|| {
+            holds.push(Arc::new(ScanPurge::default()));
+            holds.len() - 1
+        });
+        self.holds[at].clone()
+    }
+
+    /// Where in `holds` the purges that cover a copy of `key`
+    /// in `groups` are: those whose [`PurgeTarget::covers`]
+    /// is true. A per-URL purge covers the key when its base is
+    /// the key, or the key up to one of its `#`; a group purge
+    /// when its group is one of `groups`; a source purge when
+    /// its source is the key's base (the key up to its first
+    /// `#`), or that base after one of its `/`.
+    fn covering(&self, key: &str, groups: &[String]) -> Vec<usize> {
+        let mut found = Vec::new();
+        if !self.keys.is_empty() {
+            let bases = key.match_indices('#').map(|(at, _)| &key[..at]);
+            found.extend(
+                bases
+                    .chain([key])
+                    .filter_map(|base| self.keys.get(base).copied()),
+            );
+        }
+        if !self.groups.is_empty() {
+            found.extend(
+                groups
+                    .iter()
+                    .filter_map(|group| self.groups.get(group).copied()),
+            );
+        }
+        if !self.sources.is_empty() {
+            let base = key.split('#').next().unwrap_or(key);
+            let tails = base.match_indices('/').map(|(at, _)| &base[at + 1..]);
+            found.extend(
+                tails
+                    .chain([base])
+                    .filter_map(|tail| self.sources.get(tail).copied()),
+            );
+        }
+        found
     }
 }
 
@@ -620,6 +698,13 @@ pub struct ScanReport {
     pub entries: usize,
     /// What those entries are charged against the budget.
     pub bytes: usize,
+    /// The entry files it deleted: ones that do not verify,
+    /// cannot be entries, or no longer fit the budget, and
+    /// stale copies of keys written since the boot.
+    pub deleted: u64,
+    /// The entry files it could not delete. Each also counts
+    /// in the tier's errors.
+    pub undeleted: u64,
 }
 
 impl ScanPhase {
@@ -638,9 +723,15 @@ impl ScanReport {
         self.phase.ended()
     }
 
-    /// The entry files it looked at and did not index.
+    /// The entry files it looked at and neither indexed nor
+    /// tried to delete: files that are not regular, files gone
+    /// before it read them, and files a newer copy or a purge's
+    /// queued deletion took care of.
     pub fn skipped(&self) -> u64 {
-        self.files.saturating_sub(self.entries as u64)
+        self.files
+            .saturating_sub(self.entries as u64)
+            .saturating_sub(self.deleted)
+            .saturating_sub(self.undeleted)
     }
 }
 
@@ -651,6 +742,13 @@ struct BootScan {
     started: std::time::Instant,
     /// The entry files looked at so far.
     files: AtomicU64,
+    /// The entry files deleted so far, and those that could not
+    /// be (see [`DiskStore::scan_unlink`]), with the
+    /// rate-limited logs of each.
+    deleted: AtomicU64,
+    undeleted: AtomicU64,
+    deleted_log: StallLog,
+    undeleted_log: StallLog,
     /// The phase, with what an ended scan indexed and how long
     /// it took.
     state: Mutex<(ScanPhase, usize, usize, Option<std::time::Duration>)>,
@@ -856,8 +954,9 @@ enum ScanRead {
     },
     /// Nothing is there any more: a deletion got there first.
     Gone,
-    /// Something this store cannot trust: deleted on sight.
-    Bad,
+    /// Something this store cannot trust, and why: deleted on
+    /// sight.
+    Bad(&'static str),
 }
 
 /// The temp file a `put` writes before renaming into place.
@@ -944,6 +1043,10 @@ impl DiskStore {
             boot: BootScan {
                 started: std::time::Instant::now(),
                 files: AtomicU64::new(0),
+                deleted: AtomicU64::new(0),
+                undeleted: AtomicU64::new(0),
+                deleted_log: StallLog::new("entry files the boot scan deleted"),
+                undeleted_log: StallLog::new("entry files the boot scan could not delete"),
                 state: Mutex::new((ScanPhase::Checking, 0, 0, None)),
                 changed: Condvar::new(),
                 stop: AtomicBool::new(false),
@@ -1022,6 +1125,8 @@ impl DiskStore {
             files: self.boot.files.load(Ordering::Relaxed),
             entries: *entries,
             bytes: *bytes,
+            deleted: self.boot.deleted.load(Ordering::Relaxed),
+            undeleted: self.boot.undeleted.load(Ordering::Relaxed),
         }
     }
 
@@ -1058,10 +1163,7 @@ impl DiskStore {
     pub fn stop_scan(&self) -> Option<usize> {
         self.boot.stop.store(true, Ordering::Relaxed);
         let inner = self.inner.lock().unwrap();
-        inner
-            .scan
-            .as_ref()
-            .map(|scan| scan.purges.iter().map(|(_, holds)| holds.len()).sum())
+        inner.scan.as_ref().map(|scan| scan.purges.sent)
     }
 
     fn set_phase(&self, phase: ScanPhase) {
@@ -1286,17 +1388,17 @@ impl DiskStore {
             // this build: delete it on sight instead of
             // reading it into memory to find out.
             if self.max_bytes > 0 && meta.len() > self.max_bytes as u64 {
-                self.unlink_unknown(&stem, &path);
+                self.unlink_unknown(&stem, &path, "it is larger than the whole budget");
                 continue;
             }
             match self.read_scanned(&path, cap) {
                 ScanRead::Gone => {}
-                ScanRead::Bad => self.unlink_unknown(&stem, &path),
+                ScanRead::Bad(why) => self.unlink_unknown(&stem, &path, why),
                 // `put` writes each entry under its own key's
                 // stem, so a copy under another name was put
                 // there by someone else.
                 ScanRead::Entry { key, .. } if key_stem(&key) != stem => {
-                    self.unlink_unknown(&stem, &path);
+                    self.unlink_unknown(&stem, &path, "it holds another key's entry");
                 }
                 ScanRead::Entry {
                     key,
@@ -1328,14 +1430,13 @@ impl DiskStore {
                 }
             }
         }
-        if self.boot.stop.load(Ordering::Relaxed) {
-            return self.end_scan(ScanPhase::Stopped);
-        }
         found.sort_by_key(|scanned| scanned.mtime);
-        let (unlink, entries, bytes) = self.index_scanned(found, overcharged);
-        for (key, stem) in unlink {
+        let Some((unlink, entries, bytes)) = self.index_scanned(found, overcharged) else {
+            return self.end_scan(ScanPhase::Stopped);
+        };
+        for (key, stem, why) in unlink {
             let _claim = FileClaim::inline(self, &key);
-            self.unlink(&self.file_for(&stem));
+            self.scan_unlink(&self.file_for(&stem), why);
         }
         let mut state = self.boot.state.lock().unwrap();
         *state = (
@@ -1353,27 +1454,34 @@ impl DiskStore {
     /// used since the store started, unless what was done while
     /// it read says otherwise (see [`judge_scanned`]), and delete
     /// the oldest until the budget holds. Returns the files to
-    /// delete under the claims it took, and how many entries it
-    /// indexed, charged how much.
+    /// delete under the claims it took, each with why, and how
+    /// many entries it indexed, charged how much; `None` when a
+    /// shutdown stopped the scan first. That is checked under
+    /// the lock, so the purges [`DiskStore::stop_scan`] reports
+    /// as never applied are not applied.
+    #[allow(clippy::type_complexity)]
     fn index_scanned(
         &self,
         found: Vec<Scanned>,
         overcharged: Vec<(String, String, Vec<String>)>,
-    ) -> (Vec<(String, String)>, usize, usize) {
+    ) -> Option<(Vec<(String, String, &'static str)>, usize, usize)> {
         let mut unlink = Vec::new();
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
+        if self.boot.stop.load(Ordering::Relaxed) {
+            return None;
+        }
         // From here on writes are not recorded: what they
         // replace is indexed.
         let scan = inner.scan.take().unwrap_or_default();
-        let mut held: Vec<Vec<u64>> = vec![Vec::new(); scan.purges.len()];
+        let mut held: Vec<Vec<u64>> = vec![Vec::new(); scan.purges.holds.len()];
         for (key, stem, groups) in overcharged {
             if !matches!(
                 judge_scanned(inner, &scan, &mut held, &key, &stem, &groups),
                 Judged::Leave
             ) && let Some(stem) = claim_or_queue(inner, &key, &stem, &groups)
             {
-                unlink.push((key, stem));
+                unlink.push((key, stem, "it is charged more than the whole budget"));
             }
         }
         let mut kept = Vec::with_capacity(found.len());
@@ -1392,7 +1500,7 @@ impl DiskStore {
                     if let Some(stem) =
                         claim_or_queue(inner, &scanned.key, &scanned.stem, &scanned.groups)
                     {
-                        unlink.push((scanned.key, stem));
+                        unlink.push((scanned.key, stem, "its key was written since the boot"));
                     }
                 }
                 Judged::Leave => {}
@@ -1415,7 +1523,7 @@ impl DiskStore {
         for scanned in kept.drain(..over) {
             if let Some(stem) = claim_or_queue(inner, &scanned.key, &scanned.stem, &scanned.groups)
             {
-                unlink.push((scanned.key, stem));
+                unlink.push((scanned.key, stem, "it is among the oldest past the budget"));
             }
         }
         let entries = kept.len();
@@ -1439,12 +1547,10 @@ impl DiskStore {
                 },
             );
         }
-        for ((_, holds), seqs) in scan.purges.iter().zip(held) {
-            for hold in holds {
-                let _ = hold.applied.set(seqs.clone());
-            }
+        for (hold, seqs) in scan.purges.holds.iter().zip(held) {
+            let _ = hold.applied.set(seqs);
         }
-        (unlink, entries, total)
+        Some((unlink, entries, total))
     }
 
     /// Read the file at an entry path for the boot scan, with
@@ -1460,20 +1566,20 @@ impl DiskStore {
         let (file, meta) = match open_regular(path) {
             Ok(opened) => opened,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanRead::Gone,
-            Err(_) => return ScanRead::Bad,
+            Err(_) => return ScanRead::Bad("it cannot be opened as a regular file"),
         };
         let data = read_open_capped(file, meta.len(), cap);
         if self.held(OpKind::Read, path).is_err() {
-            return ScanRead::Bad;
+            return ScanRead::Bad("it cannot be read");
         }
         let Some(data) = data else {
-            return ScanRead::Bad;
+            return ScanRead::Bad("it cannot be read whole within the budget");
         };
         let Some(header) = parse_header_bytes(&data, data.len()) else {
-            return ScanRead::Bad;
+            return ScanRead::Bad("it is not an entry this build reads");
         };
         if !verify_entry_mac(&self.entry_key, &data[header.covered_start..], &header.mac) {
-            return ScanRead::Bad;
+            return ScanRead::Bad("it does not verify under this server's secret");
         }
         ScanRead::Entry {
             key: header.key,
@@ -1486,13 +1592,14 @@ impl DiskStore {
 
     /// Delete the file at `path`, an entry path whose key the
     /// boot scan does not know (issue #708): one that does not
-    /// verify, or that cannot be an entry. While it goes, a
-    /// write of a key with its stem writes nothing, so the
-    /// deletion cannot remove a file the write renamed into
-    /// place. A file at the stem of a key a write was begun for
-    /// may be that write's, so it stays: a landed write replaced
-    /// it, and otherwise the next boot deletes it.
-    fn unlink_unknown(&self, stem: &str, path: &Path) {
+    /// verify, or that cannot be an entry, for the reason
+    /// `why`. While it goes, a write of a key with its stem
+    /// writes nothing, so the deletion cannot remove a file the
+    /// write renamed into place. A file at the stem of a key a
+    /// write was begun for may be that write's, so it stays: a
+    /// landed write replaced it, and otherwise the next boot
+    /// deletes it.
+    fn unlink_unknown(&self, stem: &str, path: &Path, why: &str) {
         {
             let mut inner = self.inner.lock().unwrap();
             if let Some(scan) = inner.scan.as_mut() {
@@ -1502,9 +1609,48 @@ impl DiskStore {
                 scan.unlinking.insert(stem.to_string());
             }
         }
-        self.unlink(path);
+        self.scan_unlink(path, why);
         if let Some(scan) = self.inner.lock().unwrap().scan.as_mut() {
             scan.unlinking.remove(stem);
+        }
+    }
+
+    /// Delete the entry file at `path` for the boot scan, for
+    /// the reason `why`, under the claim or the stem the caller
+    /// holds. The scan deleted silently (issue #708): every file
+    /// it deletes now counts in its report, and every one it
+    /// cannot delete counts in the tier's errors as well. It
+    /// stays on disk, out of the index, until the next boot.
+    /// Both are logged, each kind the first at once and then at
+    /// most one line every 10 seconds with a count of the rest.
+    /// A file already gone is neither.
+    fn scan_unlink(&self, path: &Path, why: &str) {
+        let line = match self
+            .held(OpKind::Unlink, path)
+            .and_then(|()| std::fs::remove_file(path))
+        {
+            Ok(()) => {
+                self.boot.deleted.fetch_add(1, Ordering::Relaxed);
+                self.boot.deleted_log.note(
+                    monotonic_ms(),
+                    &format!("the boot scan deleted {}: {why}", path.display()),
+                )
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.boot.undeleted.fetch_add(1, Ordering::Relaxed);
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.boot.undeleted_log.note(
+                    monotonic_ms(),
+                    &format!(
+                        "the boot scan cannot delete {} ({why}), which stays on disk until the next boot: {e}",
+                        path.display()
+                    ),
+                )
+            }
+        };
+        if let Some(line) = line {
+            eprintln!("{line}");
         }
     }
 
@@ -2020,14 +2166,7 @@ impl DiskStore {
                 earlier.push(job.seq);
             }
         }
-        let scan = inner.scan.as_mut().map(|scan| {
-            let hold = Arc::new(ScanPurge::default());
-            match scan.purges.iter_mut().find(|(sent, _)| sent == target) {
-                Some((_, holds)) => holds.push(hold.clone()),
-                None => scan.purges.push((target.clone(), vec![hold.clone()])),
-            }
-            hold
-        });
+        let scan = inner.scan.as_mut().map(|scan| scan.purges.add(target));
         (removed.len(), first..inner.next_seq + 1, earlier, scan)
     }
 
@@ -2525,25 +2664,23 @@ fn claim_or_queue(inner: &mut Inner, key: &str, stem: &str, groups: &[String]) -
     Some(stem.to_string())
 }
 
-/// Why a write of `key` may not go on (issue #708), recording
-/// it for the boot scan when it may: [`WritePlan::Off`] for a
-/// directory that never answered or failed its check, and
-/// [`WritePlan::Busy`] before the directory has answered or
-/// while the scan deletes a file at the key's stem by name.
+/// Why a write of `key` may not go on (issue #708):
+/// [`WritePlan::Off`] for a directory that never answered or
+/// failed its check, and [`WritePlan::Busy`] before the
+/// directory has answered or while the scan deletes a file at
+/// the key's stem by name. While the scan runs, the write is
+/// recorded for it whether it goes on or not: the copy it was
+/// for serves from memory either way, under groups a file the
+/// scan read for the key may lack.
 fn refuse_write(inner: &mut Inner, key: &str) -> Option<WritePlan> {
     if inner.unusable {
         return Some(WritePlan::Off);
     }
     let scan = inner.scan.as_mut()?;
-    if !scan.checked {
-        return Some(WritePlan::Busy);
-    }
     let stem = key_stem(key);
-    if scan.unlinking.contains(&stem) {
-        return Some(WritePlan::Busy);
-    }
+    let busy = !scan.checked || scan.unlinking.contains(&stem);
     scan.written.insert(stem);
-    None
+    busy.then_some(WritePlan::Busy)
 }
 
 /// What the boot scan does with a file it read (issue #708).
@@ -2578,14 +2715,15 @@ fn judge_scanned(
     if inner.entries.contains_key(key) {
         return Judged::Leave;
     }
-    let mut seq = None;
-    for (n, (target, _)) in scan.purges.iter().enumerate() {
-        if target.covers(key, groups) {
-            let seq = *seq.get_or_insert_with(|| queue_held_deletion(inner, key, stem));
-            held[n].push(seq);
+    let covering = scan.purges.covering(key, groups);
+    if !covering.is_empty() {
+        let seq = queue_held_deletion(inner, key, stem);
+        for at in covering {
+            held[at].push(seq);
         }
+        return Judged::Leave;
     }
-    if seq.is_some() || inner.deletions.jobs.contains_key(key) {
+    if inner.deletions.jobs.contains_key(key) {
         return Judged::Leave;
     }
     if scan.written.contains(stem) || inner.claims.contains_key(key) {
@@ -6383,6 +6521,193 @@ mod tests {
         let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
         assert_eq!(store.keys(), vec!["k".to_string()]);
         assert!(!copy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_refused_before_the_directory_answers_keeps_the_scan_from_indexing_the_old_file() {
+        // Issue #708: until the directory answers, a write is
+        // refused, but the copy it was for still serves from
+        // memory, under groups the file a previous run left for
+        // its key may lack. Indexed, that file would be a copy a
+        // purge of those groups does not reach, so the scan
+        // treats the key as written: it deletes the file, and
+        // indexes the others.
+        let dir = temp_dir("scan-check-refused");
+        left_by_a_previous_run(&dir, &["k".to_string(), "other".to_string()], b"old");
+        let (store, gate) = started_under_gate(&dir, 1_000_000, &[OpKind::Write]);
+        let (_, path) = gate.next();
+        assert!(path.ends_with(PROBE_NAME), "{}", path.display());
+        let groups = ["g".to_string()];
+        assert!(matches!(
+            store.begin_write("k", &groups, Bucket::Unknown, true),
+            WritePlan::Busy
+        ));
+        assert!(matches!(
+            store.learn_groups("k", &groups, Bucket::Unknown),
+            Learned::Absent
+        ));
+        gate.release();
+        assert_eq!(scan_ended(&store).phase, ScanPhase::Done);
+        assert_eq!(store.keys(), vec!["other".to_string()]);
+        assert!(!store.file_for(&key_stem("k")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scan_finds_the_purges_that_cover_a_file_as_each_purge_judges_it() {
+        // Issue #708: the scan files the purges sent while it ran
+        // by name and looks up the names that could cover a file,
+        // instead of trying every target on every file under the
+        // index lock. It must find exactly the targets whose own
+        // rule covers the file, for keys with and without `#`
+        // variants, digest-form bases, and sources with and
+        // without a path.
+        let keys = [
+            "300x200/https://example.com/a.png",
+            "300x200/https://example.com/a.png#avif",
+            "300x200/https://example.com/a.png#avif#dpr2",
+            "fit-in/0x0/filters:blur(2)/s3://bucket/dir/a.png#webp#w300",
+            "sha256 0123abcd/https://example.com/a.png#jxl",
+            "100x100/a.png",
+            "a.png",
+            "x/",
+            "/#",
+            "",
+        ];
+        let mut names: Vec<String> = ["g", "h", "/", "#", "a.png#avif", "elsewhere"]
+            .map(String::from)
+            .to_vec();
+        for key in keys {
+            for (at, _) in key.char_indices().chain([(key.len(), ' ')]) {
+                names.push(key[..at].to_string());
+                names.push(key[at..].to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        let mut purges = ScanPurges::default();
+        let mut targets = Vec::new();
+        for name in &names {
+            for target in [
+                PurgeTarget::Key(name.clone()),
+                PurgeTarget::Group(name.clone()),
+                PurgeTarget::Source(name.clone()),
+            ] {
+                let hold = purges.add(&target);
+                let at = purges
+                    .holds
+                    .iter()
+                    .position(|held| Arc::ptr_eq(held, &hold))
+                    .unwrap();
+                // A repeat shares the hold.
+                assert!(Arc::ptr_eq(&purges.add(&target), &hold));
+                targets.push((target, at));
+            }
+        }
+        assert_eq!(purges.holds.len(), targets.len());
+        assert_eq!(purges.sent, 2 * targets.len());
+        let mut checked = 0;
+        for key in keys {
+            for groups in [
+                Vec::new(),
+                vec!["g".to_string()],
+                vec!["g".to_string(), "h".to_string(), key.to_string()],
+            ] {
+                let mut found = purges.covering(key, &groups);
+                found.sort_unstable();
+                found.dedup();
+                let mut expected: Vec<usize> = targets
+                    .iter()
+                    .filter(|(target, _)| target.covers(key, &groups))
+                    .map(|(_, at)| *at)
+                    .collect();
+                expected.sort_unstable();
+                assert_eq!(found, expected, "{key:?} in {groups:?}");
+                checked += expected.len();
+            }
+        }
+        assert!(checked > 100, "{checked}");
+    }
+
+    #[test]
+    fn the_boot_scan_counts_the_files_it_deletes_and_those_it_cannot() {
+        // Issue #708: the scan deleted files that do not verify,
+        // copies under another key's name and the oldest entries
+        // past the budget without a word, and a delete that
+        // failed left the file with nothing said either. Each
+        // file it deletes now counts in its report; each it
+        // cannot delete stays, and counts there and in the tier's
+        // errors; both are logged at a limited rate.
+        let payload = [7u8; 200];
+        let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
+        let file = serialize_entry(&old[0], &image(&payload), &test_entry_key()).len();
+        let one = entry_charge(&old[0], file, &[]);
+        // Three entries, a file that does not verify, and a copy
+        // of the newest under another key's name, in a budget
+        // that holds two entries.
+        let left = |dir: &Path| {
+            left_by_a_previous_run(dir, &old, &payload);
+            std::fs::write(
+                dir.join(format!("{}.bin", key_stem("bad"))),
+                b"CRABDISK6\nnot an entry",
+            )
+            .unwrap();
+            std::fs::copy(
+                dir.join(format!("{}.bin", key_stem(&old[2]))),
+                dir.join(format!("{}.bin", key_stem("copy"))),
+            )
+            .unwrap();
+        };
+        let budget = 2 * one + one / 2;
+        let dir = temp_dir("scan-deletes");
+        left(&dir);
+        let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+        let report = store.scan_report();
+        assert_eq!(report.phase, ScanPhase::Done);
+        assert_eq!(
+            (
+                report.files,
+                report.entries,
+                report.deleted,
+                report.undeleted
+            ),
+            (5, 2, 3, 0)
+        );
+        assert_eq!(report.skipped(), 0);
+        assert_eq!(store.errors(), 0);
+        assert_eq!(lru_order(&store), old[1..].to_vec());
+        for key in [old[0].as_str(), "bad", "copy"] {
+            assert!(!store.file_for(&key_stem(key)).exists(), "{key}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // A disk that refuses the deletes: the files stay, out of
+        // the index, and each refusal is an error.
+        let dir = temp_dir("scan-undeleted");
+        left(&dir);
+        let store = Arc::new(DiskStore::unscanned(&dir, budget, test_entry_key()));
+        store.set_hold(Some(Arc::new(|kind, _| match kind {
+            OpKind::Unlink => Err(std::io::Error::from_raw_os_error(30)),
+            _ => Ok(()),
+        })));
+        store.begin_scan();
+        let report = scan_ended(&store);
+        assert_eq!(report.phase, ScanPhase::Done);
+        assert_eq!(
+            (
+                report.files,
+                report.entries,
+                report.deleted,
+                report.undeleted
+            ),
+            (5, 2, 0, 3)
+        );
+        assert_eq!(report.skipped(), 0);
+        assert_eq!(store.errors(), 3);
+        assert_eq!(lru_order(&store), old[1..].to_vec());
+        for key in [old[0].as_str(), "bad", "copy"] {
+            assert!(store.file_for(&key_stem(key)).exists(), "{key}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
