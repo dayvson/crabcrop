@@ -326,8 +326,8 @@ pub fn check_decode(data: &[u8]) {
         return;
     }
     let _ = engine::validate_source_image(data);
-    let _ = engine::decode_image(data);
-    check_scaled_decode(data);
+    let full = engine::decode_image(data);
+    check_scaled_decode(data, full.is_ok());
 }
 
 /// The scaled JPEG decode at a half, a quarter and an eighth
@@ -335,12 +335,19 @@ pub fn check_decode(data: &[u8]) {
 /// returns is the size the header declares at that scale,
 /// rounded up: the size the render resolves its sizes
 /// against, so a frame of any other size would be resampled
-/// as a picture it is not.
-fn check_scaled_decode(data: &[u8]) {
+/// as a picture it is not. And it returns a frame only for a
+/// file the full-size decode reads too (`full_decodes`), or a
+/// source would render at the sizes that take the scaled
+/// decode and fail at every other (issue #713).
+fn check_scaled_decode(data: &[u8], full_decodes: bool) {
     for denominator in [2u32, 4, 8] {
         let Some(frame) = engine::decode_jpeg_scaled(data, denominator) else {
             continue;
         };
+        assert!(
+            full_decodes,
+            "decoded at 1/{denominator}, refused at full size"
+        );
         let declared = image::ImageReader::new(std::io::Cursor::new(data))
             .with_guessed_format()
             .ok()
