@@ -842,8 +842,10 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// class redaction with a segmentation model and more than
 /// 64 detections in a request, which redacts the detections
 /// past the 64th by their boxes; and a progressive JPEG
-/// source whose first operation is a resize to a third of
-/// its size or less, which decodes at full size again, #713).
+/// source with restart intervals, or with a damaged first
+/// scan the full-size decoder refuses, whose first operation
+/// is a resize to a third of its size or less, which
+/// decodes at full size again, #713).
 const RENDERING_VERSION: u32 = 8;
 
 /// Fingerprint the configuration that shapes rendered

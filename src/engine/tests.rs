@@ -9221,10 +9221,11 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
     // RGBA (issue #604). They must still write the old bytes:
     // those of the old loop over the whole image converted to
     // RGBA, except where nothing lands, which leaves the base
-    // as it was (issue #713). Checked for each kind of pixel, at offsets inside,
-    // across and past each edge, with one image kept across
-    // all the offsets as a request keeps it, with a fresh one
-    // each time, and through `overlay(...,width)`.
+    // as it was (issue #713). Checked for each kind of pixel,
+    // at offsets inside, across and past each edge, with one
+    // image kept across all the offsets as a request keeps
+    // it, with a fresh one each time, and through
+    // `overlay(...,width)`.
     use crate::url::BlendMode;
     let ctx = ProcessContext::default();
     let bases = [
