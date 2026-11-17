@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 mod disk_hang;
+mod disk_scan;
 mod disk_stall;
 mod meta_frame;
 mod request_log;
@@ -12565,6 +12566,63 @@ async fn spawn_app_with_upload_gate(
 
 fn upload_dir(tag: &str) -> crate::test_support::ScratchDir {
     crate::test_support::scratch_dir(&format!("srv-upload-{tag}"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fifo_file_source_answers_502_at_once() {
+    // Issue #708: a file source was opened with a plain open,
+    // which waits for a FIFO's writer, so a request for a FIFO
+    // under the root waited for the fetch timeout and left a
+    // blocking thread stuck in open(2) for good. It answers at
+    // once now, with the 502 a file under the root that cannot
+    // be read gets, a directory's.
+    let dir = crate::test_support::scratch_dir("srv-fifo-source");
+    let root = std::fs::canonicalize(&dir).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(root.join("pipe.png"))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success());
+    std::fs::create_dir(root.join("dir.png")).unwrap();
+    let base = spawn_state(AppState {
+        loader: Loader::with_defaults()
+            .unwrap()
+            .with_sources(crate::loader::SourceConfig {
+                file_root: Some(root.clone()),
+                ..Default::default()
+            }),
+        ..test_state()
+    })
+    .await;
+    for name in ["pipe.png", "dir.png"] {
+        let remainder = format!("30x20/file:///{name}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let fetch = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(3), fetch).await {
+            Ok(resp) => resp.unwrap(),
+            Err(_) => {
+                // Let a reader stuck in open(2) go, so the runtime
+                // can stop, then fail.
+                for _ in 0..2000 {
+                    use rustix::fs::{Mode, OFlags};
+                    drop(rustix::fs::open(
+                        root.join("pipe.png"),
+                        OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                panic!("{name}: the request waited on the file source");
+            }
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{name}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "source_fetch_failed", "{name}");
+    }
 }
 
 #[tokio::test]
