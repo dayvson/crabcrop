@@ -785,8 +785,10 @@ impl ScanReport {
 
     /// The entry files it looked at and neither indexed nor
     /// tried to delete: files that are not regular, files gone
-    /// before it read them, and files a newer copy or a purge's
-    /// queued deletion took care of.
+    /// before it read them, files a newer copy or a queued
+    /// deletion took care of, and files it cannot trust that it
+    /// leaves for the next boot because a write of their key
+    /// may have replaced them meanwhile.
     pub fn skipped(&self) -> u64 {
         self.files
             .saturating_sub(self.entries as u64)
