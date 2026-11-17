@@ -6034,10 +6034,8 @@ mod tests {
             ("/test.txt?x=1", &example, b"", creds.secret_key.as_str()),
             ("/test.txt", &example, b"", "another-secret"),
         ] {
-            let creds = sigv4::Credentials {
-                secret_key: secret.to_string(),
-                ..s3_example_creds()
-            };
+            let mut creds = s3_example_creds();
+            creds.secret_key = secret.to_string();
             let refused = verify_sigv4(&creds, "GET", target, headers, body).err();
             let refused = refused.unwrap_or_else(|| panic!("{target} {secret} verified"));
             assert_eq!(refused.code, "SignatureDoesNotMatch");
@@ -6057,10 +6055,8 @@ mod tests {
         unsigned.push(("x-amz-meta-note".to_string(), "x".to_string()));
         let refused = verify_sigv4(&creds, "GET", "/test.txt", &unsigned, b"").err();
         assert_eq!(refused.unwrap().code, "AccessDenied");
-        let other = sigv4::Credentials {
-            access_key: "AKIDSOMEONEELSE".to_string(),
-            ..s3_example_creds()
-        };
+        let mut other = s3_example_creds();
+        other.access_key = "AKIDSOMEONEELSE".to_string();
         let refused = verify_sigv4(&other, "GET", "/test.txt", &example, b"").err();
         assert_eq!(refused.unwrap().code, "InvalidAccessKeyId");
         let refused = verify_sigv4(&creds, "GET", "/test.txt", &example[..4], b"").err();
@@ -6095,21 +6091,13 @@ mod tests {
             "{body}"
         );
         // A wrong secret, or a key the store does not know.
-        let wrong_secret = store_signing(
-            &fake.endpoint,
-            Some(sigv4::Credentials {
-                secret_key: "not-the-secret".to_string(),
-                ..super::test_support::test_credentials()
-            }),
-        );
+        let mut not_the_secret = super::test_support::test_credentials();
+        not_the_secret.secret_key = "not-the-secret".to_string();
+        let wrong_secret = store_signing(&fake.endpoint, Some(not_the_secret));
         assert!(wrong_secret.get("k").await.is_none());
-        let wrong_key = store_signing(
-            &fake.endpoint,
-            Some(sigv4::Credentials {
-                access_key: "AKIDUNKNOWN".to_string(),
-                ..super::test_support::test_credentials()
-            }),
-        );
+        let mut unknown_key = super::test_support::test_credentials();
+        unknown_key.access_key = "AKIDUNKNOWN".to_string();
+        let wrong_key = store_signing(&fake.endpoint, Some(unknown_key));
         assert!(wrong_key.get("k").await.is_none());
         let refused = fake.refused();
         assert_eq!(refused.len(), 3, "{refused:?}");
@@ -6132,10 +6120,8 @@ mod tests {
         // reads, HEADs, listing pages with continuation tokens
         // (which carry `+`, `/` and `=`), and tombstones.
         let fake = start_fake().await;
-        let temporary = sigv4::Credentials {
-            session_token: Some("session/token+1=".to_string()),
-            ..super::test_support::test_credentials()
-        };
+        let mut temporary = super::test_support::test_credentials();
+        temporary.session_token = Some("session/token+1=".to_string());
         *fake.credentials.lock().unwrap() = Some(temporary.clone());
         let s = store_signing(&fake.endpoint, Some(temporary));
         seed_fillers(&fake, 1500);
@@ -6378,10 +6364,9 @@ mod tests {
         assert!(!s.exists_raw("missing.png").await);
         assert_eq!((s.errors(), s.exists_checks_failed()), (0, 0));
         // The store stops honoring the keys.
-        *fake.credentials.lock().unwrap() = Some(sigv4::Credentials {
-            access_key: "AKIDROTATED".to_string(),
-            ..super::test_support::test_credentials()
-        });
+        let mut rotated = super::test_support::test_credentials();
+        rotated.access_key = "AKIDROTATED".to_string();
+        *fake.credentials.lock().unwrap() = Some(rotated);
         assert!(s.get("k").await.is_none());
         assert!(!s.exists_raw("photo.png").await);
         assert_eq!(s.refused(Refused::Lookup), 1);
@@ -6657,7 +6642,7 @@ mod tests {
                              \"Expiration\":\"{}-{}-{}T{}:{}:{}Z\"}}",
                             creds.access_key,
                             creds.secret_key,
-                            creds.session_token.unwrap_or_default(),
+                            creds.session_token.as_deref().unwrap_or_default(),
                             &at[0..4],
                             &at[4..6],
                             &at[6..8],

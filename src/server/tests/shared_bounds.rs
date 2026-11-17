@@ -99,7 +99,7 @@ async fn group_write_backs_past_the_waiting_cap_are_skipped_and_counted() {
         background: Background::with_group_waits(2, 3),
         ..tier_test_state(None, &fake.endpoint)
     };
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     let snapshot = state.purge_guard.snapshot();
@@ -220,13 +220,12 @@ async fn refused_lookups_count_on_metrics() {
     // by request, beside the tier's errors.
     let fake = crate::s3store::test_support::start_fake().await;
     let mut state = tier_test_state(None, &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
-    *fake.credentials.lock().unwrap() = Some(crate::sigv4::Credentials {
-        access_key: "AKIDROTATED".to_string(),
-        ..crate::s3store::test_support::test_credentials()
-    });
+    let mut rotated = crate::s3store::test_support::test_credentials();
+    rotated.access_key = "AKIDROTATED".to_string();
+    *fake.credentials.lock().unwrap() = Some(rotated);
     assert!(
         lookup_tiers(&state, "40x24/example.com/i.png", &[])
             .await
@@ -264,7 +263,7 @@ async fn failed_upload_existence_checks_count_on_their_own_series() {
     .unwrap();
     let mut state = tier_test_state(None, &fake.endpoint);
     state.upload = Some(Arc::new(upload));
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     let upload = state.upload.clone().unwrap();
@@ -272,10 +271,9 @@ async fn failed_upload_existence_checks_count_on_their_own_series() {
     assert!(!upload.exists("cat.png").await);
     assert_eq!(upload.exists_checks_failed(), Some(0));
     // The bucket stops honoring the keys.
-    *fake.credentials.lock().unwrap() = Some(crate::sigv4::Credentials {
-        access_key: "AKIDROTATED".to_string(),
-        ..crate::s3store::test_support::test_credentials()
-    });
+    let mut rotated = crate::s3store::test_support::test_credentials();
+    rotated.access_key = "AKIDROTATED".to_string();
+    *fake.credentials.lock().unwrap() = Some(rotated);
     assert!(!upload.exists("cat.png").await);
     let metrics = scrape(&base, "metrics-token").await;
     assert!(
