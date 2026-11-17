@@ -50,7 +50,9 @@ through `engine::decode_jpeg_scaled` at a half, a quarter
 and an eighth (issue #653): the libjpeg-turbo decode a
 render runs, in the server process, when its first resize
 shrinks a JPEG source far enough. A frame it returns must
-be the size the header declares at that scale.
+be the size the header declares at that scale, and of a
+file the full-size decode reads too: a source must not
+render at some sizes and fail at the others (issue #713).
 
 `source_meta` checks metadata handling (`check_meta`):
 extracting a source's ICC profile, EXIF stream, XMP
