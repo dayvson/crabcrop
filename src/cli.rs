@@ -310,10 +310,36 @@ fn split_signed(input: &str, base: &str) -> (Option<Signature>, Option<String>, 
         }
         return (None, None, input.to_string());
     }
-    let path = input.strip_prefix('/').unwrap_or(input);
-    match crate::url::parse_signature(path) {
-        Ok((sig, kid, rest)) => (Some(sig), kid, rest.to_string()),
-        Err(_) => (None, None, path.to_string()),
+    // A path: the server reads its first segment as the
+    // signature, whatever it holds.
+    if let Some(path) = input.strip_prefix('/') {
+        return match crate::url::parse_signature(path) {
+            Ok((sig, kid, rest)) => (Some(sig), kid, rest.to_string()),
+            Err(_) => (None, None, path.to_string()),
+        };
+    }
+    // Without the slash, a path and a bare remainder look
+    // alike, and a remainder's first segment can parse as a
+    // keyed signature: `exp:1893456000` reads as the key `exp`
+    // and the tag `1893456000`, and so do `maxage:60`,
+    // `page:2` and `preset:cafe`. So the text is a path only
+    // when it opens with a signature a signer writes, `unsafe`
+    // or a whole tag, which no remainder the server serves
+    // begins with; anything else is the remainder, whole.
+    match crate::url::parse_signature(input) {
+        Ok((sig, kid, rest)) if is_whole_signature(&sig) => (Some(sig), kid, rest.to_string()),
+        _ => (None, None, input.to_string()),
+    }
+}
+
+/// Whether a signature segment is one a signer writes:
+/// `unsafe`, or a whole HMAC-SHA256 tag, 64 lowercase hex
+/// characters (the only spelling `crabcrop_url::verify`
+/// accepts).
+fn is_whole_signature(signature: &Signature) -> bool {
+    match signature {
+        Signature::Unsafe => true,
+        Signature::Hmac(hex) => hex.len() == 64,
     }
 }
 
@@ -2547,6 +2573,69 @@ mod tests {
                 .contains("request has 101 operations, over the 100 operation limit"),
             "{err}"
         );
+    }
+
+    /// A bare remainder stays whole, signature and all, though
+    /// its first segment parses as a keyed signature (`exp:`,
+    /// `maxage:`, `page:`, `frame:`, `preset:`), whatever its
+    /// source: without a leading slash the text is a path only
+    /// when it opens with `unsafe` or a whole tag. `explain`,
+    /// `purge` and `meta` all read their target this way, so a
+    /// misread one would purge, or fetch, another render.
+    #[tokio::test]
+    async fn bare_remainders_keep_their_first_segment() {
+        let base = "http://img.test";
+        for remainder in [
+            "exp:1893456000/300x200/https://example.com/a.jpg",
+            "maxage:60/300x200/https://example.com/a.jpg",
+            "page:2/300x200/https://example.com/doc.pdf",
+            "frame:10/300x200/https://example.com/clip.mp4",
+            "preset:cafe/https://example.com/a.jpg",
+            "exp:1893456000/300x200/root:photos/a.jpg",
+            "300x200/https://cdn.example.com/2024/a.jpg",
+        ] {
+            assert_eq!(
+                split_signed(remainder, base),
+                (None, None, remainder.to_string()),
+                "{remainder}"
+            );
+        }
+        let out = exec(&args(&[
+            "explain",
+            "--base",
+            base,
+            "exp:1893456000/300x200/https://example.com/a.jpg",
+        ]))
+        .await
+        .unwrap();
+        assert!(out.contains("signature: none (bare remainder)"), "{out}");
+        assert!(
+            out.contains("exp:1893456000  link expires at unix time 1893456000"),
+            "{out}"
+        );
+        // Paths and URLs keep their signature segment: a slash-led
+        // path any tag the server's parser takes, a slash-less one
+        // a whole tag or `unsafe`.
+        let rest = "300x200/https://example.com/a.jpg";
+        let tag = crabcrop_url::sign(b"split-secret", rest).unwrap();
+        let hmac = |hex: &str| Some(Signature::Hmac(hex.to_string()));
+        for (input, signature, kid) in [
+            (format!("/{tag}/{rest}"), hmac(&tag), None),
+            (format!("{tag}/{rest}"), hmac(&tag), None),
+            (format!("k2:{tag}/{rest}"), hmac(&tag), Some("k2")),
+            (format!("/k2:{tag}/{rest}"), hmac(&tag), Some("k2")),
+            (format!("{base}/{tag}/{rest}"), hmac(&tag), None),
+            (format!("https://other.test/{tag}/{rest}"), hmac(&tag), None),
+            (format!("unsafe/{rest}"), Some(Signature::Unsafe), None),
+            (format!("/unsafe/{rest}"), Some(Signature::Unsafe), None),
+            (format!("/abc/{rest}"), hmac("abc"), None),
+        ] {
+            assert_eq!(
+                split_signed(&input, base),
+                (signature, kid.map(String::from), rest.to_string()),
+                "{input}"
+            );
+        }
     }
 
     #[test]
