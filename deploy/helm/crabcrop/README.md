@@ -38,7 +38,7 @@ helm install crabcrop deploy/helm/crabcrop \
 - The disk result tier on its own persistent volume (8GiB budget on a 10Gi claim), so renders survive pod restarts.
 - Both credentials wired from the Secret above: the signing secret, and the metrics token through `metricsToken.existingSecret`, so `/metrics` is never answerable without its bearer token.
 - The production environment: a 512 MB memory result tier sized against the memory limit, the slow lane at one permit (long-running renders, such as animated encodes, never starve stills), the 30-second processing limit stated, and private-address sources refused.
-- Health probes are part of the chart itself: liveness and readiness both read `/health`, and every install gets them.
+- Health probes are part of the chart itself: liveness and readiness both read `/health`, and every install gets them. `/health` answers `503` once the request log has stalled, its queue full for 5 seconds because nothing reads the pod's standard output, so the liveness probe restarts a replica that can serve no image (see [The request log](../../../docs/deployment.md#the-request-log)).
 
 Serving traffic takes the usual extra step: enable the Ingress (`ingress.enabled`, with your host and TLS) or front the Service your own way.
 
