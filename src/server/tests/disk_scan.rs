@@ -87,7 +87,7 @@ async fn the_server_answers_while_the_boot_scan_is_stuck_and_a_purge_sent_meanwh
     let state = Arc::new(AppState {
         store: Some(store.clone()),
         presets: preset_test_map(),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         ..test_state()
     });
     let base = serve_state(&state).await;
@@ -184,7 +184,7 @@ async fn a_tombstone_read_while_the_boot_scan_runs_keeps_the_copy_it_covers_from
     let state = Arc::new(AppState {
         store: Some(store.clone()),
         presets: preset_test_map(),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         ..test_state()
     });
     let base = serve_state(&state).await;
