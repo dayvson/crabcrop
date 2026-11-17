@@ -192,8 +192,13 @@ impl AwsCredentials {
     ) -> Result<Self, reqwest::Error> {
         // Never through a proxy: the endpoint is the task's or
         // the pod's own agent, and its answer is credentials.
+        // Never to a redirect's target either: the plain-HTTP
+        // rule (see `container_endpoint`) holds for the URL the
+        // environment names, and a redirect could lead the
+        // fetch anywhere else, over anything.
         let client = reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(FETCH_TIMEOUT)
             .build()?;
@@ -831,6 +836,56 @@ mod tests {
             let err = parse_answer(bad).err().unwrap();
             assert!(!err.contains("hunter2") && !err.contains("X: y"), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        // The host rules hold for the URL the environment
+        // names: a redirect could send the fetch, token and
+        // all, anywhere, and take credentials from there. The
+        // endpoint's redirect is an error, and its target is
+        // never asked.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/creds", elsewhere.local_addr().unwrap());
+        let reached = Arc::new(AtomicBool::new(false));
+        let seen = reached.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = elsewhere.accept().await {
+                seen.store(true, Ordering::SeqCst);
+                let body = r#"{"AccessKeyId":"ASIAELSEWHERE","SecretAccessKey":"s"}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+        });
+        let endpoint = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/credentials", endpoint.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = endpoint.accept().await {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let answer = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+        });
+        let source = AwsCredentials::container(ContainerEndpoint {
+            url,
+            token: Some(ContainerToken::Value("pod-token".to_string())),
+            var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        })
+        .unwrap();
+        let Source::Container(container) = &*source.0 else {
+            unreachable!("a container source")
+        };
+        let err = container.refresh().await.err().unwrap();
+        assert!(err.contains("302"), "{err}");
+        assert!(!reached.load(Ordering::SeqCst));
+        assert_eq!(source.current(), None);
     }
 
     #[test]

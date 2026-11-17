@@ -726,7 +726,31 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     source_buffer_metrics(&state, &mut out);
     source_lookup_metrics(&state, &mut out);
     tier_metrics(&state, &mut out);
+    upload_metrics(&state, &mut out);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+}
+
+/// The upload bucket's failed existence checks for `/metrics`
+/// (issue #709), with a bucket destination: a HEAD the bucket
+/// refused, failed or did not answer reads as no object, so a
+/// bucket that stops answering them shows here, not in an
+/// upload's answer. The upload bucket's store is not the shared
+/// tier, and does not count in its series.
+fn upload_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(failed) = state
+        .upload
+        .as_ref()
+        .and_then(|upload| upload.exists_checks_failed())
+    else {
+        return;
+    };
+    let _ = write!(
+        out,
+        "# HELP crabcrop_upload_exists_checks_failed_total Upload existence checks the upload bucket refused, failed or did not answer; each read as no object.\n\
+         # TYPE crabcrop_upload_exists_checks_failed_total counter\n\
+         crabcrop_upload_exists_checks_failed_total {failed}\n"
+    );
 }
 
 /// Per-lane occupancy for `/metrics` (issue #324): how
@@ -953,8 +977,9 @@ fn tier_metrics(state: &AppState, out: &mut String) {
             background.group_writes_skipped()
         );
         // The requests the bucket refused (issue #709): a
-        // lookup or an existence check answered with an error
-        // other than 404, and a purge read or delete refused.
+        // lookup answered with an error that is neither a 404
+        // nor a store failure, and a purge read or delete
+        // refused.
         out.push_str(
             "# HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.\n\
              # TYPE crabcrop_cache_shared_refused_total counter\n",
@@ -4817,7 +4842,9 @@ async fn lookup_tiers_within(
         let sent = if adds_groups(&image.groups, &wanted) {
             image.groups = crate::cache::union_groups(&image.groups, &wanted);
             // Off the response path, like the write-through
-            // put, but never skipped.
+            // put, and skipped only past the waiting cap
+            // (issue #709), which the disk write below records
+            // as a debt.
             spawn_shared_put(
                 state,
                 snapshot,

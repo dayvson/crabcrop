@@ -1015,13 +1015,32 @@ pub fn build_source_config(
     // ECS and EKS Pod Identity serve, refreshed before each
     // expiry (issue #709). The static keys, when set, are used
     // exactly as before and the endpoint is never asked.
+    // CRABCROP_S3_CONTAINER_CREDENTIALS=off keeps a task's role
+    // out of every request, for a store that allows anonymous
+    // access: ECS sets the endpoint variable for every task with
+    // a role, over any value the task definition gives it.
+    let container_credentials = parse_bool_value(
+        "CRABCROP_S3_CONTAINER_CREDENTIALS",
+        get("CRABCROP_S3_CONTAINER_CREDENTIALS"),
+        true,
+    )?;
     if sources.aws_creds.is_none()
+        && container_credentials
         && let Some(endpoint) =
-            crate::credentials::container_endpoint(&get).map_err(|(var, reason)| match var {
-                // The token is a credential: its value is never
-                // kept, in the error or in its message.
-                "AWS_CONTAINER_AUTHORIZATION_TOKEN" => ConfigError::invalid_redacted(var, reason),
-                _ => ConfigError::invalid(var, &get(var).unwrap_or_default(), reason),
+            crate::credentials::container_endpoint(&get).map_err(|(var, reason)| {
+                // The token is a credential, ECS's relative URI
+                // names the task's credentials, and a full URI
+                // can carry a user and password: a refused one
+                // keeps only the fact that it was set, as a
+                // store endpoint with an `@` does. No message
+                // quotes the value.
+                let value = get(var).unwrap_or_default();
+                match var {
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI" if !value.contains('@') => {
+                        ConfigError::invalid(var, &value, reason)
+                    }
+                    _ => ConfigError::invalid_redacted(var, reason),
+                }
             })?
     {
         let var = endpoint.var;

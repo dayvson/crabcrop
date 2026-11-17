@@ -18073,7 +18073,6 @@ crabcrop_cache_shared_group_writes_skipped_total 0
 # HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.
 # TYPE crabcrop_cache_shared_refused_total counter
 crabcrop_cache_shared_refused_total{{request="lookup"}} 0
-crabcrop_cache_shared_refused_total{{request="exists"}} 0
 crabcrop_cache_shared_refused_total{{request="purge"}} 0
 # HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.
 # TYPE crabcrop_cache_shared_tombstones_unread gauge

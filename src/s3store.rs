@@ -258,13 +258,16 @@ enum Bound {
 pub const LIST_PAGE_KEYS: usize = 1000;
 
 /// The most of a listing page's body a walk reads: a page of
-/// [`LIST_PAGE_KEYS`] names of S3's longest, 1024 bytes, is
-/// about 1.4 MB of XML.
-const LIST_PAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// [`LIST_PAGE_KEYS`] names of S3's longest, 1024 bytes, each
+/// of which the XML may spell in as many as six (`&quot;`),
+/// is about 6.6 MB with the rest of each entry's fields.
+const LIST_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// The most of a refusal's body a lookup reads for its error
-/// code (issue #709). S3's error documents are a few hundred
-/// bytes.
+/// How much of an error answer's body a lookup reads for its
+/// error code (issue #709): S3 puts `<Code>` first, and the
+/// rest of a document can run past this, as a
+/// `SignatureDoesNotMatch` that spells out a canonical request
+/// with a session token does.
 const REFUSAL_BODY_BYTES: usize = 4 * 1024;
 
 /// A body past this many bytes is hashed on the blocking
@@ -275,27 +278,32 @@ const REFUSAL_BODY_BYTES: usize = 4 * 1024;
 /// less than the hand-off.
 const INLINE_HASH_BYTES: usize = 16 * 1024;
 
-/// The kinds of request a refusal counts under (issue #709),
-/// as `crabcrop_cache_shared_refused_total{request}`.
+/// What the requests a rate-limited line leaves out are, after
+/// their count (issue #709).
+const REFUSAL_LOG_REST: &str = "refused or failed requests";
+
+/// The kinds of shared-tier request a refusal counts under
+/// (issue #709), as `crabcrop_cache_shared_refused_total{request}`.
+/// A refusal is an error answer that is not a store failure
+/// (see [`store_failed`]) and not one that says there is
+/// nothing to act on, such as a `404`: the `403` of
+/// credentials the bucket does not honor, say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
     /// A lookup's GET.
     Lookup,
-    /// An existence check's HEAD: the upload endpoint's.
-    Exists,
     /// A purge walk's read of an entry header, or its delete
     /// of a covered copy.
     Purge,
 }
 
 impl Refused {
-    pub const ALL: [Refused; 3] = [Refused::Lookup, Refused::Exists, Refused::Purge];
+    pub const ALL: [Refused; 2] = [Refused::Lookup, Refused::Purge];
 
     /// The `request` label value.
     pub fn label(self) -> &'static str {
         match self {
             Refused::Lookup => "lookup",
-            Refused::Exists => "exists",
             Refused::Purge => "purge",
         }
     }
@@ -391,11 +399,21 @@ pub struct S3Store {
     /// failing silently forever.
     errors: std::sync::atomic::AtomicU64,
     /// Requests the store refused, by [`Refused`] kind (issue
-    /// #709): each one also counts in `errors`.
-    refused: [std::sync::atomic::AtomicU64; 3],
-    /// The rate limit on the lines refusals and unanswered
-    /// existence checks log (issue #709): a store that refuses
-    /// every lookup refuses one per request.
+    /// #709): a lookup's also counts in `errors`, and a purge
+    /// walk's in the one error its pass counts.
+    refused: [std::sync::atomic::AtomicU64; 2],
+    /// Existence checks that failed (issue #709): refused, a
+    /// store failure, or no answer. Each also counts in
+    /// `errors`. Only the upload bucket's store makes them.
+    exists_failed: std::sync::atomic::AtomicU64,
+    /// What the store's log lines start with: `shared storage`
+    /// for the result tier, `upload storage` for the upload
+    /// bucket (see [`S3Store::logging_as`]).
+    tier: &'static str,
+    /// The rate limit on the lines refused, failed and
+    /// unanswered lookups and existence checks log (issue
+    /// #709): a store that refuses every lookup refuses one
+    /// per request.
     refusal_log: StallLog,
 }
 
@@ -415,6 +433,8 @@ impl std::fmt::Debug for S3Store {
             .field("max_entry_bytes", &self.max_entry_bytes)
             .field("errors", &self.errors)
             .field("refused", &self.refused)
+            .field("exists_failed", &self.exists_failed)
+            .field("tier", &self.tier)
             .finish()
     }
 }
@@ -466,8 +486,20 @@ impl S3Store {
             max_entry_bytes: MAX_ENTRY_BYTES,
             errors: std::sync::atomic::AtomicU64::new(0),
             refused: Default::default(),
-            refusal_log: StallLog::for_tier("shared storage", "refused or unanswered requests"),
+            exists_failed: std::sync::atomic::AtomicU64::new(0),
+            tier: "shared storage",
+            refusal_log: StallLog::for_tier("shared storage", REFUSAL_LOG_REST),
         })
+    }
+
+    /// The store with its log lines starting `tier` instead of
+    /// `shared storage`: the upload bucket's store is not the
+    /// shared result tier, and its lines must not read as if it
+    /// were (issue #709).
+    pub fn logging_as(mut self, tier: &'static str) -> Self {
+        self.tier = tier;
+        self.refusal_log = StallLog::for_tier(tier, REFUSAL_LOG_REST);
+        self
     }
 
     /// Tier failures so far (issue #367), surfaced on
@@ -504,7 +536,7 @@ impl S3Store {
     fn note_errors(&self, count: u64, what: &str, detail: &str) {
         self.errors
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("shared storage: {what}: {detail}");
+        eprintln!("{}: {what}: {detail}", self.tier);
     }
 
     /// Requests of `kind` the store has refused so far (issue
@@ -514,15 +546,20 @@ impl S3Store {
         self.refused[kind.index()].load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Existence checks that failed so far (issue #709): the
+    /// upload bucket's store surfaces them on /metrics as
+    /// `crabcrop_upload_exists_checks_failed_total`.
+    pub fn exists_checks_failed(&self) -> u64 {
+        self.exists_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Count and log one refusal of a request of `kind` (issue
     /// #709): `status`, and the error code the store gave, if
-    /// it gave one. A refused lookup or existence check counts
-    /// in the tier's errors too, as one that got no answer
-    /// does; a purge walk's refusals count there once per
-    /// pass, with its other failures (see
-    /// [`S3Store::note_pass`]). Logged like the disk tier's
-    /// stalls: the first at once, then at most one line every
-    /// 10 seconds with a count of the rest.
+    /// it gave one. A refused lookup counts in the tier's
+    /// errors too, as one that got no answer does; a purge
+    /// walk's refusals count there once per pass, with its
+    /// other failures (see [`S3Store::note_pass`]).
     fn note_refused(
         &self,
         kind: Refused,
@@ -535,9 +572,26 @@ impl S3Store {
             self.errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        self.log_answer("refused", what, status, code);
+    }
+
+    /// Count and log one request the store answered with a
+    /// store failure (issue #709): a server error, throttling
+    /// or a timeout (see [`store_failed`]). It counts in the
+    /// tier's errors, not among the refusals.
+    fn note_failed(&self, what: &str, status: reqwest::StatusCode, code: Option<&str>) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.log_answer("failed", what, status, code);
+    }
+
+    /// Log `the store <verb> <what>: <status> (<code>)` like the
+    /// disk tier's stalls: the first at once, then at most one
+    /// line every 10 seconds with a count of the rest.
+    fn log_answer(&self, verb: &str, what: &str, status: reqwest::StatusCode, code: Option<&str>) {
         let line = match code {
-            Some(code) => format!("the store refused {what}: {status} ({code})"),
-            None => format!("the store refused {what}: {status}"),
+            Some(code) => format!("the store {verb} {what}: {status} ({code})"),
+            None => format!("the store {verb} {what}: {status}"),
         };
         if let Some(line) = self.refusal_log.note_now(&line) {
             eprintln!("{line}");
@@ -765,7 +819,11 @@ impl S3Store {
         }
         if !status.is_success() {
             let code = refusal_code(resp, started).await;
-            self.note_refused(Refused::Lookup, "a lookup", status, code.as_deref());
+            if store_failed(status) {
+                self.note_failed("a lookup", status, code.as_deref());
+            } else {
+                self.note_refused(Refused::Lookup, "a lookup", status, code.as_deref());
+            }
             return None;
         }
         let etag = response_etag(&resp);
@@ -1161,22 +1219,33 @@ impl S3Store {
 
     /// Whether an object exists (a HEAD, no body read). A
     /// HEAD that fails reads as no object, as before, but is
-    /// counted and logged at a limited rate (issue #709): a
-    /// refusal as a refused existence check, no answer as a
-    /// tier error.
+    /// counted and logged at a limited rate (issue #709):
+    /// refused, failed or unanswered, it counts among the
+    /// failed existence checks and in the store's errors.
     async fn object_exists(&self, object: &str) -> bool {
-        match self.request("HEAD", object, &[], Vec::new()).await {
-            Some(resp) if resp.status().is_success() => true,
-            Some(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => false,
-            Some(resp) => {
-                self.note_refused(Refused::Exists, "an existence check", resp.status(), None);
-                false
+        let answer = self.request("HEAD", object, &[], Vec::new()).await;
+        if let Some(resp) = &answer {
+            if resp.status().is_success() {
+                return true;
             }
-            None => {
-                self.note_unanswered("an existence check");
-                false
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return false;
             }
         }
+        self.exists_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match answer {
+            Some(resp) if store_failed(resp.status()) => {
+                self.note_failed("an existence check", resp.status(), None);
+            }
+            Some(resp) => {
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.log_answer("refused", "an existence check", resp.status(), None);
+            }
+            None => self.note_unanswered("an existence check"),
+        }
+        false
     }
 
     /// Delete one object; returns whether the store
@@ -2410,19 +2479,44 @@ async fn read_capped_at(
     Ok(data)
 }
 
-/// The error code a refusal's body names (issue #709), S3's
-/// `<Code>` (`AccessDenied`, `ExpiredToken`,
-/// `SignatureDoesNotMatch`): a few hundred bytes are read, and
-/// only a short name of letters and digits is kept, so the
-/// line it goes into says why without carrying what else the
-/// store sent.
+/// The error code an error answer's body names (issue #709),
+/// S3's `<Code>` (`AccessDenied`, `ExpiredToken`,
+/// `SignatureDoesNotMatch`, `SlowDown`): only the first
+/// [`REFUSAL_BODY_BYTES`] are read, where S3 puts it, and only a
+/// short name of letters and digits is kept, so the line it
+/// goes into says why without carrying what else the store
+/// sent.
 async fn refusal_code(resp: reqwest::Response, started: Instant) -> Option<String> {
-    let body = read_capped_at(resp, REFUSAL_BODY_BYTES, started)
-        .await
-        .ok()?;
-    let code = xml_field(std::str::from_utf8(&body).ok()?, "Code")?;
+    let body = read_prefix_at(resp, REFUSAL_BODY_BYTES, started).await?;
+    let text = String::from_utf8_lossy(&body);
+    let code = xml_field(&text, "Code")?;
     (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
         .then_some(code)
+}
+
+/// The first `cap` bytes of a response body, or all of a
+/// shorter one, under the bound of that many bytes from
+/// `started` (issue #550); the rest is never read. `None` when
+/// the body broke off or ran out of time first.
+async fn read_prefix_at(
+    mut resp: reqwest::Response,
+    cap: usize,
+    started: Instant,
+) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::from_std(started + transfer_budget(cap as u64));
+    let mut data = Vec::new();
+    while data.len() < cap {
+        let Some(chunk) = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .ok()?
+            .ok()?
+        else {
+            break;
+        };
+        let room = cap - data.len();
+        data.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    Some(data)
 }
 
 /// The ETag a store reported for an object, verbatim.
@@ -6249,16 +6343,18 @@ mod tests {
         // Issue #709: any lookup answer but a success was a
         // silent miss, and so was any HEAD that failed: a store
         // refusing every request (the 403 of expired keys) looked
-        // like an empty cache. A refusal now counts, by request,
-        // and in the tier's errors; a 404 is still an ordinary
-        // miss.
+        // like an empty cache. A refused lookup now counts as
+        // one, and in the tier's errors; a lookup the store
+        // fails (a 5xx) counts in the errors alone; a failed
+        // existence check counts among those, refused or not;
+        // and a 404 is still an ordinary miss.
         let fake = start_fake().await;
         let s = store(&fake.endpoint);
         s.put("k", &image(b"x", &[])).await;
         assert!(s.put_raw("photo.png", b"x".to_vec()).await);
         assert!(s.get("missing").await.is_none());
         assert!(!s.exists_raw("missing.png").await);
-        assert_eq!(s.errors(), 0);
+        assert_eq!((s.errors(), s.exists_checks_failed()), (0, 0));
         // The store stops honoring the keys.
         *fake.credentials.lock().unwrap() = Some(sigv4::Credentials {
             access_key: "AKIDROTATED".to_string(),
@@ -6267,16 +6363,25 @@ mod tests {
         assert!(s.get("k").await.is_none());
         assert!(!s.exists_raw("photo.png").await);
         assert_eq!(s.refused(Refused::Lookup), 1);
-        assert_eq!(s.refused(Refused::Exists), 1);
         assert_eq!(s.refused(Refused::Purge), 0);
+        assert_eq!(s.exists_checks_failed(), 1);
         assert_eq!(s.errors(), 2);
+        // It honors them again, but fails every read: errors,
+        // not refusals.
+        *fake.credentials.lock().unwrap() = Some(super::test_support::test_credentials());
+        fake.fail.lock().unwrap().get_object = true;
+        assert!(s.get("k").await.is_none());
+        assert!(!s.exists_raw("photo.png").await);
+        assert_eq!(s.refused(Refused::Lookup), 1);
+        assert_eq!(s.exists_checks_failed(), 2);
+        assert_eq!(s.errors(), 4);
     }
 
     #[tokio::test]
     async fn a_refusal_names_the_stores_error_code_and_nothing_else() {
         // Issue #709: the refused lookup's line says why with
-        // the code S3 gives, read from a capped body and kept
-        // only when it is a short name.
+        // the code S3 gives, read from the front of the body
+        // and kept only when it is a short name.
         let refusal = |body: &str| {
             reqwest::Response::from(
                 axum::http::Response::builder()
@@ -6294,12 +6399,23 @@ mod tests {
         )
         .await;
         assert_eq!(code.as_deref(), Some("ExpiredToken"));
+        // S3 puts the code first, and a document can run long
+        // after it: a SignatureDoesNotMatch spells out the
+        // canonical request, session token and all, byte by
+        // byte. Only its front is read.
+        let long = format!(
+            "<Error><Code>SignatureDoesNotMatch</Code>\
+             <CanonicalRequestBytes>{}</CanonicalRequestBytes></Error>",
+            "47 45 54 ".repeat(3000)
+        );
+        let code = refusal_code(refusal(&long), Instant::now()).await;
+        assert_eq!(code.as_deref(), Some("SignatureDoesNotMatch"));
         for body in [
             "",
             "<Error><Code>Bad\ncode</Code></Error>",
             "<Error><Code>with spaces</Code></Error>",
             &format!("<Error><Code>{}</Code></Error>", "A".repeat(65)),
-            &format!("<Error><Code>Late</Code>{}</Error>", " ".repeat(8192)),
+            &format!("{}<Error><Code>Late</Code></Error>", " ".repeat(8192)),
         ] {
             assert_eq!(refusal_code(refusal(body), Instant::now()).await, None);
         }

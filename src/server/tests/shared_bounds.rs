@@ -242,3 +242,53 @@ async fn refused_lookups_count_on_metrics() {
         "{metrics}"
     );
 }
+
+#[tokio::test]
+async fn failed_upload_existence_checks_count_on_their_own_series() {
+    // Issue #709: an upload's existence check, a HEAD to the
+    // upload bucket, read as no object whenever it failed, with
+    // nothing counted. It counts now, on the upload bucket's own
+    // series: that bucket's store is not the shared tier, so its
+    // failures move neither the shared tier's errors nor its
+    // refusals, and it logs as `upload storage`.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let upload = crate::upload::UploadStore::s3(
+        "uploads".to_string(),
+        String::new(),
+        Some(fake.endpoint.clone()),
+        "us-east-1".to_string(),
+        Some(crate::s3store::test_support::test_aws()),
+        1024,
+        false,
+    )
+    .unwrap();
+    let mut state = tier_test_state(None, &fake.endpoint);
+    state.upload = Some(Arc::new(upload));
+    state.metrics_token = Some("metrics-token".to_string());
+    let state = Arc::new(state);
+    let base = serve_state(&state).await;
+    let upload = state.upload.clone().unwrap();
+    // A name that is not there is an answer, not a failure.
+    assert!(!upload.exists("cat.png").await);
+    assert_eq!(upload.exists_checks_failed(), Some(0));
+    // The bucket stops honoring the keys.
+    *fake.credentials.lock().unwrap() = Some(crate::sigv4::Credentials {
+        access_key: "AKIDROTATED".to_string(),
+        ..crate::s3store::test_support::test_credentials()
+    });
+    assert!(!upload.exists("cat.png").await);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_upload_exists_checks_failed_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("crabcrop_cache_tier_errors_total{tier=\"shared\"} 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("crabcrop_cache_shared_refused_total{request=\"lookup\"} 0\n"),
+        "{metrics}"
+    );
+    assert!(!metrics.contains("request=\"exists\""), "{metrics}");
+}

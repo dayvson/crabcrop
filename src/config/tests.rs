@@ -881,6 +881,53 @@ fn container_credentials_apply_only_without_the_static_keys() {
         "{rendered}"
     );
     assert!(!rendered.contains("token-value"), "{rendered}");
+    // A refused endpoint keeps its value only where it can carry
+    // no credential: ECS's relative URI names the task's
+    // credentials, and a full URI can hold a user and password.
+    for (var, value, secret) in [
+        (
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "v2/credentials/task-guid-1234",
+            "task-guid-1234",
+        ),
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "https://user:hunter2@credentials.example/creds",
+            "hunter2",
+        ),
+    ] {
+        let err = build_source_config(env_of(&[(var, value)])).err().unwrap();
+        let rendered = format!("{err} {err:?}");
+        assert!(rendered.contains(var), "{rendered}");
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    // CRABCROP_S3_CONTAINER_CREDENTIALS=off keeps a role out of
+    // every request, for a store that allows anonymous access:
+    // ECS sets the endpoint variable for every task with a role,
+    // over any value the task definition gives it. A value that
+    // is not a switch stops the boot.
+    let off = build_source_config(env_of(&[
+        ecs[0],
+        ("CRABCROP_S3_CONTAINER_CREDENTIALS", "off"),
+    ]))
+    .unwrap();
+    assert!(off.aws_creds.is_none());
+    let err = build_source_config(env_of(&[
+        ecs[0],
+        ("CRABCROP_S3_CONTAINER_CREDENTIALS", "of"),
+    ]))
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Invalid {
+                var: "CRABCROP_S3_CONTAINER_CREDENTIALS",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

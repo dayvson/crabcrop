@@ -115,6 +115,12 @@ task definition's environment (sourced from Secrets
 Manager, like the signing secret): the server reads them
 once at startup and then never asks the agent, so
 temporary keys given that way expire until a restart.
+The role signs every AWS request the server makes, bucket
+sources included. For a task with a role that should not,
+such as one whose `CRABCROP_S3_ENDPOINT` store allows
+anonymous access, set `CRABCROP_S3_CONTAINER_CREDENTIALS`
+to `off`: ECS sets the agent's variable for every task
+with a role, over any value the task definition gives it.
 
 Disk tier per task: add
 `CRABCROP_RESULT_STORAGE_DIR=/var/cache/crabcrop` plus
