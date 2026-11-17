@@ -4365,24 +4365,31 @@ mod tests {
         for host in ["internal.test", "mixed.test", "10.0.0.8", "public.test"] {
             let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
             assert!(
-                matches!(exempt.check_policy(&url).await, Ok(None)),
+                matches!(exempt.check_policy(&url, host).await, Ok(None)),
                 "{host}"
             );
         }
         for host in ["internal.test", "mixed.test"] {
             let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
-            let err = checked.check_policy(&url).await.unwrap_err();
+            let err = checked.check_policy(&url, host).await.unwrap_err();
             assert!(matches!(err, LoadError::Network(_)), "{host}: {err:?}");
         }
         let url = Url::parse("http://10.0.0.8/x.png").unwrap();
-        let err = checked.check_policy(&url).await.unwrap_err();
+        let err = checked.check_policy(&url, "10.0.0.8").await.unwrap_err();
         assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
         let url = Url::parse("http://public.test/x.png").unwrap();
-        let pinned = checked.check_policy(&url).await.unwrap().unwrap();
+        let pinned = checked
+            .check_policy(&url, "public.test")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(pinned.addr, "93.184.216.34:80".parse().unwrap());
         // The allowlist still decides what may be fetched.
         let url = Url::parse("http://elsewhere.test/x.png").unwrap();
-        let err = checked.check_policy(&url).await.unwrap_err();
+        let err = checked
+            .check_policy(&url, "elsewhere.test")
+            .await
+            .unwrap_err();
         assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
     }
 
