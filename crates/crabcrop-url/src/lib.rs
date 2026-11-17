@@ -667,6 +667,7 @@ impl<'a> SealedUrl<'a> {
     /// A sealed URL for `operations` (verbatim, as for
     /// [`build_url`]) on `source`, served from `base`, with no
     /// expiry, no friendly name, and no key ID.
+    #[must_use]
     pub fn new(base: &'a str, operations: &'a str, source: &'a str) -> Self {
         SealedUrl {
             base,
@@ -680,6 +681,7 @@ impl<'a> SealedUrl<'a> {
 
     /// Expire the URL at this unix second: an `exp:` segment
     /// leads the sealed remainder.
+    #[must_use = "a setter returns the changed URL and leaves this one as it was"]
     pub fn expires(self, unix_seconds: u64) -> Self {
         SealedUrl {
             expires: Some(unix_seconds),
@@ -691,6 +693,7 @@ impl<'a> SealedUrl<'a> {
     /// never parses, validates, or authenticates it, and it is
     /// excluded from the token and the cache key. Without one,
     /// or with an empty one, the URL ends at the token.
+    #[must_use = "a setter returns the changed URL and leaves this one as it was"]
     pub fn name(self, name: &'a str) -> Self {
         SealedUrl {
             name: Some(name),
@@ -701,6 +704,7 @@ impl<'a> SealedUrl<'a> {
     /// Stamp the token segment with a key ID, as
     /// [`seal_with_key_id`] does: the server opens it under the
     /// named key only.
+    #[must_use = "a setter returns the changed URL and leaves this one as it was"]
     pub fn key_id(self, key_id: &'a str) -> Self {
         SealedUrl {
             key_id: Some(key_id),
