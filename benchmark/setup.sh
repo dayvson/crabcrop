@@ -2,13 +2,21 @@
 # End to end setup for the benchmark harness. Run from anywhere:
 #
 #   bash benchmark/setup.sh
+#   bash benchmark/setup.sh --check   # settle the crabcrop pin only
 #
 # It prepares benchmark/.work/ with the three servers at the pinned
 # versions below, then prints how to run the benchmark. Nothing is
 # installed system wide except the apt packages in step 1, and the
-# Go toolchain goes under ~/.local (no sudo for that step).
+# Go toolchain goes under ~/.local (no sudo for that step). With
+# --check it says which crabcrop commit it would build, or why it
+# refuses to, and installs nothing.
 #
-# Pinned versions (the single place to change them):
+# Pinned versions (the single place to change them). The crabcrop
+# version and tag are release version sites: scripts/bump_version.py
+# moves them, and empties CRABCROP_COMMIT, which a bump cannot know
+# because the tag comes after the release commit (issue #711). The
+# refresh that publishes new results pins the commit again; until
+# then the tag alone names it.
 GO_VERSION=1.27.4
 GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
 LIBVIPS_APT_VERSION=8.15.1
@@ -38,6 +46,78 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 WORK="$HERE/.work"
+CRABCROP_TREE="$WORK/crabcrop-${CRABCROP_TAG}"
+
+case "${1:-}" in
+  "" | --check) ;;
+  *)
+    echo "usage: bash benchmark/setup.sh [--check]" >&2
+    exit 2
+    ;;
+esac
+
+refuse() {
+  echo "setup.sh: $*" >&2
+  exit 1
+}
+
+# The crabcrop release to build, settled before anything is
+# installed (issue #711). A bump used to leave the previous
+# release's commit in CRABCROP_COMMIT, and step 5 fell back to it
+# when the new tag was missing, so it built the previous release
+# under the new tag's name. Now the tag decides: its commit is the
+# one built, and a pinned commit must equal it. Without the tag in
+# this clone, only a pinned commit whose Cargo.toml carries
+# CRABCROP_VERSION is built.
+# awk reads to the end, so git never writes into a closed pipe, and
+# a commit with no readable Cargo.toml prints nothing: the caller
+# then refuses with its own message instead of stopping on set -e.
+crabcrop_version_at() {
+  { git -C "$REPO" show "$1:Cargo.toml" 2>/dev/null || true; } \
+    | awk '/^\[/ { in_package = ($0 == "[package]") }
+           in_package && !found && /^version *= *"/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; found = 1 }'
+}
+
+case "$CRABCROP_COMMIT" in
+  "") ;;
+  *[!0-9a-f]*) refuse "CRABCROP_COMMIT '$CRABCROP_COMMIT' is not a full commit SHA" ;;
+  *) [ "${#CRABCROP_COMMIT}" -eq 40 ] || refuse "CRABCROP_COMMIT '$CRABCROP_COMMIT' is not a full commit SHA" ;;
+esac
+tagged="$(git -C "$REPO" rev-parse -q --verify "refs/tags/${CRABCROP_TAG}^{commit}" 2>/dev/null || true)"
+if [ -n "$tagged" ]; then
+  if [ -n "$CRABCROP_COMMIT" ] && [ "$CRABCROP_COMMIT" != "$tagged" ]; then
+    refuse "${CRABCROP_TAG} is commit $tagged, but CRABCROP_COMMIT pins $CRABCROP_COMMIT;" \
+      "pin the tag's commit, or fetch the tag again if it moved (git fetch --force origin tag ${CRABCROP_TAG})"
+  fi
+  crabcrop_commit="$tagged"
+  how="the ${CRABCROP_TAG} tag"
+elif [ -n "$CRABCROP_COMMIT" ]; then
+  git -C "$REPO" cat-file -e "${CRABCROP_COMMIT}^{commit}" 2>/dev/null \
+    || refuse "this clone has neither the ${CRABCROP_TAG} tag nor the pinned commit $CRABCROP_COMMIT; fetch them (git fetch --tags origin)"
+  crabcrop_commit="$CRABCROP_COMMIT"
+  how="CRABCROP_COMMIT (this clone has no ${CRABCROP_TAG} tag)"
+else
+  refuse "this clone has no ${CRABCROP_TAG} tag, and CRABCROP_COMMIT is empty, as a version bump leaves it;" \
+    "fetch the tags (git fetch --tags origin), or wait until ${CRABCROP_TAG} is tagged"
+fi
+found_version="$(crabcrop_version_at "$crabcrop_commit")"
+if [ "$found_version" != "$CRABCROP_VERSION" ]; then
+  refuse "commit $crabcrop_commit is crabcrop ${found_version:-of no readable version}, not ${CRABCROP_VERSION};" \
+    "pin the commit ${CRABCROP_TAG} names"
+fi
+# A worktree left by an earlier run is reused only at that commit.
+if [ -e "$CRABCROP_TREE" ]; then
+  at="$(git -C "$CRABCROP_TREE" rev-parse -q --verify HEAD 2>/dev/null || true)"
+  if [ "$at" != "$crabcrop_commit" ]; then
+    refuse "$CRABCROP_TREE holds ${at:-no checkout}, not $crabcrop_commit;" \
+      "remove it (git worktree remove --force '$CRABCROP_TREE') and run setup.sh again"
+  fi
+fi
+echo "crabcrop ${CRABCROP_VERSION}: commit $crabcrop_commit, from $how"
+if [ "${1:-}" = "--check" ]; then
+  exit 0
+fi
+
 mkdir -p "$WORK"
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -90,16 +170,18 @@ if [ ! -x "$WORK/thumbor-venv/bin/thumbor" ]; then
 fi
 "$WORK/thumbor-venv/bin/thumbor" --version
 
-echo "== 5/5 crabcrop ${CRABCROP_VERSION} (release build from the tag) =="
-if [ ! -x "$WORK/crabcrop-${CRABCROP_TAG}/target/release/crabcrop" ]; then
-  # A worktree of this clone checked out at the release tag, so the
-  # benchmark measures the named release, not the current branch.
-  git -C "$REPO" worktree add --detach "$WORK/crabcrop-${CRABCROP_TAG}" "$CRABCROP_TAG" 2>/dev/null \
-    || git -C "$REPO" worktree add --detach "$WORK/crabcrop-${CRABCROP_TAG}" "$CRABCROP_COMMIT"
-  (cd "$WORK/crabcrop-${CRABCROP_TAG}" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}" \
+echo "== 5/5 crabcrop ${CRABCROP_VERSION} (release build of commit ${crabcrop_commit}) =="
+# A worktree of this clone checked out at the release's commit, as
+# settled above, so the benchmark measures the named release, not
+# the current branch.
+if [ ! -e "$CRABCROP_TREE" ]; then
+  git -C "$REPO" worktree add --detach "$CRABCROP_TREE" "$crabcrop_commit"
+fi
+if [ ! -x "$CRABCROP_TREE/target/release/crabcrop" ]; then
+  (cd "$CRABCROP_TREE" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}" \
     cargo build --release --locked)
 fi
-ls -lh "$WORK/crabcrop-${CRABCROP_TAG}/target/release/crabcrop"
+ls -lh "$CRABCROP_TREE/target/release/crabcrop"
 
 echo
 echo "Setup complete. Run the benchmark with:"
