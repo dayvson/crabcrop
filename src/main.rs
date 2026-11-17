@@ -817,7 +817,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// encoded once at the first pick instead of at the quality
 /// the search ended on).
 ///
-/// 8: the first release after 0.13.0, which changes output
+/// 8: the first release after 0.13.1, which changes output
 /// for existing URLs (an aspect crop of a source that is not
 /// 8-bit RGBA, which keeps the source's layout and depth
 /// where it was cut to 8-bit RGBA: an opaque source's crop
