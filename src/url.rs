@@ -1620,6 +1620,9 @@ fn parse_focal_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
 /// factor no larger than [`MAX_FOCAL_ZOOM`]. The zoom is
 /// optional on input and always spelled in the canonical
 /// form, the way bare `trim` canonicalizes to `trim(10)`.
+/// Each number is a decimal rounded to the nearest `f32`,
+/// as the filter arguments are, and a negative zero is
+/// zero (issue #712).
 fn parse_focal_point(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFocalPoint(seg.to_string());
     let (point, zoom_text) = match rest.split_once(':') {
@@ -1627,8 +1630,8 @@ fn parse_focal_point(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         None => (rest, None),
     };
     let (x_text, y_text) = point.split_once('x').ok_or_else(invalid)?;
-    let x: f32 = x_text.parse().map_err(|_| invalid())?;
-    let y: f32 = y_text.parse().map_err(|_| invalid())?;
+    let x = positive_zero(x_text.parse().map_err(|_| invalid())?);
+    let y = positive_zero(y_text.parse().map_err(|_| invalid())?);
     if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
         return Err(invalid());
     }
@@ -1701,7 +1704,7 @@ fn parse_crop_align(s: &str) -> Option<Align> {
     };
     let mut classes: Vec<String> = Vec::new();
     for raw in list.split(',') {
-        let name = parse_class_name(&percent_decode(raw)?)?;
+        let name = parse_class_name(&decode_arg(raw)?)?;
         if classes.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
             continue;
         }
@@ -1920,6 +1923,15 @@ fn parse_class_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// A parsed float with its negative zero made zero (issue
+/// #712). Rust's `Display` spells `-0.0` as `-0`, so without
+/// this `saturation(-0)` (or `saturation(-1e-50)`, which
+/// rounds to it) kept a canonical spelling, and a cache key,
+/// apart from `saturation(0)`, though the two render alike.
+fn positive_zero(value: f32) -> f32 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
 /// Parse a `rotate` angle (issue #144): an optional minus,
 /// digits, and an optional fraction, with no exponent and no
 /// leading dot, so every implementation of the grammar reads
@@ -2068,6 +2080,18 @@ pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseErro
 /// lifetime).
 pub type ParsedRemainder<'a> = (Vec<Operation>, &'a str, Option<u64>, Option<u32>);
 
+/// The unix seconds after `exp:`, in image remainders and
+/// upload remainders alike: one or more ASCII digits, leading
+/// zeros allowed, no sign, within a `u64`. `seg` is the whole
+/// segment, which the error carries.
+fn parse_expiry(ts: &str, seg: &str) -> Result<u64, ParseError> {
+    let invalid = || ParseError::InvalidExpiry(seg.to_string());
+    if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    ts.parse::<u64>().map_err(|_| invalid())
+}
+
 /// Parse the operation segments off the front of the remainder,
 /// also extracting the request's metadata segments: an
 /// `exp:<unix-seconds>` expiry and a `maxage:<seconds>` cache
@@ -2086,13 +2110,7 @@ pub fn parse_operations_with_expiry(input: &str) -> Result<ParsedRemainder<'_>, 
             None => (rest, ""),
         };
         if let Some(ts) = seg.strip_prefix("exp:") {
-            if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(ParseError::InvalidExpiry(seg.to_string()));
-            }
-            expiry = Some(
-                ts.parse::<u64>()
-                    .map_err(|_| ParseError::InvalidExpiry(seg.to_string()))?,
-            );
+            expiry = Some(parse_expiry(ts, seg)?);
             rest = remaining;
             continue;
         }
@@ -2638,7 +2656,7 @@ pub fn expand_source_root_in_remainder(
 fn normalize_root_path(path: &str) -> Option<String> {
     let mut out: Vec<&str> = Vec::new();
     for seg in path.split('/') {
-        let decoded = percent_decode(seg)?;
+        let decoded = decode_path_segment(seg)?;
         if decoded.contains('/') || decoded.contains('\\') {
             return None;
         }
@@ -2657,9 +2675,12 @@ fn normalize_root_path(path: &str) -> Option<String> {
 }
 
 /// The `text(...)` color field: `rrggbb` (opaque) or
-/// `rrggbbaa`, as RGBA bytes.
+/// `rrggbbaa`, as RGBA bytes, every character an ASCII hex
+/// digit. Rust's integer parser also reads a leading `+`,
+/// which made `+fffff` a color (issue #712); the digit test
+/// refuses it.
 fn parse_text_color(s: &str) -> Option<[u8; 4]> {
-    if !matches!(s.len(), 6 | 8) {
+    if !matches!(s.len(), 6 | 8) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let v = u32::from_str_radix(s, 16).ok()?;
@@ -2890,16 +2911,45 @@ impl RequestDirectives {
     }
 }
 
-/// Decode `%XX` escapes; other characters pass through. A
-/// malformed escape or non-UTF-8 result is an error.
-fn percent_decode(s: &str) -> Option<String> {
+/// Decode the `%XX` escapes of a filter argument (a class
+/// name, a watermark or overlay URL, a text label), the
+/// inverse of [`encode_arg`]; other characters pass through.
+/// An escape is `%` and two ASCII hex digits in either case,
+/// as RFC 3986 spells it, so `%+1` is malformed (issue #712):
+/// Rust's integer parser reads `+1` as hex, and the escape
+/// used to decode to U+0001. A malformed escape or a result
+/// that is not UTF-8 is an error.
+fn decode_arg(s: &str) -> Option<String> {
+    decode_escapes(s, |pair| {
+        let digit = |b: u8| char::from(b).to_digit(16);
+        Some((digit(pair[0])? * 16 + digit(pair[1])?) as u8)
+    })
+}
+
+/// Decode the `%XX` escapes of a `root:` source path segment
+/// for the climb check in [`normalize_root_path`]. A root
+/// path is source text that the expansion keeps as written,
+/// not an argument of the grammar, so it keeps the reading it
+/// has always had: the two characters after `%` are read by
+/// Rust's integer parser, which also takes `+` and one digit.
+/// [`decode_arg`] refuses that spelling in arguments; here a
+/// path that resolves today keeps resolving (issue #712).
+fn decode_path_segment(s: &str) -> Option<String> {
+    decode_escapes(s, |pair| {
+        u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()
+    })
+}
+
+/// The decoding loop of [`decode_arg`] and
+/// [`decode_path_segment`]: `byte` reads the two bytes after
+/// each `%`, and the result must be UTF-8.
+fn decode_escapes(s: &str, byte: impl Fn(&[u8]) -> Option<u8>) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hex = s.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
+            out.push(byte(bytes.get(i + 1..i + 3)?)?);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -2917,7 +2967,7 @@ fn hex3(c: [u8; 3]) -> String {
 /// or overlay URL, a class name, a text label) for the
 /// canonical form: everything outside the unreserved set
 /// is encoded, so the encoding is deterministic and
-/// `percent_decode` restores the exact string.
+/// [`decode_arg`] restores the exact string.
 fn encode_arg(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for &b in text.as_bytes() {
@@ -3186,10 +3236,23 @@ pub fn purge_key(secret: &[u8]) -> Vec<u8> {
 /// an entry planted in the disk cache or the shared
 /// bucket by anyone without the secret fails verification
 /// and reads as a miss. The key is server-internal: it
-/// signs stored entries, never URLs.
+/// signs stored entries, never URLs, so the server derives
+/// it itself rather than through the client crate (issue
+/// #712). It is the HMAC of [`ENTRY_KEY_LABEL`] under the
+/// secret, the crate's derivation for every subkey; the
+/// label begins with [`crabcrop_url::RESERVED_SEGMENT`], so
+/// no signer ever computes it as a signature. Changing it
+/// would turn every stored entry into a miss.
 pub fn entry_key(secret: &[u8]) -> Vec<u8> {
-    crabcrop_url::entry_key(secret)
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(ENTRY_KEY_LABEL.as_bytes());
+    mac.finalize().into_bytes().to_vec()
 }
+
+/// The label [`entry_key`] is derived from.
+pub const ENTRY_KEY_LABEL: &str = "crabcrop/entry-key";
 
 /// The purge signature for a target path: HMAC-SHA256 of
 /// the path alone, under the derived purge key. Delegates
@@ -3282,10 +3345,12 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
 /// unambiguous here because an upload name can never
 /// contain a `:` (see `crate::upload::validate_upload_name`).
 /// A leading segment that starts with `exp:` but does not
-/// parse is a grammar error, not a name. The signature
-/// covers the remainder exactly as presented, expiry
-/// included, so verification runs on the unsplit string
-/// before this is called.
+/// parse is a grammar error, not a name, and it parses as
+/// the image grammar parses it: ASCII digits only, so
+/// `exp:+9999999999` is refused here too (issue #712). The
+/// signature covers the remainder exactly as presented,
+/// expiry included, so verification runs on the unsplit
+/// string before this is called.
 pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
     let Some((first, name)) = rest.split_once('/') else {
         // No slash: the remainder is one segment. It is a
@@ -3299,10 +3364,7 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
     let Some(ts) = first.strip_prefix("exp:") else {
         return Ok((None, rest));
     };
-    let exp: u64 = ts
-        .parse()
-        .map_err(|_| ParseError::InvalidExpiry(first.to_string()))?;
-    Ok((Some(exp), name))
+    Ok((Some(parse_expiry(ts, first)?), name))
 }
 
 /// Verify an upload signature. Like purges, uploads are

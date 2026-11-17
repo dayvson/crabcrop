@@ -53,7 +53,8 @@ HEADER = (
 
 # What a second copy of the grammar looks like: the explainer's own
 # function names, messages only it prints, and the class-name charset
-# (in either property-name spelling).
+# (in any property-name spelling: the Alphabetic property since issue
+# #712, the letter category before it).
 GRAMMAR_FUNCTIONS = (
     "validateFilter",
     "explainFilters",
@@ -70,7 +71,7 @@ MARKERS = [
     re.compile(r"no signature segment: the path is a single segment"),
     re.compile(r"expiry overflows the server's u64 parser"),
     re.compile(r"unsupported debug view"),
-    re.compile(r"\\p\{(?:L|Letter)\}\\p\{(?:N|Number)\}"),
+    re.compile(r"\\p\{(?:L|Letter|Alpha|Alphabetic)\}\\p\{(?:N|Number)\}"),
 ]
 SOURCE_SUFFIXES = {
     ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx",

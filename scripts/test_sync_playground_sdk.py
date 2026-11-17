@@ -100,6 +100,7 @@ class SyncTest(unittest.TestCase):
         self.tree.write("playground/lib.mjs", COPY)
         self.tree.write("frameworks/nuxt/crabcrop.ts", "const isSizeShaped = (seg: string) => false;\n")
         self.tree.write("frameworks/astro/x.astro", "<script>const re = /^[\\p{L}\\p{N} _.\\-/]+$/u;</script>\n")
+        self.tree.write("frameworks/astro/y.astro", "<script>const re = /^[\\p{Alphabetic}\\p{N} _.\\-/]+$/u;</script>\n")
         self.tree.write("sdks/mcp/src/index.ts", "const table = {\n  explainSegment(seg) {\n  },\n};\n")
         self.tree.write("sdks/typescript/src/operations.ts", 'throw new Error("the server rejects this filter");\n')
         # A renamed copy still prints the explainer's messages, or
@@ -112,6 +113,7 @@ class SyncTest(unittest.TestCase):
         ))
         self.assertEqual(sps.grammar_copies(self.root), [
             "frameworks/astro/x.astro:1: <script>const re = /^[\\p{L}\\p{N} _.\\-/]+$/u;</script>",
+            "frameworks/astro/y.astro:1: <script>const re = /^[\\p{Alphabetic}\\p{N} _.\\-/]+$/u;</script>",
             "frameworks/nuxt/crabcrop.ts:1: const isSizeShaped = (seg: string) => false;",
             "frameworks/sveltekit/grammar.js:1: const charset = /^[\\p{Letter}\\p{Number} _.\\-/]+$/u;",
             'frameworks/sveltekit/grammar.js:2: const none = ["no signature segment: the path is a single segment"];',

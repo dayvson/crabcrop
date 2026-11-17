@@ -13,29 +13,11 @@ import {
   timingSafeEqual,
 } from "#crypto";
 import { fromBase64Url, toBase64Url, toHex, utf8, utf8Strict } from "./bytes.ts";
-import { MAX_DIMENSION } from "./limits.ts";
+import { isReservedRemainder, MAX_DIMENSION, RESERVED_SEGMENT } from "./limits.ts";
 
-/**
- * The first remainder segment reserved for key derivation.
- * Every derived subkey (purge, purge-group, upload, seal, and
- * the server's cache entry key) is the HMAC of a label such as
- * `crabcrop/purge-key` under the secret, which is the image
- * signature of that label. No image URL may begin with this
- * segment (the server refuses one with `400 reserved_segment`),
- * and {@link sign} and every builder refuse a remainder that
- * does, so no image signature is ever a subkey.
- */
-export const RESERVED_SEGMENT = "crabcrop";
-
-/**
- * Whether `remainder` begins with {@link RESERVED_SEGMENT}: it
- * is that segment alone or starts with `crabcrop/`. The test is
- * on the text as written, as the HMAC is: `exp:1/crabcrop/x`
- * and `CRABCROP/x` are not reserved.
- */
-export function isReservedRemainder(remainder: string): boolean {
-  return remainder === RESERVED_SEGMENT || remainder.startsWith(`${RESERVED_SEGMENT}/`);
-}
+// Declared beside MAX_DIMENSION, where the explainer reads them
+// too (issue #712).
+export { isReservedRemainder, RESERVED_SEGMENT } from "./limits.ts";
 
 function assertNotReserved(remainder: string): void {
   if (isReservedRemainder(remainder)) {
