@@ -3,7 +3,7 @@
 A reproducible comparison of three self-hosted image servers on the
 same host, the same origin, and the same operations:
 
-- crabcrop 0.13.0 (release build from the `v0.13.0` tag)
+- crabcrop 0.13.1 (release build from the `v0.13.1` tag)
 - Thumbor 7.8.0 (pip, venv)
 - imgproxy 4.0.24 (official source build, see the version notes)
 
@@ -30,7 +30,7 @@ and prepares `benchmark/.work/` with the three servers. It installs
 system packages with apt (libvips and build tools), installs a Go
 toolchain under `~/.local`, builds imgproxy from its release tag,
 creates the Thumbor venv, and builds crabcrop in release mode from
-the `v0.13.0` tag in a detached worktree.
+the `v0.13.1` tag in a detached worktree.
 
 The crabcrop pin is settled before anything is installed, and
 `bash benchmark/setup.sh --check` settles it alone. The commit
@@ -191,7 +191,7 @@ tier that the budget configures. Results are written up in
 
 ## Version notes
 
-- crabcrop 0.13.0, tag `v0.13.0`, commit
+- crabcrop 0.13.1, tag `v0.13.1`, commit
   `CRABCROP_COMMIT` in setup.sh, which must be the commit the tag
   names. Built with `cargo build --release --locked` from that
   commit. Each write-up in `results/` records the commit it

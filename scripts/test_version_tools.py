@@ -465,7 +465,10 @@ class VersionToolsTest(unittest.TestCase):
         # cannot know the commit the new tag will name, so it empties
         # the pin, and setup.sh, which used to build the previous
         # release's commit under the new tag's name, refuses to run
-        # until that tag exists (issue #711).
+        # until that tag exists (issue #711). Start from a pinned tree,
+        # as the refresh after a tag leaves it: the tree itself is empty
+        # between a bump and its tag.
+        self.set_benchmark_commit("0123456789abcdef0123456789abcdef01234567")
         self.assertRegex(self.benchmark_commit(), r"^[0-9a-f]{40}$")
         new = bumped(self.version, "minor")
         code, out, err = self.run_tool("bump_version.py", new)
