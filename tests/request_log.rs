@@ -926,3 +926,197 @@ fn a_server_whose_standard_output_reader_left_during_boot_serves_on() {
     };
     assert_eq!(exit.code(), Some(0), "{}", said());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_server_whose_standard_error_reader_left_during_boot_serves_on() {
+    // Issue #738: the server's lines on stderr were written
+    // with `eprintln!`, which panics when a write fails, so a
+    // reader of stderr that had gone (a log collector that
+    // exited) ended the server at its first line there. Unsafe
+    // mode with no allowlist writes a warning there during
+    // boot, and a source that cannot be fetched writes a load
+    // error once the server serves. Each line is lost now,
+    // standard output says so once, and the server serves and
+    // stops as it would.
+    let mut child = binary()
+        .env("PORT", "0")
+        .env("CRABCROP_ALLOW_UNSAFE", "1")
+        .env("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning crabcrop");
+    drop(child.stderr.take());
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stdout.lines() {
+            let Ok(line) = line else { return };
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut server = ServerGuard::new(child);
+    let mut printed = Vec::new();
+    let deadline = Instant::now() + LONG;
+    let port = loop {
+        match lines.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => match line.strip_prefix("crabcrop listening on port ") {
+                Some(port) => break port.parse::<u16>().unwrap(),
+                None => printed.push(line),
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+        }
+        if let Some(exit) = server.0.try_wait().unwrap() {
+            panic!("crabcrop exited before it listened: {exit}\n{printed:#?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "crabcrop never listened\n{printed:#?}"
+        );
+    };
+    // It answers: the health check, and two image requests
+    // whose sources nothing serves (port 9 refuses the
+    // connection), each of which writes its load error.
+    assert_eq!(get_body(port, "/health", "").0, 200);
+    for name in ["a", "b"] {
+        let path = format!("/unsafe/40x30/http://127.0.0.1:9/{name}.png");
+        assert_eq!(status(port, &path, ""), 502, "{path}");
+    }
+    // And it stops cleanly.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&server.0),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let waited = Instant::now();
+    let exit = loop {
+        if let Some(exit) = server.0.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(waited.elapsed() < LONG, "the server did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    printed.extend(rest_of(&lines));
+    assert_eq!(exit.code(), Some(0), "{printed:#?}");
+    // Standard output said once that stderr takes no lines,
+    // at the first one, the boot's warning.
+    let notes: Vec<&String> = printed
+        .iter()
+        .filter(|line| line.starts_with("crabcrop: cannot write to standard error"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{printed:#?}");
+    assert!(notes[0].contains("Broken pipe"), "{}", notes[0]);
+    assert_eq!(printed.last().map(String::as_str), Some("shutdown: done"));
+}
+
+/// Not a test on its own: the process that
+/// `a_line_stderr_refuses_lets_go_of_stderr_before_its_note_waits`
+/// starts, by running this test binary again with a stderr
+/// whose reader is gone. It exits 0 once both of its threads
+/// are through.
+#[test]
+#[ignore = "a helper the stderr lock test runs as its child"]
+#[cfg(target_os = "linux")]
+fn stderr_note_helper() {
+    if std::env::var_os("CRABCROP_TEST_STDERR_NOTE").is_none() {
+        return;
+    }
+    let pid = std::process::id();
+    // This thread holds standard output, as a failed boot
+    // line does while it says so on stderr.
+    let out = std::io::stdout().lock();
+    let writer = std::thread::Builder::new()
+        .name("stderr-line".to_string())
+        .spawn(|| crabcrop::observe::print_stderr_line(format_args!("a line stderr refuses")))
+        .unwrap();
+    let deadline = Instant::now() + LONG;
+    let tid = loop {
+        let found = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|tid| {
+                std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
+                    .is_ok_and(|name| name.trim() == "stderr-line")
+            });
+        if let Some(tid) = found {
+            break tid;
+        }
+        assert!(Instant::now() < deadline, "the writer thread never started");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Its write to stderr fails at once, so the one place it
+    // can sleep is the wait for standard output, to say so.
+    asleep(pid, &tid);
+    // Standard error is free while it waits: this is where a
+    // writer that held it would deadlock the two threads.
+    drop(std::io::stderr().lock());
+    drop(out);
+    writer.join().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_line_stderr_refuses_lets_go_of_stderr_before_its_note_waits() {
+    // Issue #738: a stderr line that stderr refuses is noted
+    // on standard output, which another thread may hold: a
+    // boot line that failed holds it while it says so on
+    // stderr, and the request log's writer holds it through
+    // every write. The stderr line lets go of stderr first,
+    // so neither can deadlock with it. Its child holds
+    // standard output while a stderr line fails, and takes
+    // stderr once that line waits for standard output.
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "stderr_note_helper",
+            "--ignored",
+            "--test-threads=1",
+            "--quiet",
+        ])
+        .env("CRABCROP_TEST_STDERR_NOTE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take());
+    let mut stdout = child.stdout.take().unwrap();
+    let printed = std::thread::spawn(move || {
+        let mut printed = String::new();
+        let _ = stdout.read_to_string(&mut printed);
+        printed
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > LONG {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the two threads deadlocked: the stderr line held stderr while it waited for \
+                 standard output\n{}",
+                printed.join().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let printed = printed.join().unwrap();
+    assert!(status.success(), "{status}\n{printed}");
+    // And once standard output was free, the note reached it.
+    assert_eq!(
+        printed
+            .matches("crabcrop: cannot write to standard error: Broken pipe")
+            .count(),
+        1,
+        "{printed}"
+    );
+}

@@ -18495,10 +18495,10 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     // tier and the request log's queue every section is
     // there, and at rest every value is known: the request
     // counters as `Metrics::render` gives them, then the
-    // lanes, the gates and the request log (issue #707),
-    // the source buffer, the lookups and the tiers, each
-    // line the text it was when a string was formatted for
-    // it.
+    // lanes, the gates, the AI lock recoveries (issue #736)
+    // and the request log (issue #707), the source buffer,
+    // the lookups and the tiers, each line the text it was
+    // when a string was formatted for it.
     let dir = crate::test_support::scratch_dir("metrics-one-buffer");
     let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
     state.metrics_token = Some("metrics-token".to_string().into());
@@ -18512,7 +18512,16 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
         ..Default::default()
     });
     state.metrics.record_purge();
-    let scraped = scrape(&base, "metrics-token").await;
+    // The lock recovery count is the process's, which other
+    // tests can move: the scrape compared is one they did not
+    // move it during.
+    let (scraped, recoveries) = loop {
+        let before = crate::ai::lock_recoveries();
+        let scraped = scrape(&base, "metrics-token").await;
+        if crate::ai::lock_recoveries() == before {
+            break (scraped, before);
+        }
+    };
     let requests = state.metrics.render();
     assert!(requests.contains("crabcrop_bytes_served_total 1234\n"));
     let sections = scraped
@@ -18543,6 +18552,9 @@ crabcrop_gate_capacity{{gate="ai"}} 2
 crabcrop_gate_capacity{{gate="video"}} 2
 crabcrop_gate_capacity{{gate="animation"}} 1
 crabcrop_gate_capacity{{gate="probe"}} 2
+# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.
+# TYPE crabcrop_ai_lock_recoveries_total counter
+crabcrop_ai_lock_recoveries_total {recoveries}
 # HELP crabcrop_request_log_queue_bytes Bytes of request log lines held for standard output, queued or being written.
 # TYPE crabcrop_request_log_queue_bytes gauge
 crabcrop_request_log_queue_bytes 0
@@ -18615,6 +18627,54 @@ crabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000
     assert_eq!(
         crate::observe::undescribed_series(&scraped),
         Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn model_lock_recoveries_count_on_metrics() {
+    // Issue #736: since issue #715 a model lock that a
+    // request's panic poisoned is taken back by the next
+    // request and counted, but the count was only in the line
+    // on stderr. `/metrics` shows it as a counter, which a
+    // recovery moves.
+    let state = Arc::new(AppState {
+        metrics_token: Some("metrics-token".to_string().into()),
+        ..test_state()
+    });
+    let base = serve_state(&state).await;
+    let counted = |metrics: &str| -> u64 {
+        metrics
+            .lines()
+            .find_map(|line| line.strip_prefix("crabcrop_ai_lock_recoveries_total "))
+            .unwrap_or_else(|| panic!("/metrics has no lock recovery counter:\n{metrics}"))
+            .parse()
+            .unwrap()
+    };
+    let before = scrape(&base, "metrics-token").await;
+    assert!(
+        before.contains(
+            "# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.\n\
+             # TYPE crabcrop_ai_lock_recoveries_total counter\n"
+        ),
+        "/metrics does not describe the lock recovery counter:\n{before}"
+    );
+    let at_first = counted(&before);
+    crate::ai::recover_a_poisoned_lock();
+    let after = scrape(&base, "metrics-token").await;
+    // Other tests in this process can recover locks of their
+    // own meanwhile: the counter rises by this one at least.
+    assert!(
+        counted(&after) > at_first,
+        "a recovery left the counter at {at_first}:\n{after}"
+    );
+    assert_eq!(
+        crate::observe::undescribed_series(&after),
+        Vec::<String>::new()
+    );
+    // The endpoints page lists it with the other series.
+    assert!(
+        include_str!("../../docs/endpoints.md").contains("`crabcrop_ai_lock_recoveries_total`"),
+        "docs/endpoints.md does not list the lock recovery counter"
     );
 }
 

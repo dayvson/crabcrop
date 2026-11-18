@@ -731,6 +731,7 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     state.metrics.render_into(&mut out);
     lane_metrics(&state, &mut out);
     gate_metrics(&state, &mut out);
+    ai_metrics(&mut out);
     request_log_metrics(&state, &mut out);
     source_buffer_metrics(&state, &mut out);
     source_lookup_metrics(&state, &mut out);
@@ -827,6 +828,23 @@ fn gate_metrics(state: &AppState, out: &mut String) {
             gate.capacity()
         );
     }
+}
+
+/// AI model lock recoveries for `/metrics` (issue #736): the
+/// locks on the models' sessions and memos that a request's
+/// panic poisoned and a later request took back (issue #715),
+/// counted since boot. Each is also a line on stderr; a count
+/// that keeps rising is a model that panics on what it is
+/// given.
+fn ai_metrics(out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.\n\
+         # TYPE crabcrop_ai_lock_recoveries_total counter\n\
+         crabcrop_ai_lock_recoveries_total {}\n",
+        crate::ai::lock_recoveries()
+    );
 }
 
 /// The request log's queue for `/metrics` (issue #707): the
@@ -1503,7 +1521,7 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
-    eprintln!("explain load error: {e}");
+    stderr_line!("explain load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
 }
@@ -2790,7 +2808,7 @@ async fn read_upload(
             ));
         }
         Err(e) => {
-            eprintln!("upload body read failed: {e}");
+            stderr_line!("upload body read failed: {e}");
             return Err(UploadOutcome::rejected(
                 name,
                 "rejected:unreadable",
@@ -2849,7 +2867,7 @@ async fn validate_upload(
     let prepared = match run_upload_validation(state, bytes).await {
         UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
-            eprintln!("upload rejected: {e}");
+            stderr_line!("upload rejected: {e}");
             return Err(UploadOutcome::rejected(
                 name,
                 "rejected:not-an-image",
@@ -2925,7 +2943,7 @@ async fn store_upload(
         }),
         Err(crate::upload::UploadError::AlreadyExists) => Err(upload_exists(name)),
         Err(crate::upload::UploadError::Backend(cause)) => {
-            eprintln!("upload failed: {cause}");
+            stderr_line!("upload failed: {cause}");
             Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
@@ -2937,7 +2955,7 @@ async fn store_upload(
             ))
         }
         Err(crate::upload::UploadError::Io(cause)) => {
-            eprintln!("upload failed: {cause}");
+            stderr_line!("upload failed: {cause}");
             Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
@@ -4260,7 +4278,7 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
             // miss path answers with (the size hint above
             // already vouched for the body); the status
             // and headers survive, the body does not.
-            eprintln!("flight: leader body could not be collected for sharing");
+            stderr_line!("flight: leader body could not be collected for sharing");
             (Response::from_parts(parts, axum::body::Body::empty()), None)
         }
     }
@@ -5384,7 +5402,7 @@ async fn serve_miss(
     }
     record.bytes_out = processed.bytes.len();
     let mut response = if meta {
-        meta_document(state, &processed, sealed, accept).await
+        meta_document(state, processed, sealed, accept).await
     } else {
         respond(
             processed.format,
@@ -5882,15 +5900,18 @@ async fn populate_tiers(
 }
 
 /// The meta document for a render: the annotation sections
-/// the request opts into, then the document itself.
+/// the request opts into, then the document itself. The
+/// sections' blocking tasks decode the render, so they share
+/// it (issue #736): it is not copied for them.
 async fn meta_document(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    processed: crate::engine::ProcessedImage,
     sealed: bool,
     accept: Option<&str>,
 ) -> Response {
-    let frame = DocumentFrame::new(processed);
-    meta_document_from(state, processed, frame, sealed, accept).await
+    let processed = Arc::new(processed);
+    let frame = DocumentFrame::new(Arc::clone(&processed));
+    meta_document_from(state, &processed, frame, sealed, accept).await
 }
 
 /// [`meta_document`] on the frame its sections share: the
@@ -6059,9 +6080,9 @@ mod meta;
 /// only for test builds, where they are used.
 #[cfg(test)]
 pub(in crate::server) use meta::{
-    AestheticMeta, AestheticOutcome, Annotation, compose_annotation, compose_moderation,
-    f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json, pack_embedding, score_list,
-    segments_json, studio_json,
+    AestheticMeta, AestheticOutcome, Annotation, FrameDecoder, compose_annotation,
+    compose_moderation, f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json,
+    pack_embedding, score_list, segments_json, studio_json,
 };
 pub(in crate::server) use meta::{
     DocumentFrame, FrameSource, annotate_meta, compose_aesthetic, detect_meta, embed_meta,
@@ -6301,7 +6322,7 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
-    eprintln!("load error: {e}");
+    stderr_line!("load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
 }
@@ -6480,7 +6501,7 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
 const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
 
 fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
-    eprintln!("engine error: {e}");
+    stderr_line!("engine error: {e}");
     let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
     let mut response = error_response(status, code, message, accept);
