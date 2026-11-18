@@ -72,7 +72,8 @@ mod worker;
 #[cfg(feature = "avif-decode")]
 pub(crate) use worker::WORKER_TIMEOUT;
 pub use worker::{
-    RenderError, WORKER_ARG, WorkerCommand, is_worker_invocation, isolate_in_child, worker_main,
+    DEFAULT_WORKER_ADDRESS_SPACE, MIN_WORKER_ADDRESS_SPACE, RenderError, WORKER_ARG, WorkerCommand,
+    is_worker_invocation, isolate_in_child, worker_main,
 };
 
 use image::DynamicImage;

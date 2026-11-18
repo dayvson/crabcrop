@@ -80,10 +80,11 @@
 //! with the host's cores for large frames, and
 //! `-codec_whitelist` lets the tool open only the decoders
 //! of the video codecs it names. On Linux the kernel caps
-//! the tool's address space at 3 GiB behind all of that:
-//! anything the checks do not size, the probe's own decode
-//! included, is bounded by that cap, and the tool is the OOM
-//! killer's first choice.
+//! the tool's address space behind all of that, at 3 GiB
+//! unless `CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB` says
+//! otherwise (issue #738): anything the checks do not size,
+//! the probe's own decode included, is bounded by that cap,
+//! and the tool is the OOM killer's first choice.
 //!
 //! These bounds limit what a decode can cost, not what a
 //! compromised tool can reach. The empty environment keeps
@@ -233,14 +234,28 @@ const MANY_THREADS_MAX_PIXELS: u64 = 4096 * 2160;
 /// own ceiling for its default count.
 const MAX_DECODER_THREADS: usize = 16;
 
-/// The tool's address-space cap on Linux, 3 GiB. An
-/// extraction at the frame budget needs about 1.7 GiB of
-/// address space (an 8192x8192 H.264 frame), and an 8K
-/// 10-bit HEVC frame, the heaviest common source, about
-/// 2.4 GiB, most of it decoder frames and the reservations
-/// of the tool's threads; the cap leaves headroom over that
-/// and turns any larger allocation into a tool error.
-const DECODER_MAX_ADDRESS_SPACE: u64 = 3 << 30;
+/// The tool's address-space cap on Linux when
+/// `CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB` is unset,
+/// 3 GiB. An extraction at the frame budget needs about
+/// 1.7 GiB of address space (an 8192x8192 H.264 frame), and
+/// an 8K 10-bit HEVC frame, the heaviest common source,
+/// about 2.4 GiB, most of it decoder frames and the
+/// reservations of the tool's threads; the cap leaves
+/// headroom over that and turns any larger allocation into
+/// a tool error.
+pub const DEFAULT_DECODER_ADDRESS_SPACE: u64 = 3 << 30;
+
+/// The least the cap may be set to, 1 GiB (issue #738): what
+/// the tool needs to start, with room for other builds. With
+/// FFmpeg 6.1 (Ubuntu 24.04's build) and glibc 2.39, a probe
+/// ran in 270 MiB, and an extraction of one frame of a 64x48
+/// H.264 clip in 531 to 822 MiB on 2 to 12 decoder threads.
+/// Each thread reserves a stack and a malloc arena of its
+/// own, and on 16 threads, the most the decoder gets (on a
+/// host with 15 cores or more, see [`decoder_threads`]), the
+/// same extraction needed 1.6 GiB, so a cap this low leaves
+/// such a host no frame.
+pub const MIN_DECODER_ADDRESS_SPACE: u64 = 1 << 30;
 
 /// What FFmpeg logs when a decoder refuses a frame past
 /// `-max_pixels`. A run whose report says so and that
@@ -368,6 +383,10 @@ pub struct VideoFrameExtractor {
     /// [`MAX_FRAME_PNG_BYTES`]; a field so that a test can
     /// meet it with a small file.
     max_frame_png: usize,
+    /// The tool's address-space cap, in bytes:
+    /// [`DEFAULT_DECODER_ADDRESS_SPACE`] unless
+    /// [`Self::with_address_space`] set another.
+    max_address_space: u64,
 }
 
 impl VideoFrameExtractor {
@@ -399,7 +418,20 @@ impl VideoFrameExtractor {
             program,
             timeout,
             max_frame_png: MAX_FRAME_PNG_BYTES,
+            max_address_space: DEFAULT_DECODER_ADDRESS_SPACE,
         })
+    }
+
+    /// The extractor with every run of the tool capped at
+    /// `bytes` of address space, as
+    /// `CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB` sets it
+    /// (issue #738). The configuration holds it between
+    /// [`MIN_DECODER_ADDRESS_SPACE`] and its own ceiling.
+    pub fn with_address_space(self, bytes: u64) -> Self {
+        Self {
+            max_address_space: bytes,
+            ..self
+        }
     }
 
     /// Probe the source: its duration, its first video
@@ -690,7 +722,7 @@ impl VideoFrameExtractor {
             max_stderr: PROBE_REPORT_CAP,
             deadline,
             cpu_limit: tool_cpu_limit(self.timeout),
-            max_address_space: DECODER_MAX_ADDRESS_SPACE,
+            max_address_space: self.max_address_space,
         })
         .map_err(RunError::Tool)
     }

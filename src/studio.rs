@@ -31,7 +31,7 @@ pub(crate) fn timing_on() -> bool {
 /// Print one stage's elapsed time when timing is on.
 pub(crate) fn timing_mark(stage: &str, start: std::time::Instant) {
     if timing_on() {
-        eprintln!(
+        stderr_line!(
             "[studio-timing] {stage}: {:.1} ms",
             start.elapsed().as_secs_f64() * 1000.0
         );
