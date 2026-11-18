@@ -8189,6 +8189,83 @@ async fn cli_purge_group_evicts_every_grouped_entry() {
 }
 
 #[tokio::test]
+async fn cli_purges_with_expires_run_before_the_second_and_are_refused_after_it() {
+    let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        presets: preset_test_map(),
+        purge_require_expiry: true,
+        ..test_state()
+    })
+    .await;
+    let remainder = format!("40x24/{src}");
+    let grouped = format!("preset:small/{src}");
+    for rest in [&remainder, &grouped] {
+        assert_eq!(get_signed(&base, rest).await.status(), 200);
+    }
+    let future = (now_unix() + 3600).to_string();
+    let past = (now_unix() - 60).to_string();
+    let purge = |verb: &'static str, target: String, expires: Option<String>| {
+        let base = base.clone();
+        async move {
+            let mut argv = vec![verb, "--secret", "test-secret", "--base", &base];
+            if let Some(ts) = &expires {
+                argv.extend(["--expires", ts]);
+            }
+            argv.push(&target);
+            crate::cli::exec(&cli(&argv))
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    // On a server that takes only expiring purge URLs, a
+    // plain CLI purge is refused, and --expires purges.
+    let err = purge("purge", remainder.clone(), None).await.unwrap_err();
+    assert!(
+        err.contains("HTTP 403") && err.contains("expiry required"),
+        "{err}"
+    );
+    let err = purge("purge-group", "small".into(), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("expiry required"), "{err}");
+    let out = purge("purge", remainder.clone(), Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    let out = purge("purge-group", "small".into(), Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    assert_eq!(get_signed(&base, &remainder).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // An expiry that has passed is refused, and evicts
+    // nothing.
+    for verb in ["purge", "purge-group"] {
+        let target = if verb == "purge" {
+            remainder.clone()
+        } else {
+            "small".into()
+        };
+        let err = purge(verb, target, Some(past.clone())).await.unwrap_err();
+        assert!(
+            err.contains("HTTP 403") && err.contains("signature expired"),
+            "{err}"
+        );
+    }
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    // An image URL whose own exp: has passed still purges
+    // with --expires: the CLI drops the image's exp:, which
+    // the cache key does not carry, and the server never
+    // reads it as the purge's expiry.
+    let expired_image = format!(
+        "{base}/{}/exp:{past}/{remainder}",
+        sign(&format!("exp:{past}/{remainder}"))
+    );
+    let out = purge("purge", expired_image, Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+}
+
+#[tokio::test]
 async fn cli_purge_with_a_key_id_verifies_against_a_rotating_keyring() {
     let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
