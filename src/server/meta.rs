@@ -1479,7 +1479,7 @@ pub(in crate::server) fn ocr_json(meta: &OcrMeta) -> OcrJson {
 /// typed values and serialized with serde. Field order
 /// in this struct is the wire order; optional fields
 /// are skipped when absent.
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 struct MetaBody {
     width: u32,
     height: u32,
@@ -1541,6 +1541,14 @@ struct MetaBody {
 
 /// The meta response: what the pipeline produced, as JSON,
 /// without the image bytes.
+///
+/// The document is built in stages: the facts measured from
+/// the render ([`MetaBody::of_render`]), the sections the
+/// annotations made ([`MetaBody::annotate`]), the operation
+/// records ([`MetaBody::record_operations`]) and the
+/// placeholder fields ([`MetaBody::describe_placeholder`]).
+/// Each stage fills its own fields; the wire order is the
+/// struct's.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) fn meta_response(
     processed: &crate::engine::ProcessedImage,
@@ -1557,151 +1565,22 @@ pub(in crate::server) fn meta_response(
     // image-derived section (tags, detections,
     // moderation, embedding, aesthetic, OCR, placeholder,
     // ssimulacra2), never a field that reports operation
-    // or source text. Below, that means the operation
+    // or source text. Here, that means the operation
     // records (video, pdf, studio, inpaint, segments,
     // objects_crop) are skipped: each resolves or echoes
     // a URL argument, the recipe text the token exists
     // to hide. Model identities inside moderation and
     // OCR are deployment facts the plain meta of any URL
-    // already publishes, and the base fields above are
+    // already publishes, and the base fields are
     // measured from the render.
-    let tags = annotation.and_then(|a| score_list(&a.tags));
-    let alt_text = match (annotation, &tags) {
-        // The alt text rides whenever the tags render,
-        // even when it is empty: the pair is one section.
-        (Some(a), Some(_)) => Some(a.alt_text.clone()),
-        _ => None,
-    };
-    let meta = MetaBody {
-        width: processed.width,
-        height: processed.height,
-        format: format_name(processed.format),
-        bytes: processed.bytes.len(),
-        source_width: processed.source_width,
-        source_height: processed.source_height,
-        sealed: if sealed { Some(true) } else { None },
-        tags,
-        alt_text,
-        detections: detections.and_then(|pairs| {
-            // A non-finite score has no JSON
-            // representation (issue #352): the whole
-            // section is dropped rather than print a
-            // malformed value. The meta helper rejects
-            // non-finite boxes before this point, so
-            // this is the serializer's own guard: the
-            // number constructor refuses and the collect
-            // propagates the refusal.
-            pairs
-                .iter()
-                .map(|(detector, d)| {
-                    Some(DetectionJson {
-                        label: d.label.clone(),
-                        score: MetaNum::display(d.score)?,
-                        x: d.x,
-                        y: d.y,
-                        w: d.w,
-                        h: d.h,
-                        detector: detector.clone(),
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-        }),
-        moderation: moderation.map(moderation_json),
-        embedding: match embedding {
-            Some(EmbeddingMeta::Report(report)) => {
-                Some(EmbeddingJson::Packed(pack_embedding(&report.vector)))
-            }
-            Some(EmbeddingMeta::Unavailable(_)) => Some(EmbeddingJson::Absent),
-            None => None,
-        },
-        embedding_model: match embedding {
-            Some(EmbeddingMeta::Report(report)) => Some(report.model.clone()),
-            _ => None,
-        },
-        embedding_dim: match embedding {
-            Some(EmbeddingMeta::Report(report)) => Some(report.vector.len()),
-            _ => None,
-        },
-        embedding_encoding: match embedding {
-            Some(EmbeddingMeta::Report(_)) => Some("f16le-base64"),
-            _ => None,
-        },
-        embedding_normalized: match embedding {
-            Some(EmbeddingMeta::Report(_)) => Some(true),
-            _ => None,
-        },
-        embedding_reason: match embedding {
-            Some(EmbeddingMeta::Unavailable(reason)) => Some(*reason),
-            _ => None,
-        },
-        aesthetic: aesthetic.map(aesthetic_json),
-        // The verified auto-quality score, on the meta
-        // of the response it gated (issue #41). One
-        // decimal: the score is a ranking signal, not a
-        // measurement. A non-finite score cannot occur
-        // (ssimulacra2 returns a bounded dissimilarity),
-        // but the field guards anyway rather than print
-        // a malformed value.
-        ssimulacra2: processed.ssimulacra2.and_then(MetaNum::fixed1),
-        provenance: processed.provenance.as_ref().map(|facts| ProvenanceJson {
-            signing_configured: facts.signing_configured,
-            source: facts.source.as_ref().map(manifest_json),
-            output: facts.output.as_ref().map(manifest_json),
-        }),
-        video: if sealed {
-            None
-        } else {
-            processed.video.as_ref().map(|v| VideoJson {
-                width: v.width,
-                height: v.height,
-                frame_timestamp: MetaNum::seconds(v.frame_seconds),
-                duration: v.duration_seconds.and_then(MetaNum::seconds),
-            })
-        },
-        pdf: if sealed {
-            None
-        } else {
-            processed.pdf.as_ref().map(|pdf| PdfJson {
-                pages: pdf.pages,
-                page: pdf.page,
-                page_width: MetaNum::points(pdf.page_width),
-                page_height: MetaNum::points(pdf.page_height),
-            })
-        },
-        studio: if sealed {
-            None
-        } else {
-            processed.studio.as_ref().map(studio_json)
-        },
-        inpaint: if sealed {
-            None
-        } else {
-            processed.inpaint.as_ref().map(|record| InpaintJson {
-                regions: record.regions.clone(),
-            })
-        },
-        segments: if sealed {
-            None
-        } else {
-            processed.segments.as_ref().and_then(segments_json)
-        },
-        objects_crop: if sealed {
-            None
-        } else {
-            processed.objects_crop.as_ref().and_then(objects_crop_json)
-        },
-        ocr: ocr.map(ocr_json),
-        dominant_color: processed
-            .placeholder
-            .as_ref()
-            .map(|ph| ph.dominant_color.clone()),
-        placeholder: processed.placeholder.as_ref().map(|ph| ph.data_uri.clone()),
-        palette: processed.placeholder.as_ref().map(|ph| ph.palette.clone()),
-        thumbhash: processed
-            .placeholder
-            .as_ref()
-            .map(|ph| ph.thumbhash.clone()),
-    };
+    let mut meta = MetaBody::of_render(processed, sealed);
+    meta.annotate(
+        annotation, detections, moderation, embedding, aesthetic, ocr,
+    );
+    if !sealed {
+        meta.record_operations(processed);
+    }
+    meta.describe_placeholder(processed);
     let body = serde_json::to_string(&meta).unwrap_or_default();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
@@ -1709,6 +1588,149 @@ pub(in crate::server) fn meta_response(
         HeaderValue::from_static("application/json"),
     );
     meta_cache_headers((StatusCode::OK, headers, body).into_response())
+}
+
+impl MetaBody {
+    /// The facts measured from the render: its size, format
+    /// and length, the source's size, the verified
+    /// auto-quality score, the provenance facts, and the
+    /// sealed marker. Every other field starts absent.
+    fn of_render(processed: &crate::engine::ProcessedImage, sealed: bool) -> Self {
+        MetaBody {
+            width: processed.width,
+            height: processed.height,
+            format: format_name(processed.format),
+            bytes: processed.bytes.len(),
+            source_width: processed.source_width,
+            source_height: processed.source_height,
+            sealed: if sealed { Some(true) } else { None },
+            // The verified auto-quality score, on the meta
+            // of the response it gated (issue #41). One
+            // decimal: the score is a ranking signal, not a
+            // measurement. A non-finite score cannot occur
+            // (ssimulacra2 returns a bounded dissimilarity),
+            // but the field guards anyway rather than print
+            // a malformed value.
+            ssimulacra2: processed.ssimulacra2.and_then(MetaNum::fixed1),
+            provenance: processed.provenance.as_ref().map(|facts| ProvenanceJson {
+                signing_configured: facts.signing_configured,
+                source: facts.source.as_ref().map(manifest_json),
+                output: facts.output.as_ref().map(manifest_json),
+            }),
+            ..MetaBody::default()
+        }
+    }
+
+    /// The sections the annotations made: the tags with
+    /// their alt text, the detections, moderation, the
+    /// embedding, the aesthetic score and OCR.
+    fn annotate(
+        &mut self,
+        annotation: Option<&Annotation>,
+        detections: Option<&[(String, crate::ai::Detection)]>,
+        moderation: Option<&ModerationMeta>,
+        embedding: Option<&EmbeddingMeta>,
+        aesthetic: Option<&AestheticMeta>,
+        ocr: Option<&OcrMeta>,
+    ) {
+        self.tags = annotation.and_then(|a| score_list(&a.tags));
+        self.alt_text = match (annotation, &self.tags) {
+            // The alt text rides whenever the tags render,
+            // even when it is empty: the pair is one section.
+            (Some(a), Some(_)) => Some(a.alt_text.clone()),
+            _ => None,
+        };
+        self.detections = detections.and_then(detections_json);
+        self.moderation = moderation.map(moderation_json);
+        if let Some(embedding) = embedding {
+            self.embed(embedding);
+        }
+        self.aesthetic = aesthetic.map(aesthetic_json);
+        self.ocr = ocr.map(ocr_json);
+    }
+
+    /// The embedding section: the packed vector with its
+    /// model, length, encoding and normalization, or why
+    /// there is none.
+    fn embed(&mut self, embedding: &EmbeddingMeta) {
+        match embedding {
+            EmbeddingMeta::Report(report) => {
+                self.embedding = Some(EmbeddingJson::Packed(pack_embedding(&report.vector)));
+                self.embedding_model = Some(report.model.clone());
+                self.embedding_dim = Some(report.vector.len());
+                self.embedding_encoding = Some("f16le-base64");
+                self.embedding_normalized = Some(true);
+            }
+            EmbeddingMeta::Unavailable(reason) => {
+                self.embedding = Some(EmbeddingJson::Absent);
+                self.embedding_reason = Some(*reason);
+            }
+        }
+    }
+
+    /// The records of the operations that report what they
+    /// did: video, pdf, studio, inpaint, segments and
+    /// objects_crop. A sealed request gets none of them (see
+    /// [`meta_response`]).
+    fn record_operations(&mut self, processed: &crate::engine::ProcessedImage) {
+        self.video = processed.video.as_ref().map(|v| VideoJson {
+            width: v.width,
+            height: v.height,
+            frame_timestamp: MetaNum::seconds(v.frame_seconds),
+            duration: v.duration_seconds.and_then(MetaNum::seconds),
+        });
+        self.pdf = processed.pdf.as_ref().map(|pdf| PdfJson {
+            pages: pdf.pages,
+            page: pdf.page,
+            page_width: MetaNum::points(pdf.page_width),
+            page_height: MetaNum::points(pdf.page_height),
+        });
+        self.studio = processed.studio.as_ref().map(studio_json);
+        self.inpaint = processed.inpaint.as_ref().map(|record| InpaintJson {
+            regions: record.regions.clone(),
+        });
+        self.segments = processed.segments.as_ref().and_then(segments_json);
+        self.objects_crop = processed.objects_crop.as_ref().and_then(objects_crop_json);
+    }
+
+    /// The placeholder fields, when the request asked for
+    /// them: the dominant color, the data URI, the palette
+    /// and the thumbhash.
+    fn describe_placeholder(&mut self, processed: &crate::engine::ProcessedImage) {
+        let Some(placeholder) = &processed.placeholder else {
+            return;
+        };
+        self.dominant_color = Some(placeholder.dominant_color.clone());
+        self.placeholder = Some(placeholder.data_uri.clone());
+        self.palette = Some(placeholder.palette.clone());
+        self.thumbhash = Some(placeholder.thumbhash.clone());
+    }
+}
+
+/// The detections section: each box, with the detector that
+/// produced it.
+///
+/// A non-finite score has no JSON representation (issue
+/// #352): the whole section is dropped rather than print a
+/// malformed value. The meta helper rejects non-finite boxes
+/// before this point, so this is the serializer's own guard:
+/// the number constructor refuses and the collect propagates
+/// the refusal.
+fn detections_json(pairs: &[(String, crate::ai::Detection)]) -> Option<Vec<DetectionJson>> {
+    pairs
+        .iter()
+        .map(|(detector, d)| {
+            Some(DetectionJson {
+                label: d.label.clone(),
+                score: MetaNum::display(d.score)?,
+                x: d.x,
+                y: d.y,
+                w: d.w,
+                h: d.h,
+                detector: detector.clone(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
 }
 
 /// The caching header of an answer to a meta request.
