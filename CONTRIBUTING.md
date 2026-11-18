@@ -173,8 +173,9 @@ merges first (issue #539).
 
 - **Name** the file `changelog.d/<issue>.<section>.md`, for example
   `changelog.d/521.changed.md`. The section is one of `added`, `changed`,
-  `deprecated`, `removed`, `fixed` or `security`. A short slug after the
-  number, in lowercase words joined by hyphens, is always allowed:
+  `deprecated`, `removed`, `fixed` or `security` (or `summary`, for the
+  release's summary below). A short slug after the number, in lowercase
+  words joined by hyphens, is always allowed:
   `changelog.d/521-chained-resize.changed.md`. Use one when the plain name is
   taken (a second entry for the same issue and section), and also when
   another pull request for the same issue may add an entry to that section
@@ -192,6 +193,8 @@ merges first (issue #539).
   which would start a second entry or a heading: rewrap it instead. A blank
   line, a second bullet or a heading is refused, since an entry is one
   paragraph and a second entry is a second fragment.
+- **Open with what changed**: one sentence that says it, then the detail.
+  Someone deciding whether to upgrade reads the first sentences.
 - **Preview** `## [Unreleased]` as the release will write it. Each section
   lists the entries already written under `## [Unreleased]` first, as they
   are, then the fragments in issue order:
@@ -199,6 +202,22 @@ merges first (issue #539).
   ```bash
   python3 scripts/assemble_changelog.py --check
   ```
+
+  It also warns about each fragment whose first sentence runs past 160
+  characters. The warning does not fail anything: shorten the sentence, or
+  leave it as it is.
+
+Each release's section opens with a summary of two to five lines, written
+when the release is cut (RELEASING.md step 1). It is a fragment too,
+`changelog.d/<issue>.summary.md`, named after an issue its lines name. Each
+line opens with `- ` (a wrapped line joins the one above it) and points at
+the entry it summarizes by that entry's issue, as the entries name theirs,
+`(issue #521)`: a line that names no issue is refused. The release writes
+the lines as a list above the section's first heading: those written there
+by hand under `## [Unreleased]` first, then the summary fragments in issue
+order, each with its lines in the order you gave them, so one fragment sets
+the whole order. A line about an entry that names no issue goes under
+`## [Unreleased]` by hand, above the first heading.
 
 A pull request that raises `RENDERING_VERSION` also says that the release
 starts a new cache epoch (RELEASING.md step 4), in an entry that opens with

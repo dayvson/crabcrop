@@ -768,17 +768,22 @@ def git(root, *args, text=True):
     return done.stdout
 
 
-def unreleased_lines(text):
-    """The non-blank lines of the Unreleased section, subheadings left out."""
+def unreleased_body(text):
+    """The lines of the Unreleased section after its heading, as written."""
     lines, inside = [], False
     for line in text.splitlines():
         if line.startswith("## "):
             if inside:
                 break
             inside = line.rstrip() == UNRELEASED
-        elif inside and line.strip() and not line.startswith("#"):
-            lines.append(line.rstrip())
+        elif inside:
+            lines.append(line)
     return lines
+
+
+def unreleased_lines(text):
+    """The non-blank lines of the Unreleased section, subheadings left out."""
+    return [line.rstrip() for line in unreleased_body(text) if line.strip() and not line.startswith("#")]
 
 
 def git_paths(root, *args):
@@ -802,19 +807,21 @@ def fragment_at(root, rev, path):
 def second_epoch_notes(root, mine):
     """Problems with the cache-epoch notes among `mine`, the fragments a
     pull request adds or changes, when ## [Unreleased] at HEAD then holds
-    more than one, counted as the tree check counts them."""
-    notes = [f for f in mine if assemble_changelog.opens_epoch(f.text)]
+    more than one, counted as the tree check counts them: a summary line
+    that opens with the note's words, a fragment's or one written above
+    the section's first heading, is none."""
+    notes = [f for f in mine if assemble_changelog.is_epoch_note(f)]
     if not notes:
         return []
     folder, names = assemble_changelog.FRAGMENTS, {f.name for f in mine}
     others = 0
     if git(root, "ls-tree", "--name-only", "HEAD", "--", CHANGELOG).strip():
-        lines = unreleased_lines(git(root, "show", f"HEAD:{CHANGELOG}"))
-        others += sum(1 for line in lines if assemble_changelog.is_epoch(line))
+        body = unreleased_body(git(root, "show", f"HEAD:{CHANGELOG}"))
+        others += assemble_changelog.epoch_entries(body)
     for path in git_paths(root, "ls-tree", "-z", "--name-only", "HEAD", "--", f"{folder}/"):
         fragment = fragment_at(root, "HEAD", path)
         if fragment is not None and fragment.name not in names:
-            others += assemble_changelog.opens_epoch(fragment.text)
+            others += assemble_changelog.is_epoch_note(fragment)
     if others + len(notes) < 2:
         return []
     return [f"{folder}/{f.name}: {assemble_changelog.SECOND_EPOCH}" for f in notes]
