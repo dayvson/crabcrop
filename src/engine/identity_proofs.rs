@@ -248,6 +248,134 @@ fn a_refused_resample_never_hands_on_a_premultiplied_frame() {
     assert_eq!(cases, 2 * 5 * 2);
 }
 
+/// RGBA8 frames, the layout of an animation's frames, under
+/// each alpha plane a frame can carry: the mixed plane of
+/// [`frames_at`]; opaque; a GIF frame's, whose pixels are
+/// opaque or transparent black; and transparent over colors.
+fn rgba8_planes(w: u32, h: u32) -> Vec<(String, DynamicImage)> {
+    let mut frames = Vec::new();
+    for (kind, content) in [("smooth", smooth as Content), ("harsh", harsh)] {
+        let mixed = mixed_alpha(content);
+        for plane in ["mixed", "opaque", "gif", "clear"] {
+            let alpha = |x: u32, y: u32| match plane {
+                "mixed" => mixed(x, y),
+                "opaque" => 255,
+                "gif" if (x / 5 + y / 3).is_multiple_of(3) => 0,
+                "gif" => 255,
+                _ => 0,
+            };
+            let img = image::RgbaImage::from_fn(w, h, |x, y| match alpha(x, y) {
+                0 if plane == "gif" => image::Rgba([0, 0, 0, 0]),
+                a => image::Rgba([content(x, y, 0), content(x, y, 1), content(x, y, 2), a]),
+            });
+            frames.push((
+                format!("{kind} rgba8 {plane} {w}x{h}"),
+                DynamicImage::ImageRgba8(img),
+            ));
+        }
+    }
+    frames
+}
+
+#[test]
+fn the_lent_resize_matches_the_owned_resize_and_puts_the_frame_back() {
+    // Issue #737: the trim survey resizes frames it borrows. An
+    // RGBA8 frame is premultiplied where it sits and the rows
+    // that changed are written back; every other layout is
+    // read as it is. Every layout, RGBA8 under every alpha
+    // plane a frame carries, at the sizes the owned resize is
+    // proven at: the owned resize's bytes, and the frame as it
+    // came.
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (3, 2), (9, 17), (64, 48), (101, 53)] {
+        let mut frames = frames_at(w, h);
+        frames.extend(rgba8_planes(w, h));
+        for (name, img) in frames {
+            for (tw, th) in [
+                (w.div_ceil(2), h.div_ceil(2)),
+                (w.div_ceil(3), h),
+                (w, h.div_ceil(3)),
+                (w * 2, h * 2),
+                (w + 1, h + 3),
+                (1, 1),
+                (40, 27),
+                (33, 77),
+                (w, h),
+            ] {
+                let mut lent = img.clone();
+                let resized = resize_lanczos3_lent(&mut lent, tw, th);
+                let owned = resize_lanczos3_owned(img.clone(), tw, th);
+                assert!(same(&resized, &owned), "{name} to {tw}x{th}");
+                assert!(same(&lent, &img), "{name} to {tw}x{th}: the frame changed");
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 5 * (20 + 8) * 9);
+}
+
+#[test]
+fn the_rows_a_premultiply_changes_are_the_rows_copied_out() {
+    // Issue #737: the lent resize copies out the rows holding
+    // a pixel neither opaque nor black, and no other. Every
+    // row the backend's premultiply changes is among them, and
+    // an opaque frame or a GIF frame copies none.
+    for (w, h) in [(1, 1), (9, 17), (64, 48)] {
+        for (name, img) in rgba8_planes(w, h) {
+            let frame = img.to_rgba8();
+            let changing = ChangingRows::of(&frame);
+            let mut premultiplied = frame.clone();
+            fast_image_resize::MulDiv::new()
+                .multiply_alpha_inplace(&mut premultiplied)
+                .unwrap();
+            let stride = w as usize * 4;
+            let before: Vec<&[u8]> = frame.as_raw().chunks(stride).collect();
+            let after: Vec<&[u8]> = premultiplied.as_raw().chunks(stride).collect();
+            for (y, (was, is)) in before.iter().zip(&after).enumerate() {
+                if was != is {
+                    assert!(
+                        changing.rows.contains(&y),
+                        "{name}: row {y} changed uncopied"
+                    );
+                }
+            }
+            let copied: Vec<&[u8]> = changing.rows.iter().map(|&y| before[y]).collect();
+            assert_eq!(changing.bytes, copied.concat(), "{name}");
+            if name.contains("opaque") || name.contains("gif") {
+                assert!(changing.rows.is_empty(), "{name}");
+            }
+        }
+    }
+    // A black pixel is kept at any alpha; one with a color under
+    // partial alpha is not, and its row alone is copied.
+    let mut frame = image::RgbaImage::from_pixel(5, 4, image::Rgba([10, 20, 30, 255]));
+    frame.put_pixel(2, 1, image::Rgba([0, 0, 0, 7]));
+    frame.put_pixel(3, 2, image::Rgba([9, 0, 0, 200]));
+    let changing = ChangingRows::of(&frame);
+    assert_eq!(changing.rows, [2]);
+    assert_eq!(changing.bytes, frame.as_raw()[2 * 20..3 * 20]);
+}
+
+#[test]
+fn a_refused_lent_resize_puts_the_frame_back() {
+    // Issue #737: no input makes the backend refuse, so the
+    // refusal is forced. The lent frame was premultiplied where
+    // it sits; it comes back as it came, and the resize is the
+    // plain one of that frame.
+    for (w, h) in [(9, 17), (64, 48)] {
+        for (name, img) in rgba8_planes(w, h) {
+            let plain = resize_lanczos3(&img, w * 2, h + 3);
+            let mut lent = img.clone();
+            let refused = {
+                let _refusal = RefusedConvolve::new();
+                resize_lanczos3_lent(&mut lent, w * 2, h + 3)
+            };
+            assert!(same(&lent, &img), "{name}: the frame changed");
+            assert!(same(&refused, &plain), "{name}");
+        }
+    }
+}
+
 /// The cut every aspect crop made before issue #713: the
 /// image crate's, one pixel at a time through the frame's
 /// RGBA view, so every layout came out RGBA8.
