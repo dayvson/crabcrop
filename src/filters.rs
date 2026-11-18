@@ -241,6 +241,18 @@ enum Pixels<'a> {
 }
 
 impl<'a> RgbaPart<'a> {
+    /// The part of an image of `size` whose RGBA pixels are
+    /// `pixels`, with its top-left corner at `origin` in the
+    /// whole image: a part made without the whole image, as a
+    /// scaled overlay's is.
+    pub fn copied(pixels: image::RgbaImage, origin: (u32, u32), size: (u32, u32)) -> Self {
+        RgbaPart {
+            pixels: Pixels::Copied(std::sync::Arc::new(pixels)),
+            origin,
+            size,
+        }
+    }
+
     /// The part `rect` of `image`: all of it read in place
     /// when it is RGBA, otherwise a copy of `rect` alone.
     pub fn of(image: &'a DynamicImage, rect: Rect) -> Self {

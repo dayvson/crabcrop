@@ -1021,9 +1021,11 @@ version = "0.13.1"
 dependencies = [
  "ab_glyph",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "c2pa",
  "crabcrop-url",
+ "crc32fast",
  "fast-ssim2",
  "fast_image_resize",
  "fdeflate",
@@ -1063,6 +1065,7 @@ dependencies = [
  "turbojpeg",
  "ureq",
  "webp",
+ "zeroize",
  "zune-core",
  "zune-jpeg",
 ]

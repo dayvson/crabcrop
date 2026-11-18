@@ -106,7 +106,7 @@ fn aws_creds() -> Credentials {
 
 fn sources() -> SourceConfig {
     SourceConfig {
-        aws_creds: Some(aws_creds()),
+        aws_creds: Some(aws_creds().into()),
         gcs_creds: Some(Credentials {
             access_key: "GOOGEXAMPLE".to_string(),
             secret_key: GCS_SECRET.to_string(),
@@ -123,7 +123,7 @@ fn s3_store() -> S3Store {
         "cache/".to_string(),
         Some("http://127.0.0.1:9".to_string()),
         "us-east-1".to_string(),
-        Some(aws_creds()),
+        Some(aws_creds().into()),
         entry_key(CURRENT_KEY.as_bytes()),
     )
     .unwrap()
@@ -135,7 +135,7 @@ fn upload_store() -> UploadStore {
         String::new(),
         Some("http://127.0.0.1:9".to_string()),
         "us-east-1".to_string(),
-        Some(aws_creds()),
+        Some(aws_creds().into()),
         1024,
         false,
     )
@@ -159,7 +159,7 @@ fn state(dir: &std::path::Path) -> AppState {
         process_timeout: std::time::Duration::from_secs(30),
         metrics: Arc::new(Metrics::default()),
         request_log: RequestLog::inline(),
-        metrics_token: Some(METRICS_TOKEN.to_string()),
+        metrics_token: Some(METRICS_TOKEN.to_string().into()),
         cache: Arc::new(Cache::new(1024 * 1024)),
         providers: Arc::new(Providers::default()),
         tag_threshold: 0.05,

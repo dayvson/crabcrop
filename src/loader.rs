@@ -58,6 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, Url, header, redirect};
 
+use crate::credentials::AwsCredentials;
 use crate::sigv4::{self, Credentials};
 
 /// Default cap on response bodies: 10 MiB, the default of
@@ -593,13 +594,18 @@ impl Drop for BodyCharge<'_> {
 pub struct SourcePolicy {
     /// Host suffixes an URL's host must match (exactly, or as a
     /// subdomain). Empty means no allowlist. A listed host is
-    /// exempt from the private-address check: the allowlist is
-    /// how an operator vouches for a loopback or internal
-    /// source.
+    /// exempt from the private-address check, unless
+    /// `check_allowlisted` is set: the allowlist is how an
+    /// operator vouches for a loopback or internal source.
     pub allowed_suffixes: Vec<String>,
     /// Refuse hosts resolving to non-public addresses, except
     /// allowlisted hosts.
     pub block_private: bool,
+    /// Apply the private-address check, and the pinning that
+    /// comes with it, to allowlisted hosts too
+    /// (`CRABCROP_CHECK_ALLOWED_SOURCES`): the allowlist then
+    /// only narrows what may be fetched.
+    pub check_allowlisted: bool,
 }
 
 impl SourcePolicy {
@@ -614,19 +620,35 @@ impl SourcePolicy {
         Self {
             allowed_suffixes,
             block_private,
+            check_allowlisted: false,
         }
+    }
+
+    /// This policy with the private-address check applied to
+    /// allowlisted hosts too, or not (the default).
+    pub fn with_allowlisted_checked(mut self, check: bool) -> Self {
+        self.check_allowlisted = check;
+        self
+    }
+
+    /// Whether the private-address check, and the pinning
+    /// that comes with it, applies to a host that is or is not
+    /// `allowlisted`.
+    pub fn checks(&self, allowlisted: bool) -> bool {
+        self.block_private && (!allowlisted || self.check_allowlisted)
     }
 
     /// Whether fetches under this policy pin hostnames to
     /// their validated addresses (see `check_policy`): the
-    /// private-address check is on and no allowlist is set.
-    /// With an allowlist, every host the loader fetches is
-    /// listed, and listed hosts skip the check and the pin.
-    /// A pinned fetch connects directly, never through a
-    /// proxy the environment configures, which boot warns
-    /// about (issue #471).
+    /// private-address check is on, and either no allowlist
+    /// is set or it applies to listed hosts too. With an
+    /// allowlist and the exemption, every host the loader
+    /// fetches is listed, and listed hosts skip the check and
+    /// the pin. A pinned fetch connects directly, never
+    /// through a proxy the environment configures, which boot
+    /// warns about (issue #471).
     pub fn pins_hostnames(&self) -> bool {
-        self.block_private && self.allowed_suffixes.is_empty()
+        self.block_private && (self.allowed_suffixes.is_empty() || self.check_allowlisted)
     }
 }
 
@@ -1130,8 +1152,12 @@ pub struct SourceConfig {
     pub s3_endpoint: Option<String>,
     /// AWS region for endpoint derivation and signing.
     pub s3_region: String,
-    /// Ambient AWS credentials, when configured.
-    pub aws_creds: Option<Credentials>,
+    /// The AWS signing credentials, when configured: the
+    /// static keys from the environment, or the container
+    /// credentials endpoint's, refreshed (issue #709). The
+    /// upload and shared result stores sign with the same
+    /// source.
+    pub aws_creds: Option<AwsCredentials>,
     /// Base URL of the GCS XML API (or a fake, in tests).
     pub gcs_endpoint: String,
     /// Credential scope region for GCS signing.
@@ -1704,13 +1730,16 @@ impl Loader {
                 };
                 (
                     url,
-                    self.sources.aws_creds.as_ref(),
+                    self.sources
+                        .aws_creds
+                        .as_ref()
+                        .and_then(AwsCredentials::current),
                     self.sources.s3_region.as_str(),
                 )
             }
             StoreKind::Gcs => (
                 format!("{}/{bucket}/{encoded_key}", self.sources.gcs_endpoint),
-                self.sources.gcs_creds.as_ref(),
+                self.sources.gcs_creds.clone().map(std::sync::Arc::new),
                 self.sources.gcs_region.as_str(),
             ),
         };
@@ -1736,7 +1765,7 @@ impl Loader {
                 sign_headers.push(("x-amz-security-token", token.as_str()));
             }
             let authorization = sigv4::authorization(
-                creds,
+                &creds,
                 &sigv4::SignRequest {
                     method: "GET",
                     path: url.path(),
@@ -1980,8 +2009,9 @@ impl Loader {
         // loopback or internal source, so the private-address
         // check (and the connection pinning that comes with
         // it) applies to every host the operator has not
-        // listed.
-        if self.policy.block_private && !allowlisted {
+        // listed, and to listed hosts too only when the
+        // operator asks for it.
+        if self.policy.checks(allowlisted) {
             // IPv6 literals arrive bracketed from the URL parser.
             let bare = host.trim_start_matches('[').trim_end_matches(']');
             if let Ok(ip) = bare.parse::<IpAddr>() {
@@ -3114,7 +3144,7 @@ mod tests {
         let (base, captured) = spawn_capturing_server().await;
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             allowed_buckets: vec!["photos".to_string()],
             ..Default::default()
         });
@@ -3207,7 +3237,7 @@ mod tests {
         // check, before any request is signed (audit R2-05).
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             allowed_buckets: vec!["photos".to_string()],
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             gcs_creds: Some(test_creds()),
             ..Default::default()
         });
@@ -4310,6 +4340,67 @@ mod tests {
         assert_eq!(looked_up.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn allowlisted_hosts_can_be_held_to_the_private_address_check() {
+        // With the exemption (the default), a listed name that
+        // resolves inward passes the check unpinned. With the
+        // check kept for listed hosts, it fails like any other
+        // inward name, a listed inward literal is refused, and
+        // a listed public name is pinned to its checked address.
+        let listed = || {
+            SourcePolicy::new(
+                vec![
+                    "internal.test".to_string(),
+                    "mixed.test".to_string(),
+                    "10.0.0.8".to_string(),
+                    "public.test".to_string(),
+                ],
+                true,
+            )
+        };
+        let lookup = |host: &str| match host {
+            "public.test" => Ok(vec!["93.184.216.34".parse().unwrap()]),
+            other => inward_lookup(other),
+        };
+        let exempt = Loader::with_defaults()
+            .unwrap()
+            .with_policy(listed())
+            .with_host_lookup(lookup, LOOKUP_SLOTS, LOOKUP_WAIT);
+        let checked = Loader::with_defaults()
+            .unwrap()
+            .with_policy(listed().with_allowlisted_checked(true))
+            .with_host_lookup(lookup, LOOKUP_SLOTS, LOOKUP_WAIT);
+        for host in ["internal.test", "mixed.test", "10.0.0.8", "public.test"] {
+            let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
+            assert!(
+                matches!(exempt.check_policy(&url, host).await, Ok(None)),
+                "{host}"
+            );
+        }
+        for host in ["internal.test", "mixed.test"] {
+            let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
+            let err = checked.check_policy(&url, host).await.unwrap_err();
+            assert!(matches!(err, LoadError::Network(_)), "{host}: {err:?}");
+        }
+        let url = Url::parse("http://10.0.0.8/x.png").unwrap();
+        let err = checked.check_policy(&url, "10.0.0.8").await.unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+        let url = Url::parse("http://public.test/x.png").unwrap();
+        let pinned = checked
+            .check_policy(&url, "public.test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.addr, "93.184.216.34:80".parse().unwrap());
+        // The allowlist still decides what may be fetched.
+        let url = Url::parse("http://elsewhere.test/x.png").unwrap();
+        let err = checked
+            .check_policy(&url, "elsewhere.test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+    }
+
     #[test]
     fn bucket_keys_and_percent_decoding_parse() {
         assert_eq!(
@@ -4372,7 +4463,7 @@ mod tests {
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
             allowed_buckets: vec!["*".to_string()],
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             ..Default::default()
         });
         for url in [

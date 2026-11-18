@@ -105,33 +105,13 @@ fn data_uri(img: &DynamicImage) -> String {
     format!("data:image/jpeg;base64,{}", base64_encode(&bytes))
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Standard base64 with padding. (The crate carries no base64
-/// dependency; this is all the meta response needs.)
+/// Standard base64 with padding (RFC 4648, section 4), from the
+/// base64 crate (issue #737): the encoding of the placeholder's
+/// data URI and ThumbHash, and of the embeddings the meta
+/// response packs.
 pub fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0] as u32,
-            *chunk.get(1).unwrap_or(&0) as u32,
-            *chunk.get(2).unwrap_or(&0) as u32,
-        ];
-        let n = (b[0] << 16) | (b[1] << 8) | b[2];
-        out.push(BASE64[(n >> 18) as usize & 63] as char);
-        out.push(BASE64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            BASE64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            BASE64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 #[cfg(test)]
@@ -153,6 +133,75 @@ mod tests {
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64_encode(&[0xFF, 0xEE, 0xDD]), "/+7d");
+    }
+
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /// The encoder this module carried before issue #737, kept
+    /// as the oracle for the crate that replaced it.
+    fn base64_by_hand(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0] as u32,
+                *chunk.get(1).unwrap_or(&0) as u32,
+                *chunk.get(2).unwrap_or(&0) as u32,
+            ];
+            let n = (b[0] << 16) | (b[1] << 8) | b[2];
+            out.push(BASE64[(n >> 18) as usize & 63] as char);
+            out.push(BASE64[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                BASE64[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                BASE64[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn base64_matches_the_hand_written_encoder() {
+        // Issue #737: the base64 crate replaced the encoder
+        // above, and must write what it wrote. Random bytes at
+        // every length to 600, so each remainder mod 3 (no
+        // padding, two `=`, one `=`) comes up at least 200
+        // times; inputs of a megabyte at each remainder; every
+        // one- and two-byte input, which are the padded tails;
+        // and every byte value in each place of a full group.
+        let mut rng = crate::test_support::Rng::new(112);
+        let mut cases = 0;
+        let mut same = |data: &[u8]| {
+            assert!(
+                base64_encode(data) == base64_by_hand(data),
+                "{} bytes, starting {:02x?}",
+                data.len(),
+                &data[..data.len().min(8)]
+            );
+            cases += 1;
+        };
+        for len in 0..=600 {
+            same(&rng.bytes(len));
+        }
+        for len in [1 << 20, (1 << 20) + 1, (1 << 20) + 2] {
+            same(&rng.bytes(len));
+        }
+        for a in 0..=255u8 {
+            same(&[a]);
+            for b in 0..=255u8 {
+                same(&[a, b]);
+            }
+            for place in 0..3 {
+                let mut group = [0x5A; 3];
+                group[place] = a;
+                same(&group);
+            }
+        }
+        assert_eq!(cases, 601 + 3 + 256 * (1 + 256 + 3));
     }
 
     /// Minimal decoder for round-trip assertions.

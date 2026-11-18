@@ -15,6 +15,13 @@ members = ["crates/crabcrop-url"]
 crabcrop-url = { path = "crates/crabcrop-url", version = "0.13" }
 ab_glyph = "0.2"
 axum = "0.8"
+# Standard base64 with padding for the meta response: the
+# placeholder's data URI and ThumbHash, and packed embeddings
+# (issue #737), which a hand-written encoder wrote before.
+# 0.23 is the release crabcrop-url, c2pa and the HTTP clients
+# already bring into the tree, so it adds no crate (0.22 is
+# there too, for c2pa's older reqwest alone).
+base64 = "0.23"
 bytes = "1"
 # C2PA provenance (issue #173), pinned to the exact release:
 # 0.91.0 is the first release that enforces the spec's
@@ -28,6 +35,11 @@ bytes = "1"
 # authority can be reached. All c2pa contact lives in
 # src/provenance.rs.
 c2pa = { version = "=0.91.11", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
+# The CRC-32 of the PNG chunks crabcrop writes itself, the
+# interlaced file and the metadata it injects (issue #737),
+# which two hand-written table loops computed before. Already
+# in the tree through flate2 and png: it adds no crate.
+crc32fast = "1.5"
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
 # The shared purge walk reads entry headers a bounded number
@@ -168,6 +180,12 @@ zune-core = "0.5"
 # the turbojpeg crate.
 turbojpeg = { version = "1.5", default-features = false, features = ["cmake"] }
 webp = "0.3"
+# Secret-holding types zero their bytes when they are dropped:
+# the secret settings, the bucket credentials, the signing
+# keyring, and the keys derived from them. Already in the
+# tree through rustls, c2pa and the RustCrypto crates: it adds
+# no crate. Default features only (`alloc`).
+zeroize = "1"
 # GIF writes go through the gif crate directly (already in the
 # tree transitively via image) so quantization can swap from
 # NeuQuant to quantizr (issue #294): at 800x533, quantizr with

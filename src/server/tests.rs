@@ -10,7 +10,9 @@ mod disk_scan;
 mod disk_stall;
 mod meta_frame;
 mod request_log;
+mod shared_bounds;
 mod shared_state;
+mod upload_pace;
 
 const SECRET: &[u8] = b"test-secret";
 
@@ -254,7 +256,7 @@ fn providers_mut(state: &mut AppState) -> &mut Providers {
 fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
     AppState {
         allow_unsafe,
-        metrics_token,
+        metrics_token: metrics_token.map(Into::into),
         ..test_state()
     }
 }
@@ -8610,13 +8612,15 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
                 .unwrap(),
             )
         }),
+        // Signed with the fake's credentials: it refuses any
+        // request whose signature does not verify (issue #709).
         shared_store: Some(Arc::new(
             crate::s3store::S3Store::new(
                 "results".into(),
                 String::new(),
                 Some(endpoint.into()),
                 "us-east-1".into(),
-                None,
+                Some(crate::s3store::test_support::test_aws()),
                 crate::url::entry_key(b"disk-key-test"),
             )
             .unwrap(),
@@ -11522,7 +11526,7 @@ async fn slow_lane_overflow_waits_in_its_own_lane() {
 /// lane occupancy exposition can be read back.
 async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>) -> String {
     let state = AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         process_gate,
         slow_gate,
         ..test_state()
@@ -11578,7 +11582,7 @@ async fn metrics_expose_each_gates_occupancy() {
     // permits in use against their capacity the same way,
     // read live: holding permits by hand moves the gauges.
     let state = Arc::new(AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         ai_gate: Arc::new(Gate::new(3)),
         ..test_state()
     });
@@ -12556,7 +12560,7 @@ async fn spawn_app_with_upload_gate(
                 file_root: Some(dir.clone()),
                 ..Default::default()
             }),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         upload: Some(Arc::new(crate::upload::UploadStore::local(
             dir,
             max_bytes,
@@ -15287,7 +15291,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     let disk = state.store.clone().unwrap();
@@ -18037,7 +18041,7 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     // when a string was formatted for it.
     let dir = crate::test_support::scratch_dir("metrics-one-buffer");
     let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     state.request_log = RequestLog::queued_to(crate::observe::FakeStdout::default());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
@@ -18128,6 +18132,9 @@ crabcrop_cache_disk_groups_behind 0
 # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.
 # TYPE crabcrop_cache_disk_deletions_queued gauge
 crabcrop_cache_disk_deletions_queued 0
+# HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete or the boot scan failed to remove, left on disk out of the index.
+# TYPE crabcrop_cache_disk_unlinks_failed_total counter
+crabcrop_cache_disk_unlinks_failed_total 0
 # HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.
 # TYPE crabcrop_cache_shared_puts_in_flight gauge
 crabcrop_cache_shared_puts_in_flight 0
@@ -18137,6 +18144,16 @@ crabcrop_cache_shared_puts_capacity {puts}
 # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.
 # TYPE crabcrop_cache_shared_puts_skipped_total counter
 crabcrop_cache_shared_puts_skipped_total 0
+# HELP crabcrop_cache_shared_group_writes_waiting Shared tier group write-backs waiting for a write slot.
+# TYPE crabcrop_cache_shared_group_writes_waiting gauge
+crabcrop_cache_shared_group_writes_waiting 0
+# HELP crabcrop_cache_shared_group_writes_skipped_total Shared tier group write-backs skipped with as many waiting for a slot as may.
+# TYPE crabcrop_cache_shared_group_writes_skipped_total counter
+crabcrop_cache_shared_group_writes_skipped_total 0
+# HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.
+# TYPE crabcrop_cache_shared_refused_total counter
+crabcrop_cache_shared_refused_total{{request="lookup"}} 0
+crabcrop_cache_shared_refused_total{{request="purge"}} 0
 # HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.
 # TYPE crabcrop_cache_shared_tombstones_unread gauge
 crabcrop_cache_shared_tombstones_unread 0
@@ -18161,7 +18178,7 @@ async fn model_lock_recoveries_count_on_metrics() {
     // on stderr. `/metrics` shows it as a counter, which a
     // recovery moves.
     let state = Arc::new(AppState {
-        metrics_token: Some("metrics-token".to_string()),
+        metrics_token: Some("metrics-token".to_string().into()),
         ..test_state()
     });
     let base = serve_state(&state).await;
@@ -18211,7 +18228,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     let fake = crate::s3store::test_support::start_fake().await;
     fake.hold_puts.store(true, Ordering::SeqCst);
     let mut state = tier_test_state(None, &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let shared = state.shared_store.clone().unwrap();
     let base = serve_state(&state).await;
@@ -18818,7 +18835,7 @@ async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     state.shared_store = None;
     state.loader = loader;
     state.fallback = fallback;
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     serve_state(&state).await
 }

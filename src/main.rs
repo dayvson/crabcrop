@@ -23,8 +23,8 @@
 // importing them at the crate root lets every `crate::`
 // path in this file and in `config.rs` resolve to them.
 use crabcrop::{
-    ai, cache, cli, engine, frames, loader, observe, pdf, provenance, quality, s3store, server,
-    sigv4, storage, text, upload, url, video,
+    ai, cache, cli, credentials, engine, frames, loader, observe, pdf, provenance, quality,
+    s3store, server, sigv4, storage, text, upload, url, video,
 };
 
 /// Print one boot line on standard output, as `println!` does,
@@ -274,6 +274,19 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     );
     boot_line!("{}", config.connections_line());
     boot_line!("configuration fingerprint: {}", state.config_fingerprint);
+    // Credentials from the container endpoint (issue #709) are
+    // fetched before the first AWS request, the tombstone read
+    // below, and refreshed in the background from then on. The
+    // static keys need nothing here.
+    if let Some(creds) = &config.sources.aws_creds
+        && let Some(line) = creds.start().await
+    {
+        if line.starts_with("warning: ") {
+            eprintln!("{line}");
+        } else {
+            boot_line!("{line}");
+        }
+    }
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461). A slow or hanging
     // store holds the first request, and the listening line,
@@ -501,7 +514,9 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // and a secret rotation invalidates the old entries
     // rather than serving content authenticated under a
     // retired key.
-    let entry_key = crate::url::entry_key(&config.keyring.current);
+    // Each store keeps its own copy, zeroed when it is
+    // dropped, and this one is zeroed when boot is done with it.
+    let entry_key = zeroize::Zeroizing::new(crate::url::entry_key(&config.keyring.current));
     // Disk result storage, bounded by its own budget.
     let disk = match &config.result_storage {
         // A budget of 0 is no disk tier (issue #708): the
@@ -521,7 +536,7 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
             let store = crate::storage::DiskStore::start(
                 std::path::Path::new(&storage.dir),
                 storage.max_bytes,
-                entry_key.clone(),
+                entry_key.to_vec(),
             );
             let checked = store.wait_scan(store.boot_deadline(), |phase| {
                 *phase != crate::storage::ScanPhase::Checking
@@ -551,7 +566,7 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
                 config.sources.s3_endpoint.clone(),
                 config.sources.s3_region.clone(),
                 config.sources.aws_creds.clone(),
-                entry_key,
+                entry_key.to_vec(),
             )
             .map_err(|e| {
                 ConfigError::build(
@@ -768,7 +783,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         metrics_token: config
             .metrics_token
             .as_ref()
-            .map(|token| token.expose().to_string()),
+            .map(|token| zeroize::Zeroizing::new(token.expose().to_string())),
         cache: Arc::new(Cache::new(config.cache_bytes)),
         providers: Arc::new(Providers {
             removebg: ai.removebg,

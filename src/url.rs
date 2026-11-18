@@ -3290,7 +3290,11 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
 pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => crabcrop_url::verify(&purge_key(secret), hex_digest, target),
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(purge_key(secret)),
+            hex_digest,
+            target,
+        ),
     }
 }
 
@@ -3301,9 +3305,11 @@ pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool 
 pub fn verify_purge_group(secret: &[u8], signature: &Signature, group: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => {
-            crabcrop_url::verify(&purge_group_key(secret), hex_digest, group)
-        }
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(purge_group_key(secret)),
+            hex_digest,
+            group,
+        ),
     }
 }
 
@@ -3374,7 +3380,11 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
 pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => crabcrop_url::verify(&upload_key(secret), hex_digest, name),
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(upload_key(secret)),
+            hex_digest,
+            name,
+        ),
     }
 }
 
@@ -3390,8 +3400,9 @@ pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
 /// from any other forgery attempt.
 ///
 /// Its `Debug` prints the key IDs and redacts the keys
-/// (issue #455). It is not `PartialEq`: nothing compares
-/// rings, and a derived comparison of key bytes would not be
+/// (issue #455), and the keys are zeroed when it is dropped.
+/// It is not `PartialEq`: nothing compares rings, and a
+/// derived comparison of key bytes would not be
 /// constant-time.
 #[derive(Clone)]
 pub struct Keyring {
@@ -3399,6 +3410,23 @@ pub struct Keyring {
     pub current: Vec<u8>,
     pub previous: Option<(String, Vec<u8>)>,
 }
+
+impl zeroize::Zeroize for Keyring {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.current);
+        if let Some((_, previous)) = &mut self.previous {
+            zeroize::Zeroize::zeroize(previous);
+        }
+    }
+}
+
+impl Drop for Keyring {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Keyring {}
 
 impl std::fmt::Debug for Keyring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

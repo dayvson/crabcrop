@@ -21,7 +21,7 @@
 //! decode, no gates) and writes nothing anywhere.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -57,7 +57,10 @@ impl std::fmt::Debug for NamedDetector {
 }
 
 mod background;
-pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PUTS_AT_ONCE};
+pub use background::{
+    Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_GROUP_WRITES_WAITING,
+    SHARED_PUTS_AT_ONCE,
+};
 mod listen;
 pub use listen::{
     ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, RequestsInFlight,
@@ -109,8 +112,9 @@ pub struct AppState {
     /// The bearer token `/metrics` requires (issue #270),
     /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
     /// endpoint: it answers 403 rather than serving the
-    /// exposition unauthenticated.
-    pub metrics_token: Option<String>,
+    /// exposition unauthenticated. Zeroed when the state is
+    /// dropped.
+    pub metrics_token: Option<zeroize::Zeroizing<String>>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
     /// The provider and renderer handles (see
@@ -725,7 +729,31 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     source_buffer_metrics(&state, &mut out);
     source_lookup_metrics(&state, &mut out);
     tier_metrics(&state, &mut out);
+    upload_metrics(&state, &mut out);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+}
+
+/// The upload bucket's failed existence checks for `/metrics`
+/// (issue #709), with a bucket destination: a HEAD the bucket
+/// refused, failed or did not answer reads as no object, so a
+/// bucket that stops answering them shows here, not in an
+/// upload's answer. The upload bucket's store is not the shared
+/// tier, and does not count in its series.
+fn upload_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(failed) = state
+        .upload
+        .as_ref()
+        .and_then(|upload| upload.exists_checks_failed())
+    else {
+        return;
+    };
+    let _ = write!(
+        out,
+        "# HELP crabcrop_upload_exists_checks_failed_total Upload existence checks the upload bucket refused, failed or did not answer; each read as no object.\n\
+         # TYPE crabcrop_upload_exists_checks_failed_total counter\n\
+         crabcrop_upload_exists_checks_failed_total {failed}\n"
+    );
 }
 
 /// Per-lane occupancy for `/metrics` (issue #324): how
@@ -895,9 +923,11 @@ fn source_lookup_metrics(state: &AppState, out: &mut String) {
 /// stores count their own failures as they log them; the
 /// exposition reads the counters live at scrape time,
 /// one series per configured tier. With a shared tier, its
-/// write-through slots and skips follow (issue #463), then
-/// what its last complete listing of the purge tombstones
-/// found unread, and when that was (issue #577).
+/// write-through slots and skips follow (issue #463), the
+/// group write-backs waiting for a slot and skipped, and the
+/// requests the bucket refused (issue #709), then what its
+/// last complete listing of the purge tombstones found
+/// unread, and when that was (issue #577).
 fn tier_metrics(state: &AppState, out: &mut String) {
     use std::fmt::Write as _;
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
@@ -930,8 +960,12 @@ fn tier_metrics(state: &AppState, out: &mut String) {
              crabcrop_cache_disk_groups_behind {behind}\n\
              # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.\n\
              # TYPE crabcrop_cache_disk_deletions_queued gauge\n\
-             crabcrop_cache_disk_deletions_queued {deletions}\n",
-            store.ops_in_flight()
+             crabcrop_cache_disk_deletions_queued {deletions}\n\
+             # HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete or the boot scan failed to remove, left on disk out of the index.\n\
+             # TYPE crabcrop_cache_disk_unlinks_failed_total counter\n\
+             crabcrop_cache_disk_unlinks_failed_total {}\n",
+            store.ops_in_flight(),
+            store.unlinks_failed()
         );
     }
     if let Some(store) = &state.shared_store {
@@ -949,11 +983,35 @@ fn tier_metrics(state: &AppState, out: &mut String) {
              crabcrop_cache_shared_puts_capacity {}\n\
              # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.\n\
              # TYPE crabcrop_cache_shared_puts_skipped_total counter\n\
-             crabcrop_cache_shared_puts_skipped_total {}\n",
+             crabcrop_cache_shared_puts_skipped_total {}\n\
+             # HELP crabcrop_cache_shared_group_writes_waiting Shared tier group write-backs waiting for a write slot.\n\
+             # TYPE crabcrop_cache_shared_group_writes_waiting gauge\n\
+             crabcrop_cache_shared_group_writes_waiting {}\n\
+             # HELP crabcrop_cache_shared_group_writes_skipped_total Shared tier group write-backs skipped with as many waiting for a slot as may.\n\
+             # TYPE crabcrop_cache_shared_group_writes_skipped_total counter\n\
+             crabcrop_cache_shared_group_writes_skipped_total {}\n",
             background.puts_in_flight(),
             background.put_capacity(),
-            background.puts_skipped()
+            background.puts_skipped(),
+            background.group_writes_waiting(),
+            background.group_writes_skipped()
         );
+        // The requests the bucket refused (issue #709): a
+        // lookup answered with an error that is neither a 404
+        // nor a store failure, and a purge read or delete
+        // refused.
+        out.push_str(
+            "# HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.\n\
+             # TYPE crabcrop_cache_shared_refused_total counter\n",
+        );
+        for kind in crate::s3store::Refused::ALL {
+            let _ = writeln!(
+                out,
+                "crabcrop_cache_shared_refused_total{{request=\"{}\"}} {}",
+                kind.label(),
+                store.refused(kind)
+            );
+        }
         // The tombstone gap (issue #577): the unread count
         // stays as of the last complete listing, so a listing
         // time that stops moving is the sign of a failing
@@ -1465,10 +1523,13 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// inline (issue #368): the shared walk reads one entry
 /// header per object (a bounded number at a time, issue
 /// #462), so its inline cost must not grow with the whole
-/// bucket. A walk that outgrows the budget finishes in a
-/// background task, waiting for one of the
-/// [`crate::s3store::PURGE_WALKS_AT_ONCE`] turns, and logs
-/// its own count on completion. Correctness does not wait
+/// bucket. Nor does its listing (issue #709): the request
+/// lists one page, of no more names than this. A walk that
+/// outgrows the budget finishes in a background task,
+/// waiting for one of the
+/// [`crate::s3store::PURGE_WALKS_AT_ONCE`] turns with the
+/// listing's continuation token, and logs its own count on
+/// completion. Correctness does not wait
 /// for it: the generation tombstone keeps writes begun
 /// before the purge out (issue #350), and the purge's
 /// stamped tombstone, here and in the bucket, makes every
@@ -2108,13 +2169,40 @@ async fn upload_log(log: &RequestLog, name: &str, outcome: &str) {
     .await;
 }
 
+/// How long an upload body may take before its pace counts:
+/// the body must arrive within this long plus one second for
+/// every [`crate::loader::MIN_BODY_RATE`] bytes (64 KiB) it
+/// has delivered (see [`upload_body_due`]).
+pub const UPLOAD_BODY_GRACE: Duration = Duration::from_secs(10);
+
+/// When an upload body whose read started at `started`, and
+/// which has delivered `received` bytes, must have delivered
+/// more: [`UPLOAD_BODY_GRACE`] plus one second per
+/// [`crate::loader::MIN_BODY_RATE`] bytes, plus `waited`, the
+/// time the server itself spent waiting for budget. A body
+/// that keeps 64 KiB a second after the grace never meets
+/// it, and one that trickles or stalls does, so a client
+/// cannot hold its connection and its budget for longer than
+/// the body's own size accounts for: a body at the 10 MiB
+/// default cap is done within 10 + 160 seconds, plus the
+/// budget wait.
+fn upload_body_due(
+    started: tokio::time::Instant,
+    received: usize,
+    waited: Duration,
+) -> tokio::time::Instant {
+    let paced = (received as u64).saturating_mul(1000) / crate::loader::MIN_BODY_RATE as u64;
+    started + UPLOAD_BODY_GRACE + Duration::from_millis(paced) + waited
+}
+
 /// Read an upload body of at most `cap` bytes, charging it
 /// to `charge` as it arrives (issue #403), in steps so a
 /// trickling client does not touch the budget per frame.
 /// [`LoadError::TooLarge`] past the cap,
-/// [`LoadError::Network`] for an unreadable body, and
-/// [`LoadError::Busy`] when the request's wait for budget
-/// ran out.
+/// [`LoadError::Network`] for an unreadable body,
+/// [`LoadError::Timeout`] for a body that falls behind
+/// [`upload_body_due`], and [`LoadError::Busy`] when the
+/// request's wait for budget ran out.
 async fn read_upload_body(
     mut body: axum::body::Body,
     cap: usize,
@@ -2122,10 +2210,17 @@ async fn read_upload_body(
 ) -> Result<Vec<u8>, LoadError> {
     use axum::body::HttpBody as _;
     const STEP: usize = 256 * 1024;
+    let started = tokio::time::Instant::now();
+    let mut waited = Duration::ZERO;
     let mut out = Vec::new();
-    while let Some(frame) =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
-    {
+    loop {
+        let due = upload_body_due(started, out.len(), waited);
+        let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx));
+        let frame = match tokio::time::timeout_at(due, next).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => return Err(LoadError::Timeout),
+        };
         let frame = frame.map_err(|e| LoadError::Network(e.to_string()))?;
         let Ok(data) = frame.into_data() else {
             continue;
@@ -2135,7 +2230,9 @@ async fn read_upload_body(
             return Err(LoadError::TooLarge { limit: cap as u64 });
         }
         let step = received.div_ceil(STEP).saturating_mul(STEP);
+        let waiting = tokio::time::Instant::now();
         charge.grow_to(step.min(cap).max(received)).await?;
+        waited += waiting.elapsed();
         out.extend_from_slice(&data);
     }
     charge.shrink_to(out.len());
@@ -2588,6 +2685,22 @@ async fn read_upload(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "upload_too_large",
                     format!("upload exceeds the {max_bytes}-byte limit"),
+                ),
+            ));
+        }
+        Err(LoadError::Timeout) => {
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:too-slow",
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    "upload_too_slow",
+                    format!(
+                        "upload body arrived too slowly: it may take {} seconds plus one second \
+                         for every {} KiB it sends",
+                        UPLOAD_BODY_GRACE.as_secs(),
+                        crate::loader::MIN_BODY_RATE / 1024
+                    ),
                 ),
             ));
         }
@@ -3793,6 +3906,7 @@ async fn run_flight(
                             &pending.key,
                             &pending.entry,
                             pending.claim,
+                            false,
                         )
                         .await;
                     }
@@ -4172,11 +4286,14 @@ fn promote_memory_tier(
 
 /// What a learn tells the disk tier about the bucket copy,
 /// given how its write went (issue #572): only a write that
-/// was spawned, or is queued, carries the groups.
+/// was spawned, or is queued, carries the groups, and one
+/// skipped past the waiting cap leaves the bucket copy without
+/// them (issue #709).
 fn bucket_for(sent: Sent, groups: &[String]) -> crate::storage::Bucket<'_> {
     match sent {
         Sent::Spawned => crate::storage::Bucket::Carries(groups),
         Sent::Skipped => crate::storage::Bucket::Skipped,
+        Sent::Owed => crate::storage::Bucket::Lacks,
         Sent::Nothing => crate::storage::Bucket::Unknown,
     }
 }
@@ -4310,13 +4427,17 @@ fn begin_disk_write(
 /// runs to its end on its thread. The write lands with every
 /// group learned meanwhile, and the reconcile after it checks
 /// those under the write's own snapshot: a purge that lands
-/// while the write is in flight wins.
+/// while the write is in flight wins. With `owes`, the bucket
+/// copy lacks some of the entry's groups, because its group
+/// write-back was skipped (issue #709): the new record owes
+/// them, and its first hit sends them.
 async fn finish_disk_write(
     state: &AppState,
     snapshot: u64,
     key: &str,
     entry: &CachedImage,
     claim: crate::storage::WriteClaim,
+    owes: bool,
 ) {
     let Some(store) = state.store.clone() else {
         return;
@@ -4337,9 +4458,13 @@ async fn finish_disk_write(
         if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
             return;
         }
-        if let Some(landed) = store.land(claim, &entry)
-            && guard.write_covered(snapshot, &key, &landed.groups, entry.written)
-        {
+        let Some(landed) = store.land(claim, &entry) else {
+            return;
+        };
+        if owes {
+            store.owe_shared(&key, landed.id);
+        }
+        if guard.write_covered(snapshot, &key, &landed.groups, entry.written) {
             // Queued, not deleted inline: a failed delete is
             // retried, and the purge holds its tombstones for it
             // (see `DiskStore::forget_if`).
@@ -4394,11 +4519,16 @@ enum SharedWrite {
 /// backlog, a [`SharedWrite::Render`] is skipped and counted
 /// on /metrics: the local tiers hold the entry, so the cost
 /// is a render on the next replica that misses. A
-/// [`SharedWrite::Groups`] write-back is never skipped: it
-/// waits for a slot in its own task. One for the same copy,
-/// snapshot and groups as one already queued is not spawned
-/// again (issue #572): the queued one carries them, so a
-/// stall cannot queue one per request.
+/// [`SharedWrite::Groups`] write-back waits for a slot in its
+/// own task. One for the same copy, snapshot and groups as
+/// one already queued is not spawned again (issue #572): the
+/// queued one carries them, so a stall cannot queue one per
+/// request. And at most
+/// [`SHARED_GROUP_WRITES_WAITING`] wait (issue
+/// #709): past them a write-back is skipped and counted on
+/// /metrics, and comes back [`Sent::Owed`], so the disk tier
+/// records that the bucket copy lacks the groups and its next
+/// hit sends them again.
 fn spawn_shared_put(
     state: &AppState,
     snapshot: u64,
@@ -4422,8 +4552,9 @@ fn spawn_shared_put(
             None => return Sent::Skipped,
         },
         SharedWrite::Groups => match state.background.queue_groups_write(key, snapshot, &entry) {
-            Some(queued) => (None, Some(queued)),
-            None => return Sent::Spawned,
+            background::GroupsQueued::Queued(queued, slot) => (slot, Some(queued)),
+            background::GroupsQueued::Carried => return Sent::Spawned,
+            background::GroupsQueued::Skipped => return Sent::Owed,
         },
     };
     let background = state.background.clone();
@@ -4432,7 +4563,7 @@ fn spawn_shared_put(
     // The handle is dropped: the write is detached, and
     // tracked for the shutdown drain.
     let _detached = state.background.spawn(async move {
-        let _queued = queued;
+        let mut queued = queued;
         let _slot = match slot {
             Some(slot) => slot,
             None => match background.wait_put_slot().await {
@@ -4440,6 +4571,9 @@ fn spawn_shared_put(
                 None => return,
             },
         };
+        if let Some(queued) = &mut queued {
+            queued.got_slot();
+        }
         // Checked again with the slot held: a purge can begin
         // while the write waits for one.
         if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
@@ -4465,6 +4599,9 @@ enum Sent {
     /// A render's write-through found every slot taken (issue
     /// #463).
     Skipped,
+    /// A group write-back found as many waiting as may (issue
+    /// #709): the bucket copy lacks its groups.
+    Owed,
     /// Nothing to write: no shared tier, or a purge covers the
     /// copy.
     Nothing,
@@ -4777,7 +4914,9 @@ async fn lookup_tiers_within(
         let sent = if adds_groups(&image.groups, &wanted) {
             image.groups = crate::cache::union_groups(&image.groups, &wanted);
             // Off the response path, like the write-through
-            // put, but never skipped.
+            // put, and skipped only past the waiting cap
+            // (issue #709), which the disk write below records
+            // as a debt.
             spawn_shared_put(
                 state,
                 snapshot,
@@ -4802,7 +4941,15 @@ async fn lookup_tiers_within(
         let took = promote_memory_tier(state, snapshot, cache_key, &image);
         teach_slower_tiers(state, snapshot, cache_key, &image, took);
         if let Some(claim) = disk {
-            finish_disk_write(state, snapshot, cache_key, &image, claim).await;
+            finish_disk_write(
+                state,
+                snapshot,
+                cache_key,
+                &image,
+                claim,
+                sent == Sent::Owed,
+            )
+            .await;
         }
         return Some((image, "crabcrop; hit; detail=\"shared\""));
     }
@@ -4851,11 +4998,15 @@ async fn lookup_disk_tier(
     }
     let hit = store.learn_hit(&key, id, &groups)?;
     image.groups = hit.groups;
-    if hit.grew || hit.owed {
-        // The record grew, or a skipped render write left the
-        // bucket copy without some of its groups: the shared
-        // tier's copy learns them (issue #350).
-        spawn_shared_put(&state, snapshot, &key, image.clone(), SharedWrite::Groups);
+    if (hit.grew || hit.owed)
+        // The record grew, or a skipped write left the bucket
+        // copy without some of its groups: the shared tier's
+        // copy learns them (issue #350). A write-back skipped
+        // past the waiting cap leaves the debt with the record
+        // again, for the next hit (issue #709).
+        && spawn_shared_put(&state, snapshot, &key, image.clone(), SharedWrite::Groups) == Sent::Owed
+    {
+        store.owe_shared(&key, id);
     }
     if hit.grew
         && state
@@ -5642,7 +5793,7 @@ async fn populate_tiers(
         });
         return;
     }
-    finish_disk_write(state, snapshot, cache_key, &entry, claim).await;
+    finish_disk_write(state, snapshot, cache_key, &entry, claim, false).await;
 }
 
 /// The meta document for a render: the annotation sections

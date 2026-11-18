@@ -40,12 +40,27 @@
 //! write, never a failed request, because a cache must not
 //! take the pipeline down with it. Requests are signed with
 //! SigV4 exactly like the source loader's (`sigv4`), with the
-//! same credentials: `AWS_ACCESS_KEY_ID` and
-//! `AWS_SECRET_ACCESS_KEY`, plus the optional
-//! `AWS_SESSION_TOKEN`, read once from the environment at
-//! startup (no credential chain is consulted). With no
-//! credentials the requests go unsigned, for local
-//! S3-compatible development stores.
+//! same credentials (see [`crate::credentials`]): the static
+//! `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, plus the
+//! optional `AWS_SESSION_TOKEN`, read once from the
+//! environment at startup, or, with those unset, the
+//! container credentials endpoint's, refreshed before each
+//! expiry (issue #709). With no credentials the requests go
+//! unsigned, for local S3-compatible development stores.
+//!
+//! A refusal is not a miss (issue #709): a lookup or an
+//! existence check the store answers with an error other than
+//! `404`, and a purge read or delete it refuses, count on
+//! /metrics by request and in the tier's errors, and are
+//! logged at most one line every 10 seconds. A purge walk that
+//! meets a refusal has not judged that object, so its purge's
+//! tombstone stays in force.
+//!
+//! Walks list the bucket a page at a time (issue #709): one
+//! page of at most [`LIST_PAGE_KEYS`] names, judged before the
+//! next is listed, so what a walk holds, and what a walk
+//! waiting for its turn keeps, is a page and a continuation
+//! token, whatever the bucket holds.
 //!
 //! Every request is bounded (issue #550), by a rule that
 //! scales with the bytes it moves instead of one fixed
@@ -60,10 +75,11 @@ use sha2::{Digest, Sha256};
 use crate::cache::{
     ActivePurge, CachedImage, PurgeCutoff, PurgeGuard, PurgeTarget, Tombstone, now_ms,
 };
-use crate::sigv4::{self, Credentials};
+use crate::credentials::AwsCredentials;
+use crate::sigv4;
 use crate::storage::{
-    HeaderProbe, MAX_ENTRY_BYTES, MAX_TOMBSTONE_BYTES, key_stem, parse_entry, parse_entry_header,
-    parse_tombstone, serialize_entry, serialize_tombstone,
+    HeaderProbe, MAX_ENTRY_BYTES, MAX_TOMBSTONE_BYTES, StallLog, key_stem, parse_entry,
+    parse_entry_header, parse_tombstone, serialize_entry, serialize_tombstone,
 };
 
 /// The sub-prefix purge tombstones live under (issue #461),
@@ -117,12 +133,14 @@ pub const PURGE_READS_AT_ONCE: usize = 16;
 
 /// How many purge walks run in the background at once
 /// (issue #462); the others wait their turn, first come
-/// first served. A walk lists the whole prefix and reads
-/// every entry header, so walks side by side only split
-/// the store's request rate between them, while each one
-/// keeps its purge running (its tombstone open) until it
-/// ends. A purge's inline part (issue #368) is bounded on
-/// its own and never waits for a turn (see
+/// first served. A walk lists the whole prefix, a page at a
+/// time (issue #709), and reads every entry header, so walks
+/// side by side only split the store's request rate between
+/// them, while each one keeps its purge running (its
+/// tombstone open) until it ends. A walk waiting for its
+/// turn holds a continuation token, not the listing. A
+/// purge's inline part (issue #368) is bounded on its own and
+/// never waits for a turn (see
 /// [`PURGE_INLINE_READS_AT_ONCE`]).
 pub const PURGE_WALKS_AT_ONCE: usize = 2;
 
@@ -177,6 +195,47 @@ fn transfer_budget(bytes: u64) -> Duration {
     STORE_TIMEOUT + Duration::from_millis(bytes.saturating_mul(1000) / STORE_MIN_RATE)
 }
 
+/// A request body and the lower-case hex SHA-256 its
+/// signature names (`x-amz-content-sha256`).
+struct Payload {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl Payload {
+    /// No body: the digest of nothing is a constant (issue
+    /// #644).
+    fn empty() -> Self {
+        Payload {
+            bytes: Vec::new(),
+            sha256: sigv4::EMPTY_PAYLOAD_SHA256.to_string(),
+        }
+    }
+
+    /// `bytes` with their digest, taken here.
+    fn hashed(bytes: Vec<u8>) -> Self {
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        Payload { bytes, sha256 }
+    }
+
+    /// `bytes` with their digest, taken on the blocking pool
+    /// when they pass [`INLINE_HASH_BYTES`] (issue #709): a
+    /// body can be a 512 MiB entry or a 1 GiB upload. The
+    /// digest is the same either way. `None` when that task
+    /// did not report (the runtime is shutting down).
+    async fn of(bytes: Vec<u8>) -> Option<Self> {
+        if bytes.is_empty() {
+            return Some(Self::empty());
+        }
+        if bytes.len() <= INLINE_HASH_BYTES {
+            return Some(Self::hashed(bytes));
+        }
+        tokio::task::spawn_blocking(move || Self::hashed(bytes))
+            .await
+            .ok()
+    }
+}
+
 /// How [`S3Store::send`] bounds one request (issue #550).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bound {
@@ -191,6 +250,67 @@ enum Bound {
     /// the caller reads the body under the budget of its
     /// declared length ([`read_capped_at`]).
     ObjectRead,
+}
+
+/// The most names one listing page asks for: S3's own cap,
+/// and its default (issue #709). A purge walk judges a page
+/// before it lists the next.
+pub const LIST_PAGE_KEYS: usize = 1000;
+
+/// The most of a listing page's body a walk reads: a page of
+/// [`LIST_PAGE_KEYS`] names of S3's longest, 1024 bytes, each
+/// of which the XML may spell in as many as six (`&quot;`),
+/// is about 6.6 MB with the rest of each entry's fields.
+const LIST_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// How much of an error answer's body a lookup reads for its
+/// error code (issue #709): S3 puts `<Code>` first, and the
+/// rest of a document can run past this, as a
+/// `SignatureDoesNotMatch` that spells out a canonical request
+/// with a session token does.
+const REFUSAL_BODY_BYTES: usize = 4 * 1024;
+
+/// A body past this many bytes is hashed on the blocking
+/// pool, not on a runtime worker (issue #709): SHA-256 runs at
+/// a few hundred MB a second, so a large entry or upload held
+/// a worker for as long as a second, and every task queued on
+/// it waited. Below it, the hash takes tens of microseconds,
+/// less than the hand-off.
+const INLINE_HASH_BYTES: usize = 16 * 1024;
+
+/// What the requests a rate-limited line leaves out are, after
+/// their count (issue #709).
+const REFUSAL_LOG_REST: &str = "refused or failed requests";
+
+/// The kinds of shared-tier request a refusal counts under
+/// (issue #709), as `crabcrop_cache_shared_refused_total{request}`.
+/// A refusal is an error answer that is not a store failure
+/// (see [`store_failed`]) and not one that says there is
+/// nothing to act on, such as a `404`: the `403` of
+/// credentials the bucket does not honor, say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// A lookup's GET.
+    Lookup,
+    /// A purge walk's read of an entry header, or its delete
+    /// of a covered copy.
+    Purge,
+}
+
+impl Refused {
+    pub const ALL: [Refused; 2] = [Refused::Lookup, Refused::Purge];
+
+    /// The `request` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Refused::Lookup => "lookup",
+            Refused::Purge => "purge",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// The outcome of a conditional raw write
@@ -222,14 +342,15 @@ pub struct S3Store {
     prefix: String,
     endpoint: Option<String>,
     region: String,
-    creds: Option<Credentials>,
+    creds: Option<AwsCredentials>,
     /// The cache entry MAC key, derived from the server
     /// secret (issue #190): entries are written and
     /// verified under it, so an object planted in the
     /// bucket by anyone without the secret is a miss.
     /// Inert for the raw-object path (`put_raw`/`get_raw`
     /// store uploads verbatim, with no entry framing).
-    entry_key: Vec<u8>,
+    /// Zeroed when the store is dropped.
+    entry_key: zeroize::Zeroizing<Vec<u8>>,
     /// Largest object an entry read will buffer. Objects in
     /// the shared bucket are operator-adjacent data, not
     /// fully trusted input: a planted oversized object must
@@ -278,6 +399,23 @@ pub struct S3Store {
     /// visible in the logs and on /metrics instead of
     /// failing silently forever.
     errors: std::sync::atomic::AtomicU64,
+    /// Requests the store refused, by [`Refused`] kind (issue
+    /// #709): a lookup's also counts in `errors`, and a purge
+    /// walk's in the one error its pass counts.
+    refused: [std::sync::atomic::AtomicU64; 2],
+    /// Existence checks that failed (issue #709): refused, a
+    /// store failure, or no answer. Each also counts in
+    /// `errors`. Only the upload bucket's store makes them.
+    exists_failed: std::sync::atomic::AtomicU64,
+    /// What the store's log lines start with: `shared storage`
+    /// for the result tier, `upload storage` for the upload
+    /// bucket (see [`S3Store::logging_as`]).
+    tier: &'static str,
+    /// The rate limit on the lines refused, failed and
+    /// unanswered lookups and existence checks log (issue
+    /// #709): a store that refuses every lookup refuses one
+    /// per request.
+    refusal_log: StallLog,
 }
 
 impl std::fmt::Debug for S3Store {
@@ -295,6 +433,9 @@ impl std::fmt::Debug for S3Store {
             .field("entry_key", &crate::redact::Redacted)
             .field("max_entry_bytes", &self.max_entry_bytes)
             .field("errors", &self.errors)
+            .field("refused", &self.refused)
+            .field("exists_failed", &self.exists_failed)
+            .field("tier", &self.tier)
             .finish()
     }
 }
@@ -310,7 +451,7 @@ impl S3Store {
         prefix: String,
         endpoint: Option<String>,
         region: String,
-        creds: Option<Credentials>,
+        creds: Option<AwsCredentials>,
         entry_key: Vec<u8>,
     ) -> Result<Self, reqwest::Error> {
         let trimmed = prefix.trim_matches('/');
@@ -335,7 +476,7 @@ impl S3Store {
             endpoint,
             region,
             creds,
-            entry_key,
+            entry_key: zeroize::Zeroizing::new(entry_key),
             tombstones: std::sync::Mutex::new(HashMap::new()),
             tombstones_unread: std::sync::atomic::AtomicU64::new(0),
             tombstones_listed_ms: std::sync::atomic::AtomicU64::new(0),
@@ -345,7 +486,21 @@ impl S3Store {
             inline_reads: tokio::sync::Semaphore::new(PURGE_INLINE_READS_AT_ONCE),
             max_entry_bytes: MAX_ENTRY_BYTES,
             errors: std::sync::atomic::AtomicU64::new(0),
+            refused: Default::default(),
+            exists_failed: std::sync::atomic::AtomicU64::new(0),
+            tier: "shared storage",
+            refusal_log: StallLog::for_tier("shared storage", REFUSAL_LOG_REST),
         })
+    }
+
+    /// The store with its log lines starting `tier` instead of
+    /// `shared storage`: the upload bucket's store is not the
+    /// shared result tier, and its lines must not read as if it
+    /// were (issue #709).
+    pub fn logging_as(mut self, tier: &'static str) -> Self {
+        self.tier = tier;
+        self.refusal_log = StallLog::for_tier(tier, REFUSAL_LOG_REST);
+        self
     }
 
     /// Tier failures so far (issue #367), surfaced on
@@ -382,7 +537,78 @@ impl S3Store {
     fn note_errors(&self, count: u64, what: &str, detail: &str) {
         self.errors
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("shared storage: {what}: {detail}");
+        eprintln!("{}: {what}: {detail}", self.tier);
+    }
+
+    /// Requests of `kind` the store has refused so far (issue
+    /// #709), surfaced on /metrics as
+    /// `crabcrop_cache_shared_refused_total`.
+    pub fn refused(&self, kind: Refused) -> u64 {
+        self.refused[kind.index()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Existence checks that failed so far (issue #709): the
+    /// upload bucket's store surfaces them on /metrics as
+    /// `crabcrop_upload_exists_checks_failed_total`.
+    pub fn exists_checks_failed(&self) -> u64 {
+        self.exists_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count and log one refusal of a request of `kind` (issue
+    /// #709): `status`, and the error code the store gave, if
+    /// it gave one. A refused lookup counts in the tier's
+    /// errors too, as one that got no answer does; a purge
+    /// walk's refusals count there once per pass, with its
+    /// other failures (see [`S3Store::note_pass`]).
+    fn note_refused(
+        &self,
+        kind: Refused,
+        what: &str,
+        status: reqwest::StatusCode,
+        code: Option<&str>,
+    ) {
+        self.refused[kind.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if kind != Refused::Purge {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.log_answer("refused", what, status, code);
+    }
+
+    /// Count and log one request the store answered with a
+    /// store failure (issue #709): a server error, throttling
+    /// or a timeout (see [`store_failed`]). It counts in the
+    /// tier's errors, not among the refusals.
+    fn note_failed(&self, what: &str, status: reqwest::StatusCode, code: Option<&str>) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.log_answer("failed", what, status, code);
+    }
+
+    /// Log `the store <verb> <what>: <status> (<code>)` like the
+    /// disk tier's stalls: the first at once, then at most one
+    /// line every 10 seconds with a count of the rest.
+    fn log_answer(&self, verb: &str, what: &str, status: reqwest::StatusCode, code: Option<&str>) {
+        let line = match code {
+            Some(code) => format!("the store {verb} {what}: {status} ({code})"),
+            None => format!("the store {verb} {what}: {status}"),
+        };
+        if let Some(line) = self.refusal_log.note_now(&line) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Count and log, at the same rate, one request the store
+    /// did not answer (issue #709).
+    fn note_unanswered(&self, what: &str) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(line) = self.refusal_log.note_now(&format!(
+            "cannot reach the store for {what}: transport error"
+        )) {
+            eprintln!("{line}");
+        }
     }
 
     /// Read a response body under the entry size ceiling,
@@ -429,11 +655,12 @@ impl S3Store {
         body: Vec<u8>,
         extra_headers: &[(&str, &str)],
     ) -> Option<reqwest::Response> {
+        let payload = Payload::of(body).await?;
         self.send(
             method,
             object_key,
             query,
-            body,
+            payload,
             extra_headers,
             Bound::Exchange,
         )
@@ -454,7 +681,7 @@ impl S3Store {
             "GET",
             object_key,
             &[],
-            Vec::new(),
+            Payload::empty(),
             extra_headers,
             Bound::ObjectRead,
         )
@@ -468,7 +695,7 @@ impl S3Store {
         method: &str,
         object_key: &str,
         query: &[(&str, &str)],
-        body: Vec<u8>,
+        payload: Payload,
         extra_headers: &[(&str, &str)],
         bound: Bound,
     ) -> Option<reqwest::Response> {
@@ -492,14 +719,13 @@ impl S3Store {
             url_string = format!("{url_string}?{}", qs.join("&"));
         }
         let url = reqwest::Url::parse(&url_string).ok()?;
-        // A read sends no body, and the digest of nothing is
-        // a constant (issue #644): only a write hashes its
-        // payload.
-        let payload_hash = if body.is_empty() {
-            sigv4::EMPTY_PAYLOAD_SHA256.to_string()
-        } else {
-            hex::encode(Sha256::digest(&body))
-        };
+        // The caller hashed the body (see `Payload`): a read's
+        // digest is the constant of nothing (issue #644), and a
+        // large write's was taken off the runtime (issue #709).
+        let Payload {
+            bytes: body,
+            sha256: payload_hash,
+        } = payload;
         let verb = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
         // A body goes out on the client without a read
         // timeout, under its own budget (issue #550).
@@ -518,7 +744,9 @@ impl S3Store {
         for (name, value) in extra_headers {
             request = request.header(*name, *value);
         }
-        if let Some(creds) = &self.creds {
+        // The credentials in force now: a container source's
+        // refresh replaces them before they expire (issue #709).
+        if let Some(creds) = self.creds.as_ref().and_then(AwsCredentials::current) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -537,7 +765,7 @@ impl S3Store {
                 sign_headers.push(("x-amz-security-token", token.as_str()));
             }
             let authorization = sigv4::authorization(
-                creds,
+                &creds,
                 &sigv4::SignRequest {
                     method,
                     path: url.path(),
@@ -563,7 +791,11 @@ impl S3Store {
     /// entry, transport error) is a miss. A transport failure
     /// is counted and logged (issue #367): a missing object
     /// is an ordinary miss, but a store that cannot be
-    /// reached at all must not look like one.
+    /// reached at all must not look like one. Neither must
+    /// one that refuses (issue #709): any answer but a success
+    /// or a `404`, such as the `403` of expired or missing
+    /// credentials, is counted as a refused lookup and logged
+    /// with the store's error code, at a limited rate.
     pub async fn get(&self, key: &str) -> Option<CachedImage> {
         self.get_tagged(key).await.map(|(image, _)| image)
     }
@@ -582,7 +814,17 @@ impl S3Store {
                 return None;
             }
         };
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return None;
+        }
+        if !status.is_success() {
+            let code = refusal_code(resp, started).await;
+            if store_failed(status) {
+                self.note_failed("a lookup", status, code.as_deref());
+            } else {
+                self.note_refused(Refused::Lookup, "a lookup", status, code.as_deref());
+            }
             return None;
         }
         let etag = response_etag(&resp);
@@ -613,8 +855,14 @@ impl S3Store {
     /// counted and logged (issue #367).
     pub async fn put(&self, key: &str, image: &CachedImage) {
         let object = self.object_key(&key_stem(key));
-        let data = serialize_entry(key, image, &self.entry_key);
-        match self.request("PUT", &object, &[], data).await {
+        let Some(payload) = self.entry_payload(key, image).await else {
+            self.note_error("cannot store an entry", "its serialization task failed");
+            return;
+        };
+        let sent = self
+            .send("PUT", &object, &[], payload, &[], Bound::Exchange)
+            .await;
+        match sent {
             Some(resp) if resp.status().is_success() => {}
             Some(resp) => self.note_error(
                 "cannot store an entry",
@@ -622,6 +870,28 @@ impl S3Store {
             ),
             None => self.note_error("cannot store an entry", "transport error"),
         }
+    }
+
+    /// `image` serialized as the entry for `key`, with the
+    /// hash its write signs (issue #709). Serializing copies
+    /// and MACs every byte, and hashing reads them all again,
+    /// so a large image does both on the blocking pool, off
+    /// the runtime worker. `None` when that task did not report
+    /// (the runtime is shutting down).
+    async fn entry_payload(&self, key: &str, image: &CachedImage) -> Option<Payload> {
+        if image.bytes.len() <= INLINE_HASH_BYTES {
+            return Some(Payload::hashed(serialize_entry(
+                key,
+                image,
+                &self.entry_key,
+            )));
+        }
+        let (key, image, entry_key) = (key.to_string(), image.clone(), self.entry_key.clone());
+        tokio::task::spawn_blocking(move || {
+            Payload::hashed(serialize_entry(&key, &image, &entry_key))
+        })
+        .await
+        .ok()
     }
 
     /// Delete the single entry stored under `key`, if any:
@@ -727,32 +997,38 @@ impl S3Store {
         }
     }
 
-    /// Every entry object under the store prefix, following
-    /// continuation tokens: the purge walk's input, and
-    /// whether the listing ran to its end. An error yields
-    /// what was listed so far (possibly nothing), and is
-    /// counted and logged: the walk then cannot have reached
-    /// every copy (issue #462).
+    /// One page of the entry objects under the store prefix,
+    /// from `token` (`None`: the first page), of at most
+    /// `max_keys` names when given and the store's page
+    /// otherwise: the purge walk's input, a page at a time
+    /// (issue #709). `None` when the store did not list it.
     ///
-    /// The listing holds every object under the prefix, but
-    /// only names of the entry form are kept (see
+    /// A page lists every object under the prefix, but only
+    /// names of the entry form are kept (see
     /// [`S3Store::is_entry_object`]). Tombstones (issue
     /// #461), raw uploads, and the objects of a deployment
     /// whose prefix sits inside this one are never read
     /// (issue #608). The names are filtered here, not with a
     /// `delimiter` in the request, so this works on every
     /// S3-compatible store.
-    async fn list_objects(&self) -> (Vec<String>, bool) {
-        let (listed, complete) = self.list_under(&self.prefix).await;
-        if !complete {
-            self.note_error("purge walk", "listing the bucket failed");
-        }
-        let objects = listed
+    async fn list_entry_page(
+        &self,
+        token: Option<&str>,
+        max_keys: Option<usize>,
+    ) -> Option<EntryPage> {
+        let page = self.list_page(&self.prefix, token, max_keys).await?;
+        let listed = page.entries.len();
+        let objects = page
+            .entries
             .into_iter()
             .map(|(key, _)| key)
             .filter(|key| self.is_entry_object(key))
             .collect();
-        (objects, complete)
+        Some(EntryPage {
+            objects,
+            listed,
+            next: page.next,
+        })
     }
 
     /// Whether `object` has the form of an entry object this
@@ -771,40 +1047,77 @@ impl S3Store {
 
     /// Every (object key, ETag) under `prefix`, following
     /// continuation tokens, and whether the listing ran to
-    /// its end. An error stops the listing where it is.
+    /// its end. An error stops the listing where it is. The
+    /// tombstone refresh's listing: a few objects, read whole.
     async fn list_under(&self, prefix: &str) -> (Vec<(String, String)>, bool) {
         let mut listed = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let mut query: Vec<(&str, &str)> = vec![("list-type", "2")];
-            if !prefix.is_empty() {
-                query.push(("prefix", prefix));
-            }
-            if let Some(t) = &token {
-                query.push(("continuation-token", t.as_str()));
-            }
-            let Some(resp) = self.request("GET", "", &query, Vec::new()).await else {
+            let Some(page) = self.list_page(prefix, token.as_deref(), None).await else {
                 return (listed, false);
             };
-            if !resp.status().is_success() {
-                return (listed, false);
-            }
-            let Ok(text) = resp.text().await else {
-                return (listed, false);
-            };
-            for block in text.split("<Contents>").skip(1) {
-                if let Some(key) = xml_field(block, "Key") {
-                    listed.push((key, xml_field(block, "ETag").unwrap_or_default()));
-                }
-            }
-            if !text.contains("<IsTruncated>true</IsTruncated>") {
-                return (listed, true);
-            }
-            token = xml_field(&text, "NextContinuationToken");
-            if token.is_none() {
-                return (listed, false);
+            listed.extend(page.entries);
+            match page.next {
+                None => return (listed, true),
+                next => token = next,
             }
         }
+    }
+
+    /// One ListObjectsV2 page of `prefix`: from `token` (`None`:
+    /// the first page), of at most `max_keys` names when given.
+    /// `None` when the store did not answer it, answered with
+    /// an error, or answered a truncated page with no token to
+    /// go on from, or with the token it was asked with, which
+    /// would list the same page forever.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        token: Option<&str>,
+        max_keys: Option<usize>,
+    ) -> Option<ListPage> {
+        let max_keys = max_keys.map(|n| n.clamp(1, LIST_PAGE_KEYS).to_string());
+        let mut query: Vec<(&str, &str)> = vec![("list-type", "2")];
+        if !prefix.is_empty() {
+            query.push(("prefix", prefix));
+        }
+        if let Some(t) = token {
+            query.push(("continuation-token", t));
+        }
+        if let Some(n) = &max_keys {
+            query.push(("max-keys", n));
+        }
+        let started = Instant::now();
+        let resp = self.request("GET", "", &query, Vec::new()).await?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = read_capped_at(resp, LIST_PAGE_MAX_BYTES, started)
+            .await
+            .ok()?;
+        let text = String::from_utf8(body).ok()?;
+        let entries = text
+            .split("<Contents>")
+            .skip(1)
+            .filter_map(|block| {
+                let key = xml_field(block, "Key")?;
+                Some((key, xml_field(block, "ETag").unwrap_or_default()))
+            })
+            .collect();
+        if !text.contains("<IsTruncated>true</IsTruncated>") {
+            return Some(ListPage {
+                entries,
+                next: None,
+            });
+        }
+        let next = xml_field(&text, "NextContinuationToken").filter(|t| !t.is_empty())?;
+        if token == Some(next.as_str()) {
+            return None;
+        }
+        Some(ListPage {
+            entries,
+            next: Some(next),
+        })
     }
 
     /// How much of an object the purge walk reads to learn
@@ -841,7 +1154,7 @@ impl S3Store {
             return HeaderRead::Failed;
         };
         if !resp.status().is_success() {
-            return HeaderRead::unanswered(resp.status());
+            return HeaderRead::of_error(resp, started).await;
         }
         // A ranged GET reports the whole object's ETag.
         let etag = response_etag(&resp);
@@ -894,7 +1207,7 @@ impl S3Store {
                     return HeaderRead::Failed;
                 };
                 if !resp.status().is_success() {
-                    return HeaderRead::unanswered(resp.status());
+                    return HeaderRead::of_error(resp, started).await;
                 }
                 let etag = response_etag(&resp);
                 match self.read_capped(resp, started).await {
@@ -905,12 +1218,35 @@ impl S3Store {
         }
     }
 
-    /// Whether an object exists (a HEAD, no body read).
+    /// Whether an object exists (a HEAD, no body read). A
+    /// HEAD that fails reads as no object, as before, but is
+    /// counted and logged at a limited rate (issue #709):
+    /// refused, failed or unanswered, it counts among the
+    /// failed existence checks and in the store's errors.
     async fn object_exists(&self, object: &str) -> bool {
-        match self.request("HEAD", object, &[], Vec::new()).await {
-            Some(resp) => resp.status().is_success(),
-            None => false,
+        let answer = self.request("HEAD", object, &[], Vec::new()).await;
+        if let Some(resp) = &answer {
+            if resp.status().is_success() {
+                return true;
+            }
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return false;
+            }
         }
+        self.exists_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match answer {
+            Some(resp) if store_failed(resp.status()) => {
+                self.note_failed("an existence check", resp.status(), None);
+            }
+            Some(resp) => {
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.log_answer("refused", "an existence check", resp.status(), None);
+            }
+            None => self.note_unanswered("an existence check"),
+        }
+        false
     }
 
     /// Delete one object; returns whether the store
@@ -984,6 +1320,15 @@ impl S3Store {
             HeaderRead::Entry(probed) => probed,
             HeaderRead::Nothing => return ObjectPurge::Kept,
             HeaderRead::Failed => return ObjectPurge::Failed,
+            HeaderRead::Refused(status, code) => {
+                self.note_refused(
+                    Refused::Purge,
+                    "a purge walk's read",
+                    status,
+                    code.as_deref(),
+                );
+                return ObjectPurge::Refused;
+            }
         };
         let header = &probed.header;
         if object != self.object_key(&key_stem(&header.key)) {
@@ -994,8 +1339,26 @@ impl S3Store {
         }
         match self.delete_answer(object, probed.etag.as_deref()).await {
             Some(status) if status.is_success() => ObjectPurge::Deleted,
-            Some(status) if !store_failed(status) => ObjectPurge::Kept,
-            _ => ObjectPurge::Failed,
+            // Gone already, or replaced since it was read: no
+            // copy the purge covers is left there.
+            Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::PRECONDITION_FAILED) => {
+                ObjectPurge::Kept
+            }
+            Some(status) if store_failed(status) => ObjectPurge::Failed,
+            // Any other answer is a refusal, such as the `403`
+            // of credentials without `s3:DeleteObject` (issue
+            // #709): the covered copy is still there, so the
+            // walk is not complete and its tombstone stays.
+            Some(status) => {
+                self.note_refused(
+                    Refused::Purge,
+                    "a purge walk's delete of a covered copy",
+                    status,
+                    None,
+                );
+                ObjectPurge::Refused
+            }
+            None => ObjectPurge::Failed,
         }
     }
 
@@ -1022,23 +1385,19 @@ impl S3Store {
     #[allow(dead_code)]
     pub async fn purge_matching(&self, base: &str, epoch_base: &str) -> usize {
         let target = PurgeTarget::Key(base.to_string());
-        self.purge_bounded(
-            &target,
-            Some(epoch_base),
-            PurgeCutoff::EVERYTHING,
-            usize::MAX,
-        )
-        .await
-        .0
-        .removed
+        self.purge_whole(&target, Some(epoch_base), PurgeCutoff::EVERYTHING)
+            .await
+            .removed
     }
 
     /// Remove the copies `target` covers that were written
     /// before `cutoff` (issues #368, #446), with a bounded
-    /// inline scan: the walk reads at most `budget` entry
-    /// headers before returning, and any remainder comes
-    /// back as a [`PendingPurge`] for
-    /// [`S3Store::finish_purge`]. For a per-URL purge,
+    /// inline scan: the walk lists at most `budget` names,
+    /// a page of them at a time (issue #709), and reads at
+    /// most as many entry headers before returning, and any
+    /// remainder comes back as a [`PendingPurge`] for
+    /// [`S3Store::finish_purge`]: where the listing stands,
+    /// never the rest of it. For a per-URL purge,
     /// `epoch_base` names the current epoch's form of the
     /// key, whose enumerable variants are reached directly
     /// by object name first; those reads are bounded by
@@ -1060,13 +1419,73 @@ impl S3Store {
                 .await
                 .removed;
         }
-        let (objects, listed) = self.list_objects().await;
-        let (walked, pending) = self.purge_walk(target, cutoff, objects, budget).await;
-        let swept = Swept {
-            removed: removed + walked.removed,
-            complete: listed && walked.complete,
+        let mut pass = Pass::default();
+        let mut left = budget;
+        let mut token: Option<String> = None;
+        let rest = loop {
+            // A page of no more names than the budget has left,
+            // so the request lists no more than it reads.
+            let max_keys = (left < LIST_PAGE_KEYS).then_some(left);
+            let Some(page) = self.list_entry_page(token.as_deref(), max_keys).await else {
+                pass.listing_failed = true;
+                break None;
+            };
+            let EntryPage {
+                mut objects,
+                listed,
+                next,
+            } = page;
+            // A store that lists more than it was asked for
+            // leaves the excess, at most one page, to the rest.
+            let unread = if objects.len() > left {
+                objects.split_off(left)
+            } else {
+                Vec::new()
+            };
+            left = left.saturating_sub(listed.max(objects.len()));
+            self.purge_objects(objects, target, cutoff, Some(&self.inline_reads), &mut pass)
+                .await;
+            match next {
+                next if !unread.is_empty() => break Some((unread, next)),
+                None => break None,
+                Some(next) if left == 0 => break Some((Vec::new(), Some(next))),
+                Some(next) => token = Some(next),
+            }
         };
+        self.note_pass(&pass);
+        let swept = Swept {
+            removed: removed + pass.removed,
+            complete: pass.complete(),
+        };
+        let pending = rest.map(|(objects, next)| PendingPurge {
+            target: target.clone(),
+            cutoff,
+            objects,
+            next,
+        });
         (swept, pending)
+    }
+
+    /// [`S3Store::purge_bounded`] with no budget, its remainder
+    /// walked in the same call: the unbounded form the tests
+    /// and the `purge_*` helpers use.
+    async fn purge_whole(
+        &self,
+        target: &PurgeTarget,
+        epoch_base: Option<&str>,
+        cutoff: PurgeCutoff,
+    ) -> Swept {
+        let (inline, pending) = self
+            .purge_bounded(target, epoch_base, cutoff, usize::MAX)
+            .await;
+        let Some(pending) = pending else {
+            return inline;
+        };
+        let rest = self.finish_purge(pending).await;
+        Swept {
+            removed: inline.removed + rest.removed,
+            complete: inline.complete && rest.complete,
+        }
     }
 
     /// Purge the current epoch's enumerable variants of a
@@ -1090,8 +1509,11 @@ impl S3Store {
         .iter()
         .map(|candidate| self.object_key(&key_stem(candidate)))
         .collect();
-        self.purge_objects(objects, target, cutoff, Some(&self.inline_reads))
-            .await
+        let mut pass = Pass::default();
+        self.purge_objects(objects, target, cutoff, Some(&self.inline_reads), &mut pass)
+            .await;
+        self.note_pass(&pass);
+        pass.swept()
     }
 
     /// Remove every entry belonging to `group`. Returns
@@ -1099,9 +1521,8 @@ impl S3Store {
     #[allow(dead_code)]
     pub async fn purge_group(&self, group: &str) -> usize {
         let target = PurgeTarget::Group(group.to_string());
-        self.purge_bounded(&target, None, PurgeCutoff::EVERYTHING, usize::MAX)
+        self.purge_whole(&target, None, PurgeCutoff::EVERYTHING)
             .await
-            .0
             .removed
     }
 
@@ -1113,60 +1534,78 @@ impl S3Store {
     #[allow(dead_code)]
     pub async fn purge_source(&self, source: &str) -> usize {
         let target = PurgeTarget::Source(source.to_string());
-        self.purge_bounded(&target, None, PurgeCutoff::EVERYTHING, usize::MAX)
+        self.purge_whole(&target, None, PurgeCutoff::EVERYTHING)
             .await
-            .0
             .removed
     }
 
     /// Complete a bounded purge's remainder (issue #368):
-    /// walk the objects the inline budget did not reach
-    /// and delete the covered copies. Returns how many
+    /// judge the names the inline budget left, then list on
+    /// from its continuation token a page at a time (issue
+    /// #709), deleting the covered copies. Returns how many
     /// entries were removed, and whether every object was
     /// judged. A background walk: the caller holds a
     /// [`S3Store::walk_turn`].
     pub async fn finish_purge(&self, pending: PendingPurge) -> Swept {
-        self.purge_objects(pending.objects, &pending.target, pending.cutoff, None)
-            .await
+        let PendingPurge {
+            target,
+            cutoff,
+            objects,
+            next,
+        } = pending;
+        let from = next.map_or(PageFrom::Done, PageFrom::Token);
+        let mut pass = Pass::default();
+        self.walk_to_end(&target, cutoff, objects, from, &mut pass)
+            .await;
+        self.note_pass(&pass);
+        pass.swept()
     }
 
     /// One whole pass over the bucket for the purges that
-    /// joined a walk (issue #462): list it afresh and purge
-    /// what `target` covers under `cutoff`. A background
-    /// walk: the caller holds a [`S3Store::walk_turn`].
+    /// joined a walk (issue #462): list it afresh, a page at a
+    /// time, and purge what `target` covers under `cutoff`. A
+    /// background walk: the caller holds a
+    /// [`S3Store::walk_turn`].
     pub async fn relist(&self, target: &PurgeTarget, cutoff: PurgeCutoff) -> Swept {
-        let (objects, listed) = self.list_objects().await;
-        let walked = self.purge_objects(objects, target, cutoff, None).await;
-        Swept {
-            removed: walked.removed,
-            complete: listed && walked.complete,
-        }
+        let mut pass = Pass::default();
+        self.walk_to_end(target, cutoff, Vec::new(), PageFrom::First, &mut pass)
+            .await;
+        self.note_pass(&pass);
+        pass.swept()
     }
 
-    /// The shared purge walk: read each entry's header,
-    /// delete the covered copies (see
-    /// [`S3Store::purge_object`]), the first `budget`
-    /// objects now, under the inline read budget, and the
-    /// rest handed back. Reads are header-sized (see
-    /// [`S3Store::read_entry_header`]), never whole
-    /// entries.
-    async fn purge_walk(
+    /// Judge `objects`, then every page of the listing from
+    /// `from` to its end, one page at a time (issue #709): the
+    /// walk holds one page of names, whatever the bucket
+    /// holds. A listing page the store fails ends the walk
+    /// incomplete. Reads are header-sized (see
+    /// [`S3Store::read_entry_header`]), never whole entries.
+    async fn walk_to_end(
         &self,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
-        mut objects: Vec<String>,
-        budget: usize,
-    ) -> (Swept, Option<PendingPurge>) {
-        let rest = (objects.len() > budget).then(|| objects.split_off(budget));
-        let swept = self
-            .purge_objects(objects, target, cutoff, Some(&self.inline_reads))
+        objects: Vec<String>,
+        mut from: PageFrom,
+        pass: &mut Pass,
+    ) {
+        self.purge_objects(objects, target, cutoff, None, pass)
             .await;
-        let pending = rest.map(|objects| PendingPurge {
-            target: target.clone(),
-            cutoff,
-            objects,
-        });
-        (swept, pending)
+        loop {
+            let token = match std::mem::replace(&mut from, PageFrom::Done) {
+                PageFrom::Done => return,
+                PageFrom::First => None,
+                PageFrom::Token(token) => Some(token),
+            };
+            let Some(page) = self.list_entry_page(token.as_deref(), None).await else {
+                pass.listing_failed = true;
+                return;
+            };
+            self.purge_objects(page.objects, target, cutoff, None, pass)
+                .await;
+            if let Some(next) = page.next {
+                from = PageFrom::Token(next);
+            }
+        }
     }
 
     /// Purge each of `objects` (see
@@ -1176,24 +1615,25 @@ impl S3Store {
     /// the object count times the store's latency. With
     /// `shared`, each read also holds one of its permits,
     /// a budget concurrent purges share (see
-    /// [`PURGE_INLINE_READS_AT_ONCE`]). Returns how many
-    /// covered copies were deleted, and whether the store
-    /// answered for every object; the objects it did not
-    /// answer for are counted and logged as one failure.
+    /// [`PURGE_INLINE_READS_AT_ONCE`]). Adds to `pass` how
+    /// many covered copies were deleted, and how many objects
+    /// the store did not answer for or refused: the caller
+    /// logs them once per pass (see [`S3Store::note_pass`]).
     async fn purge_objects(
         &self,
         objects: Vec<String>,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
         shared: Option<&tokio::sync::Semaphore>,
-    ) -> Swept {
+        pass: &mut Pass,
+    ) {
         use futures_util::StreamExt as _;
-        let total = objects.len();
+        pass.judged += objects.len();
         // Each name moves into its read: a stream of borrowed
         // names makes the spawned walk fail the compiler's
         // Send check (a known limitation with higher-ranked
         // lifetimes).
-        let (removed, failed) = futures_util::stream::iter(objects)
+        let (removed, unanswered, refused) = futures_util::stream::iter(objects)
             .map(move |object| async move {
                 let _read = match shared {
                     Some(budget) => Some(
@@ -1207,23 +1647,43 @@ impl S3Store {
                 self.purge_object(&object, target, cutoff).await
             })
             .buffer_unordered(PURGE_READS_AT_ONCE)
-            .fold((0, 0), |(removed, failed), outcome| {
+            .fold((0, 0, 0), |(removed, unanswered, refused), outcome| {
                 std::future::ready(match outcome {
-                    ObjectPurge::Deleted => (removed + 1, failed),
-                    ObjectPurge::Kept => (removed, failed),
-                    ObjectPurge::Failed => (removed, failed + 1),
+                    ObjectPurge::Deleted => (removed + 1, unanswered, refused),
+                    ObjectPurge::Kept => (removed, unanswered, refused),
+                    ObjectPurge::Failed => (removed, unanswered + 1, refused),
+                    ObjectPurge::Refused => (removed, unanswered, refused + 1),
                 })
             })
             .await;
-        if failed > 0 {
-            self.note_error(
+        pass.removed += removed;
+        pass.unanswered += unanswered;
+        pass.refused += refused;
+    }
+
+    /// Count and log what a purge pass could not do, one line
+    /// for its listing and one for its objects, as before the
+    /// walk went page by page: a listing the store failed, and
+    /// the objects it did not answer for or refused (each
+    /// refusal also has its own count and line, see
+    /// [`S3Store::note_refused`]).
+    fn note_pass(&self, pass: &Pass) {
+        if pass.listing_failed {
+            self.note_error("purge walk", "listing the bucket failed");
+        }
+        let total = pass.judged;
+        match (pass.unanswered, pass.refused) {
+            (0, 0) => {}
+            (failed, 0) => self.note_error(
                 "purge walk",
                 &format!("the store did not answer for {failed} of {total} objects"),
-            );
-        }
-        Swept {
-            removed,
-            complete: failed == 0,
+            ),
+            (failed, refused) => self.note_error(
+                "purge walk",
+                &format!(
+                    "the store did not answer for {failed} and refused {refused} of {total} objects"
+                ),
+            ),
         }
     }
 
@@ -1716,23 +2176,100 @@ enum TombstoneRead {
 }
 
 /// The un-scanned remainder of a bounded purge walk
-/// (issue #368): the objects the inline budget did not
-/// reach, with the rule that selects among them. Hand
-/// it to [`S3Store::finish_purge`] to complete the
-/// purge off the request path.
+/// (issue #368), with the rule that selects among it: where
+/// the listing stands, not the rest of the listing (issue
+/// #709). A walk waiting for its turn keeps the continuation
+/// token of the next page, and, only when the store listed
+/// more than the inline scan asked for, the names of that
+/// one page it did not judge; before, it kept every name in
+/// the bucket, about 3.5 MB a purge at 31,000 objects. Hand
+/// it to [`S3Store::finish_purge`] to complete the purge off
+/// the request path.
 pub struct PendingPurge {
     target: PurgeTarget,
     cutoff: PurgeCutoff,
+    /// Entry objects listed but not judged yet: at most one
+    /// page's.
     objects: Vec<String>,
+    /// The continuation token of the page after them; `None`
+    /// when theirs was the last.
+    next: Option<String>,
+}
+
+impl PendingPurge {
+    /// How many listed names the remainder holds: at most one
+    /// page's, whatever the bucket holds.
+    #[cfg(test)]
+    fn held_names(&self) -> usize {
+        self.objects.len()
+    }
+}
+
+/// One page of a ListObjectsV2 listing.
+struct ListPage {
+    /// Each listed object's key and ETag, in listing order.
+    entries: Vec<(String, String)>,
+    /// The continuation token of the next page; `None` when
+    /// this page is the last.
+    next: Option<String>,
+}
+
+/// One listing page's entry objects (see
+/// [`S3Store::list_entry_page`]).
+struct EntryPage {
+    /// The names of the entry form, in listing order.
+    objects: Vec<String>,
+    /// How many names the page listed, entries or not.
+    listed: usize,
+    next: Option<String>,
+}
+
+/// Where a walk's listing goes on (issue #709).
+enum PageFrom {
+    /// From the first page.
+    First,
+    /// From the page a continuation token names.
+    Token(String),
+    /// Nowhere: the last page has been listed.
+    Done,
+}
+
+/// What one purge pass did, page by page (issue #709): the
+/// copies it deleted, the objects it judged, the ones the
+/// store did not answer for and the ones it refused, and
+/// whether a listing page failed.
+#[derive(Debug, Default)]
+struct Pass {
+    removed: usize,
+    judged: usize,
+    unanswered: usize,
+    refused: usize,
+    listing_failed: bool,
+}
+
+impl Pass {
+    /// Whether the pass judged every object in the bucket: its
+    /// listing ran to the end, and every object was answered.
+    fn complete(&self) -> bool {
+        !self.listing_failed && self.unanswered == 0 && self.refused == 0
+    }
+
+    fn swept(&self) -> Swept {
+        Swept {
+            removed: self.removed,
+            complete: self.complete(),
+        }
+    }
 }
 
 /// What a purge pass did (issue #462): how many covered
 /// copies it deleted, and whether it judged every object in
 /// the bucket. A pass is incomplete when its listing
-/// stopped early, or when the store did not answer a header
-/// read or a covered copy's delete. Such a pass must not
-/// mark its purges ended: a copy it missed would serve
-/// again once their tombstones expire.
+/// stopped early, or when the store did not answer, or
+/// refused (issue #709), a header read or a covered copy's
+/// delete. Such a pass must not mark its purges ended: a
+/// copy it missed would serve again once their tombstones
+/// expire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Swept {
     pub removed: usize,
@@ -1752,6 +2289,10 @@ enum ObjectPurge {
     /// The store did not answer the read or the delete, so
     /// the object was not judged.
     Failed,
+    /// The store refused the read or the delete (issue #709),
+    /// a `403` say: the object was not judged, or its covered
+    /// copy is still there.
+    Refused,
 }
 
 /// The outcome of reading one object's header for a purge.
@@ -1763,15 +2304,45 @@ enum HeaderRead {
     Nothing,
     /// The store did not answer (see [`store_failed`]).
     Failed,
+    /// The store refused the read with this status (issue
+    /// #709), and the error code its answer named, if any: an
+    /// `AccessDenied` for the credentials, an
+    /// `InvalidObjectState` for an object in an archive
+    /// storage class.
+    Refused(reqwest::StatusCode, Option<String>),
 }
 
 impl HeaderRead {
-    /// A read the store answered with an error `status`.
+    /// A read the store answered with an error `status`: a
+    /// `404` (gone since the listing) or a `416` (an empty
+    /// object, which a range cannot cover) holds nothing to
+    /// purge. Before issue #709 every other error that was not
+    /// a store failure read as nothing to purge too, so a walk
+    /// whose reads the store refused (a `403`) ended its purge
+    /// unjudged.
     fn unanswered(status: reqwest::StatusCode) -> Self {
         if store_failed(status) {
             HeaderRead::Failed
-        } else {
+        } else if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+        ) {
             HeaderRead::Nothing
+        } else {
+            HeaderRead::Refused(status, None)
+        }
+    }
+
+    /// [`HeaderRead::unanswered`] for the error answer `resp`,
+    /// with a refusal's error code read from the front of its
+    /// body (see [`refusal_code`]), so the line it logs says
+    /// why.
+    async fn of_error(resp: reqwest::Response, started: Instant) -> Self {
+        match Self::unanswered(resp.status()) {
+            HeaderRead::Refused(status, _) => {
+                HeaderRead::Refused(status, refusal_code(resp, started).await)
+            }
+            other => other,
         }
     }
 }
@@ -1780,7 +2351,9 @@ impl HeaderRead {
 /// a request, rather than that the request had no object
 /// to act on (issue #462): a server error, throttling, or a
 /// timeout. A purge pass that meets one has not judged that
-/// object; a 404 or a 412 is an answer.
+/// object; a 404 or a 412 is an answer, and any other error
+/// is a refusal (issue #709), which leaves the object
+/// unjudged too.
 fn store_failed(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1928,6 +2501,46 @@ async fn read_capped_at(
     Ok(data)
 }
 
+/// The error code an error answer's body names (issue #709),
+/// S3's `<Code>` (`AccessDenied`, `ExpiredToken`,
+/// `SignatureDoesNotMatch`, `SlowDown`): only the first
+/// [`REFUSAL_BODY_BYTES`] are read, where S3 puts it, and only a
+/// short name of letters and digits is kept, so the line it
+/// goes into says why without carrying what else the store
+/// sent.
+async fn refusal_code(resp: reqwest::Response, started: Instant) -> Option<String> {
+    let body = read_prefix_at(resp, REFUSAL_BODY_BYTES, started).await?;
+    let text = String::from_utf8_lossy(&body);
+    let code = xml_field(&text, "Code")?;
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some(code)
+}
+
+/// The first `cap` bytes of a response body, or all of a
+/// shorter one, under the bound of that many bytes from
+/// `started` (issue #550); the rest is never read. `None` when
+/// the body broke off or ran out of time first.
+async fn read_prefix_at(
+    mut resp: reqwest::Response,
+    cap: usize,
+    started: Instant,
+) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::from_std(started + transfer_budget(cap as u64));
+    let mut data = Vec::new();
+    while data.len() < cap {
+        let Some(chunk) = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .ok()?
+            .ok()?
+        else {
+            break;
+        };
+        let room = cap - data.len();
+        data.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    Some(data)
+}
+
 /// The ETag a store reported for an object, verbatim.
 fn response_etag(resp: &reqwest::Response) -> Option<String> {
     resp.headers()
@@ -2024,20 +2637,37 @@ pub(crate) mod test_support {
         /// the most at once.
         pub delayed: AtomicUsize,
         pub delayed_peak: AtomicUsize,
-        /// The prefix of every listing served, in order.
+        /// The prefix of every listing's first page served, in
+        /// order: one per pass over the prefix.
         pub lists: StdMutex<Vec<String>>,
+        /// Every listing page served, first pages included,
+        /// with the prefix it listed and the most names it
+        /// asked for (issue #709).
+        pub pages: StdMutex<Vec<(String, Option<usize>)>>,
     }
 
     impl WalkProbe {
-        /// How many listings of `prefix` itself were served:
+        /// How many listings of `prefix` itself were begun:
         /// the purge walks' passes over a store under that
         /// prefix (a tombstone refresh lists a sub-prefix).
+        /// A pass lists its pages after the first from their
+        /// continuation tokens, and those are not counted.
         pub fn lists_of(&self, prefix: &str) -> usize {
             self.lists
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|p| *p == prefix)
+                .count()
+        }
+
+        /// How many listing pages of `prefix` were served.
+        pub fn pages_of(&self, prefix: &str) -> usize {
+            self.pages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| p == prefix)
                 .count()
         }
     }
@@ -2108,7 +2738,39 @@ pub(crate) mod test_support {
         /// Answer a conditional DELETE with 501, as a store
         /// without conditional deletes may.
         pub if_match_delete: bool,
+        /// Refuse every DELETE with S3's `403 AccessDenied`,
+        /// as a store refuses credentials without
+        /// `s3:DeleteObject` (issue #709).
+        pub refuse_delete: bool,
+        /// Refuse every object GET, ranged or not, with
+        /// `403 AccessDenied` (issue #709).
+        pub refuse_get: bool,
+        /// Answer every listing page as truncated, naming as
+        /// the next page the one it was asked for: a store
+        /// whose listing never ends (issue #709).
+        pub stuck_token: bool,
     }
+
+    /// The credentials the fake accepts until a test sets
+    /// others (issue #709): every test store signs with them,
+    /// and the fake checks every request's SigV4 signature
+    /// against them, as S3 does, refusing a bad one in S3's
+    /// error shape.
+    pub fn test_credentials() -> crate::sigv4::Credentials {
+        crate::sigv4::Credentials {
+            access_key: "AKIDFAKES3TEST".to_string(),
+            secret_key: "fake/s3+test/secret-key".to_string(),
+            session_token: None,
+        }
+    }
+
+    /// [`test_credentials`] as a store takes them.
+    pub fn test_aws() -> crate::credentials::AwsCredentials {
+        test_credentials().into()
+    }
+
+    /// The region the fake signs in, as every test store does.
+    const FAKE_REGION: &str = "us-east-1";
 
     /// A minimal in-process S3: PUT/GET/DELETE plus
     /// ListObjectsV2 over one shared map, path-style URLs.
@@ -2155,7 +2817,22 @@ pub(crate) mod test_support {
         pub name_hold: Arc<NameHold>,
         /// Whole-object GETs broken by name (issue #549).
         pub name_break: Arc<NameBreak>,
+        /// The credentials every request must be signed with
+        /// (issue #709): [`test_credentials`] to start with.
+        /// `None` serves unsigned requests, as a store that
+        /// allows anonymous access does.
+        pub credentials: Arc<StdMutex<Option<crate::sigv4::Credentials>>>,
+        /// One line per request the signature check refused,
+        /// `"<METHOD> <key> <code>"`.
+        pub refused: Arc<StdMutex<Vec<String>>>,
         pub endpoint: String,
+    }
+
+    impl FakeS3 {
+        /// The requests the signature check refused so far.
+        pub fn refused(&self) -> Vec<String> {
+            self.refused.lock().unwrap().clone()
+        }
     }
 
     /// The first 32 hex digits of a filler object that lists
@@ -2196,6 +2873,8 @@ pub(crate) mod test_support {
         let walk = Arc::new(WalkProbe::default());
         let name_hold = Arc::new(NameHold::default());
         let name_break = Arc::new(NameBreak::default());
+        let credentials = Arc::new(StdMutex::new(Some(test_credentials())));
+        let refused = Arc::new(StdMutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
@@ -2212,6 +2891,8 @@ pub(crate) mod test_support {
         let shared_walk = walk.clone();
         let shared_name_hold = name_hold.clone();
         let shared_name_break = name_break.clone();
+        let shared_credentials = credentials.clone();
+        let shared_refused = refused.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
@@ -2228,6 +2909,8 @@ pub(crate) mod test_support {
                 let walk = shared_walk.clone();
                 let name_hold = shared_name_hold.clone();
                 let name_break = shared_name_break.clone();
+                let credentials = shared_credentials.clone();
+                let refused = shared_refused.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -2251,7 +2934,12 @@ pub(crate) mod test_support {
                     let mut if_none_match: Option<String> = None;
                     let mut if_match: Option<String> = None;
                     let mut content_type: Option<String> = None;
+                    let mut headers: Vec<(String, String)> = Vec::new();
                     for line in lines {
+                        if let Some((name, value)) = line.split_once(':') {
+                            headers
+                                .push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+                        }
                         let lower = line.to_ascii_lowercase();
                         if let Some(v) = lower.strip_prefix("content-length:") {
                             content_length = v.trim().parse().unwrap_or(0);
@@ -2283,6 +2971,37 @@ pub(crate) mod test_support {
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let target = parts.next().unwrap_or_default().to_string();
+                    // Every request is signed, as S3 requires of a
+                    // bucket that is not public (issue #709); one
+                    // that is not, or whose signature does not
+                    // verify, is refused before anything else.
+                    let expected = credentials.lock().unwrap().clone();
+                    if let Some(creds) = expected
+                        && let Err(refusal) =
+                            verify_sigv4(&creds, &method, &target, &headers, &body)
+                    {
+                        let path = target.split_once('?').map_or(target.as_str(), |(p, _)| p);
+                        let rest = path.trim_start_matches('/');
+                        let key =
+                            percent_decode(rest.split_once('/').map(|(_, k)| k).unwrap_or(""));
+                        refused
+                            .lock()
+                            .unwrap()
+                            .push(format!("{method} {key} {}", refusal.code));
+                        let payload = if method == "HEAD" {
+                            Vec::new()
+                        } else {
+                            refusal.document()
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            refusal.status,
+                            payload.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        let _ = socket.write_all(&payload).await;
+                        return;
+                    }
                     if method == "DELETE" && hold_deletes.load(Ordering::SeqCst) {
                         held_deletes.fetch_add(1, Ordering::SeqCst);
                         while hold_deletes.load(Ordering::SeqCst) {
@@ -2309,18 +3028,15 @@ pub(crate) mod test_support {
                         pace_ranged_get(&walk, &target).await;
                     }
                     let listed = (method == "GET" && target.contains("list-type=2")).then(|| {
-                        target
-                            .split_once('?')
-                            .map(|(_, query)| query)
-                            .unwrap_or("")
-                            .split('&')
-                            .find_map(|p| p.strip_prefix("prefix="))
-                            .map(percent_decode)
-                            .unwrap_or_default()
+                        let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
+                        let prefix = query_param(query, "prefix").unwrap_or_default();
+                        if query_param(query, "continuation-token").is_none() {
+                            walk.lists.lock().unwrap().push(prefix.clone());
+                        }
+                        let max_keys = query_param(query, "max-keys").and_then(|n| n.parse().ok());
+                        walk.pages.lock().unwrap().push((prefix.clone(), max_keys));
+                        prefix
                     });
-                    if let Some(prefix) = &listed {
-                        walk.lists.lock().unwrap().push(prefix.clone());
-                    }
                     let mut cut = false;
                     {
                         let (path, _) = match target.split_once('?') {
@@ -2408,8 +3124,315 @@ pub(crate) mod test_support {
             walk,
             name_hold,
             name_break,
+            credentials,
+            refused,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
+    }
+
+    /// Why the fake refused a request, in S3's error shape
+    /// (issue #709).
+    pub struct Refusal {
+        pub status: &'static str,
+        pub code: &'static str,
+        message: String,
+        /// More elements for the document, already escaped.
+        extra: String,
+    }
+
+    impl Refusal {
+        fn new(status: &'static str, code: &'static str, message: impl Into<String>) -> Self {
+            Refusal {
+                status,
+                code,
+                message: message.into(),
+                extra: String::new(),
+            }
+        }
+
+        /// The XML error document S3 sends with a refusal.
+        pub fn document(&self) -> Vec<u8> {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message>{}<RequestId>FAKES3REQUEST</RequestId><HostId>fake-s3</HostId></Error>",
+                self.code,
+                xml_escape(&self.message),
+                self.extra
+            )
+            .into_bytes()
+        }
+    }
+
+    fn xml_escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    /// Check one request's SigV4 signature as S3 does (issue
+    /// #709), from what arrived on the wire and nothing the
+    /// client computed: the canonical request is rebuilt from
+    /// the decoded path, the decoded query and the headers the
+    /// request names as signed, with this module's own
+    /// encoding, and the signature from `creds`' secret. The
+    /// payload hash must be the body's, every `x-amz-*`
+    /// header must be signed, and temporary credentials must
+    /// carry their token.
+    pub fn verify_sigv4(
+        creds: &crate::sigv4::Credentials,
+        method: &str,
+        target: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<(), Refusal> {
+        use hmac::{KeyInit as _, Mac as _};
+        use sha2::Digest as _;
+        let values = |name: &str| -> Vec<&str> {
+            headers
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+                .collect()
+        };
+        let malformed = |why: &str| {
+            Refusal::new(
+                "400 Bad Request",
+                "AuthorizationHeaderMalformed",
+                format!("The authorization header is malformed; {why}"),
+            )
+        };
+        let Some(auth) = values("authorization").first().copied() else {
+            return Err(Refusal::new(
+                "403 Forbidden",
+                "AccessDenied",
+                "Access Denied",
+            ));
+        };
+        let Some(fields) = auth.strip_prefix("AWS4-HMAC-SHA256 ") else {
+            return Err(malformed("the algorithm must be AWS4-HMAC-SHA256"));
+        };
+        let (mut credential, mut signed, mut signature) = (None, None, None);
+        for field in fields.split(',').map(str::trim) {
+            if let Some(v) = field.strip_prefix("Credential=") {
+                credential = Some(v);
+            } else if let Some(v) = field.strip_prefix("SignedHeaders=") {
+                signed = Some(v);
+            } else if let Some(v) = field.strip_prefix("Signature=") {
+                signature = Some(v);
+            }
+        }
+        let (Some(credential), Some(signed), Some(signature)) = (credential, signed, signature)
+        else {
+            return Err(malformed(
+                "Credential, SignedHeaders and Signature are required",
+            ));
+        };
+        let scope: Vec<&str> = credential.split('/').collect();
+        if scope.len() != 5 || scope[3] != "s3" || scope[4] != "aws4_request" {
+            return Err(malformed(
+                "the credential scope is not <key>/<date>/<region>/s3/aws4_request",
+            ));
+        }
+        if scope[0] != creds.access_key {
+            return Err(Refusal::new(
+                "403 Forbidden",
+                "InvalidAccessKeyId",
+                "The AWS Access Key Id you provided does not exist in our records.",
+            ));
+        }
+        if scope[2] != FAKE_REGION {
+            return Err(malformed(&format!(
+                "the region '{}' is wrong; expecting '{FAKE_REGION}'",
+                scope[2]
+            )));
+        }
+        let Some(amz_date) = values("x-amz-date").first().copied() else {
+            return Err(Refusal::new(
+                "403 Forbidden",
+                "AccessDenied",
+                "AWS authentication requires a valid Date or x-amz-date header",
+            ));
+        };
+        if amz_date.len() != 16 || amz_date.get(..8) != Some(scope[1]) {
+            return Err(malformed(
+                "Invalid credential date. Date is not the same as X-Amz-Date.",
+            ));
+        }
+        let Some(payload) = values("x-amz-content-sha256").first().copied() else {
+            return Err(Refusal::new(
+                "400 Bad Request",
+                "InvalidRequest",
+                "Missing required header for this request: x-amz-content-sha256",
+            ));
+        };
+        if payload != "UNSIGNED-PAYLOAD" && payload != hex::encode(sha2::Sha256::digest(body)) {
+            return Err(Refusal::new(
+                "400 Bad Request",
+                "XAmzContentSHA256Mismatch",
+                "The provided 'x-amz-content-sha256' header does not match what was computed.",
+            ));
+        }
+        let token = values("x-amz-security-token").first().copied();
+        if token != creds.session_token.as_deref() {
+            return Err(Refusal::new(
+                "400 Bad Request",
+                "InvalidToken",
+                "The provided token is malformed or otherwise invalid.",
+            ));
+        }
+        let names: Vec<&str> = signed.split(';').collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted != names
+            || names
+                .iter()
+                .any(|n| n.is_empty() || n.bytes().any(|b| b.is_ascii_uppercase()))
+            || !names.contains(&"host")
+        {
+            return Err(malformed(
+                "SignedHeaders must be sorted, lower-case, and name host",
+            ));
+        }
+        if headers
+            .iter()
+            .any(|(name, _)| name.starts_with("x-amz-") && !names.contains(&name.as_str()))
+        {
+            return Err(Refusal::new(
+                "403 Forbidden",
+                "AccessDenied",
+                "There were headers present in the request which were not signed",
+            ));
+        }
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let canonical_uri = sig_encode(&percent_decode_bytes(path, false), true);
+        let mut params: Vec<(String, String)> = query
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                (
+                    sig_encode(&percent_decode_bytes(k, true), false),
+                    sig_encode(&percent_decode_bytes(v, true), false),
+                )
+            })
+            .collect();
+        params.sort();
+        let canonical_query = params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut canonical_headers = String::new();
+        for name in &names {
+            let joined = values(name)
+                .iter()
+                .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>()
+                .join(",");
+            canonical_headers.push_str(&format!("{name}:{joined}\n"));
+        }
+        let canonical = format!(
+            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload}"
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{}/{FAKE_REGION}/s3/aws4_request\n{}",
+            scope[1],
+            hex::encode(sha2::Sha256::digest(canonical.as_bytes()))
+        );
+        let mac = |key: &[u8], data: &str| {
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+            mac.update(data.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        };
+        let mut key = mac(format!("AWS4{}", creds.secret_key).as_bytes(), scope[1]);
+        for part in [FAKE_REGION, "s3", "aws4_request"] {
+            key = mac(&key, part);
+        }
+        if hex::encode(mac(&key, &string_to_sign)) != signature {
+            let mut refusal = Refusal::new(
+                "403 Forbidden",
+                "SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
+            );
+            refusal.extra = format!(
+                "<AWSAccessKeyId>{}</AWSAccessKeyId><StringToSign>{}</StringToSign><SignatureProvided>{}</SignatureProvided><CanonicalRequest>{}</CanonicalRequest>",
+                xml_escape(scope[0]),
+                xml_escape(&string_to_sign),
+                xml_escape(signature),
+                xml_escape(&canonical)
+            );
+            return Err(refusal);
+        }
+        Ok(())
+    }
+
+    /// Percent-decode `text` to bytes; with `query`, a `+` is
+    /// a space, as S3 reads a query string.
+    fn percent_decode_bytes(text: &str, query: bool) -> Vec<u8> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' if i + 2 < bytes.len() => {
+                    match u8::from_str_radix(
+                        std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                        16,
+                    ) {
+                        Ok(v) => {
+                            out.push(v);
+                            i += 3;
+                            continue;
+                        }
+                        Err(_) => out.push(b'%'),
+                    }
+                }
+                b'+' if query => out.push(b' '),
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The encoding SigV4 signs: every byte but the unreserved
+    /// ones as `%XX` in upper-case hex, and `/` kept in a path.
+    fn sig_encode(bytes: &[u8], path: bool) -> String {
+        let mut out = String::new();
+        for &b in bytes {
+            if b.is_ascii_alphanumeric()
+                || matches!(b, b'-' | b'.' | b'_' | b'~')
+                || (path && b == b'/')
+            {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    /// The decoded value of the query parameter `name`.
+    fn query_param(query: &str, name: &str) -> Option<String> {
+        query.split('&').find_map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (String::from_utf8_lossy(&percent_decode_bytes(k, true)) == name)
+                .then(|| String::from_utf8_lossy(&percent_decode_bytes(v, true)).into_owned())
+        })
+    }
+
+    /// The continuation token of the page after `last`: opaque,
+    /// with the `+`, `/` and `=` real tokens carry, so a client
+    /// that does not encode them in the query fails.
+    fn continuation_token(last: &str) -> String {
+        format!("1+/{}=", hex::encode(last))
+    }
+
+    /// The key a [`continuation_token`] lists after.
+    fn listed_after(token: &str) -> Option<String> {
+        let hex_part = token.strip_prefix("1+/")?.strip_suffix('=')?;
+        String::from_utf8(hex::decode(hex_part).ok()?).ok()
     }
 
     /// Apply the walk probe's hold and delay to one ranged
@@ -2496,6 +3519,14 @@ pub(crate) mod test_support {
             Vec::new(),
             String::new(),
         );
+        let refusal = |code: &'static str, message: &str| {
+            let refusal = Refusal::new("403 Forbidden", code, message);
+            (
+                refusal.status.to_string(),
+                refusal.document(),
+                "content-type: application/xml\r\n".to_string(),
+            )
+        };
         match (method, query.contains("list-type=2")) {
             ("PUT", _) if fail.put => error,
             ("PUT", _)
@@ -2512,14 +3543,33 @@ pub(crate) mod test_support {
             }
             ("GET", true) if fail.list => error,
             ("GET", true) => {
-                let prefix = query
-                    .split('&')
-                    .find_map(|p| p.strip_prefix("prefix="))
-                    .map(percent_decode)
-                    .unwrap_or_default();
-                let mut xml = String::from(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><IsTruncated>false</IsTruncated>",
-                );
+                let prefix = query_param(query, "prefix").unwrap_or_default();
+                // Pages of at most `max-keys` names, 1000 at
+                // most and by default, as S3 lists them (issue
+                // #709), each naming the next by an opaque
+                // continuation token.
+                let max_keys = query_param(query, "max-keys")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(1000)
+                    .clamp(1, 1000);
+                let after = match query_param(query, "continuation-token") {
+                    None => None,
+                    Some(token) => match listed_after(&token) {
+                        Some(after) => Some(after),
+                        None => {
+                            let refusal = Refusal::new(
+                                "400 Bad Request",
+                                "InvalidArgument",
+                                "The continuation token provided is incorrect",
+                            );
+                            return (
+                                refusal.status.to_string(),
+                                refusal.document(),
+                                "content-type: application/xml\r\n".to_string(),
+                            );
+                        }
+                    },
+                };
                 // Keys list in ascending order, as S3 lists
                 // them, so a test can place objects ahead of
                 // others in a purge walk.
@@ -2528,9 +3578,30 @@ pub(crate) mod test_support {
                     .unwrap()
                     .iter()
                     .filter(|(k, _)| k.starts_with(&prefix))
+                    .filter(|(k, _)| {
+                        after
+                            .as_ref()
+                            .is_none_or(|after| k.as_str() > after.as_str())
+                    })
                     .map(|(k, v)| (k.clone(), etag_of(v)))
                     .collect();
                 keys.sort();
+                let truncated = keys.len() > max_keys || fail.stuck_token;
+                keys.truncate(max_keys);
+                let mut xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><KeyCount>{}</KeyCount><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
+                    keys.len()
+                );
+                if fail.stuck_token {
+                    let token = query_param(query, "continuation-token")
+                        .unwrap_or_else(|| continuation_token(""));
+                    xml += &format!("<NextContinuationToken>{token}</NextContinuationToken>");
+                } else if truncated && let Some((last, _)) = keys.last() {
+                    xml += &format!(
+                        "<NextContinuationToken>{}</NextContinuationToken>",
+                        continuation_token(last)
+                    );
+                }
                 for (k, etag) in keys {
                     // S3 escapes the ETag's quotes in listings.
                     let etag = etag.replace('"', "&quot;");
@@ -2539,6 +3610,7 @@ pub(crate) mod test_support {
                 xml += "</ListBucketResult>";
                 ("200 OK".into(), xml.into_bytes(), String::new())
             }
+            ("GET", false) if fail.refuse_get => refusal("AccessDenied", "Access Denied"),
             ("GET", false) if fail.get_object => error,
             ("GET", false) => match objects.lock().unwrap().get(&key) {
                 Some(v) => {
@@ -2568,6 +3640,7 @@ pub(crate) mod test_support {
                 ),
                 None => ("404 Not Found".into(), Vec::new(), String::new()),
             },
+            ("DELETE", _) if fail.refuse_delete => refusal("AccessDenied", "Access Denied"),
             ("DELETE", _) if fail.delete => error,
             ("DELETE", _) if fail.if_match_delete && if_match.is_some() => {
                 ("501 Not Implemented".into(), Vec::new(), String::new())
@@ -2595,7 +3668,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{TAIL_FILLER, filler_name, start_fake};
+    use super::test_support::{TAIL_FILLER, filler_name, start_fake, test_aws};
     use super::*;
     use crate::url::ImageFormat;
 
@@ -2604,13 +3677,16 @@ mod tests {
         crate::url::entry_key(b"s3store-test-secret")
     }
 
+    /// A store over `endpoint` that signs with the fake's
+    /// credentials (issue #709): the fake refuses any request
+    /// whose signature does not verify.
     fn store(endpoint: &str) -> S3Store {
         S3Store::new(
             "results".into(),
             "cache/".into(),
             Some(endpoint.into()),
             "us-east-1".into(),
-            None,
+            Some(test_aws()),
             test_entry_key(),
         )
         .unwrap()
@@ -2735,11 +3811,14 @@ mod tests {
             "cache/".into(),
             Some(endpoint),
             "us-east-1".into(),
-            Some(sigv4::Credentials {
-                access_key: "AKIDEXAMPLE".to_string(),
-                secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                session_token: None,
-            }),
+            Some(
+                sigv4::Credentials {
+                    access_key: "AKIDEXAMPLE".to_string(),
+                    secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                    session_token: None,
+                }
+                .into(),
+            ),
             test_entry_key(),
         )
         .unwrap();
@@ -3353,7 +4432,7 @@ mod tests {
             .await
             .unwrap();
         let mut other_secret = store(&fake.endpoint);
-        other_secret.entry_key = crate::url::entry_key(b"another deployment");
+        other_secret.entry_key = crate::url::entry_key(b"another deployment").into();
         let planted = other_secret
             .put_tombstone(&tombstone_for("victim", cutoff, None), 2)
             .await
@@ -4196,7 +5275,7 @@ mod tests {
             prefix.into(),
             Some(endpoint.into()),
             "us-east-1".into(),
-            None,
+            Some(test_aws()),
             entry_key,
         )
         .unwrap()
@@ -4846,7 +5925,9 @@ mod tests {
         assert!(entry.is_none());
         assert!(!exists);
         assert_eq!(raw, None);
-        assert_eq!(s.errors(), 1, "the lookup's transport error is counted");
+        // The lookup's transport error is counted, and since
+        // issue #709 so is the existence check's.
+        assert_eq!(s.errors(), 2);
         assert!(took >= STORE_TIMEOUT, "{took:?}");
         assert!(took < STORE_TIMEOUT + SLACK, "{took:?}");
     }
@@ -4888,5 +5969,824 @@ mod tests {
         assert_eq!(s.errors(), 1, "the stalled lookup is counted");
         assert!(took >= STORE_TIMEOUT, "{took:?}");
         assert!(took < STORE_TIMEOUT + SLACK, "{took:?}");
+    }
+
+    /// The S3 examples' credentials, for the verifier test.
+    fn s3_example_creds() -> sigv4::Credentials {
+        sigv4::Credentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+        }
+    }
+
+    fn header_list(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// A store over the fake signing with `creds`.
+    fn store_signing(endpoint: &str, creds: Option<sigv4::Credentials>) -> S3Store {
+        S3Store::new(
+            "results".into(),
+            "cache/".into(),
+            Some(endpoint.into()),
+            "us-east-1".into(),
+            creds.map(Into::into),
+            test_entry_key(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_fakes_verifier_reads_sigv4_as_s3_does() {
+        // Issue #709: the fake served every request whatever
+        // its Authorization header said, and the signer was
+        // proven only against the IAM example. The fake's
+        // verifier rebuilds the canonical request from what
+        // arrived; it accepts the AWS S3 GET object example,
+        // signature and all...
+        use super::test_support::verify_sigv4;
+        let example = header_list(&[
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("range", "bytes=0-9"),
+            ("x-amz-content-sha256", sigv4::EMPTY_PAYLOAD_SHA256),
+            ("x-amz-date", "20130524T000000Z"),
+            (
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,\
+                 SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,\
+                 Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+            ),
+        ]);
+        let creds = s3_example_creds();
+        assert!(verify_sigv4(&creds, "GET", "/test.txt", &example, b"").is_ok());
+        // ...and refuses it once anything it signs changes: a
+        // signed header, the path, the query, the body, or the
+        // secret.
+        let mut range = example.clone();
+        range[1].1 = "bytes=0-10".to_string();
+        for (target, headers, body, secret) in [
+            ("/test.txt", &range, &b""[..], creds.secret_key.as_str()),
+            ("/test2.txt", &example, b"", creds.secret_key.as_str()),
+            ("/test.txt?x=1", &example, b"", creds.secret_key.as_str()),
+            ("/test.txt", &example, b"", "another-secret"),
+        ] {
+            let mut creds = s3_example_creds();
+            creds.secret_key = secret.to_string();
+            let refused = verify_sigv4(&creds, "GET", target, headers, body).err();
+            let refused = refused.unwrap_or_else(|| panic!("{target} {secret} verified"));
+            assert_eq!(refused.code, "SignatureDoesNotMatch");
+            assert_eq!(refused.status, "403 Forbidden");
+            let document = String::from_utf8(refused.document()).unwrap();
+            assert!(
+                document.contains("<StringToSign>AWS4-HMAC-SHA256"),
+                "{document}"
+            );
+            assert!(document.contains("<CanonicalRequest>GET"), "{document}");
+        }
+        let refused = verify_sigv4(&creds, "GET", "/test.txt", &example, b"payload").err();
+        assert_eq!(refused.unwrap().code, "XAmzContentSHA256Mismatch");
+        // An x-amz-* header the signature does not cover is
+        // refused, as S3 refuses it.
+        let mut unsigned = example.clone();
+        unsigned.push(("x-amz-meta-note".to_string(), "x".to_string()));
+        let refused = verify_sigv4(&creds, "GET", "/test.txt", &unsigned, b"").err();
+        assert_eq!(refused.unwrap().code, "AccessDenied");
+        let mut other = s3_example_creds();
+        other.access_key = "AKIDSOMEONEELSE".to_string();
+        let refused = verify_sigv4(&other, "GET", "/test.txt", &example, b"").err();
+        assert_eq!(refused.unwrap().code, "InvalidAccessKeyId");
+        let refused = verify_sigv4(&creds, "GET", "/test.txt", &example[..4], b"").err();
+        assert_eq!(refused.unwrap().code, "AccessDenied");
+    }
+
+    #[tokio::test]
+    async fn the_fake_refuses_what_does_not_verify_in_s3s_error_shape() {
+        // Issue #709: every test store now signs with the test
+        // credentials and the fake checks each request. A
+        // request it refuses gets S3's XML error document and is
+        // logged on the fake; the store counts the refusal.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("k", &image(b"x", &[])).await;
+        assert!(s.get("k").await.is_some());
+        assert_eq!((s.errors(), fake.refused().len()), (0, 0));
+        // Unsigned: S3's AccessDenied, as XML.
+        let resp = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}/results/cache/x.bin", fake.endpoint))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers()["content-type"], "application/xml");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.starts_with("<?xml") && body.contains("<Code>AccessDenied</Code>"),
+            "{body}"
+        );
+        // A wrong secret, or a key the store does not know.
+        let mut not_the_secret = super::test_support::test_credentials();
+        not_the_secret.secret_key = "not-the-secret".to_string();
+        let wrong_secret = store_signing(&fake.endpoint, Some(not_the_secret));
+        assert!(wrong_secret.get("k").await.is_none());
+        let mut unknown_key = super::test_support::test_credentials();
+        unknown_key.access_key = "AKIDUNKNOWN".to_string();
+        let wrong_key = store_signing(&fake.endpoint, Some(unknown_key));
+        assert!(wrong_key.get("k").await.is_none());
+        let refused = fake.refused();
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        assert!(refused[0].ends_with(" AccessDenied"), "{refused:?}");
+        assert!(
+            refused[1].ends_with(" SignatureDoesNotMatch"),
+            "{refused:?}"
+        );
+        assert!(refused[2].ends_with(" InvalidAccessKeyId"), "{refused:?}");
+        assert_eq!(wrong_secret.refused(Refused::Lookup), 1);
+        assert_eq!(wrong_key.refused(Refused::Lookup), 1);
+    }
+
+    #[tokio::test]
+    async fn every_kind_of_store_request_verifies_against_the_fake() {
+        // Issue #709: every request shape the tier sends, signed
+        // with temporary credentials (so the session token is
+        // signed too), verifies: writes with a payload hash,
+        // conditional writes and deletes, ranged and whole
+        // reads, HEADs, listing pages with continuation tokens
+        // (which carry `+`, `/` and `=`), and tombstones.
+        let fake = start_fake().await;
+        let mut temporary = super::test_support::test_credentials();
+        temporary.session_token = Some("session/token+1=".to_string());
+        *fake.credentials.lock().unwrap() = Some(temporary.clone());
+        let s = store_signing(&fake.endpoint, Some(temporary));
+        seed_fillers(&fake, 1500);
+        s.put("k", &image(b"x", &["hero"])).await;
+        let (_, etag) = s.get_tagged("k").await.unwrap();
+        assert!(
+            s.put_raw("raw/a b+c.png", b"\x89PNG\r\n\x1a\n".to_vec())
+                .await
+        );
+        assert_eq!(
+            s.put_raw_if_absent("raw/a b+c.png", b"x".to_vec()).await,
+            RawPut::AlreadyExists
+        );
+        assert!(s.exists_raw("raw/a b+c.png").await);
+        assert_eq!(s.get_raw("raw/a b+c.png").await.unwrap().len(), 8);
+        let guard = Arc::new(PurgeGuard::new());
+        let tombstone = guard.begin(PurgeTarget::Group("side".into()));
+        let object = s
+            .put_tombstone(tombstone.tombstone(), tombstone.sequence())
+            .await
+            .unwrap();
+        assert!(s.refresh_tombstones(&guard).await);
+        assert_eq!(s.purge_group("hero").await, 1);
+        s.put("k", &image(b"y", &[])).await;
+        s.remove_if_match("k", etag.as_deref()).await;
+        s.remove("k").await;
+        s.end_tombstone(&object, tombstone.tombstone()).await;
+        assert!(fake.walk.pages_of("cache/") >= 2);
+        assert_eq!(fake.refused(), Vec::<String>::new());
+        assert_eq!(s.errors(), 0);
+        // The same store with no token is refused: temporary
+        // credentials must carry theirs.
+        let tokenless = store(&fake.endpoint);
+        assert!(tokenless.get("k").await.is_none());
+        assert!(fake.refused()[0].ends_with(" InvalidToken"));
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_store_still_works_where_the_bucket_allows_it() {
+        // With no credentials the requests go unsigned, for a
+        // local development store that allows anonymous access.
+        let fake = start_fake().await;
+        *fake.credentials.lock().unwrap() = None;
+        let s = store_signing(&fake.endpoint, None);
+        s.put("k", &image(b"x", &["hero"])).await;
+        assert!(s.get("k").await.is_some());
+        assert_eq!(s.purge_group("hero").await, 1);
+        assert_eq!(s.errors(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_purge_lists_one_page_inline_and_keeps_a_token_not_the_listing() {
+        // Issue #709: a purge listed the whole prefix inline,
+        // every page of it, and the walk that waited for its
+        // turn kept every name the inline scan left: about 3.5
+        // MB a queued purge at 31,000 objects. The inline scan
+        // now lists one page, of at most its budget, and what
+        // waits is where the listing stands: a continuation
+        // token.
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        seed_fillers(&fake, 2500);
+        let hero = PurgeTarget::Group("hero".into());
+        let (inline, pending) = s
+            .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, 128)
+            .await;
+        assert!(inline.complete);
+        assert_eq!(
+            *fake.walk.pages.lock().unwrap(),
+            vec![("cache/".to_string(), Some(128))]
+        );
+        assert_eq!(fake.ranged_gets.load(SeqCst), 128);
+        let pending = pending.expect("a remainder past the budget");
+        assert_eq!(pending.held_names(), 0);
+        assert!(pending.next.as_deref().is_some_and(|t| t.len() < 512));
+        // The rest lists on from the token, a page at a time,
+        // and judges every other object once.
+        let rest = s.finish_purge(pending).await;
+        assert!(rest.complete);
+        assert_eq!(fake.ranged_gets.load(SeqCst), 2500);
+        let pages = fake.walk.pages.lock().unwrap().clone();
+        assert_eq!(pages.len(), 4, "128, then 1000, 1000 and 372: {pages:?}");
+        assert!(
+            pages[1..]
+                .iter()
+                .all(|(prefix, max)| prefix == "cache/" && max.is_none())
+        );
+        assert_eq!(fake.walk.lists_of("cache/"), 1, "one pass");
+    }
+
+    #[tokio::test]
+    async fn a_walk_page_by_page_reaches_every_covered_copy() {
+        // Issue #709: with the listing taken a page at a time,
+        // copies on every page are still judged and deleted, and
+        // a pass over several pages is complete.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        seed_fillers(&fake, 1200);
+        {
+            let mut objects = fake.objects.lock().unwrap();
+            for i in 0..1100 {
+                objects.insert(
+                    format!("cache/{}", filler_name(super::test_support::HEAD_FILLER, i)),
+                    b"not a cache entry".to_vec(),
+                );
+            }
+        }
+        for i in 0..5 {
+            s.put(&format!("member-{i}"), &image(b"x", &["hero"])).await;
+        }
+        let hero = PurgeTarget::Group("hero".into());
+        let swept = s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING).await;
+        assert_eq!(
+            swept,
+            Swept {
+                removed: 5,
+                complete: true
+            }
+        );
+        assert_eq!(fake.walk.pages_of("cache/"), 3);
+        for i in 0..5 {
+            assert!(s.get(&format!("member-{i}")).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_moves_on_ends_the_walk_incomplete() {
+        // Issue #709: a store that answered every page as
+        // truncated, naming the page it was asked for as the
+        // next, kept a walk listing that page forever, holding
+        // its walk turn and growing its listing. The repeated
+        // token now ends the walk, incomplete, so its purge's
+        // tombstone stays in force.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        seed_fillers(&fake, 3);
+        fake.fail.lock().unwrap().stuck_token = true;
+        let hero = PurgeTarget::Group("hero".into());
+        let swept = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING),
+        )
+        .await
+        .expect("the walk ends");
+        assert!(!swept.complete);
+        assert_eq!(s.errors(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_of_a_covered_copy_leaves_the_walk_incomplete() {
+        // Issue #709: a 403 on a covered copy's DELETE counted
+        // as kept, with no line, so a purge whose credentials
+        // lack s3:DeleteObject ended its tombstone with the copy
+        // still in the bucket. A refusal now leaves the walk
+        // incomplete, as a store failure does, and counts.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        seed_fillers(&fake, 3);
+        s.put("old", &image(b"1", &["hero"])).await;
+        fake.fail.lock().unwrap().refuse_delete = true;
+        let hero = PurgeTarget::Group("hero".into());
+        let swept = s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING).await;
+        assert_eq!(
+            swept,
+            Swept {
+                removed: 0,
+                complete: false
+            }
+        );
+        assert_eq!(s.refused(Refused::Purge), 1);
+        assert_eq!(s.errors(), 1, "one line for the pass");
+        assert!(s.get("old").await.is_some());
+        // Once the store allows it, the next purge removes the
+        // copy and is complete.
+        fake.fail.lock().unwrap().refuse_delete = false;
+        let swept = s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING).await;
+        assert_eq!(
+            swept,
+            Swept {
+                removed: 1,
+                complete: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_header_read_leaves_the_walk_incomplete() {
+        // Issue #709: a refused read of an entry header (a 403)
+        // read as an object with nothing to purge, so the walk
+        // ended complete without having judged it. It is now
+        // a refusal: counted, and the walk is incomplete. A
+        // missing object is still an answer.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("old", &image(b"1", &["hero"])).await;
+        fake.fail.lock().unwrap().refuse_get = true;
+        let hero = PurgeTarget::Group("hero".into());
+        let swept = s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING).await;
+        assert_eq!(
+            swept,
+            Swept {
+                removed: 0,
+                complete: false
+            }
+        );
+        assert_eq!(s.refused(Refused::Purge), 1);
+        fake.fail.lock().unwrap().refuse_get = false;
+        assert!(s.get("old").await.is_some());
+        // A per-URL purge's reads by name of variants that are
+        // not there are answers, not refusals.
+        let key = PurgeTarget::Key("30x20/http://x/a.jpg".into());
+        let (swept, _) = s
+            .purge_bounded(
+                &key,
+                Some("30x20/http://x/a.jpg#cfgtest"),
+                PurgeCutoff::EVERYTHING,
+                128,
+            )
+            .await;
+        assert!(swept.complete);
+        assert_eq!(s.refused(Refused::Purge), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_lookups_and_existence_checks_are_counted_not_misses() {
+        // Issue #709: any lookup answer but a success was a
+        // silent miss, and so was any HEAD that failed: a store
+        // refusing every request (the 403 of expired keys) looked
+        // like an empty cache. A refused lookup now counts as
+        // one, and in the tier's errors; a lookup the store
+        // fails (a 5xx) counts in the errors alone; a failed
+        // existence check counts among those, refused or not;
+        // and a 404 is still an ordinary miss.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("k", &image(b"x", &[])).await;
+        assert!(s.put_raw("photo.png", b"x".to_vec()).await);
+        assert!(s.get("missing").await.is_none());
+        assert!(!s.exists_raw("missing.png").await);
+        assert_eq!((s.errors(), s.exists_checks_failed()), (0, 0));
+        // The store stops honoring the keys.
+        let mut rotated = super::test_support::test_credentials();
+        rotated.access_key = "AKIDROTATED".to_string();
+        *fake.credentials.lock().unwrap() = Some(rotated);
+        assert!(s.get("k").await.is_none());
+        assert!(!s.exists_raw("photo.png").await);
+        assert_eq!(s.refused(Refused::Lookup), 1);
+        assert_eq!(s.refused(Refused::Purge), 0);
+        assert_eq!(s.exists_checks_failed(), 1);
+        assert_eq!(s.errors(), 2);
+        // It honors them again, but fails every read: errors,
+        // not refusals.
+        *fake.credentials.lock().unwrap() = Some(super::test_support::test_credentials());
+        fake.fail.lock().unwrap().get_object = true;
+        assert!(s.get("k").await.is_none());
+        assert!(!s.exists_raw("photo.png").await);
+        assert_eq!(s.refused(Refused::Lookup), 1);
+        assert_eq!(s.exists_checks_failed(), 2);
+        assert_eq!(s.errors(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_stores_error_code_and_nothing_else() {
+        // Issue #709: the refused lookup's line says why with
+        // the code S3 gives, read from the front of the body
+        // and kept only when it is a short name.
+        let refusal = |body: &str| {
+            reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(403)
+                    .body(body.to_string())
+                    .unwrap(),
+            )
+        };
+        let code = refusal_code(
+            refusal(
+                "<?xml version=\"1.0\"?><Error><Code>ExpiredToken</Code>\
+                 <Message>The provided token has expired.</Message></Error>",
+            ),
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(code.as_deref(), Some("ExpiredToken"));
+        // S3 puts the code first, and a document can run long
+        // after it: a SignatureDoesNotMatch spells out the
+        // canonical request, session token and all, byte by
+        // byte. Only its front is read.
+        let long = format!(
+            "<Error><Code>SignatureDoesNotMatch</Code>\
+             <CanonicalRequestBytes>{}</CanonicalRequestBytes></Error>",
+            "47 45 54 ".repeat(3000)
+        );
+        let code = refusal_code(refusal(&long), Instant::now()).await;
+        assert_eq!(code.as_deref(), Some("SignatureDoesNotMatch"));
+        for body in [
+            "",
+            "<Error><Code>Bad\ncode</Code></Error>",
+            "<Error><Code>with spaces</Code></Error>",
+            &format!("<Error><Code>{}</Code></Error>", "A".repeat(65)),
+            &format!("{}<Error><Code>Late</Code></Error>", " ".repeat(8192)),
+        ] {
+            assert_eq!(refusal_code(refusal(body), Instant::now()).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purge_reads_error_answers_sort_into_nothing_unanswered_and_refused() {
+        // Issue #709: a purge walk's header read that the store
+        // refuses has not judged its object, and its line names
+        // the code: an AccessDenied is the credentials, an
+        // InvalidObjectState an entry a lifecycle rule archived.
+        // A 404 or a 416 holds nothing to purge, and a store
+        // failure is no answer.
+        let answer = |status: u16, body: &str| {
+            reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body(body.to_string())
+                    .unwrap(),
+            )
+        };
+        let archived = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+                        <Code>InvalidObjectState</Code><Message>The operation is not \
+                        valid for the object's storage class</Message></Error>";
+        let read = HeaderRead::of_error(answer(403, archived), Instant::now()).await;
+        assert!(
+            matches!(&read, HeaderRead::Refused(status, Some(code))
+                if *status == reqwest::StatusCode::FORBIDDEN && code == "InvalidObjectState"),
+            "an archived entry's read is a refusal that names its code"
+        );
+        let read = HeaderRead::of_error(answer(400, ""), Instant::now()).await;
+        assert!(matches!(read, HeaderRead::Refused(_, None)));
+        for status in [404, 416] {
+            let read = HeaderRead::of_error(answer(status, "<Error/>"), Instant::now()).await;
+            assert!(matches!(read, HeaderRead::Nothing), "{status}");
+        }
+        for status in [500, 503, 429, 408] {
+            let read = HeaderRead::of_error(answer(status, "<Error/>"), Instant::now()).await;
+            assert!(matches!(read, HeaderRead::Failed), "{status}");
+        }
+    }
+
+    /// What [`start_hashless_store`] hands back: its endpoint,
+    /// the receiver of each request's `x-amz-content-sha256` and
+    /// body, and the sender that stops it.
+    type HashlessStore = (
+        String,
+        std::sync::mpsc::Receiver<(Option<String>, Vec<u8>)>,
+        tokio::sync::oneshot::Sender<()>,
+    );
+
+    /// A server that reads one request per connection, whole,
+    /// and answers `200` without reading anything into it: on
+    /// a runtime of its own on another thread, so nothing it
+    /// does runs on the caller's.
+    fn start_hashless_store() -> HashlessStore {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                ready_tx
+                    .send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                let serve = async move {
+                    while let Ok((mut socket, _)) = listener.accept().await {
+                        let seen = seen_tx.clone();
+                        tokio::spawn(async move {
+                            let mut buf = Vec::new();
+                            let mut chunk = vec![0u8; 64 * 1024];
+                            let head_end = loop {
+                                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break at + 4;
+                                }
+                                match socket.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                }
+                            };
+                            let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                            let header = |name: &str| {
+                                head.lines()
+                                    .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+                                    .map(|v| v.trim().to_string())
+                            };
+                            let length: usize = header("content-length")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(0);
+                            while buf.len() < head_end + length {
+                                match socket.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                }
+                            }
+                            let _ = seen.send((
+                                header("x-amz-content-sha256"),
+                                buf[head_end..head_end + length].to_vec(),
+                            ));
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                                .await;
+                        });
+                    }
+                };
+                tokio::select! {
+                    () = serve => {}
+                    _ = stop_rx => {}
+                }
+            });
+        });
+        (ready_rx.recv().unwrap(), seen_rx, stop_tx)
+    }
+
+    #[tokio::test]
+    async fn large_writes_hash_off_the_runtime_and_sign_the_same_digest() {
+        // Issue #709: the whole-body SHA-256 of a write ran on a
+        // runtime worker, and so did an entry's serialization,
+        // which copies and MACs every byte: a large write held
+        // the worker, and everything queued on it, for as long
+        // as they took. They run on the blocking pool now, so a
+        // ticker on this single-threaded runtime keeps ticking
+        // through a large raw write and a large entry write, and
+        // the store still receives the digest of the bytes it
+        // gets.
+        const BODY: usize = 16 * 1024 * 1024;
+        let (endpoint, seen, stop) = start_hashless_store();
+        let s = store(&endpoint);
+        let raw = vec![0x5au8; BODY];
+        let entry = image(&vec![0xa5u8; BODY], &[]);
+        // What the hash alone costs here, in this build.
+        let hashed = Instant::now();
+        let _ = Sha256::digest(&raw);
+        let hash_time = hashed.elapsed();
+        let worst = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+        let ticking = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ticker = {
+            let (worst, ticking) = (worst.clone(), ticking.clone());
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                while ticking.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    let now = Instant::now();
+                    let mut worst = worst.lock().unwrap();
+                    *worst = (*worst).max(now - last);
+                    last = now;
+                }
+            })
+        };
+        assert!(s.put_raw("big.bin", raw.clone()).await);
+        s.put("big", &entry).await;
+        ticking.store(false, std::sync::atomic::Ordering::SeqCst);
+        ticker.await.unwrap();
+        let worst = *worst.lock().unwrap();
+        assert!(
+            worst < hash_time / 2,
+            "the runtime stalled {worst:?}; one hash takes {hash_time:?}"
+        );
+        assert_eq!(s.errors(), 0);
+        let (digest, body) = seen.recv().unwrap();
+        assert_eq!(body, raw);
+        assert_eq!(digest, Some(hex::encode(Sha256::digest(&raw))));
+        let (digest, body) = seen.recv().unwrap();
+        assert_eq!(body, serialize_entry("big", &entry, &test_entry_key()));
+        assert_eq!(digest, Some(hex::encode(Sha256::digest(&body))));
+        let _ = stop.send(());
+    }
+
+    /// A container credentials endpoint for the refresh tests:
+    /// each fetch takes the next of `answers` (the last one
+    /// repeats), a status and, for a 200, the credentials and
+    /// how many seconds from now they expire. It records the
+    /// `Authorization` header each fetch carried.
+    async fn start_credentials_endpoint(
+        answers: Vec<(u16, Option<(sigv4::Credentials, u64)>)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/credentials", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let mut next = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (status, creds) = answers[next.min(answers.len() - 1)].clone();
+                next += 1;
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                recorded.lock().unwrap().push(head.lines().find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                }));
+                let body = match creds {
+                    Some((creds, expires_in)) => {
+                        let at = sigv4::amz_date(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                                + expires_in,
+                        );
+                        format!(
+                            "{{\"AccessKeyId\":\"{}\",\"SecretAccessKey\":\"{}\",\"Token\":\"{}\",\
+                             \"Expiration\":\"{}-{}-{}T{}:{}:{}Z\"}}",
+                            creds.access_key,
+                            creds.secret_key,
+                            creds.session_token.as_deref().unwrap_or_default(),
+                            &at[0..4],
+                            &at[4..6],
+                            &at[6..8],
+                            &at[9..11],
+                            &at[11..13],
+                            &at[13..15]
+                        )
+                    }
+                    None => String::new(),
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+        });
+        (url, seen)
+    }
+
+    fn role_creds(name: &str) -> sigv4::Credentials {
+        sigv4::Credentials {
+            access_key: format!("ASIA{name}"),
+            secret_key: format!("{name}-secret/key+"),
+            session_token: Some(format!("{name}-session-token")),
+        }
+    }
+
+    #[tokio::test]
+    async fn container_credentials_sign_and_refresh_before_they_expire() {
+        // Issue #709: the keys were read once at startup, so
+        // temporary ones expired until a restart, and then every
+        // lookup was a silent miss. With no static keys, the
+        // container endpoint's credentials sign, and a refresh
+        // ahead of their expiry brings the next set before the
+        // store stops honoring the first.
+        use crate::credentials::{AwsCredentials, ContainerEndpoint, ContainerToken};
+        let fake = start_fake().await;
+        let (first, second) = (role_creds("FIRST"), role_creds("SECOND"));
+        *fake.credentials.lock().unwrap() = Some(first.clone());
+        let (url, seen) = start_credentials_endpoint(vec![
+            (200, Some((first, 2))),
+            (200, Some((second.clone(), 3600))),
+        ])
+        .await;
+        let source = AwsCredentials::container_refreshing(
+            ContainerEndpoint {
+                url,
+                token: Some(ContainerToken::Value(
+                    "pod-identity-token".to_string().into(),
+                )),
+                var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let s = S3Store::new(
+            "results".into(),
+            "cache/".into(),
+            Some(fake.endpoint.clone()),
+            "us-east-1".into(),
+            Some(source.clone()),
+            test_entry_key(),
+        )
+        .unwrap();
+        let line = source.start().await.unwrap();
+        assert!(
+            line.starts_with("aws credentials: from the container credentials endpoint"),
+            "{line}"
+        );
+        assert!(!line.contains("FIRST"), "{line}");
+        s.put("k", &image(b"x", &[])).await;
+        assert!(s.get("k").await.is_some());
+        // A second before the first set expires, the refresh
+        // brings the second, and the store honors only that.
+        wait_for("the refresh", || {
+            source
+                .current()
+                .is_some_and(|creds| creds.access_key == "ASIASECOND")
+        })
+        .await;
+        *fake.credentials.lock().unwrap() = Some(second);
+        assert!(s.get("k").await.is_some());
+        assert_eq!(s.errors(), 0);
+        assert_eq!(fake.refused(), Vec::<String>::new());
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(
+            seen.iter()
+                .all(|auth| auth.as_deref() == Some("pod-identity-token")),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_fetch_is_retried_and_reads_its_token_file_each_time() {
+        // Issue #709: an endpoint that fails at boot does not
+        // stop it; the requests go unsigned and are refused,
+        // counted, until a retry succeeds. The token file is
+        // read at every fetch, as EKS rotates it.
+        use crate::credentials::{AwsCredentials, ContainerEndpoint, ContainerToken};
+        let fake = start_fake().await;
+        let role = role_creds("ROLE");
+        *fake.credentials.lock().unwrap() = Some(role.clone());
+        let (url, seen) =
+            start_credentials_endpoint(vec![(500, None), (200, Some((role, 3600)))]).await;
+        let dir = crate::test_support::scratch_dir("s3-token-file");
+        let token = dir.join("eks-pod-identity-token");
+        std::fs::write(&token, "first-token\n").unwrap();
+        let source = AwsCredentials::container_refreshing(
+            ContainerEndpoint {
+                url,
+                token: Some(ContainerToken::File(token.clone())),
+                var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            },
+            crate::credentials::REFRESH_AHEAD,
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        let s = S3Store::new(
+            "results".into(),
+            "cache/".into(),
+            Some(fake.endpoint.clone()),
+            "us-east-1".into(),
+            Some(source.clone()),
+            test_entry_key(),
+        )
+        .unwrap();
+        let line = source.start().await.unwrap();
+        assert!(
+            line.starts_with("warning: aws credentials: cannot fetch"),
+            "{line}"
+        );
+        assert!(line.contains("500"), "{line}");
+        assert!(s.get("k").await.is_none());
+        assert_eq!(s.refused(Refused::Lookup), 1);
+        std::fs::write(&token, "rotated-token").unwrap();
+        wait_for("the retry", || source.current().is_some()).await;
+        s.put("k", &image(b"x", &[])).await;
+        assert!(s.get("k").await.is_some());
+        assert_eq!(s.refused(Refused::Lookup), 1);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0].as_deref(), Some("first-token"));
+        assert_eq!(seen[1].as_deref(), Some("rotated-token"));
     }
 }

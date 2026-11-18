@@ -367,6 +367,18 @@ add_filter('intermediate_image_sizes_advanced', 'crabcrop_wp_filter_intermediate
  * Settings screen (Settings > Crabcrop).
  */
 
+/*
+ * The settings screen never writes the stored secret back into the
+ * page (see crabcrop_wp_settings_page): its field starts empty. So an
+ * empty or missing secret field keeps the stored secret, a value
+ * replaces it, and the "remove" checkbox clears it.
+ *
+ * WordPress runs this callback twice on the first save, the second
+ * time on its own output, so the output must come back unchanged:
+ * a secret already sanitized is kept, and a map already parsed (an
+ * array under size_map, with no size_map_text) is checked again
+ * rather than dropped.
+ */
 function crabcrop_wp_sanitize_settings($input)
 {
     $out = array(
@@ -387,15 +399,33 @@ function crabcrop_wp_sanitize_settings($input)
     if (isset($input['mode']) && in_array($input['mode'], array('presets', 'signed'), true)) {
         $out['mode'] = $input['mode'];
     }
-    if (isset($input['secret'])) {
+    if (!empty($input['clear_secret'])) {
+        $out['secret'] = '';
+    } elseif (isset($input['secret']) && (string) $input['secret'] !== '') {
         $out['secret'] = (string) $input['secret'];
+    } else {
+        $out['secret'] = crabcrop_wp_stored_secret();
     }
-    $out['size_map'] = crabcrop_wp_parse_size_map(
-        isset($input['size_map_text']) ? $input['size_map_text'] : '',
-        $out['mode']
-    );
+    if (isset($input['size_map_text'])) {
+        $map_text = (string) $input['size_map_text'];
+    } elseif (isset($input['size_map']) && is_array($input['size_map'])) {
+        $map_text = crabcrop_wp_size_map_to_text($input['size_map']);
+    } else {
+        $map_text = '';
+    }
+    $out['size_map'] = crabcrop_wp_parse_size_map($map_text, $out['mode']);
     $out['disable_sizes'] = !empty($input['disable_sizes']);
     return $out;
+}
+
+/** The secret the settings screen stored, or '' for none. */
+function crabcrop_wp_stored_secret()
+{
+    $options = get_option('crabcrop_settings', array());
+    if (!is_array($options) || !isset($options['secret'])) {
+        return '';
+    }
+    return (string) $options['secret'];
 }
 
 function crabcrop_wp_constant_for($key)
@@ -419,10 +449,12 @@ function crabcrop_wp_settings_page()
     if (!is_array($options)) {
         $options = array();
     }
+    // The stored secret is never written into the page: the form
+    // only says that one is stored.
     $values = array(
         'base_url' => isset($options['base_url']) ? $options['base_url'] : '',
         'mode' => isset($options['mode']) ? $options['mode'] : 'presets',
-        'secret' => isset($options['secret']) ? $options['secret'] : '',
+        'has_secret' => isset($options['secret']) && (string) $options['secret'] !== '',
         'size_map_text' => crabcrop_wp_size_map_to_text(
             isset($options['size_map']) ? $options['size_map'] : array()
         ),
@@ -485,13 +517,23 @@ function crabcrop_wp_settings_page()
             <td>
               <input type="password" id="crabcrop-secret" class="regular-text"
                 name="crabcrop_settings[secret]"
-                value="<?php echo esc_attr($values['secret']); ?>"
-                autocomplete="off"
+                value=""
+                autocomplete="new-password"
+                <?php if ($values['has_secret'] && crabcrop_wp_constant_for('secret') === null) : ?>placeholder="A secret is stored"<?php endif; ?>
                 <?php disabled(crabcrop_wp_constant_for('secret') !== null); ?>>
               <?php if (crabcrop_wp_constant_for('secret')) : ?>
                 <p class="description">Set by the
                 <code><?php echo esc_html(crabcrop_wp_constant_for('secret')); ?></code>
                 constant in wp-config.php.</p>
+              <?php elseif ($values['has_secret']) : ?>
+                <p class="description">A secret is stored. It is not shown:
+                leave the field empty to keep it, or enter a new one to replace
+                it. The instance's <code>CRABCROP_SECRET</code>; only signed mode
+                reads it.</p>
+                <label>
+                  <input type="checkbox" name="crabcrop_settings[clear_secret]" value="1">
+                  Remove the stored secret
+                </label>
               <?php else : ?>
                 <p class="description">The instance's <code>CRABCROP_SECRET</code>.
                 Only used in signed mode; presets mode never reads it.</p>

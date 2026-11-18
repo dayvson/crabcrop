@@ -8,6 +8,12 @@
 //! shows that the secret is set, never its bytes. Types that
 //! only contain those types keep a derived `Debug`, so the
 //! redaction holds wherever they are nested.
+//!
+//! The same types zero their secret bytes when they are
+//! dropped (the `zeroize` crate), as do the keys derived from
+//! the secret for one verification or one bucket request, so
+//! a freed buffer does not keep a secret in the heap. The
+//! process environment keeps its own copy of each variable.
 
 /// Prints as `[redacted]`.
 pub(crate) struct Redacted;

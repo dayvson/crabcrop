@@ -1613,7 +1613,9 @@ async fn a_render_landing_under_a_purge_whose_tombstone_is_being_written_holds_t
         .expect("the write did not claim the key");
     let writer = {
         let (state, entry) = (state.clone(), entry.clone());
-        tokio::spawn(async move { finish_disk_write(&state, snapshot, KEY, &entry, claim).await })
+        tokio::spawn(
+            async move { finish_disk_write(&state, snapshot, KEY, &entry, claim, false).await },
+        )
     };
     within(
         std::time::Duration::from_secs(5),
