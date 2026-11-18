@@ -84,8 +84,8 @@ function purgeSignedString(target: string, expires: number | undefined): string 
  *
  * The server reads a leading `exp:` segment of the path as
  * the purge's own expiry, so a target that opens with an
- * image URL's `exp:` is refused once that second has
- * passed. An image's `exp:` is not part of its cache key:
+ * image URL's `exp:` is refused from that second on. An
+ * image's `exp:` is not part of its cache key:
  * drop it from the target and the purge evicts the same
  * entries.
  */
