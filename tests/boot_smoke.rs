@@ -205,6 +205,44 @@ fn boot_with_no_source_configuration_serves_health() {
     assert!(status.contains("200"), "no 200 from /health: {status:?}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn boot_starts_the_filter_threads_one_per_core() {
+    // Issue #739: the filters asked for the core count at
+    // every call and started a thread per band for every
+    // pass. The server starts one pool for the bands at boot,
+    // a thread per core the process may use (none on a
+    // one-core host, where the bands run on the render's own
+    // thread), and every banded pass runs on it.
+    let (server, _port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789"),
+    );
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let expected = if cores > 1 { cores } else { 0 };
+    let tasks = format!("/proc/{}/task", server.0.id());
+    let filter_threads = || {
+        std::fs::read_dir(&tasks)
+            .unwrap()
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .filter(|name| name.starts_with("filter-"))
+            .count()
+    };
+    // A thread names itself as it starts, so a count short of
+    // the cores right after the listening line gets a moment.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = filter_threads();
+    while seen != expected && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        seen = filter_threads();
+    }
+    assert_eq!(
+        seen, expected,
+        "{seen} filter threads after boot on {cores} cores"
+    );
+}
+
 /// Boot with a minimal environment plus `env`, check
 /// `/health`, stop the server, and return what it wrote
 /// to stderr while booting.

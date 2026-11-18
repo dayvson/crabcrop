@@ -219,6 +219,11 @@ async fn start() -> Option<std::time::Instant> {
     // Before the first render: the allocator keeps freed
     // frame buffers from the start (see the function).
     raise_malloc_thresholds();
+    // The threads the filters run their row bands on start
+    // here, a thread per core (issue #739): the host's
+    // parallelism is read once, at boot, and the first large
+    // render does not wait for them to start.
+    crabcrop::filters::start_band_pool();
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
     match crabcrop::svg::WorkerCommand::current_binary() {
