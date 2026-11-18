@@ -64,8 +64,8 @@ const LONG1: u8 = 0x8a;
 const LONG4: u8 = 0x8b;
 const BINFLOAT: u8 = b'G';
 const NONE: u8 = b'N';
-const NEWFALSE: u8 = 0x88;
-const NEWTRUE: u8 = 0x89;
+const NEWTRUE: u8 = 0x88;
+const NEWFALSE: u8 = 0x89;
 const MARK: u8 = b'(';
 const EMPTY_TUPLE: u8 = b')';
 const TUPLE: u8 = b't';
@@ -121,8 +121,14 @@ impl<'a> PickleMachine<'a> {
                 BININT1 | BININT2 | BININT | LONG | LONG1 | LONG4 => self.integer(op)?,
                 BINFLOAT => self.float()?,
                 NONE => self.push(PickleValue::None)?,
-                NEWFALSE => self.push(PickleValue::Bool(false))?,
-                NEWTRUE => self.push(PickleValue::Bool(true))?,
+                // The loop these handlers replaced pushed false
+                // for NEWTRUE and true for NEWFALSE, the reverse
+                // of CPython, and so do they (issue #741 changes
+                // no behavior). No bool's value is read: the
+                // loader ignores a bool (a tensor rebuild's
+                // requires-grad flag) or refuses it by its type.
+                NEWTRUE => self.push(PickleValue::Bool(false))?,
+                NEWFALSE => self.push(PickleValue::Bool(true))?,
                 MARK => self.marks.push(self.stack.len()),
                 EMPTY_TUPLE => self.push(PickleValue::Tuple(Vec::new()))?,
                 TUPLE | TUPLE1 | TUPLE2 | TUPLE3 => self.tuple(op)?,

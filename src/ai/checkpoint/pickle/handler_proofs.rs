@@ -165,9 +165,10 @@ const OPCODES: &[u8] = b"\x80cX\x8cUKMJL\x8a\x8bGN\x88\x89)(t\x85\x86\x87QR}subq
 
 /// The bytes the sweeps write over the smaller fixtures:
 /// every opcode the loop reads, the small numbers lengths
-/// and memo indices take, and bytes it refuses (0x7f, 0xff,
-/// and FRAME, APPEND and EMPTY_LIST from protocols past
-/// what a head save uses).
+/// and memo indices take, and bytes it refuses: 0x7f, 0xff,
+/// FRAME (protocol 4, past the protocol 2 a head save
+/// uses), and APPEND and EMPTY_LIST (a list, which a head
+/// save does not hold).
 fn sweep_bytes() -> Vec<u8> {
     let mut bytes = OPCODES.to_vec();
     bytes.extend(0..8);
