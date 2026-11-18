@@ -37,9 +37,9 @@ RUN apt-get update \
 # and verify both hashes, the package's before extraction and
 # the library's after. NuGet never replaces the package of a
 # published version. The libraries are, byte for byte, the
-# ones in the GitHub release tarballs this stage fetched
-# through 0.13.1: the library pins are the ones it checked
-# then.
+# ones in the GitHub release tarballs this stage used to
+# fetch (issue #733): the library pins are the ones it
+# checked then.
 ARG TARGETARCH
 RUN set -eu; \
     case "$TARGETARCH" in \
