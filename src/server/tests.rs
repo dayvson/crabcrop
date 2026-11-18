@@ -1583,6 +1583,57 @@ async fn a_purge_target_that_opens_with_an_image_expiry_reads_it_as_the_purges_o
 }
 
 #[tokio::test]
+async fn a_sealed_target_under_the_key_id_exp_purges_by_its_plain_url() {
+    // `exp` is a valid key ID, so a token sealed under it
+    // opens with `exp:s1.`. That segment is the token, never
+    // the purge's own expiry: the plain purge of the sealed
+    // spelling, with or without a friendly name, evicts the
+    // entry it shares with the plain spelling, as it always
+    // did, and so does its expiring form.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        keyring: crate::url::Keyring {
+            current_id: "exp".to_string(),
+            current: SECRET.to_vec(),
+            previous: None,
+        },
+        ..test_state()
+    })
+    .await;
+    let target = format!("100x50/{src}");
+    let token = crabcrop_url::seal_with_key_id(SECRET, "exp", &target).unwrap();
+    assert!(token.starts_with("exp:s1."), "{token}");
+    let sealed = client()
+        .get(format!("{base}/{token}/photo.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sealed.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let future = now_unix() + 3600;
+    for (n, rest) in [
+        format!("{token}/photo.png"),
+        token.clone(),
+        format!("exp:{future}/{token}/photo.png"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sig = crate::url::purge_signature(SECRET, &rest);
+        let resp = post_purge(&base, "purge", &sig, &rest).await;
+        assert_eq!(resp.status(), 200, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "purged 1\n", "{rest}");
+        let resp = get_signed(&base, &target).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; fwd=uri-miss",
+            "{rest}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), n + 2, "{rest}");
+    }
+}
+
+#[tokio::test]
 async fn a_group_purge_reads_a_leading_exp_as_its_expiry() {
     // A group is a preset name ([A-Za-z0-9_-]), and a group
     // with a slash was refused, so `exp:<n>/<group>` named

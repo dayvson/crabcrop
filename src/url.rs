@@ -3315,19 +3315,30 @@ pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u6
 /// segment is the purge's expiry. The purge evicts what it
 /// evicted before, because an image's `exp:` is not part of
 /// its cache key ([`canonical_key_form`] drops it), so the
-/// rest of the path names the same entries; once the second
-/// has passed it is refused as expired instead. A group
+/// rest of the path names the same entries; from that
+/// second on it is refused as expired instead. A group
 /// name never begins with `exp:` (groups are preset names,
 /// `[A-Za-z0-9_-]`, and a name with a `/` was refused), so
 /// for the purge-group endpoint the spelling was free.
 ///
-/// As for uploads, a leading segment that starts with `exp:`
-/// but does not parse, or that nothing follows, is a grammar
-/// error (`invalid_expiry`), never part of the target. The
-/// signature covers the remainder exactly as presented,
-/// expiry included, so verification runs on the unsplit
-/// string.
+/// A sealed target signed under the key ID `exp` opens with
+/// `exp:s1.` ([`split_sealed_segment`]): that segment is the
+/// token, which the purge unseals, and never an expiry,
+/// whose seconds are digits. It stays in the target, so the
+/// plain purge URL of such a sealed URL evicts what it
+/// always did.
+///
+/// As for uploads, any other leading segment that starts
+/// with `exp:` but does not parse, or that nothing follows,
+/// is a grammar error (`invalid_expiry`), never part of the
+/// target. The signature covers the remainder exactly as
+/// presented, expiry included, so verification runs on the
+/// unsplit string.
 pub fn split_purge_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let first = rest.split_once('/').map_or(rest, |(first, _)| first);
+    if split_sealed_segment(first).is_some() {
+        return Ok((None, rest));
+    }
     split_leading_expiry(rest)
 }
 

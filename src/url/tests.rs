@@ -663,6 +663,24 @@ fn expiring_purge_signatures_verify_over_the_full_remainder() {
 }
 
 #[test]
+fn a_sealed_purge_target_under_the_key_id_exp_carries_no_expiry() {
+    // `exp` is a valid key ID, and a token sealed under it
+    // opens with `exp:s1.`. That segment is the token, the
+    // target's first segment, never the purge's expiry,
+    // whose seconds are digits: with or without an expiry
+    // in front, the token stays whole.
+    for sealed in ["exp:s1.AAECAw/photo.jpg", "exp:s1.AAECAw"] {
+        assert_eq!(split_purge_remainder(sealed).unwrap(), (None, sealed));
+        let expiring = format!("exp:5/{sealed}");
+        assert_eq!(split_purge_remainder(&expiring).unwrap(), (Some(5), sealed));
+    }
+    // An upload name has no token, so there the segment is
+    // the malformed expiry it always was.
+    let err = split_upload_remainder("exp:s1.AAECAw/photo.jpg").unwrap_err();
+    assert_eq!(err.code(), "invalid_expiry");
+}
+
+#[test]
 fn sealed_segment_splitting() {
     assert_eq!(split_sealed_segment("s1.AAECAw"), Some((None, "s1.AAECAw")));
     assert_eq!(
