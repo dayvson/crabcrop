@@ -76,6 +76,9 @@ RUN chmod 644 /models/u2netp.onnx /models/yunet.onnx
 # COPY my-sr-model.onnx /models/sr.onnx
 # ENV CRABCROP_UPSCALE_MODEL=/models/sr.onnx
 
+# The base image's HEALTHCHECK applies unchanged: its 5-minute
+# start period covers the model preload (issue #715).
+
 # ONNX Runtime telemetry off unless an operator opts in.
 ENV ORT_DISABLE_TELEMETRY=1 \
     CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \

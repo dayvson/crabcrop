@@ -658,7 +658,6 @@ fn pdf_renderer_construction_follows_the_decoder_rules() {
 #[cfg(unix)]
 #[test]
 fn pdf_renderer_construction_validates_both_programs() {
-    use std::os::unix::fs::PermissionsExt;
     // A missing renderer is a boot error naming the
     // variable, like the decoder's.
     let missing = missing_path("renderer");
@@ -673,8 +672,7 @@ fn pdf_renderer_construction_validates_both_programs() {
     // contract.
     let dir = crate::test_support::scratch_dir("boot-pdf");
     let renderer_path = dir.join("pdftocairo");
-    std::fs::write(&renderer_path, b"#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&renderer_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_script::write_script(&renderer_path, "#!/bin/sh\n");
     let renderer_str = renderer_path.to_string_lossy().into_owned();
     let err = expect_err(build_pdf_renderer(env_of(&[(
         "CRABCROP_PDF_RENDERER",
@@ -682,16 +680,78 @@ fn pdf_renderer_construction_validates_both_programs() {
     )])));
     assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
     assert!(err.contains("pdfinfo"), "{err}");
-    // The pair in place constructs.
+    // Issue #715: the pair in place runs but renders
+    // nothing. Boot used to take it, and every `page:`
+    // request then answered `502`; the boot check refuses it.
     let info_path = dir.join("pdfinfo");
-    std::fs::write(&info_path, b"#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_script::write_script(&info_path, "#!/bin/sh\n");
+    let err = expect_err(build_pdf_renderer(env_of(&[(
+        "CRABCROP_PDF_RENDERER",
+        renderer_str.as_str(),
+    )])));
+    assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
+    assert!(
+        err.contains("a one-page test document did not render"),
+        "{err}"
+    );
+    // A pair that renders the test page constructs.
+    let page = dir.join("page.png");
+    image::RgbImage::new(16, 16).save(&page).unwrap();
+    crate::test_script::write_script(
+        &info_path,
+        "#!/bin/sh\ncat > /dev/null\n\
+         printf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  8 x 8 pts'\n",
+    );
+    crate::test_script::write_script(
+        &renderer_path,
+        &format!("#!/bin/sh\ncat > /dev/null\ncat '{}'\n", page.display()),
+    );
     let renderer = build_pdf_renderer(env_of(&[
         ("CRABCROP_PDF_RENDERER", renderer_str.as_str()),
         ("CRABCROP_PDF_TIMEOUT_SECS", "45"),
     ]))
     .unwrap();
     assert!(renderer.is_some());
+}
+
+/// Issue #715, with Poppler's own tools when they are on
+/// PATH (a machine without them skips this). pdftoppm sits
+/// next to pdfinfo and takes the renderer's arguments, so
+/// boot took `CRABCROP_PDF_RENDERER` naming it. But it
+/// writes its PNG to a file, `-.png` in its working
+/// directory, and prints nothing, so every `page:` request
+/// answered `502`. Boot now refuses it, and still takes
+/// pdftocairo, the reference renderer.
+#[cfg(unix)]
+#[test]
+fn pdf_renderer_construction_refuses_pdftoppm_and_takes_pdftocairo() {
+    let Some(dir) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find(|dir| {
+            ["pdftocairo", "pdftoppm", "pdfinfo"]
+                .iter()
+                .all(|tool| dir.join(tool).is_file())
+        })
+    }) else {
+        eprintln!("skipping: Poppler's pdftocairo, pdftoppm and pdfinfo are not on PATH");
+        return;
+    };
+    let build = |tool: &str| {
+        let path = dir.join(tool).to_string_lossy().into_owned();
+        build_pdf_renderer(env_of(&[("CRABCROP_PDF_RENDERER", path.as_str())]))
+    };
+    assert!(build("pdftocairo").unwrap().is_some());
+    // The tools run in the temporary directory, where
+    // pdftoppm leaves its file.
+    let left = std::env::temp_dir().join("-.png");
+    let there = left.exists();
+    let refused = build("pdftoppm");
+    if !there {
+        let _ = std::fs::remove_file(&left);
+    }
+    let err = expect_err(refused);
+    assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
+    assert!(err.contains("pdftoppm"), "{err}");
+    assert!(err.contains("the PDF renderer produced no output"), "{err}");
 }
 
 /// Issue #526: these construction tests once named

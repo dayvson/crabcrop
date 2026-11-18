@@ -5,7 +5,7 @@ Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from Python.
 ## Usage
 
 ```python
-from crabcrop_url import build_sealed_url, build_url, build_srcset, purge_group_signature, purge_signature, seal_url, sign, unseal, upload_signature, verify
+from crabcrop_url import build_sealed_url, build_url, build_srcset, purge_group_signature, purge_signature, seal, sign, unseal, upload_signature, verify
 
 # A signed URL. The operation string is passed verbatim and may
 # contain several segments and preset: references.
@@ -25,7 +25,8 @@ expiring = build_url(
     expires=1893456000,
 )
 
-# A responsive srcset: one {width}x0 URL per width.
+# A responsive srcset: one {width}x0 URL per width. An expiry and a
+# key_id, when given, apply to every entry.
 srcset = build_srcset(
     "https://images.example.com",
     "your-secret",
@@ -67,8 +68,30 @@ sealed_url = build_sealed_url(
     "https://example.com/photo.jpg",
     name="photo.jpg",
 )
-remainder = unseal("your-secret", seal_url("your-secret", "300x200/https://example.com/photo.jpg"))
+remainder = unseal("your-secret", seal("your-secret", "300x200/https://example.com/photo.jpg"))
 ```
+
+## Typed builders
+
+The operation string is the spec, and passing it verbatim stays the primary API. For callers who would rather build it, `ops` and `filter` are typed builders, the Python spelling of the TypeScript SDK's: each call checks its arguments against the server's grammar and returns the canonical spelling, so the typed and hand-written forms sign byte-identical URLs. A value the server would refuse raises `ValueError` at build time. Both SDKs run the builder cases in [`spec/operation-vectors.json`](../../spec/operation-vectors.json), so they spell every operation alike: a decimal argument is written the way the server prints it, the shortest decimal that reads back as the same 32-bit float (`ops.focal_point(0.1 + 0.2, 0.4, 2)` is `focalpoint:0.3x0.4:2`), and a class name is written trimmed (`ops.crop_objects(100, 100, [" person "])` is `crop:100x100:objects(person):1`).
+
+```python
+import crabcrop_url as cc
+
+operations = cc.join_ops(
+    cc.ops.crop(1200, 630, "smart"),
+    cc.ops.filters(cc.filter.format("webp", method=6), cc.filter.quality(80)),
+)
+# "crop:1200x630:smart/filters:format(webp,method:6):quality(80)"
+url = cc.build_url("https://images.example.com", "your-secret", operations, "https://example.com/photo.jpg")
+
+cc.ops.crop_objects(400, 300, ["person", "car"], 1.5)  # "crop:400x300:objects(person,car):1.5"
+cc.MAX_DIMENSION  # 16383, the server's per-axis pixel cap
+```
+
+Each TypeScript name has its Python spelling: `buildURL` is `build_url`, `ops.cropObjects` is `ops.crop_objects`, `filter.qualityPerFormat` is `filter.quality_per_format`, and an options object (`filter.format("webp", { method: 6 })`, `filter.studio("product", { bg: "white" })`) is keyword arguments. `seal` is the TypeScript and Rust name for sealing a remainder; `seal_url`, its earlier Python name, still works. Integer arguments take an `int`: a float, even `300.0`, and a `bool` raise, as `build_srcset` widths do. Imported by name, `filter` shadows the builtin `filter` in your module; `import crabcrop_url as cc` keeps both.
+
+The package ships its type annotations (`py.typed`), so a type checker reads the builders' argument types, such as the `Literal` alignments of `ops.crop`, and `crabcrop_url.__version__` is the release version.
 
 Pass `None` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. The secret may be `str` or `bytes`.
 

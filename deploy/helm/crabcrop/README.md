@@ -38,7 +38,7 @@ helm install crabcrop deploy/helm/crabcrop \
 - The disk result tier on its own persistent volume (8GiB budget on a 10Gi claim), so renders survive pod restarts.
 - Both credentials wired from the Secret above: the signing secret, and the metrics token through `metricsToken.existingSecret`, so `/metrics` is never answerable without its bearer token.
 - The production environment: a 512 MB memory result tier sized against the memory limit, the slow lane at one permit (long-running renders, such as animated encodes, never starve stills), the 30-second processing limit stated, and private-address sources refused.
-- Health probes are part of the chart itself: liveness and readiness both read `/health`, and every install gets them. `/health` answers `503` once the request log has stalled, its queue full for 5 seconds because nothing reads the pod's standard output, so the liveness probe restarts a replica that can serve no image (see [The request log](../../../docs/deployment.md#the-request-log)).
+- Health probes are part of the chart itself: startup, liveness and readiness all read `/health`, and every install gets them (the startup probe gives boot 5 minutes; see [AI variant](#ai-variant)). `/health` answers `503` once the request log has stalled, its queue full for 5 seconds because nothing reads the pod's standard output, so the liveness probe restarts a replica that can serve no image (see [The request log](../../../docs/deployment.md#the-request-log)).
 
 Serving traffic takes the usual extra step: enable the Ingress (`ingress.enabled`, with your host and TLS) or front the Service your own way.
 
@@ -133,7 +133,7 @@ ai:
     CRABCROP_REMOVEBG_MODEL: /models/removebg.onnx
 ```
 
-`ai.enabled` switches the image to the Dockerfile.ai variant and mounts the models claim at `/models`. Which features load is decided by which model env vars you set (removebg, face, upscale, detection, CLIP tagging; see [docs/ai-features.md](../../../docs/ai-features.md)). Models are preloaded and validated at boot, so a bad path fails the pod at startup. Model files are deployment artifacts: the chart never carries them.
+`ai.enabled` switches the image to the Dockerfile.ai variant and mounts the models claim at `/models`. Which features load is decided by which model env vars you set (removebg, face, upscale, detection, CLIP tagging; see [docs/ai-features.md](../../../docs/ai-features.md)). Models are preloaded and validated at boot, so a bad path fails the pod at startup. The server answers nothing until they have loaded, so the pod's startup probe gives boot 5 minutes, 150 tries 2 seconds apart, before the kubelet restarts it; for a model set that takes longer, raise `startupProbe.failureThreshold` (`startupProbe.periodSeconds` sets the period). Model files are deployment artifacts: the chart never carries them.
 
 ## Other settings
 
@@ -148,7 +148,7 @@ env:
 
 Keep secrets out of this map: see [Secrets](#secrets).
 
-The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer token, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). [docs/configuration.md](../../../docs/configuration.md) lists every variable. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer token, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), `startupProbe` (how long boot may take before a restart: `periodSeconds` 2 and `failureThreshold` 150, 5 minutes, which the liveness and readiness probes wait for; see [AI variant](#ai-variant) and [Booting](../../../docs/deployment.md#booting-and-the-probes-that-wait-for-it)), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). [docs/configuration.md](../../../docs/configuration.md) lists every variable. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Security context
 

@@ -50,6 +50,20 @@ gcsCredentials:
 # Port the server listens on (the PORT environment variable).
 containerPort: 3000
 
+# The startup probe asks /health every periodSeconds and
+# holds the liveness and readiness probes until it first
+# answers. The server binds its port early but answers only
+# once boot is done, and with ai.enabled boot loads and
+# probes every configured model first, which can take minutes
+# on a small CPU budget. The kubelet restarts the pod after
+# failureThreshold misses in a row: 150 misses 2 s apart, 5
+# minutes, by default. Raise failureThreshold for a slower
+# preload; a boot without models answers within a second or
+# two.
+startupProbe:
+  periodSeconds: 2
+  failureThreshold: 150
+
 # How long the server drains after SIGTERM before it exits
 # (CRABCROP_SHUTDOWN_GRACE_SECS): requests in flight finish,
 # then the shared-tier writes and disk-tier work they left.

@@ -2,7 +2,8 @@
 # workflow (issue #598): build, setuptools and their dependencies, each
 # pinned with the hashes of its files. Install with --require-hashes and
 # build with --no-isolation, so the build backend is this setuptools and
-# not whatever setuptools>=61 resolves to on the day.
+# not whatever setuptools>=77 (pyproject.toml's floor) resolves to on the
+# day.
 #
 # Generated with uv for Python 3.12 on Linux x86_64, the release job's
 # Python, from the pins build==1.6.1 and setuptools==84.2.1:

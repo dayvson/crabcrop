@@ -252,6 +252,52 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
     assert!(!stderr.contains("proxy"), "{stderr}");
 }
 
+#[test]
+#[cfg(unix)]
+fn crabcrop_bind_on_the_ipv6_any_address_takes_ipv4_too_or_fails_cleanly() {
+    // Issue #715: `CRABCROP_BIND=::` listens on every IPv6
+    // address and, with IPV6_V6ONLY off, on IPv4 too,
+    // whatever the host's default. On a host without IPv6
+    // the boot stops with an error that says what to set
+    // instead, and nothing panics.
+    if std::net::TcpListener::bind("[::]:0").is_err() {
+        let stderr = refused_boot(&[("CRABCROP_BIND", "::")]);
+        assert!(
+            stderr.contains("crabcrop: cannot listen on [::]:0: "),
+            "{stderr}"
+        );
+        assert!(
+            stderr.trim_end().ends_with(
+                "; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+            ),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        return;
+    }
+    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "::")]);
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("connections: bind ::, ")),
+        "{printed:#?}"
+    );
+    // IPv4, to the IPv6 listener.
+    assert!(status_line(port, "/health", "").contains("200"));
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        let mut stream = TcpStream::connect(("::1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: [::1]\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+    }
+}
+
 /// Boot with a minimal environment plus `env` and expect
 /// the boot to fail: the exit code is 1, nothing listens,
 /// and the result is what the server wrote to stderr. A
@@ -1185,36 +1231,20 @@ fn sigterm_stops_waiting_for_a_stalled_shared_write_at_the_grace() {
 
 #[test]
 #[cfg(unix)]
-fn sigterm_cuts_off_a_hung_request_at_the_grace() {
+fn sigterm_cuts_off_hung_requests_at_the_grace_and_counts_them() {
     // Issue #463: the connection drain had no deadline, so
     // one request stuck on a slow origin held the shutdown
     // until the platform killed the process. Now the grace
-    // bounds it too.
-    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let origin_addr = origin.local_addr().unwrap();
-    let (fetched_tx, fetched) = std::sync::mpsc::channel();
-    // An origin that accepts the fetch and never answers.
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in origin.incoming() {
-            let Ok(stream) = stream else { return };
-            let _ = fetched_tx.send(());
-            held.push(stream);
-        }
-    });
+    // bounds it too. Issue #715: the line that says requests
+    // were cut off says how many.
     let grace = Duration::from_secs(2);
     let (mut server, port, lines) = serving_unsafe_urls(&[
         ("CRABCROP_SOURCE_TIMEOUT_SECS", "600"),
         ("CRABCROP_SHUTDOWN_GRACE_SECS", &grace.as_secs().to_string()),
     ]);
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let request = format!(
-        "GET /unsafe/40x30/http://{origin_addr}/img/hang.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).unwrap();
-    fetched
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the server fetches the source");
+    let _streams = hung_requests(port, 2);
+    // A request that has finished is not among them.
+    assert!(status_line(port, "/health", "").contains("200"));
     let signalled = Instant::now();
     terminate(&server);
     wait_for_line(&lines, "shutdown: draining");
@@ -1227,14 +1257,78 @@ fn sigterm_cuts_off_a_hung_request_at_the_grace() {
         "exited after {took:?}"
     );
     assert!(
-        stderr.contains("shutdown: requests still in flight at the deadline are cut off"),
+        stderr.contains("shutdown: 2 requests still in flight at the deadline are cut off"),
         "{stderr}"
     );
-    // The request's miss belongs to the request: it is not
-    // reported again as background work left behind.
+    // The requests' misses belong to the requests: they are
+    // not reported again as background work left behind.
     assert!(!stderr.contains("background writes"), "{stderr}");
     assert!(!stderr.contains("renders whose client left"), "{stderr}");
     wait_for_line(&lines, "shutdown: done");
+}
+
+/// `count` requests on the server at `port`, each for a
+/// source of its own at an origin that accepts the fetch and
+/// never answers: they hang until the server cuts them off.
+/// Returns once the server has fetched every source, with
+/// the clients' streams, which keep the requests open.
+#[cfg(unix)]
+fn hung_requests(port: u16, count: usize) -> Vec<TcpStream> {
+    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let (fetched_tx, fetched) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in origin.incoming() {
+            let Ok(stream) = stream else { return };
+            let _ = fetched_tx.send(());
+            held.push(stream);
+        }
+    });
+    // A source each, so that the requests are fetches of
+    // their own and not one shared render.
+    let streams: Vec<TcpStream> = (0..count)
+        .map(|n| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let request = format!(
+                "GET /unsafe/40x30/http://{origin_addr}/img/hang-{n}.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            stream
+        })
+        .collect();
+    for _ in &streams {
+        fetched
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the server fetches each source");
+    }
+    streams
+}
+
+#[test]
+#[cfg(unix)]
+fn a_second_signal_counts_the_requests_it_cuts_off() {
+    // Issue #715: a second signal ends the drain at once, and
+    // the requests still in flight are cut off then. Its line
+    // counts them as the deadline's does; nothing used to.
+    let (mut server, port, lines) = serving_unsafe_urls(&[
+        ("CRABCROP_SOURCE_TIMEOUT_SECS", "600"),
+        ("CRABCROP_SHUTDOWN_GRACE_SECS", "120"),
+    ]);
+    let _streams = hung_requests(port, 1);
+    terminate(&server);
+    wait_for_line(&lines, "shutdown: draining");
+    let signalled = Instant::now();
+    signal(&server, rustix::process::Signal::INT);
+    let (status, stderr) = exit_of(&mut server, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(took < Duration::from_secs(5), "exited {took:?} after it");
+    assert!(
+        stderr.contains("shutdown: 1 requests still in flight at the second signal are cut off"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("at the deadline"), "{stderr}");
 }
 
 #[test]

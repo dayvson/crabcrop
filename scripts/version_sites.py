@@ -238,6 +238,14 @@ SITES = [
         r'\[project\][^\[]*?^version\s*=\s*"([^"]+)"',
         re.S | re.M,
     ),
+    # The package's own `__version__` (issue #716), which the
+    # Python SDK's tests also read against pyproject.toml.
+    pattern(
+        "sdks/python/src/crabcrop_url/__init__.py",
+        "__version__",
+        r'^__version__ = "([^"]+)"$',
+        re.M,
+    ),
     pattern(
         "sdks/mcp/src/index.ts",
         "SERVER.version",

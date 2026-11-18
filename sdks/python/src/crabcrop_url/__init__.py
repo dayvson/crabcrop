@@ -2,6 +2,11 @@
 in the crabcrop repository. Standard library only, except
 sealed URLs (issue #255), which need the ``cryptography``
 package from the ``crabcrop-url[seal]`` extra.
+
+The names follow the TypeScript SDK's, in Python's spelling
+(``buildURL`` is `build_url`, ``ops.cropObjects`` is
+`ops.crop_objects`), and the typed operation builders, `ops`,
+`filter` and `join_ops`, mirror its builders (issue #716).
 """
 
 from __future__ import annotations
@@ -10,7 +15,69 @@ import base64
 import hashlib
 import hmac
 import os
-from typing import Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
+
+from ._grammar import (
+    MAX_DIMENSION,
+    Anchor,
+    BlendMode,
+    CropAlign,
+    CurveChannel,
+    Dimension,
+    ImageFormat,
+    MaskShape,
+    PerFormatQualityFormat,
+    StudioMode,
+    StudioShadow,
+)
+from ._operations import FormatOptions, StudioOptions, filter, join_ops, ops
+
+#: The package version, the release version every crabcrop artifact
+#: shares; scripts/bump_version.py moves it with pyproject.toml.
+__version__ = "0.13.1"
+
+__all__ = [
+    "MAX_DIMENSION",
+    "MAX_SEALED_REMAINDER",
+    "RESERVED_SEGMENT",
+    "SEALED_PREFIX",
+    "Anchor",
+    "BlendMode",
+    "CropAlign",
+    "CurveChannel",
+    "Dimension",
+    "FormatOptions",
+    "ImageFormat",
+    "MaskShape",
+    "PerFormatQualityFormat",
+    "SealError",
+    "Secret",
+    "StudioMode",
+    "StudioOptions",
+    "StudioShadow",
+    "build_sealed_url",
+    "build_srcset",
+    "build_url",
+    "filter",
+    "is_reserved_remainder",
+    "is_valid_key_id",
+    "join_ops",
+    "ops",
+    "purge_group_key",
+    "purge_group_signature",
+    "purge_key",
+    "purge_signature",
+    "seal",
+    "seal_key",
+    "seal_url",
+    "seal_with_nonce",
+    "sign",
+    "sign_with_key_id",
+    "unseal",
+    "upload_key",
+    "upload_signature",
+    "verify",
+]
 
 Secret = Union[str, bytes, None]
 
@@ -225,7 +292,7 @@ def seal_key(secret: Union[str, bytes]) -> bytes:
     return _subkey(secret, "crabcrop/seal-key")
 
 
-def _aesgcm():
+def _aesgcm() -> Any:
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError:
@@ -275,7 +342,7 @@ def seal_with_nonce(
     return f"{key_id}:{token}"
 
 
-def seal_url(
+def seal(
     secret: Union[str, bytes],
     remainder: str,
     key_id: Optional[str] = None,
@@ -283,8 +350,14 @@ def seal_url(
     """Seal a remainder into a token segment (issue #255),
     with a fresh random 96-bit nonce. Pass ``key_id`` to
     stamp ``<key-id>:`` in front of it, so servers in a
-    rotation window open it against the named key only."""
+    rotation window open it against the named key only.
+    The TypeScript SDK and the Rust crate name it ``seal``
+    too."""
     return seal_with_nonce(secret, remainder, os.urandom(12), key_id)
+
+
+#: The earlier name of `seal`, kept so existing code keeps working.
+seal_url = seal
 
 
 def unseal(secret: Union[str, bytes], segment: str) -> str:
@@ -320,7 +393,7 @@ def unseal(secret: Union[str, bytes], segment: str) -> str:
     ):
         raise failed()
     try:
-        plain = _aesgcm()(seal_key(secret)).decrypt(raw[:12], raw[12:], _SEAL_AAD)
+        plain: bytes = _aesgcm()(seal_key(secret)).decrypt(raw[:12], raw[12:], _SEAL_AAD)
     except SealError:
         raise
     except Exception:
@@ -368,7 +441,7 @@ def build_sealed_url(
         raise SealError(_RESERVED_MESSAGE)
     if secret is None:
         raise SealError("sealing requires a secret: there is no unsafe token")
-    segment = seal_url(secret, remainder, key_id)
+    segment = seal(secret, remainder, key_id)
     trimmed = base.rstrip("/")
     if name:
         return f"{trimmed}/{segment}/{name}"
@@ -455,17 +528,18 @@ def build_url(
 def _validate_width(width: int) -> None:
     """A srcset width becomes a ``{width}x0`` size segment,
     so it must satisfy the grammar's dimension rules: a
-    positive integer within the server cap. Anything else
-    mints a URL the server rejects (or worse, ``-300``
-    reads as a flip), so it raises here, at build time."""
+    positive integer within the server cap, `MAX_DIMENSION`.
+    Anything else mints a URL the server rejects (or worse,
+    ``-300`` reads as a flip), so it raises here, at build
+    time."""
     if (
         isinstance(width, bool)
         or not isinstance(width, int)
         or width < 1
-        or width > 16383
+        or width > MAX_DIMENSION
     ):
         raise ValueError(
-            f"srcset width must be a positive integer no larger than 16383, got {width!r}"
+            f"srcset width must be a positive integer no larger than {MAX_DIMENSION}, got {width!r}"
         )
 
 
@@ -475,13 +549,14 @@ def build_srcset(
     source: str,
     widths: Sequence[int],
     expires: Optional[int] = None,
+    key_id: Optional[str] = None,
 ) -> str:
     """Build an ``srcset`` attribute value: one ``{width}x0``
     URL per width, entries formatted ``{url} {width}w`` and
-    joined by ``, ``. An expiry, when given, applies to every
-    entry."""
+    joined by ``, ``. An expiry and a key ID, when given,
+    apply to every entry, as `build_url` applies them."""
     for w in widths:
         _validate_width(w)
     return ", ".join(
-        f"{build_url(base, secret, f'{w}x0', source, expires)} {w}w" for w in widths
+        f"{build_url(base, secret, f'{w}x0', source, expires, key_id)} {w}w" for w in widths
     )

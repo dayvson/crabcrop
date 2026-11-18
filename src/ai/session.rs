@@ -7,9 +7,56 @@ use image::imageops::FilterType;
 use image::{ImageBuffer, Luma, Pixel, Rgb};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
-use std::sync::OnceLock;
+use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use super::AiError;
+
+/// The locks [`lock_model`] has taken back from a panic since
+/// boot, which its log line counts.
+static RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// Lock one of a provider's mutexes: its model's session, or
+/// the memo beside it. `what` names it for the log.
+///
+/// A request that panics while it holds such a lock poisons
+/// it. A lock that failed from then on would leave the model
+/// answering no request for the life of the process (issue
+/// #715), and what these locks guard comes through a panic
+/// whole: a session is the model's weights and its runtime
+/// handle, which a run reads and never changes (the lock is
+/// there because `Session::run` takes `&mut self`), and a
+/// memo's value is replaced whole. So the guard is taken
+/// back from the poison and the poison cleared, and the
+/// recovery is counted and logged on stderr, once for each
+/// panic.
+pub(super) fn lock_model<'a, T>(lock: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
+    lock_recovering(lock, what, &RECOVERED, |line| {
+        // Not `eprintln!`, which panics when stderr is
+        // closed: that panic would poison the lock again.
+        let _ = writeln!(std::io::stderr(), "{line}");
+    })
+}
+
+/// [`lock_model`], with the count and the log it reports a
+/// recovery to named.
+fn lock_recovering<'a, T>(
+    lock: &'a Mutex<T>,
+    what: &str,
+    recovered: &AtomicU64,
+    log: impl FnOnce(&str),
+) -> MutexGuard<'a, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        let count = recovered.fetch_add(1, Ordering::Relaxed) + 1;
+        log(&format!(
+            "ai: a request panicked while it held {what}; the lock is recovered and the model \
+             keeps serving (recoveries since boot: {count})"
+        ));
+        poisoned.into_inner()
+    })
+}
 
 /// The process-wide ONNX environment, created on first use:
 /// in practice that is at boot, when the server preloads its

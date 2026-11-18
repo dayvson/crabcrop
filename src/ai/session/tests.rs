@@ -216,3 +216,68 @@ fn every_model_runs_on_the_runtimes_one_thread_pool() {
         "threads after the runtime started, then after each of three sessions"
     );
 }
+
+#[test]
+fn a_lock_a_panic_poisoned_is_taken_back_whole_counted_and_logged() {
+    // Issue #715: a request that panicked while it held a
+    // model's lock poisoned it, and the model failed every
+    // later request for the life of the process. The next
+    // lock takes the value back, whole, clears the poison,
+    // and counts and logs the recovery, once for each panic.
+    let lock = std::sync::Arc::new(Mutex::new(vec![1u8, 2, 3]));
+    let poison = |lock: &std::sync::Arc<Mutex<Vec<u8>>>| {
+        let held = std::sync::Arc::clone(lock);
+        let joined = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("a panic while the lock is held");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(lock.is_poisoned());
+    };
+    let recovered = AtomicU64::new(0);
+    let mut lines: Vec<String> = Vec::new();
+    poison(&lock);
+    {
+        let mut guard = lock_recovering(&lock, "the test model's session", &recovered, |line| {
+            lines.push(line.to_string())
+        });
+        assert_eq!(*guard, [1, 2, 3]);
+        guard.push(4);
+    }
+    assert!(!lock.is_poisoned());
+    assert_eq!(recovered.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        lines,
+        [
+            "ai: a request panicked while it held the test model's session; the lock is recovered \
+             and the model keeps serving (recoveries since boot: 1)"
+        ]
+    );
+    // A lock nobody poisoned is no recovery.
+    let guard = lock_recovering(&lock, "the test model's session", &recovered, |line| {
+        lines.push(line.to_string())
+    });
+    assert_eq!(*guard, [1, 2, 3, 4]);
+    drop(guard);
+    assert_eq!(recovered.load(Ordering::Relaxed), 1);
+    assert_eq!(lines.len(), 1);
+    // Another panic is another recovery.
+    poison(&lock);
+    drop(lock_recovering(
+        &lock,
+        "the test model's session",
+        &recovered,
+        |line| lines.push(line.to_string()),
+    ));
+    assert_eq!(recovered.load(Ordering::Relaxed), 2);
+    assert!(
+        lines[1].ends_with("(recoveries since boot: 2)"),
+        "{lines:?}"
+    );
+    // The providers' lock, with the process's count and
+    // stderr, does the same.
+    poison(&lock);
+    assert_eq!(*lock_model(&lock, "the test model's session"), [1, 2, 3, 4]);
+    assert!(!lock.is_poisoned());
+}

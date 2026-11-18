@@ -7,7 +7,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::resample;
-use super::session::{ModelOutput, build_session, collect_outputs};
+use super::session::{ModelOutput, build_session, collect_outputs, lock_model};
 use super::{AiError, TagProvider, TagScore};
 
 /// Zero-shot tagging backed by a CLIP image/text ONNX model
@@ -105,11 +105,11 @@ impl OnnxClipProvider {
 
     fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
         let input = crop224_preprocess(img, CLIP_STATS);
-        if let Some((tensor, embedding)) = self
-            .last_embedding
-            .lock()
-            .map_err(|_| AiError::LockPoisoned)?
-            .as_ref()
+        if let Some((tensor, embedding)) = lock_model(
+            &self.last_embedding,
+            "the CLIP image model's embedding memo",
+        )
+        .as_ref()
             && *tensor == input
         {
             return Ok(embedding.clone());
@@ -117,16 +117,16 @@ impl OnnxClipProvider {
         let tensor =
             ort::value::Tensor::from_array(([1, 3, 224, 224], input.clone().into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.vision.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.vision, "the CLIP image model's session");
         let outputs = session
             .run(ort::inputs![self.vision_input.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let outputs = collect_outputs(outputs)?;
         let embedding = pick_embedding(&outputs, None)?;
-        *self
-            .last_embedding
-            .lock()
-            .map_err(|_| AiError::LockPoisoned)? = Some((input, embedding.clone()));
+        *lock_model(
+            &self.last_embedding,
+            "the CLIP image model's embedding memo",
+        ) = Some((input, embedding.clone()));
         Ok(embedding)
     }
 }

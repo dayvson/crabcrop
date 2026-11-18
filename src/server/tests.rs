@@ -2266,12 +2266,6 @@ fn engine_error_cases() -> Vec<(EngineError, StatusCode, &'static str, String)> 
             "image inference failed".to_string(),
         ),
         (
-            EngineError::Inference(crate::ai::AiError::LockPoisoned),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "inference_failed",
-            "image inference failed".to_string(),
-        ),
-        (
             EngineError::Render("a cause".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
             "render_failed",
@@ -6510,8 +6504,8 @@ fn compose_annotation_picks_the_clear_winner() {
 #[test]
 fn ai_error_classes_map_to_distinct_statuses() {
     // AP-16: a model that ran but produced unusable output
-    // is a 502; a runtime failure or a poisoned session
-    // lock stays a 500; the log line keeps the typed cause.
+    // is a 502; a runtime failure stays a 500; the log line
+    // keeps the typed cause.
     let status = |e: EngineError| engine_error_response(e, None).status();
     assert_eq!(
         status(EngineError::Inference(crate::ai::AiError::BadOutput(
@@ -6523,10 +6517,6 @@ fn ai_error_classes_map_to_distinct_statuses() {
         status(EngineError::Inference(crate::ai::AiError::Inference(
             "inference failed: boom".to_string()
         ))),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert_eq!(
-        status(EngineError::Inference(crate::ai::AiError::LockPoisoned)),
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }

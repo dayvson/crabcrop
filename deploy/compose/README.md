@@ -117,7 +117,7 @@ CRABCROP_SECRET=$(openssl rand -hex 32) docker compose up --build
    The fetch returns 200 and image bytes.
 3. Fetch the same signed URL again and look at the headers: `curl -i "<the signed URL it printed>"`. The `Cache-Status` header reports a hit.
 
-The image carries its own `HEALTHCHECK` (`crabcrop health`, which asks the server for `/health`), so `docker compose ps` reports health once the server is up.
+The image carries its own `HEALTHCHECK` (`crabcrop health`, which asks the server for `/health`), so `docker compose ps` reports health once the server is up. Misses in its first 5 minutes do not count, while the server loads what it is configured with (see [Booting](../../docs/deployment.md#booting-and-the-probes-that-wait-for-it)).
 
 ## Scaling and cache notes
 

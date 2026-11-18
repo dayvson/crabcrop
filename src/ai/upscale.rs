@@ -5,7 +5,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::depth::{Sample, SampleDepth, with_source_alpha};
-use super::session::{TensorOutput, build_session, first_output};
+use super::session::{TensorOutput, build_session, first_output, lock_model};
 use super::{AiError, UpscaleProvider};
 
 /// Super-resolution backed by an ONNX model with the usual
@@ -90,7 +90,7 @@ impl UpscaleProvider for OnnxUpscaleProvider {
         upscale_with(img, |input, dims| {
             let tensor = ort::value::Tensor::from_array((dims, input.into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let mut session = lock_model(&self.session, "the upscale model's session");
             let outputs = session
                 .run(ort::inputs![self.input_name.as_str() => tensor])
                 .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
