@@ -12,7 +12,9 @@ include = ["/src/**/*", "/tests/fixtures/**/*", "/README.md", "/LICENSE", "/CHAN
 members = ["crates/crabcrop-url"]
 
 [dependencies]
-crabcrop-url = { path = "crates/crabcrop-url", version = "0.13" }
+# The `zeroize` feature clears the subkeys the crate derives and
+# drops itself, and the HMAC and AES-GCM key state.
+crabcrop-url = { path = "crates/crabcrop-url", version = "0.13", features = ["zeroize"] }
 ab_glyph = "0.2"
 axum = "0.8"
 # Standard base64 with padding for the meta response: the
