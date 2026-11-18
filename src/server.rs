@@ -1294,7 +1294,7 @@ async fn explain_handle(
     };
     let (source_bytes, probe) = match probe_explained(&state, &resolved, accept).await {
         Ok(facts) => facts,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let report = explain_report(
         &state,
@@ -1341,12 +1341,15 @@ fn admit_explained<'a>(state: &AppState, full: &'a str) -> Result<(Opened<'a>, R
 /// policy, and the probe of the head it read
 /// ([`explain_probe`]). Returns the source's encoded size
 /// when the fetch states it, and the probe; a failed fetch,
-/// or a probe shed for a full gate, is the answer instead.
+/// or a probe shed for a full gate, is the answer instead,
+/// boxed as [`render_miss`] boxes its own (a bare `Response`
+/// is 128 bytes, too large for an `Err`: clippy's
+/// `result_large_err`).
 async fn probe_explained(
     state: &AppState,
     resolved: &Resolved,
     accept: Option<&str>,
-) -> Result<(Option<usize>, crate::engine::SourceProbe), Response> {
+) -> Result<(Option<usize>, crate::engine::SourceProbe), Box<Response>> {
     // Watermark and overlay sources are operations' inputs,
     // not the explained URL's source, and are never fetched:
     // no fan-out. A `frame:` segment makes the source a
@@ -1377,13 +1380,13 @@ async fn probe_explained(
         .loader
         .load_probe(&resolved.source_url, admission, &probe_settled)
         .await
-        .map_err(|e| explain_load_error(e, accept))?;
+        .map_err(|e| Box::new(explain_load_error(e, accept)))?;
     let Some(probe) = explain_probe(state, head).await else {
-        return Err(busy_response(
+        return Err(Box::new(busy_response(
             "server busy: too many source probes running at once",
             5,
             accept,
-        ));
+        )));
     };
     Ok((total_bytes.map(|n| n as usize), probe))
 }
