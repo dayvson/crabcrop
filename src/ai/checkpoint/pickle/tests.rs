@@ -224,6 +224,12 @@ fn depth_of(value: &PickleValue) -> usize {
 }
 
 #[test]
+fn unpickle_reads_newtrue_as_true_and_newfalse_as_false() {
+    assert_eq!(unpickle(b"\x80\x02\x88."), Ok(PickleValue::Bool(true)));
+    assert_eq!(unpickle(b"\x80\x02\x89."), Ok(PickleValue::Bool(false)));
+}
+
+#[test]
 fn unpickle_bounds_nesting_for_every_opcode_that_nests() {
     for opcode in [b't', 0x85, 0x86, 0x87, b's', b'u'] {
         let value = unpickle(&nested(opcode, MAX_DEPTH))

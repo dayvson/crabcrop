@@ -5,6 +5,11 @@
 //! machine. It shares the free functions there (`measure`,
 //! `charge`, `reduce` and the rest), which that change left
 //! as they were.
+//!
+//! One thing changed in the machine after this loop (issue
+//! #760), and the loop keeps it as it was: the machine
+//! pushes true for NEWTRUE and false for NEWFALSE, where
+//! the loop pushes the reverse. The proofs expect it.
 
 use super::super::{
     MAX_DEPTH, PickleValue, charge, check_nesting, measure, nesting_error, reduce, set_map_entry,

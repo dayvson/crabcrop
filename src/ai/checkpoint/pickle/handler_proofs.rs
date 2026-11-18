@@ -3,7 +3,10 @@
 //! loop is frozen in `handler_proofs/frozen.rs`, and every
 //! input here must come out of both machines the same way:
 //! the same value, the same error message, or the same
-//! panic.
+//! panic. One change came after the loop (issue #760):
+//! NEWTRUE pushes true and NEWFALSE false, where the loop
+//! pushed the reverse, so a bool in the machine's value
+//! matches its opposite in the loop's.
 //!
 //! The inputs are the checkpoint fixtures the unit tests
 //! build, and one more: the scalar opcodes at their edges,
@@ -64,11 +67,15 @@ fn outcome(run: impl FnOnce() -> Result<PickleValue, String>) -> Outcome {
     }
 }
 
-/// Values compare as `PartialEq` has them, except floats,
-/// which compare by their bits, so a NaN matches itself.
+/// The machine's value against the loop's: as `PartialEq`
+/// has them, except floats, which compare by their bits, so
+/// a NaN matches itself, and bools, which compare swapped:
+/// the loop pushed false for NEWTRUE and true for NEWFALSE,
+/// and the machine pushes what they name (issue #760).
 fn same_value(a: &PickleValue, b: &PickleValue) -> bool {
     match (a, b) {
         (PickleValue::Float(a), PickleValue::Float(b)) => a.to_bits() == b.to_bits(),
+        (PickleValue::Bool(a), PickleValue::Bool(b)) => a != b,
         (PickleValue::Tuple(a), PickleValue::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_value(a, b))
         }

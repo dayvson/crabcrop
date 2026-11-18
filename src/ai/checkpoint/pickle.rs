@@ -121,14 +121,8 @@ impl<'a> PickleMachine<'a> {
                 BININT1 | BININT2 | BININT | LONG | LONG1 | LONG4 => self.integer(op)?,
                 BINFLOAT => self.float()?,
                 NONE => self.push(PickleValue::None)?,
-                // The loop these handlers replaced pushed false
-                // for NEWTRUE and true for NEWFALSE, the reverse
-                // of CPython, and so do they (issue #741 changes
-                // no behavior). No bool's value is read: the
-                // loader ignores a bool (a tensor rebuild's
-                // requires-grad flag) or refuses it by its type.
-                NEWTRUE => self.push(PickleValue::Bool(false))?,
-                NEWFALSE => self.push(PickleValue::Bool(true))?,
+                NEWTRUE => self.push(PickleValue::Bool(true))?,
+                NEWFALSE => self.push(PickleValue::Bool(false))?,
                 MARK => self.marks.push(self.stack.len()),
                 EMPTY_TUPLE => self.push(PickleValue::Tuple(Vec::new()))?,
                 TUPLE | TUPLE1 | TUPLE2 | TUPLE3 => self.tuple(op)?,
@@ -627,6 +621,7 @@ pub(super) fn unpickle(bytes: &[u8]) -> Result<PickleValue, String> {
 mod tests;
 
 // The opcode handlers, pinned against a frozen copy of the
-// single loop they replaced (issue #741).
+// single loop they replaced (issue #741), apart from the
+// change issue #760 made after it.
 #[cfg(test)]
 mod handler_proofs;
