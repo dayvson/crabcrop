@@ -68,10 +68,10 @@ pub use listen::{
 };
 mod process;
 pub(in crate::server) use process::{
-    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
-    MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
-    SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process, wants_animation_gate,
-    wants_slow_lane,
+    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, LeaderGuard,
+    MetaFlight, MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT,
+    SharedFlight, SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process,
+    wants_animation_gate, wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -3794,22 +3794,62 @@ fn meta_flight_key(work: &MissWork) -> String {
 }
 
 /// The last stage of [`serve`]: serve the keyed request.
-/// A debug request runs the miss path on its own, a meta
-/// request coalesces through its own flights, and an image
-/// request reads the tiers and coalesces its miss.
+/// A debug request runs the miss path on its own, and a
+/// meta request coalesces through its own flights
+/// ([`serve_meta_flight`]).
+///
+/// An image request reads the tiers and coalesces its miss
+/// through its key's flight (audit R2-09): the first miss
+/// for a key leads (one fetch, one encode, under the miss
+/// path's gates); concurrent requests for the same key wait
+/// for the leader, then re-check the tiers and serve its
+/// entry. A leader whose result no tier stored (an error, a
+/// fallback, a render with the caches off) leaves its
+/// response in the flight's slot instead, and a waiter
+/// whose request is identical to the leader's answers with
+/// it (issue #407): it is the answer the waiter would have
+/// produced itself, and taking it keeps a burst on a
+/// failing origin at one fetch per flight rather than one
+/// per waiter. Identical means the same [`FlightIdentity`].
+/// The conditional header is left out of it: each waiter
+/// applies its own. A leader whose client goes away after
+/// its render has started still finishes the flight (see
+/// [`finish_started_miss`]). A waiter that cannot take the
+/// response (another spelling of the key, a body past the
+/// share cap, a leader whose request was dropped before its
+/// render started, a leader that forwent its fallback run
+/// because its client had gone, a run a purge of the key
+/// overtook) leads or follows the next flight. Waits are
+/// capped: a waiter whose flights keep ending without an
+/// answer for it stops queueing and runs the miss path
+/// itself (issue #375, [`own_miss`]), so it ends with the
+/// origin's real answer instead of a busy response masking
+/// it.
+///
+/// Each pass of the loop reads the tiers ([`answer_hit`]),
+/// takes what the flight it followed left for it
+/// ([`Following::take_shared`], [`answer_shared`]), and
+/// then leads the key's flight ([`lead_flight`]) or follows
+/// it ([`Following::wait`]). The loop stays in this function
+/// and the misses are awaited here: an async function holds
+/// its arguments for as long as it runs, so a stage of its
+/// own that takes the work would hold a second copy of it
+/// in every request's future.
 async fn run_flight(
     state: &Arc<AppState>,
     path: &str,
-    mut work: MissWork,
+    work: MissWork,
     if_none_match: Option<&str>,
-    mut record: OwedRecord,
+    record: OwedRecord,
 ) -> (Response, OwedRecord) {
     // The miss path is boxed at each of the four places this
-    // function reaches it (issue #638). Its future holds the
-    // loader's and the engine runner's state, about 20 KB.
-    // Awaited in line it made every request's future that
-    // large, and a request allocates and moves its future
-    // once, whether it goes on to miss or not.
+    // function reaches it (issue #638): the two below, and in
+    // the futures [`lead_flight`] and [`own_miss`] build. Its
+    // future holds the loader's and the engine runner's
+    // state, about 20 KB. Awaited in line it made every
+    // request's future that large, and a request allocates
+    // and moves its future once, whether it goes on to miss
+    // or not.
     // Debug requests bypass everything, per request.
     if work.debug {
         let (response, record, _) = Box::pin(serve_miss(state, work, record)).await;
@@ -3821,62 +3861,8 @@ async fn run_flight(
         let flight_key = meta_flight_key(&work);
         return Box::pin(serve_meta_flight(state, work, record, &flight_key)).await;
     }
-    // Singleflight (audit R2-09): the first miss for a key
-    // leads (one fetch, one encode, under the gates below);
-    // concurrent requests for the same key wait for the
-    // leader, then re-check the tiers and serve its entry.
-    // A leader whose result no tier stored (an error, a
-    // fallback, a render with the caches off) leaves its
-    // response in the flight's slot instead, and a waiter
-    // whose request is identical to the leader's answers
-    // with it (issue #407): it is the answer the waiter
-    // would have produced itself, and taking it keeps a
-    // burst on a failing origin at one fetch per flight
-    // rather than one per waiter. Identical means the same
-    // raw path (the sealing, the cache groups, and the
-    // cache lifetime all come from it) and the same header
-    // inputs as the miss path sees them: the negotiated
-    // format, not the raw Accept (on this path errors are
-    // plain text whatever it says), the quantized width,
-    // not the raw hint, and whether Save-Data applies, not
-    // the raw header, so browsers that phrase the same
-    // request differently still share one flight. The
-    // conditional header is left out: each waiter applies
-    // its own. A leader whose client goes away after its
-    // render has started still finishes the flight (see
-    // `finish_started_miss`). A waiter that cannot take
-    // the response (another spelling of the key, a body
-    // past the share cap, a leader whose request was
-    // dropped before its render started, a leader that
-    // forwent its fallback run because its client had
-    // gone, a run a purge of the key overtook) leads or
-    // follows the next flight.
-    // Waits are capped: a waiter whose flights
-    // keep ending without an answer for it stops queueing
-    // and runs the miss path itself (issue #375), so it
-    // ends with the origin's real answer instead of a busy
-    // response masking it.
-    let (preferred, dpr_hint, hinted_width, save_data) = (
-        work.preferred,
-        work.dpr_hint,
-        work.hinted_width,
-        work.save_data,
-    );
-    // That identity is built only by a request that leads
-    // or follows a flight (issue #641): a hit compares it
-    // with nothing. A follower builds it before it waits,
-    // and a leader once it holds the flight, never between
-    // a lookup that missed and the claim. Whatever a
-    // request does there widens the window in which the
-    // flight it would have followed can end unseen, and the
-    // request then leads a second flight for a render the
-    // first has just stored.
-    let flight_identity =
-        || format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
-    let mut flight_request: Option<String> = None;
-    let (max_age, sealed) = (work.max_age, work.sealed);
-    let mut waits = 0;
-    let mut followed: Option<Arc<FlightSlot>> = None;
+    let identity = FlightIdentity::of(path, &work);
+    let mut following = Following::default();
     // One disk budget for every tier check this request makes
     // (issue #572).
     let mut budget = DiskBudget::new();
@@ -3887,132 +3873,273 @@ async fn run_flight(
         if let Some((hit, cache_status)) =
             lookup_tiers_within(state, cache_key, groups, &mut budget).await
         {
-            record.cache_hit = true;
-            record.bytes_out = hit.bytes.len();
-            let mut response = respond(
-                hit.format,
-                hit.quality,
-                hit.bytes,
-                max_age,
-                state.client_hints,
-            );
-            attach_cache_headers(&mut response, cache_status, groups, sealed);
-            finalize_validators(&mut response, &hit.etag, if_none_match);
-            return (response, record);
+            return answer_hit(state, &work, hit, cache_status, if_none_match, record);
         }
-        let taken = followed
+        if let Some(shared) = following.take_shared(state, cache_key, groups) {
+            return answer_shared(&shared, if_none_match, record);
+        }
+        match state.inflight.lead(cache_key) {
+            Flight::Leader(guard, slot) => {
+                let request = following.request.take().unwrap_or_else(|| identity.text());
+                let (progress, lead) = lead_flight(state, work, guard, slot, request, record);
+                let answer = finish_started_miss(state, progress, lead).await;
+                return answer_miss(answer, if_none_match);
+            }
+            Flight::Follower(changed, slot) => {
+                if following.waits >= MAX_FLIGHT_WAITS {
+                    let (progress, miss) = own_miss(state, work, record);
+                    let answer = finish_started_miss(state, progress, miss).await;
+                    return answer_miss(answer, if_none_match);
+                }
+                following.wait(changed, slot, &identity).await;
+            }
+        }
+    }
+}
+
+/// What makes two image requests for one key identical for
+/// a flight's shared response (issue #407): the same raw
+/// path (the sealing, the cache groups, and the cache
+/// lifetime all come from it) and the same header inputs as
+/// the miss path sees them: the negotiated format, not the
+/// raw Accept (on this path errors are plain text whatever it
+/// says), the quantized width, not the raw hint, and whether
+/// Save-Data applies, not the raw header, so browsers that
+/// phrase the same request differently still share one
+/// flight.
+struct FlightIdentity<'a> {
+    path: &'a str,
+    preferred: Option<ImageFormat>,
+    dpr_hint: Option<f32>,
+    hinted_width: Option<u32>,
+    save_data: bool,
+}
+
+impl<'a> FlightIdentity<'a> {
+    fn of(path: &'a str, work: &MissWork) -> Self {
+        Self {
+            path,
+            preferred: work.preferred,
+            dpr_hint: work.dpr_hint,
+            hinted_width: work.hinted_width,
+            save_data: work.save_data,
+        }
+    }
+
+    /// The identity as a flight's slot records it
+    /// ([`SharedFlight::request`]).
+    ///
+    /// It is built only by a request that leads or follows a
+    /// flight (issue #641): a hit compares it with nothing. A
+    /// follower builds it before it waits, and a leader once
+    /// it holds the flight, never between a lookup that missed
+    /// and the claim. Whatever a request does there widens the
+    /// window in which the flight it would have followed can
+    /// end unseen, and the request then leads a second flight
+    /// for a render the first has just stored.
+    fn text(&self) -> String {
+        let Self {
+            path,
+            preferred,
+            dpr_hint,
+            hinted_width,
+            save_data,
+        } = self;
+        format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}")
+    }
+}
+
+/// An image request's part in the flights it has followed.
+#[derive(Default)]
+struct Following {
+    /// Its [`FlightIdentity`], once it has built it.
+    request: Option<String>,
+    /// How many flights it has waited on.
+    waits: u32,
+    /// The slot of the flight it waited on last, until the
+    /// next pass reads it.
+    slot: Option<Arc<FlightSlot>>,
+}
+
+impl Following {
+    /// The response the flight this request waited on last
+    /// left in its slot, when the request is identical to
+    /// the leader's and no purge covering the key has been
+    /// recorded since the leader's run began.
+    fn take_shared(
+        &mut self,
+        state: &AppState,
+        cache_key: &str,
+        groups: &[String],
+    ) -> Option<SharedFlight> {
+        self.slot
             .take()
             .and_then(|slot| {
                 slot.shared
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .filter(|shared| Some(&shared.request) == flight_request.as_ref())
+                    .filter(|shared| Some(&shared.request) == self.request.as_ref())
                     .cloned()
             })
             .filter(|shared| {
                 !state
                     .purge_guard
                     .purge_covers(shared.snapshot, cache_key, groups)
-            });
-        if let Some(shared) = taken {
-            record.bytes_out = shared.response.body.len();
-            record.fallback = shared.fallback;
-            let mut response = respond_shared(&shared.response);
-            if let Some(etag) = &shared.etag {
-                finalize_validators(&mut response, etag, if_none_match);
-            }
-            return (response, record);
-        }
-        match state.inflight.lead(cache_key) {
-            Flight::Leader(guard, slot) => {
-                let flight_request = flight_request.take().unwrap_or_else(flight_identity);
-                let snapshot = state.purge_guard.snapshot();
-                let progress = work.progress.clone();
-                let task_progress = progress.clone();
-                let task_state = state.clone();
-                // The render's disk write waits until the
-                // followers are woken (issue #572): they read
-                // the render from memory and never wait for it.
-                let handoff = DiskHandoff::default();
-                work.disk_handoff = Some(handoff.clone());
-                // The leader's whole part runs as one miss
-                // (see `finish_started_miss`): a render it
-                // starts is stored and answers the
-                // followers even when this request is gone,
-                // and the guard is held until it has. A
-                // miss that forwent a render for a client
-                // that had gone ends without its request's
-                // answer, so it shares nothing.
-                let lead = async move {
-                    let (response, record, render_etag) =
-                        Box::pin(serve_miss(&task_state, work, record)).await;
-                    let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
-                    if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
-                        *slot.shared.lock().unwrap() = Some(SharedFlight {
-                            request: flight_request,
-                            snapshot,
-                            response: shared,
-                            etag: render_etag.clone(),
-                            fallback: record.fallback,
-                        });
-                    }
-                    drop(guard);
-                    let pending = handoff.lock().unwrap().take();
-                    if let Some(pending) = pending {
-                        finish_disk_write(
-                            &task_state,
-                            pending.snapshot,
-                            &pending.key,
-                            &pending.entry,
-                            pending.claim,
-                            false,
-                        )
-                        .await;
-                    }
-                    (response, record, render_etag)
-                };
-                let (mut response, record, render_etag) =
-                    finish_started_miss(state, progress, lead).await;
-                if let Some(etag) = &render_etag {
-                    finalize_validators(&mut response, etag, if_none_match);
-                }
-                return (response, record);
-            }
-            Flight::Follower(mut changed, slot) => {
-                if waits >= MAX_FLIGHT_WAITS {
-                    // The wait cap is spent: run the miss
-                    // path, the same settlement the meta
-                    // flights use (issue #375). Shedding a
-                    // busy response here masked the origin's
-                    // real answer (its error, or a slow
-                    // success) behind a server_busy this
-                    // request never earned: the cap exists
-                    // to stop queueing behind failing leaders
-                    // forever, not to refuse a request that
-                    // has not had its own attempt.
-                    let progress = work.progress.clone();
-                    let task_state = state.clone();
-                    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
-                    let (mut response, record, render_etag) =
-                        finish_started_miss(state, progress, miss).await;
-                    if let Some(etag) = &render_etag {
-                        finalize_validators(&mut response, etag, if_none_match);
-                    }
-                    return (response, record);
-                }
-                waits += 1;
-                flight_request.get_or_insert_with(flight_identity);
-                // The leader always signals on drop; the
-                // timeout is only a backstop against a
-                // wedged leader, after which the waiter
-                // re-checks the tiers and may lead itself.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
-                    .await;
-                followed = Some(slot);
-            }
-        }
+            })
     }
+
+    /// Wait for the flight this request follows to end.
+    async fn wait(
+        &mut self,
+        mut changed: tokio::sync::watch::Receiver<bool>,
+        slot: Arc<FlightSlot>,
+        identity: &FlightIdentity<'_>,
+    ) {
+        self.waits += 1;
+        self.request.get_or_insert_with(|| identity.text());
+        // The leader always signals on drop; the timeout is
+        // only a backstop against a wedged leader, after which
+        // the waiter re-checks the tiers and may lead itself.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed()).await;
+        self.slot = Some(slot);
+    }
+}
+
+/// The answer to an image request from a tier hit.
+fn answer_hit(
+    state: &AppState,
+    work: &MissWork,
+    hit: CachedImage,
+    cache_status: &'static str,
+    if_none_match: Option<&str>,
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
+    record.cache_hit = true;
+    record.bytes_out = hit.bytes.len();
+    let mut response = respond(
+        hit.format,
+        hit.quality,
+        hit.bytes,
+        work.max_age,
+        state.client_hints,
+    );
+    attach_cache_headers(&mut response, cache_status, &work.groups, work.sealed);
+    finalize_validators(&mut response, &hit.etag, if_none_match);
+    (response, record)
+}
+
+/// The answer to an image request from the response the
+/// flight it followed shared (issue #407).
+fn answer_shared(
+    shared: &SharedFlight,
+    if_none_match: Option<&str>,
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
+    record.bytes_out = shared.response.body.len();
+    record.fallback = shared.fallback;
+    let mut response = respond_shared(&shared.response);
+    if let Some(etag) = &shared.etag {
+        finalize_validators(&mut response, etag, if_none_match);
+    }
+    (response, record)
+}
+
+/// The leader's part of the key's flight, as a miss to run
+/// (see [`finish_started_miss`]) with the progress it
+/// reports: run the miss, leave its response in the
+/// flight's slot for the followers (`request` is this
+/// request's [`FlightIdentity`]), wake them by dropping
+/// `guard`, and then finish the render's disk write.
+///
+/// The leader's whole part runs as one miss: a render it
+/// starts is stored and answers the followers even when
+/// this request is gone, and the guard is held until it
+/// has. A miss that forwent a render for a client that had
+/// gone ends without its request's answer, so it shares
+/// nothing.
+fn lead_flight(
+    state: &Arc<AppState>,
+    mut work: MissWork,
+    guard: LeaderGuard,
+    slot: Arc<FlightSlot>,
+    request: String,
+    record: OwedRecord,
+) -> (
+    MissProgress,
+    impl std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
+) {
+    let snapshot = state.purge_guard.snapshot();
+    let progress = work.progress.clone();
+    let task_progress = progress.clone();
+    let task_state = state.clone();
+    // The render's disk write waits until the followers are
+    // woken (issue #572): they read the render from memory
+    // and never wait for it.
+    let handoff = DiskHandoff::default();
+    work.disk_handoff = Some(handoff.clone());
+    let lead = async move {
+        let (response, record, render_etag) = Box::pin(serve_miss(&task_state, work, record)).await;
+        let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+        if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
+            *slot.shared.lock().unwrap() = Some(SharedFlight {
+                request,
+                snapshot,
+                response: shared,
+                etag: render_etag.clone(),
+                fallback: record.fallback,
+            });
+        }
+        drop(guard);
+        let pending = handoff.lock().unwrap().take();
+        if let Some(pending) = pending {
+            finish_disk_write(
+                &task_state,
+                pending.snapshot,
+                &pending.key,
+                &pending.entry,
+                pending.claim,
+                false,
+            )
+            .await;
+        }
+        (response, record, render_etag)
+    };
+    (progress, lead)
+}
+
+/// The miss of a request whose flight waits are spent, to
+/// run (see [`finish_started_miss`]) with the progress it
+/// reports: the same settlement the meta flights use (issue
+/// #375). Shedding a busy response here masked the origin's
+/// real answer (its error, or a slow success) behind a
+/// server_busy this request never earned: the cap exists to
+/// stop queueing behind failing leaders forever, not to
+/// refuse a request that has not had its own attempt.
+fn own_miss(
+    state: &Arc<AppState>,
+    work: MissWork,
+    record: OwedRecord,
+) -> (
+    MissProgress,
+    impl std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
+) {
+    let progress = work.progress.clone();
+    let task_state = state.clone();
+    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
+    (progress, miss)
+}
+
+/// A miss's answer to the request that ran it: the render's
+/// ETag answers the request's conditional headers.
+fn answer_miss(
+    (mut response, record, render_etag): (Response, OwedRecord, Option<String>),
+    if_none_match: Option<&str>,
+) -> (Response, OwedRecord) {
+    if let Some(etag) = &render_etag {
+        finalize_validators(&mut response, etag, if_none_match);
+    }
+    (response, record)
 }
 
 /// Run one image miss (`miss`: the miss path for a key,

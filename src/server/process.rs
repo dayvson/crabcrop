@@ -73,7 +73,7 @@ pub(in crate::server) struct SharedFlight {
     /// Every input `serve` shaped the response from
     /// besides the conditional headers, as the miss path
     /// sees it (the raw path, the negotiated format, the
-    /// hints; see `run_flight`): a follower takes the response
+    /// hints; see `FlightIdentity`): a follower takes the response
     /// only when its own request carries the same, since
     /// one cache key can serve spellings that answer
     /// differently (a sealed one answers errors with the
