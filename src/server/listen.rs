@@ -33,11 +33,17 @@
 //! connection that sends nothing, and it also runs while a
 //! keep-alive connection waits for its next request, which
 //! would make the idle bound the header bound.
+//!
+//! The loop also counts the requests in flight on all its
+//! connections ([`RequestsInFlight`]), so a shutdown that
+//! cuts requests off at its deadline can say how many.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -86,15 +92,92 @@ pub struct ConnectionLimits {
     pub max_connections: usize,
 }
 
+/// The listen queue of the sockets [`bind_listener`]
+/// makes itself: the one tokio's own bind gives an IPv4
+/// socket (mio's, which is the standard library's), so a
+/// connection past `max_connections` waits the same in
+/// either family.
+#[cfg(unix)]
+const LISTEN_BACKLOG: u32 = 128;
+
+/// Bind the server's listening socket at `address` (issue
+/// #715). An IPv4 address binds as it always has. An IPv6
+/// address is bound with `IPV6_V6ONLY` off, so `::` takes
+/// IPv4 connections too, as IPv4-mapped addresses, on every
+/// host: the default otherwise is the host's (on Linux
+/// `net.ipv6.bindv6only`, which a host can set to listen on
+/// IPv6 only). A host without IPv6 cannot make the socket,
+/// and the error says what to set instead.
+pub async fn bind_listener(address: SocketAddr) -> io::Result<TcpListener> {
+    #[cfg(unix)]
+    if address.is_ipv6() {
+        return bind_dual_stack(address);
+    }
+    TcpListener::bind(address).await
+}
+
+/// An IPv6 listening socket that takes IPv4 connections too.
+/// The other options are the ones tokio's own bind sets.
+#[cfg(unix)]
+fn bind_dual_stack(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v6().map_err(with_no_ipv6_hint)?;
+    socket.set_reuseaddr(true)?;
+    rustix::net::sockopt::set_ipv6_v6only(&socket, false)?;
+    socket.bind(address)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+
+/// An IPv6 socket that could not be made, with what to set
+/// instead when the reason is that the host has no IPv6
+/// (`EAFNOSUPPORT`). Any other failure, such as a full file
+/// table, says nothing about IPv6, and keeps its own message.
+#[cfg(unix)]
+fn with_no_ipv6_hint(e: io::Error) -> io::Error {
+    if rustix::io::Errno::from_io_error(&e) != Some(rustix::io::Errno::AFNOSUPPORT) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{e}; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+        ),
+    )
+}
+
+/// The requests in flight on every connection of one
+/// accept loop: each counts from its request head until its
+/// response body has been sent, or its handler or body is
+/// dropped unfinished. A shutdown that stops waiting at its
+/// deadline reads it to say how many it cut off (issue #715).
+#[derive(Clone, Debug, Default)]
+pub struct RequestsInFlight(Arc<AtomicUsize>);
+
+impl RequestsInFlight {
+    /// How many requests are in flight now.
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn started(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn ended(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Serve `router` on `listener` within `limits` until
 /// `stop` is cancelled. Then the listener closes, idle
 /// connections close, and this returns once the requests
 /// in flight have finished; the caller bounds that wait.
+/// `in_flight` counts the requests meanwhile.
 pub async fn serve_connections(
     listener: TcpListener,
     router: Router,
     limits: ConnectionLimits,
     stop: CancellationToken,
+    in_flight: RequestsInFlight,
 ) {
     let slots = Arc::new(Semaphore::new(limits.max_connections));
     let connections = TaskTracker::new();
@@ -137,6 +220,7 @@ pub async fn serve_connections(
             limits,
             stop.clone(),
             slot,
+            in_flight.clone(),
         ));
     }
     drop(listener);
@@ -157,7 +241,7 @@ fn is_per_connection(e: &io::Error) -> bool {
 
 /// Serve one connection, holding its `slot`, until it ends,
 /// a timeout closes it, or `stop` asks it to finish its
-/// requests and close.
+/// requests and close. Its requests count in `in_flight`.
 async fn serve_connection(
     stream: TcpStream,
     router: Router,
@@ -165,9 +249,10 @@ async fn serve_connection(
     limits: ConnectionLimits,
     stop: CancellationToken,
     slot: OwnedSemaphorePermit,
+    in_flight: RequestsInFlight,
 ) {
     let _slot = slot;
-    let watch = Arc::new(Watch::new(limits));
+    let watch = Arc::new(Watch::new(limits, in_flight));
     let io = TokioIo::new(Watched {
         stream,
         watch: Arc::clone(&watch),
@@ -206,6 +291,9 @@ struct Watch {
     /// incomplete: the one change that can bring the deadline
     /// ahead of the time [`Watch::expired`] sleeps to.
     changed: Notify,
+    /// The loop's count, which this connection's requests
+    /// join while they run and while their bodies are sent.
+    in_flight: RequestsInFlight,
 }
 
 /// The shortest time [`Watch::expired`] sleeps before it
@@ -242,7 +330,7 @@ struct Activity {
 }
 
 impl Watch {
-    fn new(limits: ConnectionLimits) -> Self {
+    fn new(limits: ConnectionLimits, in_flight: RequestsInFlight) -> Self {
         let now = Instant::now();
         Watch {
             header_timeout: limits.header_timeout,
@@ -256,6 +344,7 @@ impl Watch {
                 last_active: now,
             }),
             changed: Notify::new(),
+            in_flight,
         }
     }
 
@@ -320,6 +409,7 @@ impl Watch {
         if version == Version::HTTP_2 {
             activity.http2 = true;
         }
+        self.in_flight.started();
         Running {
             watch: Some(Arc::clone(self)),
         }
@@ -409,6 +499,7 @@ impl Drop for Running {
             let mut activity = watch.activity();
             activity.handlers -= 1;
             activity.last_active = Instant::now();
+            watch.in_flight.ended();
         }
     }
 }
@@ -424,6 +515,7 @@ impl Drop for Sending {
             let mut activity = watch.activity();
             activity.bodies -= 1;
             activity.last_active = Instant::now();
+            watch.in_flight.ended();
         }
     }
 }

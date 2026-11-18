@@ -17,5 +17,4 @@ fn ai_error_display_keeps_the_cause() {
         AiError::BadOutput("unexpected model output shape: [1]".to_string()).to_string(),
         "unexpected model output shape: [1]"
     );
-    assert!(AiError::LockPoisoned.to_string().contains("poisoned"));
 }

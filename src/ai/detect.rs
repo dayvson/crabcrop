@@ -7,7 +7,9 @@ use std::sync::Mutex;
 
 use super::clip::read_labels;
 use super::memo::DetectionMemo;
-use super::session::{TensorOutput, build_session, fir_resize, first_output, rgb8_view};
+use super::session::{
+    TensorOutput, build_session, fir_resize, first_output, lock_model, rgb8_view,
+};
 use super::{AiError, Detection, DetectionProvider};
 
 /// The detector's fixed input edge (YOLO letterbox).
@@ -117,18 +119,14 @@ impl DetectionProvider for OnnxDetectionProvider {
     }
 
     fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError> {
-        // A provider whose session a panic has poisoned
-        // answers no frame, as before: the memo is left out,
-        // so a remembered frame fails at the lock like any
-        // other.
-        let memo = (!self.session.is_poisoned()).then_some(&self.memo);
+        let memo = Some(&self.memo);
         detect_objects(memo, &self.classes, self.threshold, img, |input| {
             let tensor = ort::value::Tensor::from_array((
                 [1, 3, DETECT_INPUT as usize, DETECT_INPUT as usize],
                 input.into_boxed_slice(),
             ))
             .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let mut session = lock_model(&self.session, "the detection model's session");
             let outputs = session
                 .run(ort::inputs![self.input_name.as_str() => tensor])
                 .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;

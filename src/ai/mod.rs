@@ -61,10 +61,6 @@ pub enum AiError {
     /// input tensor, executing the session, a transient ORT
     /// error.
     Inference(String),
-    /// A provider's session lock was poisoned: an earlier
-    /// inference panicked while holding it, so the session's
-    /// state can no longer be trusted.
-    LockPoisoned,
     /// The model ran but its output is not what the provider
     /// contract requires: no outputs, an unreadable tensor,
     /// an unexpected shape, an embedding of the wrong size.
@@ -76,7 +72,6 @@ impl std::fmt::Display for AiError {
         match self {
             AiError::Load(cause) => write!(f, "{cause}"),
             AiError::Inference(cause) => write!(f, "{cause}"),
-            AiError::LockPoisoned => write!(f, "a model session lock was poisoned"),
             AiError::BadOutput(cause) => write!(f, "{cause}"),
         }
     }

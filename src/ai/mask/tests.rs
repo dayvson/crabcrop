@@ -74,6 +74,37 @@ fn removebg_with_the_real_model() {
     );
 }
 
+/// Issue #715 with the real model: a request that
+/// panicked while it held the session's lock poisoned it,
+/// and every later removebg request failed. The next
+/// request takes the session back, and it masks as it did
+/// before the panic.
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+/// cargo test -- --ignored removebg_takes_back_a_session_a_panic_poisoned
+#[test]
+#[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+fn removebg_takes_back_a_session_a_panic_poisoned() {
+    let (Some(dylib), Some(model)) = (
+        crate::ai::env_or_skip("CRABCROP_TEST_ORT_DYLIB"),
+        crate::ai::env_or_skip("CRABCROP_TEST_REMOVEBG_MODEL"),
+    ) else {
+        return;
+    };
+    let provider = OnnxMaskProvider::load(Some(&dylib), &model).unwrap();
+    let img = DynamicImage::ImageRgb8(noise_rgb(96, 64, 7));
+    let before = provider.mask(&img).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _session = provider.session.lock().unwrap();
+        panic!("a panic while the session is held");
+    }));
+    assert!(panicked.is_err());
+    assert!(provider.session.is_poisoned());
+    let after = provider.mask(&img).unwrap();
+    assert!(!provider.session.is_poisoned());
+    assert_eq!(after.dimensions(), before.dimensions());
+    assert_eq!(after.as_raw(), before.as_raw());
+}
+
 /// The mask provider shares the session builder with
 /// the face provider; its missing-file failure is the
 /// same Load.

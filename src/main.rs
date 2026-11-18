@@ -249,9 +249,10 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // early, serve late).
     let stores = open_stores(&config)?;
     // The listen address is `CRABCROP_BIND` (issue #592),
-    // every IPv4 interface by default.
+    // every IPv4 interface by default; an IPv6 address takes
+    // IPv4 connections too (issue #715).
     let address = std::net::SocketAddr::new(config.bind, config.port);
-    let listener = tokio::net::TcpListener::bind(address)
+    let listener = crate::server::bind_listener(address)
         .await
         .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     // The port the listener holds, which the listening line
@@ -335,11 +336,15 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // and idle time and caps how many are open.
     let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     let stop = tokio_util::sync::CancellationToken::new();
+    // The requests in flight, which a drain that ends before
+    // they do counts as cut off (issue #715).
+    let in_flight = crate::server::RequestsInFlight::default();
     let mut serve = std::pin::pin!(crate::server::serve_connections(
         listener,
         app(state),
         config.connections,
-        stop.clone()
+        stop.clone(),
+        in_flight.clone()
     ));
     tokio::select! {
         () = &mut serve => {
@@ -365,9 +370,9 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         }
     }
     let drain = async {
-        if tokio::time::timeout_at(deadline, serve).await.is_err() {
-            eprintln!("shutdown: requests still in flight at the deadline are cut off");
-        }
+        // The requests still in flight at the deadline are
+        // counted below, with the rest of what is cut off.
+        let _ = tokio::time::timeout_at(deadline, serve).await;
         let left = background.drain(deadline).await;
         let disk_left = match &disk {
             Some(disk) => disk.settle(deadline).await,
@@ -385,6 +390,13 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
             ((background.running(), disk_left), "at the second signal", std::time::Instant::now())
         }
     };
+    // The requests still in flight: their handler runs, or
+    // their response is still being sent. The runtime stops
+    // them with the rest by `stop_by`.
+    let requests = in_flight.count();
+    if requests > 0 {
+        eprintln!("shutdown: {requests} requests still in flight {when} are cut off");
+    }
     if left.writes > 0 {
         eprintln!(
             "shutdown: {} background writes still running {when} are dropped",
@@ -1509,22 +1521,27 @@ fn provenance_boot_lines(
 /// counterpart of the frame extractor. Same boot rule:
 /// a set path that is not a usable renderer, or one
 /// whose `pdfinfo` sibling is missing, is fatal here,
-/// not on the first `page:` request.
+/// not on the first `page:` request. So is a pair that
+/// runs but cannot render a page (issue #715): the boot
+/// renders a one-page document through both programs, as
+/// the C2PA identity signs one image.
 fn build_pdf_renderer(
     config: &PdfConfig,
 ) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, ConfigError> {
     match &config.renderer {
         Some(path) => {
-            let renderer = crate::pdf::PdfRenderer::new(
-                std::path::PathBuf::from(path),
-                std::time::Duration::from_secs(config.timeout_secs),
-            )
-            .map_err(|e| {
+            let unusable = |e: crate::pdf::PdfError| {
                 ConfigError::build(
                     Some("CRABCROP_PDF_RENDERER"),
                     format!("cannot use CRABCROP_PDF_RENDERER ({path}): {e}"),
                 )
-            })?;
+            };
+            let renderer = crate::pdf::PdfRenderer::new(
+                std::path::PathBuf::from(path),
+                std::time::Duration::from_secs(config.timeout_secs),
+            )
+            .map_err(unusable)?;
+            renderer.self_test().map_err(unusable)?;
             boot_line!("PDF renderer: {path} (timeout {}s)", config.timeout_secs);
             Ok(Some(Arc::new(renderer)))
         }
@@ -1888,6 +1905,13 @@ fn build_ocr(
 #[allow(dead_code)]
 #[path = "test_support/scratch.rs"]
 mod test_support;
+
+// So does the writer of fake tools' scripts: the PDF
+// renderer's boot check runs them (issue #715).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "test_support/script.rs"]
+mod test_script;
 
 #[cfg(test)]
 #[path = "main/tests.rs"]
