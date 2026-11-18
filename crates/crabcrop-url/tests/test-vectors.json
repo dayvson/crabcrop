@@ -1,0 +1,411 @@
+[
+  {
+    "description": "RFC 4231-style known answer (the server test vector)",
+    "secret": "Jefe",
+    "remainder": "what do ye want for nothing?",
+    "signature": "ba5396e10039ec002bf1fde117eee48df8c2f06bc47b5f2d3272ea77f6862da9"
+  },
+  {
+    "description": "The README worked example",
+    "secret": "your-secret",
+    "remainder": "300x200/https://example.com/photo.jpg",
+    "signature": "3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6"
+  },
+  {
+    "description": "Expiring URL",
+    "secret": "s3cr3t",
+    "remainder": "exp:1893456000/300x200/https://example.com/photo.jpg",
+    "signature": "878f5cb69f5ac5770161176099fcdd64dcce17d6e6f846a3108ffacfa4644386"
+  },
+  {
+    "description": "Per-request cache lifetime",
+    "secret": "s3cr3t",
+    "remainder": "maxage:60/300x200/https://example.com/photo.jpg",
+    "signature": "abd0de02b38ce2cf5c3fe02bfba07fed611ff36f85ce5ecdfbc01f043166c71b"
+  },
+  {
+    "description": "Preset reference and filter chain",
+    "secret": "s3cr3t",
+    "remainder": "preset:og-card/filters:grayscale/https://example.com/photo.jpg",
+    "signature": "4ccaf0251e8899792852954b375a4a0e004a6e3f79de81eb598fe4ec818fabad"
+  },
+  {
+    "description": "Bucket source with crop and quality",
+    "secret": "correct horse battery staple",
+    "remainder": "crop:1200x630:smart/filters:quality(80)/s3://media/photo.jpg",
+    "signature": "368f2826d950429c19e89b431af940d3ae4d301e1a7a03e13abb8af58941fa91"
+  },
+  {
+    "description": "Corner-aligned crop",
+    "secret": "s3cr3t",
+    "remainder": "crop:100x100:top-left/https://example.com/photo.jpg",
+    "signature": "1c3500f3b3eac7e4360b1b55ccaade9d7a98e572600ffdd2745618f2380057c7"
+  },
+  {
+    "description": "Tone curve filter",
+    "secret": "s3cr3t",
+    "remainder": "filters:curve(rgb,0,0,255,255)/https://example.com/photo.jpg",
+    "signature": "d0976f5bfc4ac633ca3f9f26772fa185de1a6a88b5b8d95be95df84d3ffdbedf"
+  },
+  {
+    "description": "Convolution filter",
+    "secret": "s3cr3t",
+    "remainder": "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/https://example.com/photo.jpg",
+    "signature": "8002b5a43eeef37c6a89d2b6a6499db9e8d3773d8778c2f5e72fee8dba4f7c5f"
+  },
+  {
+    "description": "Video output (MP4)",
+    "secret": "s3cr3t",
+    "remainder": "filters:format(mp4)/https://example.com/photo.gif",
+    "signature": "97b27f0fe291acea2f148538a8e9c75c07de26cefaa7c0d58f12cd64a200ed3e"
+  },
+  {
+    "description": "Video output (WebM)",
+    "secret": "s3cr3t",
+    "remainder": "filters:format(webm)/https://example.com/photo.webp",
+    "signature": "b020df4afd3d889e0c80a8e919a3ebe3b689797aef3b8904e1c434ed50a99733"
+  },
+  {
+    "description": "Noise filter",
+    "secret": "s3cr3t",
+    "remainder": "filters:noise(40)/https://example.com/photo.jpg",
+    "signature": "622f9da6e9e6f5989672894607c6be4c3d0f4d003b7e40beae33b2e11dfbb731"
+  },
+  {
+    "description": "Smart-crop debug view",
+    "secret": "s3cr3t",
+    "remainder": "debug:focal/crop:100x100:smart/https://example.com/photo.jpg",
+    "signature": "031e8be3ae557f4974d229a532d06215cec3f5616ca6666a030d7f12f9a997a8"
+  },
+  {
+    "description": "Orientation-adaptive fit-in",
+    "secret": "s3cr3t",
+    "remainder": "fit-in:300x200:adaptive/https://example.com/photo.jpg",
+    "signature": "97e32c2d061c022cf8738f376087b61d56a56e301b885f3fe3d822efe50591f6"
+  },
+  {
+    "description": "Named source root (short source form, signed as written)",
+    "secret": "s3cr3t",
+    "remainder": "300x200/root:photos/cat.jpg",
+    "signature": "47e002f609cfbfc252eb1357bbee780bbbaf4c336847610caf44617b06453824"
+  },
+  {
+    "description": "PDF page selection",
+    "remainder": "page:2/https://example.com/doc.pdf",
+    "secret": "s3cr3t",
+    "signature": "18080068798bd8f761b55414e1d859dccf613aaefd1e795997a4f537c6dc2169"
+  },
+  {
+    "description": "PDF page selection, zero-padded spelling (canonicalizes to page:2; signed as written)",
+    "remainder": "page:007/https://example.com/doc.pdf",
+    "secret": "s3cr3t",
+    "signature": "ae2b8fde68f8098f52b9fe980078f7576a54d09b7d21b2d5ba191c6952047769"
+  },
+  {
+    "description": "a gamma filter chain (issue #313)",
+    "remainder": "filters:gamma(2.2)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "30139aa29597be221216319d43f0b4d98db2206823b0b7564bf4bf76e62b86b9"
+  },
+  {
+    "description": "an exposure filter chain (issue #317)",
+    "remainder": "filters:exposure(1.5)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "154396fc90f5357c7e9992a6ac16d23e2c988a2c759ad447b687c2e66bbb9b9a"
+  },
+  {
+    "description": "a highlights and shadows filter chain (issue #317)",
+    "remainder": "filters:highlights_shadows(30,-20)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "a827b69d8e70c782a1a1ff316d22b4d1fded2aeaa0e22a63a8b83f03d84f4bcb"
+  },
+  {
+    "description": "a vibrance filter chain (issue #317)",
+    "remainder": "filters:vibrance(40)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "d2a8ce83c787b6590070c99a927fba250a96a1d59c3637bd97918bb479eaa2aa"
+  },
+  {
+    "description": "an enhance filter chain (issue #317)",
+    "remainder": "filters:enhance/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "114970e70a6e88f2a7ca849d8c305e26929bdb1a81c06ba32bb6b49d8bd02be8"
+  },
+  {
+    "description": "a per-side trim (issue #313)",
+    "remainder": "filters:trim(20,5,0,5,0)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "a91f98eb5268b39de30d404e0590b18065d4ed157cc2342c4aadda57aca63754"
+  },
+  {
+    "description": "a focal point crop with zoom (issue #313)",
+    "remainder": "focalpoint:0.75x0.4:2/crop:600x600/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "c67db31f358adf845837ce865f04915592fdf186b815cfbf2838c1fcdf0056d8"
+  },
+  {
+    "description": "a palette-quantized PNG (issue #313)",
+    "remainder": "filters:format(png):palette(64)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "971306ae1da419c03dd8a49b1cb0523a5cb0e1b8d3ee074fedd0e50456aca1b9"
+  },
+  {
+    "description": "a percent-encoded source, the spelling builders ask for in place of a character a browser rewrites (issue #472): signed as written",
+    "secret": "s3cr3t",
+    "remainder": "100x0/https://example.com/x%7By%7D.jpg",
+    "signature": "185ec1ffdc665285c43ca7af231f4bef87fe8c6f102709006e46e8ace401da57"
+  },
+  {
+    "description": "sealed: a plain remainder under an injected nonce (AES-256-GCM, key HMAC_SHA256(secret, \"crabcrop/seal-key\"), AAD crabcrop/sealed/1)",
+    "sealed": true,
+    "secret": "s3cr3t",
+    "nonce": "000102030405060708090a0b",
+    "remainder": "300x200/https://example.com/photo.jpg",
+    "token": "s1.AAECAwQFBgcICQoL4rtOMQmUdNPYyz3r5cEt98-xHjyY6uQLX54QmEJRN-xu0AFe4THlo0MKBmyd_G5VJ-woya4"
+  },
+  {
+    "description": "sealed: a keyed token (the key ID rides outside the ciphertext as routing metadata)",
+    "sealed": true,
+    "secret": "s3cr3t",
+    "key_id": "k2",
+    "nonce": "ffeeddccbbaa998877665544",
+    "remainder": "preset:og-card/https://example.com/photo.jpg",
+    "token": "k2:s1._-7dzLuqmYh3ZlVE6KzevG04KldWn3E5eImjNEU9NYdDXFfJk9p5nXWe04ow1thNm5gqZLe8O9S-eVSvUIlKnEgXSRK77vtu"
+  },
+  {
+    "description": "sealed: an expiring remainder with a source-root source",
+    "sealed": true,
+    "secret": "correct horse battery staple",
+    "nonce": "0b0a09080706050403020100",
+    "remainder": "exp:1893456000/300x200/root:photos/cat.jpg",
+    "token": "s1.CwoJCAcGBQQDAgEAM3yLQzhWSh2-e40WBlrwPD1nZpOaMpA5jHnyRJUHyv0GtY-GFViYaBukUi3oSXcviK6xl8_VMYLStw"
+  },
+  {
+    "description": "refused: a backslash in the source: browsers turn it into a slash",
+    "operations": "300x200",
+    "source": "https://example.com/a\\b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\\"
+    }
+  },
+  {
+    "description": "refused: a brace in the source: browsers percent-encode it",
+    "operations": "300x200",
+    "source": "https://example.com/x{y}.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "{"
+    }
+  },
+  {
+    "description": "refused: a closing brace in the source",
+    "operations": "300x200",
+    "source": "https://example.com/x}.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "}"
+    }
+  },
+  {
+    "description": "refused: a double quote in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a\"b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\""
+    }
+  },
+  {
+    "description": "refused: a less-than sign in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a<b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "<"
+    }
+  },
+  {
+    "description": "refused: a greater-than sign in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a>b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": ">"
+    }
+  },
+  {
+    "description": "refused: a backtick in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a`b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "`"
+    }
+  },
+  {
+    "description": "refused: a caret in the source (Chrome percent-encodes it)",
+    "operations": "300x200",
+    "source": "https://example.com/a^b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "^"
+    }
+  },
+  {
+    "description": "refused: a pipe in the source (Chrome percent-encodes it)",
+    "operations": "300x200",
+    "source": "https://example.com/a|b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "|"
+    }
+  },
+  {
+    "description": "refused: a raw brace in a text label: browsers percent-encode it",
+    "operations": "filters:text(x{y},12,ff8800ff,center)",
+    "source": "https://example.com/photo.jpg",
+    "refuses": {
+      "input": "operations",
+      "character": "{"
+    }
+  },
+  {
+    "description": "refused: a caret in a preset name",
+    "operations": "preset:card^2",
+    "source": "https://example.com/photo.jpg",
+    "refuses": {
+      "input": "operations",
+      "character": "^"
+    }
+  },
+  {
+    "description": "refused: a query string in the source: it would truncate the remainder",
+    "operations": "300x200",
+    "source": "https://example.com/a.jpg?w=1",
+    "refuses": {
+      "input": "source",
+      "character": "?"
+    }
+  },
+  {
+    "description": "refused: a fragment in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a.jpg#top",
+    "refuses": {
+      "input": "source",
+      "character": "#"
+    }
+  },
+  {
+    "description": "refused: a space in the source",
+    "operations": "300x200",
+    "source": "https://example.com/my photo.jpg",
+    "refuses": {
+      "input": "source",
+      "character": " "
+    }
+  },
+  {
+    "description": "refused: a control character in the operations",
+    "operations": "300x200\t",
+    "source": "https://example.com/photo.jpg",
+    "refuses": {
+      "input": "operations",
+      "character": "\t"
+    }
+  },
+  {
+    "description": "refused: a DEL in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a\u007fb.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\u007f"
+    }
+  },
+  {
+    "description": "refused: a non-ASCII character in the source",
+    "operations": "300x200",
+    "source": "https://example.com/caf\u00e9.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\u00e9"
+    }
+  },
+  {
+    "description": "signs: a source whose path names a key label: only a remainder that begins with the reserved segment is refused",
+    "secret": "s3cr3t",
+    "remainder": "300x200/https://example.com/crabcrop/purge-key.jpg",
+    "signature": "458f13f0e6e221c1be4b0ac8a9848f8c733a49e44f58089ad6359c705fadb5d4"
+  },
+  {
+    "description": "signs: a first segment that only starts with the reserved segment's letters",
+    "secret": "s3cr3t",
+    "remainder": "crabcrop-assets/photo.jpg",
+    "signature": "ae1f5fdaf7a447334c5f897a53e624d0b7e44b581b3f387b705899c01834f5cf"
+  },
+  {
+    "description": "reserved: the purge key label as a bare source (its signature would be the purge subkey)",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/purge-key",
+    "remainder": "crabcrop/purge-key"
+  },
+  {
+    "description": "reserved: the purge-group key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/purge-group-key",
+    "remainder": "crabcrop/purge-group-key"
+  },
+  {
+    "description": "reserved: the upload key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/upload-key",
+    "remainder": "crabcrop/upload-key"
+  },
+  {
+    "description": "reserved: the seal key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/seal-key",
+    "remainder": "crabcrop/seal-key"
+  },
+  {
+    "description": "reserved: the cache entry key label as a bare source",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/entry-key",
+    "remainder": "crabcrop/entry-key"
+  },
+  {
+    "description": "reserved: a key label split between the operations and the source",
+    "reserved": true,
+    "operations": "crabcrop",
+    "source": "upload-key",
+    "remainder": "crabcrop/upload-key"
+  },
+  {
+    "description": "reserved: the reserved segment alone",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop",
+    "remainder": "crabcrop"
+  },
+  {
+    "description": "reserved: any source under the reserved segment",
+    "reserved": true,
+    "operations": "",
+    "source": "crabcrop/photo.jpg",
+    "remainder": "crabcrop/photo.jpg"
+  },
+  {
+    "description": "reserved: operations under the reserved segment ahead of a real source",
+    "reserved": true,
+    "operations": "crabcrop/300x200",
+    "source": "https://example.com/photo.jpg",
+    "remainder": "crabcrop/300x200/https://example.com/photo.jpg"
+  }
+]

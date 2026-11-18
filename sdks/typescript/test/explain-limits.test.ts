@@ -65,14 +65,17 @@ test("the float grammar accepts and rejects what it did before", () => {
   // the two together show the verdict on every string whose
   // value is above -100; below that, the sign is the only
   // difference, and the pattern reads the sign the same way.
+  // Both read the decimal as the server does, as a 32-bit
+  // float (issue #712), so past its range a value is infinite
+  // and refused: `1e100` is not a sharpen amount.
   const OLD = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
   const accepts = (s: string): boolean => {
     const ok = (segment: string) => explainUrl(`https://x/${TAG}/${segment}/${SRC}`).errors.length === 0;
     return ok(`filters:sharpen(${s})`) || ok(`filters:contrast(${s})`);
   };
   const reference = (s: string): boolean => {
-    const n = Number(s);
-    return OLD.test(s) && Number.isFinite(n) && n >= -100;
+    const f = Math.fround(Number(s));
+    return OLD.test(s) && Number.isFinite(f) && f >= -100;
   };
   const alphabet = "10.eE+-z";
   let strings = [""];

@@ -412,13 +412,15 @@ fn the_decode_corpus_reaches_the_scaled_jpeg_decode() {
     // header (grayscale, CMYK, arithmetic, lossless, 12-bit,
     // a declared size past the limits) and by the data (a
     // truncated scan, scans past the limit, restart markers
-    // out of turn).
+    // out of turn, and since issue #713 a progressive first
+    // scan zune-jpeg's reader is done with short of its
+    // marker).
     let seeds = jpeg_seeds();
     let decoded = seeds.iter().filter(|s| scaled_frames(s) == 3).count();
     let refused = seeds.iter().filter(|s| scaled_frames(s) == 0).count();
-    assert!(decoded >= 3, "{decoded} JPEG seeds decode at every scale");
+    assert!(decoded >= 4, "{decoded} JPEG seeds decode at every scale");
     assert!(
-        refused >= 9,
+        refused >= 10,
         "{refused} JPEG seeds are refused at every scale"
     );
     assert_eq!(

@@ -43,7 +43,9 @@ fn main() {
                 let r = if c["key_id"].is_null() {
                     build_url(base, secret, s(&c["operations"]), s(&c["source"]), exp)
                 } else {
-                    let sk = secret.map(|b| (b, s(&c["key_id"])));
+                    // A keyed URL is always signed: the cases
+                    // give every key ID a secret.
+                    let sk = (secret.expect("a keyed case has a secret"), s(&c["key_id"]));
                     build_url_with_key_id(base, sk, s(&c["operations"]), s(&c["source"]), exp)
                 };
                 match r {

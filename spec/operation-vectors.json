@@ -562,6 +562,24 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "focalpoint:-0x-0/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "focalpoint:0x0:1/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:1.00000001x0.5:100.000001/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "focalpoint:1x0.5:100/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:1.0000001x0.5/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_focal_point",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "focalpoint:1.5x0.4/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_focal_point",
@@ -1096,6 +1114,30 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:blur(512.00001)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:blur(512)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(512.0001)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(2.)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:blur(2)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(1e-40)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:blur(abc)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
@@ -1210,6 +1252,18 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:contrast(-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:contrast(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:contrast(-1e-50)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:contrast(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:gamma(2.2)/https://example.com/a.jpg",
    "ok": true,
    "canonical": "filters:gamma(2.2)/https://example.com/a.jpg",
@@ -1282,6 +1336,12 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:exposure(-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:exposure(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:highlights_shadows(30,-20)/https://example.com/a.jpg",
    "ok": true,
    "canonical": "filters:highlights_shadows(30,-20)/https://example.com/a.jpg",
@@ -1297,6 +1357,12 @@
    "remainder": "filters:highlights_shadows(+30,20)/https://example.com/a.jpg",
    "ok": true,
    "canonical": "filters:highlights_shadows(30,20)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(-0,-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:highlights_shadows(0,0)/https://example.com/a.jpg",
    "source": "https://example.com/a.jpg"
   },
   {
@@ -1339,6 +1405,12 @@
    "remainder": "filters:vibrance(nan)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:vibrance(0)/https://example.com/a.jpg",
    "source": "https://example.com/a.jpg"
   },
   {
@@ -1417,6 +1489,24 @@
    "remainder": "filters:saturation(-1)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:saturation(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(-1e-50)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:saturation(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:saturation(255.000001)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:saturation(255)/https://example.com/a.jpg",
    "source": "https://example.com/a.jpg"
   },
   {
@@ -1702,6 +1792,18 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:format(webp,method:+6,sns:050)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:format(webp,method:6,sns:50)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webp,method:-0)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:format(mov)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
@@ -1925,6 +2027,12 @@
   },
   {
    "remainder": "filters:noise(1.5)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_noise",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(-0)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_noise",
    "source": "https://example.com/a.jpg"
@@ -2194,6 +2302,12 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:facepad(-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:facepad(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:upscale(2)/https://example.com/a.jpg",
    "ok": true,
    "canonical": "filters:upscale(2)/https://example.com/a.jpg",
@@ -2278,6 +2392,24 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:dpr(+2)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:dpr(2)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(1.50000001)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:dpr(1.5)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(1.5000001)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:text(Hello,12,ff8800,center)/https://example.com/a.jpg",
    "ok": true,
    "canonical": "filters:text(Hello,12,ff8800ff,center)/https://example.com/a.jpg",
@@ -2327,6 +2459,24 @@
   },
   {
    "remainder": "filters:text(Hello,12,ff880,center)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(%01Hi,12,ff8800,center)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:text(%01Hi,12,ff8800ff,center)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(%+1Hi,12,ff8800,center)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(Hello,12,+f8800,center)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
    "source": "https://example.com/a.jpg"
@@ -2428,6 +2578,12 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:trim(-0)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:watermark(https%3A%2F%2Fx%2Fwm.png,0,0,80)/https://example.com/a.jpg",
    "ok": true,
    "canonical": "filters:watermark(https%3A%2F%2Fx%2Fwm.png,0,0,80)/https://example.com/a.jpg",
@@ -2509,6 +2665,18 @@
    "remainder": "filters:rotate(abc)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:rotate(-0)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:rotate(0)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:rotate(36000.001)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:rotate(36000)/https://example.com/a.jpg",
    "source": "https://example.com/a.jpg"
   },
   {
@@ -5037,6 +5205,14 @@
    "canonical": "saturation(0)"
   },
   {
+   "call": "filter.saturation",
+   "args": [
+    -0.0
+   ],
+   "segment": "saturation(0)",
+   "canonical": "saturation(0)"
+  },
+  {
    "call": "filter.rgb",
    "args": [
     1,
@@ -5595,6 +5771,26 @@
    ],
    "segment": "pixelateclass(traffic%20light)",
    "canonical": "pixelateclass(traffic%20light)"
+  },
+  {
+   "call": "filter.blurClass",
+   "args": [
+    "हिंदी"
+   ],
+   "segment": "blurclass(%E0%A4%B9%E0%A4%BF%E0%A4%82%E0%A4%A6%E0%A5%80)",
+   "canonical": "blurclass(%E0%A4%B9%E0%A4%BF%E0%A4%82%E0%A4%A6%E0%A5%80)"
+  },
+  {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
+     "Ⓐ"
+    ]
+   ],
+   "segment": "crop:100x100:objects(%E2%92%B6):1",
+   "canonical": "crop:100x100:objects(%E2%92%B6):1"
   },
   {
    "call": "filter.recolorClass",

@@ -67,7 +67,7 @@ impl Neighbors for f32 {
     }
 }
 
-impl<T: FromStr + PartialOrd + Neighbors> Samples for Number<T> {
+impl<T: FromStr + PartialOrd + Neighbors + Stored> Samples for Number<T> {
     fn accepted(&self) -> Vec<String> {
         let mut out = vec![self.spell(&self.max)];
         if self.open {

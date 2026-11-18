@@ -136,7 +136,12 @@ The URL grammar and signing scheme are specified in
 [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation
 runs as its test suite. If you change the grammar or the signing scheme, update
 the spec and the vectors, and keep the SDKs (Rust, TypeScript, Python) and the
-playground in sync so they all still pass the shared vectors.
+playground in sync so they all still pass the shared vectors. The
+`crabcrop-url` crate runs its own copy of the vectors,
+`crates/crabcrop-url/tests/test-vectors.json`, so that its published package
+tests without the repository; a crate test fails until the copy matches the
+spec's file, so copy the file over when you change it:
+`cp spec/test-vectors.json crates/crabcrop-url/tests/`.
 
 The grammar has one JavaScript implementation:
 [`sdks/typescript/src/explain.ts`](sdks/typescript/src/explain.ts). The typed
