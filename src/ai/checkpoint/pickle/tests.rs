@@ -1,13 +1,17 @@
 use super::*;
 
+/// A reduce of os.system.
+pub(super) fn os_system_reduce() -> Vec<u8> {
+    b"\x80\x02cos\nsystem\n)R.".to_vec()
+}
+
 #[test]
 fn unpickle_refuses_an_unknown_callable_by_name() {
     // A reduce of os.system is the canonical
     // hostile pickle; the machine refuses it
     // before anything runs (nothing here can run:
     // the machine only builds data).
-    let pkl = b"\x80\x02cos\nsystem\n)R.".to_vec();
-    let err = unpickle(&pkl).unwrap_err();
+    let err = unpickle(&os_system_reduce()).unwrap_err();
     assert!(
         err.contains("unsupported pickle callable os.system"),
         "{err}"
@@ -18,7 +22,7 @@ fn unpickle_refuses_an_unknown_callable_by_name() {
 /// memoized value twice, pairs the two copies, and
 /// stores the pair back, so the tree doubles with every
 /// 7 bytes.
-fn memo_doubling(steps: usize) -> Vec<u8> {
+pub(super) fn memo_doubling(steps: usize) -> Vec<u8> {
     let mut pkl = b"(\x80\x02)q\x00".to_vec();
     for _ in 0..steps {
         pkl.extend_from_slice(b"h\x00h\x00\x86q\x00");
@@ -58,6 +62,16 @@ fn unpickle_refuses_memo_copies_past_the_budget() {
     assert!(unpickle(&memo_doubling(8)).is_ok());
 }
 
+/// One 32 KiB string, stored in the memo and read back
+/// twice.
+pub(super) fn memoized_string() -> Vec<u8> {
+    let mut pkl = b"\x80\x02(X".to_vec();
+    pkl.extend_from_slice(&(32 * 1024u32).to_le_bytes());
+    pkl.resize(pkl.len() + 32 * 1024, b'a');
+    pkl.extend_from_slice(b"q\x00h\x00h\x00t.");
+    pkl
+}
+
 #[test]
 fn unpickle_counts_memo_copies_of_a_string_by_their_bytes() {
     // One 32 KiB string, stored and read back twice: three
@@ -65,18 +79,13 @@ fn unpickle_counts_memo_copies_of_a_string_by_their_bytes() {
     // passes the budget at the store already. Without the
     // bytes in the count, an 896 KiB string read back from
     // the memo 65,000 times would copy about 55 GiB.
-    let mut pkl = b"\x80\x02(X".to_vec();
-    pkl.extend_from_slice(&(32 * 1024u32).to_le_bytes());
-    pkl.resize(pkl.len() + 32 * 1024, b'a');
-    pkl.extend_from_slice(b"q\x00h\x00h\x00t.");
-    let err = unpickle(&pkl).unwrap_err();
+    let err = unpickle(&memoized_string()).unwrap_err();
     assert!(err.contains(&budget_error()), "{err}");
 }
 
-#[test]
-fn unpickle_counts_every_memo_read() {
-    // A 1,000-item tuple, stored once and read back 100
-    // times. Each read counts at the tuple's size.
+/// A 1,000-item tuple, stored in the memo once and read
+/// back 100 times.
+pub(super) fn tuple_read_back() -> Vec<u8> {
     let mut pkl = b"\x80\x02((".to_vec();
     pkl.resize(pkl.len() + 1000, b'N');
     pkl.extend_from_slice(b"tq\x00");
@@ -84,14 +93,19 @@ fn unpickle_counts_every_memo_read() {
         pkl.extend_from_slice(b"h\x00");
     }
     pkl.extend_from_slice(b"t.");
-    let err = unpickle(&pkl).unwrap_err();
-    assert!(err.contains(&budget_error()), "{err}");
+    pkl
 }
 
 #[test]
-fn unpickle_counts_every_memo_write() {
-    // The same tuple stored in 100 memo slots. Each store
-    // counts at the tuple's size.
+fn unpickle_counts_every_memo_read() {
+    // A 1,000-item tuple, stored once and read back 100
+    // times. Each read counts at the tuple's size.
+    let err = unpickle(&tuple_read_back()).unwrap_err();
+    assert!(err.contains(&budget_error()), "{err}");
+}
+
+/// A 1,000-item tuple stored in 100 memo slots.
+pub(super) fn tuple_stored_100_times() -> Vec<u8> {
     let mut pkl = b"\x80\x02(".to_vec();
     pkl.resize(pkl.len() + 1000, b'N');
     pkl.push(b't');
@@ -99,8 +113,23 @@ fn unpickle_counts_every_memo_write() {
         pkl.extend_from_slice(&[b'q', i]);
     }
     pkl.push(b'.');
-    let err = unpickle(&pkl).unwrap_err();
+    pkl
+}
+
+#[test]
+fn unpickle_counts_every_memo_write() {
+    // The same tuple stored in 100 memo slots. Each store
+    // counts at the tuple's size.
+    let err = unpickle(&tuple_stored_100_times()).unwrap_err();
     assert!(err.contains(&budget_error()), "{err}");
+}
+
+/// An empty tuple, then TUPLE1 up to the 1 MiB cap.
+pub(super) fn deep_tuple_chain() -> Vec<u8> {
+    let mut pkl = b"\x80\x02)".to_vec();
+    pkl.resize(1024 * 1024 - 1, 0x85);
+    pkl.push(b'.');
+    pkl
 }
 
 #[test]
@@ -108,19 +137,13 @@ fn unpickle_refuses_a_deep_tuple_chain_on_a_small_stack() {
     // An empty tuple, then TUPLE1 up to the 1 MiB cap:
     // about a million levels, whose recursive drop
     // overflowed the stack and aborted the process.
-    let mut pkl = b"\x80\x02)".to_vec();
-    pkl.resize(1024 * 1024 - 1, 0x85);
-    pkl.push(b'.');
-    let err = unpickle_on_a_small_stack(pkl).unwrap_err();
+    let err = unpickle_on_a_small_stack(deep_tuple_chain()).unwrap_err();
     assert!(err.contains(&depth_error()), "{err}");
 }
 
-#[test]
-fn unpickle_refuses_deeply_nested_dicts_on_a_small_stack() {
-    // 20,000 dicts on the stack, each with a key, then
-    // one SETITEM per level, each storing the dict above
-    // into the one below it. They fit in the budget, so
-    // the depth bound is what refuses them.
+/// 20,000 dicts on the stack, each with a key, then one
+/// SETITEM per level.
+pub(super) fn deep_dicts() -> Vec<u8> {
     let levels = 20_000;
     let mut pkl = b"\x80\x02".to_vec();
     for _ in 0..levels {
@@ -129,13 +152,22 @@ fn unpickle_refuses_deeply_nested_dicts_on_a_small_stack() {
     pkl.push(b'}');
     pkl.resize(pkl.len() + levels, b's');
     pkl.push(b'.');
-    let err = unpickle_on_a_small_stack(pkl).unwrap_err();
+    pkl
+}
+
+#[test]
+fn unpickle_refuses_deeply_nested_dicts_on_a_small_stack() {
+    // 20,000 dicts on the stack, each with a key, then
+    // one SETITEM per level, each storing the dict above
+    // into the one below it. They fit in the budget, so
+    // the depth bound is what refuses them.
+    let err = unpickle_on_a_small_stack(deep_dicts()).unwrap_err();
     assert!(err.contains(&depth_error()), "{err}");
 }
 
 /// A pickle whose root nests `levels` tuples or dicts,
 /// each level built by `opcode`.
-fn nested(opcode: u8, levels: usize) -> Vec<u8> {
+pub(super) fn nested(opcode: u8, levels: usize) -> Vec<u8> {
     let n = levels - 1;
     let mut pkl = b"\x80\x02".to_vec();
     let repeat = |pkl: &mut Vec<u8>, bytes: &[u8], count: usize| {
