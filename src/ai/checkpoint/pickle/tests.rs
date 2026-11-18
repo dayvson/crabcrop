@@ -329,6 +329,27 @@ fn a_mark_fences_every_opcode_that_pops_or_reads_the_stack() {
 }
 
 #[test]
+fn the_latest_open_mark_is_the_fence() {
+    // Two MARKs open, at heights 1 and 2: BUILD's state and
+    // object stand above the first but not the second, and
+    // CPython refuses BUILD at the second.
+    assert_eq!(unpickle(b"N(N(Nb."), Err(below_a_mark("BUILD")));
+    // Once TUPLE closes the second, the first is the fence
+    // again, and BUILD's values stand above it: CPython reads
+    // this one, and so does the machine.
+    assert_eq!(
+        unpickle(b"N(}(NtNbt\x86."),
+        Ok(PickleValue::Tuple(vec![
+            PickleValue::None,
+            PickleValue::Tuple(vec![
+                PickleValue::Map(Vec::new()),
+                PickleValue::Tuple(vec![PickleValue::None]),
+            ]),
+        ]))
+    );
+}
+
+#[test]
 fn unpickle_reads_newtrue_as_true_and_newfalse_as_false() {
     assert_eq!(unpickle(b"\x80\x02\x88."), Ok(PickleValue::Bool(true)));
     assert_eq!(unpickle(b"\x80\x02\x89."), Ok(PickleValue::Bool(false)));
