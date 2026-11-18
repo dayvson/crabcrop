@@ -186,6 +186,17 @@ spec:
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- /* The server answers nothing until boot is done, the
+               AI preload included, so the liveness and readiness
+               probes wait for this one. It is read with defaults,
+               so values kept from an earlier release (helm upgrade
+               --reuse-values), which lack it, still render it. */}}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ (.Values.startupProbe).periodSeconds | default 2 }}
+            failureThreshold: {{ (.Values.startupProbe).failureThreshold | default 150 }}
           livenessProbe:
             httpGet:
               path: /health

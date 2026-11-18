@@ -21,7 +21,7 @@
 //! decode, no gates) and writes nothing anywhere.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -63,7 +63,8 @@ pub use background::{
 };
 mod listen;
 pub use listen::{
-    ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, serve_connections,
+    ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, RequestsInFlight,
+    bind_listener, serve_connections,
 };
 mod process;
 pub(in crate::server) use process::{
@@ -111,8 +112,9 @@ pub struct AppState {
     /// The bearer token `/metrics` requires (issue #270),
     /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
     /// endpoint: it answers 403 rather than serving the
-    /// exposition unauthenticated.
-    pub metrics_token: Option<String>,
+    /// exposition unauthenticated. Zeroed when the state is
+    /// dropped.
+    pub metrics_token: Option<zeroize::Zeroizing<String>>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
     /// The provider and renderer handles (see
@@ -2149,13 +2151,40 @@ async fn upload_log(log: &RequestLog, name: &str, outcome: &str) {
     .await;
 }
 
+/// How long an upload body may take before its pace counts:
+/// the body must arrive within this long plus one second for
+/// every [`crate::loader::MIN_BODY_RATE`] bytes (64 KiB) it
+/// has delivered (see [`upload_body_due`]).
+pub const UPLOAD_BODY_GRACE: Duration = Duration::from_secs(10);
+
+/// When an upload body whose read started at `started`, and
+/// which has delivered `received` bytes, must have delivered
+/// more: [`UPLOAD_BODY_GRACE`] plus one second per
+/// [`crate::loader::MIN_BODY_RATE`] bytes, plus `waited`, the
+/// time the server itself spent waiting for budget. A body
+/// that keeps 64 KiB a second after the grace never meets
+/// it, and one that trickles or stalls does, so a client
+/// cannot hold its connection and its budget for longer than
+/// the body's own size accounts for: a body at the 10 MiB
+/// default cap is done within 10 + 160 seconds, plus the
+/// budget wait.
+fn upload_body_due(
+    started: tokio::time::Instant,
+    received: usize,
+    waited: Duration,
+) -> tokio::time::Instant {
+    let paced = (received as u64).saturating_mul(1000) / crate::loader::MIN_BODY_RATE as u64;
+    started + UPLOAD_BODY_GRACE + Duration::from_millis(paced) + waited
+}
+
 /// Read an upload body of at most `cap` bytes, charging it
 /// to `charge` as it arrives (issue #403), in steps so a
 /// trickling client does not touch the budget per frame.
 /// [`LoadError::TooLarge`] past the cap,
-/// [`LoadError::Network`] for an unreadable body, and
-/// [`LoadError::Busy`] when the request's wait for budget
-/// ran out.
+/// [`LoadError::Network`] for an unreadable body,
+/// [`LoadError::Timeout`] for a body that falls behind
+/// [`upload_body_due`], and [`LoadError::Busy`] when the
+/// request's wait for budget ran out.
 async fn read_upload_body(
     mut body: axum::body::Body,
     cap: usize,
@@ -2163,10 +2192,17 @@ async fn read_upload_body(
 ) -> Result<Vec<u8>, LoadError> {
     use axum::body::HttpBody as _;
     const STEP: usize = 256 * 1024;
+    let started = tokio::time::Instant::now();
+    let mut waited = Duration::ZERO;
     let mut out = Vec::new();
-    while let Some(frame) =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
-    {
+    loop {
+        let due = upload_body_due(started, out.len(), waited);
+        let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx));
+        let frame = match tokio::time::timeout_at(due, next).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => return Err(LoadError::Timeout),
+        };
         let frame = frame.map_err(|e| LoadError::Network(e.to_string()))?;
         let Ok(data) = frame.into_data() else {
             continue;
@@ -2176,7 +2212,9 @@ async fn read_upload_body(
             return Err(LoadError::TooLarge { limit: cap as u64 });
         }
         let step = received.div_ceil(STEP).saturating_mul(STEP);
+        let waiting = tokio::time::Instant::now();
         charge.grow_to(step.min(cap).max(received)).await?;
+        waited += waiting.elapsed();
         out.extend_from_slice(&data);
     }
     charge.shrink_to(out.len());
@@ -2629,6 +2667,22 @@ async fn read_upload(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "upload_too_large",
                     format!("upload exceeds the {max_bytes}-byte limit"),
+                ),
+            ));
+        }
+        Err(LoadError::Timeout) => {
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:too-slow",
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    "upload_too_slow",
+                    format!(
+                        "upload body arrived too slowly: it may take {} seconds plus one second \
+                         for every {} KiB it sends",
+                        UPLOAD_BODY_GRACE.as_secs(),
+                        crate::loader::MIN_BODY_RATE / 1024
+                    ),
                 ),
             ));
         }

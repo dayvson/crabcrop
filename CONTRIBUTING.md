@@ -81,7 +81,10 @@ A unit test that stands a script in for an external tool (FFmpeg,
 pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
 `std::fs::write`. A script written through the test process's own file
 descriptor can fail to start with "Text file busy" when another test thread
-spawns a child at the same moment (issue #523).
+spawns a child at the same moment (issue #523). The binary's unit tests cannot
+see the library's test modules, so they include the function's file,
+`src/test_support/script.rs`, with `#[path]`, and call it as
+`crate::test_script::write_script`.
 
 A test that writes files makes them in a directory of its own from
 `crate::test_support::scratch_dir(tag)`: it starts empty under
@@ -133,7 +136,12 @@ The URL grammar and signing scheme are specified in
 [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation
 runs as its test suite. If you change the grammar or the signing scheme, update
 the spec and the vectors, and keep the SDKs (Rust, TypeScript, Python) and the
-playground in sync so they all still pass the shared vectors.
+playground in sync so they all still pass the shared vectors. The
+`crabcrop-url` crate runs its own copy of the vectors,
+`crates/crabcrop-url/tests/test-vectors.json`, so that its published package
+tests without the repository; a crate test fails until the copy matches the
+spec's file, so copy the file over when you change it:
+`cp spec/test-vectors.json crates/crabcrop-url/tests/`.
 
 The grammar has one JavaScript implementation:
 [`sdks/typescript/src/explain.ts`](sdks/typescript/src/explain.ts). The typed

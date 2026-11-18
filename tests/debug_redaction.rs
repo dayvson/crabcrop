@@ -159,7 +159,7 @@ fn state(dir: &std::path::Path) -> AppState {
         process_timeout: std::time::Duration::from_secs(30),
         metrics: Arc::new(Metrics::default()),
         request_log: RequestLog::inline(),
-        metrics_token: Some(METRICS_TOKEN.to_string()),
+        metrics_token: Some(METRICS_TOKEN.to_string().into()),
         cache: Arc::new(Cache::new(1024 * 1024)),
         providers: Arc::new(Providers::default()),
         tag_threshold: 0.05,

@@ -160,6 +160,32 @@ const JPX_BYTES_PER_SAMPLE: u64 = 4;
 /// to four components each, so it never comes near.
 const JPX_SCAN_COMPONENTS: usize = 1 << 20;
 
+/// The document the boot check renders (issue #715): one
+/// blank page, 8 points square, which renders to a 16x16
+/// PNG at the fixed scale. Its cross-reference offsets are
+/// exact, so no renderer has to repair it.
+const SELF_TEST_PDF: &[u8] = b"%PDF-1.4\n\
+    1 0 obj\n\
+    << /Type /Catalog /Pages 2 0 R >>\n\
+    endobj\n\
+    2 0 obj\n\
+    << /Type /Pages /Kids [3 0 R] /Count 1 >>\n\
+    endobj\n\
+    3 0 obj\n\
+    << /Type /Page /Parent 2 0 R /MediaBox [0 0 8 8] /Resources << >> >>\n\
+    endobj\n\
+    xref\n\
+    0 4\n\
+    0000000000 65535 f \n\
+    0000000009 00000 n \n\
+    0000000058 00000 n \n\
+    0000000115 00000 n \n\
+    trailer\n\
+    << /Size 4 /Root 1 0 R >>\n\
+    startxref\n\
+    199\n\
+    %%EOF\n";
+
 /// Whether bytes can be a PDF at all: the format's
 /// header, `%PDF-`, appears within the first 1024 bytes
 /// (the format's own tolerance for prefixed junk). The
@@ -279,6 +305,35 @@ impl PdfRenderer {
             probe_program,
             timeout,
         })
+    }
+
+    /// The boot check (issue #715): render the page of a
+    /// one-page test document as a `page:` request renders
+    /// one, the probe and then the renderer, and decode the
+    /// PNG. Two programs that exist and run can still fail
+    /// every page: Poppler's `pdftoppm`, for one, takes the
+    /// renderer's arguments but writes its PNG to a file, so
+    /// it prints nothing, and every `page:` request would
+    /// answer `502`. Such a pair fails here instead, at boot.
+    pub fn self_test(&self) -> Result<(), PdfError> {
+        let failed = |why: String| {
+            PdfError::Failed(format!(
+                "a one-page test document did not render: {why}. The renderer must take the \
+                 arguments pdftocairo takes and write the page to standard output as one PNG"
+            ))
+        };
+        let page = self
+            .render_page(SELF_TEST_PDF, 1)
+            .map_err(|e| failed(e.to_string()))?;
+        if page.pages != 1 {
+            return Err(failed(format!(
+                "the probe counted {} pages in it",
+                page.pages
+            )));
+        }
+        image::load_from_memory_with_format(&page.png, image::ImageFormat::Png)
+            .map_err(|e| failed(format!("the PNG the renderer wrote does not decode: {e}")))?;
+        Ok(())
     }
 
     /// Probe the source for the selected page: page
@@ -2161,5 +2216,121 @@ exit 0\n";
         assert_eq!((img.width(), img.height()), (400, 400));
         let p = img.get_pixel(200, 200);
         assert_eq!((p[0], p[1], p[2]), (255, 255, 255), "the image was drawn");
+    }
+
+    #[test]
+    fn the_self_test_document_needs_no_repair() {
+        // Issue #715: the boot renders this document, so its
+        // cross-reference table and `startxref` must point at
+        // what they name, as a renderer reads them.
+        let text = std::str::from_utf8(SELF_TEST_PDF).unwrap();
+        let xref = text.find("\nxref\n").unwrap() + 1;
+        let startxref: usize = text
+            .rsplit("startxref\n")
+            .next()
+            .and_then(|tail| tail.lines().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert_eq!(startxref, xref);
+        let lines: Vec<&str> = text[xref..].lines().collect();
+        assert_eq!(&lines[..3], ["xref", "0 4", "0000000000 65535 f "]);
+        for (n, entry) in lines[3..6].iter().enumerate() {
+            let offset: usize = entry[..10].parse().unwrap();
+            assert!(
+                text[offset..].starts_with(&format!("{} 0 obj\n", n + 1)),
+                "entry {}: {entry:?}",
+                n + 1
+            );
+        }
+        assert!(text.ends_with("startxref\n199\n%%EOF\n"));
+    }
+
+    /// The probe's report on the self-test document, in the
+    /// per-page form the reference probe prints.
+    const INFO_SELF_TEST: &str = "#!/bin/sh\n\
+cat > /dev/null\n\
+printf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  8 x 8 pts'\n\
+exit 0\n";
+
+    #[test]
+    fn the_self_test_passes_a_pair_that_renders_its_page() {
+        let dir = temp_dir("self-test-ok");
+        let png = dir.join("page.png");
+        image::RgbImage::new(16, 16).save(&png).unwrap();
+        write_tool(&dir, "pdfinfo", INFO_SELF_TEST);
+        let render = format!("#!/bin/sh\ncat > /dev/null\ncat '{}'\n", png.display());
+        let program = write_tool(&dir, "pdftocairo", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        renderer.self_test().unwrap();
+    }
+
+    #[test]
+    fn the_self_test_refuses_a_pair_that_renders_no_page() {
+        // Issue #715: a pair that runs could still fail every
+        // page, and each `page:` request answered `502`. The
+        // boot check fails it instead, naming why.
+        let silent = "#!/bin/sh\ncat > /dev/null\nexit 0\n";
+        let two_pages = INFO_SELF_TEST.replace("Pages:           1", "Pages:           2");
+        let cases = [
+            (
+                INFO_SELF_TEST,
+                silent,
+                "the PDF renderer produced no output",
+            ),
+            (
+                INFO_SELF_TEST,
+                "#!/bin/sh\ncat > /dev/null\nprintf 'P6 16 16 255 '\n",
+                "the PDF renderer's output is not a PNG",
+            ),
+            (
+                INFO_SELF_TEST,
+                RENDER_OK,
+                "the PNG the renderer wrote does not decode",
+            ),
+            (
+                INFO_SELF_TEST,
+                "#!/bin/sh\ncat > /dev/null\necho 'Syntax Error: no page' >&2\nexit 1\n",
+                "PDF renderer exited with",
+            ),
+            (
+                "#!/bin/sh\ncat > /dev/null\nexit 1\n",
+                RENDER_OK,
+                "not a PDF the probe can read",
+            ),
+            (
+                two_pages.as_str(),
+                RENDER_OK,
+                "the probe counted 2 pages in it",
+            ),
+        ];
+        for (n, (info, render, why)) in cases.into_iter().enumerate() {
+            let (_tools, program) = fake_pair(&format!("self-test-refused-{n}"), info, render);
+            let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+            let err = renderer.self_test().unwrap_err();
+            assert!(matches!(err, PdfError::Failed(_)), "{why}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.starts_with("a one-page test document did not render: "),
+                "{text}"
+            );
+            assert!(text.contains(why), "{why}: {text}");
+            assert!(
+                text.ends_with("write the page to standard output as one PNG"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The boot check with the real Poppler when it is on
+    /// PATH: the reference pair passes it.
+    #[test]
+    fn real_tools_pass_the_self_test() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(30)).unwrap();
+        renderer.self_test().unwrap();
+        let page = renderer.render_page(SELF_TEST_PDF, 1).unwrap();
+        assert_eq!(png_size(&page.png), (16, 16));
     }
 }

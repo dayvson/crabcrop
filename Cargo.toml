@@ -1,6 +1,6 @@
 [package]
 name = "crabcrop"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 rust-version = "1.96"
 description = "On-demand image optimization service in Rust"
@@ -168,6 +168,12 @@ zune-core = "0.5"
 # the turbojpeg crate.
 turbojpeg = { version = "1.5", default-features = false, features = ["cmake"] }
 webp = "0.3"
+# Secret-holding types zero their bytes when they are dropped:
+# the secret settings, the bucket credentials, the signing
+# keyring, and the keys derived from them. Already in the
+# tree through rustls, c2pa and the RustCrypto crates: it adds
+# no crate. Default features only (`alloc`).
+zeroize = "1"
 # GIF writes go through the gif crate directly (already in the
 # tree transitively via image) so quantization can swap from
 # NeuQuant to quantizr (issue #294): at 800x533, quantizr with
@@ -194,10 +200,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # (issue #545), which must not wait on a FIFO at an entry
 # path, and for the tests that open such a FIFO's write end
 # without blocking. `pipe` is for the capacity of the pipes
-# to the SVG and AVIF worker (issue #650). Neither adds a
-# crate.
+# to the SVG and AVIF worker (issue #650). `net` is for
+# `IPV6_V6ONLY`, which an IPv6 listener turns off to take
+# IPv4 connections too (issue #715). None adds a crate.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process", "fs", "pipe"] }
+rustix = { version = "1", features = ["process", "fs", "pipe", "net"] }
 
 # libjpeg-turbo's vector code (issue #668) is required on
 # the architectures the release binaries and images are

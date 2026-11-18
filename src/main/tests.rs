@@ -97,7 +97,7 @@ fn default_configuration_keeps_its_fingerprint() {
     );
     assert_eq!(
         (RENDERING_VERSION, fingerprint.as_str()),
-        (7, "25e5e3685efb9abe")
+        (8, "6e5d7c480309546a")
     );
 }
 
@@ -658,7 +658,6 @@ fn pdf_renderer_construction_follows_the_decoder_rules() {
 #[cfg(unix)]
 #[test]
 fn pdf_renderer_construction_validates_both_programs() {
-    use std::os::unix::fs::PermissionsExt;
     // A missing renderer is a boot error naming the
     // variable, like the decoder's.
     let missing = missing_path("renderer");
@@ -673,8 +672,7 @@ fn pdf_renderer_construction_validates_both_programs() {
     // contract.
     let dir = crate::test_support::scratch_dir("boot-pdf");
     let renderer_path = dir.join("pdftocairo");
-    std::fs::write(&renderer_path, b"#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&renderer_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_script::write_script(&renderer_path, "#!/bin/sh\n");
     let renderer_str = renderer_path.to_string_lossy().into_owned();
     let err = expect_err(build_pdf_renderer(env_of(&[(
         "CRABCROP_PDF_RENDERER",
@@ -682,16 +680,78 @@ fn pdf_renderer_construction_validates_both_programs() {
     )])));
     assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
     assert!(err.contains("pdfinfo"), "{err}");
-    // The pair in place constructs.
+    // Issue #715: the pair in place runs but renders
+    // nothing. Boot used to take it, and every `page:`
+    // request then answered `502`; the boot check refuses it.
     let info_path = dir.join("pdfinfo");
-    std::fs::write(&info_path, b"#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_script::write_script(&info_path, "#!/bin/sh\n");
+    let err = expect_err(build_pdf_renderer(env_of(&[(
+        "CRABCROP_PDF_RENDERER",
+        renderer_str.as_str(),
+    )])));
+    assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
+    assert!(
+        err.contains("a one-page test document did not render"),
+        "{err}"
+    );
+    // A pair that renders the test page constructs.
+    let page = dir.join("page.png");
+    image::RgbImage::new(16, 16).save(&page).unwrap();
+    crate::test_script::write_script(
+        &info_path,
+        "#!/bin/sh\ncat > /dev/null\n\
+         printf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  8 x 8 pts'\n",
+    );
+    crate::test_script::write_script(
+        &renderer_path,
+        &format!("#!/bin/sh\ncat > /dev/null\ncat '{}'\n", page.display()),
+    );
     let renderer = build_pdf_renderer(env_of(&[
         ("CRABCROP_PDF_RENDERER", renderer_str.as_str()),
         ("CRABCROP_PDF_TIMEOUT_SECS", "45"),
     ]))
     .unwrap();
     assert!(renderer.is_some());
+}
+
+/// Issue #715, with Poppler's own tools when they are on
+/// PATH (a machine without them skips this). pdftoppm sits
+/// next to pdfinfo and takes the renderer's arguments, so
+/// boot took `CRABCROP_PDF_RENDERER` naming it. But it
+/// writes its PNG to a file, `-.png` in its working
+/// directory, and prints nothing, so every `page:` request
+/// answered `502`. Boot now refuses it, and still takes
+/// pdftocairo, the reference renderer.
+#[cfg(unix)]
+#[test]
+fn pdf_renderer_construction_refuses_pdftoppm_and_takes_pdftocairo() {
+    let Some(dir) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find(|dir| {
+            ["pdftocairo", "pdftoppm", "pdfinfo"]
+                .iter()
+                .all(|tool| dir.join(tool).is_file())
+        })
+    }) else {
+        eprintln!("skipping: Poppler's pdftocairo, pdftoppm and pdfinfo are not on PATH");
+        return;
+    };
+    let build = |tool: &str| {
+        let path = dir.join(tool).to_string_lossy().into_owned();
+        build_pdf_renderer(env_of(&[("CRABCROP_PDF_RENDERER", path.as_str())]))
+    };
+    assert!(build("pdftocairo").unwrap().is_some());
+    // The tools run in the temporary directory, where
+    // pdftoppm leaves its file.
+    let left = std::env::temp_dir().join("-.png");
+    let there = left.exists();
+    let refused = build("pdftoppm");
+    if !there {
+        let _ = std::fs::remove_file(&left);
+    }
+    let err = expect_err(refused);
+    assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
+    assert!(err.contains("pdftoppm"), "{err}");
+    assert!(err.contains("the PDF renderer produced no output"), "{err}");
 }
 
 /// Issue #526: these construction tests once named
@@ -1260,7 +1320,10 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     assert_eq!(state.process_gate.capacity(), config.process_permits);
     assert_eq!(state.slow_gate.capacity(), 3);
     // The settings reach the state as validated.
-    assert_eq!(state.metrics_token.as_deref(), Some("metrics-token"));
+    assert_eq!(
+        state.metrics_token.as_ref().map(|token| token.as_str()),
+        Some("metrics-token")
+    );
     assert!(state.meta_enabled);
     assert!(!state.client_hints);
     assert!(!state.explain_enabled);
@@ -1408,4 +1471,146 @@ fn raised_malloc_thresholds_keep_a_renders_blocks() {
     if fresh >= 3000 {
         assert!(raised * 5 < fresh, "{raised} against {fresh}");
     }
+}
+
+#[test]
+fn a_disk_budget_of_zero_opens_no_disk_tier_and_never_touches_the_directory() {
+    // Issue #708: docs/configuration.md said a budget of 0
+    // disables storage even with a directory set, but boot
+    // still created and probed the directory, so one that was
+    // not writable failed the boot. A budget of 0 is no disk
+    // tier now: nothing creates, probes or reads the directory.
+    // /proc is not writable even for a privileged process.
+    let base = crate::test_support::scratch_dir("boot-disk-off");
+    for dir in [
+        "/proc/self".to_string(),
+        base.join("never-made").display().to_string(),
+    ] {
+        let config = Config::from_env(env_of(&[
+            ("CRABCROP_SECRET", "a production-grade secret"),
+            ("CRABCROP_RESULT_STORAGE_DIR", dir.as_str()),
+            ("CRABCROP_RESULT_STORAGE_MAX_MB", "0"),
+        ]))
+        .unwrap();
+        let stores = open_stores(&config).unwrap();
+        assert!(stores.disk.is_none(), "{dir}");
+    }
+    assert!(!base.join("never-made").exists());
+    // With a budget, the same unwritable directory still stops
+    // the boot, naming the variable.
+    let config = Config::from_env(env_of(&[
+        ("CRABCROP_SECRET", "a production-grade secret"),
+        ("CRABCROP_RESULT_STORAGE_DIR", "/proc/self"),
+    ]))
+    .unwrap();
+    let err = open_stores(&config).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Build {
+                var: Some("CRABCROP_RESULT_STORAGE_DIR"),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("is not writable"), "{err}");
+}
+
+#[test]
+fn open_stores_starts_the_disk_tier_and_its_scan_indexes_what_a_previous_run_left() {
+    // Issue #708: the store opens with its scan on a thread of
+    // its own, and the boot waits for the scan up to the
+    // store's deadline; a healthy disk is done by then.
+    let dir = crate::test_support::scratch_dir("boot-disk-scan");
+    let config = Config::from_env(env_of(&[
+        ("CRABCROP_SECRET", "a production-grade secret"),
+        ("CRABCROP_RESULT_STORAGE_DIR", &dir.display().to_string()),
+    ]))
+    .unwrap();
+    let store = open_stores(&config).unwrap().disk.unwrap();
+    let report = store.wait_scan(store.boot_deadline(), crate::storage::ScanPhase::ended);
+    assert_eq!(report.phase, crate::storage::ScanPhase::Done);
+    let image = crate::cache::CachedImage {
+        bytes: bytes::Bytes::from_static(b"pixels"),
+        format: crate::url::ImageFormat::Png,
+        quality: None,
+        groups: Vec::new(),
+        etag: format!(
+            "\"{}\"",
+            hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(b"pixels")[..16])
+        ),
+        written: None,
+    };
+    store.put("k", &image);
+    drop(store);
+    let store = open_stores(&config).unwrap().disk.unwrap();
+    let report = store.wait_scan(store.boot_deadline(), crate::storage::ScanPhase::ended);
+    assert_eq!(report.phase, crate::storage::ScanPhase::Done);
+    assert_eq!((report.files, report.entries), (1, 1));
+    assert!(store.get("k").is_some());
+}
+
+#[test]
+fn the_disk_tier_boot_lines_say_what_the_scan_did() {
+    // Issue #708: the boot logs when the scan starts, when it
+    // is slow, and what it found once it ends, the files it
+    // deleted included.
+    use crate::storage::{ScanPhase, ScanReport};
+    let report = |phase: ScanPhase, secs: u64| ScanReport {
+        phase,
+        elapsed: std::time::Duration::from_millis(secs * 1000 + 250),
+        files: 12,
+        entries: 9,
+        bytes: 4096,
+        deleted: 2,
+        undeleted: 0,
+    };
+    assert_eq!(
+        disk_tier_off("/var/cache/crabcrop"),
+        "result storage: off, CRABCROP_RESULT_STORAGE_MAX_MB is 0, so /var/cache/crabcrop is not used"
+    );
+    assert_eq!(
+        disk_scan_started("/c", 512, &ScanPhase::Scanning),
+        "result storage at /c: budget 512 MB, scanning the entries a previous run left"
+    );
+    assert_eq!(
+        disk_scan_started("/c", 512, &ScanPhase::Checking),
+        "result storage at /c: budget 512 MB, waiting for the directory to answer"
+    );
+    assert_eq!(
+        disk_scan_done("/c", 512, &report(ScanPhase::Done, 3)),
+        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s, deleted 2 and skipped 1"
+    );
+    assert_eq!(
+        disk_scan_done(
+            "/c",
+            512,
+            &ScanReport {
+                deleted: 1,
+                undeleted: 1,
+                ..report(ScanPhase::Done, 3)
+            }
+        ),
+        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s, deleted 1, could not delete 1 and skipped 1"
+    );
+    assert_eq!(
+        disk_scan_running("/c", &report(ScanPhase::Scanning, 35)),
+        "result storage at /c: the boot scan is still running after 35s, 12 files read; until it ends, an entry it has not indexed is a miss"
+    );
+    assert_eq!(
+        disk_scan_running("/c", &report(ScanPhase::Checking, 5)),
+        "result storage at /c: the directory has not answered after 5s; until it does, the disk tier serves and stores nothing"
+    );
+    assert_eq!(
+        disk_scan_failed(
+            "/c",
+            "cannot create the result storage directory: Permission denied"
+        ),
+        "result storage at /c: cannot create the result storage directory: Permission denied; the disk tier stays off until a restart"
+    );
+    assert_eq!(disk_scan_stopped(0).len(), 1);
+    let lines = disk_scan_stopped(2);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[1].starts_with("shutdown: 2 purges sent while the boot scan ran"));
 }

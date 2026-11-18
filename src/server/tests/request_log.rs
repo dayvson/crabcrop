@@ -33,7 +33,7 @@ async fn spawn_logging(log: RequestLog, dir: &std::path::Path) -> String {
                 file_root: Some(dir.clone()),
                 ..Default::default()
             }),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         upload: Some(Arc::new(crate::upload::UploadStore::local(
             dir,
             1024 * 1024,

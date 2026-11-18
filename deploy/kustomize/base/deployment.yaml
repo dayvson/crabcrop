@@ -38,7 +38,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: crabcrop
-          image: ghcr.io/dayvson/crabcrop:0.13.0
+          image: ghcr.io/dayvson/crabcrop:0.13.1
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -69,6 +69,18 @@ spec:
             # addresses (or set CRABCROP_ALLOWED_SOURCES).
             - name: CRABCROP_BLOCK_PRIVATE_SOURCES
               value: "1"
+          # The server answers nothing until boot is done, the
+          # AI component's model preload included, so the
+          # liveness and readiness probes wait for this one:
+          # the pod restarts after 150 misses 2 s apart, 5
+          # minutes, as the chart's default. Patch
+          # failureThreshold up for a slower preload.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 150
           livenessProbe:
             httpGet:
               path: /health

@@ -51,7 +51,12 @@ RUN mkdir -p /var/cache/crabcrop \
 # against a numeric user.
 USER 65534:65534
 # `crabcrop health` asks the server on this container's
-# port for /health and exits 1 unless it answers 200.
-HEALTHCHECK --interval=30s --timeout=3s \
+# port for /health and exits 1 unless it answers 200. The
+# server answers nothing until boot is done, and the AI
+# image's boot loads and probes its models first, so misses
+# in the first 5 minutes do not count against the container
+# (issue #715), as the Kubernetes recipes' startup probe
+# allows.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=300s \
     CMD ["crabcrop", "health"]
 ENTRYPOINT ["crabcrop"]

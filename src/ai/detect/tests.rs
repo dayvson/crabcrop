@@ -1014,11 +1014,9 @@ fn concurrent_detections_share_the_memo_safely() {
 
 #[test]
 fn without_a_memo_every_detection_runs_the_model() {
-    // A provider whose session lock is poisoned leaves its
-    // memo out, so that every detection reaches the lock and
-    // fails there as it always did. Without a memo nothing
-    // is looked up and nothing is remembered: a frame the
-    // memo knows runs the model again.
+    // Without a memo nothing is looked up and nothing is
+    // remembered: a frame the memo knows runs the model
+    // again.
     let memo = DetectionMemo::new();
     let runs = std::cell::Cell::new(0);
     let classes = classes();
@@ -1032,10 +1030,11 @@ fn without_a_memo_every_detection_runs_the_model() {
     assert_eq!(runs.get(), 2, "a detection without the memo did not run");
     // The model's failure goes out, although the memo could
     // have answered.
+    let failure = AiError::Inference("inference failed: boom".to_string());
     let failed = detect_objects(None, &classes, 0.5, &img, |_input| {
-        Err::<(Vec<i64>, Vec<f32>), _>(AiError::LockPoisoned)
+        Err::<(Vec<i64>, Vec<f32>), _>(failure.clone())
     });
-    assert_eq!(failed, Err(AiError::LockPoisoned));
+    assert_eq!(failed, Err(failure));
     // And a frame detected without the memo is not in it.
     let other = DynamicImage::ImageRgb8(noise_rgb(120, 90, 87));
     detect_objects(None, &classes, 0.5, &other, fake_yolo(&runs)).unwrap();

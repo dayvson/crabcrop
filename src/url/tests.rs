@@ -53,6 +53,23 @@ fn keyring_verifies_across_a_rotation_window() {
 }
 
 #[test]
+fn keyring_zeroes_its_keys() {
+    // What dropping a ring runs: both keys are wiped, and the
+    // key IDs, which URLs carry in the clear, are kept.
+    let mut ring = Keyring {
+        current_id: "k-new".to_string(),
+        current: b"new-secret-value".to_vec(),
+        previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+    };
+    zeroize::Zeroize::zeroize(&mut ring);
+    assert!(ring.current.is_empty());
+    let (previous_id, previous) = ring.previous.as_ref().unwrap();
+    assert!(previous.is_empty());
+    assert_eq!(previous_id, "k-old");
+    assert_eq!(ring.current_id, "k-new");
+}
+
+#[test]
 fn keyring_purge_verification_keeps_domain_separation() {
     let ring = Keyring {
         current_id: "k-new".to_string(),
@@ -4375,5 +4392,217 @@ fn the_canonical_form_is_the_segment_wise_form() {
                 "{ops:?} {source:?}"
             );
         }
+    }
+}
+
+/// The canonical form of a remainder, or the code it fails
+/// with.
+fn canonical_or_code(remainder: &str) -> Result<String, &'static str> {
+    parse_operations_with_expiry(remainder)
+        .map(|(ops, source, _, _)| canonical_form(&ops, source))
+        .map_err(|e| e.code())
+}
+
+/// Numbers read as their Rust types read them (issue #712),
+/// and every spelling of one value has one canonical form,
+/// and so one cache key. A float is the decimal rounded to the
+/// nearest `f32`, its bounds checked on the rounded value; a
+/// negative zero is zero.
+#[test]
+fn numbers_read_as_their_types_and_spell_one_way() {
+    let src = "https://example.com/a.jpg";
+    for (spelling, canonical) in [
+        // A sign, an exponent, a bare point, leading zeros.
+        ("filters:blur(+2)", "filters:blur(2)"),
+        ("filters:blur(2e0)", "filters:blur(2)"),
+        ("filters:blur(2.)", "filters:blur(2)"),
+        ("filters:blur(+.5e1)", "filters:blur(5)"),
+        ("filters:brighten(+040)", "filters:brighten(40)"),
+        ("filters:brighten(-0)", "filters:brighten(0)"),
+        (
+            "filters:format(webp,method:+6,sns:050)",
+            "filters:format(webp,method:6,sns:50)",
+        ),
+        ("filters:dpr(+2)", "filters:dpr(2)"),
+        ("filters:dpr(2e0)", "filters:dpr(2)"),
+        // Rounding to f32 comes before the bounds.
+        ("filters:blur(512.00001)", "filters:blur(512)"),
+        ("filters:dpr(1.50000001)", "filters:dpr(1.5)"),
+        ("filters:saturation(255.000001)", "filters:saturation(255)"),
+        ("filters:rotate(36000.001)", "filters:rotate(36000)"),
+        (
+            "focalpoint:1.00000001x0.5:100.000001",
+            "focalpoint:1x0.5:100",
+        ),
+        // A negative zero, written or rounded to, is zero.
+        ("filters:contrast(-0)", "filters:contrast(0)"),
+        ("filters:contrast(-1e-50)", "filters:contrast(0)"),
+        ("filters:exposure(-0.0)", "filters:exposure(0)"),
+        ("filters:saturation(-0)", "filters:saturation(0)"),
+        ("filters:saturation(-1e-50)", "filters:saturation(0)"),
+        ("filters:vibrance(-0)", "filters:vibrance(0)"),
+        (
+            "filters:highlights_shadows(-0,-0e5)",
+            "filters:highlights_shadows(0,0)",
+        ),
+        ("filters:facepad(-0)", "filters:facepad(0)"),
+        ("focalpoint:-0x-0", "focalpoint:0x0:1"),
+        ("filters:rotate(-0)", "filters:rotate(0)"),
+    ] {
+        let remainder = format!("{spelling}/{src}");
+        assert_eq!(
+            canonical_or_code(&remainder),
+            Ok(format!("{canonical}/{src}")),
+            "{spelling}"
+        );
+        // The canonical form is its own: one key for both.
+        assert_eq!(
+            canonical_key_form(&remainder),
+            canonical_key_form(&format!("{canonical}/{src}")),
+            "{spelling}"
+        );
+    }
+    for (spelling, code) in [
+        // Unsigned arguments refuse a minus sign, `-0` too.
+        ("filters:trim(-0)", "invalid_filters"),
+        ("filters:noise(-0)", "invalid_noise"),
+        ("filters:curve(rgb,-0,0,255,255)", "invalid_curve"),
+        ("filters:watermark(a.png,0,0,-0)", "invalid_filters"),
+        ("crop-rect:-0x0:10x10", "invalid_crop_rect"),
+        // Past the bounds once rounded: below the smallest
+        // normal f32, zero, infinity.
+        ("filters:blur(512.0001)", "invalid_filters"),
+        ("filters:blur(1e-40)", "invalid_filters"),
+        ("filters:blur(1e-46)", "invalid_filters"),
+        ("filters:gamma(1e-46)", "invalid_filters"),
+        ("filters:sharpen(1e-46)", "invalid_filters"),
+        ("filters:sharpen(1e39)", "invalid_filters"),
+        ("filters:sharpen(3.4028236e38)", "invalid_filters"),
+        ("filters:gamma(-0)", "invalid_filters"),
+        ("filters:dpr(-0)", "invalid_filters"),
+        ("filters:contrast(inf)", "invalid_filters"),
+        ("filters:contrast(NaN)", "invalid_filters"),
+    ] {
+        assert_eq!(
+            canonical_or_code(&format!("{spelling}/{src}")),
+            Err(code),
+            "{spelling}"
+        );
+    }
+    // The smallest normal f32, in its shortest spelling, and
+    // the largest finite one, both inside their bounds.
+    assert!(canonical_or_code(&format!("filters:blur(1.1754944e-38)/{src}")).is_ok());
+    assert!(canonical_or_code(&format!("filters:sharpen(3.4028235e38)/{src}")).is_ok());
+}
+
+/// A percent escape in a filter argument is `%` and two ASCII
+/// hex digits, and a text color is hex digits only (issue
+/// #712): Rust's integer parser also reads a `+` there, so
+/// `%+1` decoded to U+0001 and `+fffff` read as a color. A
+/// root path keeps its own reading, unchanged.
+#[test]
+fn escapes_and_colors_take_hex_digits_only() {
+    let src = "https://example.com/a.jpg";
+    for (accepted, canonical) in [
+        (
+            "filters:text(%01Hi,12,ffffff,center)",
+            "filters:text(%01Hi,12,ffffffff,center)",
+        ),
+        (
+            "filters:text(%e2%9c%93,12,FFFFFF,center)",
+            "filters:text(%E2%9C%93,12,ffffffff,center)",
+        ),
+        (
+            "filters:text(Hi,12,0fffff,center)",
+            "filters:text(Hi,12,0fffffff,center)",
+        ),
+        ("filters:blurclass(%09person)", "filters:blurclass(person)"),
+        (
+            "crop:10x10:objects(%09person)",
+            "crop:10x10:objects(person):1",
+        ),
+    ] {
+        assert_eq!(
+            canonical_or_code(&format!("{accepted}/{src}")),
+            Ok(format!("{canonical}/{src}")),
+            "{accepted}"
+        );
+    }
+    for refused in [
+        "filters:text(%+1Hi,12,ffffff,center)",
+        "filters:text(%+AHi,12,ffffff,center)",
+        "filters:text(Hi%+,12,ffffff,center)",
+        "filters:text(Hi,12,+fffff,center)",
+        "filters:text(Hi,12,+fffffff,center)",
+        "filters:text(Hi,12,-fffff,center)",
+        "filters:blurclass(%+9person)",
+        "filters:recolorclass(%+9person,ff0000)",
+        "filters:watermark(%+1a.png,0,0,50)",
+        "filters:overlay(%+1a.png,0,0,50,normal)",
+    ] {
+        assert_eq!(
+            canonical_or_code(&format!("{refused}/{src}")),
+            Err("invalid_filters"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        canonical_or_code(&format!("crop:10x10:objects(%+9person)/{src}")),
+        Err("invalid_crop")
+    );
+    // A root path's escapes are read for the climb check only,
+    // and a path that expanded before still does, as written.
+    let map = root_map();
+    let (expanded, _) = expand_source_root("root:photos/a%+1b.jpg", &map).unwrap();
+    assert_eq!(expanded, "https://cdn.example.com/photos/a%+1b.jpg");
+    assert!(expand_source_root("root:photos/a%zzb.jpg", &map).is_err());
+}
+
+/// An upload's `exp:` takes the image grammar's digits
+/// (issue #712): `u64::from_str` alone also read a leading
+/// `+`. Leading zeros stay digits.
+#[test]
+fn upload_expiries_take_ascii_digits() {
+    assert_eq!(
+        split_upload_remainder("exp:09999999999/cat.jpg").unwrap(),
+        (Some(9_999_999_999), "cat.jpg")
+    );
+    for bad in ["exp:+9999999999/cat.jpg", "exp:+0/cat.jpg", "exp:+/cat.jpg"] {
+        assert_eq!(
+            split_upload_remainder(bad).unwrap_err().code(),
+            "invalid_expiry",
+            "{bad}"
+        );
+    }
+    // The image grammar reads the same digits the same way.
+    for (ts, ok) in [("09999999999", true), ("+9999999999", false), ("", false)] {
+        let remainder = format!("exp:{ts}/300x200/a.jpg");
+        assert_eq!(parse_operations(&remainder).is_ok(), ok, "{remainder}");
+    }
+}
+
+/// The cache entry key is the HMAC of its label under the
+/// secret (issue #190), derived by the server itself since the
+/// client crate no longer exports it (issue #712). The value is
+/// pinned: a different key would turn every stored entry into a
+/// miss. Its label is reserved, so no signer computes it.
+#[test]
+fn the_entry_key_is_the_hmac_of_its_label() {
+    assert_eq!(
+        hex::encode(entry_key(b"test-secret")),
+        "682ca9e96a91d206ee5cbd2e587972bb3a7f40ba4226a8f28e541884075652e8"
+    );
+    assert!(crabcrop_url::is_reserved_remainder(ENTRY_KEY_LABEL));
+    assert!(crabcrop_url::sign(b"test-secret", ENTRY_KEY_LABEL).is_err());
+    let secret = b"test-secret";
+    let entry = entry_key(secret);
+    for other in [
+        purge_key(secret),
+        purge_group_key(secret),
+        upload_key(secret),
+        crabcrop_url::seal_key(secret),
+        secret.to_vec(),
+    ] {
+        assert_ne!(entry, other);
     }
 }

@@ -15,10 +15,10 @@
     "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "type": "module",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   },
   "main": "./dist/index.js",
   "bundleDependencies": [

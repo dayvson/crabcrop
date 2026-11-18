@@ -7,12 +7,12 @@
 # container at startup, not at first use.
 #
 # All downloads are checksum-pinned and verified before use
-# (audit PL-13): the ONNX Runtime tarball hash is checked
-# before extraction and the extracted library again after,
+# (audit PL-13): the ONNX Runtime package's hash is checked
+# before extraction and the extracted library's again after,
 # per architecture; the models are pinned at the ADD. The
 # model is a deployment artifact: it is never committed to
 # this repo. ONNX Runtime's LICENSE and its third-party
-# notices come from the same checked tarball and go beside
+# notices come from the same checked package and go beside
 # the base image's THIRD-PARTY-NOTICES.md (issue #682).
 #
 # The base is an explicit build argument so a build cannot
@@ -23,34 +23,39 @@ ARG BASE_IMAGE=crabcrop:latest
 
 # ONNX Runtime is downloaded and checked in a stage of its
 # own, so the runtime image needs no curl. The stage runs on
-# the build host's platform and fetches the target's
-# tarball. Its base is pinned like the runtime images'.
+# the build host's platform and takes the target's library
+# from the package. Its base is pinned like the runtime
+# images'.
 FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS onnxruntime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# ONNX Runtime publishes per-architecture tarballs; pick the
-# one matching the target platform and verify both hashes.
+# ONNX Runtime 1.31.0 comes from NuGet: its package,
+# Microsoft.ML.OnnxRuntime, carries the library for every
+# platform the release supports. Pick the target platform's
+# and verify both hashes, the package's before extraction and
+# the library's after. NuGet never replaces the package of a
+# published version. The libraries are, byte for byte, the
+# ones in the GitHub release tarballs this stage used to
+# fetch (issue #733): the library pins are the ones it
+# checked then.
 ARG TARGETARCH
 RUN set -eu; \
     case "$TARGETARCH" in \
-      amd64) ort_arch=x64; \
-             tgz_sha=cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57; \
+      amd64) rid=linux-x64; \
              so_sha=469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e ;; \
-      arm64) ort_arch=aarch64; \
-             tgz_sha=c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab; \
+      arm64) rid=linux-arm64; \
              so_sha=595c7f7a6775f5c7b3d567c3ed94c04f722092575abcc092560f5208a54daf99 ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-${ort_arch}-1.31.0.tgz" -o /tmp/ort.tgz; \
-    echo "$tgz_sha  /tmp/ort.tgz" | sha256sum -c -; \
-    tar -xzf /tmp/ort.tgz -C /tmp; \
+    curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.31.0/microsoft.ml.onnxruntime.1.31.0.nupkg" -o /tmp/ort.nupkg; \
+    echo "7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b  /tmp/ort.nupkg" | sha256sum -c -; \
     mkdir -p /opt/onnxruntime /opt/onnxruntime-notices; \
-    cp "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/lib/libonnxruntime.so.1.31.0" /opt/onnxruntime/libonnxruntime.so; \
+    unzip -p /tmp/ort.nupkg "runtimes/$rid/native/libonnxruntime.so" > /opt/onnxruntime/libonnxruntime.so; \
     echo "$so_sha  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c -; \
-    cp "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/LICENSE" "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/ThirdPartyNotices.txt" /opt/onnxruntime-notices/; \
-    rm -rf /tmp/ort.tgz "/tmp/onnxruntime-linux-${ort_arch}-1.31.0"
+    unzip -q /tmp/ort.nupkg LICENSE ThirdPartyNotices.txt -d /opt/onnxruntime-notices; \
+    rm /tmp/ort.nupkg
 
 FROM ${BASE_IMAGE}
 
@@ -75,6 +80,9 @@ RUN chmod 644 /models/u2netp.onnx /models/yunet.onnx
 # standardized than u2netp, so the operator layers their own:
 # COPY my-sr-model.onnx /models/sr.onnx
 # ENV CRABCROP_UPSCALE_MODEL=/models/sr.onnx
+
+# The base image's HEALTHCHECK applies unchanged: its 5-minute
+# start period covers the model preload (issue #715).
 
 # ONNX Runtime telemetry off unless an operator opts in.
 ENV ORT_DISABLE_TELEMETRY=1 \

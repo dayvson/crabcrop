@@ -12,7 +12,10 @@
 //! - At most `max_connections` connections are open at
 //!   once. At the cap the loop stops accepting, so a new
 //!   connection waits in the kernel's listen queue until
-//!   an open one closes.
+//!   an open one closes. With a per-client share set
+//!   (`per_client`, off by default), one client may hold at
+//!   most that many of them, and a connection past its share
+//!   is closed as soon as it is accepted.
 //! - The header timeout: a new connection must send its
 //!   first request head within it. On HTTP/1 each later
 //!   request head must also arrive within it, counted from
@@ -33,11 +36,17 @@
 //! connection that sends nothing, and it also runs while a
 //! keep-alive connection waits for its next request, which
 //! would make the idle bound the header bound.
+//!
+//! The loop also counts the requests in flight on all its
+//! connections ([`RequestsInFlight`]), so a shutdown that
+//! cuts requests off at its deadline can say how many.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -84,19 +93,105 @@ pub struct ConnectionLimits {
     pub idle_timeout: Duration,
     /// How many connections may be open at once.
     pub max_connections: usize,
+    /// How many of them one client may hold, or `None` for
+    /// no share: a client is an IPv4 address, or the /64 an
+    /// IPv6 address is in (see [`ClientKey`]). Behind a proxy
+    /// or a load balancer every connection comes from its
+    /// few addresses, so the share is for a server that
+    /// clients reach directly.
+    pub per_client: Option<usize>,
+}
+
+/// The listen queue of the sockets [`bind_listener`]
+/// makes itself: the one tokio's own bind gives an IPv4
+/// socket (mio's, which is the standard library's), so a
+/// connection past `max_connections` waits the same in
+/// either family.
+#[cfg(unix)]
+const LISTEN_BACKLOG: u32 = 128;
+
+/// Bind the server's listening socket at `address` (issue
+/// #715). An IPv4 address binds as it always has. An IPv6
+/// address is bound with `IPV6_V6ONLY` off, so `::` takes
+/// IPv4 connections too, as IPv4-mapped addresses, on every
+/// host: the default otherwise is the host's (on Linux
+/// `net.ipv6.bindv6only`, which a host can set to listen on
+/// IPv6 only). A host without IPv6 cannot make the socket,
+/// and the error says what to set instead.
+pub async fn bind_listener(address: SocketAddr) -> io::Result<TcpListener> {
+    #[cfg(unix)]
+    if address.is_ipv6() {
+        return bind_dual_stack(address);
+    }
+    TcpListener::bind(address).await
+}
+
+/// An IPv6 listening socket that takes IPv4 connections too.
+/// The other options are the ones tokio's own bind sets.
+#[cfg(unix)]
+fn bind_dual_stack(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v6().map_err(with_no_ipv6_hint)?;
+    socket.set_reuseaddr(true)?;
+    rustix::net::sockopt::set_ipv6_v6only(&socket, false)?;
+    socket.bind(address)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+
+/// An IPv6 socket that could not be made, with what to set
+/// instead when the reason is that the host has no IPv6
+/// (`EAFNOSUPPORT`). Any other failure, such as a full file
+/// table, says nothing about IPv6, and keeps its own message.
+#[cfg(unix)]
+fn with_no_ipv6_hint(e: io::Error) -> io::Error {
+    if rustix::io::Errno::from_io_error(&e) != Some(rustix::io::Errno::AFNOSUPPORT) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{e}; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+        ),
+    )
+}
+
+/// The requests in flight on every connection of one
+/// accept loop: each counts from its request head until its
+/// response body has been sent, or its handler or body is
+/// dropped unfinished. A shutdown that stops waiting at its
+/// deadline reads it to say how many it cut off (issue #715).
+#[derive(Clone, Debug, Default)]
+pub struct RequestsInFlight(Arc<AtomicUsize>);
+
+impl RequestsInFlight {
+    /// How many requests are in flight now.
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn started(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn ended(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Serve `router` on `listener` within `limits` until
 /// `stop` is cancelled. Then the listener closes, idle
 /// connections close, and this returns once the requests
 /// in flight have finished; the caller bounds that wait.
+/// `in_flight` counts the requests meanwhile.
 pub async fn serve_connections(
     listener: TcpListener,
     router: Router,
     limits: ConnectionLimits,
     stop: CancellationToken,
+    in_flight: RequestsInFlight,
 ) {
     let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let clients = limits.per_client.map(|share| Arc::new(Clients::new(share)));
+    let mut refusals = Refusals::default();
     let connections = TaskTracker::new();
     let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
     loop {
@@ -113,8 +208,8 @@ pub async fn serve_connections(
             () = stop.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
-        let stream = match accepted {
-            Ok((stream, _)) => stream,
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
             // The connection was reset before it was
             // accepted: take the next one.
             Err(e) if is_per_connection(&e) => continue,
@@ -130,18 +225,141 @@ pub async fn serve_connections(
                 }
             }
         };
-        connections.spawn(serve_connection(
+        // A client at its share: the connection closes here,
+        // unanswered, and its slot is free again.
+        let client = match &clients {
+            Some(clients) => match clients.admit(peer.ip()) {
+                Some(client) => Some(client),
+                None => {
+                    refusals.note(clients.share);
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let served = serve_connection(
             stream,
             router.clone(),
             Arc::clone(&builder),
             limits,
             stop.clone(),
             slot,
-        ));
+            in_flight.clone(),
+        );
+        connections.spawn(async move {
+            let _client = client;
+            served.await;
+        });
     }
     drop(listener);
     connections.close();
     connections.wait().await;
+}
+
+/// A client, as the per-client share counts it: an IPv4
+/// address, or the first 64 bits of an IPv6 one, since a
+/// host is usually given a whole /64 and can use any address
+/// in it. An IPv4 client that reaches a dual-stack listener
+/// as an IPv4-mapped address counts as its IPv4 address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ClientKey {
+    V4(std::net::Ipv4Addr),
+    V6(u64),
+}
+
+impl ClientKey {
+    fn of(ip: std::net::IpAddr) -> Self {
+        match ip.to_canonical() {
+            std::net::IpAddr::V4(v4) => ClientKey::V4(v4),
+            std::net::IpAddr::V6(v6) => ClientKey::V6((u128::from(v6) >> 64) as u64),
+        }
+    }
+}
+
+/// The connections each client holds, while the per-client
+/// share is on. A client with none has no entry, so the map
+/// holds at most one entry per open connection.
+struct Clients {
+    share: usize,
+    held: Mutex<std::collections::HashMap<ClientKey, usize>>,
+}
+
+impl Clients {
+    fn new(share: usize) -> Self {
+        Clients {
+            share,
+            held: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, std::collections::HashMap<ClientKey, usize>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A place for one more connection from `ip`, held until
+    /// it is dropped, or `None` when the client already holds
+    /// its share.
+    fn admit(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<ClientConnection> {
+        let key = ClientKey::of(ip);
+        let mut held = self.held();
+        let count = held.entry(key).or_insert(0);
+        if *count >= self.share {
+            return None;
+        }
+        *count += 1;
+        Some(ClientConnection {
+            clients: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+/// One connection's place in its client's share.
+struct ClientConnection {
+    clients: Arc<Clients>,
+    key: ClientKey,
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        let mut held = self.clients.held();
+        if let Some(count) = held.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// How often the accept loop says that it closed connections
+/// past a client's share: one line on stderr, with a count of
+/// the rest, at most this often. The line names no address.
+const REFUSAL_LINE_EVERY: Duration = Duration::from_secs(10);
+
+/// The connections closed past a client's share since the
+/// last line about them.
+#[derive(Default)]
+struct Refusals {
+    unreported: u64,
+    next_line: Option<Instant>,
+}
+
+impl Refusals {
+    fn note(&mut self, share: usize) {
+        self.unreported += 1;
+        let now = Instant::now();
+        if self.next_line.is_some_and(|at| now < at) {
+            return;
+        }
+        eprintln!(
+            "crabcrop: closed {} connection(s) from clients already holding {share} \
+             (CRABCROP_MAX_CONNECTIONS_PER_CLIENT)",
+            self.unreported
+        );
+        self.unreported = 0;
+        self.next_line = Some(now + REFUSAL_LINE_EVERY);
+    }
 }
 
 /// Whether an accept error concerns only the connection it
@@ -157,7 +375,7 @@ fn is_per_connection(e: &io::Error) -> bool {
 
 /// Serve one connection, holding its `slot`, until it ends,
 /// a timeout closes it, or `stop` asks it to finish its
-/// requests and close.
+/// requests and close. Its requests count in `in_flight`.
 async fn serve_connection(
     stream: TcpStream,
     router: Router,
@@ -165,9 +383,10 @@ async fn serve_connection(
     limits: ConnectionLimits,
     stop: CancellationToken,
     slot: OwnedSemaphorePermit,
+    in_flight: RequestsInFlight,
 ) {
     let _slot = slot;
-    let watch = Arc::new(Watch::new(limits));
+    let watch = Arc::new(Watch::new(limits, in_flight));
     let io = TokioIo::new(Watched {
         stream,
         watch: Arc::clone(&watch),
@@ -206,6 +425,9 @@ struct Watch {
     /// incomplete: the one change that can bring the deadline
     /// ahead of the time [`Watch::expired`] sleeps to.
     changed: Notify,
+    /// The loop's count, which this connection's requests
+    /// join while they run and while their bodies are sent.
+    in_flight: RequestsInFlight,
 }
 
 /// The shortest time [`Watch::expired`] sleeps before it
@@ -242,7 +464,7 @@ struct Activity {
 }
 
 impl Watch {
-    fn new(limits: ConnectionLimits) -> Self {
+    fn new(limits: ConnectionLimits, in_flight: RequestsInFlight) -> Self {
         let now = Instant::now();
         Watch {
             header_timeout: limits.header_timeout,
@@ -256,6 +478,7 @@ impl Watch {
                 last_active: now,
             }),
             changed: Notify::new(),
+            in_flight,
         }
     }
 
@@ -320,6 +543,7 @@ impl Watch {
         if version == Version::HTTP_2 {
             activity.http2 = true;
         }
+        self.in_flight.started();
         Running {
             watch: Some(Arc::clone(self)),
         }
@@ -409,6 +633,7 @@ impl Drop for Running {
             let mut activity = watch.activity();
             activity.handlers -= 1;
             activity.last_active = Instant::now();
+            watch.in_flight.ended();
         }
     }
 }
@@ -424,6 +649,7 @@ impl Drop for Sending {
             let mut activity = watch.activity();
             activity.bodies -= 1;
             activity.last_active = Instant::now();
+            watch.in_flight.ended();
         }
     }
 }

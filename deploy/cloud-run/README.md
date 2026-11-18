@@ -22,7 +22,7 @@ the wiring.
 Release images are published to GHCR as
 `ghcr.io/dayvson/crabcrop`, tagged with the release
 version. Replace the `REPLACE_ME` image in `service.yaml`
-with `ghcr.io/dayvson/crabcrop:0.13.0`, or with your own
+with `ghcr.io/dayvson/crabcrop:0.13.1`, or with your own
 build of the repo Dockerfile pushed to Artifact Registry.
 
 ## Prerequisites
@@ -57,7 +57,10 @@ gcloud run services set-iam-policy crabcrop policy.yaml  # or add --allow-unauth
 
 The service declares a startup probe on `/health` with
 room for the AI variant's model preload (30 tries at 2
-seconds) and a liveness probe on the same route. Put the
+seconds) and a liveness probe on the same route. A larger
+model set takes longer to load: raise `failureThreshold`
+(the Helm chart and the kustomize base allow 150 tries, 5
+minutes). Put the
 service behind your load balancer or CDN as you would for
 any origin; the main README's Deployment section explains
 why `/health` and `/metrics` should stay internal.

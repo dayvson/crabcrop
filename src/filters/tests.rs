@@ -2242,3 +2242,363 @@ fn redaction_blurs_stop_at_the_deadline() {
     assert!(blur_faces(&img, &[], past).is_ok());
     assert!(blur_detections(&img, &[], past).is_ok());
 }
+
+// Issue #713: the redactions keep the image's layout and
+// depth, `sharpen` and `huerotate` hold to amounts that mean
+// something, and the region blur scales with the region.
+
+/// A 48x40 image with detail everywhere, in each layout a
+/// redaction can be handed: 8-bit RGB and RGBA, gray, 16-bit
+/// RGB and RGBA, and float RGB and RGBA. The 16-bit and float
+/// samples use their low bits, so a trip through 8 bits shows.
+fn redaction_layouts() -> Vec<(&'static str, DynamicImage)> {
+    let (w, h) = (48, 40);
+    let level = |x: u32, y: u32, c: u32| ((x * 37 + y * 11 + c * 71 + (x * y) % 13) % 256) as u8;
+    let deep =
+        |x: u32, y: u32, c: u32| u16::from(level(x, y, c)) << 8 | u16::from(level(y, x, c + 3));
+    let alpha = |x: u32, y: u32| {
+        if (x / 5 + y / 3).is_multiple_of(3) {
+            255
+        } else {
+            200
+        }
+    };
+    vec![
+        (
+            "rgb8",
+            DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                Rgb([level(x, y, 0), level(x, y, 1), level(x, y, 2)])
+            })),
+        ),
+        (
+            "rgba8",
+            DynamicImage::ImageRgba8(image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([level(x, y, 0), level(x, y, 1), level(x, y, 2), alpha(x, y)])
+            })),
+        ),
+        (
+            "luma8",
+            DynamicImage::ImageLuma8(image::GrayImage::from_fn(w, h, |x, y| {
+                image::Luma([level(x, y, 0)])
+            })),
+        ),
+        (
+            "rgb16",
+            DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([deep(x, y, 0), deep(x, y, 1), deep(x, y, 2)])
+            })),
+        ),
+        (
+            "rgba16",
+            DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(w, h, |x, y| {
+                image::Rgba([
+                    deep(x, y, 0),
+                    deep(x, y, 1),
+                    deep(x, y, 2),
+                    u16::from(alpha(x, y)) * 257,
+                ])
+            })),
+        ),
+        (
+            "rgb32f",
+            DynamicImage::ImageRgb32F(image::ImageBuffer::from_fn(w, h, |x, y| {
+                let v = |c| f32::from(deep(x, y, c)) / 65535.0;
+                Rgb([v(0), v(1), v(2)])
+            })),
+        ),
+        (
+            "rgba32f",
+            DynamicImage::ImageRgba32F(image::ImageBuffer::from_fn(w, h, |x, y| {
+                let v = |c| f32::from(deep(x, y, c)) / 65535.0;
+                image::Rgba([v(0), v(1), v(2), f32::from(alpha(x, y)) / 255.0])
+            })),
+        ),
+    ]
+}
+
+type Redaction = (&'static str, Box<dyn Fn(&DynamicImage) -> DynamicImage>);
+
+/// Every redaction, on the box (8, 6, 24, 20): the region,
+/// face and class forms, rectangles and silhouettes (the
+/// left half of the box), and the class recolor.
+fn redactions() -> Vec<Redaction> {
+    let silhouette = || {
+        vec![MaskedDetection {
+            detection: detection(8, 6, 24, 20),
+            mask: image::GrayImage::from_fn(24, 20, |x, _| {
+                image::Luma([if x < 12 { 255 } else { 0 }])
+            }),
+        }]
+    };
+    let face = [face_box(8, 6, 24, 20)];
+    let boxes = || [detection(8, 6, 24, 20)];
+    vec![
+        (
+            "blur_region",
+            Box::new(|img| blur_region(img, 8, 6, 24, 20, None).unwrap()),
+        ),
+        (
+            "pixelate_region",
+            Box::new(|img| pixelate_region(img, 8, 6, 24, 20)),
+        ),
+        (
+            "blur_faces",
+            Box::new(move |img| blur_faces(img, &face, None).unwrap()),
+        ),
+        (
+            "pixelate_faces",
+            Box::new(move |img| pixelate_faces(img, &face)),
+        ),
+        (
+            "blur_detections",
+            Box::new(move |img| blur_detections(img, &boxes(), None).unwrap()),
+        ),
+        (
+            "pixelate_detections",
+            Box::new(move |img| pixelate_detections(img, &boxes())),
+        ),
+        (
+            "blur_detections_masked",
+            Box::new(move |img| blur_detections_masked(img, &silhouette(), None).unwrap()),
+        ),
+        (
+            "pixelate_detections_masked",
+            Box::new(move |img| pixelate_detections_masked(img, &silhouette())),
+        ),
+        (
+            "recolor_detections",
+            Box::new(move |img| recolor_detections(img, &boxes(), [250, 10, 90])),
+        ),
+        (
+            "recolor_detections_masked",
+            Box::new(move |img| recolor_detections_masked(img, &silhouette(), [250, 10, 90])),
+        ),
+    ]
+}
+
+/// Every sample of `img` as RGBA: at 16 bits for an integer
+/// layout, which every one widens to exactly, and as floats
+/// for a float one.
+fn samples(img: &DynamicImage) -> Vec<[f64; 4]> {
+    if matches!(
+        img,
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
+    ) {
+        img.to_rgba32f()
+            .pixels()
+            .map(|p| p.0.map(f64::from))
+            .collect()
+    } else {
+        img.to_rgba16()
+            .pixels()
+            .map(|p| p.0.map(f64::from))
+            .collect()
+    }
+}
+
+#[test]
+fn redactions_keep_the_layout_and_depth_of_the_image() {
+    // Issue #713: every redaction wrote its image back as
+    // 8-bit RGBA, so an opaque image gained an alpha channel
+    // and a 16-bit or float one lost its depth, all of it,
+    // not only the redacted box. Each now keeps the image's
+    // layout, and every sample outside the box is the one it
+    // had, at full depth. A recolor paints color, which a
+    // gray image cannot hold: it widens gray to RGB, at the
+    // same depth.
+    let inside = |x: u32, y: u32| (8..32).contains(&x) && (6..26).contains(&y);
+    let mut cases = 0;
+    for (layout, src) in redaction_layouts() {
+        for (name, redact) in redactions() {
+            let out = redact(&src);
+            let at = format!("{name} on {layout}");
+            let expected = match (name.starts_with("recolor"), src.color()) {
+                (true, image::ColorType::L8) => image::ColorType::Rgb8,
+                (_, color) => color,
+            };
+            assert_eq!(out.color(), expected, "{at}");
+            let (ours, theirs) = (samples(&out), samples(&src));
+            let mut moved = 0;
+            for (i, (p, q)) in ours.iter().zip(&theirs).enumerate() {
+                let (x, y) = (i as u32 % src.width(), i as u32 / src.width());
+                if inside(x, y) {
+                    moved += usize::from(p != q);
+                } else {
+                    assert_eq!(p, q, "{at}: ({x}, {y}) outside the box");
+                }
+            }
+            assert!(moved > 100, "{at}: {moved} pixels redacted");
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 7 * 10);
+}
+
+#[test]
+fn eight_bit_redactions_redact_to_the_colors_they_had() {
+    // Issue #713: an 8-bit RGB or gray image keeps its layout
+    // through a redaction now, and redacts to the colors the
+    // RGBA8 form always did: the redaction of the same pixels
+    // stored as RGBA8 under an opaque alpha, which the
+    // redactions handle as they always have. So a JPEG of a
+    // redacted opaque image, which drops alpha, is the file it
+    // was.
+    for (layout, src) in redaction_layouts().into_iter().take(3) {
+        if layout == "rgba8" {
+            continue;
+        }
+        let as_rgba = DynamicImage::ImageRgba8(src.to_rgba8());
+        for (name, redact) in redactions() {
+            assert_eq!(
+                redact(&src).to_rgba8(),
+                redact(&as_rgba).to_rgba8(),
+                "{name} on {layout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_redaction_with_nothing_in_frame_leaves_the_image_as_it_was() {
+    // Issue #713: faces and boxes clamped to nothing (off the
+    // frame, or empty) redact nothing, and the image comes
+    // back in its own layout, where the face forms used to
+    // hand back an RGBA8 copy.
+    let faces = [face_box(60, 60, 10, 10), face_box(4, 4, 0, 9)];
+    let boxes = [detection(60, 60, 10, 10), detection(4, 4, 9, 0)];
+    for (layout, src) in redaction_layouts() {
+        let outs = [
+            ("blur_faces", blur_faces(&src, &faces, None).unwrap()),
+            ("pixelate_faces", pixelate_faces(&src, &faces)),
+            (
+                "blur_detections",
+                blur_detections(&src, &boxes, None).unwrap(),
+            ),
+            ("pixelate_detections", pixelate_detections(&src, &boxes)),
+            (
+                "recolor_detections",
+                recolor_detections(&src, &boxes, [1, 2, 3]),
+            ),
+        ];
+        for (name, out) in outs {
+            assert_eq!(out, src, "{name} on {layout}");
+        }
+    }
+}
+
+#[test]
+fn sharpen_past_its_bound_renders_as_the_bound() {
+    // Issue #713: from 255 on, sharpening changes nothing:
+    // every sample that differs from its neighbors' mean by
+    // a level is already 0 or 255. Larger amounts used to
+    // turn flat areas to noise once the kernel's products
+    // left the range an f32 holds exactly, and 3e38
+    // overflowed it to an all-black image. They now render
+    // as 255, and 255 renders as it always did.
+    let src = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 48, |x, y| {
+        let flat = (x / 16 + y / 12) % 2 == 0;
+        let v = if flat {
+            120
+        } else {
+            ((x * 29 + y * 17) % 256) as u8
+        };
+        Rgb([v, v / 2 + 30, 255 - v])
+    }));
+    let sharpened = |a: f32| {
+        apply_filters(src.clone(), &[Filter::Sharpen(a)])
+            .0
+            .to_rgb8()
+    };
+    let bound = sharpened(MAX_SHARPEN_AMOUNT);
+    assert_eq!(MAX_SHARPEN_AMOUNT, 255.0);
+    for a in [
+        300.0,
+        300.3,
+        16_449.0,
+        20_000.0,
+        100_000.0,
+        1e8,
+        3e38,
+        f32::MAX,
+    ] {
+        assert_eq!(sharpened(a), bound, "sharpen({a})");
+    }
+    // Flat areas keep their level, and edges saturate.
+    assert_eq!(bound.get_pixel(5, 5).0, [120, 90, 135]);
+    assert!(
+        bound
+            .pixels()
+            .any(|p| p.0.contains(&0) || p.0.contains(&255))
+    );
+    // Below the bound the amount still matters.
+    assert_ne!(sharpened(10.0), sharpened(20.0));
+    assert_ne!(sharpened(254.0 / 2.0), bound);
+}
+
+#[test]
+fn huerotate_turns_by_the_angle_its_degrees_reduce_to() {
+    // Issue #713: the degrees are reduced modulo 360 before
+    // they become a float, so an angle past a turn renders as
+    // the angle it reduces to; converted whole, its rounding
+    // error reached the sine and cosine and moved pixels by a
+    // level here and there. The remainder keeps the sign, so
+    // angles from -359 to 359 render as they always did.
+    let rich = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |x, y| {
+        Rgb([(x * 4) as u8, (y * 4) as u8, ((x * 7 + y * 3) % 256) as u8])
+    }));
+    let deep = DynamicImage::ImageRgb16(rich.to_rgb16());
+    for img in [rich, deep] {
+        let turned = |d: i32| apply_filters(img.clone(), &[Filter::HueRotate(d)]).0;
+        for (degrees, reduced) in [
+            (450, 90),
+            (810, 90),
+            (-450, -90),
+            (360, 0),
+            (-720, 0),
+            (i32::MAX, 127),
+            (i32::MIN, -128),
+            (1_000_000_007, 1_000_000_007 % 360),
+        ] {
+            assert_eq!(
+                turned(degrees),
+                turned(reduced),
+                "{degrees} {:?}",
+                img.color()
+            );
+        }
+        for degrees in [-359, -90, 0, 1, 90, 359] {
+            let unreduced = match &img {
+                DynamicImage::ImageRgb8(i) => {
+                    let mut out = DynamicImage::ImageRgb8(i.clone());
+                    out = huerotate_fast(out, degrees);
+                    out
+                }
+                other => other.huerotate(degrees),
+            };
+            assert_eq!(turned(degrees), unreduced, "{degrees}");
+        }
+    }
+}
+
+#[test]
+fn the_region_blur_scales_with_the_region_at_every_size() {
+    // Issue #713: the sigma is an eighth of the region's
+    // shorter side, at least 1, as the face blur scales with
+    // the face. It stopped at 30, so a region of 240 px or
+    // more on its shorter side got no more blur than that.
+    assert_eq!(region_blur_sigma(4, 4), 1.0);
+    assert_eq!(region_blur_sigma(16, 100), 2.0);
+    assert_eq!(region_blur_sigma(240, 300), 30.0);
+    assert_eq!(region_blur_sigma(480, 300), 37.5);
+    assert_eq!(region_blur_sigma(3000, 2000), 250.0);
+    let src = DynamicImage::ImageRgb8(image::RgbImage::from_fn(300, 260, |x, y| {
+        let v = if (x / 7 + y / 9) % 2 == 0 { 20 } else { 230 };
+        Rgb([v, v, v])
+    }));
+    let out = blur_region(&src, 10, 0, 280, 256, None).unwrap().to_rgb8();
+    let region = src.crop_imm(10, 0, 280, 256);
+    let blurred = blur_fast(&region, 32.0).to_rgb8();
+    for (x, y, p) in blurred.enumerate_pixels() {
+        assert_eq!(out.get_pixel(x + 10, y), p, "({x}, {y})");
+    }
+}

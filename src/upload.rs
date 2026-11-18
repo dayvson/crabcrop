@@ -393,32 +393,199 @@ fn tmp_name() -> String {
 /// upload directory (audit R2-25): the name itself cannot
 /// traverse (it is validated), but a pre-existing
 /// directory component can be a symlink planted in the
-/// tree, and a write would follow it out. The parent is
-/// canonicalized after creation and must sit under the
-/// (canonicalized) upload root, mirroring the loader's
-/// read-side check in `load_file`.
+/// tree, and a write would follow it out. The check runs
+/// before anything is created: the deepest directory of
+/// the name that exists is canonicalized and must sit
+/// under the (canonicalized) upload root, mirroring the
+/// loader's read-side check in `load_file`. On Unix the
+/// directories and the file are then created relative to
+/// the root's descriptor, one component at a time and
+/// none of them followed if it is a symlink, so a
+/// component swapped after the check fails the write
+/// instead of redirecting it.
 fn put_local(
     dir: &std::path::Path,
     name: &str,
     bytes: &[u8],
     overwrite: bool,
 ) -> Result<(), UploadError> {
-    let target = dir.join(name);
-    let parent = target
-        .parent()
-        .ok_or_else(|| UploadError::Io("the upload path has no parent".to_string()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| UploadError::Io(format!("cannot create the upload directory: {e}")))?;
-    let root = std::fs::canonicalize(dir)
-        .map_err(|e| UploadError::Io(format!("cannot resolve the upload directory: {e}")))?;
-    let real_parent = std::fs::canonicalize(parent)
-        .map_err(|e| UploadError::Io(format!("cannot resolve the upload directory: {e}")))?;
-    if !real_parent.starts_with(&root) {
+    put_local_checked(dir, name, bytes, overwrite, || {})
+}
+
+/// [`put_local`], running `after_check` once the escape
+/// check has passed and before anything is created: the
+/// moment a change to the tree would have to land to
+/// redirect the write.
+fn put_local_checked(
+    dir: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+    overwrite: bool,
+    after_check: impl FnOnce(),
+) -> Result<(), UploadError> {
+    // A validated name has no empty, `.` or `..` segment.
+    let (parents, leaf) = match name.rsplit_once('/') {
+        Some((parents, leaf)) => (parents.split('/').collect::<Vec<_>>(), leaf),
+        None => (Vec::new(), name),
+    };
+    let inside = check_inside(dir, name, &parents)?;
+    after_check();
+    write_inside(&inside, &parents, leaf, bytes, overwrite)
+}
+
+/// Where the escape check found a name's directory: the
+/// canonical upload root, the canonical path below it of
+/// the deepest directory of the name that exists, and how
+/// many of the name's directories that covers.
+struct Inside {
+    root: PathBuf,
+    // Only the descriptor-relative write (Unix) walks these.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    beneath: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    existing: usize,
+}
+
+/// The escape check (audit R2-25), made before anything is
+/// created: the deepest of the name's directories that
+/// exists, its symlinks followed, must be the upload root
+/// or a directory under it.
+fn check_inside(
+    dir: &std::path::Path,
+    name: &str,
+    parents: &[&str],
+) -> Result<Inside, UploadError> {
+    let unresolved =
+        |e: std::io::Error| UploadError::Io(format!("cannot resolve the upload directory: {e}"));
+    let root = std::fs::canonicalize(dir).map_err(unresolved)?;
+    let mut deepest = dir.to_path_buf();
+    let mut existing = 0;
+    for segment in parents {
+        let next = deepest.join(segment);
+        match std::fs::symlink_metadata(&next) {
+            Ok(_) => {
+                deepest = next;
+                existing += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(unresolved(e)),
+        }
+    }
+    let real = std::fs::canonicalize(&deepest).map_err(unresolved)?;
+    let Ok(beneath) = real.strip_prefix(&root) else {
         return Err(UploadError::Io(format!(
             "the upload path for {name:?} escapes the upload directory"
         )));
+    };
+    Ok(Inside {
+        beneath: beneath.to_path_buf(),
+        root,
+        existing,
+    })
+}
+
+/// Create the name's missing directories and write the
+/// object, all relative to the upload root's descriptor
+/// (see [`put_local`]). The checked part of the tree is
+/// opened by its canonical path, which holds no symlink,
+/// and every component is opened without following one.
+#[cfg(unix)]
+fn write_inside(
+    inside: &Inside,
+    parents: &[&str],
+    leaf: &str,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<(), UploadError> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::io::Errno;
+    use std::io::Write as _;
+    let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let failed =
+        |what: &str, e: Errno| UploadError::Io(format!("{what}: {}", std::io::Error::from(e)));
+    let unresolved = |e| failed("cannot resolve the upload directory", e);
+    let mut at = rustix::fs::open(&inside.root, directory, Mode::empty()).map_err(unresolved)?;
+    for component in inside.beneath.components() {
+        at = rustix::fs::openat(&at, component.as_os_str(), directory, Mode::empty())
+            .map_err(unresolved)?;
     }
-    let tmp = target.with_file_name(tmp_name());
+    for segment in &parents[inside.existing..] {
+        let created = |e| failed("cannot create the upload directory", e);
+        match rustix::fs::mkdirat(&at, *segment, Mode::from_raw_mode(0o777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(created(e)),
+        }
+        at = rustix::fs::openat(&at, *segment, directory, Mode::empty()).map_err(created)?;
+    }
+    // A temp file of this name left by an earlier process
+    // (one with the same pid) is not reused: the next name
+    // is tried.
+    let (tmp, file) = {
+        let mut attempt = 0;
+        loop {
+            let tmp = tmp_name();
+            match rustix::fs::openat(
+                &at,
+                tmp.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o666),
+            ) {
+                Ok(file) => break (tmp, file),
+                Err(Errno::EXIST) if attempt < 8 => attempt += 1,
+                Err(e) => return Err(failed("cannot write the upload", e)),
+            }
+        }
+    };
+    let remove_tmp = || {
+        let _ = rustix::fs::unlinkat(&at, tmp.as_str(), AtFlags::empty());
+    };
+    if let Err(e) = std::fs::File::from(file).write_all(bytes) {
+        remove_tmp();
+        return Err(UploadError::Io(format!("cannot write the upload: {e}")));
+    }
+    if overwrite {
+        if rustix::fs::renameat(&at, tmp.as_str(), &at, leaf).is_err() {
+            remove_tmp();
+            return Err(UploadError::Io(
+                "cannot move the upload into place".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    let linked = rustix::fs::linkat(&at, tmp.as_str(), &at, leaf, AtFlags::empty());
+    remove_tmp();
+    match linked {
+        Ok(()) => Ok(()),
+        Err(Errno::EXIST) => Err(UploadError::AlreadyExists),
+        Err(e) => Err(failed("cannot move the upload into place", e)),
+    }
+}
+
+/// Elsewhere the write goes by path: the directories are
+/// created once the check has passed, and the parent is
+/// checked again before the file is written.
+#[cfg(not(unix))]
+fn write_inside(
+    inside: &Inside,
+    parents: &[&str],
+    leaf: &str,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<(), UploadError> {
+    let parent = parents
+        .iter()
+        .fold(inside.root.clone(), |path, segment| path.join(segment));
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| UploadError::Io(format!("cannot create the upload directory: {e}")))?;
+    let real_parent = std::fs::canonicalize(&parent)
+        .map_err(|e| UploadError::Io(format!("cannot resolve the upload directory: {e}")))?;
+    if !real_parent.starts_with(&inside.root) {
+        return Err(UploadError::Io(
+            "the upload path escapes the upload directory".to_string(),
+        ));
+    }
+    let target = parent.join(leaf);
+    let tmp = parent.join(tmp_name());
     std::fs::write(&tmp, bytes)
         .map_err(|e| UploadError::Io(format!("cannot write the upload: {e}")))?;
     if overwrite {
@@ -430,21 +597,14 @@ fn put_local(
         }
         return Ok(());
     }
-    match std::fs::hard_link(&tmp, &target) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&tmp);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(UploadError::AlreadyExists)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(UploadError::Io(format!(
-                "cannot move the upload into place: {e}"
-            )))
-        }
+    let linked = std::fs::hard_link(&tmp, &target);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(UploadError::AlreadyExists),
+        Err(e) => Err(UploadError::Io(format!(
+            "cannot move the upload into place: {e}"
+        ))),
     }
 }
 
@@ -568,6 +728,74 @@ mod tests {
         assert!(dir.join("plain/ok.jpg").exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_writes_create_nothing_before_the_escape_check() {
+        // The escape check runs before any directory is
+        // made: a name whose missing directories sit under a
+        // symlink out of the tree creates none of them on the
+        // other side.
+        let (_scratch, dir) = temp_dir("local-escape-first");
+        let (_outside_scratch, outside) = temp_dir("local-escape-first-outside");
+        std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
+        let store = UploadStore::local(dir.clone(), 1024, true);
+        let err = store.put("linked/new/deeper/evil.jpg", b"pixels").await;
+        assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
+        let err = store.put_new("linked/new/deeper/evil.jpg", b"pixels").await;
+        assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_writes_refuse_a_component_swapped_after_the_check() {
+        // A directory the check found inside the tree is
+        // swapped for a symlink out of it before the write:
+        // the write is refused, and nothing lands outside.
+        for overwrite in [true, false] {
+            let (_scratch, dir) = temp_dir("local-swap");
+            let (_outside_scratch, outside) = temp_dir("local-swap-outside");
+            std::fs::create_dir(dir.join("a")).unwrap();
+            let swap = || {
+                std::fs::rename(dir.join("a"), dir.join("a-moved")).unwrap();
+                std::os::unix::fs::symlink(&outside, dir.join("a")).unwrap();
+            };
+            let err = put_local_checked(&dir, "a/evil.jpg", b"pixels", overwrite, swap);
+            assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            // The same for a directory the write creates: one
+            // that appears as a symlink in its place is not
+            // followed either.
+            let swap = || std::os::unix::fs::symlink(&outside, dir.join("new")).unwrap();
+            let err = put_local_checked(&dir, "new/evil.jpg", b"pixels", overwrite, swap);
+            assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_writes_follow_a_symlink_that_stays_inside() {
+        // A symlink whose target is inside the tree passes
+        // the check, as before: the write lands at its target.
+        let (_scratch, dir) = temp_dir("local-inside-link");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("alias")).unwrap();
+        let store = UploadStore::local(dir.clone(), 1024, false);
+        store.put_new("alias/cat.jpg", b"pixels").await.unwrap();
+        store.put_new("alias/new/dog.jpg", b"pixels").await.unwrap();
+        assert_eq!(std::fs::read(dir.join("real/cat.jpg")).unwrap(), b"pixels");
+        assert_eq!(
+            std::fs::read(dir.join("real/new/dog.jpg")).unwrap(),
+            b"pixels"
+        );
+        let err = store.put_new("alias/cat.jpg", b"again").await;
+        assert!(matches!(err, Err(UploadError::AlreadyExists)), "{err:?}");
+        // A name whose directory is a file is refused.
+        let err = store.put("real/cat.jpg/x.jpg", b"pixels").await;
+        assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
     }
 
     #[test]

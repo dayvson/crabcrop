@@ -6,11 +6,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 mod disk_hang;
+mod disk_scan;
 mod disk_stall;
 mod meta_frame;
 mod request_log;
 mod shared_bounds;
 mod shared_state;
+mod upload_pace;
 
 const SECRET: &[u8] = b"test-secret";
 
@@ -254,7 +256,7 @@ fn providers_mut(state: &mut AppState) -> &mut Providers {
 fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
     AppState {
         allow_unsafe,
-        metrics_token,
+        metrics_token: metrics_token.map(Into::into),
         ..test_state()
     }
 }
@@ -2265,12 +2267,6 @@ fn engine_error_cases() -> Vec<(EngineError, StatusCode, &'static str, String)> 
             "image inference failed".to_string(),
         ),
         (
-            EngineError::Inference(crate::ai::AiError::LockPoisoned),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "inference_failed",
-            "image inference failed".to_string(),
-        ),
-        (
             EngineError::Render("a cause".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
             "render_failed",
@@ -3050,6 +3046,28 @@ fn load_spec(name: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap()
 }
 
+/// What the server answers a remainder with no presets, no
+/// default operations and no source roots, as far as the
+/// grammar decides it: the source it parses to, or the code it
+/// is refused with. The same refusals in the same order as
+/// [`resolve_request`] and the explain route: the reserved
+/// segments before the parse, the caps after it (issue #712).
+fn grammar_verdict(remainder: &str) -> Result<&str, &'static str> {
+    if crabcrop_url::is_reserved_remainder(remainder)
+        || matches!(
+            remainder.split('/').next(),
+            Some("purge" | "purge-group" | "upload")
+        )
+    {
+        return Err("reserved_segment");
+    }
+    let (ops, source, _, _) =
+        crate::url::parse_operations_with_expiry(remainder).map_err(|e| e.code())?;
+    crate::url::check_operation_count(&ops).map_err(|e| e.code())?;
+    crate::url::check_watermark_count(&ops).map_err(|e| e.code())?;
+    Ok(source)
+}
+
 #[test]
 fn differential_verdict_corpus_agrees_with_the_parser() {
     let doc = load_spec("explain-verdicts.json");
@@ -3058,8 +3076,8 @@ fn differential_verdict_corpus_agrees_with_the_parser() {
         let remainder = case["remainder"].as_str().unwrap();
         let expect_error = case["error"].as_bool().unwrap();
         let expect_source = case["source"].as_str().unwrap();
-        match crate::url::parse_operations_with_expiry(remainder) {
-            Ok((_, source, _, _)) => {
+        match grammar_verdict(remainder) {
+            Ok(source) => {
                 if expect_error {
                     bad.push(format!("{remainder}: corpus says error, parser accepts"));
                 } else if source != expect_source {
@@ -3068,12 +3086,9 @@ fn differential_verdict_corpus_agrees_with_the_parser() {
                     ));
                 }
             }
-            Err(e) => {
+            Err(code) => {
                 if !expect_error {
-                    bad.push(format!(
-                        "{remainder}: corpus says ok, parser errors {}",
-                        e.code()
-                    ));
+                    bad.push(format!("{remainder}: corpus says ok, parser errors {code}"));
                 }
             }
         }
@@ -6490,8 +6505,8 @@ fn compose_annotation_picks_the_clear_winner() {
 #[test]
 fn ai_error_classes_map_to_distinct_statuses() {
     // AP-16: a model that ran but produced unusable output
-    // is a 502; a runtime failure or a poisoned session
-    // lock stays a 500; the log line keeps the typed cause.
+    // is a 502; a runtime failure stays a 500; the log line
+    // keeps the typed cause.
     let status = |e: EngineError| engine_error_response(e, None).status();
     assert_eq!(
         status(EngineError::Inference(crate::ai::AiError::BadOutput(
@@ -6503,10 +6518,6 @@ fn ai_error_classes_map_to_distinct_statuses() {
         status(EngineError::Inference(crate::ai::AiError::Inference(
             "inference failed: boom".to_string()
         ))),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert_eq!(
-        status(EngineError::Inference(crate::ai::AiError::LockPoisoned)),
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
@@ -11515,7 +11526,7 @@ async fn slow_lane_overflow_waits_in_its_own_lane() {
 /// lane occupancy exposition can be read back.
 async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>) -> String {
     let state = AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         process_gate,
         slow_gate,
         ..test_state()
@@ -11571,7 +11582,7 @@ async fn metrics_expose_each_gates_occupancy() {
     // permits in use against their capacity the same way,
     // read live: holding permits by hand moves the gauges.
     let state = Arc::new(AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         ai_gate: Arc::new(Gate::new(3)),
         ..test_state()
     });
@@ -12549,7 +12560,7 @@ async fn spawn_app_with_upload_gate(
                 file_root: Some(dir.clone()),
                 ..Default::default()
             }),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         upload: Some(Arc::new(crate::upload::UploadStore::local(
             dir,
             max_bytes,
@@ -12568,6 +12579,63 @@ async fn spawn_app_with_upload_gate(
 
 fn upload_dir(tag: &str) -> crate::test_support::ScratchDir {
     crate::test_support::scratch_dir(&format!("srv-upload-{tag}"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fifo_file_source_answers_502_at_once() {
+    // Issue #708: a file source was opened with a plain open,
+    // which waits for a FIFO's writer, so a request for a FIFO
+    // under the root waited for the fetch timeout and left a
+    // blocking thread stuck in open(2) for good. It answers at
+    // once now, with the 502 a file under the root that cannot
+    // be read gets, a directory's.
+    let dir = crate::test_support::scratch_dir("srv-fifo-source");
+    let root = std::fs::canonicalize(&dir).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(root.join("pipe.png"))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success());
+    std::fs::create_dir(root.join("dir.png")).unwrap();
+    let base = spawn_state(AppState {
+        loader: Loader::with_defaults()
+            .unwrap()
+            .with_sources(crate::loader::SourceConfig {
+                file_root: Some(root.clone()),
+                ..Default::default()
+            }),
+        ..test_state()
+    })
+    .await;
+    for name in ["pipe.png", "dir.png"] {
+        let remainder = format!("30x20/file:///{name}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let fetch = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(3), fetch).await {
+            Ok(resp) => resp.unwrap(),
+            Err(_) => {
+                // Let a reader stuck in open(2) go, so the runtime
+                // can stop, then fail.
+                for _ in 0..2000 {
+                    use rustix::fs::{Mode, OFlags};
+                    drop(rustix::fs::open(
+                        root.join("pipe.png"),
+                        OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                panic!("{name}: the request waited on the file source");
+            }
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{name}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "source_fetch_failed", "{name}");
+    }
 }
 
 #[tokio::test]
@@ -15223,7 +15291,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     let disk = state.store.clone().unwrap();
@@ -17973,7 +18041,7 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     // it.
     let dir = crate::test_support::scratch_dir("metrics-one-buffer");
     let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     state.request_log = RequestLog::queued_to(crate::observe::FakeStdout::default());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
@@ -18100,7 +18168,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     let fake = crate::s3store::test_support::start_fake().await;
     fake.hold_puts.store(true, Ordering::SeqCst);
     let mut state = tier_test_state(None, &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let shared = state.shared_store.clone().unwrap();
     let base = serve_state(&state).await;
@@ -18707,7 +18775,7 @@ async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     state.shared_store = None;
     state.loader = loader;
     state.fallback = fallback;
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     serve_state(&state).await
 }

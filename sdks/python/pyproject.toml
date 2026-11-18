@@ -1,21 +1,32 @@
 [build-system]
-requires = ["setuptools>=61"]
+# The license expression below (PEP 639) needs setuptools 77 or newer.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "crabcrop-url"
-version = "0.13.0"
+version = "0.13.1"
 description = "Build and sign crabcrop image URLs"
-license = { text = "MIT" }
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Maxwell Dayvson Da Silva" }]
 keywords = ["image", "url", "signing", "hmac", "cdn", "crabcrop"]
+# One version classifier per minor release from requires-python on, to
+# the newest the suite has run on (tests/test_packaging.py checks that
+# the list starts at the floor and has no gap).
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Graphics",
     "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -31,3 +42,8 @@ Repository = "https://github.com/dayvson/crabcrop"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The PEP 561 marker: type checkers read the package's inline
+# annotations.
+[tool.setuptools.package-data]
+crabcrop_url = ["py.typed"]

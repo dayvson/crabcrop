@@ -27,13 +27,13 @@
 # result cache. The memory tier is 512 MB of the 2 GiB
 # limit, leaving the rest for decode and encode working
 # set; the disk tier holds 8 GiB on a 10 Gi volume. Health
-# probes (/health, liveness and readiness) are part of the
-# chart defaults and stay on.
+# probes (/health: startup, liveness and readiness) are part
+# of the chart defaults and stay on.
 
 # Pinned to the current release image. Bump with releases,
 # or set image.digest to pin the exact build.
 image:
-  tag: "0.13.0"
+  tag: "0.13.1"
 
 replicaCount: 1
 

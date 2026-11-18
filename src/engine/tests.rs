@@ -8707,6 +8707,109 @@ fn overlay_blend_honors_the_deadline() {
 }
 
 #[test]
+fn a_scaled_overlay_stops_at_the_deadline_while_it_scales() {
+    // A 500 px overlay at 100% of a 2000 px base lands whole,
+    // 2000x2000. Scaled in one call, it ran to the end before
+    // the deadline was looked at again; scaled a row at a
+    // time, it stops within a row of the deadline.
+    let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        2000,
+        2000,
+        image::Rgb([255, 0, 0]),
+    ));
+    let ov = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        500,
+        500,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 7]),
+    )));
+    let started = std::time::Instant::now();
+    let ctx = ProcessContext {
+        deadline: Some(started + std::time::Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let err = blend_overlay(
+        &ctx,
+        &base,
+        &ov,
+        0,
+        0,
+        100,
+        crate::url::BlendMode::Normal,
+        Some(100),
+    )
+    .unwrap_err();
+    assert!(matches!(err, EngineError::Timeout), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the scale ran {:?} past a 50 ms deadline",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_scaled_part_is_computed_a_row_at_a_time() {
+    // The callback runs once before each row of the part, and
+    // the first error ends the scale there.
+    let ov = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        30,
+        20,
+        image::Rgba([10, 20, 30, 40]),
+    ));
+    let size = overlay_scale::scaled_size((30, 20), 90);
+    assert_eq!(size, (90, 60));
+    let mut rows = 0;
+    let part = overlay_scale::scaled_part(&ov, size, (10, 5, 40, 12), || {
+        rows += 1;
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(part.dimensions(), (40, 12));
+    assert_eq!(rows, 12);
+    let mut rows = 0;
+    let stopped = overlay_scale::scaled_part(&ov, size, (0, 0, 90, 60), || {
+        rows += 1;
+        if rows == 3 { Err("deadline") } else { Ok(()) }
+    });
+    assert_eq!(stopped.unwrap_err(), "deadline");
+    assert_eq!(rows, 3);
+}
+
+#[test]
+fn a_scaled_row_that_reads_many_source_rows_checks_the_deadline_within_it() {
+    // Scaled down to one row, a tall overlay's every source
+    // row feeds that row: 64 columns of 65,536 rows, 4M
+    // samples. The check runs before the row and again for
+    // each further `CHECK_EVERY` samples (1M) it reads, so a
+    // row's work is bounded by the deadline too, and the
+    // pixels are still the crate's.
+    let (w, h) = (64, 1 << 16);
+    let ov = DynamicImage::ImageLuma8(image::GrayImage::from_fn(w, h, |x, y| {
+        image::Luma([((x * 31 + y * 7) % 256) as u8])
+    }));
+    assert_eq!(overlay_scale::CHECK_EVERY, 1 << 20);
+    let mut checks = 0;
+    let part = overlay_scale::scaled_part(&ov, (w, 1), (0, 0, w, 1), || {
+        checks += 1;
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(checks, 4);
+    let whole = ov
+        .resize_exact(w, 1, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    assert_eq!(part.as_raw(), whole.as_raw());
+    // An error from a check inside the row stops the scale
+    // there.
+    let mut checks = 0;
+    let stopped = overlay_scale::scaled_part(&ov, (w, 1), (0, 0, w, 1), || {
+        checks += 1;
+        if checks == 2 { Err("deadline") } else { Ok(()) }
+    });
+    assert_eq!(stopped.unwrap_err(), "deadline");
+    assert_eq!(checks, 2);
+}
+
+#[test]
 fn unresolved_overlay_is_an_error() {
     let engine = Engine;
     let err = engine
@@ -8808,7 +8911,8 @@ fn composite_walks_only_the_rows_that_land_on_the_base() {
     // it, so a large watermark placed off the canvas paid for
     // the whole walk. It walks only the rows and columns that
     // land on the base now. A top image off the canvas walks
-    // none and returns the base as it was, in RGBA as before.
+    // none and returns the base as it was, in its own layout
+    // (issue #713), where it used to come back as RGBA.
     let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
         20,
         10,
@@ -8845,7 +8949,7 @@ fn composite_walks_only_the_rows_that_land_on_the_base() {
     for at in off_canvas {
         let (rows, out) = walk(at);
         assert_eq!(rows, 0, "rows walked at {at:?}");
-        assert_eq!(out, DynamicImage::ImageRgba8(base.to_rgba8()), "{at:?}");
+        assert_eq!(out, base, "{at:?}");
     }
     // Partly on the canvas, only the rows that land are
     // walked: a negative y anchors the top's bottom edge
@@ -8918,7 +9022,10 @@ fn composite_matches_the_composite_before_issue_604() {
     // old loop at every offset that puts the top image
     // inside, across an edge, and past each edge of the base,
     // for bases with and without alpha, tops smaller and
-    // larger than the base, and every blend mode.
+    // larger than the base, and every blend mode. A top image
+    // that lands nowhere leaves the base as it was, in its own
+    // layout, where the old loop converted it to RGBA (issue
+    // #713).
     use crate::url::BlendMode;
     let bases = [
         DynamicImage::ImageRgb8(image::RgbImage::from_fn(13, 9, |x, y| {
@@ -8972,6 +9079,8 @@ fn composite_matches_the_composite_before_issue_604() {
                 for (alpha, mode) in looks {
                     let blend = |b, o| blend_channel(mode, b, o);
                     let Ok(want) = composite_before_604(base, top, at, alpha, no_check, blend);
+                    let lands = landing((base.width(), base.height()), top.dimensions(), at);
+                    let want = if lands.is_some() { want } else { base.clone() };
                     let Ok(got) = composite(base, top, at, alpha, no_check, blend);
                     assert!(
                         got == want,
@@ -9214,10 +9323,12 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
     // now, from a copy of that part when the image is not
     // RGBA (issue #604). They must still write the old bytes:
     // those of the old loop over the whole image converted to
-    // RGBA. Checked for each kind of pixel, at offsets inside,
-    // across and past each edge, with one image kept across
-    // all the offsets as a request keeps it, with a fresh one
-    // each time, and through `overlay(...,width)`.
+    // RGBA, except where nothing lands, which leaves the base
+    // as it was (issue #713). Checked for each kind of pixel,
+    // at offsets inside, across and past each edge, with one
+    // image kept across all the offsets as a request keeps
+    // it, with a fresh one each time, and through
+    // `overlay(...,width)`.
     use crate::url::BlendMode;
     let ctx = ProcessContext::default();
     let bases = [
@@ -9267,8 +9378,14 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
             for x in -16..=16 {
                 for y in -16..=16 {
                     let at = format!("{:?} on {:?} at ({x}, {y})", top.color(), base.color());
+                    let dims = (base.width(), base.height());
+                    let lands = |top: (u32, u32)| landing(dims, top, (x, y)).is_some();
+                    let unless_off = |want: DynamicImage, top| {
+                        if lands(top) { want } else { base.clone() }
+                    };
                     let Ok(want) =
                         composite_before_604(base, &rgba, (x, y), 70, no_check, |_, o| o);
+                    let want = unless_off(want, rgba.dimensions());
                     assert_eq!(
                         overlay_watermark(&ctx, base, &kept, x, y, 70).unwrap(),
                         want,
@@ -9282,11 +9399,13 @@ fn watermark_and_overlay_draw_what_they_drew_before_issue_604() {
                     );
                     let overlay = |b, o| blend_channel(BlendMode::Overlay, b, o);
                     let Ok(want) = composite_before_604(base, &rgba, (x, y), 55, no_check, overlay);
+                    let want = unless_off(want, rgba.dimensions());
                     let got = blend_overlay(&ctx, base, &kept, x, y, 55, BlendMode::Overlay, None);
                     assert_eq!(got.unwrap(), want, "{at}");
                     let screen = |b, o| blend_channel(BlendMode::Screen, b, o);
                     let Ok(want) =
                         composite_before_604(base, &scaled, (x, y), 90, no_check, screen);
+                    let want = unless_off(want, scaled.dimensions());
                     let got =
                         blend_overlay(&ctx, base, &kept, x, y, 90, BlendMode::Screen, Some(150));
                     assert_eq!(got.unwrap(), want, "{at}, scaled");
@@ -12924,4 +13043,78 @@ fn quality_in_force_resolves_each_form() {
         in_force(Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
     );
     assert_eq!(quality_in_force(None, false, never), in_force(None, None));
+}
+
+/// The parser now reads a negative zero as zero (issue #712).
+/// Each value it used to keep as `-0.0` renders the same bytes
+/// as `0.0`, so a URL that spells `-0` serves what it served
+/// before, now under the cache key of its `0` spelling: every
+/// float filter argument whose range holds zero, and the focal
+/// point a crop centers on.
+#[test]
+fn negative_zero_arguments_render_as_zero() {
+    fn chain(filter: Filter) -> Vec<Operation> {
+        vec![Operation::Filters(vec![
+            filter,
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+        ])]
+    }
+    fn focal(x: f32, y: f32) -> Vec<Operation> {
+        vec![
+            Operation::FocalPoint { x, y, zoom: 1.0 },
+            Operation::Crop {
+                size: ImageSize {
+                    width: Dimension::Pixels(60),
+                    height: Dimension::Pixels(100),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                align: Align::Center,
+            },
+        ]
+    }
+    type Build = fn(f32) -> Vec<Operation>;
+    let builds: [(&str, Build); 9] = [
+        ("contrast", |v| chain(Filter::Contrast(v))),
+        ("exposure", |v| chain(Filter::Exposure(v))),
+        ("highlights", |v| chain(Filter::HighlightsShadows(v, 30.0))),
+        ("shadows", |v| chain(Filter::HighlightsShadows(-30.0, v))),
+        ("both", |v| chain(Filter::HighlightsShadows(v, v))),
+        ("saturation", |v| chain(Filter::Saturation(v))),
+        ("vibrance", |v| chain(Filter::Vibrance(v))),
+        ("facepad", |v| chain(Filter::FacePad(v))),
+        ("focalpoint", |v| focal(v, v)),
+    ];
+    let engine = Engine;
+    for source in [photo_like_png(), gradient_png()] {
+        for (name, build) in builds {
+            let render = |v: f32| engine.process(&source, &build(v)).unwrap().bytes;
+            assert_eq!(render(-0.0), render(0.0), "{name}");
+        }
+        let point = |x: f32, y: f32| engine.process(&source, &focal(x, y)).unwrap().bytes;
+        assert_eq!(point(-0.0, 0.5), point(0.0, 0.5), "focalpoint x");
+        assert_eq!(point(0.5, -0.0), point(0.5, 0.0), "focalpoint y");
+    }
+    // The face crop's padding, which `facepad` sets, frames the
+    // same window at either zero.
+    let canvas = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 120, |x, y| {
+        image::Rgb([(x % 251) as u8, (y * 2 % 251) as u8, ((x + y) % 251) as u8])
+    }));
+    let face = crate::ai::FaceBox {
+        x: 70,
+        y: 30,
+        w: 40,
+        h: 40,
+        score: 0.9,
+    };
+    let crop = |padding: f32| {
+        png_bytes(&crate::crop::crop_around_face(
+            canvas.clone(),
+            3,
+            2,
+            &face,
+            padding,
+        ))
+    };
+    assert_eq!(crop(-0.0), crop(0.0));
 }

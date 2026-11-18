@@ -1145,8 +1145,17 @@ fn the_secret_docs_describe_routes_that_work() {
 const DOCKERFILES: [&str; 3] = ["Dockerfile", "Dockerfile.release", "Dockerfile.ai"];
 
 /// The images' health check: the binary probes its own
-/// server, so the image needs no HTTP client.
-const HEALTHCHECK: &str = r#"HEALTHCHECK --interval=30s --timeout=3s CMD ["crabcrop", "health"]"#;
+/// server, so the image needs no HTTP client. Misses in the
+/// first [`BOOT_BUDGET_SECS`], while the server boots, do
+/// not count (issue #715).
+const HEALTHCHECK: &str =
+    r#"HEALTHCHECK --interval=30s --timeout=3s --start-period=300s CMD ["crabcrop", "health"]"#;
+
+/// How long the recipes let the server boot before they
+/// restart it or count it unhealthy (issue #715): the
+/// Kubernetes startup probe's tries times its period, and
+/// the images' health check start period.
+const BOOT_BUDGET_SECS: u64 = 300;
 
 #[test]
 fn the_source_image_installs_what_the_build_needs() {
@@ -1227,8 +1236,9 @@ fn runtime_images_carry_no_curl() {
     );
 
     // The AI image keeps the base image's check. ONNX Runtime
-    // comes from a download stage that checks both hashes;
-    // the runtime stage copies the library and its notices.
+    // comes from a download stage that checks both hashes,
+    // the package's and the library's; the runtime stage
+    // copies the library and its notices.
     let ai = stages(&read("Dockerfile.ai"));
     let [download, runtime] = &ai[..] else {
         panic!("Dockerfile.ai: a download stage, then the runtime stage: {ai:#?}");
@@ -1241,7 +1251,7 @@ fn runtime_images_carry_no_curl() {
     assert_eq!(
         fetch.matches("sha256sum -c").count(),
         2,
-        "Dockerfile.ai: the tarball and the library are both checked: {fetch}"
+        "Dockerfile.ai: the package and the library are both checked: {fetch}"
     );
     assert!(
         runtime
@@ -1275,8 +1285,9 @@ fn images_carry_the_third_party_notices() {
     // code its binary contains, with crabcrop's own license,
     // where Debian keeps a package's. The AI image adds ONNX
     // Runtime's license and its own third-party notices,
-    // copied from the tarball its download stage checks, which
-    // THIRD-PARTY-NOTICES.md tells the reader to look for.
+    // extracted from the package its download stage checks
+    // (issue #733), which THIRD-PARTY-NOTICES.md tells the
+    // reader to look for.
     const COPY: &str = "COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/crabcrop/";
     for rel in ["Dockerfile", "Dockerfile.release"] {
         let stage = final_stage(&read(rel));
@@ -1293,13 +1304,13 @@ fn images_carry_the_third_party_notices() {
         .iter()
         .find(|i| i.contains("curl -fsSL "))
         .expect("Dockerfile.ai: the download stage fetches ONNX Runtime");
-    for file in ["LICENSE", "ThirdPartyNotices.txt"] {
-        let copied = format!("-1.31.0/{file}\"");
-        assert!(
-            fetch.contains(&copied) && fetch.contains("/opt/onnxruntime-notices/;"),
-            "Dockerfile.ai: the download stage copies the tarball's {file} to /opt/onnxruntime-notices/: {fetch}"
-        );
-    }
+    assert!(
+        fetch.contains(
+            "unzip -q /tmp/ort.nupkg LICENSE ThirdPartyNotices.txt -d /opt/onnxruntime-notices;"
+        ),
+        "Dockerfile.ai: the download stage extracts the package's LICENSE and ThirdPartyNotices.txt to \
+         /opt/onnxruntime-notices: {fetch}"
+    );
     let notices = "/usr/share/doc/crabcrop/onnxruntime";
     assert!(
         runtime
@@ -1310,6 +1321,34 @@ fn images_carry_the_third_party_notices() {
     assert!(
         read("THIRD-PARTY-NOTICES.md").contains(&format!("`{notices}/ThirdPartyNotices.txt`")),
         "THIRD-PARTY-NOTICES.md: points the reader at ONNX Runtime's notices in the AI image"
+    );
+}
+
+#[test]
+fn the_ai_gate_runs_the_library_the_ai_image_ships() {
+    // The release waits for the real-model AI tests, which load
+    // the x64 ONNX Runtime library the AI workflow downloads and
+    // checks. That must be the library the amd64 AI image
+    // installs, byte for byte, whichever download each takes it
+    // from (issue #733): the gate's pin is the image's.
+    let ai = read("Dockerfile.ai");
+    let amd64 = ai
+        .split("amd64) ")
+        .nth(1)
+        .expect("Dockerfile.ai: the download stage has an amd64 case");
+    let pin = amd64
+        .split("so_sha=")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .expect("Dockerfile.ai: the amd64 case pins the library");
+    assert!(
+        pin.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Dockerfile.ai: the amd64 library pin is a SHA-256: {pin}"
+    );
+    let gate = read(".github/workflows/ai-models.yml");
+    assert!(
+        gate.contains(&format!("{pin}  libonnxruntime.so")),
+        ".github/workflows/ai-models.yml: checks libonnxruntime.so against Dockerfile.ai's amd64 pin {pin}"
     );
 }
 
@@ -1607,6 +1646,129 @@ fn kubernetes_recipes_request_modest_resources() {
             "values-production.yaml: resources.{path}"
         );
     }
+}
+
+/// The startup probe of a container's spec, from the line
+/// `startupProbe:` at `indent`, keys at column 0.
+fn startup_probe(text: &str, indent: usize, rel: &str) -> String {
+    dedent(
+        &yaml_block(text, indent, "startupProbe")
+            .unwrap_or_else(|| panic!("{rel}: the container has a startupProbe")),
+    )
+}
+
+#[test]
+fn recipes_let_a_slow_boot_finish_before_a_restart() {
+    // Issue #715: the server binds its port before the AI
+    // preload and answers nothing, /health included, until
+    // boot is done. The Kubernetes recipes had liveness and
+    // readiness probes only, so a pod whose preload ran past
+    // about a minute (three misses 20 s apart, the first at
+    // the kubelet's first tick from 5 s on, 45 to 65 s in
+    // all) was restarted before it served, and the images'
+    // health check counted its misses from the start. Now a
+    // startup probe holds the other two until /health first
+    // answers, and the health check has a start period, of
+    // one budget.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    let number = |path: &str| -> u64 {
+        yaml_scalar(&values, path)
+            .unwrap_or_else(|| panic!("values.yaml: {path}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("values.yaml: {path}: {e}"))
+    };
+    let period = number("startupProbe.periodSeconds");
+    let tries = number("startupProbe.failureThreshold");
+    assert_eq!(period * tries, BOOT_BUDGET_SECS, "values.yaml: the budget");
+
+    // The template probes /health with those numbers, and
+    // the same defaults for values an upgrade with
+    // --reuse-values keeps, which lack them.
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let lines: Vec<&str> = deployment.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim() == "startupProbe:")
+        .expect("deployment.yaml: a startupProbe");
+    assert_eq!(
+        template_depth(&lines, at),
+        0,
+        "deployment.yaml: the startupProbe renders whatever the values"
+    );
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let liveness = lines
+        .iter()
+        .position(|l| l.trim() == "livenessProbe:")
+        .expect("deployment.yaml: a livenessProbe");
+    assert_eq!(
+        depth(lines[at]),
+        depth(lines[liveness]),
+        "deployment.yaml: the startupProbe sits beside the liveness probe"
+    );
+    let probe = startup_probe(&deployment, depth(lines[at]), "deployment.yaml");
+    for (path, want) in [
+        ("httpGet.path", "/health".to_string()),
+        ("httpGet.port", "http".to_string()),
+        (
+            "periodSeconds",
+            format!("{{{{ (.Values.startupProbe).periodSeconds | default {period} }}}}"),
+        ),
+        (
+            "failureThreshold",
+            format!("{{{{ (.Values.startupProbe).failureThreshold | default {tries} }}}}"),
+        ),
+    ] {
+        assert_eq!(
+            yaml_scalar(&probe, path).as_deref(),
+            Some(want.as_str()),
+            "deployment.yaml: startupProbe.{path}"
+        );
+    }
+
+    // The kustomize base has the same probe and numbers.
+    let base = read("deploy/kustomize/base/deployment.yaml");
+    let probe = startup_probe(&base, 10, "kustomize base");
+    for (path, want) in [
+        ("httpGet.path", "/health".to_string()),
+        ("httpGet.port", "http".to_string()),
+        ("periodSeconds", period.to_string()),
+        ("failureThreshold", tries.to_string()),
+    ] {
+        assert_eq!(
+            yaml_scalar(&probe, path).as_deref(),
+            Some(want.as_str()),
+            "kustomize base: startupProbe.{path}"
+        );
+    }
+
+    // Cloud Run's service had one already: the same route,
+    // tried as often.
+    let cloud_run = read("deploy/cloud-run/service.yaml");
+    let probe = startup_probe(&cloud_run, 10, "cloud-run/service.yaml");
+    assert_eq!(
+        yaml_scalar(&probe, "httpGet.path").as_deref(),
+        Some("/health")
+    );
+    assert_eq!(
+        yaml_scalar(&probe, "periodSeconds").as_deref(),
+        Some(period.to_string().as_str()),
+        "cloud-run/service.yaml: the chart's period"
+    );
+
+    // The images' health check starts counting at the same
+    // budget, and the AI image inherits it (see
+    // `runtime_images_carry_no_curl`).
+    for rel in ["Dockerfile", "Dockerfile.release"] {
+        let checks: Vec<String> = final_stage(&read(rel))
+            .into_iter()
+            .filter(|i| i.starts_with("HEALTHCHECK"))
+            .collect();
+        assert_eq!(checks, [HEALTHCHECK], "{rel}");
+    }
+    assert!(
+        HEALTHCHECK.contains(&format!(" --start-period={BOOT_BUDGET_SECS}s ")),
+        "{HEALTHCHECK}"
+    );
 }
 
 /// The ranges the optional NetworkPolicy keeps the pod from

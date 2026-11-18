@@ -349,7 +349,8 @@ pub struct S3Store {
     /// bucket by anyone without the secret is a miss.
     /// Inert for the raw-object path (`put_raw`/`get_raw`
     /// store uploads verbatim, with no entry framing).
-    entry_key: Vec<u8>,
+    /// Zeroed when the store is dropped.
+    entry_key: zeroize::Zeroizing<Vec<u8>>,
     /// Largest object an entry read will buffer. Objects in
     /// the shared bucket are operator-adjacent data, not
     /// fully trusted input: a planted oversized object must
@@ -475,7 +476,7 @@ impl S3Store {
             endpoint,
             region,
             creds,
-            entry_key,
+            entry_key: zeroize::Zeroizing::new(entry_key),
             tombstones: std::sync::Mutex::new(HashMap::new()),
             tombstones_unread: std::sync::atomic::AtomicU64::new(0),
             tombstones_listed_ms: std::sync::atomic::AtomicU64::new(0),
@@ -4431,7 +4432,7 @@ mod tests {
             .await
             .unwrap();
         let mut other_secret = store(&fake.endpoint);
-        other_secret.entry_key = crate::url::entry_key(b"another deployment");
+        other_secret.entry_key = crate::url::entry_key(b"another deployment").into();
         let planted = other_secret
             .put_tombstone(&tombstone_for("victim", cutoff, None), 2)
             .await

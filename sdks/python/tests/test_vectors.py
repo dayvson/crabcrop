@@ -18,6 +18,7 @@ from crabcrop_url import (  # noqa: E402
     purge_key,
     purge_group_signature,
     purge_signature,
+    seal,
     seal_url,
     seal_with_nonce,
     sign,
@@ -87,6 +88,7 @@ class TestVectors(unittest.TestCase):
             ]
             if what == "source":
                 calls.append(lambda: build_srcset(base, "s3cr3t", v["source"], [320]))
+                calls.append(lambda: build_srcset(base, "s3cr3t", v["source"], [320], key_id="k2"))
             for call in calls:
                 with self.subTest(description=v["description"]):
                     with self.assertRaises(ValueError) as caught:
@@ -367,6 +369,12 @@ class TestSealedVectors(unittest.TestCase):
                 self.assertEqual(unseal(v["secret"], v["token"]), v["remainder"])
                 with self.assertRaises(SealError):
                     unseal("wrong-secret", v["token"])
+                # `seal`, the TypeScript and Rust name (issue #716),
+                # draws a fresh nonce, so its token opens back to the
+                # vector's remainder rather than matching the token.
+                fresh = seal(v["secret"], v["remainder"], v.get("key_id"))
+                self.assertEqual(unseal(v["secret"], fresh), v["remainder"])
+                self.assertEqual(fresh.split(":", 1)[0] if ":" in fresh else None, v.get("key_id"))
 
     def test_round_trip_and_builders(self):
         remainder = "300x200/https://example.com/photo.jpg"

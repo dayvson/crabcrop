@@ -66,7 +66,11 @@ Settings resolve in this order, highest precedence first:
    name and attachment ID, for last-word adjustments.
 3. **The settings screen** (Settings > Crabcrop): base URL, mode,
    secret, size mapping, and the sizes toggle. A field set by a
-   constant is shown disabled, with the constant named.
+   constant is shown disabled, with the constant named. The screen
+   never shows the stored secret: once one is stored, its field
+   starts empty and says so. Save with the field empty to keep the
+   secret, type a new one to replace it, or tick **Remove the
+   stored secret** to clear it.
 
 Code wins over the admin screen on purpose: a deployment managed in
 `wp-config.php` cannot be silently repointed from the dashboard.

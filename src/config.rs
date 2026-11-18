@@ -198,7 +198,8 @@ impl std::error::Error for ConfigError {
 }
 
 /// A secret setting's value. `Debug` prints `[redacted]`
-/// (issue #455).
+/// (issue #455), and its bytes are zeroed when it is
+/// dropped.
 #[derive(Clone)]
 pub struct Secret(String);
 
@@ -207,6 +208,20 @@ impl Secret {
         &self.0
     }
 }
+
+impl zeroize::Zeroize for Secret {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Secret {}
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -610,7 +625,9 @@ impl Config {
     /// The boot line that names the request and source
     /// posture (issue #590): the request mode, the source
     /// allowlist's host count, and the private-address
-    /// check.
+    /// check, including whether listed hosts are exempt from
+    /// it (the default) or held to it
+    /// (`CRABCROP_CHECK_ALLOWED_SOURCES`).
     pub fn posture_line(&self) -> String {
         let mode = match (self.allow_unsafe, self.only_presets) {
             (false, false) => "signed",
@@ -623,10 +640,16 @@ impl Config {
             1 => "1 host".to_string(),
             n => format!("{n} hosts"),
         };
-        let check = if self.policy.block_private {
-            "on"
-        } else {
-            "off"
+        let listed = !self.policy.allowed_suffixes.is_empty();
+        let check = match (
+            self.policy.block_private,
+            listed,
+            self.policy.check_allowlisted,
+        ) {
+            (false, _, _) => "off",
+            (true, false, _) => "on",
+            (true, true, false) => "on, allowlisted hosts exempt",
+            (true, true, true) => "on, allowlisted hosts included",
         };
         format!(
             "request mode: {mode}; source allowlist: {allowlist}; private-address check: {check}"
@@ -638,8 +661,12 @@ impl Config {
     /// default comes from the open-file limit, so the line
     /// says what it came to.
     pub fn connections_line(&self) -> String {
+        let per_client = match self.connections.per_client {
+            Some(share) => format!(", at most {share} per client"),
+            None => String::new(),
+        };
         format!(
-            "connections: bind {}, at most {} open, header timeout {}s, idle timeout {}s",
+            "connections: bind {}, at most {} open{per_client}, header timeout {}s, idle timeout {}s",
             self.bind,
             self.connections.max_connections,
             self.connections.header_timeout.as_secs(),
@@ -898,7 +925,9 @@ pub fn check_bucket_policy(
 /// `CRABCROP_ALLOW_ANY_SOURCE` is the deliberate full
 /// opt-out: it switches the private-address check off
 /// entirely. A configured allowlist still applies either
-/// way.
+/// way. `CRABCROP_CHECK_ALLOWED_SOURCES` applies the check
+/// to allowlisted hosts too, which asks for a check the
+/// other two switch off, so it is refused with either.
 ///
 /// A set allowlist must name at least one host (issue
 /// #590). A value that normalizes to no entries (empty,
@@ -924,7 +953,27 @@ pub fn build_source_policy(
         get("CRABCROP_ALLOW_ANY_SOURCE"),
         false,
     )?;
-    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any);
+    let check_allowlisted = parse_bool_value(
+        "CRABCROP_CHECK_ALLOWED_SOURCES",
+        get("CRABCROP_CHECK_ALLOWED_SOURCES"),
+        false,
+    )?;
+    if check_allowlisted && (!block_private || allow_any) {
+        let off = if allow_any {
+            "CRABCROP_ALLOW_ANY_SOURCE"
+        } else {
+            "CRABCROP_BLOCK_PRIVATE_SOURCES"
+        };
+        return Err(ConfigError::conflict(
+            &["CRABCROP_CHECK_ALLOWED_SOURCES", off],
+            format!(
+                "CRABCROP_CHECK_ALLOWED_SOURCES applies the private-address check to \
+                 allowlisted hosts, but {off} switches the check off: set one of them"
+            ),
+        ));
+    }
+    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any)
+        .with_allowlisted_checked(check_allowlisted);
     if let Some(raw) = &raw
         && policy.allowed_suffixes.is_empty()
     {
@@ -1470,9 +1519,11 @@ const MAX_CONNECTIONS_LIMIT: usize = 1_000_000;
 /// (issue #607): `CRABCROP_HEADER_TIMEOUT_SECS`, 1 to 600
 /// like the other wall-clock limits;
 /// `CRABCROP_IDLE_TIMEOUT_SECS`, 1 to 86400, since an edge
-/// may pool connections for longer than 10 minutes; and
+/// may pool connections for longer than 10 minutes;
 /// `CRABCROP_MAX_CONNECTIONS`, 1 to a million, by default
-/// three quarters of the open-file limit.
+/// three quarters of the open-file limit; and
+/// `CRABCROP_MAX_CONNECTIONS_PER_CLIENT`, how many of those
+/// one client may hold, 0 (the default) for no share.
 pub fn connection_limits(
     get: &impl Fn(&str) -> Option<String>,
 ) -> Result<crate::server::ConnectionLimits, ConfigError> {
@@ -1514,10 +1565,25 @@ pub fn connection_limits(
             ),
         ));
     }
+    let per_client: usize = parse_env_value(
+        "CRABCROP_MAX_CONNECTIONS_PER_CLIENT",
+        get("CRABCROP_MAX_CONNECTIONS_PER_CLIENT"),
+        0,
+    )?;
+    if per_client > MAX_CONNECTIONS_LIMIT {
+        return Err(ConfigError::invalid(
+            "CRABCROP_MAX_CONNECTIONS_PER_CLIENT",
+            &get("CRABCROP_MAX_CONNECTIONS_PER_CLIENT").unwrap_or_default(),
+            format!(
+                "CRABCROP_MAX_CONNECTIONS_PER_CLIENT must be between 0 and {MAX_CONNECTIONS_LIMIT}, got {per_client}"
+            ),
+        ));
+    }
     Ok(crate::server::ConnectionLimits {
         header_timeout: std::time::Duration::from_secs(header),
         idle_timeout: std::time::Duration::from_secs(idle),
         max_connections,
+        per_client: (per_client > 0).then_some(per_client),
     })
 }
 
@@ -1565,6 +1631,20 @@ pub fn proxy_bypass_warning(
     if !policy.pins_hostnames() {
         return None;
     }
+    let (why, fix) = if policy.allowed_suffixes.is_empty() {
+        (
+            "with private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
+             CRABCROP_ALLOWED_SOURCES,",
+            "List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy",
+        )
+    } else {
+        (
+            "with CRABCROP_CHECK_ALLOWED_SOURCES on, the private-address check covers the \
+             allowlisted hosts too, and",
+            "Turn CRABCROP_CHECK_ALLOWED_SOURCES off to fetch the allowlisted hosts through \
+             the proxy",
+        )
+    };
     let set: Vec<&str> = PROXY_VARIABLES
         .iter()
         .filter_map(|pair| {
@@ -1578,12 +1658,9 @@ pub fn proxy_bypass_warning(
         return None;
     }
     Some(format!(
-        "a proxy is configured ({}), but source fetches bypass it: with private-address \
-         blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no CRABCROP_ALLOWED_SOURCES, \
-         each source host is pinned to the address the check validated and connected to \
-         directly, so under proxy-only egress those fetches fail. List the source hosts \
-         in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy \
-         (see docs/configuration.md)",
+        "a proxy is configured ({}), but source fetches bypass it: {why} each source host \
+         is pinned to the address the check validated and connected to directly, so under \
+         proxy-only egress those fetches fail. {fix} (see docs/configuration.md)",
         set.join(", ")
     ))
 }

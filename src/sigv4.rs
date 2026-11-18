@@ -14,6 +14,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,12 +24,29 @@ pub const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// A static credential pair (plus the optional session token).
+/// The secret key and the session token are zeroed when it is
+/// dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
 }
+
+impl Zeroize for Credentials {
+    fn zeroize(&mut self) {
+        self.secret_key.zeroize();
+        self.session_token.zeroize();
+    }
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Credentials {}
 
 impl std::fmt::Debug for Credentials {
     /// The access key ID prints, since it names the identity
@@ -190,13 +208,13 @@ pub fn authorization(creds: &Credentials, req: &SignRequest<'_>) -> String {
         sha256_hex(canonical_request.as_bytes())
     );
 
-    let k_date = hmac(
-        format!("AWS4{}", creds.secret_key).as_bytes(),
-        date.as_bytes(),
-    );
-    let k_region = hmac(&k_date, req.region.as_bytes());
-    let k_service = hmac(&k_region, req.service.as_bytes());
-    let k_signing = hmac(&k_service, b"aws4_request");
+    // The signing key and each key it is derived through are
+    // zeroed when they are dropped, like the secret key.
+    let k_secret = Zeroizing::new(format!("AWS4{}", creds.secret_key));
+    let k_date = Zeroizing::new(hmac(k_secret.as_bytes(), date.as_bytes()));
+    let k_region = Zeroizing::new(hmac(&k_date, req.region.as_bytes()));
+    let k_service = Zeroizing::new(hmac(&k_region, req.service.as_bytes()));
+    let k_signing = Zeroizing::new(hmac(&k_service, b"aws4_request"));
     let signature = hex::encode(hmac(&k_signing, string_to_sign.as_bytes()));
 
     format!(
@@ -208,6 +226,22 @@ pub fn authorization(creds: &Credentials, req: &SignRequest<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_zero_their_secrets() {
+        // What dropping a credential pair runs: the secret key
+        // and the session token are wiped, and the access key
+        // ID, which travels in every request, is kept.
+        let mut creds = Credentials {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: Some("session-token".to_string()),
+        };
+        creds.zeroize();
+        assert_eq!(creds.secret_key, "");
+        assert_eq!(creds.session_token, None);
+        assert_eq!(creds.access_key, "AKIDEXAMPLE");
+    }
 
     #[test]
     fn dates_format_in_utc() {
