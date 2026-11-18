@@ -229,6 +229,7 @@ class TestSurrogates(unittest.TestCase):
     def test_no_text_makes_the_verifier_raise(self):
         rng = random.Random(716)
         alphabet = ["a", "/", ":", "%", "x", "1", "é", "\U0001f600", chr(0xD800), chr(0xDBFF), chr(0xDC00), chr(0xDFFF), "\x00"]
+        raised = []
         for _ in range(500):
             text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(20)))
             remainder = f"300x200/{text}"
@@ -236,8 +237,11 @@ class TestSurrogates(unittest.TestCase):
             tag = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
             for url in (f"{BASE}/{tag}/{remainder}", f"{BASE}/k:{tag}/{remainder}", f"{BASE}/{tag}/{text}"):
                 for key in (secret, {"k": secret}, {"k": "s3cr3t", "j": secret}, {}):
-                    with self.subTest(url=ascii(url), key=ascii(key)):
+                    try:
                         self.assertIn(cc.verify_url_signature(key, url), (None, True, False))
+                    except Exception as error:  # noqa: BLE001
+                        raised.append(f"{ascii(key)}, {ascii(url)}: {type(error).__name__}")
+        self.assertEqual(raised[:5], [], f"{len(raised)} of 6000 calls raised")
 
 
 class TestComparison(unittest.TestCase):
