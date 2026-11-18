@@ -555,6 +555,114 @@ fn expiring_upload_signatures_verify_over_the_full_remainder() {
 }
 
 #[test]
+fn purge_remainders_split_an_optional_expiry() {
+    // The plain forms are the target path or the group name
+    // alone, a source's slashes included.
+    for plain in [
+        "300x200/https://example.com/a.jpg",
+        "thumb",
+        "s1.AAECAw/photo.jpg",
+        "expedition/https://example.com/a.jpg",
+        "300x200/exp:1893456000/https://example.com/a.jpg",
+        "",
+    ] {
+        assert_eq!(split_purge_remainder(plain).unwrap(), (None, plain));
+    }
+    // The expiring form leads with the exp: segment, and
+    // only that one segment is the purge's expiry: an exp:
+    // after it is the image's, part of the target.
+    assert_eq!(
+        split_purge_remainder("exp:1893456000/300x200/https://example.com/a.jpg").unwrap(),
+        (Some(1893456000), "300x200/https://example.com/a.jpg")
+    );
+    assert_eq!(
+        split_purge_remainder("exp:1893456000/thumb").unwrap(),
+        (Some(1893456000), "thumb")
+    );
+    assert_eq!(
+        split_purge_remainder("exp:5/exp:1893456000/300x200/a.jpg").unwrap(),
+        (Some(5), "exp:1893456000/300x200/a.jpg")
+    );
+    assert_eq!(
+        split_purge_remainder("exp:007/s1.AAECAw/photo.jpg").unwrap(),
+        (Some(7), "s1.AAECAw/photo.jpg")
+    );
+    assert_eq!(split_purge_remainder("exp:5/").unwrap(), (Some(5), ""));
+    // A leading segment that opens with exp: but does not
+    // parse, or that nothing follows, is the grammar error
+    // the image and upload grammars answer, whatever comes
+    // after it.
+    let long = format!("exp:{}/thumb", "9".repeat(10_000));
+    for bad in [
+        "exp:soon/300x200/https://example.com/a.jpg",
+        "exp:/thumb",
+        "exp:-5/thumb",
+        "exp:+5/thumb",
+        "exp:5.0/thumb",
+        "exp: 5/thumb",
+        "exp:\u{0661}\u{0662}/thumb",
+        "exp:18446744073709551616/thumb",
+        long.as_str(),
+        "exp:1893456000",
+        "exp:",
+    ] {
+        let err = split_purge_remainder(bad).unwrap_err();
+        assert_eq!(err.code(), "invalid_expiry", "{bad}");
+    }
+    assert_eq!(
+        split_purge_remainder("exp:18446744073709551615/thumb").unwrap(),
+        (Some(u64::MAX), "thumb")
+    );
+}
+
+#[test]
+fn expiring_purge_signatures_verify_over_the_full_remainder() {
+    let secret = b"test-secret";
+    let exp = 1893456000u64;
+    for (target, sig, verify_here, verify_there) in [
+        (
+            "300x200/https://example.com/a.jpg",
+            purge_signature_with_expiry(secret, "300x200/https://example.com/a.jpg", exp),
+            verify_purge as fn(&[u8], &Signature, &str) -> bool,
+            verify_purge_group as fn(&[u8], &Signature, &str) -> bool,
+        ),
+        (
+            "thumb",
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            verify_purge_group,
+            verify_purge,
+        ),
+    ] {
+        let sig = Signature::Hmac(sig);
+        let remainder = format!("exp:{exp}/{target}");
+        // Verification runs over the remainder exactly as
+        // presented, the expiry segment included.
+        assert!(verify_here(secret, &sig, &remainder), "{target}");
+        // Another expiry, another target, the stripped
+        // target and the other endpoint all fail.
+        assert!(
+            !verify_here(secret, &sig, &format!("exp:{}/{target}", exp + 1)),
+            "{target}"
+        );
+        assert!(
+            !verify_here(secret, &sig, &format!("exp:{exp}/{target}x")),
+            "{target}"
+        );
+        assert!(!verify_here(secret, &sig, target), "{target}");
+        assert!(!verify_there(secret, &sig, &remainder), "{target}");
+    }
+    // A plain purge signature over a target that opens with
+    // an image URL's exp: segment is the same bytes as the
+    // expiring form of the rest: the server cannot tell the
+    // two apart, which is why it reads that segment as the
+    // purge's expiry.
+    assert_eq!(
+        purge_signature(secret, "exp:1893456000/300x200/https://example.com/a.jpg"),
+        purge_signature_with_expiry(secret, "300x200/https://example.com/a.jpg", exp)
+    );
+}
+
+#[test]
 fn sealed_segment_splitting() {
     assert_eq!(split_sealed_segment("s1.AAECAw"), Some((None, "s1.AAECAw")));
     assert_eq!(

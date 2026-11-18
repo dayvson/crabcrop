@@ -3264,6 +3264,15 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
     crabcrop_url::purge_signature(secret, target)
 }
 
+/// The expiring purge signature for a target path: HMAC of
+/// `exp:<expires>/<target>` under the derived purge key.
+/// Delegates to the crate helper; this mints, for operators
+/// and tests.
+#[allow(dead_code)]
+pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) -> String {
+    crabcrop_url::purge_signature_with_expiry(secret, target, expires)
+}
+
 /// Derive the purge-group signing key from the server
 /// secret. Purge-group signatures live in their own domain
 /// beside the purge domain (audit R2-14), under this
@@ -3280,6 +3289,46 @@ pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     crabcrop_url::purge_group_signature(secret, group)
+}
+
+/// The expiring purge-group signature for a cache group:
+/// HMAC of `exp:<expires>/<group>` under the derived
+/// purge-group key. Delegates to the crate helper.
+#[allow(dead_code)]
+pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u64) -> String {
+    crabcrop_url::purge_group_signature_with_expiry(secret, group, expires)
+}
+
+/// Split a purge or purge-group request remainder (what
+/// follows the signature segment) into its optional expiry
+/// and the target: the purge path, or the group name. The
+/// expiring form leads with an `exp:<unix-seconds>` segment,
+/// the upload endpoint's spelling (see
+/// [`split_upload_remainder`]), and only a leading segment
+/// is the purge's expiry.
+///
+/// An image remainder may carry `exp:` among its operations,
+/// so a plain purge minted over such a remainder can open
+/// with `exp:<n>/`. Its signature covers the same bytes as
+/// the expiring form of the rest, so it verifies either way,
+/// and it is read the one way every purge URL is: that
+/// segment is the purge's expiry. The purge evicts what it
+/// evicted before, because an image's `exp:` is not part of
+/// its cache key ([`canonical_key_form`] drops it), so the
+/// rest of the path names the same entries; once the second
+/// has passed it is refused as expired instead. A group
+/// name never begins with `exp:` (groups are preset names,
+/// `[A-Za-z0-9_-]`, and a name with a `/` was refused), so
+/// for the purge-group endpoint the spelling was free.
+///
+/// As for uploads, a leading segment that starts with `exp:`
+/// but does not parse, or that nothing follows, is a grammar
+/// error (`invalid_expiry`), never part of the target. The
+/// signature covers the remainder exactly as presented,
+/// expiry included, so verification runs on the unsplit
+/// string.
+pub fn split_purge_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    split_leading_expiry(rest)
 }
 
 /// Verify a purge signature. Purges are the server's only
@@ -3358,10 +3407,18 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
 /// expiry included, so verification runs on the unsplit
 /// string before this is called.
 pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
-    let Some((first, name)) = rest.split_once('/') else {
-        // No slash: the remainder is one segment. It is a
-        // name, unless it spells an expiry with no name
-        // after it, which is malformed.
+    split_leading_expiry(rest)
+}
+
+/// Split an optional leading `exp:<unix-seconds>` segment
+/// off a remainder, the expiring spelling the upload, purge
+/// and purge-group endpoints share. A remainder that does
+/// not open with `exp:` comes back whole.
+fn split_leading_expiry(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let Some((first, tail)) = rest.split_once('/') else {
+        // No slash: the remainder is one segment. It is
+        // what the endpoint names, unless it spells an
+        // expiry with nothing after it, which is malformed.
         if rest.starts_with("exp:") {
             return Err(ParseError::InvalidExpiry(rest.to_string()));
         }
@@ -3370,7 +3427,7 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
     let Some(ts) = first.strip_prefix("exp:") else {
         return Ok((None, rest));
     };
-    Ok((Some(parse_expiry(ts, first)?), name))
+    Ok((Some(parse_expiry(ts, first)?), tail))
 }
 
 /// Verify an upload signature. Like purges, uploads are

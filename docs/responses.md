@@ -70,7 +70,7 @@ Operational failures carry these codes:
 | Code | Status | Failure |
 | --- | --- | --- |
 | `bad_signature` | `403` | The signature does not verify (image, explain, purge, purge-group, and upload routes). |
-| `signature_expired` | `403` | The signed URL's `exp:` second has been reached. |
+| `signature_expired` | `403` | The signed URL's `exp:` second has been reached (image, explain, purge, purge-group, and upload routes). |
 | `reserved_segment` | `400` | An image URL begins with a purge or upload segment, or with `crabcrop`, the segment reserved for key derivation. The `crabcrop` refusal comes before the signature check, so it is the answer whatever the signature. |
 | `invalid_path` | `400` | An explain, purge, purge-group, or upload path does not have the route's shape. |
 | `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |

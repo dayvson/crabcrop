@@ -74,6 +74,17 @@ signature for POST /purge-group/<signature>/<group> = lowercase_hex( HMAC_SHA256
 
 `path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature does not verify as a purge signature, and vice versa, and because each purge endpoint has its own subkey, a per-target purge signature can never be transplanted to `/purge-group` (or the reverse), whatever string it was minted over. The separation rests on the [reserved remainders](#reserved-remainders) rule: a subkey is the image signature of its label, so no signer may sign a label. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
 
+A purge signature may carry an expiry, in the upload spelling ([below](#upload-signatures)):
+
+```text
+signature for POST /purge/<signature>/exp:<unix-seconds>/<path>        = lowercase_hex( HMAC_SHA256( purge subkey, "exp:<unix-seconds>/" + path ) )
+signature for POST /purge-group/<signature>/exp:<unix-seconds>/<group> = lowercase_hex( HMAC_SHA256( purge-group subkey, "exp:<unix-seconds>/" + group ) )
+```
+
+The expiry is part of the signed string, so it can neither be stripped (the remainder no longer matches) nor extended (ditto), and the path or group stays bound exactly as in the plain form. The server refuses the purge with `403` (`signature expired`) once the current second reaches the expiry, the comparison image and upload URLs use, and it evicts nothing. Only the first segment after the signature segment is an expiry. One that opens with `exp:` but does not parse, or that nothing follows, is a grammar error (`invalid_expiry`, `400`), as for uploads. A purge URL without an expiry keeps working and authorizes its purge until the secret rotates. The `crabcrop-url` crate mints the expiring form beside the plain one, with `purge_signature_with_expiry` / `purge_group_signature_with_expiry`.
+
+One case reads both ways, and is settled here. An image remainder may carry `exp:` among its operations, so a plain purge minted over an image URL's remainder can open with `exp:<n>/`. That path signs the same bytes as the expiring form of the rest, so it verifies under both readings, and the server reads it the way it reads every purge path: the leading `exp:` segment is the purge's own expiry. Before that second the purge evicts the same entries the other reading would: an image's `exp:` is not part of its cache key (the canonical form drops every `exp:` segment), so the rest of the path names the entries the whole path did. From that second on the purge is refused as expired. The image's `exp:` adds nothing to the target, so drop it and sign the rest, with or without an expiry of the purge's own, and the purge evicts the same entries. An `exp:` segment further in the path, or inside a sealed target's payload, is the image's and plays no part in the purge. A purge-group path could not open with `exp:` before: a group is a preset name (`[A-Za-z0-9_-]`), and a group with a `/` was refused (`400`, `invalid_purge_group`).
+
 ## Upload signatures
 
 The upload endpoint (issue #168) is signed under its own derived subkey, the same construction in a third domain:

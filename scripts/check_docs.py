@@ -87,7 +87,6 @@ RESERVED = set()
 # until its entry is removed.
 UNTESTED = {
     "invalid_path",
-    "invalid_purge_group",
     "invalid_upload_name",
     "meta_not_available",
     "processing_failed",
