@@ -2235,16 +2235,13 @@ fn is_valid_bucket_name(bucket: &str) -> bool {
     }
     // Not an IPv4 address spelling: four numeric labels.
     let labels: Vec<&str> = bucket.split('.').collect();
-    if labels.len() == 4
+    let ipv4_spelling = labels.len() == 4
         && labels.iter().all(|label| {
             !label.is_empty()
                 && label.bytes().all(|b| b.is_ascii_digit())
                 && label.parse::<u32>().is_ok_and(|n| n <= 255)
-        })
-    {
-        return false;
-    }
-    true
+        });
+    !ipv4_spelling
 }
 
 /// Decode `%XX` escapes in a URL path. A literal `+` stays a
