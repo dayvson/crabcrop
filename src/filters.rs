@@ -14,6 +14,11 @@ use crate::url::{
     Quality,
 };
 
+mod bands;
+
+use bands::band_pool;
+pub use bands::start_band_pool;
+
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EncodeOptions {
@@ -629,55 +634,53 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
     };
     let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
     // Every output pixel is a pure function of the source,
-    // so the canvas splits into row bands across scoped
-    // threads without changing a byte; small
-    // canvases run sequentially on the calling thread.
+    // so the canvas splits into row bands on the filters'
+    // pool without changing a byte; small canvases run on
+    // the calling thread.
     let row_len = (new_w * 4) as usize;
-    let threads = band_threads();
-    let band_rows = if threads > 1 && new_h >= 128 {
-        (new_h as usize).div_ceil(threads)
+    let pool = band_pool();
+    let band_rows = if pool.bands() > 1 && new_h >= 128 {
+        (new_h as usize).div_ceil(pool.bands())
     } else {
         new_h as usize
     };
     let out_raw = out.as_mut();
-    std::thread::scope(|s| {
-        for (bi, band) in out_raw.chunks_mut(band_rows * row_len).enumerate() {
+    pool.run(
+        out_raw.chunks_mut(band_rows * row_len).enumerate(),
+        |(bi, band)| {
             let y_start = (bi * band_rows) as u32;
-            let sample = &sample;
-            s.spawn(move || {
-                let rows = band.len() / row_len;
-                for ly in 0..rows {
-                    let y = y_start + ly as u32;
-                    for x in 0..new_w {
-                        let dx = x as f32 - dcx;
-                        let dy = y as f32 - dcy;
-                        let sx = cos * dx + sin * dy + scx;
-                        let sy = -sin * dx + cos * dy + scy;
-                        let x0 = sx.floor();
-                        let y0 = sy.floor();
-                        let fx = sx - x0;
-                        let fy = sy - y0;
-                        let (x0, y0) = (x0 as i32, y0 as i32);
-                        let mut px = [0f32; 4];
-                        for (wx, xx) in [(1.0 - fx, x0), (fx, x0 + 1)] {
-                            for (wy, yy) in [(1.0 - fy, y0), (fy, y0 + 1)] {
-                                let tap = sample(xx, yy);
-                                let weight = wx * wy;
-                                for (i, channel) in px.iter_mut().enumerate() {
-                                    *channel += tap[i] * weight;
-                                }
+            let rows = band.len() / row_len;
+            for ly in 0..rows {
+                let y = y_start + ly as u32;
+                for x in 0..new_w {
+                    let dx = x as f32 - dcx;
+                    let dy = y as f32 - dcy;
+                    let sx = cos * dx + sin * dy + scx;
+                    let sy = -sin * dx + cos * dy + scy;
+                    let x0 = sx.floor();
+                    let y0 = sy.floor();
+                    let fx = sx - x0;
+                    let fy = sy - y0;
+                    let (x0, y0) = (x0 as i32, y0 as i32);
+                    let mut px = [0f32; 4];
+                    for (wx, xx) in [(1.0 - fx, x0), (fx, x0 + 1)] {
+                        for (wy, yy) in [(1.0 - fy, y0), (fy, y0 + 1)] {
+                            let tap = sample(xx, yy);
+                            let weight = wx * wy;
+                            for (i, channel) in px.iter_mut().enumerate() {
+                                *channel += tap[i] * weight;
                             }
                         }
-                        let o = ly * row_len + (x * 4) as usize;
-                        band[o] = px[0].round() as u8;
-                        band[o + 1] = px[1].round() as u8;
-                        band[o + 2] = px[2].round() as u8;
-                        band[o + 3] = px[3].round() as u8;
                     }
+                    let o = ly * row_len + (x * 4) as usize;
+                    band[o] = px[0].round() as u8;
+                    band[o + 1] = px[1].round() as u8;
+                    band[o + 2] = px[2].round() as u8;
+                    band[o + 3] = px[3].round() as u8;
                 }
-            });
-        }
-    });
+            }
+        },
+    );
     if has_alpha {
         DynamicImage::ImageRgba8(out)
     } else {
@@ -717,7 +720,7 @@ fn map_rgb(img: DynamicImage, f: impl Fn(u8, u8, u8) -> [u8; 3] + Sync) -> Dynam
 }
 
 /// Apply a per-pixel RGB mapping over a raw channel buffer,
-/// in row bands across scoped threads when the frame is
+/// in row bands on the filters' pool when the frame is
 /// large enough for the split to pay for itself. Each output
 /// pixel depends only on the same input pixel, so banding
 /// cannot change the result; small frames run sequentially
@@ -727,43 +730,36 @@ fn map_rgb_bands<const CH: usize>(
     width: usize,
     f: &(impl Fn(u8, u8, u8) -> [u8; 3] + Sync),
 ) {
-    let row = width * CH;
-    let Some(band_rows) = pointwise_band_rows(buf.len(), row) else {
-        for p in buf.as_chunks_mut::<CH>().0 {
+    let run = |band: &mut [u8]| {
+        for p in band.as_chunks_mut::<CH>().0 {
             let [r, g, b] = f(p[0], p[1], p[2]);
             p[0] = r;
             p[1] = g;
             p[2] = b;
         }
+    };
+    let row = width * CH;
+    let Some(band_rows) = pointwise_band_rows(buf.len(), row) else {
+        run(buf);
         return;
     };
-    std::thread::scope(|s| {
-        for band in buf.chunks_mut(band_rows * row) {
-            s.spawn(move || {
-                for p in band.as_chunks_mut::<CH>().0 {
-                    let [r, g, b] = f(p[0], p[1], p[2]);
-                    p[0] = r;
-                    p[1] = g;
-                    p[2] = b;
-                }
-            });
-        }
-    });
+    band_pool().run(buf.chunks_mut(band_rows * row), run);
 }
 
 /// How a per-pixel map splits a buffer of `len` bytes, in
-/// rows of `row` bytes, into row bands across threads: the
-/// rows of one band, or `None` to map the buffer on the
-/// calling thread. A frame under 3,000,000 subpixels or 256
-/// rows does not repay a spawn, and banding needs a second
-/// core; past that, up to four bands.
+/// rows of `row` bytes, into row bands on the pool: the rows
+/// of one band, or `None` to map the buffer on the calling
+/// thread. A frame under 3,000,000 subpixels or 256 rows
+/// does not repay the hand-off, and banding needs a second
+/// thread; past that, as many bands as the pool splits a
+/// pass into (four at most).
 fn pointwise_band_rows(len: usize, row: usize) -> Option<usize> {
     let rows = len / row.max(1);
-    let threads = band_threads();
-    if threads < 2 || rows < 256 || len < 3_000_000 {
+    let bands = band_pool().bands();
+    if bands < 2 || rows < 256 || len < 3_000_000 {
         None
     } else {
-        Some(rows.div_ceil(threads))
+        Some(rows.div_ceil(bands))
     }
 }
 
@@ -839,12 +835,7 @@ fn lanes_bands<const CH: usize>(
         run(buf);
         return;
     };
-    std::thread::scope(|s| {
-        for band in buf.chunks_mut(band_rows * row) {
-            let run = &run;
-            s.spawn(move || run(band));
-        }
-    });
+    band_pool().run(buf.chunks_mut(band_rows * row), run);
 }
 
 /// One block of [`lanes_bands`]: the pixels' channels out to
@@ -1207,11 +1198,8 @@ where
     if rows == 0 || row_len == 0 {
         return;
     }
-    let band_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4)
-        .min(rows);
+    let pool = band_pool();
+    let band_threads = pool.bands().min(rows);
     if band_threads <= 1 {
         f(0, dst);
         return;
@@ -1227,12 +1215,7 @@ where
         start += take / row_len;
         rest = tail;
     }
-    std::thread::scope(|s| {
-        for (start_row, chunk) in chunks {
-            let f = &f;
-            s.spawn(move || f(start_row, chunk));
-        }
-    });
+    pool.run(chunks, |(start_row, chunk)| f(start_row, chunk));
 }
 
 fn blur_clamp_idx(i: isize, len: usize) -> usize {
@@ -1617,16 +1600,15 @@ pub(crate) fn blur_gray_within(
     Ok(image::GrayImage::from_raw(img.width(), img.height(), narrow).expect("blur size"))
 }
 
-fn band_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4)
-}
-
+/// The rows of one band when a permutation or a per-pixel
+/// map splits `rows` rows of `total_subpx` subpixels on the
+/// filters' pool: all of them, one band on the calling
+/// thread, under 3,000,000 subpixels or without a second
+/// thread.
 fn perm_band_rows(rows: usize, total_subpx: usize) -> usize {
-    if band_threads() > 1 && total_subpx >= 3_000_000 {
-        rows.div_ceil(band_threads())
+    let bands = band_pool().bands();
+    if bands > 1 && total_subpx >= 3_000_000 {
+        rows.div_ceil(bands)
     } else {
         rows
     }
@@ -1647,36 +1629,28 @@ fn map_pixels_bands<const CH: usize>(
         }
         return;
     }
-    std::thread::scope(|s| {
-        for band in px.chunks_mut(br * width) {
-            s.spawn(move || {
-                for p in band {
-                    f(p);
-                }
-            });
+    band_pool().run(px.chunks_mut(br * width), |band| {
+        for p in band {
+            f(p);
         }
     });
 }
 
 fn rot270_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
     let br = perm_band_rows(w, w * h * CH);
-    std::thread::scope(|s| {
-        for (bi, band) in dst.chunks_mut(br * h).enumerate() {
-            let y0 = bi * br;
-            s.spawn(move || {
-                let tile = 64usize;
-                let mut ty = 0usize;
-                while ty < h {
-                    let t_end = (ty + tile).min(h);
-                    for (ly, orow) in band.chunks_mut(h).enumerate() {
-                        let c = w - 1 - (y0 + ly);
-                        for y in ty..t_end {
-                            orow[y] = src[y * w + c];
-                        }
-                    }
-                    ty = t_end;
+    band_pool().run(dst.chunks_mut(br * h).enumerate(), |(bi, band)| {
+        let y0 = bi * br;
+        let tile = 64usize;
+        let mut ty = 0usize;
+        while ty < h {
+            let t_end = (ty + tile).min(h);
+            for (ly, orow) in band.chunks_mut(h).enumerate() {
+                let c = w - 1 - (y0 + ly);
+                for y in ty..t_end {
+                    orow[y] = src[y * w + c];
                 }
-            });
+            }
+            ty = t_end;
         }
     });
 }
@@ -1722,57 +1696,36 @@ fn rot90_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u
 fn rot180_px<const CH: usize>(src: &[[u8; CH]], _w: usize, _h: usize, dst: &mut [[u8; CH]]) {
     let n = src.len();
     let br = perm_band_rows(n, n * CH);
-    std::thread::scope(|s| {
-        let mut rest = dst;
-        let mut start = 0usize;
-        while !rest.is_empty() {
-            let take = br.min(rest.len());
-            let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
-            let st = start;
-            start += take;
-            rest = tail;
-            s.spawn(move || {
-                for (i, px) in head.iter_mut().enumerate() {
-                    *px = src[n - 1 - (st + i)];
-                }
-            });
+    band_pool().run(dst.chunks_mut(br).enumerate(), |(bi, head)| {
+        let st = bi * br;
+        for (i, px) in head.iter_mut().enumerate() {
+            *px = src[n - 1 - (st + i)];
         }
     });
 }
 
 fn fliph_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
     let br = perm_band_rows(h, w * h * CH);
-    std::thread::scope(|s| {
-        for (sband, dband) in src.chunks(br * w).zip(dst.chunks_mut(br * w)) {
-            s.spawn(move || {
-                for (srow, drow) in sband.chunks(w).zip(dband.chunks_mut(w)) {
-                    for (i, px) in drow.iter_mut().enumerate() {
-                        *px = srow[w - 1 - i];
-                    }
+    band_pool().run(
+        src.chunks(br * w).zip(dst.chunks_mut(br * w)),
+        |(sband, dband)| {
+            for (srow, drow) in sband.chunks(w).zip(dband.chunks_mut(w)) {
+                for (i, px) in drow.iter_mut().enumerate() {
+                    *px = srow[w - 1 - i];
                 }
-            });
-        }
-    });
+            }
+        },
+    );
 }
 
 fn flipv_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
     let br = perm_band_rows(h, w * h * CH);
-    std::thread::scope(|s| {
-        let mut rest = dst;
-        let mut y0 = 0usize;
-        while !rest.is_empty() {
-            let take = (br * w).min(rest.len());
-            let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
-            let rows = take / w;
-            let src_rows = &src[(h - y0 - rows) * w..(h - y0) * w];
-            s.spawn(move || {
-                for r in 0..rows {
-                    head[r * w..(r + 1) * w]
-                        .copy_from_slice(&src_rows[(rows - 1 - r) * w..(rows - r) * w]);
-                }
-            });
-            y0 += rows;
-            rest = tail;
+    band_pool().run(dst.chunks_mut(br * w).enumerate(), |(bi, head)| {
+        let y0 = bi * br;
+        let rows = head.len() / w;
+        let src_rows = &src[(h - y0 - rows) * w..(h - y0) * w];
+        for r in 0..rows {
+            head[r * w..(r + 1) * w].copy_from_slice(&src_rows[(rows - 1 - r) * w..(rows - r) * w]);
         }
     });
 }
@@ -3663,36 +3616,23 @@ fn auto_levels(img: image::RgbImage) -> image::RgbImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let raw = img.as_raw();
     let row = w * 3;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4);
-    let hists: [[u64; 256]; 3] = if threads < 2 || h < 256 || raw.len() < 3_000_000 {
-        let mut hists = [[0u64; 256]; 3];
-        for p in raw.as_chunks::<3>().0 {
+    let count = |band: &[u8], hists: &mut [[u64; 256]; 3]| {
+        for p in band.as_chunks::<3>().0 {
             hists[0][p[0] as usize] += 1;
             hists[1][p[1] as usize] += 1;
             hists[2][p[2] as usize] += 1;
         }
+    };
+    let pool = band_pool();
+    let hists: [[u64; 256]; 3] = if pool.bands() < 2 || h < 256 || raw.len() < 3_000_000 {
+        let mut hists = [[0u64; 256]; 3];
+        count(raw, &mut hists);
         hists
     } else {
-        let band_rows = h.div_ceil(threads);
-        let locals: Vec<[[u64; 256]; 3]> = std::thread::scope(|s| {
-            let handles: Vec<_> = raw
-                .chunks(band_rows * row)
-                .map(|band| {
-                    s.spawn(move || {
-                        let mut hists = [[0u64; 256]; 3];
-                        for p in band.as_chunks::<3>().0 {
-                            hists[0][p[0] as usize] += 1;
-                            hists[1][p[1] as usize] += 1;
-                            hists[2][p[2] as usize] += 1;
-                        }
-                        hists
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let bands: Vec<&[u8]> = raw.chunks(h.div_ceil(pool.bands()) * row).collect();
+        let mut locals = vec![[[0u64; 256]; 3]; bands.len()];
+        pool.run(bands.into_iter().zip(&mut locals), |(band, hists)| {
+            count(band, hists)
         });
         let mut hists = [[0u64; 256]; 3];
         for local in locals {
@@ -3806,3 +3746,8 @@ mod w4proofs;
 // the chunked sums of the 8-bit blur (issue #660).
 #[cfg(test)]
 mod vector_proofs;
+
+// Every banded filter at several pool sizes, held to its
+// one-band bytes (issue #739).
+#[cfg(test)]
+mod band_proofs;

@@ -427,8 +427,9 @@ fn lanes_split_into_bands_where_the_per_pixel_maps_do() {
     // Issue #659: the lane mapping bands a frame under the
     // rule the per-pixel maps follow, read from one place:
     // the calling thread under 3,000,000 subpixels or 256
-    // rows, else one band per core, four at most.
-    let threads = band_threads();
+    // rows, else as many bands as the filters' pool splits a
+    // pass into, one per core and four at most.
+    let threads = band_pool().bands();
     assert!((1..=4).contains(&threads));
     assert_eq!(pointwise_band_rows(2_999_997, 2_997), None);
     assert_eq!(pointwise_band_rows(255 * 30_000, 30_000), None);
