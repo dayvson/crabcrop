@@ -3616,23 +3616,27 @@ fn auto_levels(img: image::RgbImage) -> image::RgbImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let raw = img.as_raw();
     let row = w * 3;
-    let count = |band: &[u8], hists: &mut [[u64; 256]; 3]| {
+    let count = |band: &[u8]| {
+        let mut hists = [[0u64; 256]; 3];
         for p in band.as_chunks::<3>().0 {
             hists[0][p[0] as usize] += 1;
             hists[1][p[1] as usize] += 1;
             hists[2][p[2] as usize] += 1;
         }
+        hists
     };
     let pool = band_pool();
     let hists: [[u64; 256]; 3] = if pool.bands() < 2 || h < 256 || raw.len() < 3_000_000 {
-        let mut hists = [[0u64; 256]; 3];
-        count(raw, &mut hists);
-        hists
+        count(raw)
     } else {
+        // Each band counts on its own thread's stack and stores
+        // its counts once at the end: slots side by side in the
+        // vector would share a cache line where one band's top
+        // bins meet the next band's bottom ones.
         let bands: Vec<&[u8]> = raw.chunks(h.div_ceil(pool.bands()) * row).collect();
         let mut locals = vec![[[0u64; 256]; 3]; bands.len()];
-        pool.run(bands.into_iter().zip(&mut locals), |(band, hists)| {
-            count(band, hists)
+        pool.run(bands.into_iter().zip(&mut locals), |(band, local)| {
+            *local = count(band)
         });
         let mut hists = [[0u64; 256]; 3];
         for local in locals {
