@@ -326,6 +326,27 @@ class TestDifferential(unittest.TestCase):
             f"{len(mismatches)} of {len(inputs)} inputs explain differently (seed {SEED}):\n{shown}",
         )
 
+    def test_class_names_take_the_letters_and_digits_the_typescript_explainer_takes(self):
+        # The class-name table is Unicode 17.0's, written out whole; on
+        # a Node with the same Unicode tables, the TypeScript explainer's
+        # [\p{Alphabetic}\p{N}] is exactly that set.
+        version = ".".join(map(str, cc._grammar._ALPHANUMERIC_UNICODE))
+        run = subprocess.run([NODE, "-p", "process.versions.unicode"], capture_output=True, text=True, timeout=60)
+        if run.stdout.strip() != version:
+            self.skipTest(f"Node reads Unicode {run.stdout.strip()}, the table {version}")
+        script = (
+            "const re = /^[\\p{Alphabetic}\\p{N}]$/u; const out = [];"
+            "for (let c = 0; c <= 0x10ffff; c++) {"
+            " if ((c < 0xd800 || c > 0xdfff) && re.test(String.fromCodePoint(c))) out.push(c); }"
+            "process.stdout.write(JSON.stringify(out));"
+        )
+        run = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        typescript = json.loads(run.stdout)
+        python = [c for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF and cc._grammar.is_alphanumeric(chr(c))]
+        self.assertGreater(len(python), 140000)
+        self.assertEqual(python, typescript)
+
     def test_the_inputs_reach_every_segment_kind_and_verdict(self):
         # A generator that drifted into one corner would pass the
         # comparison above while testing little. About a fifth of the

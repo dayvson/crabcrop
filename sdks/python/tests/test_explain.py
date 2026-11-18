@@ -462,7 +462,10 @@ class TestNumbers(unittest.TestCase):
     def test_a_class_name_is_letters_or_digits_as_rusts_is_alphanumeric_reads_them(self):
         # The Unicode Alphabetic property holds more than the letter
         # categories: Devanagari vowel signs, U+0345, circled letters.
-        for name in ("हिंदी", "a\u0345", "Ⓐ", "Ⅰ", "traffic light", "e-bike_2.0/x"):
+        # The letters are Unicode 17.0's, as the server's Rust reads
+        # them, whatever this Python's unicodedata knows: U+A7CE and
+        # U+323B0 are new in 17.0.
+        for name in ("हिंदी", "a\u0345", "Ⓐ", "Ⅰ", "traffic light", "e-bike_2.0/x", "\ua7ce", "\U000323b0"):
             self.assertEqual(errors(f"filters:blurclass({quote(name, safe='')})"), [], name)
         for name in ("✓", "a\u200db", "a*b", "", "é" * 33):
             self.assertEqual(len(errors(f"filters:blurclass({quote(name, safe='')})")), 1, name)
