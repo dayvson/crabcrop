@@ -297,9 +297,23 @@ class VersionToolsTest(unittest.TestCase):
         (self.tree / "changelog.d/1.feature.md").write_text("A thing (issue #1).\n", encoding="utf-8")
         snapshot = self.snapshot()
         code, out, err = self.run_tool("bump_version.py", bumped(self.version, "patch"))
-        self.assert_reported(code, out, err, ["changelog.d/1.feature.md: unknown section 'feature': use one of added, changed, deprecated, removed, fixed, security"])
+        self.assert_reported(code, out, err, ["changelog.d/1.feature.md: unknown section 'feature': use one of added, changed, deprecated, removed, fixed, security, or summary"])
         self.assertIn("nothing was written", err)
         self.assertEqual(self.snapshot(), snapshot, "a refused bump wrote files")
+
+    def test_a_bump_writes_the_summary_first(self):
+        # A summary fragment's lines open the release's section, above its
+        # first heading (RELEASING.md step 1, issue #740).
+        new = bumped(self.version, "patch")
+        (self.tree / "changelog.d/1.fixed.md").write_text("A bump fragment (issue #1).\n", encoding="utf-8")
+        (self.tree / "changelog.d/1.summary.md").write_text("- Upgrade for the fix (issue #1).\n", encoding="utf-8")
+        code, out, err = self.run_tool("bump_version.py", new, "--date", "2026-02-03")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("opens with a summary of 1 line(s)", out)
+        self.assertIn("removed changelog.d/1.summary.md", out)
+        text = (self.tree / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{new}] - 2026-02-03\n\n- Upgrade for the fix (issue #1).\n\n### ", text)
+        self.assertEqual(list((self.tree / "changelog.d").iterdir()), [])
 
     def test_the_check_fails_on_a_stale_helm_image_tag(self):
         # A pin that was stale before a bump is not the old version

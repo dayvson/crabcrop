@@ -13,7 +13,10 @@
 # model is a deployment artifact: it is never committed to
 # this repo. ONNX Runtime's LICENSE and its third-party
 # notices come from the same checked package and go beside
-# the base image's THIRD-PARTY-NOTICES.md (issue #682).
+# the base image's THIRD-PARTY-NOTICES.md (issue #682). The
+# models' license texts are committed, in
+# scripts/notices/models/, and go beside that file too
+# (issue #702).
 #
 # The base is an explicit build argument so a build cannot
 # silently layer onto a stale local image: pass a digest for
@@ -74,6 +77,16 @@ ADD --checksum=sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2
 # Remote ADD files land mode 0600; the runtime user (65534)
 # must be able to read the models at boot preload.
 RUN chmod 644 /models/u2netp.onnx /models/yunet.onnx
+
+# The models' license texts (issue #702), from the
+# repository, which is this build's context: a directory for
+# each model, named after its file in /models.
+# THIRD-PARTY-NOTICES.md names every text and what the
+# projects each model comes from say about its license. Its
+# template pins both checksums above, so a model replaced
+# here fails scripts/check_notices.py until its texts are
+# read again.
+COPY scripts/notices/models /usr/share/doc/crabcrop/models
 
 # The upscale model follows the same rule (layered artifact,
 # preloaded at boot). Super-resolution ONNX exports are less

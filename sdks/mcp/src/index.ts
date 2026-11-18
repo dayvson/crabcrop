@@ -187,6 +187,30 @@ function hasDotSegment(path: string): boolean {
   });
 }
 
+/** The largest expiry the server reads: a u64 of unix seconds. */
+const MAX_EXPIRY = 18446744073709551615n;
+
+/**
+ * The purge target of a cached URL's remainder: the
+ * remainder without the `exp:<unix-seconds>` segments it
+ * opens with. The server reads a purge path's leading `exp:`
+ * as the purge's own expiry, so an image URL whose `exp:`
+ * has passed would be refused as an expired purge; an
+ * image's `exp:` is not part of its cache key, so the rest
+ * names the same entries. A leading segment the server would
+ * not read as an expiry stays, for the server to refuse.
+ */
+function purgeTarget(path: string): string {
+  let target = path;
+  for (;;) {
+    const m = /^exp:([0-9]+)\//.exec(target);
+    if (m === null || BigInt(m[1]) > MAX_EXPIRY) {
+      return target;
+    }
+    target = target.slice(m[0].length);
+  }
+}
+
 const TOOLS = [
   {
     name: "sign_url",
@@ -351,8 +375,11 @@ const TOOLS = [
     description:
       "Evict a cached result from a crabcrop server. The path is the cached " +
       "URL's remainder after its signature (operations and source; a preset " +
-      "URL works as-is, the server expands it). Requires the signing secret (argument or " +
-      "CRABCROP_SECRET). Returns how many entries were removed. " +
+      "URL works as-is, the server expands it, and the exp: segments it opens " +
+      "with are dropped, since the cache key does not carry them). Requires the signing secret (argument or " +
+      "CRABCROP_SECRET). With expires, the purge URL carries that expiry and stops " +
+      "working at that second, which a server with CRABCROP_PURGE_REQUIRE_EXPIRY " +
+      "requires. Returns how many entries were removed. " +
       "For safety the request only goes to /purge/ under the configured " +
       "CRABCROP_BASE (a base argument must equal it) and paths with dot " +
       "segments are refused: this tool will not POST to arbitrary endpoints.",
@@ -360,6 +387,7 @@ const TOOLS = [
       type: "object",
       properties: {
         path: { type: "string", description: "Remainder of the cached URL, e.g. \"300x200/https://example.com/a.jpg\"." },
+        expires: { type: "number", description: "Optional unix-seconds expiry for the purge URL, emitted as an exp: segment after the signature: the signature covers it, and the server refuses the purge from that second on." },
         base: { type: "string", description: "Redundant: the request always goes to CRABCROP_BASE, and a base argument must equal it (trailing slashes aside). Omit it." },
         secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
       },
@@ -393,7 +421,8 @@ const TOOLS = [
       }
       const secret = optionalStringArg(args, "secret") ?? envSecret;
       if (!secret) throw new Error("purge requires a secret: pass the secret argument or set CRABCROP_SECRET");
-      const target = stringArg(args, "path").replace(/^\//, "");
+      const target = purgeTarget(stringArg(args, "path").replace(/^\//, ""));
+      const expires = numberArg(args, "expires");
       if (hasDotSegment(target)) {
         return textResult(
           "purge_result: refusing a path with dot segments: they would resolve out of the purge prefix",
@@ -402,15 +431,16 @@ const TOOLS = [
       }
       // The SDK's helper: purge signatures are
       // domain-separated from image signatures (audit P-1),
-      // and the derivation lives in exactly one place.
-      const signature = purgeSignature(secret, target);
+      // and the derivation lives in exactly one place. It
+      // refuses an expiry the server cannot read.
+      const signature = purgeSignature(secret, target, expires);
       // Set as a path, a `?` or `#` in the target is
       // percent-encoded instead of starting a query or
       // fragment. The prefix check is the invariant itself,
       // whatever spelling a path finds past hasDotSegment.
       const url = new URL(purgeBase);
       const prefix = `${url.pathname.replace(/\/+$/, "")}/purge/${signature}/`;
-      url.pathname = prefix + target;
+      url.pathname = prefix + (expires === undefined ? target : `exp:${expires}/${target}`);
       if (!url.pathname.startsWith(prefix)) {
         return textResult("purge_result: refusing a path that resolves out of the purge prefix", true);
       }

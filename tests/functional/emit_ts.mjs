@@ -33,10 +33,10 @@ for (const c of cases) {
           Buffer.from(c.nonce, "hex"), c.key_id ?? undefined);
         break;
       case "purge_sig":
-        v = purgeSignature(c.secret, c.target);
+        v = purgeSignature(c.secret, c.target, c.expires ?? undefined);
         break;
       case "group_sig":
-        v = purgeGroupSignature(c.secret, c.group);
+        v = purgeGroupSignature(c.secret, c.group, c.expires ?? undefined);
         break;
       case "upload_sig":
         v = uploadSignature(c.secret, c.name, c.expires ?? undefined);

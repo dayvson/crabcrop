@@ -117,11 +117,19 @@ if ($GROUP === 'vectors') {
     $signed = 0;
     $refused = 0;
     $reserved = 0;
+    $purges = 0;
     $reserved_message = 'remainder begins with the reserved segment "crabcrop": '
         . 'it is kept for key derivation, and no image URL may begin with it';
     foreach ($vectors as $vector) {
         if (!empty($vector['sealed'])) {
             continue; // Sealing is out of scope for a URL builder.
+        }
+        if (isset($vector['purge_signature'])) {
+            // Purge signatures too: the plugin builds image URLs
+            // and mints none. They are counted, so a spec without
+            // them shows here.
+            $purges++;
+            continue;
         }
         if (!empty($vector['reserved'])) {
             // A remainder under the reserved segment: every derived
@@ -193,6 +201,7 @@ if ($GROUP === 'vectors') {
     check($signed >= 20, "signature vectors covered ($signed)");
     check($refused >= 17, "refusal vectors covered ($refused)");
     check($reserved >= 9, "reserved vectors covered ($reserved)");
+    check($purges >= 6, "purge vectors recognized and skipped ($purges)");
     // A key label's signature would be its subkey: refused, and a
     // source that only names a label further in still signs.
     foreach (array('crabcrop/purge-key', 'crabcrop/upload-key', 'crabcrop/seal-key') as $label) {

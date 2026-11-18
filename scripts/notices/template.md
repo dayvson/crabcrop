@@ -107,6 +107,53 @@ the one it takes the library from.
 
 <!-- include: file=scripts/notices/onnxruntime/LICENSE label="`LICENSE` in ONNX Runtime 1.31.0" sha256=2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c -->
 
+The image also carries two models, which `Dockerfile.ai` downloads and checks
+against the SHA-256 it pins for each. Their license texts ship beside this
+file, in `/usr/share/doc/crabcrop/models/`, copied byte for byte from the
+projects the models come from, at the commits named below.
+
+`/models/u2netp.onnx` (SHA-256
+`309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8`), the model
+behind `removebg`, is u2netp, the small U²-Net model, in the ONNX form that
+rembg publishes in its `v0.0.0` release. Neither project says which license
+covers this file. U²-Net's repository is under the Apache License 2.0, and its
+README links the trained u2netp weights from Google Drive and Baidu Pan,
+outside the repository, without naming a license for them. rembg is under the
+MIT License, and its README, in its list of models, says that model weights
+carry their own licenses, independent of rembg's MIT license, and links
+U²-Net's repository as u2netp's source. This file does not decide between the
+two, and the image ships both texts: the Apache License 2.0 as
+`/usr/share/doc/crabcrop/models/u2netp/U-2-Net/LICENSE` and the MIT License as
+`/usr/share/doc/crabcrop/models/u2netp/rembg/LICENSE.txt`. The Apache License
+2.0 asks a redistribution to give its recipients a copy of the license, to
+mark the files it changes, to keep the work's copyright, patent, trademark and
+attribution notices in any source form it distributes, and to carry the
+attribution notices of the work's NOTICE file. U²-Net's repository has no
+NOTICE file and its LICENSE names no copyright holder, and the image ships the
+model unchanged. The MIT License asks that the copyright notice and the license
+text go with every copy.
+
+<!-- pinned: file=Dockerfile.ai sha256=309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8 -->
+
+<!-- include: file=scripts/notices/models/u2netp/U-2-Net/LICENSE label="`LICENSE` in U²-Net at commit ac7e1c8, https://raw.githubusercontent.com/xuebinqin/U-2-Net/ac7e1c817ecab7c7dff5ce6b1abba61cd213ff29/LICENSE" sha256=c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 -->
+
+<!-- include: file=scripts/notices/models/u2netp/rembg/LICENSE.txt label="`LICENSE.txt` in rembg at commit 991927b, https://raw.githubusercontent.com/danielgatis/rembg/991927b77667946dab59c50df31f7d4640e80457/LICENSE.txt" sha256=90a3215072968fd304669c5389f04f1274a587abdd0507d99dead0f5511f8999 -->
+
+`/models/yunet.onnx` (SHA-256
+`8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`), the face
+detection model, is YuNet, as `face_detection_yunet_2023mar.onnx` in OpenCV
+Zoo's `models/face_detection_yunet` directory. At the commit named below, that
+file is the one `Dockerfile.ai` pins, and the directory's README says that all
+files in it are licensed under the MIT License, in its `LICENSE` file, which
+the image ships as `/usr/share/doc/crabcrop/models/yunet/LICENSE`. OpenCV Zoo
+as a whole is under the Apache License 2.0, and its README refers to each
+model's own license. The MIT License asks that the copyright notice and the
+license text go with every copy.
+
+<!-- pinned: file=Dockerfile.ai sha256=8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4 -->
+
+<!-- include: file=scripts/notices/models/yunet/LICENSE label="`models/face_detection_yunet/LICENSE` in OpenCV Zoo at commit 48b10fa, https://raw.githubusercontent.com/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/LICENSE" sha256=c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958 -->
+
 ## Rust crates
 
 <!-- crates -->
