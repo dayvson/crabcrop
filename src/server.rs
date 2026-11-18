@@ -720,6 +720,7 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     state.metrics.render_into(&mut out);
     lane_metrics(&state, &mut out);
     gate_metrics(&state, &mut out);
+    ai_metrics(&mut out);
     request_log_metrics(&state, &mut out);
     source_buffer_metrics(&state, &mut out);
     source_lookup_metrics(&state, &mut out);
@@ -792,6 +793,23 @@ fn gate_metrics(state: &AppState, out: &mut String) {
             gate.capacity()
         );
     }
+}
+
+/// AI model lock recoveries for `/metrics` (issue #736): the
+/// locks on the models' sessions and memos that a request's
+/// panic poisoned and a later request took back (issue #715),
+/// counted since boot. Each is also a line on stderr; a count
+/// that keeps rising is a model that panics on what it is
+/// given.
+fn ai_metrics(out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.\n\
+         # TYPE crabcrop_ai_lock_recoveries_total counter\n\
+         crabcrop_ai_lock_recoveries_total {}\n",
+        crate::ai::lock_recoveries()
+    );
 }
 
 /// The request log's queue for `/metrics` (issue #707): the
