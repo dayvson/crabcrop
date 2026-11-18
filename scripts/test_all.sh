@@ -140,7 +140,9 @@ step "TypeScript SDK"
 (cd sdks/typescript && npm ci --no-audit --no-fund && npm run build && npm test)
 
 step "Python SDK"
-(cd sdks/python && python3 -m unittest discover -s tests)
+# The differential tests run the TypeScript SDK on the Node above;
+# with CRABCROP_DIFF_REQUIRE_NODE they fail, not skip, without it.
+(cd sdks/python && CRABCROP_DIFF_REQUIRE_NODE=1 python3 -m unittest discover -s tests)
 
 step "MCP server"
 (cd sdks/mcp && npm ci --no-audit --no-fund && npm test)
