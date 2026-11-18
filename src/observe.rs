@@ -39,7 +39,16 @@ pub fn print_stderr_line(line: std::fmt::Arguments<'_>) {
         use std::io::Write as _;
         use std::sync::atomic::{AtomicBool, Ordering};
         static TOLD: AtomicBool = AtomicBool::new(false);
-        if let Err(e) = writeln!(std::io::stderr().lock(), "{line}")
+        // The lock on standard error is let go before the note
+        // takes the one on standard output. A boot line that
+        // fails holds standard output while it says so on
+        // standard error, so holding both the other way round
+        // could deadlock with it, and the request log's writer
+        // holds standard output through a write that a slow
+        // reader can stall, which would stall every stderr line
+        // behind this one.
+        let written = writeln!(std::io::stderr().lock(), "{line}");
+        if let Err(e) = written
             && !TOLD.swap(true, Ordering::Relaxed)
         {
             let _ = writeln!(

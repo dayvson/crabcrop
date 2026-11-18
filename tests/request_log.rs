@@ -1014,3 +1014,109 @@ fn a_server_whose_standard_error_reader_left_during_boot_serves_on() {
     assert!(notes[0].contains("Broken pipe"), "{}", notes[0]);
     assert_eq!(printed.last().map(String::as_str), Some("shutdown: done"));
 }
+
+/// Not a test on its own: the process that
+/// `a_line_stderr_refuses_lets_go_of_stderr_before_its_note_waits`
+/// starts, by running this test binary again with a stderr
+/// whose reader is gone. It exits 0 once both of its threads
+/// are through.
+#[test]
+#[ignore = "a helper the stderr lock test runs as its child"]
+#[cfg(target_os = "linux")]
+fn stderr_note_helper() {
+    if std::env::var_os("CRABCROP_TEST_STDERR_NOTE").is_none() {
+        return;
+    }
+    let pid = std::process::id();
+    // This thread holds standard output, as a failed boot
+    // line does while it says so on stderr.
+    let out = std::io::stdout().lock();
+    let writer = std::thread::Builder::new()
+        .name("stderr-line".to_string())
+        .spawn(|| crabcrop::observe::print_stderr_line(format_args!("a line stderr refuses")))
+        .unwrap();
+    let deadline = Instant::now() + LONG;
+    let tid = loop {
+        let found = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|tid| {
+                std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
+                    .is_ok_and(|name| name.trim() == "stderr-line")
+            });
+        if let Some(tid) = found {
+            break tid;
+        }
+        assert!(Instant::now() < deadline, "the writer thread never started");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Its write to stderr fails at once, so the one place it
+    // can sleep is the wait for standard output, to say so.
+    asleep(pid, &tid);
+    // Standard error is free while it waits: this is where a
+    // writer that held it would deadlock the two threads.
+    drop(std::io::stderr().lock());
+    drop(out);
+    writer.join().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_line_stderr_refuses_lets_go_of_stderr_before_its_note_waits() {
+    // Issue #738: a stderr line that stderr refuses is noted
+    // on standard output, which another thread may hold: a
+    // boot line that failed holds it while it says so on
+    // stderr, and the request log's writer holds it through
+    // every write. The stderr line lets go of stderr first,
+    // so neither can deadlock with it. Its child holds
+    // standard output while a stderr line fails, and takes
+    // stderr once that line waits for standard output.
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "stderr_note_helper",
+            "--ignored",
+            "--test-threads=1",
+            "--quiet",
+        ])
+        .env("CRABCROP_TEST_STDERR_NOTE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take());
+    let mut stdout = child.stdout.take().unwrap();
+    let printed = std::thread::spawn(move || {
+        let mut printed = String::new();
+        let _ = stdout.read_to_string(&mut printed);
+        printed
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > LONG {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the two threads deadlocked: the stderr line held stderr while it waited for \
+                 standard output\n{}",
+                printed.join().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let printed = printed.join().unwrap();
+    assert!(status.success(), "{status}\n{printed}");
+    // And once standard output was free, the note reached it.
+    assert_eq!(
+        printed
+            .matches("crabcrop: cannot write to standard error: Broken pipe")
+            .count(),
+        1,
+        "{printed}"
+    );
+}
