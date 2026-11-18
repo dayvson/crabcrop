@@ -5645,6 +5645,7 @@ fn is_video_container(bytes: &[u8]) -> bool {
 
 mod encode;
 mod jpeg_scaled;
+mod overlay_scale;
 mod webp_anim;
 pub use encode::AvifTiles;
 pub(in crate::engine) use encode::{
@@ -5680,7 +5681,11 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 /// `overlay_watermark`, as does the alpha convention: the
 /// effective alpha is the overlay pixel's alpha times the
 /// opacity, and the base alpha channel is preserved, so
-/// `Normal` reproduces a watermark exactly.
+/// `Normal` reproduces a watermark exactly. A scaled overlay
+/// is scaled only where it lands, a row at a time, with the
+/// deadline checked before each row and within a row that
+/// reads many source samples (see `overlay_scale`): the same
+/// pixels the whole scale gave there.
 #[allow(clippy::too_many_arguments)]
 fn blend_overlay(
     ctx: &ProcessContext<'_>,
@@ -5723,22 +5728,25 @@ fn blend_overlay(
     if !lands_on((base.width(), base.height()), (x, y)) {
         return Ok(base.clone());
     }
-    // The overlay is scaled first and its RGBA pixels read
-    // after, as before: the resize reads the decoded image.
-    let scaled = target.map(|target| {
-        ov.image()
-            .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
-    });
-    let top_size = match &scaled {
-        Some(scaled) => (scaled.width(), scaled.height()),
-        None => (ov.image().width(), ov.image().height()),
+    // The scaled size is known before anything is scaled, so
+    // only the part that lands is: a scale the pixel budget
+    // admits can still take long whole, and a sliver of it on
+    // the canvas no longer pays for the rest.
+    let source_size = (ov.image().width(), ov.image().height());
+    let top_size = match target {
+        Some(target) => overlay_scale::scaled_size(source_size, target),
+        None => source_size,
     };
     let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
         return Ok(base.clone());
     };
-    let top = match &scaled {
-        Some(scaled) => crate::filters::RgbaPart::of(scaled, part.0),
-        None => ov.rgba_part(part.0),
+    let top = if top_size == source_size {
+        // Scaled to its own size, the overlay is itself.
+        ov.rgba_part(part.0)
+    } else {
+        let pixels =
+            overlay_scale::scaled_part(ov.image(), top_size, part.0, || ctx.check_deadline())?;
+        crate::filters::RgbaPart::copied(pixels, (part.0.0, part.0.1), top_size)
     };
     // The blend walks every overlay pixel; a large legal pair
     // still runs long, so the deadline is honored per row

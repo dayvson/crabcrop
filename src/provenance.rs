@@ -719,6 +719,9 @@ impl ProvenanceSigner {
         tsa: Option<TimestampAuthority>,
         parts: impl Fn(&SignRequest<'_>) -> ManifestParts,
     ) -> Result<Self, String> {
+        // The SDK keeps its own copy of the key; this one is
+        // zeroed once the probe is done with it.
+        let key_pem = zeroize::Zeroizing::new(key_pem);
         let mut first_error = None;
         for alg in [
             SigningAlg::Es256,

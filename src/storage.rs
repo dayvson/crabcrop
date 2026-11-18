@@ -677,7 +677,8 @@ pub struct DiskStore {
     /// secret (issue #190): entries are written and
     /// verified under it, so an entry planted in the
     /// directory by anyone without the secret is a miss.
-    entry_key: Vec<u8>,
+    /// Zeroed when the store is dropped.
+    entry_key: zeroize::Zeroizing<Vec<u8>>,
     inner: Mutex<Inner>,
     /// Write failures, counted and logged as they happen
     /// (issue #367): a cache stays best-effort, but a tier
@@ -1093,7 +1094,7 @@ impl DiskStore {
         Self {
             dir: dir.to_path_buf(),
             max_bytes,
-            entry_key,
+            entry_key: zeroize::Zeroizing::new(entry_key),
             inner: Mutex::new(Inner::new()),
             errors: std::sync::atomic::AtomicU64::new(0),
             permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
@@ -3744,9 +3745,10 @@ const TOMBSTONE_MAGIC: &str = "CRABPURGE1";
 pub(crate) const MAX_TOMBSTONE_BYTES: usize = 64 * 1024;
 
 /// The tombstone MAC key: the entry key under a label of
-/// its own.
-fn tombstone_mac_key(entry_key: &[u8]) -> [u8; 32] {
-    entry_mac(entry_key, b"crabcrop purge tombstone v1")
+/// its own, zeroed when the caller is done with it, like the
+/// entry key itself.
+fn tombstone_mac_key(entry_key: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    zeroize::Zeroizing::new(entry_mac(entry_key, b"crabcrop purge tombstone v1"))
 }
 
 fn target_parts(target: &PurgeTarget) -> (&'static str, &str) {
@@ -3769,7 +3771,7 @@ pub(crate) fn serialize_tombstone(tombstone: &Tombstone, entry_key: &[u8]) -> Ve
     }));
     let mut body = format!("{kind}\n{start}\n{ended}\n{}\n", name.len()).into_bytes();
     body.extend_from_slice(name.as_bytes());
-    let mac = entry_mac(&tombstone_mac_key(entry_key), &body);
+    let mac = entry_mac(tombstone_mac_key(entry_key).as_slice(), &body);
     let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
     let mut out = format!("{TOMBSTONE_MAGIC}\n{mac_hex}\n").into_bytes();
     out.extend_from_slice(&body);
@@ -3795,7 +3797,7 @@ pub(crate) fn parse_tombstone(data: &[u8], entry_key: &[u8]) -> Option<Tombstone
     let mac_vec = hex_decode(mac_line)?;
     let mut mac = [0u8; 32];
     mac.copy_from_slice(&mac_vec);
-    if !verify_entry_mac(&tombstone_mac_key(entry_key), &data[pos..], &mac) {
+    if !verify_entry_mac(tombstone_mac_key(entry_key).as_slice(), &data[pos..], &mac) {
         return None;
     }
     let kind = take_line(data, &mut pos)?;
@@ -4147,7 +4149,7 @@ mod tests {
         // Well-MACed but malformed bodies: an unknown kind,
         // an unstamped start, a bad end, a lying length.
         let signed = |body: &str| {
-            let mac = entry_mac(&tombstone_mac_key(&key), body.as_bytes());
+            let mac = entry_mac(tombstone_mac_key(&key).as_slice(), body.as_bytes());
             let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
             format!("{TOMBSTONE_MAGIC}\n{mac_hex}\n{body}").into_bytes()
         };

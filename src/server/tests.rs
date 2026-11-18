@@ -11,6 +11,7 @@ mod disk_stall;
 mod meta_frame;
 mod request_log;
 mod shared_state;
+mod upload_pace;
 
 const SECRET: &[u8] = b"test-secret";
 
@@ -254,7 +255,7 @@ fn providers_mut(state: &mut AppState) -> &mut Providers {
 fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
     AppState {
         allow_unsafe,
-        metrics_token,
+        metrics_token: metrics_token.map(Into::into),
         ..test_state()
     }
 }
@@ -11522,7 +11523,7 @@ async fn slow_lane_overflow_waits_in_its_own_lane() {
 /// lane occupancy exposition can be read back.
 async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>) -> String {
     let state = AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         process_gate,
         slow_gate,
         ..test_state()
@@ -11578,7 +11579,7 @@ async fn metrics_expose_each_gates_occupancy() {
     // permits in use against their capacity the same way,
     // read live: holding permits by hand moves the gauges.
     let state = Arc::new(AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         ai_gate: Arc::new(Gate::new(3)),
         ..test_state()
     });
@@ -12556,7 +12557,7 @@ async fn spawn_app_with_upload_gate(
                 file_root: Some(dir.clone()),
                 ..Default::default()
             }),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         upload: Some(Arc::new(crate::upload::UploadStore::local(
             dir,
             max_bytes,
@@ -15287,7 +15288,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     let disk = state.store.clone().unwrap();
@@ -18037,7 +18038,7 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     // it.
     let dir = crate::test_support::scratch_dir("metrics-one-buffer");
     let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     state.request_log = RequestLog::queued_to(crate::observe::FakeStdout::default());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
@@ -18151,7 +18152,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     let fake = crate::s3store::test_support::start_fake().await;
     fake.hold_puts.store(true, Ordering::SeqCst);
     let mut state = tier_test_state(None, &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let shared = state.shared_store.clone().unwrap();
     let base = serve_state(&state).await;
@@ -18758,7 +18759,7 @@ async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     state.shared_store = None;
     state.loader = loader;
     state.fallback = fallback;
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     serve_state(&state).await
 }

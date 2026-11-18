@@ -320,8 +320,17 @@ fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
         &default_policy,
     )
     .expect("a warning under the default policy");
-    assert!(warning.contains("(HTTPS_PROXY)"), "{warning}");
-    assert!(warning.contains("CRABCROP_ALLOWED_SOURCES"), "{warning}");
+    // Word for word what boot printed before the allowlist
+    // opt-in gave the warning a second form.
+    assert_eq!(
+        warning,
+        "a proxy is configured (HTTPS_PROXY), but source fetches bypass it: with \
+         private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
+         CRABCROP_ALLOWED_SOURCES, each source host is pinned to the address the check \
+         validated and connected to directly, so under proxy-only egress those fetches \
+         fail. List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through \
+         the proxy (see docs/configuration.md)"
+    );
     // The value is never echoed: a proxy URL can carry
     // credentials.
     assert!(!warning.contains("hunter2"), "{warning}");
@@ -375,6 +384,53 @@ fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
             "{pairs:?}"
         );
     }
+    // With the check kept for allowlisted hosts, they are
+    // pinned too, and listing them no longer routes them
+    // through the proxy: the warning says so.
+    let policy = build_source_policy(env_of(&[
+        ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+        ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+    ]))
+    .unwrap();
+    assert!(policy.pins_hostnames());
+    let warning = proxy_bypass_warning(proxied("HTTPS_PROXY"), &policy).unwrap();
+    assert!(
+        warning.contains("Turn CRABCROP_CHECK_ALLOWED_SOURCES off"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn allowlisted_hosts_can_be_held_to_the_private_address_check() {
+    // Off by default: listed hosts skip the check, as the
+    // configuration reference has always said.
+    let listed = ("CRABCROP_ALLOWED_SOURCES", "images.example.com,10.0.0.5");
+    let policy = build_source_policy(env_of(&[listed])).unwrap();
+    assert!(policy.block_private && !policy.check_allowlisted);
+    assert!(!policy.checks(true) && policy.checks(false));
+    let policy =
+        build_source_policy(env_of(&[listed, ("CRABCROP_CHECK_ALLOWED_SOURCES", "1")])).unwrap();
+    assert!(policy.check_allowlisted);
+    assert!(policy.checks(true) && policy.checks(false));
+    // Asking for the check while switching it off is a
+    // contradiction, refused at boot whichever switch does it.
+    for off in [
+        ("CRABCROP_BLOCK_PRIVATE_SOURCES", "0"),
+        ("CRABCROP_ALLOW_ANY_SOURCE", "1"),
+    ] {
+        let err = expect_err(build_source_policy(env_of(&[
+            listed,
+            ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            off,
+        ])));
+        assert!(err.contains("CRABCROP_CHECK_ALLOWED_SOURCES"), "{err}");
+        assert!(err.contains(off.0), "{err}");
+    }
+    let err = expect_err(build_source_policy(env_of(&[(
+        "CRABCROP_CHECK_ALLOWED_SOURCES",
+        "maybe",
+    )])));
+    assert!(err.contains("CRABCROP_CHECK_ALLOWED_SOURCES"), "{err}");
 }
 
 #[test]
@@ -480,6 +536,14 @@ fn a_value_that_only_contains_a_placeholder_is_not_one() {
 }
 
 #[test]
+fn a_secret_setting_zeroes_its_value() {
+    // What dropping a secret setting runs.
+    let mut token = Secret("a-metrics-token-of-32-bytes-0123".to_string());
+    zeroize::Zeroize::zeroize(&mut token);
+    assert_eq!(token.expose(), "");
+}
+
+#[test]
 fn a_metrics_token_under_16_bytes_warns_without_quoting_it() {
     let warning = metrics_token_warning(&Secret("fifteen-bytes!!".to_string()))
         .expect("a warning for 15 bytes");
@@ -499,7 +563,7 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
     // allowlist's host count and the private-address check.
     let presets = temp_file("posture-presets", b"thumb = 300x200\n");
     let presets = presets.path.as_str();
-    let cases: [(&[(&str, &str)], &str); 8] = [
+    let cases: [(&[(&str, &str)], &str); 11] = [
         (
             &[],
             "request mode: signed; source allowlist: none; private-address check: on",
@@ -525,14 +589,21 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
         ),
         (
             &[("CRABCROP_ALLOWED_SOURCES", "images.example.com")],
-            "request mode: signed; source allowlist: 1 host; private-address check: on",
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
+        ),
+        (
+            &[("CRABCROP_ALLOWED_SOURCES", "192.0.2.10")],
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
         ),
         (
             &[(
                 "CRABCROP_ALLOWED_SOURCES",
                 "a.example, ,b.example,.c.example",
             )],
-            "request mode: signed; source allowlist: 3 hosts; private-address check: on",
+            "request mode: signed; source allowlist: 3 hosts; \
+             private-address check: on, allowlisted hosts exempt",
         ),
         (
             &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
@@ -541,6 +612,20 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
         (
             &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
             "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+        (
+            &[
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+                ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            ],
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts included",
+        ),
+        (
+            // With no allowlist, holding listed hosts to the check
+            // changes nothing, so the line says only that it is on.
+            &[("CRABCROP_CHECK_ALLOWED_SOURCES", "1")],
+            "request mode: signed; source allowlist: none; private-address check: on",
         ),
     ];
     for (pairs, line) in cases {
@@ -1291,6 +1376,42 @@ fn the_connection_bounds_default_and_check_their_range() {
 }
 
 #[test]
+fn the_per_client_share_is_off_unless_set() {
+    // A directly exposed server can hold each client to a
+    // share of the connection cap; 0, the default, is no
+    // share, as it must be behind a proxy.
+    let set = |v: &str| connection_limits(&env_of(&[("CRABCROP_MAX_CONNECTIONS_PER_CLIENT", v)]));
+    assert_eq!(connection_limits(&env_of(&[])).unwrap().per_client, None);
+    assert_eq!(set("0").unwrap().per_client, None);
+    assert_eq!(set("1").unwrap().per_client, Some(1));
+    assert_eq!(set("16").unwrap().per_client, Some(16));
+    for bad in ["-1", "1000001", "some", ""] {
+        let err = expect_err(set(bad));
+        assert!(
+            err.contains("CRABCROP_MAX_CONNECTIONS_PER_CLIENT"),
+            "{bad:?}: {err}"
+        );
+    }
+    // The boot line names the share only when one is set,
+    // so the line is unchanged for every server without it.
+    let line = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().connections_line();
+    let plain = line(&[("CRABCROP_MAX_CONNECTIONS", "100")]);
+    assert_eq!(
+        plain,
+        "connections: bind 0.0.0.0, at most 100 open, header timeout 30s, idle timeout 3900s"
+    );
+    let shared = line(&[
+        ("CRABCROP_MAX_CONNECTIONS", "100"),
+        ("CRABCROP_MAX_CONNECTIONS_PER_CLIENT", "8"),
+    ]);
+    assert_eq!(
+        shared,
+        "connections: bind 0.0.0.0, at most 100 open, at most 8 per client, \
+         header timeout 30s, idle timeout 3900s"
+    );
+}
+
+#[test]
 fn the_source_buffer_budget_follows_the_configured_fetch_cap() {
     const MB: u64 = 1024 * 1024;
     let budget = |pairs: &[(&str, &str)], permits| source_buffer_budget(env_of(pairs), permits);
@@ -1637,6 +1758,7 @@ fn from_env_reads_every_default() {
             ),
             idle_timeout: std::time::Duration::from_secs(crate::server::DEFAULT_IDLE_TIMEOUT_SECS),
             max_connections: default_max_connections(),
+            per_client: None,
         }
     );
     let lanes = (config.process_permits + config.slow_lane_permits) as u64;

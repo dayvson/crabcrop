@@ -8707,6 +8707,109 @@ fn overlay_blend_honors_the_deadline() {
 }
 
 #[test]
+fn a_scaled_overlay_stops_at_the_deadline_while_it_scales() {
+    // A 500 px overlay at 100% of a 2000 px base lands whole,
+    // 2000x2000. Scaled in one call, it ran to the end before
+    // the deadline was looked at again; scaled a row at a
+    // time, it stops within a row of the deadline.
+    let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        2000,
+        2000,
+        image::Rgb([255, 0, 0]),
+    ));
+    let ov = WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        500,
+        500,
+        |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 7]),
+    )));
+    let started = std::time::Instant::now();
+    let ctx = ProcessContext {
+        deadline: Some(started + std::time::Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let err = blend_overlay(
+        &ctx,
+        &base,
+        &ov,
+        0,
+        0,
+        100,
+        crate::url::BlendMode::Normal,
+        Some(100),
+    )
+    .unwrap_err();
+    assert!(matches!(err, EngineError::Timeout), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the scale ran {:?} past a 50 ms deadline",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_scaled_part_is_computed_a_row_at_a_time() {
+    // The callback runs once before each row of the part, and
+    // the first error ends the scale there.
+    let ov = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        30,
+        20,
+        image::Rgba([10, 20, 30, 40]),
+    ));
+    let size = overlay_scale::scaled_size((30, 20), 90);
+    assert_eq!(size, (90, 60));
+    let mut rows = 0;
+    let part = overlay_scale::scaled_part(&ov, size, (10, 5, 40, 12), || {
+        rows += 1;
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(part.dimensions(), (40, 12));
+    assert_eq!(rows, 12);
+    let mut rows = 0;
+    let stopped = overlay_scale::scaled_part(&ov, size, (0, 0, 90, 60), || {
+        rows += 1;
+        if rows == 3 { Err("deadline") } else { Ok(()) }
+    });
+    assert_eq!(stopped.unwrap_err(), "deadline");
+    assert_eq!(rows, 3);
+}
+
+#[test]
+fn a_scaled_row_that_reads_many_source_rows_checks_the_deadline_within_it() {
+    // Scaled down to one row, a tall overlay's every source
+    // row feeds that row: 64 columns of 65,536 rows, 4M
+    // samples. The check runs before the row and again for
+    // each further `CHECK_EVERY` samples (1M) it reads, so a
+    // row's work is bounded by the deadline too, and the
+    // pixels are still the crate's.
+    let (w, h) = (64, 1 << 16);
+    let ov = DynamicImage::ImageLuma8(image::GrayImage::from_fn(w, h, |x, y| {
+        image::Luma([((x * 31 + y * 7) % 256) as u8])
+    }));
+    assert_eq!(overlay_scale::CHECK_EVERY, 1 << 20);
+    let mut checks = 0;
+    let part = overlay_scale::scaled_part(&ov, (w, 1), (0, 0, w, 1), || {
+        checks += 1;
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(checks, 4);
+    let whole = ov
+        .resize_exact(w, 1, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    assert_eq!(part.as_raw(), whole.as_raw());
+    // An error from a check inside the row stops the scale
+    // there.
+    let mut checks = 0;
+    let stopped = overlay_scale::scaled_part(&ov, (w, 1), (0, 0, w, 1), || {
+        checks += 1;
+        if checks == 2 { Err("deadline") } else { Ok(()) }
+    });
+    assert_eq!(stopped.unwrap_err(), "deadline");
+    assert_eq!(checks, 2);
+}
+
+#[test]
 fn unresolved_overlay_is_an_error() {
     let engine = Engine;
     let err = engine

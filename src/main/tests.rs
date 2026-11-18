@@ -1320,7 +1320,10 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     assert_eq!(state.process_gate.capacity(), config.process_permits);
     assert_eq!(state.slow_gate.capacity(), 3);
     // The settings reach the state as validated.
-    assert_eq!(state.metrics_token.as_deref(), Some("metrics-token"));
+    assert_eq!(
+        state.metrics_token.as_ref().map(|token| token.as_str()),
+        Some("metrics-token")
+    );
     assert!(state.meta_enabled);
     assert!(!state.client_hints);
     assert!(!state.explain_enabled);
