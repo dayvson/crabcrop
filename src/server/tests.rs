@@ -3351,13 +3351,15 @@ fn resolve_by_three_walks(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    let own_len = ops.len();
     let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     crate::url::check_operation_count(&ops).map_err(grammar)?;
     crate::url::check_watermark_count(&ops).map_err(grammar)?;
-    let (source_url, _) =
+    let (source_url, root) =
         crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
+    let checked_at = now_unix();
     if let Some(exp) = expiry
-        && now_unix() >= exp
+        && checked_at >= exp
     {
         return Err(Refusal::AsIs((
             StatusCode::FORBIDDEN,
@@ -3367,15 +3369,27 @@ fn resolve_by_three_walks(
     }
     Ok(Resolved {
         ops,
+        own_len,
         source_url,
+        root,
         groups,
         max_age,
+        expiry: expiry.map(|at| Expiry { at, checked_at }),
     })
 }
 
-/// A resolved request: its operations, source, groups and
-/// cache lifetime.
-type ResolvedParts = (Vec<crate::url::Operation>, String, Vec<String>, Option<u32>);
+/// A resolved request: its operations, how many of them are
+/// its own, its source and the root reference it was written
+/// as, its groups, its cache lifetime and its expiry.
+type ResolvedParts = (
+    Vec<crate::url::Operation>,
+    usize,
+    String,
+    Option<crate::url::RootRef>,
+    Vec<String>,
+    Option<u32>,
+    Option<u64>,
+);
 
 /// A refusal: its kind, and its answer when it has its own.
 type RefusalParts = (&'static str, Option<ErrorParts>);
@@ -3386,9 +3400,12 @@ fn resolved_parts(resolved: Result<Resolved, Refusal>) -> Result<ResolvedParts, 
     match resolved {
         Ok(resolved) => Ok((
             resolved.ops,
+            resolved.own_len,
             resolved.source_url,
+            resolved.root,
             resolved.groups,
             resolved.max_age,
+            resolved.expiry.map(|expiry| expiry.at),
         )),
         Err(Refusal::Unopened) => Err(("unopened", None)),
         Err(Refusal::Payload(parts)) => Err(("payload", Some(parts))),

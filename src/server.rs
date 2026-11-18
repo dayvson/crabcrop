@@ -1242,29 +1242,28 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// the self-explaining URL report (issue #196; the report
 /// itself is built in [`crate::explain`]).
 ///
-/// The checks mirror the image path exactly and run in its
-/// order: signature grammar, signature verification, the
-/// reserved-segment guard, preset expansion, operation
-/// parsing, the operation cap, expiry. Only then is the
-/// source touched, once, through the loader with all of
-/// its guards, and the facts come from header probing
-/// (`crate::engine::probe_source`): no decode, no
-/// detection, no process, AI, or video gate (an SVG, AVIF,
-/// or HEIC probe takes the probe gate, see
+/// The request runs in stages. [`admit_explained`] admits
+/// it through the image path's own [`authenticate`] and
+/// [`resolve_request`], so a URL this route admits is one
+/// the image route admits, and a refusal is the image
+/// path's own status and body (issue #741). Only then is
+/// the source touched, once, through the loader with all
+/// of its guards ([`probe_explained`]), and the facts come
+/// from header probing (`crate::engine::probe_source`): no
+/// decode, no detection, no process, AI, or video gate (an
+/// SVG, AVIF, or HEIC probe takes the probe gate, see
 /// [`explain_probe`]), and nothing written to any cache
-/// tier. A bad signature, an over-cap operation list, or an
-/// expired URL therefore costs zero
-/// source fetches, and answers with the image path's own
-/// status and body.
+/// tier. A bad signature, an over-cap operation list, or
+/// an expired URL therefore costs zero source fetches.
+/// [`explain_report`] builds the report and
+/// [`explain_response`] answers it.
 async fn explain_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let accept = accept_of(&headers);
+    let accept = accept.as_deref();
     // With `CRABCROP_EXPLAIN=0` the route is off (issue #591):
     // every request answers the router's own `404 not_found`
     // before the signature is read, so the answer is the
@@ -1274,7 +1273,7 @@ async fn explain_handle(
             StatusCode::NOT_FOUND,
             "not_found",
             "not found".to_string(),
-            accept.as_deref(),
+            accept,
         );
     }
     let Some(tail) = uri.path().strip_prefix("/explain/") else {
@@ -1282,134 +1281,88 @@ async fn explain_handle(
             StatusCode::BAD_REQUEST,
             "invalid_path",
             "expected /explain/<signature>/<target>".to_string(),
-            accept.as_deref(),
+            accept,
         );
     };
     let full = format!("/{tail}");
-    // A sealed spelling is refused wholesale (issue #255):
-    // the server never unseals as a service, because an
-    // endpoint that opens tokens would be an unsealing
-    // oracle for anyone who lifts one off a public page.
-    // Operators unseal locally (the CLI's `unseal` verb,
-    // under their own secret) and then explain the plain
-    // form. The refusal is the uniform one and no source
-    // fetch happens for it.
-    let first_segment = tail.split('/').next().unwrap_or("");
-    if crate::url::looks_sealed(first_segment) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
-    }
-    let (signature, key_id, rest) = match parse_signature(&full) {
-        Ok(v) => v,
-        Err(e) => return parse_failure(&e, accept.as_deref()),
+    let (credential, resolved) = match admit_explained(&state, &full) {
+        Ok((opened, resolved)) => (opened.credential, resolved),
+        // Only plain spellings are admitted here, so every
+        // refusal is the plain spelling's own answer, as on
+        // the image route.
+        Err(refusal) => return refusal.answer(false, accept),
     };
-    // The reserved segment is refused before verification,
-    // as on the image path.
-    if crabcrop_url::is_reserved_remainder(rest) {
-        let (status, code, message) = reserved_remainder_parts();
-        return error_response(status, code, message, accept.as_deref());
-    }
-    if !state
-        .keyring
-        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
-    }
-    // The same domain separation as the image path: a
-    // remainder may not begin with a reserved segment.
-    if matches!(
-        rest.split('/').next(),
-        Some("purge" | "purge-group" | "upload")
-    ) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "reserved_segment",
-            "an image URL may not begin with a purge or upload segment".to_string(),
-            accept.as_deref(),
-        );
-    }
-    let groups = crate::url::preset_names(rest);
-    // Expansion always runs, even with no presets loaded:
-    // a `preset:` segment is a grammar error
-    // (`unknown_preset`) on every server, never source text.
-    let expanded;
-    let rest = match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
-        Ok(text) => {
-            expanded = text;
-            &expanded
-        }
-        Err(e) => return parse_failure(&e, accept.as_deref()),
+    let (source_bytes, probe) = match probe_explained(&state, &resolved, accept).await {
+        Ok(facts) => facts,
+        Err(response) => return response,
     };
-    let (ops, source_url, expiry, _) = match parse_operations_with_expiry(rest) {
-        Ok(v) => v,
-        Err(e) => return parse_failure(&e, accept.as_deref()),
-    };
-    // The operation cap (issue #469) and the watermark URL
-    // cap (issue #613), on the list the image path counts
-    // (the defaults merged in) and at the same point: an
-    // over-cap URL answers its 400 here, before the probe
-    // fetch.
-    let counted = crate::url::merge_default_ops(&state.default_ops, ops.clone());
-    if let Err(e) = crate::url::check_operation_count(&counted)
-        .and_then(|()| crate::url::check_watermark_count(&counted))
-    {
-        return parse_failure(&e, accept.as_deref());
-    }
-    // A root source expands for the probe fetch only: the
-    // report below carries the source exactly as written
-    // and the root's name, never the base URL the reference
-    // resolves to (operator configuration, issue #248).
-    let (fetch_url, root_ref) =
-        match crate::url::expand_source_root(source_url, &state.source_roots) {
-            Ok(v) => v,
-            Err(e) => return parse_failure(&e, accept.as_deref()),
-        };
-    // Server-wide defaults merge here, once, exactly as the
-    // image path merges them: the admission, the canonical
-    // form, and the forecast all follow the list the image
-    // request runs (issue #468). The report's operation
-    // list stays `ops`, the URL's own, so it never credits
-    // the URL with a default.
-    let merged = crate::url::merge_default_ops(&state.default_ops, ops.clone());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(exp) = expiry
-        && now >= exp
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "signature_expired",
-            "signature expired".to_string(),
-            accept.as_deref(),
-        );
-    }
+    let report = explain_report(
+        &state,
+        &headers,
+        credential,
+        resolved,
+        source_bytes,
+        probe,
+        full,
+    );
+    explain_response(&report, accept)
+}
 
-    // The single bounded source fetch, through the loader
-    // and its policy. Watermark and overlay sources are
-    // operations' inputs, not the explained URL's source,
-    // and are never fetched: no fan-out. A `frame:`
-    // segment makes the source a video, so the loader may
-    // accept a `video/*` Content-Type for it (issue #214);
-    // a `page:` segment does the same for
-    // `application/pdf` (issue #215). Explain never runs
-    // either tool: the fetch is admitted, the probe stays
-    // the raw-bytes probe.
+/// The first stage of [`explain_handle`]: the image path's
+/// admission, [`authenticate`] and [`resolve_request`]
+/// themselves (issue #741), so the two routes cannot
+/// disagree on which plain URLs they admit or on how they
+/// refuse the rest.
+///
+/// A sealed spelling is refused before either runs,
+/// wholesale (issue #255): the server never unseals as a
+/// service, because an endpoint that opens tokens would be
+/// an unsealing oracle for anyone who lifts one off a
+/// public page. Operators unseal locally (the CLI's
+/// `unseal` verb, under their own secret) and then explain
+/// the plain form. The refusal is the uniform
+/// `bad_signature`, and no source fetch happens for it.
+fn admit_explained<'a>(state: &AppState, full: &'a str) -> Result<(Opened<'a>, Resolved), Refusal> {
+    let nolead = full.strip_prefix('/').unwrap_or(full);
+    if crate::url::looks_sealed(nolead.split('/').next().unwrap_or("")) {
+        return Err(Refusal::AsIs(bad_signature_parts()));
+    }
+    // The stages time their work into a request record. An
+    // explain request owes the request log no line, so this
+    // one goes nowhere.
+    let mut record = RequestRecord::default();
+    let opened = authenticate(state, full, &mut record)?;
+    let resolved = resolve_request(state, &opened.remainder, &mut record)?;
+    Ok((opened, resolved))
+}
+
+/// The second stage of [`explain_handle`]: the single
+/// bounded source fetch, through the loader and its
+/// policy, and the probe of the head it read
+/// ([`explain_probe`]). Returns the source's encoded size
+/// when the fetch states it, and the probe; a failed fetch,
+/// or a probe shed for a full gate, is the answer instead.
+async fn probe_explained(
+    state: &AppState,
+    resolved: &Resolved,
+    accept: Option<&str>,
+) -> Result<(Option<usize>, crate::engine::SourceProbe), Response> {
+    // Watermark and overlay sources are operations' inputs,
+    // not the explained URL's source, and are never fetched:
+    // no fan-out. A `frame:` segment makes the source a
+    // video, so the loader may accept a `video/*`
+    // Content-Type for it (issue #214); a `page:` segment
+    // does the same for `application/pdf` (issue #215).
+    // Explain never runs either tool: the fetch is admitted,
+    // the probe stays the raw-bytes probe. Both are read
+    // from the merged list, the one the image request runs.
     let admission = crate::loader::MediaAdmission {
-        video: merged
+        video: resolved
+            .ops
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: merged
+        pdf: resolved
+            .ops
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
@@ -1418,39 +1371,62 @@ async fn explain_handle(
     // identifies the source instead of downloading the
     // whole body (which also keeps this route off the
     // result cache's coalescing path by construction: it
-    // never held a whole body to share).
-    let fetched = match state
+    // never held a whole body to share). A root source is
+    // fetched at its expansion.
+    let crate::loader::ProbeLoad { head, total_bytes } = state
         .loader
-        .load_probe(&fetch_url, admission, &probe_settled)
+        .load_probe(&resolved.source_url, admission, &probe_settled)
         .await
-    {
-        Ok(fetched) => fetched,
-        Err(e) => return explain_load_error(e, accept.as_deref()),
-    };
-    let Some(probe) = explain_probe(&state, fetched.head).await else {
-        return busy_response(
+        .map_err(|e| explain_load_error(e, accept))?;
+    let Some(probe) = explain_probe(state, head).await else {
+        return Err(busy_response(
             "server busy: too many source probes running at once",
             5,
-            accept.as_deref(),
-        );
+            accept,
+        ));
     };
+    Ok((total_bytes.map(|n| n as usize), probe))
+}
 
+/// The third stage of [`explain_handle`]: the report on an
+/// admitted URL and its probed source.
+///
+/// The forecast, the canonical form and the admission all
+/// follow the operations the image request runs, the
+/// server-wide defaults merged in (issue #468); the
+/// report's operation list is the URL's own, so it never
+/// credits the URL with a default. The source is reported
+/// exactly as written, with a root's name, never the base
+/// URL a root reference resolves to (operator
+/// configuration, issue #248).
+fn explain_report(
+    state: &AppState,
+    headers: &HeaderMap,
+    credential: Credential,
+    resolved: Resolved,
+    source_bytes: Option<usize>,
+    probe: crate::engine::SourceProbe,
+    image_path: String,
+) -> crate::explain::Report {
+    let ops = resolved.own_ops().to_vec();
     // Each referenced preset with the operations its
     // definition expands to. Definitions were validated at
     // boot; one that no longer parses (it cannot) is listed
     // by name alone rather than failing the report.
-    let mut presets = Vec::new();
-    for name in &groups {
-        let entry_ops = state
-            .presets
-            .get(name)
-            .and_then(|definition| {
-                crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
-            })
-            .unwrap_or_default();
-        presets.push(crate::explain::preset_entry(name, &entry_ops));
-    }
-
+    let presets = resolved
+        .groups
+        .iter()
+        .map(|name| {
+            let entry_ops = state
+                .presets
+                .get(name)
+                .and_then(|definition| {
+                    crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
+                })
+                .unwrap_or_default();
+            crate::explain::preset_entry(name, &entry_ops)
+        })
+        .collect();
     // The canonical form is the cache key's path form, of
     // the merged list as the image path keys it. The key's
     // config fingerprint suffix is operator state and stays
@@ -1461,30 +1437,49 @@ async fn explain_handle(
     // itself is keyed on the expansion, but printing that
     // here would publish the root's base URL into the
     // report.
-    let canonical = crate::url::canonical_form(&merged, source_url);
-    let report = crate::explain::Report::new(crate::explain::ReportInput {
-        signed: !matches!(signature, crate::url::Signature::Unsafe),
+    let source_url = resolved.written_source();
+    let canonical = crate::url::canonical_form(&resolved.ops, &source_url);
+    let (signed, key_id) = match credential {
+        Credential::Signature(key_id) => (true, key_id),
+        Credential::Unsafe => (false, None),
+        // Never admitted here (see `admit_explained`).
+        Credential::Sealed => (true, None),
+    };
+    // The expiry verdict reads the clock the admission read,
+    // so the report never calls a URL it admitted expired.
+    let (expiry, now) = match resolved.expiry {
+        Some(expiry) => (Some(expiry.at), expiry.checked_at),
+        None => (None, unix_seconds()),
+    };
+    crate::explain::Report::new(crate::explain::ReportInput {
+        signed,
         key_id,
         expiry,
         now,
-        source_url: source_url.to_string(),
-        source_root: root_ref.map(|r| r.name),
+        source_url,
+        source_root: resolved.root.map(|r| r.name),
         probe,
         // The DPR hint is read as the image path reads it, so
         // the forecast steps a hinted factor down as the image
         // request does (issue #529), and not at all with
         // client hints off.
-        dpr_hint: dpr_hint(&headers).filter(|_| state.client_hints),
-        source_bytes: fetched.total_bytes.map(|n| n as usize),
+        dpr_hint: dpr_hint(headers).filter(|_| state.client_hints),
+        source_bytes,
         ops,
-        merged_ops: merged,
+        merged_ops: resolved.ops,
         presets,
         canonical,
-        cache_group: groups.into_iter().next(),
-        image_path: full,
-    });
+        cache_group: resolved.groups.into_iter().next(),
+        image_path,
+    })
+}
 
-    let (content_type, body) = if crate::explain::wants_json(accept.as_deref()) {
+/// The last stage of [`explain_handle`]: the report as the
+/// client asked for it, JSON for a JSON `Accept` and the
+/// HTML page otherwise, stored nowhere and served under a
+/// policy that runs no script.
+fn explain_response(report: &crate::explain::Report, accept: Option<&str>) -> Response {
+    let (content_type, body) = if crate::explain::wants_json(accept) {
         (
             "application/json",
             serde_json::to_string(&report.to_json()).unwrap_or_default(),
@@ -3181,7 +3176,9 @@ async fn serve(
     let save_data = hints && save_data_hint(headers);
     let full = format!("/{path}");
     let opened = authenticate(state, &full, &mut record);
-    let sealed = opened.as_ref().is_ok_and(|opened| opened.sealed);
+    let sealed = opened
+        .as_ref()
+        .is_ok_and(|opened| matches!(opened.credential, Credential::Sealed));
     let admitted = opened.and_then(|opened| {
         let resolved = resolve_request(state, &opened.remainder, &mut record)?;
         let negotiated = negotiate(state, &resolved.ops, accept, dpr, width, save_data)?;
@@ -3275,9 +3272,20 @@ struct Opened<'a> {
     /// The remainder as presented, or as its sealed token
     /// decrypts.
     remainder: std::borrow::Cow<'a, str>,
-    /// Whether the request arrived in the sealed spelling
-    /// (issue #255).
-    sealed: bool,
+    /// What admitted it.
+    credential: Credential,
+}
+
+/// What admitted a remainder (see [`authenticate`]).
+enum Credential {
+    /// A sealed token that opened: the request arrived in
+    /// the sealed spelling (issue #255).
+    Sealed,
+    /// A signature that verified, with the key ID its
+    /// segment named, if any (issue #143).
+    Signature(Option<String>),
+    /// The `unsafe` segment, on a server that allows it.
+    Unsafe,
 }
 
 /// The first stage of [`serve`]: verify the signature over
@@ -3324,7 +3332,7 @@ fn authenticate<'a>(
         return match opened {
             Some(text) => Ok(Opened {
                 remainder: std::borrow::Cow::Owned(text),
-                sealed: true,
+                credential: Credential::Sealed,
             }),
             None => Err(Refusal::Unopened),
         };
@@ -3348,15 +3356,15 @@ fn authenticate<'a>(
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
     record.verify = verify_start.elapsed();
     if !verified {
-        return Err(Refusal::AsIs((
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-        )));
+        return Err(Refusal::AsIs(bad_signature_parts()));
     }
+    let credential = match signature {
+        crate::url::Signature::Hmac(_) => Credential::Signature(key_id),
+        crate::url::Signature::Unsafe => Credential::Unsafe,
+    };
     Ok(Opened {
         remainder: std::borrow::Cow::Borrowed(rest),
-        sealed: false,
+        credential,
     })
 }
 
@@ -3365,12 +3373,55 @@ struct Resolved {
     /// The operations the engine runs: the remainder's
     /// own, with the server-wide defaults merged in.
     ops: Vec<crate::url::Operation>,
+    /// How many of `ops` are the remainder's own: the
+    /// last ones, since [`crate::url::merge_default_ops`]
+    /// puts a request's operations after the defaults it
+    /// keeps.
+    own_len: usize,
     /// The source to fetch, a root source expanded.
     source_url: String,
+    /// The root reference the source was written as
+    /// (issue #248), when it was one.
+    root: Option<crate::url::RootRef>,
     /// The cache groups (RFC 9875).
     groups: Vec<String>,
     /// The `maxage:` cache lifetime (issue #159).
     max_age: Option<u32>,
+    /// The `exp:` the URL carries, when it carries one.
+    expiry: Option<Expiry>,
+}
+
+impl Resolved {
+    /// The remainder's own operations, without the
+    /// server-wide defaults.
+    fn own_ops(&self) -> &[crate::url::Operation] {
+        &self.ops[self.ops.len() - self.own_len..]
+    }
+
+    /// The source as the URL wrote it: a root reference as
+    /// written, never its expansion.
+    fn written_source(&self) -> String {
+        match &self.root {
+            Some(root) => root.written(),
+            None => self.source_url.clone(),
+        }
+    }
+}
+
+/// A URL's `exp:` second and the clock reading it was
+/// admitted at, in unix seconds.
+#[derive(Clone, Copy)]
+struct Expiry {
+    at: u64,
+    checked_at: u64,
+}
+
+/// The clock in whole unix seconds, the unit of `exp:`.
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The second stage of [`serve`]: expand and parse the
@@ -3378,6 +3429,10 @@ struct Resolved {
 /// what it may not ask for: a reserved segment, a preset
 /// or grammar failure, too many operations, an unknown
 /// source root, or an expired URL, in that order.
+///
+/// It and [`authenticate`] are the explain route's
+/// admission too ([`admit_explained`]), so a refusal added
+/// to either holds on both routes.
 fn resolve_request(
     state: &AppState,
     rest: &str,
@@ -3450,6 +3505,7 @@ fn resolve_request(
     // directive (format, quality, fill) by coming later. The
     // signature never covers the defaults: they are operator
     // configuration, not request content.
+    let own_len = ops.len();
     let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     // The operation cap (issue #469) counts this merged list,
     // the one the engine runs, and answers here: before the
@@ -3467,7 +3523,7 @@ fn resolve_request(
     // are one render, sharing a cache entry and a purge
     // target. The loader's checks evaluate the expanded
     // URL unchanged, the allowlist included.
-    let (source_url, _) =
+    let (source_url, root) =
         crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
@@ -3475,24 +3531,28 @@ fn resolve_request(
     // cache: an expired URL never serves, cached or not. The
     // comparison is exact: the URL is valid strictly before
     // its `exp` second.
-    if let Some(exp) = expiry {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now >= exp {
-            return Err(Refusal::AsIs((
-                StatusCode::FORBIDDEN,
-                "signature_expired",
-                "signature expired".to_string(),
-            )));
+    let expiry = match expiry {
+        Some(at) => {
+            let checked_at = unix_seconds();
+            if checked_at >= at {
+                return Err(Refusal::AsIs((
+                    StatusCode::FORBIDDEN,
+                    "signature_expired",
+                    "signature expired".to_string(),
+                )));
+            }
+            Some(Expiry { at, checked_at })
         }
-    }
+        None => None,
+    };
     Ok(Resolved {
         ops,
+        own_len,
         source_url,
+        root,
         groups,
         max_age,
+        expiry,
     })
 }
 
@@ -6302,6 +6362,16 @@ fn reserved_remainder_parts() -> ErrorParts {
     )
 }
 
+/// The refusal for a signature that does not verify, and
+/// for a sealed spelling on the explain route.
+fn bad_signature_parts() -> ErrorParts {
+    (
+        StatusCode::FORBIDDEN,
+        "bad_signature",
+        "bad signature".to_string(),
+    )
+}
+
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.
 fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
@@ -6310,14 +6380,6 @@ fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
         e.code(),
         truncate_echo(&e.to_string()),
     )
-}
-
-/// A grammar failure's response: the parser's code and
-/// its (truncated) message, as plain text or the v2
-/// envelope per the client's Accept.
-fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
-    let (status, code, message) = parse_failure_parts(e);
-    error_response(status, code, message, accept)
 }
 
 /// The engine failure classes: status, stable code, and
