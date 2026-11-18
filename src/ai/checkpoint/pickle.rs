@@ -97,10 +97,23 @@ const BINPERSID: u8 = b'Q';
 /// objects and never touches the filesystem. What it
 /// builds is bounded too: every value counts against
 /// `MAX_BUILT`, and no value nests past `MAX_DEPTH`.
+///
+/// An open MARK fences the stack, as in CPython's
+/// unpickler (`Modules/_pickle.c`, where `load_mark` sets
+/// the fence of the `Pdata` stack, `marker` lowers it to
+/// the MARK before when an opcode closes one, and
+/// `Pdata_pop`, `Pdata_poptuple`, `load_build`,
+/// `do_setitems` and the memo puts refuse to reach below
+/// it). No opcode here pops or reads a value from below
+/// the latest open MARK (see `fenced`), so no MARK stands
+/// past the top of the stack, and TUPLE and SETITEMS
+/// always find theirs within it (issue #760).
 struct PickleMachine<'a> {
     bytes: &'a [u8],
     at: usize,
     stack: Vec<PickleValue>,
+    /// The stack length each open MARK recorded, the
+    /// latest last.
     marks: Vec<usize>,
     memo: Vec<Option<PickleValue>>,
     /// The running count against `MAX_BUILT`.
@@ -147,8 +160,10 @@ impl<'a> PickleMachine<'a> {
     }
 
     /// STOP: the one value left on the stack is the
-    /// pickle's.
+    /// pickle's. CPython pops it like any other value, so
+    /// it refuses one below an open MARK.
     fn stop(mut self) -> Result<PickleValue, String> {
+        self.fenced("STOP", 1)?;
         if self.stack.len() != 1 {
             return Err(format!(
                 "the pickle ends with {} values on the stack, not one",
@@ -237,12 +252,15 @@ impl<'a> PickleMachine<'a> {
     }
 
     /// TUPLE folds the values since the mark into a tuple,
-    /// TUPLE1 to TUPLE3 the top one to three.
+    /// TUPLE1 to TUPLE3 the top one to three. TUPLE closes
+    /// its MARK and takes only what stands above it; CPython
+    /// refuses TUPLE1 to TUPLE3 a value below an open MARK.
     fn tuple(&mut self, op: u8) -> Result<(), String> {
         let from = match op {
             TUPLE => self.mark()?,
             TUPLE1..=TUPLE3 => {
                 let n = usize::from(op - TUPLE1) + 1;
+                self.fenced(["TUPLE1", "TUPLE2", "TUPLE3"][n - 1], n)?;
                 self.stack
                     .len()
                     .checked_sub(n)
@@ -255,7 +273,10 @@ impl<'a> PickleMachine<'a> {
     }
 
     /// SETITEM: value, then key, onto the map below them.
+    /// CPython refuses it unless all three stand above the
+    /// latest open MARK.
     fn set_item(&mut self) -> Result<(), String> {
+        self.fenced("SETITEM", 3)?;
         let value = self.pop()?;
         let key = self.pop()?;
         let PickleValue::Str(key) = key else {
@@ -270,9 +291,14 @@ impl<'a> PickleMachine<'a> {
     }
 
     /// SETITEMS: key/value pairs since the mark, onto the
-    /// map below it.
+    /// map below it. CPython reads the map below a MARK on
+    /// purpose: it sits under the MARK that SETITEMS
+    /// closes. It must still stand above the MARK open
+    /// before that one, or CPython refuses it.
     fn set_items(&mut self) -> Result<(), String> {
         let from = self.mark()?;
+        // The pairs since the MARK, and the map under them.
+        self.fenced("SETITEMS", self.stack.len() - from + 1)?;
         let items: Vec<PickleValue> = self.stack.drain(from..).collect();
         if !items.len().is_multiple_of(2) {
             return Err("a pickle SETITEMS holds an odd item count".to_string());
@@ -295,8 +321,10 @@ impl<'a> PickleMachine<'a> {
 
     /// BUILD: the state (a metadata dict in torch saves)
     /// is validated as data and discarded; the built
-    /// object stays.
+    /// object stays. CPython refuses it unless both stand
+    /// above the latest open MARK.
     fn build(&mut self) -> Result<(), String> {
+        self.fenced("BUILD", 2)?;
         let state = self.pop()?;
         if !matches!(state, PickleValue::Map(_) | PickleValue::None) {
             return Err("a pickle BUILD state is not a dict".to_string());
@@ -314,11 +342,11 @@ impl<'a> PickleMachine<'a> {
         match op {
             BINPUT => {
                 let at = self.byte().ok_or("the pickle ends inside BINPUT")? as usize;
-                self.put_memo(at)
+                self.put_memo("BINPUT", at)
             }
             LONG_BINPUT => {
                 let at = self.u32()? as usize;
-                self.put_memo(at)
+                self.put_memo("LONG_BINPUT", at)
             }
             BINGET => {
                 let at = self.byte().ok_or("the pickle ends inside BINGET")? as usize;
@@ -340,8 +368,10 @@ impl<'a> PickleMachine<'a> {
     }
 
     /// REDUCE: call an allowlisted global (see `reduce`)
-    /// with an argument tuple.
+    /// with an argument tuple. CPython pops both, so it
+    /// refuses either below an open MARK.
     fn call(&mut self) -> Result<(), String> {
+        self.fenced("REDUCE", 2)?;
         let args = self.pop()?;
         let callable = self.pop()?;
         let PickleValue::Global(module, name) = callable else {
@@ -357,8 +387,10 @@ impl<'a> PickleMachine<'a> {
     /// BINPERSID: torch's persistent id for a storage, a
     /// tuple of (the word "storage", the storage class,
     /// the archive key, the location, the element count).
-    /// Only the key is used.
+    /// Only the key is used. CPython pops the id, so it
+    /// refuses one below an open MARK.
     fn persistent_id(&mut self) -> Result<(), String> {
+        self.fenced("BINPERSID", 1)?;
         let value = self.pop()?;
         let PickleValue::Tuple(parts) = &value else {
             return Err("a pickle persistent id is not a tuple".to_string());
@@ -425,10 +457,29 @@ impl<'a> PickleMachine<'a> {
             .ok_or_else(|| "the pickle's stack underflows".to_string())
     }
 
+    /// Close the latest open MARK, for TUPLE and SETITEMS:
+    /// the stack length it recorded. No opcode since has
+    /// popped below it, so it is within the stack.
     fn mark(&mut self) -> Result<usize, String> {
         self.marks
             .pop()
             .ok_or_else(|| "the pickle has a tuple or items opcode with no mark".to_string())
+    }
+
+    /// Refuse `name`, an opcode about to pop or read the
+    /// top `n` values of the stack, when one of them stands
+    /// below the latest open MARK, as CPython refuses it
+    /// ("unexpected MARK found"). Each opcode checks before
+    /// it takes or looks at a value, as in CPython. A MARK
+    /// at the bottom of the stack fences nothing: there, a
+    /// stack shorter than `n` is the opcode's own
+    /// underflow, which it reports in its own words.
+    fn fenced(&self, name: &str, n: usize) -> Result<(), String> {
+        let fence = self.marks.last().copied().unwrap_or(0);
+        if fence > 0 && self.stack.len() < fence + n {
+            return Err(fence_error(name));
+        }
+        Ok(())
     }
 
     /// Push a value built from the file's bytes. It
@@ -452,9 +503,13 @@ impl<'a> PickleMachine<'a> {
         Ok(())
     }
 
-    /// A memo copy counts at the size of the tree it
-    /// copies, before the copy is made.
-    fn put_memo(&mut self, at: usize) -> Result<(), String> {
+    /// Store the stack top in the memo, for `name`. A memo
+    /// copy counts at the size of the tree it copies, before
+    /// the copy is made. CPython refuses to store a top that
+    /// stands below an open MARK; it checks once it has read
+    /// the index, as this does.
+    fn put_memo(&mut self, name: &str, at: usize) -> Result<(), String> {
+        self.fenced(name, 1)?;
         if at > 4096 {
             return Err("a pickle memo index is implausibly large".to_string());
         }
@@ -532,6 +587,13 @@ fn nesting_error() -> String {
     format!(
         "the pickle nests tuples or dicts more than {MAX_DEPTH} levels deep: a head state dict nests a few"
     )
+}
+
+/// The refusal of an opcode that would pop or read a
+/// value from below an open MARK (see
+/// `PickleMachine::fenced`).
+fn fence_error(name: &str) -> String {
+    format!("a pickle {name} uses a value from below an open MARK")
 }
 
 /// The refusal of a byte outside the opcode allowlist.
@@ -622,6 +684,6 @@ mod tests;
 
 // The opcode handlers, pinned against a frozen copy of the
 // single loop they replaced (issue #741), apart from the
-// change issue #760 made after it.
+// two changes issue #760 made after it.
 #[cfg(test)]
 mod handler_proofs;

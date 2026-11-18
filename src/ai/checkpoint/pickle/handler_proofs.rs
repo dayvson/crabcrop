@@ -1,16 +1,29 @@
 //! The pickle machine against the single opcode loop it
 //! had before its opcodes got handlers (issue #741). The
 //! loop is frozen in `handler_proofs/frozen.rs`, and every
-//! input here must come out of both machines the same way:
-//! the same value, the same error message, or the same
-//! panic. One change came after the loop (issue #760):
-//! NEWTRUE pushes true and NEWFALSE false, where the loop
-//! pushed the reverse, so a bool in the machine's value
-//! matches its opposite in the loop's.
+//! input here must come out of both machines the same way,
+//! as the same value or the same error message, but for
+//! the two changes issue #760 made after the loop:
+//!
+//! - An open MARK fences the stack. Where the loop pops or
+//!   reads a value from below the latest open MARK, the
+//!   machine refuses that opcode with the fence error. A
+//!   model of the stack's height and its MARKs
+//!   ([`first_breach`]) finds the first such opcode, and
+//!   the fence error is expected there when the loop reads
+//!   every opcode before it without an error; the loop's
+//!   outcome is expected everywhere else. The loop panics
+//!   only after such an opcode, at a TUPLE or SETITEMS whose
+//!   MARK stands past the top of the stack, so the machine
+//!   must never panic.
+//! - NEWTRUE pushes true and NEWFALSE false, where the loop
+//!   pushed the reverse, so a bool in the machine's value
+//!   matches its opposite in the loop's.
 //!
 //! The inputs are the checkpoint fixtures the unit tests
-//! build, and one more: the scalar opcodes at their edges,
-//! which none of those holds. The small ones run whole, cut
+//! build, the fence tests' pickles, and one more: the
+//! scalar opcodes at their edges, which none of those
+//! holds. The small ones run whole, cut
 //! at every length, with every byte deleted or overwritten,
 //! and with every span of up to eight bytes doubled: the
 //! head pickle's bytes take every value, the others' every
@@ -37,19 +50,22 @@ use proptest::test_runner::{FileFailurePersistence, TestCaseError};
 
 use super::super::tests::{head_pickle, overflowing_size_pickle};
 use super::tests::{
-    deep_dicts, deep_tuple_chain, memo_doubling, memoized_string, nested, os_system_reduce,
-    tuple_read_back, tuple_stored_100_times,
+    ABOVE_A_MARK, BELOW_A_MARK, STALE_MARKS, deep_dicts, deep_tuple_chain, memo_doubling,
+    memoized_string, nested, os_system_reduce, tuple_read_back, tuple_stored_100_times,
 };
-use super::{MAX_DEPTH, PickleValue, unpickle};
+use super::{MAX_DEPTH, PickleValue, fence_error, unpickle};
 
 /// What a machine made of an input. A panic is an outcome
 /// too: the loop panics when a TUPLE or SETITEMS finds its
-/// mark above the top of the stack, and the handlers must
-/// panic on the same inputs until that is fixed on its own.
+/// mark past the top of the stack. No input may panic the
+/// machine (issue #760).
 #[derive(Debug)]
 enum Outcome {
     Value(PickleValue),
     Error(String),
+    /// The panic's message, which only the reports print
+    /// (through `Debug`): a panic matches nothing.
+    #[allow(dead_code)]
     Panicked(String),
 }
 
@@ -89,27 +105,174 @@ fn same_value(a: &PickleValue, b: &PickleValue) -> bool {
     }
 }
 
+/// The machine's outcome against the loop's. A panic
+/// matches nothing: the machine must not panic, and where
+/// the loop panics, the fence error is expected instead.
 fn same(a: &Outcome, b: &Outcome) -> bool {
     match (a, b) {
         (Outcome::Value(a), Outcome::Value(b)) => same_value(a, b),
         (Outcome::Error(a), Outcome::Error(b)) => a == b,
-        (Outcome::Panicked(a), Outcome::Panicked(b)) => a == b,
         _ => false,
     }
 }
 
-/// What each machine made of `pkl`, when they differ.
+/// What each machine made of `pkl`, and the breach the loop
+/// reaches in it, when the machine's outcome is not the one
+/// expected: the fence error at that breach, and the loop's
+/// outcome where there is none.
 fn disagreement(pkl: &[u8]) -> Option<String> {
     let handlers = outcome(|| unpickle(pkl));
     let frozen = outcome(|| frozen::unpickle(pkl));
-    if same(&handlers, &frozen) {
+    let breach = reached_breach(pkl);
+    let expected = match breach {
+        Some((_, name)) => matches!(&handlers, Outcome::Error(e) if *e == fence_error(name)),
+        None => same(&handlers, &frozen),
+    };
+    if expected {
         return None;
     }
     Some(format!(
-        "{} bytes, starting b\"{}\":\n  the handlers: {handlers:?}\n  the loop: {frozen:?}",
+        "{} bytes, starting b\"{}\":\n  the handlers: {handlers:?}\n  the loop: {frozen:?}\n  \
+         the breach the loop reaches (offset, opcode): {breach:?}",
         pkl.len(),
         pkl[..pkl.len().min(160)].escape_ascii()
     ))
+}
+
+/// The loop refuses a pickle longer than this before it
+/// reads an opcode (`frozen::unpickle`).
+const LOOP_MAX_BYTES: usize = 1024 * 1024;
+
+/// An opcode that pops or reads a value from below an open
+/// MARK: its offset in the pickle and its name.
+type Breach = (usize, &'static str);
+
+/// The breach the loop reaches in `pkl`: the first one
+/// [`first_breach`] finds, when the loop reads every opcode
+/// before it without an error.
+fn reached_breach(pkl: &[u8]) -> Option<Breach> {
+    if pkl.len() > LOOP_MAX_BYTES {
+        return None;
+    }
+    let breach = first_breach(pkl)?;
+    let before = &pkl[..breach.0];
+    match outcome(|| frozen::unpickle(before)) {
+        Outcome::Error(e) if e == "the pickle ends without a STOP" => Some(breach),
+        _ => None,
+    }
+}
+
+/// The first opcode in `pkl` that pops or reads a value from
+/// below an open MARK, found by a model of the loop's stack:
+/// its height, and the height each open MARK recorded. The
+/// model walks the opcodes as the loop parses them and takes
+/// each to succeed; [`reached_breach`] checks that the loop
+/// gets that far. It stops where the loop stops for certain:
+/// at STOP, at a byte the loop does not read, at an operand
+/// that runs past the end, and at a TUPLE or SETITEMS with no
+/// MARK open.
+///
+/// What an opcode uses is what CPython's unpickler takes from
+/// its stack (`Modules/_pickle.c`): BUILD and REDUCE the top
+/// two values, SETITEM the top three (the dict too),
+/// BINPERSID, BINPUT, LONG_BINPUT and STOP the top one, TUPLE1
+/// to TUPLE3 the top one to three, SETITEMS the dict under the
+/// MARK it closes, and TUPLE only what stands above its own
+/// MARK. An opcode breaches when the lowest value it uses
+/// stands below the latest open MARK, unless that MARK is at
+/// the bottom of the stack, where it fences nothing.
+fn first_breach(pkl: &[u8]) -> Option<Breach> {
+    let mut at = 0;
+    let mut height = 0usize;
+    let mut marks: Vec<usize> = Vec::new();
+    loop {
+        // No breach without a MARK, so none is left once no
+        // MARK is open and no '(' byte follows.
+        if marks.is_empty() && !pkl.get(at..)?.contains(&b'(') {
+            return None;
+        }
+        let start = at;
+        let op = *pkl.get(start)?;
+        at = opcode_end(pkl, start)?;
+        let h = height as isize;
+        // The opcode's name, the lowest stack position it uses
+        // (none: `isize::MAX`), and the height after it.
+        let (name, lowest, after) = match op {
+            b'(' => {
+                marks.push(height);
+                continue;
+            }
+            b't' => {
+                let mark = marks.pop()?;
+                ("TUPLE", isize::MAX, mark + 1)
+            }
+            b'u' => {
+                let mark = marks.pop()?;
+                ("SETITEMS", mark as isize - 1, mark)
+            }
+            b'b' => ("BUILD", h - 2, height.saturating_sub(1)),
+            b'R' => ("REDUCE", h - 2, height.saturating_sub(1)),
+            b's' => ("SETITEM", h - 3, height.saturating_sub(2)),
+            b'Q' => ("BINPERSID", h - 1, height),
+            b'q' => ("BINPUT", h - 1, height),
+            b'r' => ("LONG_BINPUT", h - 1, height),
+            b'.' => ("STOP", h - 1, height),
+            0x85..=0x87 => {
+                let n = usize::from(op - 0x84);
+                let name = ["TUPLE1", "TUPLE2", "TUPLE3"][n - 1];
+                (name, h - n as isize, height.saturating_sub(n) + 1)
+            }
+            0x80 => ("PROTO", isize::MAX, height),
+            // Every other opcode the loop reads pushes one value.
+            _ => ("", isize::MAX, height + 1),
+        };
+        let fence = marks.last().map_or(0, |&mark| mark as isize);
+        if fence > 0 && lowest < fence {
+            return Some((start, name));
+        }
+        if op == b'.' {
+            return None;
+        }
+        height = after;
+    }
+}
+
+/// Where the opcode at `at` in `pkl` ends, past its operand,
+/// as the loop parses it: `None` for a byte the loop does not
+/// read, or an operand that runs past the end.
+fn opcode_end(pkl: &[u8], at: usize) -> Option<usize> {
+    let length = |i: usize| pkl.get(i).map(|&b| usize::from(b));
+    let word = |i: usize| {
+        pkl.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let line = |i: usize| Some(i + pkl.get(i..)?.iter().position(|&b| b == b'\n')? + 1);
+    let end = match *pkl.get(at)? {
+        b'N'
+        | 0x88
+        | 0x89
+        | b'('
+        | b')'
+        | b't'
+        | 0x85..=0x87
+        | b'}'
+        | b's'
+        | b'u'
+        | b'b'
+        | b'R'
+        | b'Q'
+        | b'.' => at + 1,
+        0x80 | b'K' | b'q' | b'h' => at + 2,
+        b'M' => at + 3,
+        b'J' | b'r' | b'j' => at + 5,
+        b'G' => at + 9,
+        0x8c | b'U' | 0x8a => at + 2 + length(at + 1)?,
+        b'X' | 0x8b => at + 5 + word(at + 1)?,
+        b'L' => line(at + 1)?,
+        b'c' => line(line(at + 1)?)?,
+        _ => return None,
+    };
+    (end <= pkl.len()).then_some(end)
 }
 
 /// One way to vary a fixture.
@@ -185,7 +348,8 @@ fn sweep_bytes() -> Vec<u8> {
 }
 
 /// Run both machines over each variant of `pkl`, and fail
-/// with the first few that come out differently.
+/// with the first few where the machine's outcome is not
+/// the one expected (see `disagreement`).
 fn check(name: &str, pkl: &[u8], variants: impl Iterator<Item = Variant>) {
     let (mut runs, mut differ, mut reports) = (0usize, 0usize, Vec::new());
     for variant in variants {
@@ -271,6 +435,19 @@ fn nesting_fixtures() -> Vec<Fixture> {
     out
 }
 
+/// The fence tests' pickles (issue #760): the ones that
+/// left a MARK past the top of the stack, and for each
+/// opcode that pops or reads the stack, one where it uses a
+/// value just below an open MARK and one where it uses
+/// values just above one.
+fn fence_fixtures() -> Vec<Fixture> {
+    let named = |kind: &str, (name, pkl): &(&str, &[u8])| (format!("{kind}: {name}"), pkl.to_vec());
+    let stale = STALE_MARKS.iter().map(|case| named("a stale MARK", case));
+    let below = BELOW_A_MARK.iter().map(|case| named("below a MARK", case));
+    let above = ABOVE_A_MARK.iter().map(|case| named("above a MARK", case));
+    stale.chain(below).chain(above).collect()
+}
+
 /// The fixtures that copy or nest until the budget or the
 /// depth bound stops them.
 fn large_fixtures() -> Vec<Fixture> {
@@ -310,6 +487,14 @@ fn the_machines_agree_on_the_variants_of_the_small_fixtures() {
 fn the_machines_agree_on_the_variants_of_the_nesting_shapes() {
     let bytes = sweep_bytes();
     for (name, pkl) in nesting_fixtures() {
+        check(&name, &pkl, every_variant(pkl.len(), &bytes));
+    }
+}
+
+#[test]
+fn the_machines_agree_on_the_variants_of_the_fence_cases() {
+    let bytes = sweep_bytes();
+    for (name, pkl) in fence_fixtures() {
         check(&name, &pkl, every_variant(pkl.len(), &bytes));
     }
 }

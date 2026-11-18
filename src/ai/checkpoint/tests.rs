@@ -268,3 +268,49 @@ fn aesthetic_head_refuses_memo_copies_and_deep_nesting() {
         );
     }
 }
+
+#[test]
+fn aesthetic_head_refuses_a_pickle_that_left_a_stale_mark_without_a_panic() {
+    // Issue #760: an opcode in these took a value from below
+    // a MARK, and the TUPLE that closed the MARK found it
+    // past the top of the stack, which panicked the load,
+    // and the boot with it. Each is now a load error naming
+    // the file and the opcode that reached below the MARK.
+    for (tag, pkl, name) in [
+        ("head-mark-build", &b"N}(bt."[..], "BUILD"),
+        ("head-mark-tuple", &b"))(\x86t."[..], "TUPLE2"),
+    ] {
+        let (_head, path) = temp_file(tag, &head_archive(pkl, &[]));
+        let loaded = std::panic::catch_unwind(|| AestheticHead::load(&path))
+            .unwrap_or_else(|_| panic!("{tag}: the load panicked"));
+        let err = expect_load(loaded);
+        let want =
+            format!("{path} is not usable: a pickle {name} uses a value from below an open MARK");
+        assert!(err.ends_with(&want), "{tag}: {err}");
+    }
+}
+
+#[test]
+fn aesthetic_head_refuses_a_head_with_a_stray_mark_before_its_build() {
+    // The synthetic head with a MARK before its BUILD tail:
+    // BUILD then uses the state dict and the root dict below
+    // the MARK. The load accepted it before issue #760;
+    // CPython's unpickler refuses it ("unexpected MARK
+    // found"), and so does the load now.
+    let mut pkl = head_pickle(3, 1);
+    assert!(pkl.ends_with(b"b."));
+    pkl.insert(pkl.len() - 2, b'(');
+    let archive = head_archive(
+        &pkl,
+        &[
+            ("archive/data/0", &floats_bytes(&[0.5, -0.25, 2.0])),
+            ("archive/data/1", &floats_bytes(&[0.75])),
+        ],
+    );
+    let (_head, path) = temp_file("head-stray-mark", &archive);
+    let err = expect_load(AestheticHead::load(&path));
+    assert!(
+        err.ends_with("is not usable: a pickle BUILD uses a value from below an open MARK"),
+        "{err}"
+    );
+}

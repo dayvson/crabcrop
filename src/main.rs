@@ -2102,6 +2102,12 @@ mod test_support;
 #[path = "test_support/script.rs"]
 mod test_script;
 
+// And so does the writer of head saves: the aesthetic
+// head's boot error is checked on one (issue #760).
+#[cfg(test)]
+#[path = "test_support/head_archive.rs"]
+mod test_head_archive;
+
 #[cfg(test)]
 #[path = "main/tests.rs"]
 mod tests;
