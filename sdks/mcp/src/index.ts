@@ -26,7 +26,7 @@
  */
 import { buildURL, explainUrl, purgeSignature } from "@crabcrop/url";
 
-const SERVER = { name: "crabcrop", version: "0.13.1" };
+const SERVER = { name: "crabcrop", version: "0.14.0" };
 
 /**
  * The MCP versions this server speaks, newest first (issue
