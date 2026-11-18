@@ -1320,15 +1320,25 @@ fn build_ai_providers(config: &AiConfig) -> Result<AiProviders, ConfigError> {
         None => None,
     };
     let segment = build_segment(ort_dylib, config.segment.as_ref())?;
-    let (tagger, tag_threshold, embeddings) = match build_tagger(ort_dylib, config.clip.as_ref())? {
+    let clip = build_clip(ort_dylib, config.clip.as_ref(), config.moderation.as_ref())?;
+    let (tagger, tag_threshold, embeddings, clip_moderation) = match clip {
         Some(setup) => (
-            Some(setup.provider),
+            Some(setup.tagger),
             setup.threshold,
             Some(setup.embeddings),
+            setup.moderation,
         ),
-        None => (None, 0.05, None),
+        None => (None, 0.05, None, None),
     };
-    let moderation = build_moderation(ort_dylib, config.moderation.as_ref())?;
+    let moderation = match &config.moderation {
+        Some(ModerationConfig::Model { model, labels }) => {
+            Some(build_moderation(ort_dylib, model, labels.as_deref())?)
+        }
+        // Built with the tags, over the same load of the CLIP
+        // models (issue #736).
+        Some(ModerationConfig::ClipPrompts { .. }) => clip_moderation,
+        None => None,
+    };
     let aesthetic = build_aesthetic(config.aesthetic_head.as_deref())?;
     let ocr = build_ocr(ort_dylib, config.ocr.as_ref())?;
     let detect = build_detector(ort_dylib, config.detect.as_ref())?;
@@ -1715,128 +1725,165 @@ fn build_declared_detectors(
     Ok(DeclaredDetectors { boxes, focal })
 }
 
-/// A loaded tag provider plus the threshold its meta
-/// annotations compose with, and the embedding
-/// provider built from the same tagger (issue #172).
-struct TaggerSetup {
-    provider: Arc<dyn crate::ai::TagProvider>,
+/// The CLIP models' users, built over one load of the models
+/// (issue #736): the tag provider with the threshold its meta
+/// annotations compose with, the embedding provider built from
+/// the same tagger (issue #172), and the moderation review
+/// signals when moderation runs on CLIP prompts (issue #171).
+struct ClipSetup {
+    tagger: Arc<dyn crate::ai::TagProvider>,
     threshold: f32,
     embeddings: Arc<dyn crate::ai::EmbeddingProvider>,
+    moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
 }
 
-/// Build the CLIP tag provider, when the CLIP set is
-/// configured: preloaded like every other model, with a
-/// broken configuration failing startup.
-fn build_tagger(
+/// One label set a load of the CLIP models gives back: the set
+/// as a tag provider, and how many labels it holds.
+type ClipLabelSet = (Arc<dyn crate::ai::TagProvider>, usize);
+
+/// Build the CLIP users, when the CLIP set is configured:
+/// preloaded like every other model, with a broken
+/// configuration failing startup. With moderation on CLIP
+/// prompts, the prompts load with the tags, over the same
+/// image model (issue #736): one vision session and one
+/// embedding memo, so a meta request that asks for tags and
+/// moderation embeds its image once. The fallback used to load
+/// the CLIP models a second time.
+fn build_clip(
     ort_dylib: Option<&str>,
     config: Option<&ClipConfig>,
-) -> Result<Option<TaggerSetup>, ConfigError> {
+    moderation: Option<&ModerationConfig>,
+) -> Result<Option<ClipSetup>, ConfigError> {
+    build_clip_from(config, moderation, |config, label_sets| {
+        let sets = crate::ai::OnnxClipProvider::load_sets(
+            ort_dylib,
+            &config.image_model,
+            &config.text_model,
+            &config.tokenizer,
+            label_sets,
+        )?;
+        Ok(sets
+            .into_iter()
+            .map(|set| {
+                let labels = set.label_count();
+                (Arc::new(set) as Arc<dyn crate::ai::TagProvider>, labels)
+            })
+            .collect())
+    })
+}
+
+/// [`build_clip`] with the load named: `load` loads the CLIP
+/// models once for the label sets it is handed and gives back
+/// one set for each, in order. Boot hands it the ONNX load; the
+/// tests count its calls.
+fn build_clip_from(
+    config: Option<&ClipConfig>,
+    moderation: Option<&ModerationConfig>,
+    load: impl FnOnce(&ClipConfig, Vec<Vec<String>>) -> Result<Vec<ClipLabelSet>, crate::ai::AiError>,
+) -> Result<Option<ClipSetup>, ConfigError> {
     let Some(config) = config else {
         return Ok(None);
     };
-    let provider = crate::ai::OnnxClipProvider::load(
-        ort_dylib,
-        &config.image_model,
-        &config.text_model,
-        &config.tokenizer,
-        &config.labels,
-    )
-    .map_err(|e| {
+    let tagging = |e: crate::ai::AiError| {
         ConfigError::build(
             Some("CRABCROP_CLIP_IMAGE_MODEL"),
             format!("cannot load the CLIP tagging models: {e}"),
         )
-    })?;
+    };
+    let mut label_sets = vec![crate::ai::read_labels(&config.labels).map_err(tagging)?];
+    let prompts = match moderation {
+        Some(ModerationConfig::ClipPrompts { labels }) => Some(labels),
+        _ => None,
+    };
+    if let Some(prompts) = prompts {
+        label_sets.push(crate::ai::read_labels(prompts).map_err(|e| {
+            ConfigError::build(
+                Some("CRABCROP_MODERATION_LABELS"),
+                format!("cannot load the CLIP moderation fallback: {e}"),
+            )
+        })?);
+    }
+    let mut sets = load(config, label_sets).map_err(tagging)?.into_iter();
+    let mut next_set = || {
+        sets.next().ok_or_else(|| {
+            tagging(crate::ai::AiError::Load(
+                "the load gave back fewer label sets than it was handed".to_string(),
+            ))
+        })
+    };
+    let (tagger, labels) = next_set()?;
     boot_line!(
-        "CLIP tagging loaded ({} labels, threshold {})",
-        provider.label_count(),
+        "CLIP tagging loaded ({labels} labels, threshold {})",
         config.threshold
     );
-    // The threshold is presentation, applied where
-    // the meta annotation is composed (issue #152),
-    // so it travels with the provider to the server
-    // state rather than living inside the provider.
-    let provider = Arc::new(provider);
     // The embedding provider wraps the same
     // tagger (issue #172): the vector the tag
     // scores are computed from, surfaced with the
     // image model's identity.
     let embeddings = Arc::new(crate::ai::ClipEmbeddingProvider::new(
-        provider.clone(),
+        tagger.clone(),
         config.image_model.clone(),
     ));
-    Ok(Some(TaggerSetup {
-        provider,
+    let moderation = match prompts {
+        Some(_) => {
+            let (prompts, count) = next_set()?;
+            boot_line!(
+                "moderation review signals loaded from {} ({count} prompt labels)",
+                config.image_model
+            );
+            let provider: Arc<dyn crate::ai::ModerationProvider> = Arc::new(
+                crate::ai::ClipModerationProvider::new(prompts, config.image_model.clone()),
+            );
+            Some(provider)
+        }
+        None => None,
+    };
+    Ok(Some(ClipSetup {
+        tagger,
+        // The threshold is presentation, applied where the
+        // meta annotation is composed (issue #152), so it
+        // travels with the provider to the server state rather
+        // than living inside the provider.
         threshold: config.threshold,
         embeddings,
+        moderation,
     }))
 }
 
-/// Build the moderation provider, when configured (issue
-/// #171): a verdict classifier from
-/// `CRABCROP_MODERATION_MODEL`, or the CLIP zero-shot
-/// fallback when only a labels file is set. Preloaded like
-/// every other provider, with a broken configuration
-/// failing startup.
+/// Build the moderation verdict classifier (issue #171) from
+/// `CRABCROP_MODERATION_MODEL`, preloaded like every other
+/// provider, with a broken configuration failing startup. The
+/// CLIP zero-shot fallback, for a labels file without a model,
+/// is built with the tagger: [`build_clip`].
 fn build_moderation(
     ort_dylib: Option<&str>,
-    config: Option<&ModerationConfig>,
-) -> Result<Option<Arc<dyn crate::ai::ModerationProvider>>, ConfigError> {
-    match config {
-        None => Ok(None),
-        Some(ModerationConfig::Model { model, labels }) => {
-            // With a model, the labels file names its output
-            // categories; the provider checks the count
-            // against its probe at load.
-            let labels = match labels {
-                Some(path) => Some(crate::ai::read_labels(path).map_err(|e| {
-                    ConfigError::build(
-                        Some("CRABCROP_MODERATION_LABELS"),
-                        format!("cannot read the moderation labels: {e}"),
-                    )
-                })?),
-                None => None,
-            };
-            let provider = crate::ai::OnnxModerationProvider::load(ort_dylib, model, labels)
-                .map_err(|e| {
-                    ConfigError::build(
-                        Some("CRABCROP_MODERATION_MODEL"),
-                        format!("cannot load the moderation model: {e}"),
-                    )
-                })?;
-            boot_line!(
-                "moderation verdicts loaded from {model} ({} categories)",
-                provider.labels().len()
-            );
-            Ok(Some(Arc::new(provider)))
-        }
-        Some(ModerationConfig::ClipPrompts { labels, clip }) => {
-            // The same CLIP model files load again with the
-            // moderation labels, so the two label sets stay
-            // independent.
-            let tagger = crate::ai::OnnxClipProvider::load(
-                ort_dylib,
-                &clip.image_model,
-                &clip.text_model,
-                &clip.tokenizer,
-                labels,
+    model: &str,
+    labels: Option<&str>,
+) -> Result<Arc<dyn crate::ai::ModerationProvider>, ConfigError> {
+    // With a model, the labels file names its output
+    // categories; the provider checks the count
+    // against its probe at load.
+    let labels = match labels {
+        Some(path) => Some(crate::ai::read_labels(path).map_err(|e| {
+            ConfigError::build(
+                Some("CRABCROP_MODERATION_LABELS"),
+                format!("cannot read the moderation labels: {e}"),
             )
-            .map_err(|e| {
-                ConfigError::build(
-                    Some("CRABCROP_MODERATION_LABELS"),
-                    format!("cannot load the CLIP moderation fallback: {e}"),
-                )
-            })?;
-            boot_line!(
-                "moderation review signals loaded from {} ({} prompt labels)",
-                clip.image_model,
-                tagger.label_count()
-            );
-            let provider =
-                crate::ai::ClipModerationProvider::new(Arc::new(tagger), clip.image_model.clone());
-            Ok(Some(Arc::new(provider)))
-        }
-    }
+        })?),
+        None => None,
+    };
+    let provider =
+        crate::ai::OnnxModerationProvider::load(ort_dylib, model, labels).map_err(|e| {
+            ConfigError::build(
+                Some("CRABCROP_MODERATION_MODEL"),
+                format!("cannot load the moderation model: {e}"),
+            )
+        })?;
+    boot_line!(
+        "moderation verdicts loaded from {model} ({} categories)",
+        provider.labels().len()
+    );
+    Ok(Arc::new(provider))
 }
 
 /// Build the aesthetic head, when configured (issue #172):
