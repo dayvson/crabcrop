@@ -5,8 +5,9 @@ package from the ``crabcrop-url[seal]`` extra.
 
 The names follow the TypeScript SDK's, in Python's spelling
 (``buildURL`` is `build_url`, ``ops.cropObjects`` is
-`ops.crop_objects`), and the typed operation builders, `ops`,
-`filter` and `join_ops`, mirror its builders (issue #716).
+`ops.crop_objects`), the typed operation builders, `ops`,
+`filter` and `join_ops`, mirror its builders, and `explain_url` is
+its explainer (issue #716).
 """
 
 from __future__ import annotations
@@ -17,8 +18,18 @@ import hmac
 import os
 from typing import Any, Optional, Sequence, Union
 
+from ._explain import (
+    FILTER_DESCRIPTIONS,
+    ExplainedSegment,
+    ExplainedSignature,
+    Explanation,
+    SegmentKind,
+    SignatureKind,
+    explain_url,
+)
 from ._grammar import (
     MAX_DIMENSION,
+    RESERVED_SEGMENT,
     Anchor,
     BlendMode,
     CropAlign,
@@ -29,6 +40,7 @@ from ._grammar import (
     PerFormatQualityFormat,
     StudioMode,
     StudioShadow,
+    is_reserved_remainder,
 )
 from ._operations import FormatOptions, StudioOptions, filter, join_ops, ops
 
@@ -37,6 +49,7 @@ from ._operations import FormatOptions, StudioOptions, filter, join_ops, ops
 __version__ = "0.13.1"
 
 __all__ = [
+    "FILTER_DESCRIPTIONS",
     "MAX_DIMENSION",
     "MAX_SEALED_REMAINDER",
     "RESERVED_SEGMENT",
@@ -46,18 +59,24 @@ __all__ = [
     "CropAlign",
     "CurveChannel",
     "Dimension",
+    "ExplainedSegment",
+    "ExplainedSignature",
+    "Explanation",
     "FormatOptions",
     "ImageFormat",
     "MaskShape",
     "PerFormatQualityFormat",
     "SealError",
     "Secret",
+    "SegmentKind",
+    "SignatureKind",
     "StudioMode",
     "StudioOptions",
     "StudioShadow",
     "build_sealed_url",
     "build_srcset",
     "build_url",
+    "explain_url",
     "filter",
     "is_reserved_remainder",
     "is_valid_key_id",
@@ -116,28 +135,10 @@ def sign_with_key_id(
     return f"{key_id}:{sign(secret, remainder)}"
 
 
-#: The first remainder segment reserved for key derivation.
-#: Every derived subkey (purge, purge-group, upload, seal, and
-#: the server's cache entry key) is the HMAC of a label such as
-#: ``crabcrop/purge-key`` under the secret, which is the image
-#: signature of that label. No image URL may begin with this
-#: segment (the server refuses one with ``400
-#: reserved_segment``), and `sign` and every builder refuse a
-#: remainder that does, so no image signature is ever a subkey.
-RESERVED_SEGMENT = "crabcrop"
-
 _RESERVED_MESSAGE = (
     f'remainder begins with the reserved segment "{RESERVED_SEGMENT}": '
     "it is kept for key derivation, and no image URL may begin with it"
 )
-
-
-def is_reserved_remainder(remainder: str) -> bool:
-    """Whether ``remainder`` begins with `RESERVED_SEGMENT`: it
-    is that segment alone or starts with ``crabcrop/``. The
-    test is on the text as written, as the HMAC is:
-    ``exp:1/crabcrop/x`` and ``CRABCROP/x`` are not reserved."""
-    return remainder.split("/", 1)[0] == RESERVED_SEGMENT
 
 
 def _refuse_reserved(remainder: str) -> None:

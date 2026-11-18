@@ -1,11 +1,12 @@
-"""The parts of the URL grammar the typed builders check against:
-the server's caps, the closed sets of names and numbers, and the
-class-name and text-label rules (issue #716). They are the values
-the TypeScript SDK's ``explain.ts`` and ``limits.ts`` give its
-builders, and the test suite reads them back from those files, so
-the two SDKs cannot drift apart unnoticed. Each closed set is the
-``Literal`` type the builders' signatures use, read back with
-``get_args``, so the type and the check are one copy here.
+"""The parts of the URL grammar the typed builders and the explainer
+check against: the server's caps, the closed sets of names and
+numbers, the class-name and text-label rules, and the reserved
+segment (issue #716). They are the values the TypeScript SDK's
+``explain.ts`` and ``limits.ts`` give its builders and its explainer,
+and the test suite reads them back from those files, so the two SDKs
+cannot drift apart unnoticed. Each closed set is the ``Literal`` type
+the builders' signatures use, read back with ``get_args``, so the
+type and the check are one copy here.
 """
 
 from __future__ import annotations
@@ -20,6 +21,27 @@ from typing import List, Literal, Tuple, Union, get_args
 #: name. A larger value is a parse error on the server, so the
 #: builders and ``build_srcset`` check against this one constant.
 MAX_DIMENSION = 16383
+
+#: The first remainder segment reserved for key derivation.
+#: Every derived subkey (purge, purge-group, upload, seal, and
+#: the server's cache entry key) is the HMAC of a label such as
+#: ``crabcrop/purge-key`` under the secret, which is the image
+#: signature of that label. No image URL may begin with this
+#: segment (the server refuses one with ``400
+#: reserved_segment``), and `sign` and every builder refuse a
+#: remainder that does, so no image signature is ever a subkey.
+#: The explainer reports such a remainder as the server answers
+#: it.
+RESERVED_SEGMENT = "crabcrop"
+
+
+def is_reserved_remainder(remainder: str) -> bool:
+    """Whether ``remainder`` begins with `RESERVED_SEGMENT`: it
+    is that segment alone or starts with ``crabcrop/``. The
+    test is on the text as written, as the HMAC is:
+    ``exp:1/crabcrop/x`` and ``CRABCROP/x`` are not reserved."""
+    return remainder.split("/", 1)[0] == RESERVED_SEGMENT
+
 
 #: Output formats the ``format(...)`` filter accepts; ``jpg`` is an
 #: input alias of ``jpeg``.

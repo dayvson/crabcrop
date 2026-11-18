@@ -50,19 +50,16 @@ PYTHON_NAMES = {
     "StudioMode": "StudioMode",
     "StudioOptions": "StudioOptions",
     "StudioShadow": "StudioShadow",
+    "explainUrl": "explain_url",
+    "FILTER_DESCRIPTIONS": "FILTER_DESCRIPTIONS",
+    "ExplainedSegment": "ExplainedSegment",
+    "Explanation": "Explanation",
+    "SegmentKind": "SegmentKind",
+    "SignatureKind": "SignatureKind",
 }
 
-# The explainer and what reads URLs through it: the Python port
-# follows issue #712, which changes the explainer's number rules.
-EXPLAINER = {
-    "explainUrl",
-    "FILTER_DESCRIPTIONS",
-    "verifyUrlSignature",
-    "ExplainedSegment",
-    "Explanation",
-    "SegmentKind",
-    "SignatureKind",
-}
+# What reads URLs through the explainer, ported next.
+PENDING = {"verifyUrlSignature"}
 
 # Option objects the Python functions take as keyword arguments.
 KEYWORD_ARGUMENTS = {"BuildOptions", "SealOptions"}
@@ -82,7 +79,7 @@ class TestNames(unittest.TestCase):
         self.assertIn("buildURL", exports)
         for name in sorted(exports):
             with self.subTest(export=name):
-                if name in EXPLAINER or name in KEYWORD_ARGUMENTS:
+                if name in PENDING or name in KEYWORD_ARGUMENTS:
                     continue
                 self.assertIn(name, PYTHON_NAMES, f"the TypeScript SDK exports {name}; give it a Python name")
                 python = PYTHON_NAMES[name]
