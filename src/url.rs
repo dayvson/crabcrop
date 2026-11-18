@@ -761,6 +761,96 @@ fn parse_studio(p: &str) -> Option<StudioSpec> {
 /// for the tests and the pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
+    /// Overlay another image at (x, y) with an opacity (0-100).
+    /// The URL is the percent-decoded watermark location; the
+    /// server fetches it before the engine runs. Negative
+    /// coordinates anchor from the right/bottom edges.
+    Watermark {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+    },
+    /// Composite another image over the result with a blend
+    /// mode, at (x, y) with an opacity (0-100), optionally
+    /// scaled to `width` percent of the base image's width.
+    /// The URL is the percent-decoded overlay location; the
+    /// server fetches it before the engine runs, through the
+    /// same prefetch as watermarks. Negative coordinates
+    /// anchor from the right/bottom edges.
+    Overlay {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+        blend: BlendMode,
+        width: Option<u32>,
+    },
+    /// Remove the background with the server's segmentation
+    /// model, keeping the subject over transparency. The model
+    /// is operator-configured; the engine applies its mask.
+    RemoveBg,
+    /// Studio mode (issues #197 and #198): one filter
+    /// naming an outcome, expanded deterministically in the
+    /// engine and reported in meta. `product` composites
+    /// the subject the segmentation model finds onto a
+    /// backdrop with a synthesized contact shadow, scaled
+    /// and centered to a pad margin; `scene` keeps the
+    /// photograph's scene, reframing it on the detected
+    /// subject and applying a per-image light and color
+    /// correction.
+    Studio(StudioSpec),
+    /// Blur every detected face (privacy redaction), backed by
+    /// the server's face model.
+    BlurFaces,
+    /// Pixelate every detected face (privacy redaction),
+    /// backed by the server's face model.
+    PixelateFaces,
+    /// Blur every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    BlurClass(String),
+    /// Pixelate every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    PixelateClass(String),
+    /// Recolor every detected object of the named class to
+    /// the given RGB color (issue #175), backed by the
+    /// server's detection model. With a segment provider
+    /// configured the paint follows the object's
+    /// silhouette; without one it fills the box.
+    RecolorClass(String, [u8; 3]),
+    /// Padding for `crop:*:face`, as a fraction of the face
+    /// size added on every side. A request-wide directive,
+    /// like `no_upscale`.
+    FacePad(f32),
+    /// AI super-resolution by the given factor (2 or 4),
+    /// backed by the server's upscale model.
+    Upscale(u32),
+    /// Device-pixel-ratio directive: scale size and crop
+    /// targets by the factor (1, 1.5, 2, or 3) before the
+    /// no-upscale cap sees them.
+    Dpr(f32),
+    /// Rendered text overlaid at one of the nine grid anchors.
+    /// The text is the percent-decoded label; color is RGBA.
+    Text {
+        text: String,
+        size: u32,
+        color: [u8; 4],
+        anchor: Anchor,
+    },
+    /// Gaussian-blur the rectangle (x, y, w, h), in the
+    /// pixels of the image at the point the filter runs.
+    /// Redaction of plates, screens, documents.
+    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Pixelate the rectangle (x, y, w, h), same coordinate
+    /// convention as `BlurRegion`.
+    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Erase the rectangle (x, y, w, h) and inpaint it from
+    /// the surrounding pixels, same coordinate convention
+    /// and bounds discipline as `BlurRegion`. Backed by the
+    /// server's inpainting model (issue #176).
+    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Desaturate the image.
     Grayscale,
     /// Invert every channel.
@@ -866,87 +956,9 @@ pub enum Filter {
     /// counts, clamped by the engine so at least one pixel
     /// survives on each axis.
     TrimSides(u8, [u32; 4]),
-    /// Overlay another image at (x, y) with an opacity (0-100).
-    /// The URL is the percent-decoded watermark location; the
-    /// server fetches it before the engine runs. Negative
-    /// coordinates anchor from the right/bottom edges.
-    Watermark {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-    },
-    /// Composite another image over the result with a blend
-    /// mode, at (x, y) with an opacity (0-100), optionally
-    /// scaled to `width` percent of the base image's width.
-    /// The URL is the percent-decoded overlay location; the
-    /// server fetches it before the engine runs, through the
-    /// same prefetch as watermarks. Negative coordinates
-    /// anchor from the right/bottom edges.
-    Overlay {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-        blend: BlendMode,
-        width: Option<u32>,
-    },
-    /// Remove the background with the server's segmentation
-    /// model, keeping the subject over transparency. The model
-    /// is operator-configured; the engine applies its mask.
-    RemoveBg,
-    /// Studio mode (issues #197 and #198): one filter
-    /// naming an outcome, expanded deterministically in the
-    /// engine and reported in meta. `product` composites
-    /// the subject the segmentation model finds onto a
-    /// backdrop with a synthesized contact shadow, scaled
-    /// and centered to a pad margin; `scene` keeps the
-    /// photograph's scene, reframing it on the detected
-    /// subject and applying a per-image light and color
-    /// correction.
-    Studio(StudioSpec),
     /// Keep the source ICC profile instead of converting
     /// to sRGB (`filters:keep_profile`).
     KeepProfile,
-    /// Blur every detected face (privacy redaction), backed by
-    /// the server's face model.
-    BlurFaces,
-    /// Pixelate every detected face (privacy redaction),
-    /// backed by the server's face model.
-    PixelateFaces,
-    /// Blur every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    BlurClass(String),
-    /// Pixelate every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    PixelateClass(String),
-    /// Recolor every detected object of the named class to
-    /// the given RGB color (issue #175), backed by the
-    /// server's detection model. With a segment provider
-    /// configured the paint follows the object's
-    /// silhouette; without one it fills the box.
-    RecolorClass(String, [u8; 3]),
-    /// Padding for `crop:*:face`, as a fraction of the face
-    /// size added on every side. A request-wide directive,
-    /// like `no_upscale`.
-    FacePad(f32),
-    /// AI super-resolution by the given factor (2 or 4),
-    /// backed by the server's upscale model.
-    Upscale(u32),
-    /// Device-pixel-ratio directive: scale size and crop
-    /// targets by the factor (1, 1.5, 2, or 3) before the
-    /// no-upscale cap sees them.
-    Dpr(f32),
-    /// Rendered text overlaid at one of the nine grid anchors.
-    /// The text is the percent-decoded label; color is RGBA.
-    Text {
-        text: String,
-        size: u32,
-        color: [u8; 4],
-        anchor: Anchor,
-    },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Rounded corners: radii in pixels, CSS order (top-left,
@@ -972,18 +984,6 @@ pub enum Filter {
     Pixelate(u32),
     /// Mirror the image, horizontally or vertically.
     Flip(FlipDirection),
-    /// Gaussian-blur the rectangle (x, y, w, h), in the
-    /// pixels of the image at the point the filter runs.
-    /// Redaction of plates, screens, documents.
-    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Pixelate the rectangle (x, y, w, h), same coordinate
-    /// convention as `BlurRegion`.
-    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Erase the rectangle (x, y, w, h) and inpaint it from
-    /// the surrounding pixels, same coordinate convention
-    /// and bounds discipline as `BlurRegion`. Backed by the
-    /// server's inpainting model (issue #176).
-    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
