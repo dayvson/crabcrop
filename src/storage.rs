@@ -970,10 +970,10 @@ fn read_open_capped(mut file: std::fs::File, len: u64, cap: usize) -> Option<Vec
 /// does not follow a symlink either: the check would then
 /// see the target, and the boot scan skips symlinks.
 ///
-/// `file://` sources open their canonical path through this
-/// too (issue #708): that path names no symlink, so refusing
-/// one refuses only a link swapped in after the path was
-/// resolved.
+/// `file://` sources open their file with [`open_regular_at`]
+/// (issue #708), relative to the directory that holds it,
+/// which the loader reaches from the file root a component at
+/// a time (see `load_file` in `loader.rs`).
 ///
 /// Returns the file with the metadata that check read. An
 /// error is the open's own, `NotFound` for a path with nothing
@@ -981,8 +981,21 @@ fn read_open_capped(mut file: std::fs::File, len: u64, cap: usize) -> Option<Vec
 /// a regular file.
 #[cfg(unix)]
 pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    open_regular_at(rustix::fs::CWD, path)
+}
+
+/// [`open_regular`] for `path` relative to the open directory
+/// `dir`, with the same flags and the same check: the open
+/// does not wait for a FIFO's writer, does not follow a
+/// symlink, and what it opened must be a regular file.
+#[cfg(unix)]
+pub(crate) fn open_regular_at(
+    dir: impl std::os::fd::AsFd,
+    path: impl rustix::path::Arg,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
+    let fd = rustix::fs::openat(
+        dir,
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
