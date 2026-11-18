@@ -303,18 +303,76 @@ fn split_signed(input: &str, base: &str) -> (Option<Signature>, Option<String>, 
     // path really starts with a signature segment: a bare
     // remainder also contains "://" (in its source), so
     // anything less strict would mangle it.
-    if let Some((_, after_scheme)) = input.split_once("://") {
+    if let Some(after_scheme) = after_url_scheme(input) {
         let path = after_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
         if let Ok((sig, kid, remainder)) = crate::url::parse_signature(path) {
             return (Some(sig), kid, remainder.to_string());
         }
         return (None, None, input.to_string());
     }
-    let path = input.strip_prefix('/').unwrap_or(input);
-    match crate::url::parse_signature(path) {
-        Ok((sig, kid, rest)) => (Some(sig), kid, rest.to_string()),
-        Err(_) => (None, None, path.to_string()),
+    // A path: the server reads its first segment as the
+    // signature, whatever it holds.
+    if let Some(path) = input.strip_prefix('/') {
+        return match crate::url::parse_signature(path) {
+            Ok((sig, kid, rest)) => (Some(sig), kid, rest.to_string()),
+            Err(_) => (None, None, path.to_string()),
+        };
     }
+    // Without the slash, a path and a bare remainder look
+    // alike, and a remainder's first segment can parse as a
+    // keyed signature: `exp:1893456000` reads as the key `exp`
+    // and the tag `1893456000`, and so do `maxage:60`,
+    // `page:2` and `preset:cafe`. So the text is a path only
+    // when it opens with a signature a signer writes, `unsafe`
+    // or a whole tag, which no remainder the server serves
+    // begins with; anything else is the remainder, whole.
+    match crate::url::parse_signature(input) {
+        Ok((sig, kid, rest)) if is_whole_signature(&sig) => (Some(sig), kid, rest.to_string()),
+        _ => (None, None, input.to_string()),
+    }
+}
+
+/// Whether a signature segment is one a signer writes:
+/// `unsafe`, or a whole HMAC-SHA256 tag, 64 lowercase hex
+/// characters (the only spelling `crabcrop_url::verify`
+/// accepts).
+fn is_whole_signature(signature: &Signature) -> bool {
+    match signature {
+        Signature::Unsafe => true,
+        Signature::Hmac(hex) => hex.len() == 64,
+    }
+}
+
+/// The text after `<scheme>://` when `input` opens with a URL
+/// scheme (RFC 3986: a letter, then letters, digits, `+`, `-`
+/// or `.`), as a full URL does. A path or a bare remainder
+/// holds a `://` too, in its source
+/// (`/unsafe/filters:blur(2)/http://x/a.png`), and the text
+/// before it there is no scheme (issue #712).
+fn after_url_scheme(input: &str) -> Option<&str> {
+    let (scheme, after) = input.split_once("://")?;
+    let mut chars = scheme.chars();
+    let is_scheme = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    is_scheme.then_some(after)
+}
+
+/// Why the server refuses `rest` before it reads an operation,
+/// whatever the signature: its first segment is the one key
+/// derivation owns, or one of the purge and upload endpoints'
+/// own (the server's `resolve_request`).
+fn refused_remainder(rest: &str) -> Option<String> {
+    if crabcrop_url::is_reserved_remainder(rest) {
+        return Some(format!(
+            "an image URL may not begin with the reserved segment {}",
+            crabcrop_url::RESERVED_SEGMENT
+        ));
+    }
+    matches!(
+        rest.split('/').next(),
+        Some("purge" | "purge-group" | "upload")
+    )
+    .then(|| "an image URL may not begin with a purge or upload segment".to_string())
 }
 
 /// What validating a CLI remainder yields: how many leading
@@ -328,8 +386,18 @@ type PresetParse = (usize, Vec<Operation>, String, Option<u64>, Option<u32>);
 /// rest, returning how many were dropped. Server presets
 /// expand before parsing, so the CLI cannot parse them
 /// itself; it can only step aside. A remainder that parses
-/// no way fails with the error of the whole remainder.
+/// no way fails with the error of the whole remainder. The
+/// operations that parse are held to the server's caps
+/// (issue #712): a dropped reference only adds operations,
+/// so a parse past either cap is one the server refuses.
 fn parse_with_presets(rest: &str) -> Result<PresetParse, ParseError> {
+    let parsed = parse_past_presets(rest)?;
+    crate::url::check_operation_count(&parsed.1)?;
+    crate::url::check_watermark_count(&parsed.1)?;
+    Ok(parsed)
+}
+
+fn parse_past_presets(rest: &str) -> Result<PresetParse, ParseError> {
     let first_error = match crate::url::parse_operations_with_expiry(rest) {
         Ok((ops, source, expiry, max_age)) => {
             return Ok((0, ops, source.to_string(), expiry, max_age));
@@ -518,8 +586,8 @@ fn unseal_cmd(config: &Config, positional: &[String]) -> Result<String, CliError
     let input = input.trim();
     let path = match input.strip_prefix(&format!("{}/", config.base)) {
         Some(rest) => rest.to_string(),
-        None => match input.split_once("://") {
-            Some((_, after_scheme)) => after_scheme
+        None => match after_url_scheme(input) {
+            Some(after_scheme) => after_scheme
                 .split_once('/')
                 .map(|(_, p)| p.to_string())
                 .unwrap_or_default(),
@@ -569,7 +637,13 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, CliError> {
         None => lines.push("signature: none (bare remainder)".to_string()),
     }
     let segments: Vec<&str> = rest.split('/').collect();
-    match parse_with_presets(&rest) {
+    // The server refuses these before it reads an operation,
+    // so the verdict is the server's whatever the grammar says.
+    let parsed = match refused_remainder(&rest) {
+        Some(reason) => Err(reason),
+        None => parse_with_presets(&rest).map_err(|e| e.to_string()),
+    };
+    match parsed {
         Ok((dropped, ops, source, expiry, max_age)) => {
             for seg in &segments[..dropped] {
                 lines.push(format!(
@@ -2415,6 +2489,153 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("DOES NOT MATCH"), "{out}");
+    }
+
+    /// `explain` gives the server's verdict (issue #712): on a
+    /// path whose source carries a scheme, on the remainders the
+    /// server refuses before it reads an operation, on the
+    /// operation and watermark caps, and on each number spelling.
+    #[tokio::test]
+    async fn explain_gives_the_server_verdict() {
+        let explain = |input: String| async move {
+            exec(&args(&["explain", "--base", "http://img.test", &input]))
+                .await
+                .unwrap()
+        };
+        let out = explain("/unsafe/filters:blur(2)/http://x/a.png".to_string()).await;
+        assert!(out.contains("signature: unsafe"), "{out}");
+        assert!(out.contains("source: http://x/a.png"), "{out}");
+        assert!(out.contains("verdict: valid, 1 operation"), "{out}");
+        let watermarks = (0..17)
+            .map(|i| format!("watermark(w{i}.png,0,0,50)"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let refused: [(String, &str); 8] = [
+            (
+                "crabcrop/x".into(),
+                "an image URL may not begin with the reserved segment crabcrop",
+            ),
+            (
+                "crabcrop".into(),
+                "an image URL may not begin with the reserved segment crabcrop",
+            ),
+            (
+                "purge/300x200/x.jpg".into(),
+                "an image URL may not begin with a purge or upload segment",
+            ),
+            (
+                "upload/x.jpg".into(),
+                "an image URL may not begin with a purge or upload segment",
+            ),
+            (
+                format!("filters:{}/x.jpg", ["invert"; 101].join(":")),
+                "request has 101 operations, over the 100 operation limit",
+            ),
+            (
+                format!("filters:{watermarks}/x.jpg"),
+                "request names 17 distinct watermark and overlay URLs",
+            ),
+            (
+                "filters:text(Hi,12,+fffff,center)/x.jpg".into(),
+                "invalid filters segment",
+            ),
+            (
+                "filters:text(%+1Hi,12,ffffff,center)/x.jpg".into(),
+                "invalid filters segment",
+            ),
+        ];
+        for (remainder, reason) in refused {
+            let out = explain(format!("/unsafe/{remainder}")).await;
+            assert!(
+                out.contains(&format!("verdict: invalid: {reason}")),
+                "{out}"
+            );
+        }
+        // The caps leave room up to them.
+        let at_cap = format!("/unsafe/filters:{}/x.jpg", ["invert"; 100].join(":"));
+        assert!(explain(at_cap).await.contains("verdict: valid"));
+        // A negative zero reads as zero, in the gloss as in
+        // the canonical form.
+        let out = explain("/unsafe/filters:contrast(-0)/x.jpg".to_string()).await;
+        assert!(out.contains("contrast(0): adjust contrast"), "{out}");
+        // Signing holds the caps too, before it mints a URL the
+        // server would refuse.
+        let err = exec(&args(&[
+            "sign",
+            "--secret",
+            "cli-cap-secret",
+            &format!("filters:{}/x.jpg", ["invert"; 101].join(":")),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("request has 101 operations, over the 100 operation limit"),
+            "{err}"
+        );
+    }
+
+    /// A bare remainder stays whole when its first segment
+    /// parses as a keyed signature (`exp:`, `maxage:`, `page:`,
+    /// `frame:`, `preset:`), whatever its source: without a
+    /// leading slash the text is a path only when it opens with
+    /// `unsafe` or a whole tag. `explain`, `purge` and `meta`
+    /// all read their target this way, so a misread one would
+    /// purge, or fetch, another render.
+    #[tokio::test]
+    async fn bare_remainders_keep_their_first_segment() {
+        let base = "http://img.test";
+        for remainder in [
+            "exp:1893456000/300x200/https://example.com/a.jpg",
+            "maxage:60/300x200/https://example.com/a.jpg",
+            "page:2/300x200/https://example.com/doc.pdf",
+            "frame:10/300x200/https://example.com/clip.mp4",
+            "preset:cafe/https://example.com/a.jpg",
+            "exp:1893456000/300x200/root:photos/a.jpg",
+            "300x200/https://cdn.example.com/2024/a.jpg",
+        ] {
+            assert_eq!(
+                split_signed(remainder, base),
+                (None, None, remainder.to_string()),
+                "{remainder}"
+            );
+        }
+        let out = exec(&args(&[
+            "explain",
+            "--base",
+            base,
+            "exp:1893456000/300x200/https://example.com/a.jpg",
+        ]))
+        .await
+        .unwrap();
+        assert!(out.contains("signature: none (bare remainder)"), "{out}");
+        assert!(
+            out.contains("exp:1893456000  link expires at unix time 1893456000"),
+            "{out}"
+        );
+        // Paths and URLs keep their signature segment: a slash-led
+        // path any tag the server's parser takes, a slash-less one
+        // a whole tag or `unsafe`.
+        let rest = "300x200/https://example.com/a.jpg";
+        let tag = crabcrop_url::sign(b"split-secret", rest).unwrap();
+        let hmac = |hex: &str| Some(Signature::Hmac(hex.to_string()));
+        for (input, signature, kid) in [
+            (format!("/{tag}/{rest}"), hmac(&tag), None),
+            (format!("{tag}/{rest}"), hmac(&tag), None),
+            (format!("k2:{tag}/{rest}"), hmac(&tag), Some("k2")),
+            (format!("/k2:{tag}/{rest}"), hmac(&tag), Some("k2")),
+            (format!("{base}/{tag}/{rest}"), hmac(&tag), None),
+            (format!("https://other.test/{tag}/{rest}"), hmac(&tag), None),
+            (format!("unsafe/{rest}"), Some(Signature::Unsafe), None),
+            (format!("/unsafe/{rest}"), Some(Signature::Unsafe), None),
+            (format!("/abc/{rest}"), hmac("abc"), None),
+        ] {
+            assert_eq!(
+                split_signed(&input, base),
+                (signature, kid.map(String::from), rest.to_string()),
+                "{input}"
+            );
+        }
     }
 
     #[test]

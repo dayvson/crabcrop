@@ -97,7 +97,7 @@ fn default_configuration_keeps_its_fingerprint() {
     );
     assert_eq!(
         (RENDERING_VERSION, fingerprint.as_str()),
-        (7, "25e5e3685efb9abe")
+        (8, "6e5d7c480309546a")
     );
 }
 
@@ -1411,4 +1411,146 @@ fn raised_malloc_thresholds_keep_a_renders_blocks() {
     if fresh >= 3000 {
         assert!(raised * 5 < fresh, "{raised} against {fresh}");
     }
+}
+
+#[test]
+fn a_disk_budget_of_zero_opens_no_disk_tier_and_never_touches_the_directory() {
+    // Issue #708: docs/configuration.md said a budget of 0
+    // disables storage even with a directory set, but boot
+    // still created and probed the directory, so one that was
+    // not writable failed the boot. A budget of 0 is no disk
+    // tier now: nothing creates, probes or reads the directory.
+    // /proc is not writable even for a privileged process.
+    let base = crate::test_support::scratch_dir("boot-disk-off");
+    for dir in [
+        "/proc/self".to_string(),
+        base.join("never-made").display().to_string(),
+    ] {
+        let config = Config::from_env(env_of(&[
+            ("CRABCROP_SECRET", "a production-grade secret"),
+            ("CRABCROP_RESULT_STORAGE_DIR", dir.as_str()),
+            ("CRABCROP_RESULT_STORAGE_MAX_MB", "0"),
+        ]))
+        .unwrap();
+        let stores = open_stores(&config).unwrap();
+        assert!(stores.disk.is_none(), "{dir}");
+    }
+    assert!(!base.join("never-made").exists());
+    // With a budget, the same unwritable directory still stops
+    // the boot, naming the variable.
+    let config = Config::from_env(env_of(&[
+        ("CRABCROP_SECRET", "a production-grade secret"),
+        ("CRABCROP_RESULT_STORAGE_DIR", "/proc/self"),
+    ]))
+    .unwrap();
+    let err = open_stores(&config).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Build {
+                var: Some("CRABCROP_RESULT_STORAGE_DIR"),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("is not writable"), "{err}");
+}
+
+#[test]
+fn open_stores_starts_the_disk_tier_and_its_scan_indexes_what_a_previous_run_left() {
+    // Issue #708: the store opens with its scan on a thread of
+    // its own, and the boot waits for the scan up to the
+    // store's deadline; a healthy disk is done by then.
+    let dir = crate::test_support::scratch_dir("boot-disk-scan");
+    let config = Config::from_env(env_of(&[
+        ("CRABCROP_SECRET", "a production-grade secret"),
+        ("CRABCROP_RESULT_STORAGE_DIR", &dir.display().to_string()),
+    ]))
+    .unwrap();
+    let store = open_stores(&config).unwrap().disk.unwrap();
+    let report = store.wait_scan(store.boot_deadline(), crate::storage::ScanPhase::ended);
+    assert_eq!(report.phase, crate::storage::ScanPhase::Done);
+    let image = crate::cache::CachedImage {
+        bytes: bytes::Bytes::from_static(b"pixels"),
+        format: crate::url::ImageFormat::Png,
+        quality: None,
+        groups: Vec::new(),
+        etag: format!(
+            "\"{}\"",
+            hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(b"pixels")[..16])
+        ),
+        written: None,
+    };
+    store.put("k", &image);
+    drop(store);
+    let store = open_stores(&config).unwrap().disk.unwrap();
+    let report = store.wait_scan(store.boot_deadline(), crate::storage::ScanPhase::ended);
+    assert_eq!(report.phase, crate::storage::ScanPhase::Done);
+    assert_eq!((report.files, report.entries), (1, 1));
+    assert!(store.get("k").is_some());
+}
+
+#[test]
+fn the_disk_tier_boot_lines_say_what_the_scan_did() {
+    // Issue #708: the boot logs when the scan starts, when it
+    // is slow, and what it found once it ends, the files it
+    // deleted included.
+    use crate::storage::{ScanPhase, ScanReport};
+    let report = |phase: ScanPhase, secs: u64| ScanReport {
+        phase,
+        elapsed: std::time::Duration::from_millis(secs * 1000 + 250),
+        files: 12,
+        entries: 9,
+        bytes: 4096,
+        deleted: 2,
+        undeleted: 0,
+    };
+    assert_eq!(
+        disk_tier_off("/var/cache/crabcrop"),
+        "result storage: off, CRABCROP_RESULT_STORAGE_MAX_MB is 0, so /var/cache/crabcrop is not used"
+    );
+    assert_eq!(
+        disk_scan_started("/c", 512, &ScanPhase::Scanning),
+        "result storage at /c: budget 512 MB, scanning the entries a previous run left"
+    );
+    assert_eq!(
+        disk_scan_started("/c", 512, &ScanPhase::Checking),
+        "result storage at /c: budget 512 MB, waiting for the directory to answer"
+    );
+    assert_eq!(
+        disk_scan_done("/c", 512, &report(ScanPhase::Done, 3)),
+        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s, deleted 2 and skipped 1"
+    );
+    assert_eq!(
+        disk_scan_done(
+            "/c",
+            512,
+            &ScanReport {
+                deleted: 1,
+                undeleted: 1,
+                ..report(ScanPhase::Done, 3)
+            }
+        ),
+        "result storage at /c: 9 entries, 4096 bytes, budget 512 MB; the boot scan read 12 files in 3.2s, deleted 1, could not delete 1 and skipped 1"
+    );
+    assert_eq!(
+        disk_scan_running("/c", &report(ScanPhase::Scanning, 35)),
+        "result storage at /c: the boot scan is still running after 35s, 12 files read; until it ends, an entry it has not indexed is a miss"
+    );
+    assert_eq!(
+        disk_scan_running("/c", &report(ScanPhase::Checking, 5)),
+        "result storage at /c: the directory has not answered after 5s; until it does, the disk tier serves and stores nothing"
+    );
+    assert_eq!(
+        disk_scan_failed(
+            "/c",
+            "cannot create the result storage directory: Permission denied"
+        ),
+        "result storage at /c: cannot create the result storage directory: Permission denied; the disk tier stays off until a restart"
+    );
+    assert_eq!(disk_scan_stopped(0).len(), 1);
+    let lines = disk_scan_stopped(2);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[1].starts_with("shutdown: 2 purges sent while the boot scan ran"));
 }

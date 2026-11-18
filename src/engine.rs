@@ -1217,12 +1217,11 @@ impl Default for ProcessContext<'_> {
 /// the processing deadline. Its focal analysis is the
 /// built-in saliency statistic, or, with a face or focal
 /// provider configured, an inference that takes the AI
-/// gate like any other (issue #379). An animated image
-/// render runs that analysis once, on the first frame,
-/// and replays the window (issue #376); a video render
-/// still runs it on every frame. A still spelling of the
-/// same source (a `frame:` selection renders one frame)
-/// runs these operations normally.
+/// gate like any other (issue #379). An animated render,
+/// image or video, runs that analysis once, on the first
+/// frame, and replays the window (issues #376, #713). A
+/// still spelling of the same source (a `frame:` selection
+/// renders one frame) runs these operations normally.
 fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), EngineError> {
     let inference_bound = directives.removebg
         || directives.studio
@@ -2058,6 +2057,14 @@ impl Engine {
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> Result<StillEncode, EngineError> {
+        // A JPEG with a fill encodes the image flattened over
+        // it, so that is the image the encodes, the quality
+        // pick and the scores read (issue #713): scoring the
+        // unflattened one measured the colors under its
+        // transparent pixels, which the file never shows. It
+        // is flattened once here rather than at every encode.
+        let flattened = flattened_for(img, format, encode_opts.fill);
+        let img = flattened.as_ref().unwrap_or(img);
         // Every candidate of a verified search is scored
         // against this image: the metric's work on it is done
         // once, at the first score, and dropped with this call
@@ -2258,11 +2265,8 @@ impl Engine {
         // the rest replay. One trim window per trim (issue
         // #465): the union over every frame, settled before
         // any frame renders, so the frames share one canvas.
-        let share = FrameShare {
-            smart_windows: Some(SmartWindows::default()),
-            ..FrameShare::default()
-        };
-        let (frames, encode_opts) = render_frames(frames, ops, ctx, directives, share)?;
+        let (mut frames, encode_opts) =
+            render_frames(frames, ops, ctx, directives, FrameShare::default())?;
         // Resolve the quality directive for a WebP output the
         // same way the still path does: an explicit value is
         // used as given, `quality(auto)` is picked from the
@@ -2276,13 +2280,11 @@ impl Engine {
                     .quality
                     .as_ref()
                     .and_then(|q| q.resolved_for(ImageFormat::WebP));
-                quality_in_force(resolved, ctx.save_data, || {
-                    auto_quality(&DynamicImage::ImageRgba8(frames.first.buffer().clone()))
-                })
+                quality_in_force(resolved, ctx.save_data, || frames.with_first(auto_quality))
             }
             AnimatedFormat::Gif => QualityInForce::default(),
         };
-        let placeholder = first_frame_placeholder(&frames, ctx);
+        let placeholder = first_frame_placeholder(&mut frames, ctx);
         let out = match format {
             AnimatedFormat::Gif => encode_animated_gif(&frames, ctx.deadline)?,
             AnimatedFormat::WebP => encode_animated_webp(
@@ -2328,14 +2330,16 @@ impl Engine {
             )
         })?;
         let source_size = frames.dimensions();
-        // The frames share their trim windows (issue #465),
-        // as on the animated image paths: the encoder takes
-        // one frame size.
-        let (frames, _) = render_frames(frames, ops, ctx, directives, FrameShare::default())?;
+        // The frames share their smart crop windows and their
+        // trim windows (issues #376, #465, #713), as on the
+        // animated image paths: the first frame decides each
+        // window, so a smart crop holds still from frame to
+        // frame, and the encoder takes one frame size.
+        let (mut frames, _) = render_frames(frames, ops, ctx, directives, FrameShare::default())?;
         // The placeholder is a meta-only surface (meta itself
         // refuses video URLs in the server). It is taken here,
         // before the frames move into the encoder's.
-        let placeholder = first_frame_placeholder(&frames, ctx);
+        let placeholder = first_frame_placeholder(&mut frames, ctx);
         let (width, height) = frames.dimensions();
         let out_frames: Vec<crate::video::VideoFrame> = frames
             .into_iter()
@@ -2366,12 +2370,11 @@ impl Engine {
 /// caller asked for one: it describes the first processed
 /// frame.
 fn first_frame_placeholder(
-    frames: &Frames,
+    frames: &mut Frames,
     ctx: &ProcessContext<'_>,
 ) -> Option<crate::placeholder::Placeholder> {
-    ctx.placeholders.then(|| {
-        crate::placeholder::compute(&DynamicImage::ImageRgba8(frames.first.buffer().clone()))
-    })
+    ctx.placeholders
+        .then(|| frames.with_first(crate::placeholder::compute))
 }
 
 /// Run the operations over every frame of an animated render,
@@ -2413,12 +2416,15 @@ fn render_frames(
     let (img, encode_opts, delay) = render(frames.first)?;
     budget.check_frames(img.width(), img.height(), frame_count)?;
     budget.charge(img.width(), img.height())?;
-    let first = image::Frame::from_parts(img.to_rgba8(), 0, 0, delay);
+    // A rendered frame is the chain's own image, so an RGBA8
+    // one becomes the frame without a copy (issue #713); any
+    // other layout converts as it always did.
+    let first = image::Frame::from_parts(img.into_rgba8(), 0, 0, delay);
     let mut rest = Vec::with_capacity(frames.rest.len());
     for frame in frames.rest {
         let (img, _, delay) = render(frame)?;
         budget.charge(img.width(), img.height())?;
-        rest.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
+        rest.push(image::Frame::from_parts(img.into_rgba8(), 0, 0, delay));
     }
     Ok((Frames { first, rest }, encode_opts))
 }
@@ -2696,6 +2702,19 @@ impl Frames {
     /// The first frame's width and height.
     fn dimensions(&self) -> (u32, u32) {
         self.first.buffer().dimensions()
+    }
+
+    /// `f` of the first frame as a `DynamicImage`. The frame's
+    /// buffer is lent for the call and put back, where it was
+    /// copied once for each look (issue #713): the quality pick
+    /// and the placeholder each read the whole frame.
+    fn with_first<T>(&mut self, f: impl FnOnce(&DynamicImage) -> T) -> T {
+        let (left, top, delay) = (self.first.left(), self.first.top(), self.first.delay());
+        let empty = image::Frame::new(image::RgbaImage::new(0, 0));
+        let img = DynamicImage::ImageRgba8(std::mem::replace(&mut self.first, empty).into_buffer());
+        let out = f(&img);
+        self.first = image::Frame::from_parts(img.into_rgba8(), left, top, delay);
+        out
     }
 }
 
@@ -3681,6 +3700,16 @@ fn segment_detection(
         .map_err(EngineError::Inference)
 }
 
+/// The most box-prompted segmentation decodes one request
+/// runs (issue #713). Each detection of a class filter is one
+/// decode, and a crowd can hold hundreds of detections: an
+/// evaluation measured about 1.2 s more for 35 more people in
+/// a debug build, all of it holding one of the AI permits. 64
+/// covers a group photograph, about two seconds at that rate;
+/// the detections past it are redacted by their boxes (see
+/// [`ChainState::class_targets`]).
+pub(crate) const MAX_SEGMENT_DECODES: usize = 64;
+
 /// The detections of one class operation with their
 /// segmentation masks, plus the record entries the masks
 /// produced (issue #175). The geometry is measured on
@@ -3695,10 +3724,15 @@ fn segment_for_class(
     provider: &dyn crate::ai::SegmentProvider,
     img: &DynamicImage,
     detections: &[crate::ai::Detection],
+    check_deadline: impl Fn() -> Result<(), EngineError>,
 ) -> Result<(Vec<crate::filters::MaskedDetection>, Vec<SegmentObject>), EngineError> {
     let mut masked = Vec::with_capacity(detections.len());
     let mut objects = Vec::new();
     for det in detections {
+        // Between decodes, not only between filters (issue
+        // #713): a request with many objects stops at its
+        // deadline instead of decoding on.
+        check_deadline()?;
         let mask = segment_detection(memo, provider, img, det)?;
         if let Some(geometry) = crate::ai::mask_geometry(&mask) {
             let (tx, ty, tw, th) = geometry.tight;
@@ -4031,10 +4065,10 @@ impl TrimWindows {
 /// of the scene.
 #[derive(Debug, Default)]
 struct FrameShare {
-    /// One smart crop window per crop (issue #376). `None`
-    /// on the video path, whose frames still decide their
-    /// smart crops one at a time.
-    smart_windows: Option<SmartWindows>,
+    /// One smart crop window per crop (issue #376), on the
+    /// animated image and video paths alike: the video path
+    /// let each frame decide its own until issue #713.
+    smart_windows: SmartWindows,
     /// One trim window per trim filter (issue #465).
     trims: TrimWindows,
 }
@@ -4062,6 +4096,13 @@ fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
 /// cost is one extra chain prefix per trim per frame, under
 /// the render's own deadline. A lone frame has nothing to
 /// share and trims for itself.
+///
+/// A prefix runs on a copy of each frame, since its steps
+/// take the frame they work on (a resize premultiplies its
+/// own frame where it sits) and the render needs the frames
+/// as they came. A trim nothing runs before reads the frames
+/// where they are (issue #713): its survey is the tolerance
+/// pass alone, and copying every frame for it was the cost.
 fn survey_trims(
     frames: &Frames,
     ops: &[Operation],
@@ -4085,15 +4126,27 @@ fn survey_trims(
                 _ => continue,
             };
             let key = (op_index, filter_index);
+            let first_step = op_index == 0 && filter_index == 0;
             // The first frame's dimensions and the union so far.
             let mut surveyed: Option<((u32, u32), Option<Window>)> = None;
             for frame in frames.iter() {
                 ctx.check_deadline()?;
-                let img = DynamicImage::ImageRgba8(frame.buffer().clone());
-                let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
-                let img = chain.run_to(img, ops, key)?;
-                let dims = (img.width(), img.height());
-                let found = crate::filters::trim_box(&img, tolerance);
+                let (dims, found) = if first_step {
+                    let rgba = frame.buffer();
+                    (
+                        rgba.dimensions(),
+                        crate::filters::trim_box_rgba(rgba, tolerance),
+                    )
+                } else {
+                    let img = DynamicImage::ImageRgba8(frame.buffer().clone());
+                    let mut chain =
+                        ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
+                    let img = chain.run_to(img, ops, key)?;
+                    (
+                        (img.width(), img.height()),
+                        crate::filters::trim_box(&img, tolerance),
+                    )
+                };
                 match &mut surveyed {
                     None => surveyed = Some((dims, found)),
                     Some((first, union)) if *first == dims => *union = union_box(*union, found),
@@ -4175,6 +4228,9 @@ struct ChainState<'r, 'a> {
     /// of what was segmented, in chain order.
     segment_memo: SegmentMemo,
     segment_objects: Vec<SegmentObject>,
+    /// How many box-prompted decodes the chain has run, held
+    /// to [`MAX_SEGMENT_DECODES`] (issue #713).
+    segment_decodes: usize,
     /// The objects-crop record (issue #318): the last
     /// `objects` crop in the chain wins, like the studio
     /// record, since its framing is the one the response
@@ -4335,12 +4391,14 @@ impl PendingFocal {
 }
 
 /// What a class filter paints (see
-/// [`ChainState::class_targets`]): the segmentation masks
-/// when a segment provider is configured, the detection
-/// boxes when not.
-enum ClassTargets {
-    Masked(Vec<crate::filters::MaskedDetection>),
-    Boxes(Vec<crate::ai::Detection>),
+/// [`ChainState::class_targets`]): the detections with their
+/// segmentation masks, and the detections it paints by their
+/// boxes. Without a segment provider every detection is a
+/// box; with one, every detection is masked until the
+/// request's decodes run out (see [`MAX_SEGMENT_DECODES`]).
+struct ClassTargets {
+    masked: Vec<crate::filters::MaskedDetection>,
+    boxes: Vec<crate::ai::Detection>,
 }
 
 impl<'r, 'a> ChainState<'r, 'a> {
@@ -4371,6 +4429,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
             inpaint_regions: Vec::new(),
             segment_memo: None,
             segment_objects: Vec::new(),
+            segment_decodes: 0,
             objects_crop_record: None,
             fusion: fusion_plan(ops),
             fused_window: None,
@@ -4764,10 +4823,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
             crate::crop::Uncut::whole(cropped)
         } else if *align == Align::Smart
-            && let Some(windows) = self
-                .share
-                .as_deref_mut()
-                .and_then(|s| s.smart_windows.as_mut())
+            && let Some(windows) = self.share.as_deref_mut().map(|s| &mut s.smart_windows)
         {
             windows.crop(img, (tw, th), op_index, align, self.ctx)
         } else {
@@ -5090,22 +5146,22 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
             Filter::BlurClass(class) => {
                 let deadline = self.ctx.deadline;
-                img = match self.class_targets(&img, class)? {
-                    ClassTargets::Masked(masked) => {
-                        crate::filters::blur_detections_masked(&img, &masked, deadline)?
-                    }
-                    ClassTargets::Boxes(boxes) => {
-                        crate::filters::blur_detections(&img, &boxes, deadline)?
-                    }
-                };
+                let ClassTargets { masked, boxes } = self.class_targets(&img, class)?;
+                if !masked.is_empty() {
+                    img = crate::filters::blur_detections_masked(&img, &masked, deadline)?;
+                }
+                if !boxes.is_empty() {
+                    img = crate::filters::blur_detections(&img, &boxes, deadline)?;
+                }
             }
             Filter::PixelateClass(class) => {
-                img = match self.class_targets(&img, class)? {
-                    ClassTargets::Masked(masked) => {
-                        crate::filters::pixelate_detections_masked(&img, &masked)
-                    }
-                    ClassTargets::Boxes(boxes) => crate::filters::pixelate_detections(&img, &boxes),
-                };
+                let ClassTargets { masked, boxes } = self.class_targets(&img, class)?;
+                if !masked.is_empty() {
+                    img = crate::filters::pixelate_detections_masked(&img, &masked);
+                }
+                if !boxes.is_empty() {
+                    img = crate::filters::pixelate_detections(&img, &boxes);
+                }
             }
             Filter::RecolorClass(class, color) => {
                 // The class rules are the
@@ -5116,14 +5172,13 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 // silhouette when a segment
                 // provider is configured, the
                 // box when not (issue #175).
-                img = match self.class_targets(&img, class)? {
-                    ClassTargets::Masked(masked) => {
-                        crate::filters::recolor_detections_masked(&img, &masked, *color)
-                    }
-                    ClassTargets::Boxes(boxes) => {
-                        crate::filters::recolor_detections(&img, &boxes, *color)
-                    }
-                };
+                let ClassTargets { masked, boxes } = self.class_targets(&img, class)?;
+                if !masked.is_empty() {
+                    img = crate::filters::recolor_detections_masked(&img, &masked, *color);
+                }
+                if !boxes.is_empty() {
+                    img = crate::filters::recolor_detections(&img, &boxes, *color);
+                }
             }
             // Padding is read from the request as a
             // whole by the face crop; no pixels here.
@@ -5231,25 +5286,43 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// objects added to the record. The #42 rule, inherited:
     /// a detection or segmentation failure fails the request
     /// rather than serve the image unredacted.
+    ///
+    /// A request runs at most [`MAX_SEGMENT_DECODES`] decodes
+    /// across its class filters (issue #713), to the
+    /// detections in the order the detector gives them, best
+    /// first. Past that, the rest are painted by their boxes,
+    /// as without a segment provider: a box holds the whole
+    /// object, so nothing is left unredacted. The deadline is
+    /// checked before each decode.
     fn class_targets(
         &mut self,
         img: &DynamicImage,
         class: &str,
     ) -> Result<ClassTargets, EngineError> {
-        let boxes = detect_for_class(
+        let mut boxes = detect_for_class(
             &mut self.detection_memos,
             &self.detect_providers,
             img,
             class,
         )?;
-        Ok(match self.ctx.segment_provider {
-            Some(provider) => {
-                let (masked, mut objects) =
-                    segment_for_class(&mut self.segment_memo, provider, img, &boxes)?;
-                self.segment_objects.append(&mut objects);
-                ClassTargets::Masked(masked)
-            }
-            None => ClassTargets::Boxes(boxes),
+        let Some(provider) = self.ctx.segment_provider else {
+            return Ok(ClassTargets {
+                masked: Vec::new(),
+                boxes,
+            });
+        };
+        let room = MAX_SEGMENT_DECODES.saturating_sub(self.segment_decodes);
+        let rest = boxes.split_off(room.min(boxes.len()));
+        let ctx = self.ctx;
+        let (masked, mut objects) =
+            segment_for_class(&mut self.segment_memo, provider, img, &boxes, || {
+                ctx.check_deadline()
+            })?;
+        self.segment_decodes += masked.len();
+        self.segment_objects.append(&mut objects);
+        Ok(ClassTargets {
+            masked,
+            boxes: rest,
         })
     }
 
@@ -5650,9 +5723,10 @@ fn blend_overlay(
         None => None,
     };
     // An overlay that lands off the canvas is neither scaled
-    // nor copied (issue #604).
+    // nor copied (issue #604), and leaves the base as it was,
+    // in its own layout (issue #713).
     if !lands_on((base.width(), base.height()), (x, y)) {
-        return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
+        return Ok(base.clone());
     }
     // The scaled size is known before anything is scaled, so
     // only the part that lands is: a scale the pixel budget
@@ -5664,7 +5738,7 @@ fn blend_overlay(
         None => source_size,
     };
     let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
-        return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
+        return Ok(base.clone());
     };
     let top = if top_size == source_size {
         // Scaled to its own size, the overlay is itself.
@@ -5695,7 +5769,9 @@ fn blend_overlay(
 /// clipped, never a panic. The deadline is checked before
 /// anything is copied and per row of the composite, as the
 /// overlay checks it, and only the part of the watermark that
-/// lands on the base is read or copied (issue #604).
+/// lands on the base is read or copied (issue #604). A
+/// watermark that lands nowhere leaves the base as it was, in
+/// its own layout (issue #713).
 fn overlay_watermark(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
@@ -5707,7 +5783,7 @@ fn overlay_watermark(
     ctx.check_deadline()?;
     let top_size = (wm.image().width(), wm.image().height());
     let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
-        return Ok(DynamicImage::ImageRgba8(base.to_rgba8()));
+        return Ok(base.clone());
     };
     composite(
         base,
@@ -5773,6 +5849,9 @@ fn landing(
 /// kept. Only the part of `top` that lands on `base` is read
 /// (issue #604, see [`landing`]), and `each_row` runs before
 /// each of its rows, where the callers check the deadline.
+/// The blend works in 8-bit RGBA, so a composite that lands
+/// is RGBA8; one that lands nowhere is the base as it was, in
+/// its own layout (issue #713).
 fn composite<E, T>(
     base: &DynamicImage,
     top: &T,
@@ -5784,12 +5863,12 @@ fn composite<E, T>(
 where
     T: image::GenericImageView<Pixel = image::Rgba<u8>>,
 {
-    let mut out = base.to_rgba8();
     let Some(((tx0, ty0, w, h), (bx0, by0))) =
-        landing((out.width(), out.height()), top.dimensions(), (x, y))
+        landing((base.width(), base.height()), top.dimensions(), (x, y))
     else {
-        return Ok(DynamicImage::ImageRgba8(out));
+        return Ok(base.clone());
     };
+    let mut out = base.to_rgba8();
     let opacity = alpha as f32 / 100.0;
     for row in 0..h {
         each_row()?;
@@ -5807,6 +5886,24 @@ where
         }
     }
     Ok(DynamicImage::ImageRgba8(out))
+}
+
+/// The image a JPEG with a `fill` encodes: `img` flattened over
+/// the fill, as the encoder flattens it, when `img` has alpha;
+/// `None` for every other format, a JPEG without a fill, and
+/// an image with no alpha to flatten, which encode as they
+/// are.
+fn flattened_for(
+    img: &DynamicImage,
+    format: StillFormat,
+    fill: Option<[u8; 3]>,
+) -> Option<DynamicImage> {
+    match (format, fill) {
+        (StillFormat::Jpeg, Some(bg)) if img.color().has_alpha() => {
+            Some(DynamicImage::ImageRgb8(flatten(img, bg)))
+        }
+        _ => None,
+    }
 }
 
 /// Composite an image over a solid background color, dropping the
@@ -5896,9 +5993,9 @@ enum SourceWindow {
     /// the backend's crop box (issue #287).
     Fused(Window),
     /// The window an aspect crop decided on (issue #654).
-    /// The result is RGBA8 and byte for byte the two-step
-    /// chain's: the window cut to RGBA8, then resized (see
-    /// [`resize_lanczos3_cut`]).
+    /// The result is in the frame's layout and byte for byte
+    /// the two-step chain's: the window cut, then resized
+    /// (see [`resize_lanczos3_cut`]).
     Cut(Window),
     /// A frame the JPEG decoder reduced (issue #653): the
     /// picture of a larger image, at a fraction of its size.
@@ -6034,9 +6131,7 @@ fn apply_size_windowed(
         // the materialized window itself, so the fused
         // path materializes it here.
         SourceWindow::Fused((x, y, ww, wh)) if unchanged => img.crop_imm(x, y, ww, wh),
-        SourceWindow::Cut(window) if unchanged => {
-            DynamicImage::ImageRgba8(crate::crop::cut_rgba(&img, window))
-        }
+        SourceWindow::Cut(window) if unchanged => crate::crop::cut(&img, window),
         SourceWindow::Whole if unchanged => img,
         SourceWindow::Fused((x, y, ww, wh)) => resize_lanczos3_cropped(&img, x, y, ww, wh, w, h),
         SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
@@ -6197,19 +6292,18 @@ fn blank_like(img: &DynamicImage, w: u32, h: u32) -> Option<DynamicImage> {
     }
 }
 
-/// An aspect crop's window resized to (w, h), as RGBA8
-/// (issue #654): byte for byte [`resize_lanczos3`] of the
-/// window cut to RGBA8 ([`crate::crop::cut_rgba`]), which is
-/// what a crop has always produced.
+/// An aspect crop's window resized to (w, h), in the frame's
+/// layout (issues #654, #713): byte for byte
+/// [`resize_lanczos3`] of the window cut
+/// ([`crate::crop::cut`]).
 ///
 /// Where it can, the resample reads the window straight from
 /// the frame, without making that cut (see
 /// [`resample_window`]). Everywhere else the window is cut
-/// first, as it always was, the frame is released, and the
-/// cut is resized: a layout other than RGB8 and RGBA8, a
-/// window that needs no resample, a case
-/// [`opaque_stays_opaque`] or [`view_holds_no_more`] turns
-/// away, and a backend refusal.
+/// first, the frame is released, and the cut is resized: a
+/// layout other than RGB8 and RGBA8, a window that needs no
+/// resample, a case [`view_holds_no_more`] turns away, and a
+/// backend refusal.
 fn resize_lanczos3_cut(img: DynamicImage, window: Window, w: u32, h: u32) -> DynamicImage {
     let (x, y, ww, wh) = window;
     let inside =
@@ -6223,14 +6317,14 @@ fn resize_lanczos3_cut(img: DynamicImage, window: Window, w: u32, h: u32) -> Dyn
     } else {
         img
     };
-    let cut = crate::crop::cut_rgba(&img, window);
+    let cut = crate::crop::cut(&img, window);
     drop(img);
-    resize_lanczos3_owned(DynamicImage::ImageRgba8(cut), w, h)
+    resize_lanczos3_owned(cut, w, h)
 }
 
 /// The window of an RGB8 or RGBA8 frame resampled to (w, h)
-/// through a view of the frame, as RGBA8; or the frame handed
-/// back, for the caller to cut the window first.
+/// through a view of the frame, in the frame's layout; or the
+/// frame handed back, for the caller to cut the window first.
 ///
 /// A view ends at the window's edges, so the resample sees
 /// exactly the pixels a cut would hold. The backend's crop
@@ -6239,24 +6333,15 @@ fn resize_lanczos3_cut(img: DynamicImage, window: Window, w: u32, h: u32) -> Dyn
 /// [`resize_lanczos3_cropped`] (issue #287) differs from the
 /// two-step chain and this does not. A test pins both.
 ///
-/// An RGB8 frame is resampled as RGB8 and gains its opaque
-/// alpha afterwards. The RGBA8 resample of the same pixels
-/// under an alpha of 255 computes the same color channels
-/// (premultiplying by 255 and dividing by 255 change
-/// nothing, and the convolution runs per channel) provided
-/// its alpha comes out 255 everywhere, which
-/// [`opaque_stays_opaque`] answers. The resample writes its
-/// RGB8 rows into the front of the result's own buffer,
-/// which [`spread_rgb_to_rgba`] then widens in place, so
-/// the result is the only buffer of the output's size. An
-/// RGBA8 frame has its window premultiplied where it sits
-/// (see [`resample_premultiplying`]): the crop owns the frame
-/// and nothing reads it afterwards.
+/// An RGB8 frame is resampled as RGB8, into the result's own
+/// buffer. An RGBA8 frame has its window premultiplied where
+/// it sits (see [`resample_premultiplying`]): the crop owns
+/// the frame and nothing reads it afterwards.
 ///
 /// `Err` hands the frame back as it came: another layout, a
-/// case [`opaque_stays_opaque`] or [`view_holds_no_more`]
-/// turns away, and a backend refusal, which no input reaches
-/// and which leaves an RGBA8 window straight again.
+/// case [`view_holds_no_more`] turns away, and a backend
+/// refusal, which no input reaches and which leaves an RGBA8
+/// window straight again.
 fn resample_window(
     img: DynamicImage,
     (x, y, ww, wh): Window,
@@ -6265,29 +6350,15 @@ fn resample_window(
 ) -> Result<DynamicImage, DynamicImage> {
     let frame_bytes = img.as_bytes().len() as u64;
     match img {
-        DynamicImage::ImageRgb8(rgb)
-            if opaque_stays_opaque((ww, wh), (w, h))
-                && view_holds_no_more(frame_bytes, 3, (ww, wh), (w, h)) =>
-        {
-            let pixels = w as usize * h as usize;
-            let mut out = vec![0u8; pixels * 4];
-            let done = fast_image_resize::images::Image::from_slice_u8(
-                w,
-                h,
-                &mut out[..pixels * 3],
-                fast_image_resize::PixelType::U8x3,
-            )
-            .is_ok_and(|mut packed| {
-                fast_image_resize::images::CroppedImage::new(&rgb, x, y, ww, wh)
-                    .is_ok_and(|view| convolve_lanczos3(&view, &mut packed))
-            });
-            if !done {
-                return Err(DynamicImage::ImageRgb8(rgb));
+        DynamicImage::ImageRgb8(rgb) if view_holds_no_more(frame_bytes, 3, (ww, wh), (w, h)) => {
+            let mut resized = image::RgbImage::new(w, h);
+            let done = fast_image_resize::images::CroppedImage::new(&rgb, x, y, ww, wh)
+                .is_ok_and(|view| convolve_lanczos3(&view, &mut resized));
+            if done {
+                Ok(DynamicImage::ImageRgb8(resized))
+            } else {
+                Err(DynamicImage::ImageRgb8(rgb))
             }
-            spread_rgb_to_rgba(&mut out, pixels);
-            Ok(DynamicImage::ImageRgba8(
-                image::RgbaImage::from_raw(w, h, out).expect("resize size"),
-            ))
         }
         DynamicImage::ImageRgba8(mut rgba)
             if view_holds_no_more(frame_bytes, 4, (ww, wh), (w, h)) =>
@@ -6305,43 +6376,17 @@ fn resample_window(
     }
 }
 
-/// Widen `pixels` RGB8 pixels packed at the front of `buf`
-/// to RGBA8 over the first `4 * pixels` bytes of it, alpha
-/// 255, in place. Pixel `i` moves from byte `3 * i` to byte
-/// `4 * i`, so the pixels move from the last one back: a
-/// run of them is copied whole where its new place lies
-/// past its old one (every run but the first few), and one
-/// pixel at a time where the two overlap.
-fn spread_rgb_to_rgba(buf: &mut [u8], pixels: usize) {
-    const RUN: usize = 256;
-    let mut end = pixels;
-    while end > 0 {
-        let start = end.saturating_sub(RUN);
-        if 4 * start >= 3 * end {
-            let (packed, spread) = buf.split_at_mut(4 * start);
-            let packed = packed[3 * start..3 * end].as_chunks::<3>().0;
-            let spread = spread[..4 * (end - start)].as_chunks_mut::<4>().0;
-            for (d, s) in spread.iter_mut().zip(packed) {
-                *d = [s[0], s[1], s[2], 255];
-            }
-        } else {
-            for i in (start..end).rev() {
-                let (r, g, b) = (buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]);
-                buf[4 * i..4 * i + 4].copy_from_slice(&[r, g, b, 255]);
-            }
-        }
-        end = start;
-    }
-}
-
 /// Whether resampling a window straight from the frame holds
 /// no more memory at its peak than the cut-first chain did
-/// before issue #654. That chain peaked at the larger of two
-/// moments: the frame beside the RGBA8 cut; and, with the
-/// frame released, the cut, the backend's premultiplied copy
-/// of it, the backend's working rows and the output. Read
-/// from the frame, a crop holds the frame, the working rows
-/// and the output at once. That is no more than the second
+/// before issue #654, which cut every layout to RGBA8. That
+/// chain peaked at the larger of two moments: the frame
+/// beside the RGBA8 cut; and, with the frame released, the
+/// cut, the backend's premultiplied copy of it, the backend's
+/// working rows and the output. Read from the frame, a crop
+/// holds the frame, the working rows and the output at once,
+/// and an RGB8 crop's output now has three bytes a pixel
+/// where that chain's had four (issue #713), so the bound
+/// holds for it with room to spare. That is no more than the second
 /// moment when the frame is no larger than the cut and its
 /// copy, and no more than the first when the working rows
 /// and the output fit in the size of the cut. So an aspect
@@ -6351,9 +6396,10 @@ fn spread_rgb_to_rgba(buf: &mut [u8], pixels: usize) {
 /// frame released, as before.
 ///
 /// `frame_bytes` is the frame's buffer and `channels` its
-/// bytes per pixel; a cut and the output have four. The
-/// backend convolves down the columns first, into working
-/// rows no wider than the window and as tall as the output.
+/// bytes per pixel; the bound counts the cut and the output
+/// at the four that chain's had. The backend convolves down
+/// the columns first, into working rows no wider than the
+/// window and as tall as the output.
 fn view_holds_no_more(
     frame_bytes: u64,
     channels: u64,
@@ -6364,27 +6410,6 @@ fn view_holds_no_more(
     let output = 4 * w as u64 * h as u64;
     let working = channels * ww as u64 * h as u64;
     frame_bytes <= 2 * cut || working + output <= cut
-}
-
-/// The largest reduction, per axis, at which
-/// [`opaque_stays_opaque`] holds by arithmetic alone.
-const MAX_OPAQUE_REDUCTION: u64 = 1024;
-
-/// Whether the backend's RGBA8 resample of a fully opaque
-/// `from` window to `to` pixels leaves every alpha at 255.
-/// The backend rounds each kernel weight to fixed point, so
-/// the weights of one output pixel sum to one give or take
-/// half a unit per tap, and 255 times that sum rounds back
-/// to 255 while the error stays under 1/510 of the scale.
-/// The scale has at most 21 bits and a Lanczos3 pixel reads
-/// six taps per unit of reduction, so the error is under
-/// 3 * 1024 + 1 units of 2^-21 for reductions up to 1024,
-/// against the 4112 that would move alpha; with fewer bits
-/// the weights are larger and the taps fewer, and the margin
-/// only grows. Past that reduction nothing is claimed.
-fn opaque_stays_opaque((ww, wh): (u32, u32), (w, h): (u32, u32)) -> bool {
-    let within = |from: u32, to: u32| from as u64 <= to as u64 * MAX_OPAQUE_REDUCTION;
-    within(ww, w) && within(wh, h)
 }
 
 /// [`resize_lanczos3`] fused with the crop that precedes it
@@ -6662,6 +6687,12 @@ mod gif_frame_tests;
 // The largest output whose `quality(auto)` pick is verified.
 #[cfg(test)]
 mod quality_bound_tests;
+
+// Layout and depth through crops and composites, the quality
+// reference, the filter bounds, shared video windows and the
+// segmentation cap (issue #713).
+#[cfg(test)]
+mod fidelity_tests;
 
 #[cfg(test)]
 pub(crate) mod test_formats;

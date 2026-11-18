@@ -248,11 +248,18 @@ fn a_refused_resample_never_hands_on_a_premultiplied_frame() {
     assert_eq!(cases, 2 * 5 * 2);
 }
 
-/// The cut every aspect crop made before issue #654: the
+/// The cut every aspect crop made before issue #713: the
 /// image crate's, one pixel at a time through the frame's
-/// RGBA view.
-fn crate_cut(img: &DynamicImage, (x, y, w, h): Window) -> DynamicImage {
+/// RGBA view, so every layout came out RGBA8.
+fn rgba_cut(img: &DynamicImage, (x, y, w, h): Window) -> DynamicImage {
     DynamicImage::ImageRgba8(image::imageops::crop_imm(img, x, y, w, h).to_image())
+}
+
+/// The cut a crop stands for since issue #713: the image
+/// crate's `DynamicImage::crop_imm`, one pixel at a time, in
+/// the frame's own layout.
+fn crate_cut(img: &DynamicImage, (x, y, w, h): Window) -> DynamicImage {
+    img.crop_imm(x, y, w, h)
 }
 
 /// The two-step chain a crop was: the cut, then the resize of
@@ -281,16 +288,17 @@ fn windows(w: u32, h: u32) -> Vec<Window> {
 
 #[test]
 fn cut_by_rows_matches_the_crate_cut() {
-    // Issue #654: RGB8 and RGBA8 windows are copied by rows.
-    // Every layout, windows on every edge, and windows that
-    // reach past the frame, which both cuts clamp.
+    // Issue #654: RGB8 and RGBA8 windows are copied by rows,
+    // and since issue #713 in the frame's layout. Every
+    // layout, windows on every edge, and windows that reach
+    // past the frame, which both cuts clamp.
     let mut cases = 0;
     for (w, h) in [(1, 1), (2, 3), (7, 5), (64, 48)] {
         for (name, img) in frames_at(w, h) {
             let mut windows = windows(w, h);
             windows.extend([(w / 2, h / 2, w, h), (w, h, 1, 1), (0, 0, w + 5, h + 5)]);
             for window in windows {
-                let ours = DynamicImage::ImageRgba8(crate::crop::cut_rgba(&img, window));
+                let ours = crate::crop::cut(&img, window);
                 assert!(same(&crate_cut(&img, window), &ours), "{name} {window:?}");
                 cases += 1;
             }
@@ -396,28 +404,6 @@ fn window_resample_matches_cut_then_resize() {
         from_frame > 300 && cut_first > 300,
         "{from_frame} {cut_first}"
     );
-}
-
-#[test]
-fn rgb_rows_widen_to_rgba_in_place() {
-    // Issue #654: the RGB8 resample lands at the front of
-    // the RGBA8 result's own buffer and is widened where it
-    // sits. Every length around the run size and its
-    // multiples, where whole runs give way to single pixels;
-    // the bytes past the pixels are left alone.
-    for pixels in (0..=1100).chain([2047, 2048, 2049, 5000]) {
-        let packed: Vec<u8> = (0..pixels * 3).map(|i| (i * 7 + i / 5) as u8).collect();
-        let mut buf = packed.clone();
-        buf.resize(pixels * 4 + 3, 0xAB);
-        spread_rgb_to_rgba(&mut buf, pixels);
-        let (spread, past) = buf.split_at(pixels * 4);
-        let (wide, _) = spread.as_chunks::<4>();
-        let (narrow, _) = packed.as_chunks::<3>();
-        for (i, (wide, px)) in wide.iter().zip(narrow).enumerate() {
-            assert_eq!(*wide, [px[0], px[1], px[2], 255], "pixel {i} of {pixels}");
-        }
-        assert_eq!(past, [0xAB; 3], "{pixels}");
-    }
 }
 
 #[test]
@@ -548,15 +534,14 @@ fn image_bytes_mut(img: &mut DynamicImage) -> &mut [u8] {
 }
 
 #[test]
-fn an_opaque_window_stays_opaque_within_the_reduction_bound() {
-    // Issue #654: an RGB8 window is resampled without its
-    // alpha, which is only the RGBA8 resample's bytes while
-    // that alpha comes out 255. Up to the bound it does, by
-    // arithmetic; a strip at the bound and one past it both
-    // match the two-step chain, the second by taking it.
-    assert!(opaque_stays_opaque((1024, 2048), (1, 2)));
-    assert!(!opaque_stays_opaque((1025, 1), (1, 1)));
-    assert!(!opaque_stays_opaque((1, 2049), (1, 2)));
+fn an_rgb_window_resamples_as_rgb_at_any_reduction() {
+    // Issue #713: an RGB8 window is resampled as RGB8 and
+    // stays RGB8. The RGBA8 resample it used to stand for
+    // could take alpha under 255 past a reduction of 1024,
+    // and the crop then took the RGBA8 chain; with no alpha
+    // there is nothing to lose, so strips at that reduction
+    // and past it are resampled from the frame like any
+    // other window, and match the two-step chain.
     for (ww, wh, tw, th) in [
         (1024, 2, 1, 1),
         (2, 1024, 1, 1),
@@ -569,13 +554,68 @@ fn an_opaque_window_stays_opaque_within_the_reduction_bound() {
         }));
         let window = (2, 1, ww, wh);
         let ours = resize_lanczos3_cut(img.clone(), window, tw, th);
+        assert!(matches!(ours, DynamicImage::ImageRgb8(_)), "{ww}x{wh}");
         assert!(
             same(&cut_then_resize(&img, window, tw, th), &ours),
             "{ww}x{wh} to {tw}x{th}"
         );
-        let (pixels, _) = ours.as_bytes().as_chunks::<4>();
-        assert!(pixels.iter().all(|px| px[3] == 255));
     }
+}
+
+/// What the crop chain made of `img` before issue #713: the
+/// RGBA8 cut, then the resize unless the cut already had the
+/// target's size.
+fn rgba_crop(img: &DynamicImage, window: Window, tw: u32, th: u32) -> DynamicImage {
+    let cut = rgba_cut(img, window);
+    if (cut.width(), cut.height()) == (tw, th) {
+        cut
+    } else {
+        resize_lanczos3(&cut, tw, th)
+    }
+}
+
+#[test]
+fn eight_bit_crops_keep_the_pixels_they_had() {
+    // Issue #713: a crop keeps the frame's layout. An RGBA8
+    // frame's crop is the bytes it always was; an RGB8 or a
+    // gray frame's crop has no alpha now, and its color is
+    // the color the RGBA8 crop had, under an alpha of 255
+    // throughout. So a JPEG of such a crop, which drops
+    // alpha, is the file it was. Reductions stay inside the
+    // 1024 to one the RGBA8 resample kept an opaque alpha
+    // to, and enlargements, one-pixel strips and the
+    // window's own size are there too.
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (7, 5), (64, 48), (333, 217)] {
+        for (name, img) in layouts(w, h, harsh, mixed_alpha(harsh))
+            .into_iter()
+            .filter(|(name, _)| ["rgb8", "rgba8", "luma8"].contains(name))
+        {
+            for window in windows(w, h) {
+                for (tw, th) in targets(window.2, window.3) {
+                    let before = rgba_crop(&img, window, tw, th).to_rgba8();
+                    let ours = resize_lanczos3_cut(img.clone(), window, tw, th);
+                    let at = format!("{name} {w}x{h} {window:?} to {tw}x{th}");
+                    assert_eq!(ours.color(), img.color(), "{at}");
+                    match &ours {
+                        DynamicImage::ImageRgba8(rgba) => assert_eq!(*rgba, before, "{at}"),
+                        DynamicImage::ImageRgb8(rgb) => {
+                            assert!(before.pixels().all(|p| p[3] == 255), "{at}");
+                            assert_eq!(*rgb, DynamicImage::ImageRgba8(before).to_rgb8(), "{at}");
+                        }
+                        DynamicImage::ImageLuma8(gray) => {
+                            for (g, p) in gray.pixels().zip(before.pixels()) {
+                                assert_eq!([g[0], g[0], g[0], 255], p.0, "{at}");
+                            }
+                        }
+                        other => unreachable!("{:?}", other.color()),
+                    }
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert!(cases > 600, "{cases}");
 }
 
 #[test]
@@ -627,10 +667,11 @@ fn run(img: &DynamicImage, ops: &[Operation], ctx: &ProcessContext<'_>) -> Dynam
         .img
 }
 
-/// What a crop to `tw` by `th` was before issue #654, given
-/// the window it decided on (`None` when it made no cut):
-/// the crate's cut, then the resize unless the cut already
-/// has the target's size.
+/// What a crop to `tw` by `th` was before issue #654, in the
+/// frame's layout as issue #713 has it, given the window it
+/// decided on (`None` when it made no cut): the crate's cut,
+/// then the resize unless the cut already has the target's
+/// size.
 fn old_crop(img: &DynamicImage, window: Option<Window>, tw: u32, th: u32) -> DynamicImage {
     let cut = match window {
         Some(window) => crate_cut(img, window),
@@ -860,10 +901,7 @@ fn animated_frames_replay_one_window_from_their_own_frames() {
     let directives = crate::url::RequestDirectives::analyze(&ops);
     let frame = |content: Content| layouts(101, 53, content, mixed_alpha(content)).remove(1).1;
     let frames = [frame(harsh), frame(smooth), frame(harsh)];
-    let mut share = FrameShare {
-        smart_windows: Some(SmartWindows::default()),
-        ..FrameShare::default()
-    };
+    let mut share = FrameShare::default();
     let (_, trace) =
         crate::crop::crop_to_aspect_traced(frames[0].clone(), tw, th, Align::Smart, None, None);
     let window = trace.expect("the first frame decides").window;
@@ -890,8 +928,11 @@ fn animated_frames_replay_one_window_from_their_own_frames() {
             same(&old_crop(img, Some(window), tw, th), &ours),
             "frame {index}"
         );
-        let shared = share.smart_windows.as_ref().expect("shared windows");
-        assert_eq!(shared.get((0, 101, 53)), Some(window), "frame {index}");
+        assert_eq!(
+            share.smart_windows.get((0, 101, 53)),
+            Some(window),
+            "frame {index}"
+        );
     }
 }
 

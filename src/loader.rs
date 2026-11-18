@@ -17,7 +17,8 @@
 //! - `file://...`, local files under a configured root. A path
 //!   with a `..` segment is refused before the filesystem is
 //!   touched, and the rest are canonicalized per request so a
-//!   symlink cannot lead out of the root either.
+//!   symlink cannot lead out of the root either. Only a regular
+//!   file is read: the open cannot wait on a FIFO (issue #708).
 //!
 //! Bucket sources are gated by a bucket allowlist rather than the
 //! host policy: the endpoint is operator configuration, not
@@ -42,6 +43,11 @@
 //! Every lookup of a source host name, the private-address
 //! check's and the HTTP client's own for a fetch the check does
 //! not pin, runs on slots of their own (see [`LOOKUP_SLOTS`]).
+//! Concurrent lookups of one name share one slot and one
+//! answer, and a fetch's lookups of the other hosts its
+//! redirects name count against the fetch's origin, whose
+//! redirects hold at most a share of the slots (see
+//! [`LOOKUP_SLOTS_PER_ORIGIN`]).
 //! A host name that resolves to a non-public address fails the
 //! way a name that does not resolve fails, so the answer never
 //! says which names resolve inside the server's network.
@@ -709,40 +715,95 @@ pub struct Loader {
 /// keeps lookups to a quarter of that pool, however many
 /// requests name hosts whose DNS does not answer. The
 /// bound has a cost: with a resolver that gives up after
-/// about 10 seconds, requests naming such hosts at about
-/// 13 a second keep every slot taken, and other lookups
-/// wait and then shed while they do. An allowlist avoids
-/// it, since a host off the list is refused before any
-/// lookup. Lookups normally take milliseconds, so 128 at
-/// once serve thousands of fresh host names a second.
+/// about 10 seconds, requests that each name a different
+/// such host as their source, at about 13 a second, keep
+/// every slot taken, and other lookups wait and then shed
+/// while they do. The hosts one origin's redirects name
+/// hold no more than its share (see
+/// [`LOOKUP_SLOTS_PER_ORIGIN`]). An allowlist avoids
+/// both, since a host off the list is refused before any
+/// lookup, on every hop. Lookups normally take
+/// milliseconds, so 128 at once serve thousands of fresh
+/// host names a second.
 pub const LOOKUP_SLOTS: usize = 128;
 
-/// How long a load waits for a host lookup slot before it
-/// sheds with [`LoadError::LookupBusy`]: the stills gate's
-/// wait. A slot that stays taken this long belongs to a
-/// lookup the resolver is not answering, and waiting
-/// longer would only park the request.
+/// How many of the [`LOOKUP_SLOTS`] the hosts one origin's
+/// redirects name may hold at once: an eighth of them. A
+/// fetch's origin is the host its source URL names. A
+/// redirect names the next host, so the hosts a chain
+/// looks up are the origin's choice, the way the source
+/// host is the client's, and each of those lookups keeps
+/// its slot until the resolver returns, which can be past
+/// the fetch's own timeout. So every lookup a fetch starts
+/// of a host other than its origin, on any hop, counts
+/// against the origin's share, which bounds the slots one
+/// origin's fetches hold, whatever names their redirects
+/// give. The origin's own name takes no share: concurrent
+/// lookups of one name share one slot, so it holds one at
+/// most, and the names its redirects give cannot keep it
+/// from being looked up. The share leaves room for the
+/// hosts an ordinary chain of redirects names, while it
+/// takes eight origins to fill every slot.
+pub const LOOKUP_SLOTS_PER_ORIGIN: usize = LOOKUP_SLOTS / 8;
+
+/// How long a load waits for a host lookup slot, and for
+/// one of its origin's share, before it sheds with
+/// [`LoadError::LookupBusy`]: the stills gate's wait. A
+/// slot that stays taken this long belongs to a lookup
+/// the resolver is not answering, and waiting longer
+/// would only park the request.
 pub const LOOKUP_WAIT: Duration = Duration::from_secs(5);
 
 /// One host name lookup: the system resolver, or a
 /// stand-in in tests.
 type LookupFn = dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync;
 
+/// What one lookup found: the addresses, or the cause of
+/// its failure.
+type Answer = Result<Vec<IpAddr>, String>;
+
+/// Where a running lookup's answer arrives; every ask that
+/// waits on the lookup subscribes to it.
+type AnswerSender = tokio::sync::watch::Sender<Option<Answer>>;
+
+/// The lookups running now, by host name.
+type Running = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<AnswerSender>>>,
+>;
+
+/// The origins with asks holding or waiting for their share.
+type Origins = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, OriginShare>>>;
+
 /// The source host lookups, on slots of their own (see
-/// [`LOOKUP_SLOTS`]). A load waits at most its
-/// [`LOOKUP_WAIT`] for a slot. While it waits it holds
-/// nothing: a load that gives up then, at that wait or at
-/// its own source timeout, leaves the queue, and its lookup
-/// never starts. Once started, a lookup keeps its slot until
-/// the resolver returns, even if the load that asked for it
-/// has given up, because the call cannot be interrupted;
-/// the slot count is what bounds those.
+/// [`LOOKUP_SLOTS`]):
+///
+/// - An ask for a name that is being looked up waits for
+///   that lookup's answer instead of starting another, so
+///   asks for one name take one slot between them, and
+///   get one answer. Nothing outlives the lookup: an ask
+///   that comes after the answer starts a lookup of its
+///   own.
+/// - Any other ask takes a slot, and before it, for a name
+///   other than its origin's own, one of its origin's share
+///   of the slots (see [`LOOKUP_SLOTS_PER_ORIGIN`]). It
+///   waits at most [`LOOKUP_WAIT`] for the two. While it
+///   waits it starts nothing: a load that gives up then, at
+///   that wait or at its own source timeout, leaves the
+///   queue, and its lookup never starts.
+///
+/// Once started, a lookup keeps its slot, and its origin's
+/// share when it took one, until the resolver returns, even
+/// if every load that asked for it has given up, because
+/// the call cannot be interrupted; the slot count and the
+/// shares are what bound those.
 #[derive(Clone)]
 struct HostLookups {
     slots: std::sync::Arc<tokio::sync::Semaphore>,
     capacity: usize,
     wait: Duration,
     lookup: std::sync::Arc<LookupFn>,
+    running: Running,
+    shares: OriginShares,
 }
 
 impl std::fmt::Debug for HostLookups {
@@ -750,6 +811,7 @@ impl std::fmt::Debug for HostLookups {
         f.debug_struct("HostLookups")
             .field("free_slots", &self.slots.available_permits())
             .field("capacity", &self.capacity)
+            .field("per_origin", &self.shares.per_origin)
             .field("wait", &self.wait)
             .finish_non_exhaustive()
     }
@@ -757,21 +819,32 @@ impl std::fmt::Debug for HostLookups {
 
 impl HostLookups {
     /// Lookups through the system resolver, on the default
-    /// slots and wait.
+    /// slots, shares and wait.
     fn system() -> Self {
         Self::new(
             std::sync::Arc::new(system_lookup),
             LOOKUP_SLOTS,
+            LOOKUP_SLOTS_PER_ORIGIN,
             LOOKUP_WAIT,
         )
     }
 
-    fn new(lookup: std::sync::Arc<LookupFn>, slots: usize, wait: Duration) -> Self {
+    fn new(
+        lookup: std::sync::Arc<LookupFn>,
+        slots: usize,
+        per_origin: usize,
+        wait: Duration,
+    ) -> Self {
         Self {
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
             capacity: slots,
             wait,
             lookup,
+            running: Running::default(),
+            shares: OriginShares {
+                per_origin,
+                origins: Origins::default(),
+            },
         }
     }
 
@@ -781,33 +854,232 @@ impl HostLookups {
         self.capacity - self.slots.available_permits()
     }
 
-    /// The addresses `host` resolves to. A lookup failure is
-    /// [`LoadError::Network`]; no free slot within the wait is
+    /// The addresses `host` resolves to, for a fetch of
+    /// `origin`. A lookup of a host other than `origin` takes
+    /// one of `origin`'s share of the slots as well as a slot
+    /// (see [`LOOKUP_SLOTS_PER_ORIGIN`]). A lookup failure is
+    /// [`LoadError::Network`]; no free slot, or none of
+    /// `origin`'s share, within the wait is
     /// [`LoadError::LookupBusy`].
-    async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, LoadError> {
-        let slot = match tokio::time::timeout(self.wait, self.slots.clone().acquire_owned()).await {
+    async fn resolve(&self, host: &str, origin: &str) -> Result<Vec<IpAddr>, LoadError> {
+        // DNS names are case-insensitive: one name, one lookup.
+        let name = host.to_ascii_lowercase();
+        let running = lock(&self.running)
+            .get(&name)
+            .map(|answer| answer.subscribe());
+        if let Some(answer) = running {
+            return answer_of(answer).await;
+        }
+        let until = tokio::time::Instant::now() + self.wait;
+        // The origin's own name takes no share: its lookups are
+        // shared, so it holds one slot at most, and the hosts its
+        // redirects name must not keep it from being looked up.
+        let share = if name.eq_ignore_ascii_case(origin) {
+            None
+        } else {
+            Some(self.shares.take(origin, until).await?)
+        };
+        let slot = match tokio::time::timeout_at(until, self.slots.clone().acquire_owned()).await {
             Ok(Ok(slot)) => slot,
             _ => return Err(LoadError::LookupBusy),
         };
+        answer_of(self.start(name, host, slot, share)).await
+    }
+
+    /// Start the lookup of `host` on `slot`, and on `share`
+    /// when it took one, and return where its answer arrives.
+    /// When another ask has started a lookup of the same name
+    /// meanwhile, `slot` and `share` go back, and the answer
+    /// is that lookup's.
+    fn start(
+        &self,
+        name: String,
+        host: &str,
+        slot: tokio::sync::OwnedSemaphorePermit,
+        share: Option<OriginSlot>,
+    ) -> tokio::sync::watch::Receiver<Option<Answer>> {
+        let mut running = lock(&self.running);
+        if let Some(answer) = running.get(&name) {
+            return answer.subscribe();
+        }
+        let answer = std::sync::Arc::new(AnswerSender::new(None));
+        running.insert(name.clone(), std::sync::Arc::clone(&answer));
+        drop(running);
+        let waiting = answer.subscribe();
+        let finished = Finished {
+            running: std::sync::Arc::clone(&self.running),
+            name,
+        };
         let lookup = std::sync::Arc::clone(&self.lookup);
         let host = host.to_owned();
-        let found = tokio::task::spawn_blocking(move || {
-            // The slot belongs to the thread, not the load:
-            // it frees when the resolver returns.
-            let _slot = slot;
-            lookup(&host)
-        })
-        .await
-        .map_err(|e| LoadError::Network(format!("dns lookup failed: {e}")))?
-        .map_err(|e| LoadError::Network(format!("dns lookup failed: {e}")))?;
-        Ok(found)
+        // The slot and the share belong to the thread, not to any
+        // load: they free when the resolver returns.
+        let held = (slot, share);
+        tokio::task::spawn_blocking(move || {
+            let found = lookup(&host).map_err(|e| format!("dns lookup failed: {e}"));
+            // Asks from here on start a lookup of their own, and
+            // the slot and the share are free before any ask has
+            // the answer, as a load that ran its own lookup finds
+            // them.
+            drop(finished);
+            drop(held);
+            answer.send_replace(Some(found));
+        });
+        waiting
     }
+}
+
+#[cfg(test)]
+impl HostLookups {
+    /// How many asks wait on the running lookup of `name`;
+    /// `None` when no lookup of it runs.
+    fn waiting_on(&self, name: &str) -> Option<usize> {
+        lock(&self.running)
+            .get(name)
+            .map(|answer| answer.receiver_count())
+    }
+
+    /// What the lookups keep track of: the origins with asks
+    /// holding or waiting for their share, and the lookups
+    /// running.
+    fn tracked(&self) -> (usize, usize) {
+        (lock(&self.shares.origins).len(), lock(&self.running).len())
+    }
+}
+
+/// Lock one of the lookups' maps, poisoned or not. Each
+/// critical section is one map update, which a panic cannot
+/// leave half done, and the guards that unlock in `Drop`
+/// must not panic while their thread unwinds.
+fn lock<T>(map: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Takes a lookup's name off the running map when the lookup
+/// ends, whichever way it ends: a lookup that stopped without
+/// answering (a resolver that panicked, a runtime shutting
+/// down before it ran) must not leave later asks waiting on
+/// it.
+struct Finished {
+    running: Running,
+    name: String,
+}
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        lock(&self.running).remove(&self.name);
+    }
+}
+
+/// The answer a running lookup gives. One that stopped
+/// without answering fails like a lookup that failed.
+async fn answer_of(
+    mut answer: tokio::sync::watch::Receiver<Option<Answer>>,
+) -> Result<Vec<IpAddr>, LoadError> {
+    let found = match answer.wait_for(Option::is_some).await {
+        Ok(found) => found.clone(),
+        Err(_) => None,
+    };
+    found
+        .unwrap_or_else(|| Err("dns lookup failed: the lookup stopped".to_string()))
+        .map_err(LoadError::Network)
+}
+
+/// Each origin's share of the lookup slots (see
+/// [`LOOKUP_SLOTS_PER_ORIGIN`]).
+#[derive(Clone)]
+struct OriginShares {
+    per_origin: usize,
+    origins: Origins,
+}
+
+/// One origin's share: its slots, and how many asks hold or
+/// wait for one. The origin is forgotten when the last of
+/// them leaves, so the map holds only origins with lookups
+/// running or waiting.
+struct OriginShare {
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    asks: usize,
+}
+
+impl OriginShares {
+    /// One slot of `origin`'s share, waiting until `until`
+    /// for it.
+    async fn take(
+        &self,
+        origin: &str,
+        until: tokio::time::Instant,
+    ) -> Result<OriginSlot, LoadError> {
+        let ask = self.ask(origin);
+        match tokio::time::timeout_at(until, ask.slots.clone().acquire_owned()).await {
+            Ok(Ok(slot)) => Ok(OriginSlot {
+                _slot: slot,
+                _ask: ask,
+            }),
+            _ => Err(LoadError::LookupBusy),
+        }
+    }
+
+    /// Count one more ask against `origin`.
+    fn ask(&self, origin: &str) -> OriginAsk {
+        let mut origins = lock(&self.origins);
+        let share = origins
+            .entry(origin.to_owned())
+            .or_insert_with(|| OriginShare {
+                slots: std::sync::Arc::new(tokio::sync::Semaphore::new(self.per_origin)),
+                asks: 0,
+            });
+        share.asks += 1;
+        OriginAsk {
+            origins: std::sync::Arc::clone(&self.origins),
+            origin: origin.to_owned(),
+            slots: std::sync::Arc::clone(&share.slots),
+        }
+    }
+}
+
+/// One ask counted against an origin, from the time it asks
+/// until its lookup ends or it gives up.
+struct OriginAsk {
+    origins: Origins,
+    origin: String,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for OriginAsk {
+    fn drop(&mut self) {
+        let mut origins = lock(&self.origins);
+        if let Some(share) = origins.get_mut(&self.origin) {
+            share.asks -= 1;
+            if share.asks == 0 {
+                origins.remove(&self.origin);
+            }
+        }
+    }
+}
+
+/// A slot of an origin's share, held while its lookup runs.
+/// Fields drop in order, so the slot is back before the ask
+/// stops counting: an origin is never forgotten while one of
+/// its slots is out.
+struct OriginSlot {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    _ask: OriginAsk,
 }
 
 /// Resolve `host` with the system resolver (`getaddrinfo`).
 fn system_lookup(host: &str) -> std::io::Result<Vec<IpAddr>> {
     use std::net::ToSocketAddrs;
     Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
+}
+
+tokio::task_local! {
+    /// The origin of the source fetch whose request is being
+    /// sent (see [`LOOKUP_SLOTS_PER_ORIGIN`]): the HTTP
+    /// client calls [`SlotResolver`] with nothing but a host
+    /// name, so the fetch sets this around its request.
+    static FETCH_ORIGIN: String;
 }
 
 /// The HTTP clients' resolver for source hosts: the same
@@ -823,8 +1095,15 @@ impl reqwest::dns::Resolve for SlotResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let lookups = self.0.clone();
         let host = name.as_str().to_owned();
+        // Read while the fetch's request is being polled: the
+        // client can finish a connect it started on a task of
+        // its own. A lookup no fetch asked for is its own
+        // origin, which takes no share.
+        let origin = FETCH_ORIGIN
+            .try_with(String::clone)
+            .unwrap_or_else(|_| host.clone());
         Box::pin(async move {
-            let ips = lookups.resolve(&host).await?;
+            let ips = lookups.resolve(&host, &origin).await?;
             // Port 0: the client puts in the URL's port.
             let addrs: reqwest::dns::Addrs = Box::new(
                 ips.into_iter()
@@ -985,15 +1264,30 @@ impl Loader {
 
     /// Resolve host names with `lookup` instead of the system
     /// resolver, on `slots` lookup slots with `wait` for one:
-    /// lets tests stand in for DNS without the network.
+    /// lets tests stand in for DNS without the network. One
+    /// origin's redirects may hold [`LOOKUP_SLOTS_PER_ORIGIN`]
+    /// of them, or all of them when there are fewer.
     #[cfg(test)]
     pub(crate) fn with_host_lookup(
-        mut self,
+        self,
         lookup: impl Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync + 'static,
         slots: usize,
         wait: Duration,
     ) -> Self {
-        self.lookups = HostLookups::new(std::sync::Arc::new(lookup), slots, wait);
+        self.with_host_lookup_shares(lookup, slots, LOOKUP_SLOTS_PER_ORIGIN.min(slots), wait)
+    }
+
+    /// [`Loader::with_host_lookup`], with `per_origin` of the
+    /// slots for one origin's redirects.
+    #[cfg(test)]
+    pub(crate) fn with_host_lookup_shares(
+        mut self,
+        lookup: impl Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync + 'static,
+        slots: usize,
+        per_origin: usize,
+        wait: Duration,
+    ) -> Self {
+        self.lookups = HostLookups::new(std::sync::Arc::new(lookup), slots, per_origin, wait);
         self.client = source_client(self.timeout, &self.lookups).expect("source client");
         self.pinned_clients.lock().unwrap().clear();
         self
@@ -1173,6 +1467,12 @@ impl Loader {
     ) -> Result<LoadBody, LoadError> {
         let mut parsed =
             Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
+        // Every lookup this fetch starts of another host, on
+        // any redirect hop, counts against the host the caller
+        // named (see `LOOKUP_SLOTS_PER_ORIGIN`). A URL with no
+        // host has no lookup to count: the policy refuses it
+        // first.
+        let origin = parsed.host_str().unwrap_or_default().to_owned();
         let mut hops = 0;
         loop {
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -1185,14 +1485,13 @@ impl Loader {
                     LoadError::Network(cause)
                 });
             }
-            let pin = self.check_policy(&parsed).await?;
+            let pin = self.check_policy(&parsed, &origin).await?;
             let client = match &pin {
                 Some(pin) => self.pinned_client(pin)?,
                 None => self.client.clone(),
             };
-            let resp = client
-                .get(parsed.clone())
-                .send()
+            let resp = FETCH_ORIGIN
+                .scope(origin.clone(), client.get(parsed.clone()).send())
                 .await
                 .map_err(map_request_error)?;
             let status = resp.status();
@@ -1547,14 +1846,24 @@ impl Loader {
         {
             return Err(LoadError::NotFound);
         }
-        let mut file = tokio::fs::File::open(&canonical)
+        // Opened the way the disk tier opens its entries (issue
+        // #708), on a blocking thread: a plain open of a FIFO
+        // waits in open(2) for a writer that may never come, so
+        // the open does not wait, and what it opened must be a
+        // regular file. Anything else at a path inside the root
+        // (a FIFO, a socket, a device, a directory) is the
+        // read failure a directory always answered.
+        let open = canonical.clone();
+        let (file, meta) = tokio::task::spawn_blocking(move || crate::storage::open_regular(&open))
             .await
+            .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))?
             .map_err(map_file_error)?;
+        let mut file = tokio::fs::File::from_std(file);
         if matches!(mode, BodyMode::Probe(_)) {
             // A probe of a file needs only its head; the
             // total is the file's own size. The size cap
             // keeps the full load's too-large answer.
-            let total = file.metadata().await.map_err(map_file_error)?.len();
+            let total = meta.len();
             if total > self.max_bytes {
                 return Err(LoadError::TooLarge {
                     limit: self.max_bytes,
@@ -1581,7 +1890,7 @@ impl Loader {
         // under the read charges the rest as it arrives.
         let mut part = match mode {
             BodyMode::Full(Some(charged)) => {
-                let total = file.metadata().await.map_err(map_file_error)?.len();
+                let total = meta.len();
                 if total > self.max_bytes {
                     return Err(LoadError::TooLarge {
                         limit: self.max_bytes,
@@ -1657,8 +1966,15 @@ impl Loader {
     /// address, is the same [`LoadError::Network`] either way:
     /// the caller sent only the name, so the answer must not
     /// tell it what the name resolves to inside the server's
-    /// network. Every redirect hop runs through here too.
-    async fn check_policy(&self, url: &Url) -> Result<Option<PinnedResolution>, LoadError> {
+    /// network. Every redirect hop runs through here too, and
+    /// a lookup of a host other than `origin`, the host the
+    /// fetch began at, counts against `origin`'s share (see
+    /// [`LOOKUP_SLOTS_PER_ORIGIN`]).
+    async fn check_policy(
+        &self,
+        url: &Url,
+        origin: &str,
+    ) -> Result<Option<PinnedResolution>, LoadError> {
         // The loader never presents credentials to an origin
         // (audit L-2): a signed URL must not make the server
         // authenticate anywhere with author-chosen userinfo.
@@ -1701,7 +2017,7 @@ impl Loader {
                 }
                 return Ok(None);
             }
-            let ips = self.lookups.resolve(host).await?;
+            let ips = self.lookups.resolve(host, origin).await?;
             if let Some(ip) = ips.iter().find(|ip| is_non_public(ip)) {
                 // The same failure as a name that does not
                 // resolve (see `LoadError::Network`); the
@@ -2724,7 +3040,11 @@ mod tests {
             .with_policy(SourcePolicy::new(vec![], true));
         for url in ["http://8.8.8.8/img.jpg", "http://1.1.1.1/img.jpg"] {
             let parsed = Url::parse(url).unwrap();
-            assert!(blocking.check_policy(&parsed).await.is_ok(), "{url}");
+            let origin = parsed.host_str().unwrap();
+            assert!(
+                blocking.check_policy(&parsed, origin).await.is_ok(),
+                "{url}"
+            );
         }
     }
 
@@ -3187,6 +3507,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Make a FIFO at `path`.
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {}: {status}", path.display());
+    }
+
+    /// Await `load`, failing the test if it has not answered
+    /// within 3 seconds, before the test loader's 5 second
+    /// timeout (issue #708). A load stuck opening the FIFO at
+    /// `fifo` for reading waits for a writer, and its blocking
+    /// thread stays stuck past any timeout, so one is then let
+    /// in, until the load ends, and the test fails naming the
+    /// wait instead of hanging, the runtime's drop included.
+    #[cfg(unix)]
+    async fn answers_promptly<T>(fifo: &std::path::Path, load: impl Future<Output = T>) -> T {
+        let mut load = std::pin::pin!(load);
+        if let Ok(answer) = tokio::time::timeout(Duration::from_secs(3), &mut load).await {
+            return answer;
+        }
+        let fifo = fifo.to_path_buf();
+        let release = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                // With a reader waiting in open(2), this opens and
+                // lets it go; closing it is the end of file the
+                // reader then sees. With none it fails at once.
+                use rustix::fs::{Mode, OFlags};
+                drop(rustix::fs::open(
+                    &fifo,
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let _ = load.await;
+        let _ = release.join();
+        panic!("a file source load waited for a writer on a FIFO");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_under_the_root_answers_at_once_as_a_file_that_cannot_be_read() {
+        // Issue #708: a file source was opened with a plain open,
+        // which waits in open(2) until a FIFO has a writer, so a
+        // FIFO under the root held its request, and a thread of
+        // the blocking pool, until one came. The open does not
+        // wait now, and what it opened must be a regular file:
+        // anything else answers at once with the read failure a
+        // directory under the root gets, through a symlink inside
+        // the root too.
+        let (base, root) = make_file_tree();
+        make_fifo(&root.join("pipe.jpg"));
+        std::os::unix::fs::symlink(root.join("pipe.jpg"), root.join("piped.jpg")).unwrap();
+        let fifo = root.join("pipe.jpg");
+        let loader = file_loader(&root, 1024);
+        for url in ["file:///pipe.jpg", "file:///piped.jpg"] {
+            let full = answers_promptly(&fifo, loader.load(url)).await;
+            assert!(
+                matches!(full, Err(LoadError::Network(_))),
+                "{url}: {full:?}"
+            );
+            let probe = answers_promptly(
+                &fifo,
+                loader.load_probe(url, MediaAdmission::default(), &|_: &[u8]| true),
+            )
+            .await;
+            assert!(
+                matches!(probe, Err(LoadError::Network(_))),
+                "probe {url}: {probe:?}"
+            );
+        }
+        let dir = loader.load("file:///sub").await;
+        assert!(matches!(dir, Err(LoadError::Network(_))), "{dir:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_that_resolves_inside_the_root_still_loads() {
+        // Issue #708: the open refuses to follow a symlink, but it
+        // opens the canonical path, which names none, so a link
+        // that resolves inside the root still reads its target,
+        // whether it names the file or a directory on the way.
+        let (base, root) = make_file_tree();
+        std::os::unix::fs::symlink(root.join("pic.jpg"), root.join("alias.jpg")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("subdir")).unwrap();
+        std::os::unix::fs::symlink("pic.jpg", root.join("relative.jpg")).unwrap();
+        let loader = file_loader(&root, 1024);
+        for (url, body) in [
+            ("file:///alias.jpg", &b"rootpic"[..]),
+            ("file:///relative.jpg", b"rootpic"),
+            ("file:///subdir/inner.jpg", b"inner"),
+        ] {
+            assert_eq!(loader.load(url).await.unwrap(), body, "{url}");
+            let probe = loader
+                .load_probe(url, MediaAdmission::default(), &|_: &[u8]| true)
+                .await
+                .unwrap();
+            assert_eq!(probe.head, body, "probe {url}");
+            assert_eq!(probe.total_bytes, Some(body.len() as u64), "probe {url}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn file_source_paths_are_judged_on_their_text() {
         let stays = |path: &str| file_source_path_stays_in_root(path);
@@ -3221,26 +3649,44 @@ mod tests {
 
     impl StuckResolver {
         fn lookup(&self) -> impl Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync + 'static {
-            let state = std::sync::Arc::clone(&self.state);
+            let resolver = self.clone();
             move |_host| {
-                let (lock, released) = &*state;
-                let mut st = lock.lock().unwrap();
-                st.started += 1;
-                st.running += 1;
-                // Bounded, so a failing test cannot hang the run.
-                let give_up = std::time::Instant::now() + Duration::from_secs(30);
-                while !st.released && std::time::Instant::now() < give_up {
-                    st = released
-                        .wait_timeout(st, Duration::from_millis(50))
-                        .unwrap()
-                        .0;
-                }
-                st.running -= 1;
+                resolver.block();
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "resolver did not answer",
                 ))
             }
+        }
+
+        /// A resolver that answers late: each lookup blocks the
+        /// same way until the release, and then answers `ip`.
+        fn late_lookup(
+            &self,
+            ip: IpAddr,
+        ) -> impl Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync + 'static {
+            let resolver = self.clone();
+            move |_host| {
+                resolver.block();
+                Ok(vec![ip])
+            }
+        }
+
+        /// Count one lookup, and block it until the release.
+        fn block(&self) {
+            let (lock, released) = &*self.state;
+            let mut st = lock.lock().unwrap();
+            st.started += 1;
+            st.running += 1;
+            // Bounded, so a failing test cannot hang the run.
+            let give_up = std::time::Instant::now() + Duration::from_secs(30);
+            while !st.released && std::time::Instant::now() < give_up {
+                st = released
+                    .wait_timeout(st, Duration::from_millis(50))
+                    .unwrap()
+                    .0;
+            }
+            st.running -= 1;
         }
 
         fn release(&self) {
@@ -3425,7 +3871,11 @@ mod tests {
             .collect();
         eventually("all 96 stuck lookups running", || stuck.running() == 96).await;
         let url = Url::parse("http://origin.test/x.png").unwrap();
-        let pin = tokio::time::timeout(Duration::from_secs(1), loader.check_policy(&url)).await;
+        let pin = tokio::time::timeout(
+            Duration::from_secs(1),
+            loader.check_policy(&url, "origin.test"),
+        )
+        .await;
         let addr = pin
             .expect("the lookup waited for a slot")
             .expect("the lookup failed")
@@ -3492,6 +3942,321 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lookups_of_one_name_share_one_slot_and_one_answer() {
+        // Asks for a name that is being looked up wait for
+        // that lookup instead of starting their own: one slot
+        // between them, and its answer for all of them, though
+        // the ask that started it gave up long before. Joining
+        // takes no slot, so asks from an origin whose share is
+        // all out still join, and a joined ask waits for the
+        // answer within its own timeout, past the wait for a
+        // slot.
+        let late = StuckResolver::default();
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(20))
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec![], true))
+            .with_host_lookup_shares(late.late_lookup(public), 4, 1, Duration::from_millis(300));
+        let url = Url::parse("http://shared.test/x.png").unwrap();
+        let first = tokio::time::timeout(
+            Duration::from_millis(100),
+            loader.check_policy(&url, "origin.test"),
+        )
+        .await;
+        assert!(first.is_err(), "the late lookup answered early");
+        eventually("the lookup to start", || late.running() == 1).await;
+        let asks: Vec<_> = (0..8)
+            .map(|_| {
+                let loader = loader.clone();
+                let url = url.clone();
+                tokio::spawn(async move { loader.check_policy(&url, "origin.test").await })
+            })
+            .collect();
+        // Settled once every ask waits on the running lookup,
+        // runs one of its own, or has given up.
+        eventually("each ask to wait on a lookup or finish", || {
+            let waiting = loader.lookups.waiting_on("shared.test").unwrap_or(0);
+            let own = late.running().saturating_sub(1);
+            let finished = asks.iter().filter(|ask| ask.is_finished()).count();
+            waiting + own + finished == 8
+        })
+        .await;
+        assert_eq!(late.started(), 1, "an ask started a lookup of its own");
+        assert_eq!(loader.lookups.waiting_on("shared.test"), Some(8));
+        assert_eq!(loader.lookup_slots(), (1, 4));
+        sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            loader.lookups.waiting_on("shared.test"),
+            Some(8),
+            "a joined ask gave up at the wait for a slot"
+        );
+        late.release();
+        for ask in asks {
+            let pin = ask
+                .await
+                .unwrap()
+                .expect("the lookup failed")
+                .expect("no pin");
+            assert_eq!(pin.addr, SocketAddr::new(public, 80));
+        }
+        assert_eq!(late.started(), 1, "an ask started a lookup of its own");
+        // Nothing outlives the lookup: the next ask starts one.
+        eventually("the lookup to finish", || {
+            loader.lookups.tracked() == (0, 0)
+        })
+        .await;
+        loader.check_policy(&url, "origin.test").await.unwrap();
+        assert_eq!(late.started(), 2, "an answer was kept past its lookup");
+        eventually("the slots to come free", || loader.lookup_slots().0 == 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lookup_that_stops_without_answering_fails_its_asks_and_leaves_nothing() {
+        // A resolver call that panics ends its lookup with no
+        // answer. Every ask waiting on that lookup fails the
+        // way a failed lookup fails, and the lookup leaves
+        // nothing behind: its name, its slot and its origin's
+        // share are free, and the next ask for the name starts
+        // a lookup of its own instead of waiting on the old one.
+        let stuck = StuckResolver::default();
+        let resolver = stuck.clone();
+        let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(20))
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec![], true))
+            .with_host_lookup_shares(
+                move |_host| {
+                    resolver.block();
+                    panic!("the stand-in resolver stopped");
+                },
+                4,
+                1,
+                Duration::from_millis(300),
+            );
+        let url = Url::parse("http://stops.test/x.png").unwrap();
+        let ask = |loader: &Loader| {
+            let loader = loader.clone();
+            let url = url.clone();
+            tokio::spawn(async move { loader.check_policy(&url, "origin.test").await })
+        };
+        let mut asks = vec![ask(&loader)];
+        eventually("the lookup to start", || stuck.running() == 1).await;
+        asks.extend([ask(&loader), ask(&loader)]);
+        eventually("the asks to wait on the lookup", || {
+            loader.lookups.waiting_on("stops.test") == Some(3)
+        })
+        .await;
+        stuck.release();
+        let stopped = LoadError::Network("dns lookup failed: the lookup stopped".to_string());
+        for ask in asks {
+            let answer = tokio::time::timeout(Duration::from_secs(5), ask)
+                .await
+                .expect("an ask still waits on the stopped lookup");
+            assert_eq!(answer.unwrap().unwrap_err(), stopped);
+        }
+        assert_eq!(stuck.started(), 1, "an ask started a lookup of its own");
+        eventually("the lookup to leave nothing behind", || {
+            loader.lookups.tracked() == (0, 0) && loader.lookup_slots().0 == 0
+        })
+        .await;
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.check_policy(&url, "origin.test"),
+        )
+        .await
+        .expect("the next ask waited on the stopped lookup");
+        assert_eq!(next.unwrap_err(), stopped);
+        assert_eq!(stuck.started(), 2, "the next ask joined the stopped lookup");
+    }
+
+    /// Spawn a server that sends each fetch on through two
+    /// redirects to hosts of its choosing, a fresh name each
+    /// time, `n` counting the server's connections: first to
+    /// `r{n}.relay.test` on this server's port, a name the
+    /// stand-in resolvers answer and this server serves too,
+    /// then from there to `r{n}.stuck.test`, a name they never
+    /// answer. A fetch of `/direct` gets an image instead.
+    /// Returns its port.
+    async fn spawn_redirecting_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for n in 0u64.. {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let answer = if buf.starts_with(b"GET /direct ") {
+                        ok_image_response()
+                    } else {
+                        let location = if buf.starts_with(b"GET /relay ") {
+                            format!("http://r{n}.stuck.test/x.png")
+                        } else {
+                            format!("http://r{n}.relay.test:{port}/relay")
+                        };
+                        response(
+                            "302 Found",
+                            &format!("Location: {location}\r\nContent-Length: 0\r\n"),
+                            b"",
+                        )
+                    };
+                    let _ = socket.write_all(&answer).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// Serve pinned fetches of `host` on `port` from the local
+    /// server there, as though `validated`, the address the
+    /// stand-in resolver gave, were that server's. Pinned
+    /// clients are cached by host and validated address, so the
+    /// client for the local server goes in under the key the
+    /// fetch's own check makes.
+    fn serve_pin_locally(loader: &Loader, host: &str, port: u16, validated: IpAddr) {
+        let local = loader
+            .pinned_client(&PinnedResolution {
+                host: host.to_string(),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            })
+            .unwrap();
+        loader
+            .pinned_clients
+            .lock()
+            .unwrap()
+            .insert((host.to_string(), SocketAddr::new(validated, port)), local);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_origins_redirects_leave_the_lookup_slots_to_other_hosts() {
+        // A redirect names the next host, so an origin picks
+        // the hosts its fetches look up. Here every fetch of
+        // origin.test goes through a fresh name that resolves
+        // to a fresh name the resolver never answers, and each
+        // hop's lookup counts against origin.test, not against
+        // the hop before it. With 4 slots and 2 per origin,
+        // those lookups hold 2 of them. The fetches past the
+        // share wait for it holding no slot, and shed without
+        // starting a lookup, while a fetch of another host
+        // finds a slot, and so does a fetch of origin.test's
+        // own image: its own name takes no share. The same
+        // under each policy: the private-address check's
+        // lookups (the default), and the HTTP client's own for
+        // the fetches the check does not pin.
+        const FLOOD: usize = 6;
+        for policy in [
+            SourcePolicy::new(vec![], true),
+            SourcePolicy::new(vec![], false),
+            SourcePolicy::new(vec!["test".to_string()], true),
+        ] {
+            let pins = policy.pins_hostnames();
+            // A pinned fetch must validate a public address; the
+            // test serves it locally (see `serve_pin_locally`).
+            let resolved: IpAddr = if pins { "93.184.216.34" } else { "127.0.0.1" }
+                .parse()
+                .unwrap();
+            let stuck = StuckResolver::default();
+            let stuck_lookup = stuck.lookup();
+            let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(20))
+                .unwrap()
+                .with_policy(policy.clone())
+                .with_host_lookup_shares(
+                    move |host| {
+                        if host.ends_with(".stuck.test") {
+                            stuck_lookup(host)
+                        } else {
+                            Ok(vec![resolved])
+                        }
+                    },
+                    4,
+                    2,
+                    Duration::from_secs(2),
+                );
+            let origin = spawn_redirecting_server().await;
+            let other = spawn_server(Respond::Bytes(ok_image_response())).await;
+            let other = Url::parse(&other).unwrap().port().unwrap();
+            if pins {
+                serve_pin_locally(&loader, "origin.test", origin, resolved);
+                // The relay names come from the server's connection
+                // count: two connections a fetch at most, and the
+                // fetch of the origin's own image takes a number
+                // too.
+                for n in 0..=2 * FLOOD {
+                    serve_pin_locally(&loader, &format!("r{n}.relay.test"), origin, resolved);
+                }
+                serve_pin_locally(&loader, "other.test", other, resolved);
+            }
+            let flood: Vec<_> = (0..FLOOD)
+                .map(|_| {
+                    let loader = loader.clone();
+                    let url = format!("http://origin.test:{origin}/x.png");
+                    tokio::spawn(async move { loader.load(&url).await })
+                })
+                .collect();
+            eventually("two of the fetches' lookups to stick", || {
+                stuck.running() >= 2
+            })
+            .await;
+            // The other fetches reach their next lookup and wait
+            // for origin.test's share, for up to the 2 s wait,
+            // holding no slot: another host's fetch takes one
+            // at once, while they still wait.
+            sleep(Duration::from_millis(200)).await;
+            let body = tokio::time::timeout(
+                Duration::from_secs(1),
+                loader.load(&format!("http://other.test:{other}/x.png")),
+            )
+            .await;
+            assert_eq!(
+                body,
+                Ok(Ok(b"\xff\xd8\xff\xd9".to_vec())),
+                "{policy:?}: the other host found no slot"
+            );
+            // The share holds only the hosts origin.test's
+            // redirects name: a fetch of its own image, which
+            // needs a lookup of its own name and no redirect,
+            // finds a slot while the share is all out.
+            let direct = tokio::time::timeout(
+                Duration::from_secs(1),
+                loader.load(&format!("http://origin.test:{origin}/direct")),
+            )
+            .await;
+            assert_eq!(
+                direct,
+                Ok(Ok(b"\xff\xd8\xff\xd9".to_vec())),
+                "{policy:?}: the origin's own name found no slot"
+            );
+            assert_eq!(loader.lookup_slots(), (2, 4), "{policy:?}");
+            eventually("the fetches past the share to shed", || {
+                flood.iter().filter(|f| f.is_finished()).count() == FLOOD - 2
+            })
+            .await;
+            assert_eq!(stuck.running(), 2, "{policy:?}");
+            assert_eq!(
+                stuck.started(),
+                2,
+                "{policy:?}: a shed fetch started a lookup"
+            );
+            assert_eq!(loader.lookup_slots(), (2, 4), "{policy:?}");
+            stuck.release();
+            let mut shed = 0;
+            for fetch in flood {
+                match fetch.await.unwrap() {
+                    Err(LoadError::LookupBusy) => shed += 1,
+                    Err(LoadError::Network(_)) => {}
+                    other => panic!("{policy:?}: {other:?}"),
+                }
+            }
+            assert_eq!(shed, FLOOD - 2, "{policy:?}");
+            eventually("the lookups to finish", || {
+                loader.lookups.tracked() == (0, 0) && loader.lookup_slots().0 == 0
+            })
+            .await;
+        }
+    }
+
     /// A stand-in resolver: `internal.test` and `loopback.test`
     /// resolve inward, `mixed.test` to one public and one
     /// non-public address, `empty.test` to nothing, and every
@@ -3530,11 +4295,14 @@ mod tests {
             "missing.test",
         ] {
             let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
-            let err = loader.check_policy(&url).await.unwrap_err();
+            let err = loader.check_policy(&url, host).await.unwrap_err();
             assert!(matches!(err, LoadError::Network(_)), "{host}: {err:?}");
         }
         let url = Url::parse("http://internal.test/x.png").unwrap();
-        let err = loader.check_policy(&url).await.unwrap_err();
+        let err = loader
+            .check_policy(&url, "internal.test")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("10.96.0.12"), "{err}");
         // What the URL text decides stays a refusal, and an
         // allowlist miss looks nothing up.
