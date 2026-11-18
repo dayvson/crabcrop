@@ -9025,7 +9025,10 @@ fn an_overlay_before_a_trim_is_scaled_once_for_the_survey_and_the_frames() {
     };
     let sizes = [(40, 30); 4];
     let overlay = scaled_overlay("ov", (6, 5), 40);
-    let both = [Operation::Filters(vec![overlay.clone(), Filter::Trim(5)])];
+    let both = [Operation::Filters(vec![
+        overlay.clone(),
+        Filter::Plain(PlainFilter::Trim(5)),
+    ])];
     let (scaled, frames) = rendered_with_scales(bordered_frames_of(&sizes), &both, &ctx);
     assert_eq!(scaled, 1);
     let (_, overlaid) = rendered_with_scales(
@@ -9040,8 +9043,13 @@ fn an_overlay_before_a_trim_is_scaled_once_for_the_survey_and_the_frames() {
         first: overlaid.next().unwrap(),
         rest: overlaid.collect(),
     };
-    let (_, trimmed) =
-        rendered_with_scales(overlaid, &[Operation::Filters(vec![Filter::Trim(5)])], &ctx);
+    let (_, trimmed) = rendered_with_scales(
+        overlaid,
+        &[Operation::Filters(vec![Filter::Plain(PlainFilter::Trim(
+            5,
+        ))])],
+        &ctx,
+    );
     assert_ne!(trimmed[0].dimensions(), (40, 30), "the trim cut nothing");
     assert!(frames == trimmed);
 }
