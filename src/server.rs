@@ -196,6 +196,12 @@ pub struct AppState {
     /// `HEAD` to the route answers `404 not_found` before
     /// anything else.
     pub explain_enabled: bool,
+    /// Whether the purge endpoints take only the expiring
+    /// form (`CRABCROP_PURGE_REQUIRE_EXPIRY`, off by
+    /// default). On, a purge or purge-group URL with no
+    /// `exp:` segment answers `403 expiry_required` once its
+    /// signature has verified, and purges nothing.
+    pub purge_require_expiry: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -481,6 +487,7 @@ impl std::fmt::Debug for AppState {
             width_step,
             client_hints,
             explain_enabled,
+            purge_require_expiry,
             preserve_metadata,
             brand_color,
             presets,
@@ -1846,15 +1853,24 @@ fn unix_now() -> u64 {
 /// its expiry, at the unix second `now`. A purge URL is
 /// valid strictly before its `exp:` second, the comparison
 /// image and upload URLs use: from that second on it is
-/// refused as expired. One with no expiry runs.
-fn purge_expiry_refusal(expiry: Option<u64>, now: u64) -> Option<ErrorParts> {
+/// refused as expired. One with no expiry runs, unless
+/// `require_expiry` (`CRABCROP_PURGE_REQUIRE_EXPIRY`) says
+/// the server takes only expiring purge URLs.
+fn purge_expiry_refusal(expiry: Option<u64>, now: u64, require_expiry: bool) -> Option<ErrorParts> {
     match expiry {
         Some(exp) if now >= exp => Some((
             StatusCode::FORBIDDEN,
             "signature_expired",
             "signature expired".to_string(),
         )),
-        _ => None,
+        Some(_) => None,
+        None if require_expiry => Some((
+            StatusCode::FORBIDDEN,
+            "expiry_required",
+            "expiry required: this server accepts only purge URLs that carry an exp: segment"
+                .to_string(),
+        )),
+        None => None,
     }
 }
 
@@ -1872,7 +1888,9 @@ fn purge_expiry_refusal(expiry: Option<u64>, now: u64) -> Option<ErrorParts> {
 /// `POST /purge/<signature>/exp:<unix-seconds>/<path>`, signs
 /// the `exp:` segment along with the path, and is a 403
 /// from its expiry second on (see
-/// [`crate::url::split_purge_remainder`]). Idempotent:
+/// [`crate::url::split_purge_remainder`]); with
+/// `CRABCROP_PURGE_REQUIRE_EXPIRY`, a URL without an expiry
+/// is a 403 as well. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<Arc<AppState>>,
@@ -1938,7 +1956,9 @@ async fn purge_handle(
             );
         }
     };
-    if let Some((status, code, message)) = purge_expiry_refusal(expiry, unix_now()) {
+    if let Some((status, code, message)) =
+        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
+    {
         state.metrics.record_purge();
         purge_log(&state.request_log, "purge", target, None).await;
         return error_response(status, code, message, accept.as_deref());
@@ -2091,7 +2111,8 @@ async fn purge_handle(
 /// count of 0. The expiring form,
 /// `POST /purge-group/<signature>/exp:<unix-seconds>/<group>`,
 /// signs the `exp:` segment along with the group name, and
-/// is a 403 from its expiry second on.
+/// is a 403 from its expiry second on; the setting that
+/// refuses a URL without one applies here too.
 async fn purge_group_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -2162,7 +2183,9 @@ async fn purge_group_handle(
             accept.as_deref(),
         );
     }
-    if let Some((status, code, message)) = purge_expiry_refusal(expiry, unix_now()) {
+    if let Some((status, code, message)) =
+        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
+    {
         state.metrics.record_purge();
         purge_log(&state.request_log, "purge-group", &target, None).await;
         return error_response(status, code, message, accept.as_deref());

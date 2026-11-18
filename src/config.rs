@@ -305,6 +305,9 @@ pub struct Config {
     /// (`CRABCROP_LOG_SYNC`, issue #642), instead of by the
     /// request log's writer thread.
     pub log_sync: bool,
+    /// Whether the purge endpoints refuse a URL that carries
+    /// no expiry (`CRABCROP_PURGE_REQUIRE_EXPIRY`).
+    pub purge_require_expiry: bool,
 }
 
 /// Disk result storage: `CRABCROP_RESULT_STORAGE_DIR`, with
@@ -575,6 +578,7 @@ impl Config {
         let client_hints = client_hints_config(&get)?;
         let explain_enabled = explain_config(&get)?;
         let log_sync = log_sync_config(&get)?;
+        let purge_require_expiry = purge_require_expiry_config(&get)?;
         Ok(Config {
             keyring,
             allow_unsafe,
@@ -617,6 +621,7 @@ impl Config {
             client_hints,
             explain_enabled,
             log_sync,
+            purge_require_expiry,
         })
     }
 }
@@ -2028,6 +2033,24 @@ pub fn explain_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, Conf
 /// at the cost of one `write` per request.
 pub fn log_sync_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
     parse_bool_value("CRABCROP_LOG_SYNC", get("CRABCROP_LOG_SYNC"), false)
+}
+
+/// Whether the purge and purge-group endpoints refuse a URL
+/// that carries no expiry: `CRABCROP_PURGE_REQUIRE_EXPIRY`,
+/// off by default, so the purge URLs a deployment already
+/// holds keep working. On, only the expiring form
+/// (`/purge/<signature>/exp:<unix-seconds>/<path>`) purges,
+/// for an operator who mints only expiring purge URLs: one
+/// without an expiry answers `403 expiry_required`, so every
+/// purge URL the server takes stops working at its expiry.
+pub fn purge_require_expiry_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    parse_bool_value(
+        "CRABCROP_PURGE_REQUIRE_EXPIRY",
+        get("CRABCROP_PURGE_REQUIRE_EXPIRY"),
+        false,
+    )
 }
 
 /// The AI settings: every model path, checked for
