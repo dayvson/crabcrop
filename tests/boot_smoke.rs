@@ -1599,6 +1599,26 @@ fn serving(env: &[(&str, &str)]) -> (ServerGuard, u16, Vec<String>) {
     (server, port, printed)
 }
 
+/// Bind `port` on `ip` without listening, so that a
+/// connection there is refused for as long as the socket is
+/// held, or `None` when something already holds the port on
+/// that address. The kernel picks a server's port for the
+/// address the server binds, and the same number can be in
+/// use on another loopback address, by another test's server
+/// or origin: a test that expects a refusal there holds the
+/// port first.
+#[cfg(target_os = "linux")]
+fn hold_unlistened(ip: std::net::Ipv4Addr, port: u16) -> Option<rustix::fd::OwnedFd> {
+    let socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::STREAM,
+        None,
+    )
+    .ok()?;
+    rustix::net::bind(&socket, &std::net::SocketAddrV4::new(ip, port)).ok()?;
+    Some(socket)
+}
+
 #[test]
 fn a_connection_that_never_finishes_its_request_head_is_closed_at_the_header_timeout() {
     // Issue #607: the server never set a timer on its
@@ -1757,7 +1777,17 @@ fn crabcrop_bind_listens_on_the_named_address_only() {
         TcpStream::connect(("127.0.0.2", port)).is_ok(),
         "by default the server listens on every IPv4 interface"
     );
-    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+    // The kernel picks the port for 127.0.0.1 only, so it can
+    // be in use on 127.0.0.2 already, by the health verb
+    // test's server: hold it there, bound but not listening,
+    // so a connection is refused for certain.
+    let (_server, port, printed, _held) = (0..8)
+        .find_map(|_| {
+            let (server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+            hold_unlistened(std::net::Ipv4Addr::new(127, 0, 0, 2), port)
+                .map(|held| (server, port, printed, held))
+        })
+        .expect("in 8 tries, a server port that nothing holds on 127.0.0.2");
     assert!(status_line(port, "/health", "").contains("200"));
     let refused = TcpStream::connect(("127.0.0.2", port)).map(|_| ());
     assert_eq!(
@@ -1830,7 +1860,18 @@ fn the_health_verb_probes_the_address_crabcrop_bind_names() {
     // failed on a healthy server. The verb reads
     // CRABCROP_BIND as the server does and probes that
     // address. 127.0.0.2 is a loopback address on Linux.
-    let (_server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+    // The check without the setting needs nothing to listen
+    // on 127.0.0.1 at the server's port. The kernel picks the
+    // port for 127.0.0.2 only, so another test's server or
+    // origin can listen on 127.0.0.1 at the same number: the
+    // test holds the port there, bound but not listening, and
+    // starts another server when something else holds it.
+    let (_server, port, _held) = (0..8)
+        .find_map(|_| {
+            let (server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+            hold_unlistened(std::net::Ipv4Addr::LOCALHOST, port).map(|held| (server, port, held))
+        })
+        .expect("in 8 tries, a server port that nothing holds on 127.0.0.1");
     let health = |vars: &[(&str, &str)]| {
         Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .arg("health")
