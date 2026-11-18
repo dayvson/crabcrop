@@ -15,7 +15,7 @@
 
 use base64::Engine as _;
 use crabcrop_url::{
-    BuildError, MAX_SEALED_REMAINDER, SEALED_PREFIX, SealError, build_sealed_url, build_url,
+    BuildError, MAX_SEALED_REMAINDER, SEALED_PREFIX, SealError, SealedUrl, build_url,
     build_url_with_key_id, is_reserved_remainder, open_token, seal, seal_with_key_id,
     seal_with_nonce, sign, sign_with_key_id, unseal, verify,
 };
@@ -135,7 +135,8 @@ proptest! {
 
     /// A signature is 64 lowercase hex characters and
     /// verifies over the remainder it was minted for, bare
-    /// and behind a key ID.
+    /// and behind a key ID. Only that spelling verifies: its
+    /// uppercase form fails, as the server refuses it.
     #[test]
     fn signatures_verify_keyed_and_bare(
         secret in secret(),
@@ -147,6 +148,8 @@ proptest! {
         prop_assert_eq!(tag.len(), 64);
         prop_assert!(tag.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         prop_assert!(verify(&secret, &tag, &remainder));
+        let upper = tag.to_uppercase();
+        prop_assert!(upper == tag || !verify(&secret, &upper, &remainder));
         let keyed = sign_with_key_id(&secret, &kid, &remainder).unwrap();
         prop_assert_eq!(keyed, format!("{kid}:{tag}"));
     }
@@ -330,13 +333,14 @@ proptest! {
         prop_assert_eq!(unsigned, format!("https://img.example.com/unsafe/{remainder}"));
 
         let keyed =
-            build_url_with_key_id(&base, Some((&secret, &kid)), &operations, &source, expires)
-                .unwrap();
+            build_url_with_key_id(&base, (&secret, &kid), &operations, &source, expires).unwrap();
         prop_assert_eq!(keyed, format!("https://img.example.com/{kid}:{tag}/{remainder}"));
 
-        let sealed =
-            build_sealed_url(&base, Some(&secret), &operations, &source, expires, None, Some(&kid))
-                .unwrap();
+        let mut url = SealedUrl::new(&base, &operations, &source).key_id(&kid);
+        if let Some(exp) = expires {
+            url = url.expires(exp);
+        }
+        let sealed = url.build(&secret).unwrap();
         let segment = sealed.strip_prefix("https://img.example.com/").unwrap();
         prop_assert_eq!(unseal(&secret, segment), Ok(remainder.clone()));
     }
@@ -368,11 +372,11 @@ proptest! {
             prop_assert_eq!(build_url(base, Some(&secret), operations, source, None), refused.clone());
             prop_assert_eq!(build_url(base, None, operations, source, None), refused.clone());
             prop_assert_eq!(
-                build_url_with_key_id(base, Some((&secret, &kid)), operations, source, None),
+                build_url_with_key_id(base, (&secret, &kid), operations, source, None),
                 refused.clone()
             );
             prop_assert_eq!(
-                build_sealed_url(base, Some(&secret), operations, source, None, None, None),
+                SealedUrl::new(base, operations, source).build(&secret),
                 Err(SealError::ReservedRemainder(remainder.clone()))
             );
         }
