@@ -125,7 +125,7 @@ fn shared() -> &'static BandPool {
 }
 
 /// The pool the filters band on: the shared one, or in a test
-/// the one [`on_test_pool`] set for the calling thread.
+/// the one `on_test_pool` set for the calling thread.
 pub(crate) fn band_pool() -> &'static BandPool {
     #[cfg(test)]
     if let Some(pool) = TEST_POOL.with(std::cell::Cell::get) {
