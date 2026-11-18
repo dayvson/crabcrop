@@ -99,9 +99,11 @@ both SDKs must all pass.
   in CI fails. `scripts/check_locks.py` fails CI when the two lockfiles
   disagree on a package both carry, or when either locks a decoder at
   two versions: one decoder version is what ships, pre-checks and
-  fuzzes. A Dependabot cargo pull request moves the root lockfile only,
-  so one that moves a package both carry fails that check until the
-  refresh is pushed to its branch.
+  fuzzes. It also fails on a second reqwest (issue #742): c2pa's async
+  HTTP stack, which crabcrop never calls, compiled reqwest 0.12 beside
+  crabcrop's 0.13. A Dependabot cargo pull request moves the
+  root lockfile only, so one that moves a package both carry fails that
+  check until the refresh is pushed to its branch.
 - `THIRD-PARTY-NOTICES.md`, which every artifact ships, is generated
   from `Cargo.lock` for the release build (`scripts/check_notices.py
   --write`, with the cargo-about version the script pins; RELEASING.md,

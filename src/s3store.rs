@@ -537,7 +537,7 @@ impl S3Store {
     fn note_errors(&self, count: u64, what: &str, detail: &str) {
         self.errors
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("{}: {what}: {detail}", self.tier);
+        stderr_line!("{}: {what}: {detail}", self.tier);
     }
 
     /// Requests of `kind` the store has refused so far (issue
@@ -595,7 +595,7 @@ impl S3Store {
             None => format!("the store {verb} {what}: {status}"),
         };
         if let Some(line) = self.refusal_log.note_now(&line) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -607,7 +607,7 @@ impl S3Store {
         if let Some(line) = self.refusal_log.note_now(&format!(
             "cannot reach the store for {what}: transport error"
         )) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 

@@ -1,10 +1,12 @@
 //! One decode of the render for all the annotation sections
-//! of a meta document (issue #676).
+//! of a meta document (issue #676), on the blocking pool and
+//! with a decoder's panic contained there (issue #736).
 
 use super::*;
 use crate::ai::{
     DetectionProvider, EmbeddingProvider, ModerationProvider, OcrProvider, TagProvider,
 };
+use std::sync::atomic::AtomicBool;
 
 /// One provider call: who was called, where the frame was,
 /// and its size.
@@ -146,7 +148,7 @@ async fn a_meta_document_decodes_its_render_once_for_every_section() {
     let log = FrameLog::default();
     let state = logging_state(&log);
     let processed = still_processed(test_png(), ImageFormat::Png);
-    let frame = DocumentFrame::with_decoder(&processed, decode_for_the_document);
+    let frame = DocumentFrame::with_decoder(Arc::new(processed.clone()), decode_for_the_document);
     let shared = meta_document_from(&state, &processed, frame, false, Some(EVERY_SECTION)).await;
     assert_eq!(DOCUMENT_DECODES.load(Ordering::SeqCst), 1);
     let seen = log.take();
@@ -190,7 +192,8 @@ async fn an_undecodable_render_degrades_each_section_on_its_own() {
     let log = FrameLog::default();
     let state = logging_state(&log);
     let processed = still_processed(b"these bytes are no image".to_vec(), ImageFormat::Png);
-    let frame = DocumentFrame::with_decoder(&processed, decode_what_does_not_decode);
+    let frame =
+        DocumentFrame::with_decoder(Arc::new(processed.clone()), decode_what_does_not_decode);
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     assert!(annotate_meta(&state, &frame).await.is_none());
     assert!(detect_meta(&state, &frame).await.is_none());
@@ -211,7 +214,8 @@ async fn an_undecodable_render_degrades_each_section_on_its_own() {
     assert_eq!(state.ai_gate.available_permits(), 2);
     // The document still answers, as it did when each
     // section decoded for itself.
-    let frame = DocumentFrame::with_decoder(&processed, decode_what_does_not_decode);
+    let frame =
+        DocumentFrame::with_decoder(Arc::new(processed.clone()), decode_what_does_not_decode);
     let shared = meta_document_from(&state, &processed, frame, false, Some(EVERY_SECTION)).await;
     let alone = processed.clone();
     let alone = meta_document_from(&state, &processed, alone, false, Some(EVERY_SECTION)).await;
@@ -236,7 +240,7 @@ async fn a_section_takes_its_permit_before_it_asks_for_the_frame() {
     let mut state = logging_state(&log);
     state.ai_gate = Arc::new(Gate::new(1));
     let processed = still_processed(test_png(), ImageFormat::Png);
-    let frame = DocumentFrame::with_decoder(&processed, decode_behind_the_gate);
+    let frame = DocumentFrame::with_decoder(Arc::new(processed.clone()), decode_behind_the_gate);
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     let held = state.ai_gate.clone().acquire_owned().await.unwrap();
     let waiting = tokio::time::timeout(std::time::Duration::from_millis(200), async {
@@ -288,7 +292,8 @@ async fn the_annotation_deadline_still_ends_a_document_on_a_shared_frame() {
         release: release.clone(),
     }));
     let processed = still_processed(test_png(), ImageFormat::Png);
-    let frame = DocumentFrame::with_decoder(&processed, crate::engine::decode_image);
+    let frame =
+        DocumentFrame::with_decoder(Arc::new(processed.clone()), crate::engine::decode_image);
     let started = Instant::now();
     let response = meta_document_from(&state, &processed, frame, false, Some(EVERY_SECTION)).await;
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
@@ -307,4 +312,270 @@ async fn the_annotation_deadline_still_ends_a_document_on_a_shared_frame() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(back, "every permit returns once the inferences do");
+}
+
+/// Set while [`decode_beside_the_runtime`] waits.
+static DECODING: AtomicBool = AtomicBool::new(false);
+/// Set by [`run_beside_the_decode`] once it has run during a
+/// decode.
+static RAN_BESIDE: AtomicBool = AtomicBool::new(false);
+static BESIDE_DECODES: AtomicUsize = AtomicUsize::new(0);
+
+/// The engine's decoder, once another future on the test's
+/// runtime has run during the decode. On a runtime of one
+/// thread that can only happen when the decode runs off that
+/// thread: a decode on it holds the thread, so the other
+/// future never runs, and after 5 seconds the decode gives up
+/// as a render that does not decode.
+fn decode_beside_the_runtime(bytes: &[u8]) -> Result<DynamicImage, crate::engine::EngineError> {
+    BESIDE_DECODES.fetch_add(1, Ordering::SeqCst);
+    DECODING.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    while !RAN_BESIDE.load(Ordering::SeqCst) {
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            return Err(crate::engine::EngineError::Decode(
+                "nothing else ran on the runtime while the render decoded".to_string(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    crate::engine::decode_image(bytes)
+}
+
+/// The other future: it waits, giving the runtime's thread
+/// up, until a decode is under way, and then lets it finish.
+async fn run_beside_the_decode() {
+    while !DECODING.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    RAN_BESIDE.store(true, Ordering::SeqCst);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_render_decodes_off_the_runtime_thread() {
+    // Issue #736: each section decoded the shared frame on
+    // the runtime's worker, before its blocking task, so a
+    // large render's decode held that worker from every other
+    // request scheduled on it. This runtime has one thread,
+    // and its decoder cannot finish unless another future
+    // runs on that thread meanwhile. Each section, the first
+    // to ask on a frame of its own, answers from the pixels.
+    let log = FrameLog::default();
+    let mut state = logging_state(&log);
+    // Room for every section at once, for the last part.
+    state.ai_gate = Arc::new(Gate::new(5));
+    let processed = Arc::new(still_processed(test_png(), ImageFormat::Png));
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let fresh = || {
+        DECODING.store(false, Ordering::SeqCst);
+        RAN_BESIDE.store(false, Ordering::SeqCst);
+        DocumentFrame::with_decoder(Arc::clone(&processed), decode_beside_the_runtime)
+    };
+    let frame = fresh();
+    let (tags, ()) = tokio::join!(annotate_meta(&state, &frame), run_beside_the_decode());
+    assert!(tags.is_some(), "the tags' decode held the runtime's thread");
+    let frame = fresh();
+    let (boxes, ()) = tokio::join!(detect_meta(&state, &frame), run_beside_the_decode());
+    assert_eq!(
+        boxes.map(|boxes| boxes.len()),
+        Some(2),
+        "the detections' decode held the runtime's thread"
+    );
+    let frame = fresh();
+    let (moderation, ()) = tokio::join!(moderate_meta(&state, &frame), run_beside_the_decode());
+    assert!(
+        matches!(moderation, ModerationMeta::Report(_)),
+        "the moderation's decode held the runtime's thread: {moderation:?}"
+    );
+    let frame = fresh();
+    let (embedding, ()) = tokio::join!(embed_meta(&state, &frame), run_beside_the_decode());
+    assert!(
+        matches!(embedding, EmbeddingMeta::Report(_)),
+        "the embedding's decode held the runtime's thread: {embedding:?}"
+    );
+    let frame = fresh();
+    let (ocr, ()) = tokio::join!(ocr_meta(&state, &frame, deadline), run_beside_the_decode());
+    assert!(
+        matches!(ocr, OcrMeta::Report(_)),
+        "the OCR's decode held the runtime's thread: {ocr:?}"
+    );
+    assert_eq!(BESIDE_DECODES.load(Ordering::SeqCst), 5);
+    assert_eq!(log.take().len(), 6);
+    // All five at once on one frame: the section that asks
+    // first decodes it, and the others wait for that frame
+    // rather than decode their own.
+    let frame = fresh();
+    let ((tags, boxes, moderation, embedding, ocr), ()) = tokio::join!(
+        async {
+            tokio::join!(
+                annotate_meta(&state, &frame),
+                detect_meta(&state, &frame),
+                moderate_meta(&state, &frame),
+                embed_meta(&state, &frame),
+                ocr_meta(&state, &frame, deadline),
+            )
+        },
+        run_beside_the_decode(),
+    );
+    assert!(tags.is_some() && boxes.is_some());
+    assert!(matches!(moderation, ModerationMeta::Report(_)));
+    assert!(matches!(embedding, EmbeddingMeta::Report(_)));
+    assert!(matches!(ocr, OcrMeta::Report(_)));
+    assert_eq!(BESIDE_DECODES.load(Ordering::SeqCst), 6);
+    let seen = log.take();
+    assert_eq!(seen.len(), 6);
+    for (who, at, size) in &seen {
+        assert_eq!((*at, *size), (seen[0].1, (100, 60)), "{who}");
+    }
+    assert_eq!(state.ai_gate.available_permits(), 5);
+}
+
+static PANICKED_DECODES: AtomicUsize = AtomicUsize::new(0);
+
+/// A decoder with a bug: the render's bytes make it panic.
+fn decode_that_panics(_: &[u8]) -> Result<DynamicImage, crate::engine::EngineError> {
+    PANICKED_DECODES.fetch_add(1, Ordering::SeqCst);
+    panic!("a decoder bug: these bytes break it");
+}
+
+/// A decoder that refuses the render's bytes, as it refuses
+/// bytes that are no image.
+fn decode_that_refuses(_: &[u8]) -> Result<DynamicImage, crate::engine::EngineError> {
+    Err(crate::engine::EngineError::Decode(
+        "not an image".to_string(),
+    ))
+}
+
+#[tokio::test]
+async fn a_decoder_panic_fails_its_sections_and_not_the_request() {
+    // Issue #736: the decode ran on the request's own task,
+    // outside any catch_unwind, so a decoder that panicked
+    // unwound that task and the client lost its answer. The
+    // panic is now caught in the blocking task that decodes
+    // and answers as a render that does not decode: tags and
+    // detections are left out, the sections asked for by name
+    // report the failure, no provider runs, every permit comes
+    // back, and the document is the one a decoder that refuses
+    // the bytes gives.
+    let log = FrameLog::default();
+    let state = Arc::new(logging_state(&log));
+    let processed = Arc::new(still_processed(test_png(), ImageFormat::Png));
+    // The sections run on a task of their own, as a
+    // request's do: a panic that unwound them ends that task
+    // with it.
+    let sections = tokio::spawn({
+        let state = Arc::clone(&state);
+        let frame = DocumentFrame::with_decoder(Arc::clone(&processed), decode_that_panics);
+        async move {
+            let deadline = Instant::now() + std::time::Duration::from_secs(60);
+            (
+                annotate_meta(&state, &frame).await,
+                detect_meta(&state, &frame).await,
+                moderate_meta(&state, &frame).await,
+                embed_meta(&state, &frame).await,
+                ocr_meta(&state, &frame, deadline).await,
+            )
+        }
+    })
+    .await;
+    let (tags, boxes, moderation, embedding, ocr) =
+        sections.unwrap_or_else(|e| panic!("the decoder's panic unwound the sections' task: {e}"));
+    assert!(tags.is_none() && boxes.is_none());
+    assert_eq!(moderation, ModerationMeta::Unavailable("inference_failed"));
+    assert_eq!(embedding, EmbeddingMeta::Unavailable("inference_failed"));
+    assert_eq!(ocr, OcrMeta::Unavailable("inference_failed"));
+    assert!(log.take().is_empty());
+    // As for a render that does not decode, each section
+    // tried for itself.
+    assert_eq!(PANICKED_DECODES.load(Ordering::SeqCst), 5);
+    assert_eq!(state.ai_gate.available_permits(), 2);
+    let document = |decode: FrameDecoder| {
+        let state = Arc::clone(&state);
+        let processed = Arc::clone(&processed);
+        tokio::spawn(async move {
+            let frame = DocumentFrame::with_decoder(Arc::clone(&processed), decode);
+            let response =
+                meta_document_from(&state, &processed, frame, false, Some(EVERY_SECTION)).await;
+            parts(response).await
+        })
+    };
+    let panicked = document(decode_that_panics)
+        .await
+        .unwrap_or_else(|e| panic!("the decoder's panic unwound the document's task: {e}"));
+    let refused = document(decode_that_refuses).await.unwrap();
+    assert_eq!(panicked, refused);
+    assert_eq!(panicked.0, StatusCode::OK);
+    assert!(panicked.2.contains("inference_failed"), "{}", panicked.2);
+    assert!(log.take().is_empty());
+}
+
+/// Opened by the deadline test below once its document has
+/// answered, to let [`decode_until_released`] finish.
+static HELD_RELEASE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static HELD_OPENED: std::sync::Condvar = std::sync::Condvar::new();
+/// Set when [`decode_until_released`] returns.
+static HELD_DECODE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The engine's decoder, once the test opens the release. A
+/// decode that the release does not reach in 10 seconds opens
+/// it itself and goes on, so a run where the test cannot open
+/// it (the decode holding the runtime's only thread) still
+/// ends.
+fn decode_until_released(bytes: &[u8]) -> Result<DynamicImage, crate::engine::EngineError> {
+    let open = HELD_RELEASE.lock().unwrap();
+    let (mut open, _) = HELD_OPENED
+        .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+        .unwrap();
+    *open = true;
+    drop(open);
+    let decoded = crate::engine::decode_image(bytes);
+    HELD_DECODE_DONE.store(true, Ordering::SeqCst);
+    decoded
+}
+
+#[tokio::test]
+async fn the_annotation_deadline_ends_a_document_while_its_render_decodes() {
+    // Issue #736: the decode ran on the request's task, where
+    // the annotation deadline cannot interrupt it, so a decode
+    // that outlasted the deadline held the whole document until
+    // it ended. It now runs in the first section's blocking
+    // task: the document answers at the deadline with the decode
+    // still running, the tags and detections left out and the
+    // sections asked for by name timed out, and the permits the
+    // detached tasks hold come back once the decode and the
+    // inferences behind it end.
+    let log = FrameLog::default();
+    let mut state = logging_state(&log);
+    state.process_timeout = std::time::Duration::from_millis(300);
+    let processed = Arc::new(still_processed(test_png(), ImageFormat::Png));
+    let frame = DocumentFrame::with_decoder(Arc::clone(&processed), decode_until_released);
+    let response = meta_document_from(&state, &processed, frame, false, Some(EVERY_SECTION)).await;
+    assert!(
+        !HELD_DECODE_DONE.load(Ordering::SeqCst),
+        "the document waited for its render's decode"
+    );
+    let (status, _, body) = parts(response).await;
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(body.get("tags").is_none(), "{body}");
+    assert!(body.get("detections").is_none(), "{body}");
+    assert_eq!(body["moderation"]["reason"], "timed_out", "{body}");
+    assert_eq!(body["embedding_reason"], "timed_out", "{body}");
+    assert_eq!(body["ocr"]["reason"], "timed_out", "{body}");
+    assert!(log.take().is_empty());
+    *HELD_RELEASE.lock().unwrap() = true;
+    HELD_OPENED.notify_all();
+    let mut back = false;
+    for _ in 0..100 {
+        if state.ai_gate.available_permits() == 2 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        back,
+        "every permit returns once the decode and the inferences end"
+    );
+    assert!(HELD_DECODE_DONE.load(Ordering::SeqCst));
 }
