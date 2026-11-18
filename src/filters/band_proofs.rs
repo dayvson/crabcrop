@@ -1,9 +1,10 @@
 //! Issue #739: the filters run their row bands on one pool, and
 //! every banded filter writes the same bytes at every pool
 //! size. Each case runs on one thread (one band, on the calling
-//! thread) and on pools of 2, 3 and 8 threads, each pool
-//! splitting a pass into as many bands; eight is past the four
-//! bands any host splits a pass into, so the frame gets more
+//! thread) and on pools of 2, 3, 4 and 8 threads, each pool
+//! splitting a pass into as many bands. One to four bands are
+//! the splits hosts make (four on every host with four cores
+//! or more), and eight is past them, so the frame gets more
 //! band edges than a server ever cuts. Every frame is large
 //! enough for the filter to band at each size, and each case
 //! checks that the pool's threads ran its bands.
@@ -13,7 +14,7 @@ use super::*;
 use crate::url::FlipDirection;
 
 /// The pool sizes past one thread the filters run at.
-const POOL_SIZES: [usize; 3] = [2, 3, 8];
+const POOL_SIZES: [usize; 4] = [2, 3, 4, 8];
 
 /// Grain in 0..64 for a pixel's channel: a hash of where it
 /// is, so no two neighbouring rows repeat and a band edge in
@@ -91,7 +92,8 @@ fn every_blur_writes_the_same_bytes_at_every_pool_size() {
     // A blur bands any frame of two rows or more. Here 61 rows
     // make bands of 5 to 31 rows, against kernels that reach 7
     // rows (sigma 2.5, the ring pass) and 58 rows (sigma 18,
-    // the transient's two passes), in every sample type.
+    // the transient's two passes), in each of the ten sample
+    // layouts the blur takes.
     let rgb = photo(97, 61);
     let rgba = with_alpha(&rgb);
     let layouts = [
@@ -99,6 +101,8 @@ fn every_blur_writes_the_same_bytes_at_every_pool_size() {
         DynamicImage::ImageLumaA8(rgba.to_luma_alpha8()),
         rgb.clone(),
         rgba.clone(),
+        DynamicImage::ImageLuma16(rgb.to_luma16()),
+        DynamicImage::ImageLumaA16(rgba.to_luma_alpha16()),
         DynamicImage::ImageRgb16(rgb.to_rgb16()),
         DynamicImage::ImageRgba16(rgba.to_rgba16()),
         DynamicImage::ImageRgb32F(rgb.to_rgb32f()),
