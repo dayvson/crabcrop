@@ -6,15 +6,16 @@
 //! panic.
 //!
 //! The inputs are the checkpoint fixtures the unit tests
-//! build. The small ones run whole, cut at every length,
-//! with every byte deleted or overwritten, and with every
-//! span of up to eight bytes doubled: the head pickle's
-//! bytes take every value, the others' every opcode the
-//! loop reads and a few other bytes. The large ones, which
-//! run until a limit stops them, run whole and cut at a
-//! sample of lengths. As property tests, random opcode
-//! streams run, and the fixtures mutated, truncated and
-//! with spans repeated. An ignored test adds the LAION
+//! build, and one more: the scalar opcodes at their edges,
+//! which none of those holds. The small ones run whole, cut
+//! at every length, with every byte deleted or overwritten,
+//! and with every span of up to eight bytes doubled: the
+//! head pickle's bytes take every value, the others' every
+//! opcode the loop reads and a few other bytes. The large
+//! ones, which run until a limit stops them, run whole and
+//! cut at a sample of lengths. As property tests, random
+//! opcode streams run, and the fixtures mutated, truncated
+//! and with spans repeated. An ignored test adds the LAION
 //! heads the AI workflow downloads.
 //!
 //! The cases per property default to [`DEFAULT_CASES`];
@@ -200,10 +201,41 @@ fn check(name: &str, pkl: &[u8], variants: impl Iterator<Item = Variant>) {
 /// A fixture: its name and its bytes.
 type Fixture = (String, Vec<u8>);
 
+/// The scalar opcodes at their edges, in one tuple: BININT1
+/// and BININT2 at their largest, BININT at -1 and at both
+/// ends of the i32 range, a LONG line at each end of the
+/// i64 range (one with the L suffix, one without), LONG1
+/// and LONG4 at every length up to the eight bytes an i64
+/// holds with the top bit set (sign-extended below eight
+/// bytes, not at eight), a negative zero and a NaN, a
+/// SHORT_BINSTRING that is not UTF-8 (read lossily) and a
+/// BINUNICODE that is. A head save writes none of these,
+/// and the sweeps vary each.
+fn scalar_edges() -> Vec<u8> {
+    let mut pkl = b"\x80\x02(K\xffM\xff\xff".to_vec();
+    pkl.extend_from_slice(b"J\xff\xff\xff\xffJ\x00\x00\x00\x80J\xff\xff\xff\x7f");
+    pkl.extend_from_slice(b"L-9223372036854775808L\nL9223372036854775807\n");
+    for len in 0..=8u8 {
+        let body: Vec<u8> = (1..=len)
+            .map(|i| if i == len { 0x80 | i } else { i })
+            .collect();
+        pkl.extend_from_slice(&[0x8a, len]);
+        pkl.extend_from_slice(&body);
+        pkl.push(0x8b);
+        pkl.extend_from_slice(&u32::from(len).to_le_bytes());
+        pkl.extend_from_slice(&body);
+    }
+    pkl.extend_from_slice(b"G\x80\x00\x00\x00\x00\x00\x00\x00");
+    pkl.extend_from_slice(b"G\x7f\xf8\x00\x00\x00\x00\x00\x01");
+    pkl.extend_from_slice(b"U\x02\xff\xfeX\x02\x00\x00\x00\xc3\xa9");
+    pkl.extend_from_slice(b"t.");
+    pkl
+}
+
 /// The other fixtures that run in microseconds: the head
 /// pickle with two bias values and with a size that
-/// overflows, the hostile reduce, a short memo chain and
-/// the empty pickle.
+/// overflows, the hostile reduce, a short memo chain, the
+/// empty pickle and the scalar edges.
 fn small_fixtures() -> Vec<Fixture> {
     vec![
         ("head_pickle(3, 2)".to_string(), head_pickle(3, 2)),
@@ -214,6 +246,7 @@ fn small_fixtures() -> Vec<Fixture> {
         ("os_system_reduce()".to_string(), os_system_reduce()),
         ("memo_doubling(8)".to_string(), memo_doubling(8)),
         ("the empty pickle".to_string(), Vec::new()),
+        ("scalar_edges()".to_string(), scalar_edges()),
     ]
 }
 
