@@ -22,7 +22,9 @@ both SDKs must all pass.
   `main.rs` is the binary, reading configuration and booting the
   server. The operation parser and canonical forms in `url.rs`
   (a filter is one row of the table in `url/filters.rs`, which
-  generates both its parser and its canonical spelling),
+  generates both its parser and its canonical spelling, and one
+  variant: of `PlainFilter` when `filters.rs` applies it from the
+  image alone, of `Filter` when the engine applies it itself),
   pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in

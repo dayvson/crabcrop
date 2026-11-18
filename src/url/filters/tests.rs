@@ -256,9 +256,9 @@ fn parse_one(text: &str) -> Result<Filter, ParseError> {
 /// was written, and only its spelling sorts it.
 fn sorted(filter: Filter) -> Filter {
     match filter {
-        Filter::Quality(Quality::PerFormat(mut entries)) => {
+        Filter::Plain(PlainFilter::Quality(Quality::PerFormat(mut entries))) => {
             entries.sort_by_key(|(format, _)| format.map(format_text));
-            Filter::Quality(Quality::PerFormat(entries))
+            Filter::Plain(PlainFilter::Quality(Quality::PerFormat(entries)))
         }
         other => other,
     }

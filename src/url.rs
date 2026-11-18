@@ -755,12 +755,24 @@ fn parse_studio(p: &str) -> Option<StudioSpec> {
     Some(spec)
 }
 
-/// One filter from a `filters:...` segment.
+/// One filter from a `filters:...` segment, as the engine
+/// routes it (issue #741). A [`PlainFilter`] needs nothing
+/// but the image it is given, and `crate::filters` applies
+/// it. Every other variant needs something only the engine
+/// holds: the images the server fetched, a model, the font,
+/// the bounds of the image in effect, or the request as a
+/// whole. The engine applies those itself. The engine's
+/// match names every variant, and the match in
+/// `crate::filters` every plain one, so a new filter does
+/// not compile until one side applies it.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
 /// for the tests and the pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
+    /// A filter `crate::filters` applies from the image
+    /// alone.
+    Plain(PlainFilter),
     /// Overlay another image at (x, y) with an opacity (0-100).
     /// The URL is the percent-decoded watermark location; the
     /// server fetches it before the engine runs. Negative
@@ -851,6 +863,14 @@ pub enum Filter {
     /// and bounds discipline as `BlurRegion`. Backed by the
     /// server's inpainting model (issue #176).
     RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
+}
+
+/// A filter that needs nothing but the image it is given
+/// (issue #741): a pixel filter, which `crate::filters`
+/// applies in URL order, or an encoding directive, which it
+/// records for the encoder. [`Filter::Plain`] carries it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlainFilter {
     /// Desaturate the image.
     Grayscale,
     /// Invert every channel.
@@ -2359,16 +2379,16 @@ pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec
         matches!(
             op,
             Operation::Filters(filters)
-                if filters.iter().any(|f| matches!(f, Filter::MaxBytes(_)))
+                if filters.iter().any(|f| matches!(f, Filter::Plain(PlainFilter::MaxBytes(_))))
         )
     });
     let keep_default_filter = |f: &Filter| -> bool {
         match f {
-            Filter::Format(_) => directives.explicit_format.is_none(),
-            Filter::Quality(_) => !directives.quality_directive,
-            Filter::Fill(_) => directives.fill.is_none(),
+            Filter::Plain(PlainFilter::Format(_)) => directives.explicit_format.is_none(),
+            Filter::Plain(PlainFilter::Quality(_)) => !directives.quality_directive,
+            Filter::Plain(PlainFilter::Fill(_)) => directives.fill.is_none(),
             Filter::Dpr(_) => directives.dpr.is_none(),
-            Filter::MaxBytes(_) => !url_has_max_bytes,
+            Filter::Plain(PlainFilter::MaxBytes(_)) => !url_has_max_bytes,
             _ => true,
         }
     };
@@ -2833,25 +2853,25 @@ impl RequestDirectives {
             if let Operation::Filters(filters) = op {
                 for f in filters {
                     match f {
-                        Filter::Format(spec) => {
+                        Filter::Plain(PlainFilter::Format(spec)) => {
                             d.explicit_format = Some(spec.format);
                             d.format_options = spec.options;
                         }
-                        Filter::NoUpscale => d.no_upscale = true,
-                        Filter::Fill(color) => d.fill = Some(*color),
+                        Filter::Plain(PlainFilter::NoUpscale) => d.no_upscale = true,
+                        Filter::Plain(PlainFilter::Fill(color)) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
                         Filter::Studio(_) => d.studio = true,
                         Filter::RemoveRegion { .. } => d.remove_region = true,
-                        Filter::Radius(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Radius(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("radius")
                         }
-                        Filter::Mask(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Mask(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("mask")
                         }
                         Filter::Upscale(_) => d.upscale = true,
                         Filter::Dpr(factor) => d.dpr = Some(*factor),
-                        Filter::KeepProfile => d.keep_profile = true,
-                        Filter::Quality(_) => d.quality_directive = true,
+                        Filter::Plain(PlainFilter::KeepProfile) => d.keep_profile = true,
+                        Filter::Plain(PlainFilter::Quality(_)) => d.quality_directive = true,
                         Filter::Text { .. } => d.text = true,
                         Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
                         Filter::BlurClass(name)
