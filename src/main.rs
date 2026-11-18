@@ -24,7 +24,7 @@
 // path in this file and in `config.rs` resolve to them.
 use crabcrop::{
     ai, cache, cli, credentials, engine, frames, loader, observe, pdf, provenance, quality,
-    s3store, server, sigv4, storage, text, upload, url, video,
+    s3store, server, sigv4, storage, svg, text, upload, url, video,
 };
 
 /// Print one boot line on standard output, as `println!` does,
@@ -221,14 +221,14 @@ async fn start() -> Option<std::time::Instant> {
     raise_malloc_thresholds();
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
-    match crabcrop::svg::WorkerCommand::current_binary() {
-        Ok(worker) => crabcrop::svg::isolate_in_child(worker),
+    let worker = match crabcrop::svg::WorkerCommand::current_binary() {
+        Ok(worker) => worker,
         Err(e) => {
             eprintln!("crabcrop: cannot locate this binary to start SVG workers: {e}");
             std::process::exit(1);
         }
-    }
-    match run().await {
+    };
+    match run(worker).await {
         Ok(deadline) => Some(deadline),
         Err(e) => {
             eprintln!("crabcrop: {e}");
@@ -238,10 +238,20 @@ async fn start() -> Option<std::time::Instant> {
 }
 
 /// Boot from the process environment, then serve until a
-/// signal stops the server. Returns the deadline by which
-/// the runtime must stop.
-async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
+/// signal stops the server, its SVG work in workers started
+/// from `worker`. Returns the deadline by which the runtime
+/// must stop.
+async fn run(
+    worker: crabcrop::svg::WorkerCommand,
+) -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let config = Config::from_env(|name| env::var(name).ok())?;
+    // The workers take their address-space cap from the
+    // configuration (issue #738), before anything is built
+    // that could render an SVG.
+    crabcrop::svg::isolate_in_child(crabcrop::svg::WorkerCommand {
+        max_address_space: config.svg_worker_address_space,
+        ..worker
+    });
     // The result stores open, and then the listener binds,
     // before the AI preload: a taken port or an unwritable
     // directory is a cheap failure and should not wait for
@@ -1054,10 +1064,11 @@ const RENDERING_VERSION: u32 = 8;
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
 /// metadata policy, the quality tuning knobs, the AVIF
-/// tile count, the width-hint step, the AI behavior
-/// thresholds, and the file-based inputs whose contents
-/// change results (the AI models, the CLIP set, the
-/// overlay font, the video and PDF tools, the detector
+/// tile count, the width-hint step, the tools'
+/// address-space caps that are not at their defaults, the
+/// AI behavior thresholds, and the file-based inputs whose
+/// contents change results (the AI models, the CLIP set,
+/// the overlay font, the video and PDF tools, the detector
 /// declarations and the models they name), plus the brand
 /// color, whose value shapes studio composites. A file
 /// input is identified by a digest of its contents, never
@@ -1117,6 +1128,34 @@ fn config_fingerprint(
     }
     part("jxl_speed", &format!("{jxl_speed:?}"));
     part("width_step", &width_step.to_string());
+    // The tools' address-space caps (issue #738), each only
+    // when it is not its default, so a configuration that
+    // leaves them alone keeps the fingerprint it had. What a
+    // tool returns can depend on its cap, not only whether it
+    // fails: the PDF renderer leaves out of the page an image
+    // it cannot decode under the cap.
+    for (name, default) in [
+        (
+            "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB",
+            crate::video::DEFAULT_ENCODER_ADDRESS_SPACE,
+        ),
+        (
+            "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB",
+            crate::frames::DEFAULT_DECODER_ADDRESS_SPACE,
+        ),
+        (
+            "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB",
+            crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE,
+        ),
+        (
+            "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB",
+            crate::svg::DEFAULT_WORKER_ADDRESS_SPACE,
+        ),
+    ] {
+        if let Some(cap) = changed_cap(&get, name, default) {
+            part(name, &cap);
+        }
+    }
     // The AI behavior thresholds, at their effective
     // values (the builders' defaults when unset): both
     // gate what detection and tagging report, and
@@ -1216,6 +1255,20 @@ fn config_fingerprint(
     }
     let digest = hasher.finalize();
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A tool's address-space cap for the fingerprint (issue
+/// #738): its value in megabytes when it is set to anything
+/// but `default` (in bytes), `None` when it is unset or the
+/// default. A value that does not parse contributes its raw
+/// text: boot fails on it later, in the configuration.
+fn changed_cap(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> Option<String> {
+    let value = get(name)?;
+    match value.parse::<u64>() {
+        Ok(mb) if mb == default >> 20 => None,
+        Ok(mb) => Some(mb.to_string()),
+        Err(_) => Some(value),
+    }
 }
 
 /// The fingerprint identity of one file-based input: the
@@ -1426,11 +1479,13 @@ fn build_video_encoder(
                     Some("CRABCROP_VIDEO_ENCODER"),
                     format!("cannot use CRABCROP_VIDEO_ENCODER ({path}): {e}"),
                 )
-            })?;
+            })?
+            .with_address_space(config.encoder_address_space);
             boot_line!(
-                "video encoder: {path} (timeout {}s, output cap {} MB)",
+                "video encoder: {path} (timeout {}s, output cap {} MB, address space {} MB)",
                 config.timeout_secs,
-                config.max_mb
+                config.max_mb,
+                config.encoder_address_space >> 20
             );
             Ok(Some(Arc::new(encoder)))
         }
@@ -1458,8 +1513,13 @@ fn build_video_decoder(
                     Some("CRABCROP_VIDEO_DECODER"),
                     format!("cannot use CRABCROP_VIDEO_DECODER ({path}): {e}"),
                 )
-            })?;
-            boot_line!("video decoder: {path} (timeout {}s)", config.timeout_secs);
+            })?
+            .with_address_space(config.decoder_address_space);
+            boot_line!(
+                "video decoder: {path} (timeout {}s, address space {} MB)",
+                config.timeout_secs,
+                config.decoder_address_space >> 20
+            );
             Ok(Some(Arc::new(extractor)))
         }
         None => Ok(None),
@@ -1539,7 +1599,10 @@ fn provenance_boot_lines(
 /// not on the first `page:` request. So is a pair that
 /// runs but cannot render a page (issue #715): the boot
 /// renders a one-page document through both programs, as
-/// the C2PA identity signs one image.
+/// the C2PA identity signs one image. It renders under the
+/// configured address-space cap, so a cap the pair cannot
+/// work in stops the boot too, and the error names the
+/// cap's variable when it is not the default (issue #738).
 fn build_pdf_renderer(
     config: &PdfConfig,
 ) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, ConfigError> {
@@ -1555,9 +1618,25 @@ fn build_pdf_renderer(
                 std::path::PathBuf::from(path),
                 std::time::Duration::from_secs(config.timeout_secs),
             )
-            .map_err(unusable)?;
-            renderer.self_test().map_err(unusable)?;
-            boot_line!("PDF renderer: {path} (timeout {}s)", config.timeout_secs);
+            .map_err(unusable)?
+            .with_address_space(config.renderer_address_space);
+            let cap_mb = config.renderer_address_space >> 20;
+            renderer.self_test().map_err(|e| {
+                if config.renderer_address_space == crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE {
+                    return unusable(e);
+                }
+                ConfigError::build(
+                    Some("CRABCROP_PDF_RENDERER"),
+                    format!(
+                        "cannot use CRABCROP_PDF_RENDERER ({path}) under the {cap_mb} MB \
+                         address-space cap CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB sets: {e}"
+                    ),
+                )
+            })?;
+            boot_line!(
+                "PDF renderer: {path} (timeout {}s, address space {cap_mb} MB)",
+                config.timeout_secs
+            );
             Ok(Some(Arc::new(renderer)))
         }
         None => Ok(None),

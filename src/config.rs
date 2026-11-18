@@ -292,6 +292,10 @@ pub struct Config {
     pub fallback_image: Option<String>,
     pub video: VideoConfig,
     pub pdf: PdfConfig,
+    /// The SVG worker's address-space cap, in bytes
+    /// (`CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB`, issue
+    /// #738). AVIF decodes run in the same worker.
+    pub svg_worker_address_space: u64,
     pub provenance: Option<ProvenanceConfig>,
     /// Meta mode (issue #453).
     pub meta_enabled: bool,
@@ -570,6 +574,13 @@ impl Config {
         let fallback_image = get("CRABCROP_FALLBACK_IMAGE").filter(|v| !v.is_empty());
         let video = video_config(&get)?;
         let pdf = pdf_config(&get)?;
+        let svg_worker_address_space = address_space_cap(
+            &get,
+            "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB",
+            "SVG worker",
+            crate::svg::DEFAULT_WORKER_ADDRESS_SPACE,
+            crate::svg::MIN_WORKER_ADDRESS_SPACE,
+        )?;
         let provenance = provenance_config(&get)?;
         let meta_enabled = meta_mode_config(&get)?;
         let client_hints = client_hints_config(&get)?;
@@ -612,6 +623,7 @@ impl Config {
             fallback_image,
             video,
             pdf,
+            svg_worker_address_space,
             provenance,
             meta_enabled,
             client_hints,
@@ -2498,15 +2510,20 @@ pub fn parse_detector_declarations(text: &str) -> Result<Vec<DetectorDeclaration
 }
 
 /// The video tools' settings: the shared wall-clock limit
-/// (issue #214), the encoder's output cap, and the encoder
-/// (issue #162) and frame extractor programs. The bounds
-/// parse whether or not a tool is configured: a typo'd
-/// bound is a boot error even before the tool is set.
+/// (issue #214), the encoder's output cap, each tool's
+/// address-space cap (issue #738), and the encoder (issue
+/// #162) and frame extractor programs. The bounds parse
+/// whether or not a tool is configured: a typo'd bound is a
+/// boot error even before the tool is set.
 #[derive(Debug)]
 pub struct VideoConfig {
     pub timeout_secs: u64,
     pub max_mb: usize,
     pub max_bytes: usize,
+    /// The encoder's address-space cap, in bytes.
+    pub encoder_address_space: u64,
+    /// The frame extractor's address-space cap, in bytes.
+    pub decoder_address_space: u64,
     pub encoder: Option<String>,
     pub decoder: Option<String>,
 }
@@ -2532,10 +2549,26 @@ pub fn video_config(get: impl Fn(&str) -> Option<String>) -> Result<VideoConfig,
             "CRABCROP_VIDEO_MAX_MB is too large",
         )
     })?;
+    let encoder_address_space = address_space_cap(
+        &get,
+        "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB",
+        "video encoder",
+        crate::video::DEFAULT_ENCODER_ADDRESS_SPACE,
+        crate::video::MIN_ENCODER_ADDRESS_SPACE,
+    )?;
+    let decoder_address_space = address_space_cap(
+        &get,
+        "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB",
+        "video decoder",
+        crate::frames::DEFAULT_DECODER_ADDRESS_SPACE,
+        crate::frames::MIN_DECODER_ADDRESS_SPACE,
+    )?;
     Ok(VideoConfig {
         timeout_secs,
         max_mb,
         max_bytes,
+        encoder_address_space,
+        decoder_address_space,
         encoder: get("CRABCROP_VIDEO_ENCODER").filter(|v| !v.is_empty()),
         decoder: get("CRABCROP_VIDEO_DECODER").filter(|v| !v.is_empty()),
     })
@@ -2562,13 +2595,17 @@ fn video_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Conf
 }
 
 /// The PDF renderer's settings (issue #215): its program,
-/// and its own wall-clock limit rather than the video
-/// tools', because a page render's cost profile differs
-/// from a frame extraction's. The limit parses even when
-/// no renderer is configured, like the video bounds.
+/// its own wall-clock limit rather than the video tools',
+/// because a page render's cost profile differs from a frame
+/// extraction's, and the address-space cap of both its tools
+/// (issue #738). The bounds parse even when no renderer is
+/// configured, like the video bounds.
 #[derive(Debug)]
 pub struct PdfConfig {
     pub timeout_secs: u64,
+    /// The renderer's and the probe's address-space cap, in
+    /// bytes.
+    pub renderer_address_space: u64,
     pub renderer: Option<String>,
 }
 
@@ -2585,10 +2622,56 @@ pub fn pdf_config(get: impl Fn(&str) -> Option<String>) -> Result<PdfConfig, Con
             format!("CRABCROP_PDF_TIMEOUT_SECS must be between 1 and 600, got {timeout_secs}"),
         ));
     }
+    let renderer_address_space = address_space_cap(
+        &get,
+        "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB",
+        "PDF renderer",
+        crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE,
+        crate::pdf::MIN_RENDERER_ADDRESS_SPACE,
+    )?;
     Ok(PdfConfig {
         timeout_secs,
+        renderer_address_space,
         renderer: get("CRABCROP_PDF_RENDERER").filter(|v| !v.is_empty()),
     })
+}
+
+/// The most a tool's address-space cap may be set to, in
+/// megabytes: 64 GiB, the most the source buffer budget may
+/// be. A cap that large bounds nothing these tools do, and
+/// a value past it is more likely a cap written in bytes or
+/// kilobytes than one meant.
+const MAX_ADDRESS_SPACE_MB: u64 = 65_536;
+
+/// One tool's address-space cap, in bytes (issue #738):
+/// `var`, in megabytes, from the least the tool needs to
+/// start (`min`, in bytes) to [`MAX_ADDRESS_SPACE_MB`], or
+/// `default` (in bytes) when it is unset. A value under the
+/// least stops the boot, naming the variable: the `tool`
+/// would fail every run. The caps are not derived from the
+/// container's memory limit: an address-space cap is not a
+/// limit on resident memory.
+fn address_space_cap(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    tool: &str,
+    default: u64,
+    min: u64,
+) -> Result<u64, ConfigError> {
+    const MB: u64 = 1024 * 1024;
+    let mb: u64 = parse_env_value(var, get(var), default / MB)?;
+    let min_mb = min / MB;
+    if !(min_mb..=MAX_ADDRESS_SPACE_MB).contains(&mb) {
+        return Err(ConfigError::invalid(
+            var,
+            &get(var).unwrap_or_default(),
+            format!(
+                "{var} must be between {min_mb} (what the {tool} needs to start) and \
+                 {MAX_ADDRESS_SPACE_MB}, got {mb}"
+            ),
+        ));
+    }
+    Ok(mb * MB)
 }
 
 /// The C2PA signing identity (issue #173): a PEM
