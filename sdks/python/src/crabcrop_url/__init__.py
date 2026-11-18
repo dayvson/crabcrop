@@ -5,8 +5,10 @@ package from the ``crabcrop-url[seal]`` extra.
 
 The names follow the TypeScript SDK's, in Python's spelling
 (``buildURL`` is `build_url`, ``ops.cropObjects`` is
-`ops.crop_objects`), and the typed operation builders, `ops`,
-`filter` and `join_ops`, mirror its builders (issue #716).
+`ops.crop_objects`), the typed operation builders, `ops`,
+`filter` and `join_ops`, mirror its builders, and `explain_url`
+and `verify_url_signature` are its explainer and URL verifier
+(issue #716).
 """
 
 from __future__ import annotations
@@ -15,10 +17,20 @@ import base64
 import hashlib
 import hmac
 import os
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Mapping, Optional, Sequence, Union
 
+from ._explain import (
+    FILTER_DESCRIPTIONS,
+    ExplainedSegment,
+    ExplainedSignature,
+    Explanation,
+    SegmentKind,
+    SignatureKind,
+    explain_url,
+)
 from ._grammar import (
     MAX_DIMENSION,
+    RESERVED_SEGMENT,
     Anchor,
     BlendMode,
     CropAlign,
@@ -29,6 +41,7 @@ from ._grammar import (
     PerFormatQualityFormat,
     StudioMode,
     StudioShadow,
+    is_reserved_remainder,
 )
 from ._operations import FormatOptions, StudioOptions, filter, join_ops, ops
 
@@ -37,6 +50,7 @@ from ._operations import FormatOptions, StudioOptions, filter, join_ops, ops
 __version__ = "0.13.1"
 
 __all__ = [
+    "FILTER_DESCRIPTIONS",
     "MAX_DIMENSION",
     "MAX_SEALED_REMAINDER",
     "RESERVED_SEGMENT",
@@ -46,18 +60,25 @@ __all__ = [
     "CropAlign",
     "CurveChannel",
     "Dimension",
+    "ExplainedSegment",
+    "ExplainedSignature",
+    "Explanation",
     "FormatOptions",
     "ImageFormat",
+    "Keyring",
     "MaskShape",
     "PerFormatQualityFormat",
     "SealError",
     "Secret",
+    "SegmentKind",
+    "SignatureKind",
     "StudioMode",
     "StudioOptions",
     "StudioShadow",
     "build_sealed_url",
     "build_srcset",
     "build_url",
+    "explain_url",
     "filter",
     "is_reserved_remainder",
     "is_valid_key_id",
@@ -77,9 +98,14 @@ __all__ = [
     "upload_key",
     "upload_signature",
     "verify",
+    "verify_url_signature",
 ]
 
 Secret = Union[str, bytes, None]
+
+#: Secrets by key ID, as a server in a rotation window holds them:
+#: what `verify_url_signature` takes in place of one secret.
+Keyring = Mapping[str, Union[str, bytes]]
 
 
 def _key(secret: Union[str, bytes]) -> bytes:
@@ -116,28 +142,10 @@ def sign_with_key_id(
     return f"{key_id}:{sign(secret, remainder)}"
 
 
-#: The first remainder segment reserved for key derivation.
-#: Every derived subkey (purge, purge-group, upload, seal, and
-#: the server's cache entry key) is the HMAC of a label such as
-#: ``crabcrop/purge-key`` under the secret, which is the image
-#: signature of that label. No image URL may begin with this
-#: segment (the server refuses one with ``400
-#: reserved_segment``), and `sign` and every builder refuse a
-#: remainder that does, so no image signature is ever a subkey.
-RESERVED_SEGMENT = "crabcrop"
-
 _RESERVED_MESSAGE = (
     f'remainder begins with the reserved segment "{RESERVED_SEGMENT}": '
     "it is kept for key derivation, and no image URL may begin with it"
 )
-
-
-def is_reserved_remainder(remainder: str) -> bool:
-    """Whether ``remainder`` begins with `RESERVED_SEGMENT`: it
-    is that segment alone or starts with ``crabcrop/``. The
-    test is on the text as written, as the HMAC is:
-    ``exp:1/crabcrop/x`` and ``CRABCROP/x`` are not reserved."""
-    return remainder.split("/", 1)[0] == RESERVED_SEGMENT
 
 
 def _refuse_reserved(remainder: str) -> None:
@@ -294,6 +302,66 @@ def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
     if is_reserved_remainder(remainder):
         return False
     return hmac.compare_digest(sign(secret, remainder), signature)
+
+
+def _utf8_as_javascript_writes(text: str) -> bytes:
+    """The UTF-8 bytes TextEncoder and ``node:crypto`` write for the
+    same text in JavaScript: a lone surrogate, which UTF-8 cannot
+    encode, becomes U+FFFD, and a surrogate pair the character it
+    encodes."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        units = text.encode("utf-16-le", "surrogatepass")
+        return units.decode("utf-16-le", "replace").encode("utf-8")
+
+
+def verify_url_signature(
+    secret_or_keyring: Union[str, bytes, Keyring], input: str
+) -> Optional[bool]:
+    """Verify a URL's signature locally, as the TypeScript SDK's
+    ``verifyUrlSignature`` does: ``True`` or ``False``, or ``None``
+    when the URL is unsigned (``unsafe``), sealed, malformed, or
+    longer than the 64 KiB `explain_url` reads. The URL is read the
+    way `explain_url` reads it, so a query or fragment is not part of
+    the signed path.
+
+    With one secret (``str`` or ``bytes``), the key ID a URL carries
+    is ignored: the question is whether this secret made the tag.
+    With a keyring (a mapping of key ID to secret), the server's
+    rotation rules apply: a keyed URL consults its named key only (an
+    unknown ID is ``False``), and an unkeyed URL consults every key.
+    A remainder that begins with `RESERVED_SEGMENT` is ``False``
+    whatever its tag. Each comparison is constant-time
+    (``hmac.compare_digest``), as in `verify`.
+
+    A lone surrogate in the URL or in a ``str`` secret, which UTF-8
+    cannot encode, is hashed as U+FFFD, the bytes the TypeScript
+    SDK's HMAC hashes for it, so no URL and no secret of text makes
+    this raise."""
+    explained = explain_url(input)
+    signature = explained.signature
+    if signature is None or signature.kind != "hmac":
+        return None
+    remainder = explained.remainder
+    # No signature over a reserved remainder is ever valid: the
+    # server refuses it whatever the signature, and this check
+    # must not confirm a derived subkey either.
+    if is_reserved_remainder(remainder):
+        return False
+    tag = signature.value
+    message = _utf8_as_javascript_writes(remainder)
+
+    def made_by(secret: Union[str, bytes]) -> bool:
+        key = _utf8_as_javascript_writes(secret) if isinstance(secret, str) else secret
+        return hmac.compare_digest(hmac.new(key, message, hashlib.sha256).hexdigest(), tag)
+
+    if not isinstance(secret_or_keyring, Mapping):
+        return made_by(secret_or_keyring)
+    if signature.key_id is not None:
+        secret = secret_or_keyring.get(signature.key_id)
+        return secret is not None and made_by(secret)
+    return any(made_by(secret) for secret in secret_or_keyring.values())
 
 
 # ---------------------------------------------------------------------------
