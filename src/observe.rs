@@ -20,6 +20,36 @@ mod request_log;
 pub(crate) use request_log::fake::FakeStdout;
 pub use request_log::{QUEUE_BYTES, QueueState, RequestLog, SHUTDOWN_WAIT, STALLED_AFTER};
 
+/// What [`stderr_line!`](crate::stderr_line) writes with.
+/// `eprintln!` panics when a write to standard error fails,
+/// so a reader of the pipe that went away (a log collector
+/// that exited) ended the boot at its first warning, and a
+/// request at its first error line. A line that cannot be
+/// written is dropped instead, standard output says so once,
+/// if it can, and the server goes on: the line after it is
+/// tried again, so the lines come back if standard error
+/// does. In the library's tests, `eprintln!` keeps the lines
+/// in the test's captured output.
+#[doc(hidden)]
+pub fn print_stderr_line(line: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    eprintln!("{line}");
+    #[cfg(not(test))]
+    {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if let Err(e) = writeln!(std::io::stderr().lock(), "{line}")
+            && !TOLD.swap(true, Ordering::Relaxed)
+        {
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "crabcrop: cannot write to standard error: {e}; the lines it does not take are dropped"
+            );
+        }
+    }
+}
+
 /// The status recorded for an image request whose client went away
 /// before it was answered (issue #707): 499, the "client closed
 /// request" of nginx and the log tools built around it. No response

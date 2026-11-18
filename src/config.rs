@@ -376,7 +376,7 @@ impl Config {
         }
         let metrics_token = metrics_token_config(&get)?;
         if let Some(warning) = metrics_token.as_ref().and_then(metrics_token_warning) {
-            eprintln!("warning: {warning}");
+            stderr_line!("warning: {warning}");
         }
         let process_timeout_secs: u64 = parse_env_value(
             "CRABCROP_PROCESS_TIMEOUT_SECS",
@@ -467,7 +467,7 @@ impl Config {
         })?;
         let policy = build_source_policy(&get)?;
         if let Some(warning) = proxy_bypass_warning(&get, &policy) {
-            eprintln!("warning: {warning}");
+            stderr_line!("warning: {warning}");
         }
         let mut sources = build_source_config(&get)?;
         // The upload destination (issue #168), resolved after

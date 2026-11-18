@@ -1286,7 +1286,7 @@ impl DiskStore {
     fn note_error(&self, what: &str, e: &std::io::Error) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("result storage: {what}: {e}");
+        stderr_line!("result storage: {what}: {e}");
     }
 
     /// Count and log one failed run of a background job. It
@@ -1296,7 +1296,7 @@ impl DiskStore {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(line) = self.job_log.note(monotonic_ms(), &format!("{what}: {e}")) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -1307,7 +1307,7 @@ impl DiskStore {
     pub(crate) fn note_task_failure(&self, what: &str) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("result storage: disk task failed: {what}");
+        stderr_line!("result storage: disk task failed: {what}");
     }
 
     /// Whether the index holds `key`, without touching
@@ -1329,7 +1329,7 @@ impl DiskStore {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(line) = self.stall_log.note(monotonic_ms(), stall.what()) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -1452,7 +1452,7 @@ impl DiskStore {
             // file is left in place, since the store did not
             // make it, and logged so the operator sees it.
             if !meta.is_file() {
-                eprintln!(
+                stderr_line!(
                     "result storage: skipping {}: not a regular file",
                     path.display()
                 );
@@ -1732,7 +1732,7 @@ impl DiskStore {
             }
         };
         if let Some(line) = line {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -2541,7 +2541,7 @@ impl DiskStore {
                     "cannot delete a cache entry file; it stays on disk, out of the index, until the next boot finds it: {e}"
                 );
                 if let Some(line) = self.unlink_log.note_now(&line) {
-                    eprintln!("{line}");
+                    stderr_line!("{line}");
                 }
             }
         }

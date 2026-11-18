@@ -1496,7 +1496,7 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
-    eprintln!("explain load error: {e}");
+    stderr_line!("explain load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
 }
@@ -2687,7 +2687,7 @@ async fn read_upload(
             ));
         }
         Err(e) => {
-            eprintln!("upload body read failed: {e}");
+            stderr_line!("upload body read failed: {e}");
             return Err(UploadOutcome::rejected(
                 name,
                 "rejected:unreadable",
@@ -2746,7 +2746,7 @@ async fn validate_upload(
     let prepared = match run_upload_validation(state, bytes).await {
         UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
-            eprintln!("upload rejected: {e}");
+            stderr_line!("upload rejected: {e}");
             return Err(UploadOutcome::rejected(
                 name,
                 "rejected:not-an-image",
@@ -2822,7 +2822,7 @@ async fn store_upload(
         }),
         Err(crate::upload::UploadError::AlreadyExists) => Err(upload_exists(name)),
         Err(crate::upload::UploadError::Backend(cause)) => {
-            eprintln!("upload failed: {cause}");
+            stderr_line!("upload failed: {cause}");
             Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
@@ -2834,7 +2834,7 @@ async fn store_upload(
             ))
         }
         Err(crate::upload::UploadError::Io(cause)) => {
-            eprintln!("upload failed: {cause}");
+            stderr_line!("upload failed: {cause}");
             Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
@@ -4157,7 +4157,7 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
             // miss path answers with (the size hint above
             // already vouched for the body); the status
             // and headers survive, the body does not.
-            eprintln!("flight: leader body could not be collected for sharing");
+            stderr_line!("flight: leader body could not be collected for sharing");
             (Response::from_parts(parts, axum::body::Body::empty()), None)
         }
     }
@@ -6198,7 +6198,7 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
-    eprintln!("load error: {e}");
+    stderr_line!("load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
 }
@@ -6377,7 +6377,7 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
 const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
 
 fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
-    eprintln!("engine error: {e}");
+    stderr_line!("engine error: {e}");
     let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
     let mut response = error_response(status, code, message, accept);

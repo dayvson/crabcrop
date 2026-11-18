@@ -36,7 +36,29 @@ macro_rules! boot_line {
     };
 }
 
+/// Write one line on standard error without `eprintln!`'s
+/// panic: the library's `stderr_line!` (issue #738), defined
+/// here as well, before `mod config`, so that the binary's
+/// tests keep the lines in their captured output.
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {
+        $crate::print_stderr_line(format_args!($($arg)*))
+    };
+}
+
 mod config;
+
+/// What the binary's [`stderr_line!`] writes with: the
+/// library's `observe::print_stderr_line`, which drops a line
+/// standard error does not take. In the tests, `eprintln!`
+/// keeps the lines in the test's captured output, as the
+/// library's own tests do.
+fn print_stderr_line(line: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    eprintln!("{line}");
+    #[cfg(not(test))]
+    crabcrop::observe::print_stderr_line(line);
+}
 
 /// What [`boot_line!`] prints with. `println!` panics when a write
 /// to standard output fails, and the boot lines are written before
@@ -98,7 +120,7 @@ fn main() {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("crabcrop: cannot start the async runtime: {e}");
+            stderr_line!("crabcrop: cannot start the async runtime: {e}");
             std::process::exit(1);
         }
     };
@@ -131,7 +153,7 @@ fn not_dumpable() {
     if let Err(e) =
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
     {
-        eprintln!("crabcrop: cannot mark the process non-dumpable: {e}");
+        stderr_line!("crabcrop: cannot mark the process non-dumpable: {e}");
     }
 }
 
@@ -224,14 +246,14 @@ async fn start() -> Option<std::time::Instant> {
     let worker = match crabcrop::svg::WorkerCommand::current_binary() {
         Ok(worker) => worker,
         Err(e) => {
-            eprintln!("crabcrop: cannot locate this binary to start SVG workers: {e}");
+            stderr_line!("crabcrop: cannot locate this binary to start SVG workers: {e}");
             std::process::exit(1);
         }
     };
     match run(worker).await {
         Ok(deadline) => Some(deadline),
         Err(e) => {
-            eprintln!("crabcrop: {e}");
+            stderr_line!("crabcrop: {e}");
             std::process::exit(1);
         }
     }
@@ -274,7 +296,7 @@ async fn run(
     // warning when unsigned URLs may fetch from any host.
     boot_line!("{}", config.posture_line());
     if let Some(warning) = config.posture_warning() {
-        eprintln!("warning: {warning}");
+        stderr_line!("warning: {warning}");
     }
     boot_line!(
         "source fetch: cap {} MB, timeout {}s, buffer budget {} MB",
@@ -292,7 +314,7 @@ async fn run(
         && let Some(line) = creds.start().await
     {
         if line.starts_with("warning: ") {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         } else {
             boot_line!("{line}");
         }
@@ -322,12 +344,12 @@ async fn run(
                     None
                 }
                 crate::storage::ScanPhase::Failed(e) => {
-                    eprintln!("{}", disk_scan_failed(&storage.dir, e));
+                    stderr_line!("{}", disk_scan_failed(&storage.dir, e));
                     None
                 }
                 crate::storage::ScanPhase::Stopped => None,
                 _ => {
-                    eprintln!("warning: {}", disk_scan_running(&storage.dir, &report));
+                    stderr_line!("warning: {}", disk_scan_running(&storage.dir, &report));
                     Some((storage.dir.clone(), storage.max_mb))
                 }
             }
@@ -389,7 +411,7 @@ async fn run(
     // #708): the next boot scans the directory again.
     if let Some(purges) = disk.as_ref().and_then(|disk| disk.stop_scan()) {
         for line in disk_scan_stopped(purges) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
     let drain = async {
@@ -408,7 +430,7 @@ async fn run(
     let ((left, disk_left), when, stop_by) = tokio::select! {
         left = drain => (left, "at the deadline", deadline.into_std()),
         () = signalled_again => {
-            eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
+            stderr_line!("shutdown: a second signal ends the drain; what is still running is cut off");
             let disk_left = disk.as_ref().map(|disk| disk.backlog()).unwrap_or_default();
             ((background.running(), disk_left), "at the second signal", std::time::Instant::now())
         }
@@ -418,10 +440,10 @@ async fn run(
     // them with the rest by `stop_by`.
     let requests = in_flight.count();
     if requests > 0 {
-        eprintln!("shutdown: {requests} requests still in flight {when} are cut off");
+        stderr_line!("shutdown: {requests} requests still in flight {when} are cut off");
     }
     if left.writes > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} background writes still running {when} are dropped",
             left.writes
         );
@@ -429,7 +451,7 @@ async fn run(
     if left.renders > 0 {
         // A render whose client had gone, cut off before it
         // was stored: the next request for it renders it.
-        eprintln!(
+        stderr_line!(
             "shutdown: {} renders whose client left, still running {when}, are dropped unstored",
             left.renders
         );
@@ -437,19 +459,19 @@ async fn run(
     // Disk work left undone (issue #572), and what each kind
     // costs after a restart.
     if disk_left.deletions > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} purged disk entries are not deleted yet; the next boot indexes them again, so send those purges again, by URL for an entry a group purge removed before it had caught up with the group",
             disk_left.deletions
         );
     }
     if disk_left.behind > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} disk entries have not caught up with cache groups learned since they were written; after a restart a purge of those groups does not reach them",
             disk_left.behind
         );
     }
     if disk_left.owed > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} bucket copies may lack a cache group whose write was skipped; a restart forgets this",
             disk_left.owed
         );
@@ -473,7 +495,7 @@ async fn run(
     let limit = crate::observe::SHUTDOWN_WAIT;
     let unwritten = log.finish(Some("shutdown: done"), limit).await;
     if unwritten > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: standard output did not take the log within {}s; the last {unwritten} log lines are not written",
             limit.as_secs()
         );
@@ -693,12 +715,12 @@ fn watch_disk_scan(
                     return;
                 }
                 crate::storage::ScanPhase::Failed(e) => {
-                    eprintln!("{}", disk_scan_failed(&dir, e));
+                    stderr_line!("{}", disk_scan_failed(&dir, e));
                     return;
                 }
                 // The shutdown logs it.
                 crate::storage::ScanPhase::Stopped => return,
-                _ => eprintln!("{}", disk_scan_running(&dir, &report)),
+                _ => stderr_line!("{}", disk_scan_running(&dir, &report)),
             }
         }
     };
@@ -706,7 +728,7 @@ fn watch_disk_scan(
         .name("crabcrop-scan-watch".to_string())
         .spawn(watch)
     {
-        eprintln!("result storage: cannot watch the boot scan: {e}");
+        stderr_line!("result storage: cannot watch the boot scan: {e}");
     }
 }
 
@@ -1551,7 +1573,7 @@ fn build_provenance_signer(
     let (line, warning) = provenance_boot_lines(&signer.name, signer.alg(), &config.cert);
     boot_line!("{line}");
     if let Some(warning) = warning {
-        eprintln!("warning: {warning}");
+        stderr_line!("warning: {warning}");
     }
     Ok(Some(Arc::new(signer)))
 }

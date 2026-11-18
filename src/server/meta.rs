@@ -322,16 +322,16 @@ pub(in crate::server) async fn annotate_meta(
         Ok(Ok(scores)) => match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
             Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
             Err(e) => {
-                eprintln!("annotation error: {e}");
+                stderr_line!("annotation error: {e}");
                 None
             }
         },
         Ok(Err(e)) => {
-            eprintln!("annotation error: {e}");
+            stderr_line!("annotation error: {e}");
             None
         }
         Err(e) => {
-            eprintln!("annotation task failed: {e}");
+            stderr_line!("annotation task failed: {e}");
             None
         }
     }
@@ -393,15 +393,15 @@ pub(in crate::server) async fn detect_meta(
                         aggregated.extend(detections.into_iter().map(|d| (name.clone(), d)));
                     }
                     Err(e) => {
-                        eprintln!("detection error from {name}: {e}");
+                        stderr_line!("detection error from {name}: {e}");
                     }
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("detection error from {name}: {e}");
+                stderr_line!("detection error from {name}: {e}");
             }
             Err(e) => {
-                eprintln!("detection task failed for {name}: {e}");
+                stderr_line!("detection task failed for {name}: {e}");
             }
         }
     }
@@ -502,16 +502,16 @@ pub(in crate::server) async fn moderate_meta(
         ) {
             Ok(()) => ModerationMeta::Report(compose_moderation(&report)),
             Err(e) => {
-                eprintln!("moderation error: {e}");
+                stderr_line!("moderation error: {e}");
                 ModerationMeta::Unavailable("inference_failed")
             }
         },
         Ok(Err(e)) => {
-            eprintln!("moderation error: {e}");
+            stderr_line!("moderation error: {e}");
             ModerationMeta::Unavailable("inference_failed")
         }
         Err(e) => {
-            eprintln!("moderation task failed: {e}");
+            stderr_line!("moderation task failed: {e}");
             ModerationMeta::Unavailable("inference_failed")
         }
     }
@@ -677,17 +677,17 @@ pub(in crate::server) async fn embed_meta(
             match check_finite_scores("the embedding provider", embedding.vector.iter().copied()) {
                 Ok(()) => EmbeddingMeta::Report(embedding),
                 Err(e) => {
-                    eprintln!("embedding error: {e}");
+                    stderr_line!("embedding error: {e}");
                     EmbeddingMeta::Unavailable("inference_failed")
                 }
             }
         }
         Ok(Err(e)) => {
-            eprintln!("embedding error: {e}");
+            stderr_line!("embedding error: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
         }
         Err(e) => {
-            eprintln!("embedding task failed: {e}");
+            stderr_line!("embedding task failed: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
         }
     }
@@ -763,17 +763,17 @@ pub(in crate::server) async fn ocr_meta(
             match check_finite_scores("the OCR provider", report.lines.iter().map(|l| l.score)) {
                 Ok(()) => OcrMeta::Report(compose_ocr(&report)),
                 Err(e) => {
-                    eprintln!("OCR error: {e}");
+                    stderr_line!("OCR error: {e}");
                     OcrMeta::Unavailable("inference_failed")
                 }
             }
         }
         Ok(Err(e)) => {
-            eprintln!("OCR error: {e}");
+            stderr_line!("OCR error: {e}");
             OcrMeta::Unavailable("inference_failed")
         }
         Err(e) => {
-            eprintln!("OCR task failed: {e}");
+            stderr_line!("OCR task failed: {e}");
             OcrMeta::Unavailable("inference_failed")
         }
     }

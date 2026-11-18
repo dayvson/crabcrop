@@ -15,6 +15,20 @@
 
 #![forbid(unsafe_code)]
 
+/// Write one line on standard error, as `eprintln!` does,
+/// without its panic (issue #738), with
+/// [`observe::print_stderr_line`]. Every line the server
+/// writes there goes through that function: the binary has a
+/// `stderr_line!` of its own that calls it too. Defined
+/// before the modules, so that each of them can use it by
+/// name.
+#[macro_export]
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {
+        $crate::observe::print_stderr_line(format_args!($($arg)*))
+    };
+}
+
 pub mod ai;
 mod avif;
 pub mod cache;

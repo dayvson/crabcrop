@@ -926,3 +926,91 @@ fn a_server_whose_standard_output_reader_left_during_boot_serves_on() {
     };
     assert_eq!(exit.code(), Some(0), "{}", said());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_server_whose_standard_error_reader_left_during_boot_serves_on() {
+    // Issue #738: the server's lines on stderr were written
+    // with `eprintln!`, which panics when a write fails, so a
+    // reader of stderr that had gone (a log collector that
+    // exited) ended the server at its first line there. Unsafe
+    // mode with no allowlist writes a warning there during
+    // boot, and a source that cannot be fetched writes a load
+    // error once the server serves. Each line is lost now,
+    // standard output says so once, and the server serves and
+    // stops as it would.
+    let mut child = binary()
+        .env("PORT", "0")
+        .env("CRABCROP_ALLOW_UNSAFE", "1")
+        .env("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning crabcrop");
+    drop(child.stderr.take());
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stdout.lines() {
+            let Ok(line) = line else { return };
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut server = ServerGuard::new(child);
+    let mut printed = Vec::new();
+    let deadline = Instant::now() + LONG;
+    let port = loop {
+        match lines.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => match line.strip_prefix("crabcrop listening on port ") {
+                Some(port) => break port.parse::<u16>().unwrap(),
+                None => printed.push(line),
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+        }
+        if let Some(exit) = server.0.try_wait().unwrap() {
+            panic!("crabcrop exited before it listened: {exit}\n{printed:#?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "crabcrop never listened\n{printed:#?}"
+        );
+    };
+    // It answers: the health check, and two image requests
+    // whose sources nothing serves (port 9 refuses the
+    // connection), each of which writes its load error.
+    assert_eq!(get_body(port, "/health", "").0, 200);
+    for name in ["a", "b"] {
+        let path = format!("/unsafe/40x30/http://127.0.0.1:9/{name}.png");
+        assert_eq!(status(port, &path, ""), 502, "{path}");
+    }
+    // And it stops cleanly.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&server.0),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let waited = Instant::now();
+    let exit = loop {
+        if let Some(exit) = server.0.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(waited.elapsed() < LONG, "the server did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    printed.extend(rest_of(&lines));
+    assert_eq!(exit.code(), Some(0), "{printed:#?}");
+    // Standard output said once that stderr takes no lines,
+    // at the first one, the boot's warning.
+    let notes: Vec<&String> = printed
+        .iter()
+        .filter(|line| line.starts_with("crabcrop: cannot write to standard error"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{printed:#?}");
+    assert!(notes[0].contains("Broken pipe"), "{}", notes[0]);
+    assert_eq!(printed.last().map(String::as_str), Some("shutdown: done"));
+}
