@@ -5130,7 +5130,7 @@ async fn serve_miss(
     }
     record.bytes_out = processed.bytes.len();
     let mut response = if meta {
-        meta_document(state, &processed, sealed, accept).await
+        meta_document(state, processed, sealed, accept).await
     } else {
         respond(
             processed.format,
@@ -5628,15 +5628,18 @@ async fn populate_tiers(
 }
 
 /// The meta document for a render: the annotation sections
-/// the request opts into, then the document itself.
+/// the request opts into, then the document itself. The
+/// sections' blocking tasks decode the render, so they share
+/// it (issue #736): it is not copied for them.
 async fn meta_document(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    processed: crate::engine::ProcessedImage,
     sealed: bool,
     accept: Option<&str>,
 ) -> Response {
-    let frame = DocumentFrame::new(processed);
-    meta_document_from(state, processed, frame, sealed, accept).await
+    let processed = Arc::new(processed);
+    let frame = DocumentFrame::new(Arc::clone(&processed));
+    meta_document_from(state, &processed, frame, sealed, accept).await
 }
 
 /// [`meta_document`] on the frame its sections share: the
@@ -5805,9 +5808,9 @@ mod meta;
 /// only for test builds, where they are used.
 #[cfg(test)]
 pub(in crate::server) use meta::{
-    AestheticMeta, AestheticOutcome, Annotation, compose_annotation, compose_moderation,
-    f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json, pack_embedding, score_list,
-    segments_json, studio_json,
+    AestheticMeta, AestheticOutcome, Annotation, FrameDecoder, compose_annotation,
+    compose_moderation, f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json,
+    pack_embedding, score_list, segments_json, studio_json,
 };
 pub(in crate::server) use meta::{
     DocumentFrame, FrameSource, annotate_meta, compose_aesthetic, detect_meta, embed_meta,
