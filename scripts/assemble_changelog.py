@@ -5,21 +5,32 @@ Every pull request used to add its CHANGELOG line at the same place, so each
 merge put every other open pull request with an entry into conflict. A pull
 request now adds one file instead, changelog.d/<issue>.<section>.md, holding
 its entry's paragraph; two pull requests never touch the same file, and the
-release gathers them.
+release gathers them. The lines that open a release's section, its summary,
+come the same way, as changelog.d/<issue>.summary.md (issue #740).
 
   Name     <issue>.<section>.md, or <issue>-<slug>.<section>.md, which is
            always allowed and needed for a second entry for the same issue
            and section, or one another open pull request may add.
            The issue is a number without leading zeros, the slug lowercase
            letters and digits in hyphen-separated words, the section one of
-           added, changed, deprecated, removed, fixed, security.
+           added, changed, deprecated, removed, fixed, security, or summary
+           for lines of the release's summary.
   Text     One paragraph in CHANGELOG.md's house style, naming its issue the
            way the entries there do, "(issue #N)" or "(issues #N and #M)".
            Wrapped lines are joined with one space, a byte-order mark,
            surrounding blank lines and a leading "- " are dropped (the
            assembler writes the bullet), and a blank line, a second bullet
            or a heading line is refused.
-  Order    Sections in CHANGELOG.md's own order, Added, Changed, Deprecated,
+  Summary  The release's summary lines (RELEASING.md step 1), one or more:
+           a line opens with "- " or after a blank line, and a wrapped line
+           is joined to the one above it. Each names the issue of the entry
+           it summarizes, as the entries do, the file's issue among them; a
+           heading line is refused. A summary line is no cache-epoch note,
+           whatever it opens with.
+  Order    The summary first, as a list above the first ### heading: the
+           lines already written there under ## [Unreleased], as written,
+           then the summary fragments' lines in fragment order (below). Then
+           sections in CHANGELOG.md's own order, Added, Changed, Deprecated,
            Removed, Fixed, Security, a missing heading created in its place;
            within one, the hand-written entries already under
            ## [Unreleased] first, as written, then the fragments by issue
@@ -35,7 +46,9 @@ Usage:
   scripts/assemble_changelog.py X.Y.Z [--date YYYY-MM-DD] [--root DIR]
 
 --check prints ## [Unreleased] as the release will write it, the fragments
-in place, and writes nothing; it exits 1 only when a fragment is malformed
+in place, and writes nothing. It warns on stderr, and still exits 0, for a
+fragment or summary line whose first sentence runs past
+FIRST_SENTENCE_LIMIT characters; it exits 1 only when a fragment is malformed
 (or CHANGELOG.md has no single ## [Unreleased] to assemble into). Given a version,
 the script moves ## [Unreleased]'s entries and every fragment into a new
 ## [X.Y.Z] - YYYY-MM-DD section (today by default), leaves an empty
@@ -62,7 +75,18 @@ CHANGELOG = "CHANGELOG.md"
 FRAGMENTS = "changelog.d"
 UNRELEASED = "## [Unreleased]"
 SECTIONS = ("added", "changed", "deprecated", "removed", "fixed", "security")
+# The kind of fragment whose lines open the release's section, above its
+# first heading, instead of going under one.
+SUMMARY = "summary"
 HEADINGS = {section: f"### {section.capitalize()}" for section in SECTIONS}
+# --check warns about a first sentence longer than this (issue #740): a
+# reader deciding whether to upgrade scans the opening sentences. When the
+# check was added, 32 of the 41 fragments in changelog.d opened with a
+# sentence of 38 to 154 characters (median 112 over all 41), and the other
+# 9 with one of 191 to 489, which carried the change's detail as well. 160
+# sits just above the first group. It warns and does not refuse: how terse
+# an entry is stays the maintainer's call.
+FIRST_SENTENCE_LIMIT = 160
 README = "README.md"
 EPOCH = "This release starts a new cache epoch"
 SECOND_EPOCH = (
@@ -111,8 +135,8 @@ def parse_name(name):
     stem = STEM.fullmatch(parts[0])
     if len(parts) != 3 or parts[2] != "md" or stem is None:
         raise FragmentError(BAD_NAME)
-    if parts[1] not in SECTIONS:
-        raise FragmentError(f"unknown section {parts[1]!r}: use one of {', '.join(SECTIONS)}")
+    if parts[1] not in SECTIONS + (SUMMARY,):
+        raise FragmentError(f"unknown section {parts[1]!r}: use one of {', '.join(SECTIONS)}, or {SUMMARY}")
     return int(stem.group("issue")), stem.group("slug") or "", parts[1]
 
 
@@ -146,8 +170,14 @@ def opens_epoch(text):
     return text[: len(EPOCH)].lower() == EPOCH.lower()
 
 
-def entry_text(raw, issue, section):
-    """The entry a fragment's bytes hold, normalized as the module says."""
+def is_epoch_note(fragment):
+    """Whether a fragment is the cache-epoch note: a summary line that opens
+    with the same words only points at it."""
+    return fragment.section != SUMMARY and opens_epoch(fragment.text)
+
+
+def fragment_lines(raw):
+    """A fragment's lines, stripped, without the blank lines around them."""
     try:
         # An editor's byte-order mark is no text: kept, it would hide a
         # leading "- " or a cache-epoch note.
@@ -159,6 +189,12 @@ def entry_text(raw, issue, section):
         lines.pop(0)
     while lines and not lines[-1]:
         lines.pop()
+    return lines
+
+
+def entry_text(raw, issue, section):
+    """The entry a fragment's bytes hold, normalized as the module says."""
+    lines = fragment_lines(raw)
     bullet = BULLET.match(lines[0]) if lines else None
     if bullet:
         lines[0] = lines[0][bullet.end() :]
@@ -194,10 +230,86 @@ def entry_text(raw, issue, section):
     return text
 
 
+def summary_text(raw, issue):
+    """The summary lines a summary fragment's bytes hold, normalized as the
+    module says, one to a line of the result."""
+    items, opens = [], True
+    for line in fragment_lines(raw):
+        if HEADING.match(line):
+            raise FragmentError(
+                "has a line opening with '# ', a heading, which the assembler writes: "
+                "if a summary line wrapped there, rewrap it"
+            )
+        bullet = BULLET.match(line)
+        if bullet or not line:
+            opens = True
+            line = line[bullet.end() :] if bullet else ""
+            if not line:  # a blank line, or a bullet on a line of its own
+                continue
+        if opens:
+            items.append(line)
+            opens = False
+        else:
+            items[-1] += " " + line
+    if not items:
+        raise FragmentError("is empty: write the summary's lines")
+    named = []
+    for number, item in enumerate(items, 1):
+        found = issues_named(item)
+        if not found:
+            raise FragmentError(
+                f"summary line {number} names no issue: point it at the entry it summarizes "
+                "as the entries name theirs, (issue #N)"
+            )
+        named += [n for n in found if n not in named]
+    if issue not in named:
+        raise FragmentError(f"names {describe(named)}, not #{issue} from its file name")
+    return "\n".join(items)
+
+
 def parse(name, raw):
-    """The Fragment a file named `name` holding `raw` bytes is, or FragmentError."""
+    """The Fragment a file named `name` holding `raw` bytes is, or FragmentError.
+    A summary fragment's text holds its lines, one to a line."""
     issue, slug, section = parse_name(name)
+    if section == SUMMARY:
+        return Fragment(name, issue, slug, section, summary_text(raw, issue))
     return Fragment(name, issue, slug, section, entry_text(raw, issue, section))
+
+
+def first_sentence(text):
+    """The text up to its first sentence end, a ".", "!" or "?" followed by
+    whitespace or the end of the text; a code span ends no sentence."""
+    i = 0
+    while i < len(text):
+        if text[i] == "`":
+            fence = len(text[i:]) - len(text[i:].lstrip("`"))
+            close = text.find("`" * fence, i + fence)
+            i = i + fence if close == -1 else close + fence
+            continue
+        if text[i] in ".!?" and (i + 1 == len(text) or text[i + 1].isspace()):
+            return text[: i + 1]
+        i += 1
+    return text
+
+
+def long_openings(fragments):
+    """A warning for each fragment, and each summary line, whose first
+    sentence runs past FIRST_SENTENCE_LIMIT characters."""
+    found = []
+    for fragment in fragments:
+        if fragment.section == SUMMARY:
+            units = [(f"summary line {n}'s", line) for n, line in enumerate(fragment.text.split("\n"), 1)]
+        else:
+            units = [("its", fragment.text)]
+        for whose, text in units:
+            length = len(first_sentence(text))
+            if length > FIRST_SENTENCE_LIMIT:
+                found.append(
+                    f"{FRAGMENTS}/{fragment.name}: {whose} first sentence runs {length} characters, "
+                    f"past {FIRST_SENTENCE_LIMIT}: open with one sentence that says what changed, "
+                    "then the detail (CONTRIBUTING.md, Changelog)"
+                )
+    return found
 
 
 def check_changed_file(rel, read):
@@ -283,7 +395,7 @@ def load(root):
     fragments, problems = read_fragments(root)
     notes = sum(1 for line in lines[start + 1 : end] if is_epoch(line))
     for fragment in fragments:
-        if opens_epoch(fragment.text):
+        if is_epoch_note(fragment):
             if notes:
                 problems.append(f"{FRAGMENTS}/{fragment.name}: {SECOND_EPOCH}")
             notes += 1
@@ -314,6 +426,19 @@ def place(content, lead, tail):
     return out + [""]
 
 
+def summary_head(preamble, fragments):
+    """The lines above the first ### heading: the hand-written ones, then
+    every summary line the fragments hold, a list item each. Without a
+    summary fragment the text keeps its bytes."""
+    summary = [f"- {line}" for f in fragments if f.section == SUMMARY for line in f.text.split("\n")]
+    if not summary:
+        return list(preamble)
+    written = trimmed(preamble)
+    if written and not BULLET.match(written[-1]):
+        written.append("")  # after prose; after a list item, the list goes on
+    return [""] + written + summary
+
+
 def assemble_body(body, fragments):
     """[Unreleased]'s lines after its heading with the fragments in place and
     headings that hold nothing dropped. Untouched text keeps its bytes."""
@@ -339,7 +464,7 @@ def assemble_body(body, fragments):
         lead = [f.text for f in mine if opens_epoch(f.text)]
         tail = [f.text for f in mine if not opens_epoch(f.text)]
         subsections[at][1] = place(subsections[at][1], lead, tail)
-    out = list(preamble)
+    out = summary_head(preamble, fragments)
     for heading, content in subsections:
         if not trimmed(content):
             continue
@@ -352,17 +477,42 @@ def assemble_body(body, fragments):
 
 
 def entries(lines):
-    return sum(1 for line in lines if line.startswith("- "))
+    """How many list items the lines hold under their ### headings."""
+    count, under = 0, False
+    for line in lines:
+        if line.startswith("### "):
+            under = True
+        elif under and line.startswith("- "):
+            count += 1
+    return count
+
+
+def summary_lines(lines):
+    """How many list items the lines hold above their first ### heading."""
+    count = 0
+    for line in lines:
+        if line.startswith("### "):
+            break
+        if line.startswith("- "):
+            count += 1
+    return count
 
 
 def preview(root):
-    """(## [Unreleased] as the release will write it, its note); AssembleError."""
+    """(## [Unreleased] as the release will write it, its note, the
+    warnings about long first sentences); AssembleError."""
     lines, start, end, fragments = load(root)
     body = assemble_body(lines[start + 1 : end], fragments)
     section = trimmed([lines[start]] + body)
     hand = entries(lines[start + 1 : end])
-    note = f"{len(fragments)} fragment(s) after {hand} hand-written entr{'y' if hand == 1 else 'ies'}"
-    return "\n".join(section) + "\n", note
+    note = (
+        f"{len(fragments)} fragment(s) after {hand} hand-written entr{'y' if hand == 1 else 'ies'} "
+        f"under {UNRELEASED}"
+    )
+    summary = summary_lines(body)
+    if summary:
+        note += f", which opens with a summary of {summary} line(s)"
+    return "\n".join(section) + "\n", note, long_openings(fragments)
 
 
 def release_date(date):
@@ -407,6 +557,9 @@ def plan(root, version, date=None):
         f"## [{version}] - {date} holds {hand} hand-written entr{'y' if hand == 1 else 'ies'} "
         f"and {len(fragments)} fragment(s)"
     )
+    summary = summary_lines(section)
+    if summary:
+        note += f", and opens with a summary of {summary} line(s)"
     if not section:
         note += f"; it is empty, since {UNRELEASED} and {FRAGMENTS}/ held nothing to release"
     return Plan("\n".join(new) + "\n", [f"{FRAGMENTS}/{f.name}" for f in fragments], note)
@@ -439,9 +592,11 @@ def main(argv=None):
     root = args.root.resolve()
     try:
         if args.check:
-            text, note = preview(root)
+            text, note, warnings = preview(root)
             sys.stdout.write(text)
-            print(f"assemble_changelog: {note} under {UNRELEASED}; nothing written", file=sys.stderr)
+            for warning in warnings:
+                print(f"assemble_changelog: warning: {warning}", file=sys.stderr)
+            print(f"assemble_changelog: {note}; nothing written", file=sys.stderr)
             return 0
         for line in apply(root, plan(root, args.version, args.date)):
             print(line)

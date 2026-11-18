@@ -12,12 +12,17 @@ deletes them.
   one for a second entry with the same issue and section, and whenever
   another open pull request for that issue may add one to that section.
 - Write one paragraph in the style of CHANGELOG.md, naming the issue as the
-  entries there do: `(issue #521)`. Leave out the leading `- `.
+  entries there do: `(issue #521)`. Leave out the leading `- `. Open with one
+  sentence that says what changed, and put the detail after it.
 - A change that cannot name a public issue, such as the fix for a private
   security advisory, writes a line under `## [Unreleased]` in CHANGELOG.md
   instead.
+- The summary that opens a release's section is a fragment too,
+  `<issue>.summary.md`: its lines, each opening with `- ` and naming the
+  issue of the entry it summarizes (RELEASING.md step 1).
 - Preview `## [Unreleased]` with the fragments in place:
-  `python3 scripts/assemble_changelog.py --check`.
+  `python3 scripts/assemble_changelog.py --check`. It also warns, without
+  failing, about a fragment whose first sentence runs past 160 characters.
 
 [CONTRIBUTING.md](../CONTRIBUTING.md#changelog) has the full rules and
 RELEASING.md step 1 the release side. This README is not a fragment: the

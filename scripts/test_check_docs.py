@@ -700,6 +700,18 @@ class TreeChecks(unittest.TestCase):
         self.write("changelog.d/9.changed.md", "This release starts a new cache epoch (issue #9).\n")
         self.assertOnly("changelog", "changelog.d/9.changed.md", "second cache-epoch note")
 
+    def test_changelog_summary_fragments_pass(self):
+        # A summary line that points at the cache-epoch note in the note's
+        # own words is no second note (issue #740).
+        epoch = "This release starts a new cache epoch"
+        self.write("changelog.d/7.changed.md", f"{epoch} (issue #7).\n")
+        self.write("changelog.d/7.summary.md", f"- {epoch}: expect a cold cache (issue #7).\n")
+        self.assertEqual(self.problems(), [])
+
+    def test_changelog_summary_line_without_an_issue(self):
+        self.write("changelog.d/7.summary.md", "- Upgrade first (issue #7).\n- Then read on.\n")
+        self.assertOnly("changelog", "changelog.d/7.summary.md", "summary line 2 names no issue")
+
     # tested
 
     def test_tested_documented_code_no_test_names(self):
@@ -953,6 +965,23 @@ class ChangelogEntry(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("edits the fragment changelog.d/7.changed.md", done.stdout)
 
+    def test_a_summary_line_is_no_second_cache_epoch_note(self):
+        # The release's summary may open with the note's words to point at
+        # it (issue #740); the gate counts notes as the tree check does.
+        epoch = "This release starts a new cache epoch"
+        self.write("changelog.d/5.changed.md", f"{epoch} (issue #5).\n")
+        self.commit("note on main")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/7.fixed.md", "The change (issue #7).\n")
+        self.write(
+            "changelog.d/5.summary.md", f"- {epoch}: expect a cold cache (issue #5).\n- The change (issue #7).\n"
+        )
+        self.commit("change")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("adds the fragments changelog.d/5.summary.md, changelog.d/7.fixed.md", done.stdout)
+
     def test_a_file_name_that_is_not_utf8(self):
         def make(rel):
             try:
@@ -1001,6 +1030,7 @@ class ChangelogEntry(unittest.TestCase):
             ("changelog.d/1.fixed.md", "### Fixed\nOne (issue #1).\n", "a heading"),
             ("changelog.d/1.fixed.md", "One (issue #1),\n# wrapped.\n", "a heading"),
             ("changelog.d/1.fixed.md", b"\xff\xfe (issue #1)\n", "not UTF-8"),
+            ("changelog.d/1.summary.md", "- One (issue #1).\n- Two.\n", "summary line 2 names no issue"),
             (
                 "changelog.d/1.fixed.md",
                 "This release starts a new cache epoch (issue #1).\n",
@@ -1431,6 +1461,135 @@ class AssembleChangelog(unittest.TestCase):
             "### Changed\n\n- This release starts a new cache epoch. Changes below alter the bytes (issue #6).\n\n"
             "- A hand-written change (issue #2).\n\n- A change (issue #9).\n\n### Fixed",
             done.stdout,
+        )
+
+    def test_summary_fragments_open_the_section(self):
+        # The release's summary (issue #740): a summary fragment's lines open
+        # the section as one list above its first heading, in both modes, and
+        # the release deletes the fragment with the others.
+        self.write(
+            "changelog.d/9.summary.md",
+            "- Upgrade before the fix lands (issue #9).\n- Two fixes,\n  wrapped (issues #5 and #40).\n",
+        )
+        summary = "- Upgrade before the fix lands (issue #9).\n- Two fixes, wrapped (issues #5 and #40).\n"
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "## [Unreleased]\n\n" + summary + "\n" + ASSEMBLED)
+        self.assertIn(
+            "7 fragment(s) after 3 hand-written entries under ## [Unreleased], "
+            "which opens with a summary of 2 line(s); nothing written",
+            done.stderr,
+        )
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("and 7 fragment(s), and opens with a summary of 2 line(s)", done.stdout)
+        self.assertIn("removed changelog.d/9.summary.md", done.stdout)
+        start, end = ASSEMBLY_CHANGELOG.index("## [Unreleased]"), ASSEMBLY_CHANGELOG.index("## [0.1.0]")
+        self.assertEqual(
+            self.changelog(),
+            ASSEMBLY_CHANGELOG[:start]
+            + "## [Unreleased]\n\n## [0.2.0] - 2026-02-03\n\n"
+            + summary
+            + "\n"
+            + ASSEMBLED
+            + "\n"
+            + ASSEMBLY_CHANGELOG[end:],
+        )
+
+    def test_summary_lines_follow_the_hand_written_ones_in_fragment_order(self):
+        # As with entries: the lines written by hand first, then the
+        # fragments by issue, the plain name before its slugged ones, each
+        # fragment's lines in its own order. A blank line starts a line too.
+        self.write("changelog.d/40-later.summary.md", "Last (issue #40).\n")
+        self.write("changelog.d/40.summary.md", "Third (issue #40).\n\nFourth, on\ntwo lines (issue #30).\n")
+        self.write("changelog.d/5.summary.md", "\ufeff* Second (issue #5).\r\n")
+        lines = "- Second (issue #5).\n- Third (issue #40).\n- Fourth, on two lines (issue #30).\n- Last (issue #40).\n"
+        for written, head in (
+            ("- First, by hand (issue #20).\n", "- First, by hand (issue #20).\n" + lines),
+            ("A paragraph by hand.\n", "A paragraph by hand.\n\n" + lines),
+        ):
+            with self.subTest(written=written):
+                self.write(
+                    "CHANGELOG.md", ASSEMBLY_CHANGELOG.replace("## [Unreleased]\n", f"## [Unreleased]\n\n{written}", 1)
+                )
+                done = self.run_script("--check")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, "## [Unreleased]\n\n" + head + "\n" + ASSEMBLED)
+
+    def test_a_malformed_summary_fragment_is_refused(self):
+        for text, message in (
+            ("- Upgrade first (issue #9).\n- Then read on.\n", "summary line 2 names no issue"),
+            ("Upgrade first (issue #8).\n", "names issue #8, not #9 from its file name"),
+            ("### Summary\n\n- Upgrade first (issue #9).\n", "has a line opening with '# ', a heading"),
+            ("- \n\n-\n", "is empty"),
+        ):
+            self.write("changelog.d/9.summary.md", text)
+            before = self.snapshot()
+            for args in (("--check",), ("0.2.0", "--date", "2026-02-03")):
+                with self.subTest(text=text, args=args):
+                    done = self.run_script(*args)
+                    self.assertEqual(done.returncode, 1, done.stdout)
+                    self.assertIn(f"changelog.d/9.summary.md: {message}", done.stderr)
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_a_summary_line_is_no_cache_epoch_note(self):
+        # A summary line may point at the cache-epoch note in the note's own
+        # words: it is no second note, and it stays out of Changed.
+        epoch = "This release starts a new cache epoch"
+        self.write("changelog.d/6.changed.md", f"{epoch} (issue #6).\n")
+        self.write("changelog.d/6.summary.md", f"{epoch}: expect a cold cache (issue #6).\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(
+            done.stdout.startswith(f"## [Unreleased]\n\n- {epoch}: expect a cold cache (issue #6).\n\n### Added\n"),
+            done.stdout,
+        )
+        self.assertIn(f"### Changed\n\n- {epoch} (issue #6).\n\n- A change (issue #9).\n", done.stdout)
+
+    def test_check_warns_about_a_long_first_sentence(self):
+        # Past 160 characters, counted to the first sentence end outside a
+        # code span, --check warns and still exits 0 with the section; the
+        # release itself does not warn.
+        def opening(length, issue):
+            tail = f" (issue #{issue})."
+            return "A" + "a" * (length - 1 - len(tail)) + tail
+
+        self.write("changelog.d/12.fixed.md", opening(160, 12) + " Then the detail, as long as it likes." * 20 + "\n")
+        self.write("changelog.d/13.fixed.md", opening(161, 13) + " Then the detail.\n")
+        spanned = "A `blur(1.5). now` span ends no sentence, so this one runs on" + " and on" * 15 + " (issue #14)."
+        self.write("changelog.d/14.fixed.md", spanned + " Then the detail.\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("- " + opening(161, 13) + " Then the detail.\n", done.stdout)
+        self.assertEqual(
+            [line for line in done.stderr.splitlines() if "warning" in line],
+            [
+                "assemble_changelog: warning: changelog.d/13.fixed.md: its first sentence runs 161 characters, "
+                "past 160: open with one sentence that says what changed, then the detail (CONTRIBUTING.md, Changelog)",
+                f"assemble_changelog: warning: changelog.d/14.fixed.md: its first sentence runs {len(spanned)} "
+                "characters, past 160: open with one sentence that says what changed, then the detail "
+                "(CONTRIBUTING.md, Changelog)",
+            ],
+        )
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("warning", done.stdout + done.stderr)
+
+    def test_check_warns_about_a_long_summary_line(self):
+        # Each summary line is read on its own, as an entry's first sentence is.
+        long = "Each summary line is read on its own, so this one, which runs on" + " and on" * 12 + " (issue #15)."
+        self.assertGreater(len(long), 160)
+        self.write("changelog.d/15.summary.md", f"- A short line (issue #15).\n- {long}\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"## [Unreleased]\n\n- A short line (issue #15).\n- {long}\n\n### Added", done.stdout)
+        self.assertEqual(
+            [line for line in done.stderr.splitlines() if "warning" in line],
+            [
+                f"assemble_changelog: warning: changelog.d/15.summary.md: summary line 2's first sentence runs "
+                f"{len(long)} characters, past 160: open with one sentence that says what changed, then the "
+                "detail (CONTRIBUTING.md, Changelog)"
+            ],
         )
 
     def test_a_second_cache_epoch_note_is_refused(self):
