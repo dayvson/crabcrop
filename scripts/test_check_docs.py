@@ -708,6 +708,16 @@ class TreeChecks(unittest.TestCase):
         self.write("changelog.d/7.summary.md", f"- {epoch}: expect a cold cache (issue #7).\n")
         self.assertEqual(self.problems(), [])
 
+    def test_changelog_hand_written_summary_line_passes(self):
+        # The same line written by hand above the first heading is no note
+        # either; one written under a heading still is.
+        epoch = "This release starts a new cache epoch"
+        self.write("changelog.d/7.changed.md", f"{epoch} (issue #7).\n")
+        self.edit("CHANGELOG.md", "## [Unreleased]\n\n", f"## [Unreleased]\n\n- {epoch}: expect a cold cache.\n\n")
+        self.assertEqual(self.problems(), [])
+        self.edit("CHANGELOG.md", "cold cache.\n\n", f"cold cache.\n\n### Changed\n\n- {epoch} (issue #2).\n\n")
+        self.assertOnly("changelog", "changelog.d/7.changed.md", "second cache-epoch note")
+
     def test_changelog_summary_line_without_an_issue(self):
         self.write("changelog.d/7.summary.md", "- Upgrade first (issue #7).\n- Then read on.\n")
         self.assertOnly("changelog", "changelog.d/7.summary.md", "summary line 2 names no issue")
@@ -981,6 +991,21 @@ class ChangelogEntry(unittest.TestCase):
         done = self.entry()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("adds the fragments changelog.d/5.summary.md, changelog.d/7.fixed.md", done.stdout)
+
+    def test_a_hand_written_summary_line_is_no_second_cache_epoch_note(self):
+        # Nor is a summary line written by hand above the first heading of
+        # ## [Unreleased] (RELEASING.md step 1): the note that follows it,
+        # as a fragment, is the first.
+        epoch = "This release starts a new cache epoch"
+        self.add_line("## [Unreleased]\n\n", f"- {epoch}: expect a cold cache (issue #7).\n\n")
+        self.commit("summary on main")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("src/lib.rs", "pub fn f() { g() }\n")
+        self.write("changelog.d/7.changed.md", f"{epoch} (issue #7).\n")
+        self.commit("note")
+        done = self.entry()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("adds the fragment changelog.d/7.changed.md", done.stdout)
 
     def test_a_file_name_that_is_not_utf8(self):
         def make(rel):
@@ -1545,6 +1570,24 @@ class AssembleChangelog(unittest.TestCase):
             done.stdout,
         )
         self.assertIn(f"### Changed\n\n- {epoch} (issue #6).\n\n- A change (issue #9).\n", done.stdout)
+
+    def test_a_hand_written_summary_line_is_no_cache_epoch_note(self):
+        # Nor is a summary line written by hand above the first heading, as
+        # RELEASING.md step 1 asks for a line no fragment can hold: the note,
+        # a fragment here, is still the only one, in both modes.
+        epoch = "This release starts a new cache epoch"
+        summary = f"- {epoch}: expect a cold cache (issue #6).\n- A private fix, by hand.\n"
+        self.write(
+            "CHANGELOG.md", ASSEMBLY_CHANGELOG.replace("## [Unreleased]\n", f"## [Unreleased]\n\n{summary}", 1)
+        )
+        self.write("changelog.d/6.changed.md", f"{epoch} (issue #6).\n")
+        done = self.run_script("--check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.startswith(f"## [Unreleased]\n\n{summary}\n### Added\n"), done.stdout)
+        self.assertIn(f"### Changed\n\n- {epoch} (issue #6).\n\n- A change (issue #9).\n", done.stdout)
+        done = self.run_script("0.2.0", "--date", "2026-02-03")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"## [0.2.0] - 2026-02-03\n\n{summary}\n### Added\n", self.changelog())
 
     def test_check_warns_about_a_long_first_sentence(self):
         # Past 160 characters, counted to the first sentence end outside a

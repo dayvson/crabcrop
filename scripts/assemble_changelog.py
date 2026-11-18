@@ -25,7 +25,8 @@ come the same way, as changelog.d/<issue>.summary.md (issue #740).
            a line opens with "- " or after a blank line, and a wrapped line
            is joined to the one above it. Each names the issue of the entry
            it summarizes, as the entries do, the file's issue among them; a
-           heading line is refused. A summary line is no cache-epoch note,
+           heading line is refused. A summary line, a fragment's or one
+           written above the first heading, is no cache-epoch note,
            whatever it opens with.
   Order    The summary first, as a list above the first ### heading: the
            lines already written there under ## [Unreleased], as written,
@@ -379,6 +380,19 @@ def is_epoch(entry_line):
     return entry_line.startswith("- ") and opens_epoch(entry_line[2:])
 
 
+def epoch_entries(body):
+    """How many cache-epoch notes ## [Unreleased]'s lines after its heading
+    hold as entries, under a ### heading. A summary line written above the
+    first heading that opens with the note's words only points at the note."""
+    count, under = 0, False
+    for line in body:
+        if line.startswith("### "):
+            under = True
+        elif under and is_epoch(line):
+            count += 1
+    return count
+
+
 def load(root):
     """(CHANGELOG.md's lines, start, end, fragments); AssembleError with every problem."""
     path = Path(root) / CHANGELOG
@@ -393,7 +407,7 @@ def load(root):
         lines.pop()
     start, end = locate(lines)
     fragments, problems = read_fragments(root)
-    notes = sum(1 for line in lines[start + 1 : end] if is_epoch(line))
+    notes = epoch_entries(lines[start + 1 : end])
     for fragment in fragments:
         if is_epoch_note(fragment):
             if notes:
