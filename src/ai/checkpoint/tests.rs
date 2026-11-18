@@ -45,7 +45,7 @@ fn pkl_str(out: &mut Vec<u8>, s: &str) {
 /// tensor over storage "0" and a bias tensor over
 /// storage "1", closed by the metadata BUILD tail.
 /// Memo indices follow the real files.
-fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
+pub(super) fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
     let mut p = Vec::new();
     let binint2 = |p: &mut Vec<u8>, v: usize| {
         p.push(b'M');
@@ -252,12 +252,10 @@ fn aesthetic_head_rejects_a_storage_shorter_than_the_tensor() {
     assert!(err.contains("overruns its storage"), "{err}");
 }
 
-#[test]
-fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
-    // A shape whose element count overflows usize (issue
-    // #484) is a load error naming the overflow, never a
-    // multiply that panics (debug) or wraps to a small
-    // count (release) before the storage bound is checked.
+/// `head_pickle(3, 1)` with the weight's size (1, 3)
+/// swapped for (2^32, 2^32), whose element count
+/// overflows usize.
+pub(super) fn overflowing_size_pickle() -> Vec<u8> {
     let pkl = head_pickle(3, 1);
     // The weight's size tuple (1, 3): BININT1 1, BININT2 3,
     // TUPLE2. Swap in (2^32, 2^32) as two LONG1 values.
@@ -272,8 +270,17 @@ fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
     patched.extend_from_slice(&huge);
     patched.push(0x86);
     patched.extend_from_slice(&pkl[at[0] + size.len()..]);
+    patched
+}
+
+#[test]
+fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
+    // A shape whose element count overflows usize (issue
+    // #484) is a load error naming the overflow, never a
+    // multiply that panics (debug) or wraps to a small
+    // count (release) before the storage bound is checked.
     let archive = head_archive(
-        &patched,
+        &overflowing_size_pickle(),
         &[
             ("archive/data/0", &floats_bytes(&[0.5, -0.25, 2.0])),
             ("archive/data/1", &floats_bytes(&[0.75])),
