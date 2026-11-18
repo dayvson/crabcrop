@@ -705,9 +705,9 @@ def pin_problems(root, parts):
         for digest in part.args.get("sha256", []):
             if digest not in text:
                 problems.append(
-                    f"{path} no longer pins the download with sha256 {digest}, which the texts {TEMPLATE} copies "
-                    f"after line {part.line} come from: copy them again from the download it pins now, then update "
-                    "that line"
+                    f"{path} no longer pins the download with sha256 {digest}, whose license texts {TEMPLATE} "
+                    f"copies after line {part.line}: read the license of the download it pins now, copy its texts "
+                    "again, then update that line"
                 )
     return problems
 
