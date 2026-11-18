@@ -58,7 +58,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [0.13.0] - 2026-11-15
 
-- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #668).
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #668). A build from source, `cargo install crabcrop` included, now needs cmake and make.
 - Request log lines now reach standard output up to about a millisecond after their response, unless `CRABCROP_LOG_SYNC=1` is set (issue #642).
 - Every host now writes AVIF in four tiles, so replicas render the same file, unless the new `CRABCROP_AVIF_TILES` names another count (issues #671 and #688).
 - JPEG XL output of small images with an alpha channel no longer answers `500`, or decodes fully transparent under quality 15 (issues #670 and #696).
@@ -230,7 +230,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #567).
 - Boot refuses placeholder secrets from crabcrop's docs and a `CRABCROP_ALLOWED_SOURCES` that names no host: replace them before upgrading (issues #588, #590).
-- The Helm chart and the kustomize base now request 100m of CPU and 128Mi of memory, so values that set only limits should set requests too (issue #592).
+- The Helm chart and the kustomize base now request 100m of CPU and 128Mi of memory, so values that set only limits should set requests too (issue #592). Their pods now run with a read-only root filesystem, so a disk tier or upload directory needs a writable mount, or the server exits at boot.
 - The server now bounds its own connections, with a header timeout, an idle timeout and `CRABCROP_MAX_CONNECTIONS` (issue #607).
 - A disk tier that stops answering no longer hangs requests, and a purge no longer deletes another deployment's entries in a shared bucket (issues #572 and #608).
 
@@ -518,8 +518,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 ## [0.10.0] - 2026-11-08
 
 - This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #464).
-- Set `CRABCROP_META_MODE=1` before upgrading if you use meta responses, now off by default, and check the three settings boot now refuses (issues #453 and #469).
-- The binary serves only when it runs with no arguments, and a bad source URL answers `400 invalid_source` instead of `502` (issues #467 and #470).
+- Set `CRABCROP_META_MODE=1` before upgrading if you use meta responses, now off by default, and check the settings boot now refuses (issues #453, #455 and #469).
+- The binary serves only when it runs with no arguments, and a bad source URL answers `400 invalid_source` instead of `502` (issues #467 and #470). Source formats crabcrop never documented, such as OpenEXR, QOI and PNM, are no longer decoded (issue #466).
 - A Nuxt site that passed the secret as a provider option shipped it to every browser: rotate it (issue #381).
 - SVG sources render in a capped worker process (issue #447), and shared-tier purges leave a tombstone in the bucket (issues #446, #461).
 
