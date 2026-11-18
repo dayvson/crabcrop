@@ -1,9 +1,11 @@
 """The package metadata (issue #716): an SPDX license expression,
 Python-version classifiers that match requires-python, the typing
-marker in the package data, and one version."""
+marker in the package data, and one version; and sources that show
+every character they hold."""
 
 import re
 import sys
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -27,6 +29,30 @@ class TestVersion(unittest.TestCase):
         project = re.search(r'^\[project\][^\[]*?^version = "([^"]+)"$', PYPROJECT, re.M | re.S)
         self.assertIsNotNone(project)
         self.assertEqual(crabcrop_url.__version__, project.group(1))
+
+
+class TestSources(unittest.TestCase):
+    def test_no_source_holds_an_invisible_character(self):
+        # The grammar is full of characters that look like nothing: the
+        # White_Space set the server trims, U+FEFF, which it keeps, the
+        # line terminators JavaScript's `.` stops at. Written literally
+        # they are invisible in an editor and a diff, and U+2028 and
+        # U+2029 end the line for anything that splits on Unicode line
+        # breaks, so the sources spell each as an escape.
+        sources = sorted((PYTHON_SDK / "src" / "crabcrop_url").glob("*.py"))
+        sources += sorted((PYTHON_SDK / "tests").glob("*.py"))
+        names = {path.name for path in sources}
+        self.assertLessEqual({"__init__.py", "_grammar.py", "test_packaging.py"}, names)
+        for path in sources:
+            text = path.read_text(encoding="utf-8")
+            hidden = []
+            for number, line in enumerate(text.split("\n"), 1):
+                for c in line:
+                    category = unicodedata.category(c)
+                    if category in ("Zl", "Zp", "Cf", "Cc") or (category == "Zs" and c != " "):
+                        hidden.append(f"line {number}: U+{ord(c):04X}")
+            with self.subTest(source=path.name):
+                self.assertEqual(hidden, [])
 
 
 @unittest.skipIf(tomllib is None, "reading pyproject.toml needs tomllib (Python 3.11 or newer)")

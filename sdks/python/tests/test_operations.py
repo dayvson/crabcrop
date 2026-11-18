@@ -290,14 +290,14 @@ class TestTypedSpellings(unittest.TestCase):
         cases = [
             (ops.crop_objects(100, 100, [" person", "PERSON\t"]), "crop:100x100:objects(person):1"),
             (ops.crop_objects(100, 100, [" traffic light "]), "crop:100x100:objects(traffic%20light):1"),
-            (filter.blur_class("\u0085person　"), "blurclass(person)"),
+            (filter.blur_class("\u0085person\u3000"), "blurclass(person)"),
             (filter.pixelate_class("\nperson"), "pixelateclass(person)"),
         ]
         for got, want in cases:
             self.assertEqual(got, want)
         # The server keeps U+FEFF and the information separators,
         # which Python's str.strip() would remove.
-        for kept in ("﻿person", "person\x1c", "\x1fperson"):
+        for kept in ("\ufeffperson", "person\x1c", "\x1fperson"):
             with self.assertRaises(ValueError, msg=repr(kept)):
                 filter.blur_class(kept)
         # Only A to Z fold: the Kelvin sign is its own class.

@@ -123,9 +123,9 @@ MAX_TEXT_EXTENT = 100000
 # Python's `str.strip()` disagrees: it also strips U+001C to
 # U+001F, which the server keeps (issue #537).
 _SERVER_WHITE_SPACE = frozenset(
-    "\t\n\x0b\x0c\r \x85\xa0 "
-    "           "
-    "    　"
+    "\t\n\x0b\x0c\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
 )
 
 
