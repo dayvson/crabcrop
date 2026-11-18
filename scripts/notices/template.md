@@ -100,9 +100,10 @@ The `crabcrop-ai` image adds ONNX Runtime 1.31.0, which crabcrop loads at run
 time from `/opt/onnxruntime/libonnxruntime.so`. ONNX Runtime is under the MIT
 License, below. Its own third-party notices ship in the image beside this file,
 as `/usr/share/doc/crabcrop/onnxruntime/ThirdPartyNotices.txt`, with its
-`LICENSE`: `Dockerfile.ai` copies both from the release tarball it verifies.
+`LICENSE`: `Dockerfile.ai` extracts both from the NuGet package it verifies,
+the one it takes the library from.
 
-<!-- pinned: file=Dockerfile.ai sha256=cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 sha256=c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab -->
+<!-- pinned: file=Dockerfile.ai sha256=7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b -->
 
 <!-- include: file=scripts/notices/onnxruntime/LICENSE label="`LICENSE` in ONNX Runtime 1.31.0" sha256=2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c -->
 
