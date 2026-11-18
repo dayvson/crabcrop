@@ -1,5 +1,5 @@
 use crate::ai::{AestheticHead, AiError};
-use crate::test_support::{ScratchDir, scratch_dir};
+use crate::test_support::{ScratchDir, head_archive, scratch_dir};
 
 /// Write bytes to a fresh temp file and return the
 /// scratch directory it lives in and its path (issue
@@ -118,60 +118,6 @@ pub(super) fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
     p.push(b'b');
     p.push(b'.');
     p
-}
-
-/// Wrap a pickle and its storages in a stored-entry
-/// zip archive of the shape `torch.save` writes.
-fn head_archive(pkl: &[u8], storages: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    let mut central: Vec<u8> = Vec::new();
-    let mut entries: Vec<(&str, &[u8])> = vec![("archive/data.pkl", pkl)];
-    entries.extend_from_slice(storages);
-    entries.push(("archive/version", b"3\n"));
-    for (name, data) in &entries {
-        let local_at = out.len() as u32;
-        out.extend_from_slice(b"PK\x03\x04");
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
-        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
-        out.extend_from_slice(&0u32.to_le_bytes()); // time and date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc (the reader ignores it)
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // extra
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
-        central.extend_from_slice(b"PK\x01\x02");
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&local_at.to_le_bytes());
-        central.extend_from_slice(name.as_bytes());
-    }
-    let cd_at = out.len() as u32;
-    let cd_len = central.len() as u32;
-    out.extend_from_slice(&central);
-    out.extend_from_slice(b"PK\x05\x06");
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&cd_len.to_le_bytes());
-    out.extend_from_slice(&cd_at.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out
 }
 
 fn floats_bytes(values: &[f32]) -> Vec<u8> {
