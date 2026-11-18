@@ -15,6 +15,12 @@ members = ["crates/crabcrop-url"]
 crabcrop-url = { path = "crates/crabcrop-url", version = "0.13" }
 ab_glyph = "0.2"
 axum = "0.8"
+# Standard base64 with padding for the meta response: the
+# placeholder's data URI and ThumbHash, and packed embeddings
+# (issue #737), which a hand-written encoder wrote before.
+# 0.23 is the release crabcrop-url, c2pa and the HTTP client
+# already bring into the tree, so it adds no crate.
+base64 = "0.23"
 bytes = "1"
 # C2PA provenance (issue #173), pinned to the exact release:
 # 0.91.0 is the first release that enforces the spec's
@@ -23,11 +29,19 @@ bytes = "1"
 # upgrades are deliberate. Default features off: the default
 # crypto is a vendored OpenSSL build, and this tree has no
 # OpenSSL; `rust_native_crypto` swaps in the pure-Rust
-# backend. The two HTTP features mirror upstream's default
-# set (minus the wasm backends) so a configured timestamp
-# authority can be reached. All c2pa contact lives in
-# src/provenance.rs.
-c2pa = { version = "=0.91.11", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
+# backend. `http_ureq` is the HTTP stack of the SDK's
+# blocking calls, the only ones crabcrop makes: a
+# configured timestamp authority is reached through a ureq
+# agent. Upstream's other default, `http_reqwest`, serves
+# only the SDK's async calls, and it compiled a second
+# reqwest, 0.12, beside the tree's 0.13 (issue #742). All
+# c2pa contact lives in src/provenance.rs.
+c2pa = { version = "=0.91.11", default-features = false, features = ["rust_native_crypto", "http_ureq"] }
+# The CRC-32 of the PNG chunks crabcrop writes itself, the
+# interlaced file and the metadata it injects (issue #737),
+# which two hand-written table loops computed before. Already
+# in the tree through flate2 and png: it adds no crate.
+crc32fast = "1.5"
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
 # The shared purge walk reads entry headers a bounded number

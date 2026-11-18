@@ -4,7 +4,7 @@
 use image::DynamicImage;
 use image::imageops::FilterType;
 use ort::session::Session;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::resample;
 use super::session::{ModelOutput, build_session, collect_outputs, lock_model};
@@ -17,23 +17,37 @@ use super::{AiError, TagProvider, TagScore};
 /// expected to include the projection head (outputs named
 /// `image_embeds`/`text_embeds` or `pooled_output`), which
 /// is validated at load: mismatched pairs fail startup.
+/// Label sets loaded together ([`OnnxClipProvider::load_sets`])
+/// score over one image model: the tags and the CLIP
+/// moderation fallback's prompts do (issue #736).
 pub struct OnnxClipProvider {
-    vision: Mutex<Session>,
-    vision_input: String,
+    image: Arc<ClipImageModel>,
     labels: Vec<String>,
     /// Label embeddings, flattened `labels.len()` x `dim`,
     /// each row L2-normalized.
     label_embeddings: Vec<f32>,
+}
+
+/// The CLIP image model, which every label set loaded with it
+/// shares: the vision session, and the embedding it last
+/// computed.
+struct ClipImageModel {
+    session: Mutex<Session>,
+    input: String,
+    /// The projection size: every label set's rows have it.
     dim: usize,
     /// The last image embedding computed, keyed by the exact
     /// preprocessed tensor that produced it: one meta request
-    /// asks this provider for tag scores and for the embedding
-    /// itself (and an aesthetic score off the same vector) as
+    /// asks for tag scores, for the embedding itself (and an
+    /// aesthetic score off the same vector), and, with the
+    /// CLIP moderation fallback, for the prompts' scores, as
     /// separate calls on the same image, and the vision run is
-    /// the expensive half of both. The comparison is exact
-    /// slice equality, so a hit returns precisely the vector
-    /// a fresh run would: the model is a pure function of the
-    /// tensor. A miss on any byte runs the model as before.
+    /// the expensive part of each. The prompts score over this
+    /// model too (issue #736), so they read the same memo. The
+    /// comparison is exact slice equality, so a hit returns
+    /// precisely the vector a fresh run would: the model is a
+    /// pure function of the tensor. A miss on any byte runs the
+    /// model as before.
     last_embedding: Mutex<Option<(Vec<f32>, Vec<f32>)>>,
 }
 
@@ -48,62 +62,100 @@ impl OnnxClipProvider {
         labels_path: &str,
     ) -> Result<Self, AiError> {
         let labels = read_labels(labels_path)?;
+        let mut sets =
+            Self::load_sets(dylib, image_model, text_model, tokenizer_path, vec![labels])?;
+        // One label set in, one provider out.
+        Ok(sets.remove(0))
+    }
+
+    /// Load the model pair once for several label sets: a
+    /// provider for each set, in their order, every one
+    /// scoring over the one image model and its embedding memo
+    /// (issue #736). The text model embeds every set and is
+    /// dropped before the image model loads. The tagger and the
+    /// CLIP moderation fallback's prompts load this way, so the
+    /// vision session is held once and an image both score is
+    /// embedded once. No label set, or a set with no labels, is
+    /// a load error.
+    pub fn load_sets(
+        dylib: Option<&str>,
+        image_model: &str,
+        text_model: &str,
+        tokenizer_path: &str,
+        label_sets: Vec<Vec<String>>,
+    ) -> Result<Vec<Self>, AiError> {
+        if label_sets.is_empty() || label_sets.iter().any(Vec::is_empty) {
+            return Err(AiError::Load(
+                "the CLIP models need at least one label set, and a label in each".to_string(),
+            ));
+        }
         let tokenizer =
             crate::tokenizer::ClipTokenizer::load(tokenizer_path).map_err(AiError::Load)?;
-        let (text, _) = build_session(dylib, text_model)?;
+        let (mut text, _) = build_session(dylib, text_model)?;
         let text_inputs: Vec<String> = text.inputs().iter().map(|i| i.name().to_string()).collect();
-        let mut text = text;
-        let mut label_embeddings: Vec<f32> = Vec::new();
+        let mut embedded: Vec<(Vec<String>, Vec<f32>)> = Vec::with_capacity(label_sets.len());
         let mut dim = 0usize;
-        for label in &labels {
-            let (ids, mask) = tokenizer.encode(label).map_err(AiError::Load)?;
-            // Embedding the labels is part of loading: a text
-            // model that cannot run here is a load failure,
-            // not a request-time inference failure.
-            let emb = run_text(&mut text, &text_inputs, &ids, &mask).map_err(|e| {
-                AiError::Load(format!("the text model could not embed the labels: {e}"))
-            })?;
-            if dim == 0 {
-                dim = emb.len();
-            } else if emb.len() != dim {
-                return Err(AiError::Load(
-                    "the text model returned inconsistent embedding sizes".to_string(),
-                ));
+        for labels in label_sets {
+            let mut label_embeddings: Vec<f32> = Vec::new();
+            for label in &labels {
+                let (ids, mask) = tokenizer.encode(label).map_err(AiError::Load)?;
+                // Embedding the labels is part of loading: a text
+                // model that cannot run here is a load failure,
+                // not a request-time inference failure.
+                let emb = run_text(&mut text, &text_inputs, &ids, &mask).map_err(|e| {
+                    AiError::Load(format!("the text model could not embed the labels: {e}"))
+                })?;
+                if dim == 0 {
+                    dim = emb.len();
+                } else if emb.len() != dim {
+                    return Err(AiError::Load(
+                        "the text model returned inconsistent embedding sizes".to_string(),
+                    ));
+                }
+                label_embeddings.extend_from_slice(&normalize(&emb));
             }
-            label_embeddings.extend_from_slice(&normalize(&emb));
+            embedded.push((labels, label_embeddings));
         }
-        let (vision, vision_input) = build_session(dylib, image_model)?;
-        let provider = Self {
-            vision: Mutex::new(vision),
-            vision_input,
-            labels,
-            label_embeddings,
+        drop(text);
+        let (session, input) = build_session(dylib, image_model)?;
+        let image = Arc::new(ClipImageModel {
+            session: Mutex::new(session),
+            input,
             dim,
             last_embedding: Mutex::new(None),
-        };
+        });
         // Fail fast on a mismatched pair: embed a black
         // image once and check the projection size agrees
         // with the text side.
         let probe = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
-        let emb = provider
-            .embed_image(&probe)
+        let emb = image
+            .embed(&probe)
             .map_err(|e| AiError::Load(format!("the image model failed its load probe: {e}")))?;
-        if emb.len() != provider.dim {
+        if emb.len() != dim {
             return Err(AiError::Load(format!(
                 "the image model produced a {}-dimensional embedding but the text model produced {}: the pair does not share a projection space",
                 emb.len(),
-                provider.dim
+                dim
             )));
         }
-        Ok(provider)
+        Ok(embedded
+            .into_iter()
+            .map(|(labels, label_embeddings)| Self {
+                image: Arc::clone(&image),
+                labels,
+                label_embeddings,
+            })
+            .collect())
     }
 
     /// The number of configured labels.
     pub fn label_count(&self) -> usize {
         self.labels.len()
     }
+}
 
-    fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
+impl ClipImageModel {
+    fn embed(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
         let input = crop224_preprocess(img, CLIP_STATS);
         if let Some((tensor, embedding)) = lock_model(
             &self.last_embedding,
@@ -117,9 +169,9 @@ impl OnnxClipProvider {
         let tensor =
             ort::value::Tensor::from_array(([1, 3, 224, 224], input.clone().into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = lock_model(&self.vision, "the CLIP image model's session");
+        let mut session = lock_model(&self.session, "the CLIP image model's session");
         let outputs = session
-            .run(ort::inputs![self.vision_input.as_str() => tensor])
+            .run(ort::inputs![self.input.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let outputs = collect_outputs(outputs)?;
         let embedding = pick_embedding(&outputs, None)?;
@@ -135,18 +187,19 @@ impl std::fmt::Debug for OnnxClipProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OnnxClipProvider")
             .field("labels", &self.labels.len())
-            .field("dim", &self.dim)
+            .field("dim", &self.image.dim)
             .finish_non_exhaustive()
     }
 }
 
 impl TagProvider for OnnxClipProvider {
     fn embedding(&self, img: &DynamicImage) -> Result<Option<Vec<f32>>, AiError> {
-        Ok(Some(normalize(&self.embed_image(img)?)))
+        Ok(Some(normalize(&self.image.embed(img)?)))
     }
 
     fn scores(&self, img: &DynamicImage) -> Result<Vec<TagScore>, AiError> {
-        let emb = normalize(&self.embed_image(img)?);
+        let emb = normalize(&self.image.embed(img)?);
+        let dim = self.image.dim;
         Ok(self
             .labels
             .iter()
@@ -155,7 +208,7 @@ impl TagProvider for OnnxClipProvider {
                 label: label.clone(),
                 score: emb
                     .iter()
-                    .zip(&self.label_embeddings[i * self.dim..(i + 1) * self.dim])
+                    .zip(&self.label_embeddings[i * dim..(i + 1) * dim])
                     .map(|(a, b)| a * b)
                     .sum(),
             })

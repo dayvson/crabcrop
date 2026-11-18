@@ -14,8 +14,33 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use super::AiError;
 
 /// The locks [`lock_model`] has taken back from a panic since
-/// boot, which its log line counts.
+/// boot, which its log line counts and `/metrics` shows
+/// (issue #736).
 static RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// How many locks [`lock_model`] has taken back from a panic
+/// since boot: `crabcrop_ai_lock_recoveries_total` on
+/// `/metrics` (issue #736).
+pub(crate) fn lock_recoveries() -> u64 {
+    RECOVERED.load(Ordering::Relaxed)
+}
+
+/// Poison a lock, as a request that panics while it holds a
+/// model's lock does, and take it back through [`lock_model`],
+/// as the next request does: one recovery, counted where
+/// `/metrics` reads the count.
+#[cfg(test)]
+pub(crate) fn recover_a_poisoned_lock() {
+    let lock = std::sync::Arc::new(Mutex::new(()));
+    let held = std::sync::Arc::clone(&lock);
+    let panicked = std::thread::spawn(move || {
+        let _guard = held.lock();
+        panic!("a request panics while it holds a model's lock");
+    })
+    .join();
+    assert!(panicked.is_err() && lock.is_poisoned());
+    drop(lock_model(&lock, "a test model's session"));
+}
 
 /// Lock one of a provider's mutexes: its model's session, or
 /// the memo beside it. `what` names it for the log.

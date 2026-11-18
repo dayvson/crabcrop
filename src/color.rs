@@ -1193,38 +1193,15 @@ pub fn inject_jpeg(bytes: &[u8], icc: Option<&[u8]>, meta: &SourceMeta, preserve
     out
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut table = [0u32; 256];
-        for (i, entry) in table.iter_mut().enumerate() {
-            let mut c = i as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            *entry = c;
-        }
-        table
-    });
-    let mut c = 0xFFFF_FFFFu32;
-    for &b in data {
-        c = table[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    c ^ 0xFFFF_FFFF
-}
-
+/// One PNG chunk: length, type, data, and the CRC-32 of the
+/// type and data, from crc32fast (issue #737).
 fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 12);
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
-    let mut crc_input = kind.to_vec();
-    crc_input.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    let crc = crc32fast::hash(&out[4..]);
+    out.extend_from_slice(&crc.to_be_bytes());
     out
 }
 
@@ -1795,6 +1772,94 @@ mod tests {
         assert_eq!(got.icc, meta_in.icc);
         assert_eq!(got.xmp, meta_in.xmp);
         assert!(got.exif_tiff.is_some());
+    }
+
+    /// The CRC-32 this module computed by hand before issue
+    /// #737, kept as the oracle for the crate that replaced it.
+    fn crc32_by_table(data: &[u8]) -> u32 {
+        static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+        let table = TABLE.get_or_init(|| {
+            let mut table = [0u32; 256];
+            for (i, entry) in table.iter_mut().enumerate() {
+                let mut c = i as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+                *entry = c;
+            }
+            table
+        });
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in data {
+            c = table[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+        }
+        c ^ 0xFFFF_FFFF
+    }
+
+    /// [`png_chunk`] as it was before issue #737.
+    fn png_chunk_by_table(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + 12);
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = kind.to_vec();
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32_by_table(&crc_input).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn injected_png_chunks_are_the_bytes_the_hand_written_crc_gave() {
+        // Issue #737: crc32fast replaced the table loop. Each
+        // chunk type the injection writes, on random data of
+        // every length crc_lengths names, and a whole injection
+        // of a profile, EXIF and both forms of XMP, comes out as
+        // the table wrote it.
+        let lengths = crate::test_support::crc_lengths();
+        let longest = lengths.iter().max().unwrap();
+        let random = crate::test_support::Rng::new(1196).bytes(longest + 8);
+        let kinds: [&[u8; 4]; 5] = [b"iCCP", b"eXIf", b"iTXt", b"IHDR", b"IEND"];
+        for &len in &lengths {
+            let kind = kinds[len % kinds.len()];
+            let data = &random[len % 8..][..len];
+            assert!(
+                png_chunk(kind, data) == png_chunk_by_table(kind, data),
+                "{} with {len} bytes",
+                String::from_utf8_lossy(kind)
+            );
+        }
+        let ihdr = [0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0];
+        let mut src = b"\x89PNG\r\n\x1a\n".to_vec();
+        src.extend_from_slice(&png_chunk_by_table(b"IHDR", &ihdr));
+        src.extend_from_slice(&png_chunk_by_table(b"IEND", &[]));
+        let icc = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        for xmp_compressed in [false, true] {
+            let meta = SourceMeta {
+                icc: Some(icc.clone()),
+                exif_tiff: Some(tiff_with_orientation(6, false)),
+                xmp: Some(b"<x:xmpmeta>a packet</x:xmpmeta>".repeat(40)),
+                xmp_compressed,
+                photoshop: None,
+            };
+            let out = inject_png(&src, Some(&icc), &meta, true);
+            // Signature, IHDR, the three inserts, IEND: each
+            // chunk is what the table would have written.
+            let mut at = 8;
+            let mut kinds = Vec::new();
+            while at < out.len() {
+                let len = u32::from_be_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+                let kind: &[u8; 4] = out[at + 4..at + 8].try_into().unwrap();
+                let data = &out[at + 8..at + 8 + len];
+                assert_eq!(&out[at..at + 12 + len], png_chunk_by_table(kind, data));
+                kinds.push(String::from_utf8_lossy(kind).into_owned());
+                at += 12 + len;
+            }
+            assert_eq!(kinds, ["IHDR", "iCCP", "eXIf", "iTXt", "IEND"]);
+        }
     }
 
     #[test]

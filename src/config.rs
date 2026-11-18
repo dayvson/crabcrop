@@ -2086,9 +2086,10 @@ pub enum ModerationConfig {
         labels: Option<String>,
     },
     /// No model: the labels file holds zero-shot prompts for
-    /// the CLIP fallback, which loads the CLIP set again
-    /// with these labels.
-    ClipPrompts { labels: String, clip: ClipConfig },
+    /// the CLIP fallback, which scores them over the CLIP set
+    /// the tagger loads (issue #736), so the set must be
+    /// configured.
+    ClipPrompts { labels: String },
 }
 
 /// The OCR pipeline (issue #177): detection and recognition
@@ -2148,10 +2149,7 @@ pub fn ai_config(get: impl Fn(&str) -> Option<String>) -> Result<AiConfig, Confi
         // Labels without a model are zero-shot prompts for
         // the CLIP fallback, which needs the CLIP set.
         (None, Some(labels)) => match &clip {
-            Some(clip) => Some(ModerationConfig::ClipPrompts {
-                labels,
-                clip: clip.clone(),
-            }),
+            Some(_) => Some(ModerationConfig::ClipPrompts { labels }),
             None => {
                 return Err(ConfigError::conflict(
                     &["CRABCROP_MODERATION_LABELS", "CRABCROP_MODERATION_MODEL"],

@@ -2390,7 +2390,7 @@ fn first_frame_placeholder(
 /// ones; the first frame's copy is the request's and comes back
 /// with the frames.
 fn render_frames(
-    frames: Frames,
+    mut frames: Frames,
     ops: &[Operation],
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
@@ -2403,7 +2403,7 @@ fn render_frames(
         None
     };
     let dpr = dpr_factor(directives.dpr, ctx);
-    survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
+    survey_trims(&mut frames, ops, cap, dpr, ctx, directives, &mut share)?;
     let frame_count = frames.len();
     let mut budget = OutputBudget::new();
     let mut render = |frame: image::Frame| {
@@ -2699,23 +2699,53 @@ impl Frames {
         std::iter::once(&self.first).chain(&self.rest)
     }
 
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut image::Frame> {
+        std::iter::once(&mut self.first).chain(&mut self.rest)
+    }
+
     /// The first frame's width and height.
     fn dimensions(&self) -> (u32, u32) {
         self.first.buffer().dimensions()
     }
 
-    /// `f` of the first frame as a `DynamicImage`. The frame's
-    /// buffer is lent for the call and put back, where it was
-    /// copied once for each look (issue #713): the quality pick
-    /// and the placeholder each read the whole frame.
+    /// `f` of the first frame as a `DynamicImage`, lent for the
+    /// call (see [`lend_frame`]), where it was copied once for
+    /// each look (issue #713): the quality pick and the
+    /// placeholder each read the whole frame.
     fn with_first<T>(&mut self, f: impl FnOnce(&DynamicImage) -> T) -> T {
-        let (left, top, delay) = (self.first.left(), self.first.top(), self.first.delay());
-        let empty = image::Frame::new(image::RgbaImage::new(0, 0));
-        let img = DynamicImage::ImageRgba8(std::mem::replace(&mut self.first, empty).into_buffer());
-        let out = f(&img);
-        self.first = image::Frame::from_parts(img.into_rgba8(), left, top, delay);
-        out
+        lend_frame(&mut self.first, |img| f(img))
     }
+}
+
+/// `f` of `frame` as a `DynamicImage`: the frame's buffer is
+/// lent for the call and put back, with the frame's position
+/// and delay, instead of copied (issues #713, #737). `f` may
+/// work on the pixels where they sit, as the trim survey's
+/// resize does (see [`resize_lanczos3_lent`]), as long as it
+/// leaves them as they came.
+fn lend_frame<T>(frame: &mut image::Frame, f: impl FnOnce(&mut DynamicImage) -> T) -> T {
+    let (left, top, delay) = (frame.left(), frame.top(), frame.delay());
+    let empty = image::Frame::new(image::RgbaImage::new(0, 0));
+    let mut img = DynamicImage::ImageRgba8(std::mem::replace(frame, empty).into_buffer());
+    let out = f(&mut img);
+    *frame = image::Frame::from_parts(img.into_rgba8(), left, top, delay);
+    out
+}
+
+/// A copy of a lent frame, for a chain whose first step cannot
+/// read the frame where it is (see [`ChainState::run_to`]).
+fn copy_of_lent(frame: &DynamicImage) -> DynamicImage {
+    #[cfg(test)]
+    LENT_FRAME_COPIES.set(LENT_FRAME_COPIES.get() + 1);
+    frame.clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many lent frames [`copy_of_lent`] copied on this
+    /// thread, so a test can see which chains read their frames
+    /// where they are.
+    static LENT_FRAME_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl IntoIterator for Frames {
@@ -4097,14 +4127,18 @@ fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
 /// the render's own deadline. A lone frame has nothing to
 /// share and trims for itself.
 ///
-/// A prefix runs on a copy of each frame, since its steps
-/// take the frame they work on (a resize premultiplies its
-/// own frame where it sits) and the render needs the frames
-/// as they came. A trim nothing runs before reads the frames
-/// where they are (issue #713): its survey is the tolerance
-/// pass alone, and copying every frame for it was the cost.
+/// The render needs the frames as they came, and a prefix's
+/// steps work on the image they are handed (a resize
+/// premultiplies its own frame where it sits), so each frame
+/// is lent to its prefix and comes back unchanged (issue
+/// #737). A prefix that starts with a resize or a fit-in that
+/// resamples the whole frame reads the lent frame where it is
+/// (see [`ChainState::run_to`]); any other prefix runs on a
+/// copy of the frame. A trim nothing runs before reads the
+/// frames where they are (issue #713): its survey is the
+/// tolerance pass alone.
 fn survey_trims(
-    frames: &Frames,
+    frames: &mut Frames,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
     dpr: f32,
@@ -4129,7 +4163,7 @@ fn survey_trims(
             let first_step = op_index == 0 && filter_index == 0;
             // The first frame's dimensions and the union so far.
             let mut surveyed: Option<((u32, u32), Option<Window>)> = None;
-            for frame in frames.iter() {
+            for frame in frames.iter_mut() {
                 ctx.check_deadline()?;
                 let (dims, found) = if first_step {
                     let rgba = frame.buffer();
@@ -4138,14 +4172,15 @@ fn survey_trims(
                         crate::filters::trim_box_rgba(rgba, tolerance),
                     )
                 } else {
-                    let img = DynamicImage::ImageRgba8(frame.buffer().clone());
-                    let mut chain =
-                        ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
-                    let img = chain.run_to(img, ops, key)?;
-                    (
-                        (img.width(), img.height()),
-                        crate::filters::trim_box(&img, tolerance),
-                    )
+                    lend_frame(frame, |lent| {
+                        let mut chain =
+                            ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
+                        let img = chain.run_to(lent, ops, key)?;
+                        Ok::<_, EngineError>((
+                            (img.width(), img.height()),
+                            crate::filters::trim_box(&img, tolerance),
+                        ))
+                    })?
                 };
                 match &mut surveyed {
                     None => surveyed = Some((dims, found)),
@@ -4460,12 +4495,19 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// detection memos, and the output budget.
     fn step(
         &mut self,
-        mut img: DynamicImage,
+        img: DynamicImage,
         op_index: usize,
         op: &Operation,
     ) -> Result<DynamicImage, EngineError> {
         self.ctx.check_deadline()?;
-        img = self.apply_op(img, op_index, op)?;
+        let img = self.apply_op(img, op_index, op)?;
+        self.stepped(img, op)
+    }
+
+    /// What an operation owes the chain once it has run (see
+    /// [`ChainState::step`]): the detection memos and the
+    /// output budget.
+    fn stepped(&mut self, img: DynamicImage, op: &Operation) -> Result<DynamicImage, EngineError> {
         // Every operation other than the filters segment
         // sizes, crops, or pads, so the detection memos never
         // survive one (issue #373); the filters arm
@@ -4494,17 +4536,29 @@ impl<'r, 'a> ChainState<'r, 'a> {
         Ok(img)
     }
 
-    /// Run the chain on `img` up to the filter at `key` (the
-    /// operation and filter indexes) and return the image
-    /// that filter receives: the trim survey's view of a
-    /// frame (see [`survey_trims`]).
+    /// Run the chain up to the filter at `key` (the operation
+    /// and filter indexes) on a frame lent for the run, and
+    /// return the image that filter receives: the trim
+    /// survey's view of a frame (see [`survey_trims`]). The
+    /// frame comes back as it was. A first operation that
+    /// resamples the whole frame reads it where it is (see
+    /// [`ChainState::lent_step`]); after any other, the chain
+    /// runs on a copy of the frame (issue #737).
     fn run_to(
         &mut self,
-        mut img: DynamicImage,
+        frame: &mut DynamicImage,
         ops: &[Operation],
         (op_index, filter_index): (usize, usize),
     ) -> Result<DynamicImage, EngineError> {
-        for (index, op) in ops.iter().enumerate().take(op_index) {
+        let lent = match ops.first() {
+            Some(first) if op_index > 0 => self.lent_step(frame, first)?,
+            _ => None,
+        };
+        let (mut img, next) = match lent {
+            Some(img) => (img, 1),
+            None => (copy_of_lent(frame), 0),
+        };
+        for (index, op) in ops.iter().enumerate().take(op_index).skip(next) {
             img = self.step(img, index, op)?;
         }
         if let Some(Operation::Filters(filters)) = ops.get(op_index) {
@@ -4513,6 +4567,49 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
         }
         Ok(img)
+    }
+
+    /// The chain's first operation, `op`, on a frame lent for
+    /// it (issue #737): a resize or a fit-in that resamples the
+    /// whole frame reads it where it is (see
+    /// [`resize_lanczos3_lent`]) and returns the image it
+    /// makes, with what [`ChainState::step`] owes the chain
+    /// around it. `None` for any other operation, and for a
+    /// resize that leaves the frame at its size, which hands
+    /// on the frame itself: those run on a copy.
+    fn lent_step(
+        &mut self,
+        frame: &mut DynamicImage,
+        op: &Operation,
+    ) -> Result<Option<DynamicImage>, EngineError> {
+        self.ctx.check_deadline()?;
+        let img = match op {
+            Operation::Size(size) if self.fused_window.is_none() && self.reduced.is_none() => {
+                let cap = self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch));
+                let Some(img) = apply_size_lent(frame, size, cap, self.dpr)? else {
+                    return Ok(None);
+                };
+                self.focal_resized(&img, size.flip_horizontal, size.flip_vertical);
+                img
+            }
+            Operation::FitIn { size, adaptive } => {
+                let Some(img) = apply_fit_in_lent(frame, size, *adaptive, self.cap, self.dpr)?
+                else {
+                    return Ok(None);
+                };
+                self.focal_resized(&img, false, false);
+                img
+            }
+            _ => return Ok(None),
+        };
+        self.stepped(img, op).map(Some)
+    }
+
+    /// Carry the pending focal form through a resize of the
+    /// whole image to `img`, mirrored on the axes it flipped.
+    fn focal_resized(&mut self, img: &DynamicImage, flip_h: bool, flip_v: bool) {
+        let dims = (img.width(), img.height());
+        self.focal = self.focal.map(|f| f.scaled(dims, flip_h, flip_v));
     }
 
     /// Apply one operation of the chain to the image in hand.
@@ -4564,15 +4661,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         self.dpr,
                     )?
                 };
-                let dims = (img.width(), img.height());
-                self.focal = self
-                    .focal
-                    .map(|f| f.scaled(dims, size.flip_horizontal, size.flip_vertical));
+                self.focal_resized(&img, size.flip_horizontal, size.flip_vertical);
             }
             Operation::FitIn { size, adaptive } => {
                 img = apply_fit_in(img, size, *adaptive, self.cap, self.dpr)?;
-                let dims = (img.width(), img.height());
-                self.focal = self.focal.map(|f| f.scaled(dims, false, false));
+                self.focal_resized(&img, false, false);
             }
             Operation::Pad { size, fill } => {
                 let (tw, th) = match (size.width, size.height) {
@@ -6122,7 +6215,7 @@ fn apply_size_windowed(
     let (w, h) = resize_target(size, dpr, (sw, sh), cap);
     check_output_size(w, h, (sw, sh))?;
     let unchanged = w == sw && h == sh;
-    let mut img = match window {
+    let img = match window {
         // A reduced frame is not the size the target was
         // resolved against, so it is resampled whatever the
         // target is.
@@ -6137,13 +6230,39 @@ fn apply_size_windowed(
         SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
         SourceWindow::Whole => resize_lanczos3_owned(img, w, h),
     };
+    Ok(flipped(img, size))
+}
+
+/// [`apply_size`] of a frame lent for the resize (issue #737):
+/// the image it makes, with the frame back as it came (see
+/// [`resize_lanczos3_lent`]). `None` when the size is the
+/// frame's own, where [`apply_size`] hands on the frame itself,
+/// which a lent frame cannot be.
+fn apply_size_lent(
+    frame: &mut DynamicImage,
+    size: &ImageSize,
+    cap: Option<SizeCap>,
+    dpr: f32,
+) -> Result<Option<DynamicImage>, EngineError> {
+    check_nonzero_size(size)?;
+    let dims = (frame.width(), frame.height());
+    let (w, h) = resize_target(size, dpr, dims, cap);
+    check_output_size(w, h, dims)?;
+    if (w, h) == dims {
+        return Ok(None);
+    }
+    Ok(Some(flipped(resize_lanczos3_lent(frame, w, h), size)))
+}
+
+/// `img` mirrored on the axes `size` flips.
+fn flipped(mut img: DynamicImage, size: &ImageSize) -> DynamicImage {
     if size.flip_horizontal {
         img = crate::filters::fliph_fast(&img);
     }
     if size.flip_vertical {
         img = crate::filters::flipv_fast(&img);
     }
-    Ok(img)
+    img
 }
 
 /// Resize to (w, h) with the SIMD backend (fast_image_resize),
@@ -6211,6 +6330,89 @@ fn resize_lanczos3_owned(mut img: DynamicImage, w: u32, h: u32) -> DynamicImage 
         dst
     } else {
         resize_lanczos3(&img, w, h)
+    }
+}
+
+/// [`resize_lanczos3_owned`] of a frame lent for the resize
+/// (issue #737): the same bytes, and the frame back as it came.
+/// Read through [`resize_lanczos3`], a frame with alpha would be
+/// premultiplied into a second buffer the size of the frame. An
+/// RGBA8 frame is premultiplied where it sits instead, as an
+/// owned frame is, with each row the premultiply changes copied
+/// out before it and written back after the resample. The
+/// premultiply rounds `c * alpha / 255`, which keeps a pixel at
+/// full alpha and a black one as they are, so the rows to copy
+/// are those holding any other pixel: none for an opaque frame,
+/// and none for a GIF frame, whose pixels are opaque or
+/// transparent black. Any other layout, and a size that needs
+/// no resample, take [`resize_lanczos3`].
+fn resize_lanczos3_lent(img: &mut DynamicImage, w: u32, h: u32) -> DynamicImage {
+    let (sw, sh) = (img.width(), img.height());
+    let resamples = (w, h) != (sw, sh) && w > 0 && h > 0 && sw > 0 && sh > 0;
+    let changing = match &*img {
+        DynamicImage::ImageRgba8(rgba) if resamples => ChangingRows::of(rgba),
+        _ => return resize_lanczos3(img, w, h),
+    };
+    let mut dst = DynamicImage::new_rgba8(w, h);
+    let done = resample_premultiplying(img, &mut dst);
+    if let DynamicImage::ImageRgba8(rgba) = img {
+        changing.put_back(rgba);
+    }
+    if done {
+        dst
+    } else {
+        resize_lanczos3(img, w, h)
+    }
+}
+
+/// The rows of an RGBA8 frame that a premultiply changes,
+/// copied out before it runs (see [`resize_lanczos3_lent`]).
+struct ChangingRows {
+    /// The bytes in a row of the frame.
+    stride: usize,
+    /// The row indexes, in order.
+    rows: Vec<usize>,
+    /// Their bytes, one row after another.
+    bytes: Vec<u8>,
+}
+
+impl ChangingRows {
+    /// Copy out the rows of `frame` holding a pixel that is
+    /// neither opaque nor black.
+    fn of(frame: &image::RgbaImage) -> Self {
+        let mut changing = ChangingRows {
+            stride: frame.width() as usize * 4,
+            rows: Vec::new(),
+            bytes: Vec::new(),
+        };
+        if changing.stride == 0 {
+            return changing;
+        }
+        let rows = frame.as_raw().chunks_exact(changing.stride);
+        for (y, row) in rows.take(frame.height() as usize).enumerate() {
+            let changes = row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|&[r, g, b, a]| a != u8::MAX && (r | g | b) != 0);
+            if changes {
+                changing.rows.push(y);
+                changing.bytes.extend_from_slice(row);
+            }
+        }
+        changing
+    }
+
+    /// Write the copied rows back into `frame`, the frame they
+    /// were copied from.
+    fn put_back(&self, frame: &mut image::RgbaImage) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let pixels: &mut [u8] = frame;
+        for (&y, row) in self.rows.iter().zip(self.bytes.chunks_exact(self.stride)) {
+            pixels[y * self.stride..][..self.stride].copy_from_slice(row);
+        }
     }
 }
 
@@ -6632,6 +6834,40 @@ fn apply_fit_in(
     cap: Option<(u32, u32)>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
+    let dims = (img.width(), img.height());
+    match fit_in_target(size, adaptive, cap, dpr, dims)? {
+        Some((w, h)) if (w, h) != dims => Ok(resize_lanczos3_owned(img, w, h)),
+        _ => Ok(img),
+    }
+}
+
+/// [`apply_fit_in`] of a frame lent for the resize (issue
+/// #737), as [`apply_size_lent`] is of a resize: `None` when
+/// the fit-in leaves the frame as it is.
+fn apply_fit_in_lent(
+    frame: &mut DynamicImage,
+    size: &ImageSize,
+    adaptive: bool,
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+) -> Result<Option<DynamicImage>, EngineError> {
+    let dims = (frame.width(), frame.height());
+    Ok(match fit_in_target(size, adaptive, cap, dpr, dims)? {
+        Some((w, h)) if (w, h) != dims => Some(resize_lanczos3_lent(frame, w, h)),
+        _ => None,
+    })
+}
+
+/// The size a fit-in to `size` leaves a `sw` by `sh` image at,
+/// checked against the output bounds; `None` when the box
+/// bounds neither axis, so the image passes as it is.
+fn fit_in_target(
+    size: &ImageSize,
+    adaptive: bool,
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+    (sw, sh): (u32, u32),
+) -> Result<Option<(u32, u32)>, EngineError> {
     check_nonzero_size(size)?;
     let scaled = ImageSize {
         width: scale_dimension(size.width, dpr),
@@ -6639,7 +6875,6 @@ fn apply_fit_in(
         flip_horizontal: size.flip_horizontal,
         flip_vertical: size.flip_vertical,
     };
-    let (sw, sh) = (img.width(), img.height());
     let size = &fit_in_box(&scaled, sw, sh, adaptive);
     let mut scale = f64::INFINITY;
     match size.width {
@@ -6653,7 +6888,7 @@ fn apply_fit_in(
         Dimension::Proportional => {}
     }
     if !scale.is_finite() {
-        return Ok(img);
+        return Ok(None);
     }
     let w = ((sw as f64 * scale).round() as u32).max(1);
     let h = ((sh as f64 * scale).round() as u32).max(1);
@@ -6662,11 +6897,7 @@ fn apply_fit_in(
         None => (w, h),
     };
     check_output_size(w, h, (sw, sh))?;
-    if w == sw && h == sh {
-        Ok(img)
-    } else {
-        Ok(resize_lanczos3_owned(img, w, h))
-    }
+    Ok(Some((w, h)))
 }
 
 #[cfg(test)]

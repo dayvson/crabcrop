@@ -850,35 +850,13 @@ fn adam7_filtered_stream<'a>(
     stream
 }
 
-/// The PNG chunk CRC (CRC-32 over the chunk type and data),
-/// table-driven.
-const fn png_crc_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
-
+/// The PNG chunk CRC: the CRC-32 of the chunk type and data,
+/// from crc32fast (issue #737).
 fn png_crc32(kind: &[u8; 4], data: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = png_crc_table();
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in kind.iter().chain(data.iter()) {
-        crc = TABLE[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(kind);
+    crc.update(data);
+    crc.finalize()
 }
 
 fn write_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -1736,5 +1714,81 @@ mod tests {
             direct.to_string(),
             message(image_crate_avif(&wide, DEFAULT_AVIF_SPEED, 80).unwrap_err())
         );
+    }
+
+    /// The table [`png_crc32_by_table`] reads: the CRC this
+    /// module computed by hand before issue #737, kept as the
+    /// oracle for the crate that replaced it.
+    const fn png_crc_table() -> [u32; 256] {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            table[i] = c;
+            i += 1;
+        }
+        table
+    }
+
+    fn png_crc32_by_table(kind: &[u8; 4], data: &[u8]) -> u32 {
+        const TABLE: [u32; 256] = png_crc_table();
+        let mut crc = 0xFFFF_FFFFu32;
+        for byte in kind.iter().chain(data.iter()) {
+            crc = TABLE[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    /// Every chunk type crabcrop writes into a PNG itself: the
+    /// interlaced file's (issue #319) and the metadata
+    /// `color::inject_png` adds.
+    const PNG_CHUNK_TYPES: [&[u8; 4]; 8] = [
+        b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND", b"iCCP", b"eXIf", b"iTXt",
+    ];
+
+    #[test]
+    fn the_png_chunk_crc_matches_the_hand_written_table() {
+        // Issue #737: crc32fast replaced the table loop, and the
+        // CRC it writes must be the one the table gave: each
+        // chunk type crabcrop writes, over random bytes, zeros
+        // and ones at every length crc_lengths names.
+        let lengths = crate::test_support::crc_lengths();
+        let longest = lengths.iter().max().unwrap();
+        let random = crate::test_support::Rng::new(737).bytes(longest + 8);
+        let mut cases = 0;
+        for &len in &lengths {
+            let kind = PNG_CHUNK_TYPES[len % PNG_CHUNK_TYPES.len()];
+            // The random bytes start at a different alignment
+            // for each length.
+            let shifted = &random[len % 8..][..len];
+            for data in [shifted, &vec![0; len], &vec![0xFF; len]] {
+                assert_eq!(
+                    png_crc32(kind, data),
+                    png_crc32_by_table(kind, data),
+                    "{} with {len} bytes",
+                    String::from_utf8_lossy(kind)
+                );
+                cases += 1;
+            }
+        }
+        // Each type on its own, with no data and with a little.
+        for kind in PNG_CHUNK_TYPES {
+            for data in [&[][..], b"x", &random[..13]] {
+                assert_eq!(png_crc32(kind, data), png_crc32_by_table(kind, data));
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 3 * lengths.len() + 3 * PNG_CHUNK_TYPES.len());
+        // The value every PNG ends with, from the specification.
+        assert_eq!(png_crc32(b"IEND", &[]), 0xAE42_6082);
     }
 }

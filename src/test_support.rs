@@ -34,6 +34,42 @@ impl Rng {
     pub(crate) fn pick<'a, T>(&mut self, of: &'a [T]) -> &'a T {
         &of[self.below(of.len())]
     }
+
+    /// `len` random bytes.
+    pub(crate) fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.step() as u8).collect()
+    }
+}
+
+/// The lengths a CRC-32 from crc32fast is compared with the
+/// table loops it replaced at (issue #737): every length to
+/// past 1 KiB, across the sizes where the crate changes method
+/// below that (16 bytes, its 128-byte fold, the 256 bytes of its
+/// AVX2 loop); the 1.5 KiB where its Arm path splits into three
+/// streams, which moves with the data's alignment; the 2 KiB of
+/// its AVX-512 loop; a byte either side of 4 KiB, 64 KiB and
+/// 1 MiB, and of the limits on the chunks crabcrop injects (the
+/// caps on an embedded profile and on an XMP packet, and the
+/// largest `iTXt` a plain packet makes, 22 bytes of header past
+/// its cap); and megabytes, the size of an IDAT.
+pub(crate) fn crc_lengths() -> Vec<usize> {
+    let mut lengths: Vec<usize> = (0..=1100).chain(1530..=1560).collect();
+    let edges = [
+        2048,
+        4096,
+        65_536,
+        1 << 20,
+        crate::color::MAX_EMBED_ICC_BYTES,
+        crate::color::MAX_XMP_BYTES,
+        crate::color::MAX_XMP_BYTES + b"XML:com.adobe.xmp\0".len() + 4,
+    ];
+    for edge in edges {
+        lengths.extend([edge - 1, edge, edge + 1]);
+    }
+    lengths.extend([3 << 20, (4 << 20) + 13]);
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths
 }
 
 #[cfg(all(test, unix))]

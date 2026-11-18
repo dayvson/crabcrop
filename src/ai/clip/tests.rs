@@ -365,6 +365,80 @@ fn clip_live_tags_a_photo() {
     );
 }
 
+/// Label sets loaded together share one image model (issue
+/// #736): the tags and the CLIP moderation fallback's prompts
+/// hold one vision session and one embedding memo, the prompts
+/// score an image the tags just scored without running the
+/// model again, and each set scores an image exactly as it does
+/// loaded on its own.
+/// Ignored: needs the runtime, both models, the tokenizer, a
+/// label file, and a photo:
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
+/// CRABCROP_TEST_CLIP_TEXT_MODEL=... CRABCROP_TEST_CLIP_TOKENIZER=...
+/// CRABCROP_TEST_CLIP_LABELS=... CRABCROP_TEST_IMAGE=...
+/// cargo test -- --ignored clip_label_sets_share
+#[test]
+#[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
+fn clip_label_sets_share_one_image_model_and_its_memo() {
+    let var = |name: &str| std::env::var(name).unwrap();
+    let dylib = var("CRABCROP_TEST_ORT_DYLIB");
+    let image_model = var("CRABCROP_TEST_CLIP_IMAGE_MODEL");
+    let text_model = var("CRABCROP_TEST_CLIP_TEXT_MODEL");
+    let tokenizer = var("CRABCROP_TEST_CLIP_TOKENIZER");
+    let labels = read_labels(&var("CRABCROP_TEST_CLIP_LABELS")).unwrap();
+    // Prompts of their own: the label file's last three, last
+    // first.
+    let prompts: Vec<String> = labels.iter().rev().take(3).cloned().collect();
+    let mut sets = OnnxClipProvider::load_sets(
+        Some(&dylib),
+        &image_model,
+        &text_model,
+        &tokenizer,
+        vec![labels.clone(), prompts.clone()],
+    )
+    .unwrap();
+    assert_eq!(sets.len(), 2);
+    let signals = Arc::new(sets.pop().unwrap());
+    let tags = sets.pop().unwrap();
+    assert!(
+        Arc::ptr_eq(&tags.image, &signals.image),
+        "each label set loaded an image model of its own"
+    );
+    assert_eq!(Arc::strong_count(&tags.image), 2);
+    assert_eq!(
+        (tags.label_count(), signals.label_count()),
+        (labels.len(), 3)
+    );
+    let img = Arc::new(image::open(var("CRABCROP_TEST_IMAGE")).unwrap());
+    let tag_scores = tags.scores(&img).unwrap();
+    // The prompts score from the embedding the tags' run left
+    // in the memo: they answer while the session's lock is
+    // held here, so they never run the model.
+    let session = tags.image.session.lock().unwrap();
+    let (sent, answer) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let (signals, img) = (Arc::clone(&signals), Arc::clone(&img));
+        move || sent.send(signals.scores(&img))
+    });
+    let signal_scores = answer
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the prompts waited for the image model's session: they ran it again")
+        .unwrap();
+    drop(session);
+    // Each set scores as it does loaded on its own.
+    let (_labels_dir, labels_path) = temp_file("clip-sets-labels", labels.join("\n").as_bytes());
+    let (_prompts_dir, prompts_path) =
+        temp_file("clip-sets-prompts", prompts.join("\n").as_bytes());
+    let load_alone = |path: &str| {
+        OnnxClipProvider::load(Some(&dylib), &image_model, &text_model, &tokenizer, path).unwrap()
+    };
+    assert_eq!(tag_scores, load_alone(&labels_path).scores(&img).unwrap());
+    assert_eq!(
+        signal_scores,
+        load_alone(&prompts_path).scores(&img).unwrap()
+    );
+}
+
 /// Write bytes to a fresh temp file and return the
 /// scratch directory it lives in and its path: the
 /// load() failure tests need real files (a label list,
