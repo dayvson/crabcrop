@@ -780,6 +780,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if !config.explain_enabled {
         boot_line!("explain: off");
     }
+    if config.purge_require_expiry {
+        boot_line!("purges: expiring URLs only");
+    }
     // The request log (issue #642): a queue and its writer
     // thread, or with `CRABCROP_LOG_SYNC` a line written
     // where it is logged.
@@ -853,6 +856,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         width_step: config.width_step,
         client_hints: config.client_hints,
         explain_enabled: config.explain_enabled,
+        purge_require_expiry: config.purge_require_expiry,
         preserve_metadata: config.preserve_metadata,
         brand_color: config.brand_color,
         presets: config.presets.clone(),
@@ -2097,6 +2101,12 @@ mod test_support;
 #[allow(dead_code)]
 #[path = "test_support/script.rs"]
 mod test_script;
+
+// And so does the writer of head saves: the aesthetic
+// head's boot error is checked on one (issue #760).
+#[cfg(test)]
+#[path = "test_support/head_archive.rs"]
+mod test_head_archive;
 
 #[cfg(test)]
 #[path = "main/tests.rs"]

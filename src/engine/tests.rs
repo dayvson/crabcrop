@@ -8885,6 +8885,216 @@ fn a_scaled_row_that_reads_many_source_rows_checks_the_deadline_within_it() {
     assert_eq!(checks, 2);
 }
 
+/// The frames of an animated render, one of each size in
+/// `sizes`, each with pixels of its own inside a flat
+/// three-pixel border.
+fn bordered_frames_of(sizes: &[(u32, u32)]) -> Frames {
+    let mut frames = sizes.iter().zip(0u32..).map(|(&(w, h), index)| {
+        let buffer = image::RgbaImage::from_fn(w, h, |x, y| {
+            if x < 3 || y < 3 || x + 3 >= w || y + 3 >= h {
+                image::Rgba([250, 250, 250, 255])
+            } else {
+                image::Rgba([
+                    ((x * 13 + index * 41) % 256) as u8,
+                    ((y * 17 + index * 23) % 256) as u8,
+                    ((x * y + index * 7) % 256) as u8,
+                    255,
+                ])
+            }
+        });
+        image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(80, 1))
+    });
+    let first = frames.next().expect("at least one frame");
+    Frames {
+        first,
+        rest: frames.collect(),
+    }
+}
+
+/// The overlays the scaled overlay renders draw: `ov`, an RGB
+/// image, and `ov2`, an RGBA one under partial alpha.
+fn scaled_overlay_images() -> WatermarkImages {
+    let mut map = WatermarkImages::new();
+    map.insert(
+        "ov".to_string(),
+        WatermarkImage::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            23,
+            17,
+            |x, y| image::Rgb([(x * 11) as u8, (y * 15) as u8, ((x + y) * 5) as u8]),
+        ))),
+    );
+    map.insert(
+        "ov2".to_string(),
+        WatermarkImage::new(DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
+            30,
+            30,
+            |x, y| image::Rgba([(y * 8) as u8, 90, (x * 8) as u8, ((x + y) * 4) as u8]),
+        ))),
+    );
+    map
+}
+
+/// `overlay(<url>,<x>,<y>,80,normal,<width>)`.
+fn scaled_overlay(url: &str, (x, y): (i32, i32), width: u32) -> Filter {
+    Filter::Overlay {
+        url: url.to_string(),
+        x,
+        y,
+        alpha: 80,
+        blend: crate::url::BlendMode::Normal,
+        width: Some(width),
+    }
+}
+
+/// `frames` through `ops`, as an animated render runs them,
+/// with how many overlay parts the render scaled.
+fn rendered_with_scales(
+    frames: Frames,
+    ops: &[Operation],
+    ctx: &ProcessContext<'_>,
+) -> (usize, Vec<image::RgbaImage>) {
+    let directives = crate::url::RequestDirectives::analyze(ops);
+    let before = overlay_scale::SCALED_PARTS.get();
+    let (rendered, _) =
+        render_frames(frames, ops, ctx, &directives, FrameShare::default()).unwrap();
+    let scaled = overlay_scale::SCALED_PARTS.get() - before;
+    let frames = rendered
+        .into_iter()
+        .map(image::Frame::into_buffer)
+        .collect();
+    (scaled, frames)
+}
+
+/// The frames of `sizes` through `ops`, each alone, as a still
+/// runs them.
+fn rendered_alone(
+    sizes: &[(u32, u32)],
+    ops: &[Operation],
+    ctx: &ProcessContext<'_>,
+) -> Vec<image::RgbaImage> {
+    let directives = crate::url::RequestDirectives::analyze(ops);
+    bordered_frames_of(sizes)
+        .into_iter()
+        .map(|frame| {
+            let img = DynamicImage::ImageRgba8(frame.into_buffer());
+            apply_operations(img, ops, None, 1.0, ctx, &directives, None)
+                .unwrap()
+                .img
+                .into_rgba8()
+        })
+        .collect()
+}
+
+#[test]
+fn an_animated_render_scales_its_overlay_once() {
+    // `overlay(...,width)` scaled the part of the overlay that
+    // lands again on every frame of an animated render, though
+    // the frames share one canvas and so ask for the same part.
+    // The first frame's scale is kept and drawn on the rest:
+    // one scale for six frames, and every frame is the frame
+    // rendered alone. Scaled down, up, and across the far edges.
+    let map = scaled_overlay_images();
+    let ctx = ProcessContext {
+        watermarks: Some(&map),
+        ..Default::default()
+    };
+    let sizes = [(40, 30); 6];
+    for overlay in [
+        scaled_overlay("ov", (3, 2), 60),
+        scaled_overlay("ov2", (-2, -1), 150),
+        scaled_overlay("ov", (-30, 4), 100),
+    ] {
+        let ops = [Operation::Filters(vec![overlay.clone()])];
+        let (scaled, frames) = rendered_with_scales(bordered_frames_of(&sizes), &ops, &ctx);
+        assert_eq!(scaled, 1, "{overlay:?}");
+        assert!(frames == rendered_alone(&sizes, &ops, &ctx), "{overlay:?}");
+    }
+}
+
+#[test]
+fn an_overlay_before_a_trim_is_scaled_once_for_the_survey_and_the_frames() {
+    // A trim's survey runs the chain up to the trim on every
+    // frame before the frames render, the overlay included.
+    // The survey and the render take the one kept part, and the
+    // render is the overlay drawn on each frame, then the trim
+    // window those frames share.
+    let map = scaled_overlay_images();
+    let ctx = ProcessContext {
+        watermarks: Some(&map),
+        ..Default::default()
+    };
+    let sizes = [(40, 30); 4];
+    let overlay = scaled_overlay("ov", (6, 5), 40);
+    let both = [Operation::Filters(vec![overlay.clone(), Filter::Trim(5)])];
+    let (scaled, frames) = rendered_with_scales(bordered_frames_of(&sizes), &both, &ctx);
+    assert_eq!(scaled, 1);
+    let (_, overlaid) = rendered_with_scales(
+        bordered_frames_of(&sizes),
+        &[Operation::Filters(vec![overlay])],
+        &ctx,
+    );
+    let mut overlaid = overlaid.into_iter().map(|buffer| {
+        image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(80, 1))
+    });
+    let overlaid = Frames {
+        first: overlaid.next().unwrap(),
+        rest: overlaid.collect(),
+    };
+    let (_, trimmed) =
+        rendered_with_scales(overlaid, &[Operation::Filters(vec![Filter::Trim(5)])], &ctx);
+    assert_ne!(trimmed[0].dimensions(), (40, 30), "the trim cut nothing");
+    assert!(frames == trimmed);
+}
+
+#[test]
+fn a_frame_of_another_size_scales_its_own_overlay() {
+    // A kept part is found by everything its pixels depend on:
+    // the overlay, the size it is scaled to (a share of the
+    // frame's width) and the part that lands. A frame of
+    // another width asks for another size and scales its own:
+    // two widths, two scales. A frame of another height that
+    // asks for the same size and the same part is drawn the
+    // kept pixels, which are its own. Every frame is the frame
+    // rendered alone.
+    let map = scaled_overlay_images();
+    let ctx = ProcessContext {
+        watermarks: Some(&map),
+        ..Default::default()
+    };
+    let ops = [Operation::Filters(vec![scaled_overlay("ov", (1, 1), 25)])];
+    for (sizes, scales) in [
+        (&[(40, 30), (40, 30), (20, 15), (40, 30), (20, 15)][..], 2),
+        (&[(40, 30), (40, 20), (40, 30)][..], 1),
+    ] {
+        let (scaled, frames) = rendered_with_scales(bordered_frames_of(sizes), &ops, &ctx);
+        assert_eq!(scaled, scales, "{sizes:?}");
+        assert!(frames == rendered_alone(sizes, &ops, &ctx), "{sizes:?}");
+    }
+}
+
+#[test]
+fn the_kept_overlay_parts_hold_no_more_than_the_image_they_land_on() {
+    // A chain may scale many overlays that land whole: the kept
+    // parts hold at most one frame's pixels. `ov` at 100% is
+    // 40x30, the whole frame, and is kept; `ov2` at 100% lands
+    // on the whole frame too, and is scaled for each of the
+    // four frames, as before. Every frame is the frame rendered
+    // alone.
+    let map = scaled_overlay_images();
+    let ctx = ProcessContext {
+        watermarks: Some(&map),
+        ..Default::default()
+    };
+    let sizes = [(40, 30); 4];
+    let ops = [Operation::Filters(vec![
+        scaled_overlay("ov", (0, 0), 100),
+        scaled_overlay("ov2", (0, 0), 100),
+    ])];
+    let (scaled, frames) = rendered_with_scales(bordered_frames_of(&sizes), &ops, &ctx);
+    assert_eq!(scaled, 1 + 4);
+    assert!(frames == rendered_alone(&sizes, &ops, &ctx));
+}
+
 #[test]
 fn unresolved_overlay_is_an_error() {
     let engine = Engine;

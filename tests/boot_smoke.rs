@@ -634,6 +634,83 @@ fn explain_off_answers_404_while_images_still_render() {
     );
 }
 
+/// One HTTP/1.0 POST with no body on `port`: the
+/// response's status line and its body.
+fn post(port: u16, path: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    let status = response.lines().next().unwrap_or("").to_string();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn purge_require_expiry_refuses_plain_purges_and_boot_says_so() {
+    // With `CRABCROP_PURGE_REQUIRE_EXPIRY=1` a purge URL
+    // with no expiry answers 403, boot says so, and the
+    // expiring form still purges. Unset, both purge.
+    let secret = "boot-smoke-secret-0123456789";
+    let target = "100x50/https://example.com/a.jpg";
+    let plain = format!(
+        "/purge/{}/{target}",
+        crabcrop_url::purge_signature(secret.as_bytes(), target)
+    );
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let expiring = format!(
+        "/purge/{}/exp:{exp}/{target}",
+        crabcrop_url::purge_signature_with_expiry(secret.as_bytes(), target, exp)
+    );
+    for (value, plain_status, says_so) in [(None, "200", false), (Some("1"), "403", true)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+        command.env_clear().env("CRABCROP_SECRET", secret);
+        if let Some(value) = value {
+            command.env("CRABCROP_PURGE_REQUIRE_EXPIRY", value);
+        }
+        let (_server, port, _, printed) = common::serve_printing(&mut command);
+        let (status, body) = post(port, &plain);
+        assert!(
+            status.contains(plain_status),
+            "{value:?}: {status:?} {body:?}"
+        );
+        assert_eq!(
+            body.starts_with("expiry required"),
+            says_so,
+            "{value:?}: {body:?}"
+        );
+        let (status, body) = post(port, &expiring);
+        assert!(status.contains("200"), "{value:?}: {status:?} {body:?}");
+        assert_eq!(
+            printed.iter().any(|l| l == "purges: expiring URLs only"),
+            says_so,
+            "{value:?}: {printed:#?}"
+        );
+    }
+    // A typo stops the boot and names the variable, rather
+    // than leaving plain purge URLs working.
+    let stderr = refused_boot(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", "required")]);
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_PURGE_REQUIRE_EXPIRY"),
+        "{stderr}"
+    );
+}
+
 /// A model file that exists, so a boot failure is about
 /// the runtime, never about a missing model, and the
 /// directory it lives in.

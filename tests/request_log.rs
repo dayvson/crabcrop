@@ -1073,6 +1073,14 @@ fn a_line_stderr_refuses_lets_go_of_stderr_before_its_note_waits() {
     // so neither can deadlock with it. Its child holds
     // standard output while a stderr line fails, and takes
     // stderr once that line waits for standard output.
+    //
+    // The child's stderr has had no reader since before the
+    // spawn, so its first line there fails. A read end dropped
+    // after the spawn left a window: under load the line was
+    // written into the pipe first, never failed, never waited,
+    // and the child found no thread to watch (issue #758).
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -1083,10 +1091,9 @@ fn a_line_stderr_refuses_lets_go_of_stderr_before_its_note_waits() {
         ])
         .env("CRABCROP_TEST_STDERR_NOTE", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(writer)
         .spawn()
         .unwrap();
-    drop(child.stderr.take());
     let mut stdout = child.stdout.take().unwrap();
     let printed = std::thread::spawn(move || {
         let mut printed = String::new();

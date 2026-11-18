@@ -17,6 +17,18 @@ getrandom = "0.4"
 hex = "0.4"
 hmac = "0.13"
 sha2 = "0.11"
+zeroize = { version = "1", optional = true }
+
+[features]
+# Off by default, so the crate adds no dependency unless asked.
+# On, it clears the subkeys the crate derives for its own
+# signing and sealing when it drops them, and turns on the
+# `zeroize` features of hmac, sha2 and aes-gcm, which clear
+# their own state when it is dropped: the HMAC's buffers and
+# output, the SHA-256 states an HMAC keeps from its key, and
+# the AES round keys and the GHASH key. The crabcrop server
+# turns it on.
+zeroize = ["dep:zeroize", "hmac/zeroize", "sha2/zeroize", "aes-gcm/zeroize"]
 
 [dev-dependencies]
 serde_json = "1"

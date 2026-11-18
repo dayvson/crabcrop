@@ -1,5 +1,5 @@
 use crate::ai::{AestheticHead, AiError};
-use crate::test_support::{ScratchDir, scratch_dir};
+use crate::test_support::{ScratchDir, head_archive, scratch_dir};
 
 /// Write bytes to a fresh temp file and return the
 /// scratch directory it lives in and its path (issue
@@ -45,7 +45,7 @@ fn pkl_str(out: &mut Vec<u8>, s: &str) {
 /// tensor over storage "0" and a bias tensor over
 /// storage "1", closed by the metadata BUILD tail.
 /// Memo indices follow the real files.
-fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
+pub(super) fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
     let mut p = Vec::new();
     let binint2 = |p: &mut Vec<u8>, v: usize| {
         p.push(b'M');
@@ -118,60 +118,6 @@ fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
     p.push(b'b');
     p.push(b'.');
     p
-}
-
-/// Wrap a pickle and its storages in a stored-entry
-/// zip archive of the shape `torch.save` writes.
-fn head_archive(pkl: &[u8], storages: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    let mut central: Vec<u8> = Vec::new();
-    let mut entries: Vec<(&str, &[u8])> = vec![("archive/data.pkl", pkl)];
-    entries.extend_from_slice(storages);
-    entries.push(("archive/version", b"3\n"));
-    for (name, data) in &entries {
-        let local_at = out.len() as u32;
-        out.extend_from_slice(b"PK\x03\x04");
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
-        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
-        out.extend_from_slice(&0u32.to_le_bytes()); // time and date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc (the reader ignores it)
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // extra
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
-        central.extend_from_slice(b"PK\x01\x02");
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&local_at.to_le_bytes());
-        central.extend_from_slice(name.as_bytes());
-    }
-    let cd_at = out.len() as u32;
-    let cd_len = central.len() as u32;
-    out.extend_from_slice(&central);
-    out.extend_from_slice(b"PK\x05\x06");
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&cd_len.to_le_bytes());
-    out.extend_from_slice(&cd_at.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out
 }
 
 fn floats_bytes(values: &[f32]) -> Vec<u8> {
@@ -252,12 +198,10 @@ fn aesthetic_head_rejects_a_storage_shorter_than_the_tensor() {
     assert!(err.contains("overruns its storage"), "{err}");
 }
 
-#[test]
-fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
-    // A shape whose element count overflows usize (issue
-    // #484) is a load error naming the overflow, never a
-    // multiply that panics (debug) or wraps to a small
-    // count (release) before the storage bound is checked.
+/// `head_pickle(3, 1)` with the weight's size (1, 3)
+/// swapped for (2^32, 2^32), whose element count
+/// overflows usize.
+pub(super) fn overflowing_size_pickle() -> Vec<u8> {
     let pkl = head_pickle(3, 1);
     // The weight's size tuple (1, 3): BININT1 1, BININT2 3,
     // TUPLE2. Swap in (2^32, 2^32) as two LONG1 values.
@@ -272,8 +216,17 @@ fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
     patched.extend_from_slice(&huge);
     patched.push(0x86);
     patched.extend_from_slice(&pkl[at[0] + size.len()..]);
+    patched
+}
+
+#[test]
+fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
+    // A shape whose element count overflows usize (issue
+    // #484) is a load error naming the overflow, never a
+    // multiply that panics (debug) or wraps to a small
+    // count (release) before the storage bound is checked.
     let archive = head_archive(
-        &patched,
+        &overflowing_size_pickle(),
         &[
             ("archive/data/0", &floats_bytes(&[0.5, -0.25, 2.0])),
             ("archive/data/1", &floats_bytes(&[0.75])),
@@ -314,4 +267,50 @@ fn aesthetic_head_refuses_memo_copies_and_deep_nesting() {
             "{tag}: {err}"
         );
     }
+}
+
+#[test]
+fn aesthetic_head_refuses_a_pickle_that_left_a_stale_mark_without_a_panic() {
+    // Issue #760: an opcode in these took a value from below
+    // a MARK, and the TUPLE that closed the MARK found it
+    // past the top of the stack, which panicked the load,
+    // and the boot with it. Each is now a load error naming
+    // the file and the opcode that reached below the MARK.
+    for (tag, pkl, name) in [
+        ("head-mark-build", &b"N}(bt."[..], "BUILD"),
+        ("head-mark-tuple", &b"))(\x86t."[..], "TUPLE2"),
+    ] {
+        let (_head, path) = temp_file(tag, &head_archive(pkl, &[]));
+        let loaded = std::panic::catch_unwind(|| AestheticHead::load(&path))
+            .unwrap_or_else(|_| panic!("{tag}: the load panicked"));
+        let err = expect_load(loaded);
+        let want =
+            format!("{path} is not usable: a pickle {name} uses a value from below an open MARK");
+        assert!(err.ends_with(&want), "{tag}: {err}");
+    }
+}
+
+#[test]
+fn aesthetic_head_refuses_a_head_with_a_stray_mark_before_its_build() {
+    // The synthetic head with a MARK just before its closing
+    // BUILD: BUILD then uses the state dict and the root
+    // dict, both below the MARK. The load accepted it before
+    // issue #760; CPython's unpickler refuses it
+    // ("unexpected MARK found"), and so does the load now.
+    let mut pkl = head_pickle(3, 1);
+    assert!(pkl.ends_with(b"b."));
+    pkl.insert(pkl.len() - 2, b'(');
+    let archive = head_archive(
+        &pkl,
+        &[
+            ("archive/data/0", &floats_bytes(&[0.5, -0.25, 2.0])),
+            ("archive/data/1", &floats_bytes(&[0.75])),
+        ],
+    );
+    let (_head, path) = temp_file("head-stray-mark", &archive);
+    let err = expect_load(AestheticHead::load(&path));
+    assert!(
+        err.ends_with("is not usable: a pickle BUILD uses a value from below an open MARK"),
+        "{err}"
+    );
 }

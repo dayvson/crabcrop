@@ -131,6 +131,43 @@ fn explain_defaults_to_on_and_turns_off_by_the_boolean_spellings() {
 }
 
 #[test]
+fn purge_require_expiry_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
+    // Unset is off, so the purge URLs a deployment already
+    // holds keep working after the upgrade.
+    assert_eq!(
+        purge_require_expiry_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(false)
+    );
+    let set = |v: &str| {
+        purge_require_expiry_config(env_of(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", v)]))
+            .map_err(|e| e.to_string())
+    };
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    // A typo is a boot error naming the variable, never a
+    // silent default that leaves plain purge URLs working.
+    for bad in ["", "required", "onn", "2"] {
+        let err = expect_err(set(bad));
+        assert!(
+            err.contains("CRABCROP_PURGE_REQUIRE_EXPIRY"),
+            "{bad:?}: {err}"
+        );
+    }
+    // The setting reaches the configuration.
+    let config = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRABCROP_SECRET", "a production-grade secret")];
+        env.extend_from_slice(extra);
+        Config::from_env(env_of(&env)).unwrap()
+    };
+    assert!(!config(&[]).purge_require_expiry);
+    assert!(config(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", "1")]).purge_require_expiry);
+}
+
+#[test]
 fn log_sync_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
     // Issue #642: unset, request lines go through the
     // writer thread.
