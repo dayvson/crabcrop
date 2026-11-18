@@ -508,3 +508,74 @@ async fn a_decoder_panic_fails_its_sections_and_not_the_request() {
     assert!(panicked.2.contains("inference_failed"), "{}", panicked.2);
     assert!(log.take().is_empty());
 }
+
+/// Opened by the deadline test below once its document has
+/// answered, to let [`decode_until_released`] finish.
+static HELD_RELEASE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static HELD_OPENED: std::sync::Condvar = std::sync::Condvar::new();
+/// Set when [`decode_until_released`] returns.
+static HELD_DECODE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The engine's decoder, once the test opens the release. A
+/// decode that the release does not reach in 10 seconds opens
+/// it itself and goes on, so a run where the test cannot open
+/// it (the decode holding the runtime's only thread) still
+/// ends.
+fn decode_until_released(bytes: &[u8]) -> Result<DynamicImage, crate::engine::EngineError> {
+    let open = HELD_RELEASE.lock().unwrap();
+    let (mut open, _) = HELD_OPENED
+        .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+        .unwrap();
+    *open = true;
+    drop(open);
+    let decoded = crate::engine::decode_image(bytes);
+    HELD_DECODE_DONE.store(true, Ordering::SeqCst);
+    decoded
+}
+
+#[tokio::test]
+async fn the_annotation_deadline_ends_a_document_while_its_render_decodes() {
+    // Issue #736: the decode ran on the request's task, where
+    // the annotation deadline cannot interrupt it, so a decode
+    // that outlasted the deadline held the whole document until
+    // it ended. It now runs in the first section's blocking
+    // task: the document answers at the deadline with the decode
+    // still running, the tags and detections left out and the
+    // sections asked for by name timed out, and the permits the
+    // detached tasks hold come back once the decode and the
+    // inferences behind it end.
+    let log = FrameLog::default();
+    let mut state = logging_state(&log);
+    state.process_timeout = std::time::Duration::from_millis(300);
+    let processed = Arc::new(still_processed(test_png(), ImageFormat::Png));
+    let frame = DocumentFrame::with_decoder(Arc::clone(&processed), decode_until_released);
+    let response = meta_document_from(&state, &processed, frame, false, Some(EVERY_SECTION)).await;
+    assert!(
+        !HELD_DECODE_DONE.load(Ordering::SeqCst),
+        "the document waited for its render's decode"
+    );
+    let (status, _, body) = parts(response).await;
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(body.get("tags").is_none(), "{body}");
+    assert!(body.get("detections").is_none(), "{body}");
+    assert_eq!(body["moderation"]["reason"], "timed_out", "{body}");
+    assert_eq!(body["embedding_reason"], "timed_out", "{body}");
+    assert_eq!(body["ocr"]["reason"], "timed_out", "{body}");
+    assert!(log.take().is_empty());
+    *HELD_RELEASE.lock().unwrap() = true;
+    HELD_OPENED.notify_all();
+    let mut back = false;
+    for _ in 0..100 {
+        if state.ai_gate.available_permits() == 2 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        back,
+        "every permit returns once the decode and the inferences end"
+    );
+    assert!(HELD_DECODE_DONE.load(Ordering::SeqCst));
+}
