@@ -6,6 +6,7 @@ remainders, and the answers for what is not a signed URL."""
 import hashlib
 import hmac
 import json
+import random
 import sys
 import unittest
 from pathlib import Path
@@ -185,6 +186,58 @@ class TestReserved(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIs(cc.verify_url_signature(secret, f"{BASE}/{subkey}/{label}"), False)
                 self.assertIs(cc.verify_url_signature({"k": secret}, f"{BASE}/k:{subkey}/{label}"), False)
+
+
+class TestSurrogates(unittest.TestCase):
+    """A Python string can hold surrogate code points, which UTF-8
+    cannot encode (``surrogateescape`` makes one of each byte that is
+    not UTF-8). The TypeScript SDK's HMAC hashes a lone surrogate as
+    U+FFFD, as TextEncoder and node:crypto write it, and reads a pair
+    as the character it encodes (crypto.test.ts pins both), so the
+    verifier answers as it does, and raises for no text."""
+
+    REMAINDER = "300x200/https://example.com/a.jpg"
+
+    def test_a_lone_surrogate_in_the_url_hashes_as_the_replacement_character(self):
+        lone = chr(0xDCFF)
+        remainder = f"300x200/https://example.com/{lone}.jpg"
+        tag = raw_tag("s3cr3t", remainder.replace(lone, "�"))
+        self.assertIs(cc.verify_url_signature("s3cr3t", f"{BASE}/{tag}/{remainder}"), True)
+        self.assertIs(cc.verify_url_signature({"k": "s3cr3t"}, f"{BASE}/{tag}/{remainder}"), True)
+        self.assertIs(cc.verify_url_signature({"k": "s3cr3t"}, f"{BASE}/k:{tag}/{remainder}"), True)
+        self.assertIs(cc.verify_url_signature("wrong", f"{BASE}/{tag}/{remainder}"), False)
+        self.assertIs(cc.verify_url_signature("s3cr3t", f"{BASE}/{'a' * 64}/{remainder}"), False)
+
+    def test_a_lone_surrogate_in_a_secret_hashes_the_same_way(self):
+        secret = "s3cr3t" + chr(0xD800)
+        tag = raw_tag("s3cr3t�", self.REMAINDER)
+        url = f"{BASE}/{tag}/{self.REMAINDER}"
+        self.assertIs(cc.verify_url_signature(secret, url), True)
+        self.assertIs(cc.verify_url_signature({"a": "other", "b": secret}, url), True)
+        self.assertIs(cc.verify_url_signature({"k": secret}, f"{BASE}/k:{tag}/{self.REMAINDER}"), True)
+        self.assertIs(cc.verify_url_signature({"k": "s3cr3t"}, f"{BASE}/k:{tag}/{self.REMAINDER}"), False)
+
+    def test_a_surrogate_pair_is_the_character_it_encodes(self):
+        pair = chr(0xD83D) + chr(0xDE00)  # U+1F600 as two UTF-16 code units
+        tag = raw_tag("s3cr3t", "300x200/https://example.com/\U0001f600.jpg")
+        url = f"{BASE}/{tag}/300x200/https://example.com/{pair}.jpg"
+        self.assertIs(cc.verify_url_signature("s3cr3t", url), True)
+        self.assertIs(cc.verify_url_signature("s3cr3t" + pair, url), False)
+        keyed = raw_tag("s3cr3t\U0001f600", self.REMAINDER)
+        self.assertIs(cc.verify_url_signature("s3cr3t" + pair, f"{BASE}/{keyed}/{self.REMAINDER}"), True)
+
+    def test_no_text_makes_the_verifier_raise(self):
+        rng = random.Random(716)
+        alphabet = ["a", "/", ":", "%", "x", "1", "é", "\U0001f600", chr(0xD800), chr(0xDBFF), chr(0xDC00), chr(0xDFFF), "\x00"]
+        for _ in range(500):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(20)))
+            remainder = f"300x200/{text}"
+            secret = "".join(rng.choice(alphabet) for _ in range(rng.randrange(8)))
+            tag = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+            for url in (f"{BASE}/{tag}/{remainder}", f"{BASE}/k:{tag}/{remainder}", f"{BASE}/{tag}/{text}"):
+                for key in (secret, {"k": secret}, {"k": "s3cr3t", "j": secret}, {}):
+                    with self.subTest(url=ascii(url), key=ascii(key)):
+                        self.assertIn(cc.verify_url_signature(key, url), (None, True, False))
 
 
 class TestComparison(unittest.TestCase):

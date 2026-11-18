@@ -764,6 +764,38 @@ class TestTables(unittest.TestCase):
         self.assertEqual(cc._explain._KEPT_DIGITS, 1000)
 
 
+class TestSurrogates(unittest.TestCase):
+    """A Python string can hold surrogate code points, which no UTF-8
+    text does. The TypeScript explainer reads UTF-16, where a high
+    surrogate followed by a low one is one character, so the port
+    reads a pair as that character, and the two explainers give one
+    answer on the same code units."""
+
+    PAIR = chr(0xD835) + chr(0xDC00)  # U+1D400, a letter, as two code units
+
+    def test_a_surrogate_pair_reads_as_the_character_it_encodes(self):
+        letter = "\U0001d400"
+        for template in (
+            f"https://x/{TAG}/filters:blurclass(%s)/{SRC}",
+            f"https://x/{TAG}/crop:400x300:objects(%s)/{SRC}",
+            f"https://x/{TAG}/filters:text(%s,100,ffffff,center)/{SRC}",
+            f"https://x/{TAG}/300x200/https://e.com/%s.jpg",
+        ):
+            self.assertEqual(cc.explain_url(template % self.PAIR), cc.explain_url(template % letter), template)
+        self.assertEqual(errors(f"filters:blurclass({self.PAIR})"), [])
+        # 600 characters at size 100 are within the text caps; 1,200
+        # code points would be past the 1,000-character one.
+        self.assertEqual(errors(f"filters:text({self.PAIR * 600},100,ffffff,center)"), [])
+
+    def test_a_surrogate_pair_counts_the_four_bytes_of_its_character(self):
+        cap = 64 * 1024
+        head = f"https://x/{TAG}/300x200/https://e.com/"
+        count = (cap - len(head) - 4) // 4
+        url = f"{head}{self.PAIR * count}{'a' * (cap - len(head) - 4 - 4 * count)}.jpg"
+        self.assertEqual(cc.explain_url(url).errors, [])
+        self.assertIn("longer than 64 KiB", cc.explain_url(url + "a").errors[0])
+
+
 class TestHostileInput(unittest.TestCase):
     """The explainer reads untrusted URLs: no input makes it raise or
     stall."""

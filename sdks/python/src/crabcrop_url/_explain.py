@@ -1491,6 +1491,24 @@ def _signature_of(raw: str) -> ExplainedSignature:
     )
 
 
+def _as_javascript_reads(text: str) -> str:
+    """``text`` as JavaScript reads the same UTF-16 code units: a high
+    surrogate followed by a low one is the one character the pair
+    encodes, and any other surrogate stays a lone surrogate, as it
+    would in a JavaScript string."""
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+
+def _too_long() -> Explanation:
+    return Explanation(
+        None,
+        [],
+        "",
+        "",
+        [f"the URL is longer than 64 KiB ({MAX_EXPLAIN_BYTES} bytes): the explainer does not read it"],
+    )
+
+
 def explain_url(input: str, now_seconds: Optional[int] = None) -> Explanation:
     """Parse a crabcrop URL (or bare path) back into its pieces,
     explaining each segment, as the TypeScript SDK's ``explainUrl``
@@ -1511,22 +1529,27 @@ def explain_url(input: str, now_seconds: Optional[int] = None) -> Explanation:
 
     Input longer than 64 KiB of UTF-8 is not read: the answer is one
     error and no signature, so `verify_url_signature` returns
-    ``None`` for it."""
+    ``None`` for it.
+
+    A string that holds surrogate code points, which no UTF-8 text
+    does, is read as JavaScript reads the same UTF-16: a surrogate
+    pair is the one character it encodes, and a lone surrogate counts
+    the three bytes TextEncoder writes for it."""
     if not isinstance(input, str):
         raise TypeError(f"explain_url takes the URL as a str, got {type(input).__name__}")
     if now_seconds is None:
         now_seconds = int(time.time())
     # A UTF-8 byte per character at least, so a long string is refused
-    # before it is encoded. A lone surrogate counts the three bytes
-    # TextEncoder writes for it.
-    if len(input) > MAX_EXPLAIN_BYTES or len(input.encode("utf-8", "surrogatepass")) > MAX_EXPLAIN_BYTES:
-        return Explanation(
-            None,
-            [],
-            "",
-            "",
-            [f"the URL is longer than 64 KiB ({MAX_EXPLAIN_BYTES} bytes): the explainer does not read it"],
-        )
+    # before it is encoded.
+    if len(input) > MAX_EXPLAIN_BYTES:
+        return _too_long()
+    try:
+        size = len(input.encode("utf-8"))
+    except UnicodeEncodeError:
+        input = _as_javascript_reads(input)
+        size = len(input.encode("utf-8", "surrogatepass"))
+    if size > MAX_EXPLAIN_BYTES:
+        return _too_long()
     # Extract the path by string surgery, never with a URL parser:
     # WHATWG parsing resolves dot segments (.. and %2e%2e) that the
     # server treats as literal path bytes (audit P-3). A query or

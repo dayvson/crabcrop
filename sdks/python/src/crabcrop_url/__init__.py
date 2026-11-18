@@ -264,6 +264,18 @@ def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
     return hmac.compare_digest(sign(secret, remainder), signature)
 
 
+def _utf8_as_javascript_writes(text: str) -> bytes:
+    """The UTF-8 bytes TextEncoder and ``node:crypto`` write for the
+    same text in JavaScript: a lone surrogate, which UTF-8 cannot
+    encode, becomes U+FFFD, and a surrogate pair the character it
+    encodes."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        units = text.encode("utf-16-le", "surrogatepass")
+        return units.decode("utf-16-le", "replace").encode("utf-8")
+
+
 def verify_url_signature(
     secret_or_keyring: Union[str, bytes, Keyring], input: str
 ) -> Optional[bool]:
@@ -281,7 +293,12 @@ def verify_url_signature(
     unknown ID is ``False``), and an unkeyed URL consults every key.
     A remainder that begins with `RESERVED_SEGMENT` is ``False``
     whatever its tag. Each comparison is constant-time
-    (``hmac.compare_digest``), as in `verify`."""
+    (``hmac.compare_digest``), as in `verify`.
+
+    A lone surrogate in the URL or in a ``str`` secret, which UTF-8
+    cannot encode, is hashed as U+FFFD, the bytes the TypeScript
+    SDK's HMAC hashes for it, so no URL and no secret of text makes
+    this raise."""
     explained = explain_url(input)
     signature = explained.signature
     if signature is None or signature.kind != "hmac":
@@ -293,9 +310,11 @@ def verify_url_signature(
     if is_reserved_remainder(remainder):
         return False
     tag = signature.value
+    message = _utf8_as_javascript_writes(remainder)
 
     def made_by(secret: Union[str, bytes]) -> bool:
-        return hmac.compare_digest(sign(secret, remainder), tag)
+        key = _utf8_as_javascript_writes(secret) if isinstance(secret, str) else secret
+        return hmac.compare_digest(hmac.new(key, message, hashlib.sha256).hexdigest(), tag)
 
     if not isinstance(secret_or_keyring, Mapping):
         return made_by(secret_or_keyring)
