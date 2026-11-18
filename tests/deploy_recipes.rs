@@ -1287,7 +1287,8 @@ fn images_carry_the_third_party_notices() {
     // Runtime's license and its own third-party notices,
     // extracted from the package its download stage checks
     // (issue #733), which THIRD-PARTY-NOTICES.md tells the
-    // reader to look for.
+    // reader to look for, and the license texts of the
+    // models it adds (issue #702).
     const COPY: &str = "COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/crabcrop/";
     for rel in ["Dockerfile", "Dockerfile.release"] {
         let stage = final_stage(&read(rel));
@@ -1322,6 +1323,73 @@ fn images_carry_the_third_party_notices() {
         read("THIRD-PARTY-NOTICES.md").contains(&format!("`{notices}/ThirdPartyNotices.txt`")),
         "THIRD-PARTY-NOTICES.md: points the reader at ONNX Runtime's notices in the AI image"
     );
+
+    // The models' license texts are committed in
+    // scripts/notices/models/, in a directory for each model
+    // the runtime stage adds, named after its file in /models,
+    // and the runtime stage installs them all.
+    // THIRD-PARTY-NOTICES.md names each model with the
+    // checksum its ADD pins, and each text by its path in the
+    // image. The notices template pins the same checksums, so
+    // a model replaced without its notice fails both this test
+    // and scripts/check_notices.py; one added without its
+    // texts, or texts left for a model the image dropped, fail
+    // this test.
+    let models = "/usr/share/doc/crabcrop/models";
+    assert!(
+        runtime
+            .iter()
+            .any(|i| i == &format!("COPY scripts/notices/models {models}")),
+        "Dockerfile.ai: the runtime stage installs the models' license texts at {models}: {runtime:#?}"
+    );
+    // The file wraps its prose: read line breaks as spaces.
+    let listed = read("THIRD-PARTY-NOTICES.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let texts = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/notices/models");
+    let mut added = Vec::new();
+    for add in runtime.iter().filter(|i| i.starts_with("ADD ")) {
+        let words: Vec<&str> = add.split_whitespace().collect();
+        let sha = words
+            .iter()
+            .find_map(|w| w.strip_prefix("--checksum=sha256:"))
+            .unwrap_or_else(|| panic!("Dockerfile.ai: an ADD with no SHA-256 pin: {add}"));
+        let path = words.last().expect("an ADD names its destination");
+        let name = path
+            .strip_prefix("/models/")
+            .and_then(|file| Path::new(file).file_stem())
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_else(|| {
+                panic!("Dockerfile.ai: an ADD that is not a model in /models: {add}")
+            });
+        let dir = texts.join(name);
+        assert!(
+            dir.is_dir() && !files_under(&dir).is_empty(),
+            "Dockerfile.ai adds {path}, and scripts/notices/models/{name}/ holds no license text for it"
+        );
+        assert!(
+            listed.contains(&format!("`{path}` (SHA-256 `{sha}`)")),
+            "THIRD-PARTY-NOTICES.md: names {path} with the SHA-256 Dockerfile.ai pins for it, {sha}"
+        );
+        added.push(name);
+    }
+    assert!(
+        !added.is_empty(),
+        "Dockerfile.ai: the runtime stage adds the models: {runtime:#?}"
+    );
+    for file in files_under(&texts) {
+        let rel = file.strip_prefix(&texts).unwrap().to_str().unwrap();
+        let model = rel.split('/').next().unwrap();
+        assert!(
+            added.contains(&model),
+            "scripts/notices/models/{rel}: Dockerfile.ai adds no model named {model} to /models"
+        );
+        assert!(
+            listed.contains(&format!("`{models}/{rel}`")),
+            "THIRD-PARTY-NOTICES.md: names {models}/{rel}, a license text the AI image carries"
+        );
+    }
 }
 
 #[test]
