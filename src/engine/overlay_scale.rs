@@ -33,6 +33,13 @@ use image::{DynamicImage, ImageBuffer, Pixel, RgbaImage};
 /// two of work, and a check costs a clock read.
 pub(super) const CHECK_EVERY: usize = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// How many parts [`scaled_part`] has scaled on this thread,
+    /// so a test can see how often a render scales its overlay.
+    pub(super) static SCALED_PARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The size the image crate's
 /// `resize(width, u32::MAX, Lanczos3)` gives an image of
 /// `(w, h)`: its rule for fitting inside a box with the
@@ -70,6 +77,8 @@ pub(super) fn scaled_part<E>(
     part: crate::filters::Rect,
     check: impl FnMut() -> Result<(), E>,
 ) -> Result<RgbaImage, E> {
+    #[cfg(test)]
+    SCALED_PARTS.set(SCALED_PARTS.get() + 1);
     let (x, y, w, h) = part;
     if size == (image.width(), image.height()) {
         // The crate copies an image already at the size.
