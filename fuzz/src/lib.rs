@@ -539,8 +539,8 @@ pub fn check_chain(input: &str) -> ChainOutcome {
 }
 
 /// The filter leg of [`check_chain`]. Returns how many
-/// filters it applied before the chain ended or a budget
-/// stopped it.
+/// plain filters it applied before the chain ended or a
+/// budget stopped it; the others are not counted.
 fn check_filter_leg(ops: &[Operation]) -> usize {
     let chain: Vec<&PlainFilter> = ops
         .iter()
