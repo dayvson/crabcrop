@@ -16,4 +16,4 @@ A [WordPress plugin](../plugins/wordpress) rewrites a WordPress site's media URL
 
 The [playground](../playground) is a static page (no build step, no server state) for building, signing, previewing, and debugging URLs in the browser: the secret never leaves the page, signatures verify locally, and pasted URLs are explained segment by segment with errors highlighted.
 
-For coding agents, [`sdks/mcp`](../sdks/mcp) is a first-party MCP server (stdio, MCP 2024-11-05 through 2025-11-25; it bundles the `@crabcrop/url` SDK it is built on) exposing `sign_url`, `explain_url`, `fetch_meta`, and `purge_result` over the same SDK and HTTP surface, configured with `CRABCROP_BASE` / `CRABCROP_SECRET`. Client setup snippets are in its README.
+For coding agents, [`sdks/mcp`](../sdks/mcp) is a first-party MCP server (stdio, MCP 2024-11-05 through 2025-11-25; it bundles the `@crabcrop/url` SDK it is built on) exposing `sign_url`, `explain_url`, `fetch_meta`, and `purge_result` (with an optional expiry) over the same SDK and HTTP surface, configured with `CRABCROP_BASE` / `CRABCROP_SECRET`. Client setup snippets are in its README.
