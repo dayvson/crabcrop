@@ -223,6 +223,138 @@ fn depth_of(value: &PickleValue) -> usize {
     }
 }
 
+/// The pickles of issue #760: an opcode takes a value from
+/// below a MARK, then the TUPLE or SETITEMS that closes the
+/// MARK finds it past the top of the stack. The loop before
+/// the issue panicked there. Each comes with the opcode
+/// that is now refused.
+pub(super) const STALE_MARKS: &[(&str, &[u8])] = &[
+    ("BUILD", b"N}(bt."),
+    ("TUPLE2", b"))(\x86t."),
+    ("BUILD", b"N}(bu."),
+];
+
+/// For each opcode that pops or reads the stack, a pickle
+/// where it uses a value from below an open MARK. CPython's
+/// unpickler refuses each one ("unexpected MARK found");
+/// the loop before issue #760 accepted each one.
+pub(super) const BELOW_A_MARK: &[(&str, &[u8])] = &[
+    // The object under the state.
+    ("BUILD", b"}(Nb."),
+    // The callable under the arguments.
+    ("REDUCE", b"ccollections\nOrderedDict\n()R."),
+    // The persistent id.
+    (
+        "BINPERSID",
+        b"(\x8c\x07storagectorch\nFloatStorage\n\x8c\x010\x8c\x03cpuK\x01t(Q.",
+    ),
+    // The dict under the key and value.
+    ("SETITEM", b"}(\x8c\x01k\x8c\x01vs."),
+    // The dict under the MARK that SETITEMS closes, below
+    // the MARK before it.
+    ("SETITEMS", b"}((\x8c\x01k\x8c\x01vu."),
+    // One value below the MARK.
+    ("TUPLE1", b")(\x85."),
+    ("TUPLE2", b")(N\x86."),
+    ("TUPLE3", b")(NN\x87."),
+    // The top the memo would store.
+    ("BINPUT", b"N(q\x00."),
+    ("LONG_BINPUT", b"N(r\x00\x00\x00\x00."),
+    // The pickle's value.
+    ("STOP", b"N(."),
+];
+
+/// The same opcodes using only values above a MARK that
+/// has a value under it, closed by TUPLE before the end.
+/// CPython reads each one, and so does the machine. STOP's
+/// value stands over a MARK at the bottom, which fences
+/// nothing: over any other MARK, a value stands under the
+/// MARK too, and STOP refuses a stack of two.
+pub(super) const ABOVE_A_MARK: &[(&str, &[u8])] = &[
+    ("BUILD", b"N(}Nbt\x86."),
+    ("REDUCE", b"N(ccollections\nOrderedDict\n)Rt\x86."),
+    (
+        "BINPERSID",
+        b"N((\x8c\x07storagectorch\nFloatStorage\n\x8c\x010\x8c\x03cpuK\x01tQt\x86.",
+    ),
+    ("SETITEM", b"N(}\x8c\x01k\x8c\x01vst\x86."),
+    // The dict under the MARK that SETITEMS closes, above
+    // the MARK before it: CPython reads it there.
+    ("SETITEMS", b"N(}(\x8c\x01k\x8c\x01vut\x86."),
+    ("TUPLE1", b"N(N\x85t\x86."),
+    ("TUPLE2", b"N(NN\x86t\x86."),
+    ("TUPLE3", b"N(NNN\x87t\x86."),
+    ("BINPUT", b"N(Nq\x00t\x86."),
+    ("LONG_BINPUT", b"N(Nr\x00\x00\x00\x00t\x86."),
+    ("STOP", b"(N."),
+];
+
+/// The refusal of `name` at a MARK.
+fn below_a_mark(name: &str) -> String {
+    format!("a pickle {name} uses a value from below an open MARK")
+}
+
+#[test]
+fn unpickle_refuses_the_pickles_that_left_a_stale_mark_without_a_panic() {
+    for (name, pkl) in STALE_MARKS {
+        let result = std::panic::catch_unwind(|| unpickle(pkl))
+            .unwrap_or_else(|_| panic!("b\"{}\" panicked", pkl.escape_ascii()));
+        assert_eq!(
+            result,
+            Err(below_a_mark(name)),
+            "b\"{}\"",
+            pkl.escape_ascii()
+        );
+    }
+}
+
+#[test]
+fn a_mark_fences_every_opcode_that_pops_or_reads_the_stack() {
+    for (name, pkl) in BELOW_A_MARK {
+        assert_eq!(
+            unpickle(pkl),
+            Err(below_a_mark(name)),
+            "b\"{}\"",
+            pkl.escape_ascii()
+        );
+    }
+    for (name, pkl) in ABOVE_A_MARK {
+        let result = unpickle(pkl);
+        assert!(
+            result.is_ok(),
+            "{name}: b\"{}\": {result:?}",
+            pkl.escape_ascii()
+        );
+    }
+}
+
+#[test]
+fn the_latest_open_mark_is_the_fence() {
+    // Two MARKs open, at heights 1 and 2: BUILD's state and
+    // object stand above the first but not the second, and
+    // CPython refuses BUILD at the second.
+    assert_eq!(unpickle(b"N(N(Nb."), Err(below_a_mark("BUILD")));
+    // Once TUPLE closes the second, the first is the fence
+    // again, and BUILD's values stand above it: CPython reads
+    // this one, and so does the machine.
+    assert_eq!(
+        unpickle(b"N(}(NtNbt\x86."),
+        Ok(PickleValue::Tuple(vec![
+            PickleValue::None,
+            PickleValue::Tuple(vec![
+                PickleValue::Map(Vec::new()),
+                PickleValue::Tuple(vec![PickleValue::None]),
+            ]),
+        ]))
+    );
+}
+
+#[test]
+fn unpickle_reads_newtrue_as_true_and_newfalse_as_false() {
+    assert_eq!(unpickle(b"\x80\x02\x88."), Ok(PickleValue::Bool(true)));
+    assert_eq!(unpickle(b"\x80\x02\x89."), Ok(PickleValue::Bool(false)));
+}
+
 #[test]
 fn unpickle_bounds_nesting_for_every_opcode_that_nests() {
     for opcode in [b't', 0x85, 0x86, 0x87, b's', b'u'] {

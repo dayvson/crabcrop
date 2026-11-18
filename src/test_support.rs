@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+mod head_archive;
+pub(crate) use head_archive::head_archive;
 mod scratch;
 pub(crate) use scratch::{ScratchDir, scratch_dir};
 mod script;

@@ -5,6 +5,15 @@
 //! machine. It shares the free functions there (`measure`,
 //! `charge`, `reduce` and the rest), which that change left
 //! as they were.
+//!
+//! Two things changed in the machine after this loop (issue
+//! #760), and the loop keeps them as they were. The machine
+//! refuses an opcode that pops or reads a value from below
+//! an open MARK, where the loop takes the value and goes on,
+//! at times to a panic at the TUPLE or SETITEMS that finds
+//! the MARK past the top of the stack. And the machine
+//! pushes true for NEWTRUE and false for NEWFALSE, where the
+//! loop pushes the reverse. The proofs expect both changes.
 
 use super::super::{
     MAX_DEPTH, PickleValue, charge, check_nesting, measure, nesting_error, reduce, set_map_entry,

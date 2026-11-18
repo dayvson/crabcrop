@@ -1287,6 +1287,41 @@ fn ai_construction_with_real_models_builds_every_provider() {
 }
 
 #[test]
+fn build_aesthetic_names_its_variable_for_a_head_that_reaches_below_a_mark() {
+    // Issue #760: this head's pickle takes a value from below
+    // a MARK, which panicked the load and the boot with it.
+    // The boot now stops on the configuration error every
+    // malformed head file gets, for CRABCROP_AESTHETIC_HEAD.
+    // Boot loads the CLIP models before the head, but
+    // build_aesthetic, the head's own step, needs none of
+    // them, so this runs without the models.
+    let head = temp_file(
+        "aesthetic-stale-mark",
+        &crate::test_head_archive::head_archive(b"N}(bt.", &[]),
+    );
+    let err = build_aesthetic(Some(head.as_str()))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Build {
+                var: Some("CRABCROP_AESTHETIC_HEAD"),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.starts_with("cannot load the aesthetic head: the aesthetic head ")
+            && message
+                .ends_with(" is not usable: a pickle BUILD uses a value from below an open MARK"),
+        "{message}"
+    );
+}
+
+#[test]
 fn declared_detectors_refuse_an_oversized_file() {
     // A declarations file past the byte cap refuses at
     // the read, before any parsing or load (audit R2-27).
