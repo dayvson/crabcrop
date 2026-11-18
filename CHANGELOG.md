@@ -28,6 +28,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [0.13.1] - 2026-11-17
 
+- No setting changes, and renders cached by 0.13.0 keep serving. `/health` now answers `503 request_log_stalled` once the request log's queue has stayed full for 5 seconds (issue #707).
+- An image request whose client goes away now leaves its log line and metrics, with the status `499` (issue #707).
+- An animated WebP past the animation budgets is refused from its headers, and the host lookups of one origin's redirects hold at most 16 of the 128 lookup slots.
+
 ### Added
 
 - `/metrics` shows the request log's queue and the AI, video, animation and `/explain` probe gates (issue #707). The queue: the bytes of lines it holds, `crabcrop_request_log_queue_bytes`, against the 8 MiB it holds before requests wait for room, `crabcrop_request_log_queue_capacity_bytes`; the requests waiting for room, `crabcrop_request_log_requests_waiting`; and the seconds it has spent full, `crabcrop_request_log_queue_full_seconds_total`. With `CRABCROP_LOG_SYNC=1` there is no queue, and none of these series. The gates are shown as the lanes are, `crabcrop_gate_in_use` against `crabcrop_gate_capacity`, with `gate="ai"`, `gate="video"`, `gate="animation"` and `gate="probe"`. The loader and engine error counters, the byte totals and the cache hit and miss counters gained the `# HELP` lines they lacked, so every series now has one.
@@ -53,6 +57,12 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
   Since 0.11.0 a render that has started outlives its client and is stored, but the request was dropped with its record, so it left neither, and nor did the requests waiting on its render whose clients gave up too, a miss dropped before its render started, or a meta or debug request dropped mid-render. Each now records itself when the server stops working on it: at once for a request that stops where it is, and once its render is stored for a render that finishes for nobody, with its load and render times. `499` is the "client closed request" of nginx's logs: no response carries it, it counts in `status_class="4xx"`, and such a request served no bytes. A request whose client gives up while it waits for room in the log's queue was never handled and leaves nothing, as before. A request line also names its method: a `HEAD` request, which the image route answers too, was logged as `GET`. And a server whose standard output had no reader left during boot (a log collector that exited) no longer panics at its first boot line: a boot line that cannot be written is lost, stderr says so once, and the server boots and serves, the request log counting the lines it cannot write as it does once the server serves.
 
 ## [0.13.0] - 2026-11-15
+
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #668).
+- Request log lines now reach standard output up to about a millisecond after their response, unless `CRABCROP_LOG_SYNC=1` is set (issue #642).
+- Every host now writes AVIF in four tiles, so replicas render the same file, unless the new `CRABCROP_AVIF_TILES` names another count (issues #671 and #688).
+- JPEG XL output of small images with an alpha channel no longer answers `500`, or decodes fully transparent under quality 15 (issues #670 and #696).
+- JPEG output encodes in about a third of the time, and a JPEG first resized to a third or less decodes at reduced scale (issues #653 and #668).
 
 ### Added
 
@@ -218,6 +228,12 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [0.12.0] - 2026-11-13
 
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #567).
+- Boot refuses placeholder secrets from crabcrop's docs and a `CRABCROP_ALLOWED_SOURCES` that names no host: replace them before upgrading (issues #588, #590).
+- The Helm chart and the kustomize base now request 100m of CPU and 128Mi of memory, so values that set only limits should set requests too (issue #592).
+- The server now bounds its own connections, with a header timeout, an idle timeout and `CRABCROP_MAX_CONNECTIONS` (issue #607).
+- A disk tier that stops answering no longer hangs requests, and a purge no longer deletes another deployment's entries in a shared bucket (issues #572 and #608).
+
 ### Added
 
 - With the shared tier on, `/metrics` now shows when a replica cannot read the purge tombstones (issue #577).
@@ -344,6 +360,12 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [0.11.0] - 2026-11-10
 
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #564).
+- Purge any CDN in front of the server after upgrading (issue #569). A response a client hint applies to is now `Cache-Control: private`, and the Cloudflare, CloudFront, BunnyCDN and Akamai recipes set the new `CRABCROP_CLIENT_HINTS=0`.
+- A source whose host resolves to a non-public address now answers `502` instead of `403`. A remainder that begins with `crabcrop` answers `400 reserved_segment`.
+- Animated GIF, JPEG XL, HEIC, video frame and PDF sources are held to tighter decode bounds, and source host lookups run at most 128 at once.
+- Slow purge tombstone reads delay a starting replica by at most 10 seconds, and a FIFO in the disk tier's directory no longer blocks boot (issues #545 and #549).
+
 ### Changed
 
 - This release starts a new cache epoch.
@@ -440,6 +462,11 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [0.10.1] - 2026-11-09
 
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #528).
+- A source with a 16384 px side and no sizing step in the URL now answers `400 unsupported_operation` in every format (issue #528).
+- A `DPR` or `Sec-CH-DPR` hint that would push a size past the limits now steps down to a factor that fits instead of failing (issue #529).
+- SVG handling, preset expansion and PDF rasters are bounded, and AVIF sources decode in the capped worker process (issue #522).
+
 ### Changed
 
 - This release starts a new cache epoch.
@@ -489,6 +516,12 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 - AVIF sources are checked for consistent container sizes before decoding, and decoding runs in the capped worker process with a deadline (issue #522). An AVIF whose item table does not agree with the data the file holds, or whose declared image size is past the decode limits, fails with `502` (`415` as an upload) before any decoding; the explain report reads an AVIF's size from the container without decoding it; and an AVIF still decoding at the processing deadline fails with `504` while the server carries on. Valid files decode to the same pixels as before.
 
 ## [0.10.0] - 2026-11-08
+
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #464).
+- Set `CRABCROP_META_MODE=1` before upgrading if you use meta responses, now off by default, and check the three settings boot now refuses (issues #453 and #469).
+- The binary serves only when it runs with no arguments, and a bad source URL answers `400 invalid_source` instead of `502` (issues #467 and #470).
+- A Nuxt site that passed the secret as a provider option shipped it to every browser: rotate it (issue #381).
+- SVG sources render in a capped worker process (issue #447), and shared-tier purges leave a tombstone in the bucket (issues #446, #461).
 
 ### Added
 
