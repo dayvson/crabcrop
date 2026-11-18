@@ -6691,7 +6691,9 @@ mod tests {
         let source = AwsCredentials::container_refreshing(
             ContainerEndpoint {
                 url,
-                token: Some(ContainerToken::Value("pod-identity-token".to_string())),
+                token: Some(ContainerToken::Value(
+                    "pod-identity-token".to_string().into(),
+                )),
                 var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             },
             std::time::Duration::from_secs(1),

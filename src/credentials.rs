@@ -107,8 +107,9 @@ pub struct ContainerEndpoint {
 /// Where a fetch's `Authorization` token comes from.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ContainerToken {
-    /// `AWS_CONTAINER_AUTHORIZATION_TOKEN`'s value.
-    Value(String),
+    /// `AWS_CONTAINER_AUTHORIZATION_TOKEN`'s value, zeroed when
+    /// it is dropped, like the other secrets.
+    Value(zeroize::Zeroizing<String>),
     /// `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`: read at every
     /// fetch.
     File(PathBuf),
@@ -360,7 +361,7 @@ impl Container {
     async fn fetch(&self) -> Result<Fetched, String> {
         let mut request = self.client.get(&self.endpoint.url);
         if let Some(token) = &self.endpoint.token {
-            request = request.header(reqwest::header::AUTHORIZATION, read_token(token)?);
+            request = request.header(reqwest::header::AUTHORIZATION, read_token(token)?.as_str());
         }
         let mut resp = request
             .send()
@@ -388,19 +389,20 @@ impl Container {
 /// The token a fetch sends, from the variable or the file,
 /// with surrounding whitespace dropped (a file may end in a
 /// newline). A token that could break out of its header is
-/// refused.
-fn read_token(token: &ContainerToken) -> Result<String, String> {
+/// refused. Each copy is zeroed when it is dropped, the
+/// file's whole text included.
+fn read_token(token: &ContainerToken) -> Result<zeroize::Zeroizing<String>, String> {
     let value = match token {
-        ContainerToken::Value(value) => value.trim().to_string(),
-        ContainerToken::File(path) => std::fs::read_to_string(path)
-            .map_err(|e| {
+        ContainerToken::Value(value) => zeroize::Zeroizing::new(value.trim().to_string()),
+        ContainerToken::File(path) => {
+            let text = zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
                 format!(
                     "cannot read AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE {}: {e}",
                     path.display()
                 )
-            })?
-            .trim()
-            .to_string(),
+            })?);
+            zeroize::Zeroizing::new(text.trim().to_string())
+        }
     };
     if value.is_empty() || !header_safe(&value) {
         return Err("the authorization token is empty or not a header value".to_string());
@@ -643,7 +645,7 @@ pub fn container_endpoint(
                 "AWS_CONTAINER_AUTHORIZATION_TOKEN must be one line of printable text".to_string(),
             ));
         }
-        Some(ContainerToken::Value(value))
+        Some(ContainerToken::Value(value.into()))
     } else {
         None
     };
@@ -665,6 +667,33 @@ mod tests {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         }
+    }
+
+    #[test]
+    fn the_container_token_zeroes_its_value() {
+        // What dropping a token from the variable runs: its
+        // bytes are wiped, as the other secrets' are.
+        let endpoint = container_endpoint(env(&[
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "http://127.0.0.1:8080/creds",
+            ),
+            ("AWS_CONTAINER_AUTHORIZATION_TOKEN", "pod-token"),
+        ]))
+        .unwrap()
+        .unwrap();
+        let Some(ContainerToken::Value(mut token)) = endpoint.token else {
+            panic!("a token from AWS_CONTAINER_AUTHORIZATION_TOKEN");
+        };
+        assert_eq!(token.as_str(), "pod-token");
+        zeroize::Zeroize::zeroize(&mut token);
+        assert_eq!(token.as_str(), "");
+        // The copy each fetch sends is zeroed when it is dropped
+        // too, whether it came from the variable or the file.
+        fn zeroed_when_dropped<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let sent = read_token(&ContainerToken::Value("pod-token".to_string().into())).unwrap();
+        zeroed_when_dropped(&sent);
+        assert_eq!(sent.as_str(), "pod-token");
     }
 
     #[test]
@@ -877,7 +906,7 @@ mod tests {
         });
         let source = AwsCredentials::container(ContainerEndpoint {
             url,
-            token: Some(ContainerToken::Value("pod-token".to_string())),
+            token: Some(ContainerToken::Value("pod-token".to_string().into())),
             var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         })
         .unwrap();
@@ -894,7 +923,9 @@ mod tests {
     fn debug_prints_neither_token_nor_path_nor_secret() {
         let source = AwsCredentials::container(ContainerEndpoint {
             url: "http://169.254.170.2/v2/credentials/task-guid-1234".to_string(),
-            token: Some(ContainerToken::Value("bearer-secret-token".to_string())),
+            token: Some(ContainerToken::Value(
+                "bearer-secret-token".to_string().into(),
+            )),
             var: "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         })
         .unwrap();
