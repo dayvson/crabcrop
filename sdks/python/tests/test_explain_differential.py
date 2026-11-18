@@ -148,6 +148,9 @@ INSERTS = list("0123456789abcdefxX:,()/+-.%eE_ ;*!~?#") + [
     "\xa0", "\u2028", "\r", "\n", "\t", "\x00", "😀", "中", "%41", "%C3%A9", "%ED%A0%80",
     "%C0%80", "%F4%90%80%80", "%E2%82", "%zz", "%4", "%2B1", "%2C", "%3A", "%28", "%20",
     "crabcrop/", "purge/", "upload/", "preset:thumb/", "exp:1/", "maxage:0/", "debug:focal/",
+    # Surrogate code points, which a Python string can hold: two lone
+    # ones and a pair, which JavaScript reads as the character U+1D400.
+    chr(0xD800), chr(0xDFFF), chr(0xD835) + chr(0xDC00),
 ]
 NUMBER = re.compile(r"[+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?")
 
@@ -327,7 +330,9 @@ def verifier_questions(inputs):
         if signature is None or signature.kind != "hmac":
             questions.append([SECRET, given])
             continue
-        remainder = explained.remainder.encode("utf-8", "surrogatepass")
+        # The bytes JavaScript's HMAC hashes: a lone surrogate as U+FFFD.
+        units = explained.remainder.encode("utf-16-le", "surrogatepass")
+        remainder = units.decode("utf-16-le", "replace").encode("utf-8")
         tag = hmac.new(SECRET.encode("utf-8"), remainder, hashlib.sha256).hexdigest()
         named = signature.key_id or "k1"
         for url in (given, given.replace(signature.value, tag, 1)):
@@ -375,30 +380,32 @@ class TestDifferential(unittest.TestCase):
             got = typescript_shape(cc.explain_url(given, NOW))
             if got != want:
                 mismatches.append((given, got, want))
-        shown = "\n".join(
-            f"input {given!r}\n  python     {json.dumps(got)}\n  typescript {json.dumps(want)}"
-            for given, got, want in mismatches[:5]
-        )
-        self.assertEqual(
-            len(mismatches),
-            0,
-            f"{len(mismatches)} of {len(inputs)} inputs explain differently (seed {SEED}):\n{shown}",
-        )
         answers = {None: 0, True: 0, False: 0}
         disagreements = []
         for (key, given), want in zip(questions, typescript["verdicts"]):
-            got = cc.verify_url_signature(key, given)
-            answers[got] += 1
+            try:
+                got = cc.verify_url_signature(key, given)
+            except Exception as error:  # noqa: BLE001 (an answer TypeScript did not give)
+                got = f"{type(error).__name__}: {error}"
+            if got in answers:
+                answers[got] += 1
             if got is not want:
                 disagreements.append((key, given, got, want))
         shown = "\n".join(
-            f"verify_url_signature({key!r}, {given!r})\n  python {got}, typescript {want}"
-            for key, given, got, want in disagreements[:5]
+            [
+                f"input {given!r}\n  python     {json.dumps(got)}\n  typescript {json.dumps(want)}"
+                for given, got, want in mismatches[:5]
+            ]
+            + [
+                f"verify_url_signature({key!r}, {given!r})\n  python {got}, typescript {want}"
+                for key, given, got, want in disagreements[:5]
+            ]
         )
         self.assertEqual(
-            len(disagreements),
-            0,
-            f"{len(disagreements)} of {len(questions)} verifier answers differ (seed {SEED}):\n{shown}",
+            (len(mismatches), len(disagreements)),
+            (0, 0),
+            f"{len(mismatches)} of {len(inputs)} inputs explain differently, and {len(disagreements)} of "
+            f"{len(questions)} verifier answers differ (seed {SEED}):\n{shown}",
         )
         # The questions reach every answer, True included.
         self.assertGreater(min(answers.values()), len(inputs) // 20, answers)
