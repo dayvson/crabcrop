@@ -52,6 +52,8 @@ The `convolution` filter covers the sharpen, blur, and edge styles the built-ins
 curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/https://example.com/photo.jpg"
 ```
 
+Some filters split a frame into row bands, once it is large enough to repay that, and work on the bands side by side: the blurs (the `blur` filter, a `pad` blur fill, the face, region and class blurs, and the studio shadow), `rotate` at an angle that is not a quarter turn, `grayscale`, `brighten`, `contrast`, `gamma`, `exposure`, `highlights_shadows`, `huerotate`, `saturation`, `vibrance`, `rgb`, `curve`, `sepia`, `duotone`, `monochrome`, `enhance`, `flip`, and the half and three-quarter turns. The bands run on the server's filter threads: one pool that every request shares, started at boot with a thread for each core the server may use. A one-core host starts none, and runs the bands on the request's own thread. A filter splits a frame into at most four bands, and the request waits while the pool runs them, so the filters of all the requests in flight keep at most one thread per core busy. The output is the same bytes whatever the number of bands or cores.
+
 **Encoding directives** leave the pixels alone and steer the encoder:
 
 | Directive | Parameters | Description | Example |
