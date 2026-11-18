@@ -177,6 +177,7 @@ fn state(dir: &std::path::Path) -> AppState {
         width_step: 100,
         client_hints: true,
         explain_enabled: true,
+        purge_require_expiry: false,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),

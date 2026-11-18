@@ -1462,6 +1462,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
         ("CRABCROP_META_MODE", "1"),
         ("CRABCROP_CLIENT_HINTS", "0"),
         ("CRABCROP_EXPLAIN", "0"),
+        ("CRABCROP_PURGE_REQUIRE_EXPIRY", "1"),
         ("CRABCROP_AVIF_TILES", "16"),
     ]))
     .unwrap();
@@ -1484,6 +1485,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     assert!(state.meta_enabled);
     assert!(!state.client_hints);
     assert!(!state.explain_enabled);
+    assert!(state.purge_require_expiry);
     assert_eq!(state.avif_tiles.count(), 16);
     assert_eq!(state.config_fingerprint, config.config_fingerprint);
     assert_eq!(

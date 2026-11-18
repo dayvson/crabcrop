@@ -35,6 +35,11 @@ const vectors = JSON.parse(
   source?: string;
   refuses?: { input: string; character: string };
   reserved?: boolean;
+  endpoint?: string;
+  target?: string;
+  expires?: number;
+  signed?: string;
+  purge_signature?: string;
 }[];
 
 for (const v of vectors) {
@@ -481,6 +486,53 @@ test("purge signatures match the published vectors", () => {
     purgeGroupSignature("test-secret", "thumb"),
     purgeSignature("test-secret", "thumb"),
   );
+});
+
+// The purge vectors: each endpoint's helper, plain or
+// expiring, reproduces the signature, and the expiring form
+// is the plain signature over the signed string, which is
+// also what follows the signature segment in the path.
+let purges = 0;
+let expiringPurges = 0;
+for (const v of vectors) {
+  if (v.purge_signature === undefined) {
+    continue;
+  }
+  purges++;
+  if (v.expires !== undefined) {
+    expiringPurges++;
+  }
+  const expected = v.purge_signature;
+  test(`purge vector: ${v.description}`, () => {
+    assert.ok(v.endpoint === "purge" || v.endpoint === "purge-group", v.endpoint);
+    const helper = v.endpoint === "purge" ? purgeSignature : purgeGroupSignature;
+    assert.equal(helper(v.secret, v.target as string, v.expires), expected);
+    assert.equal(helper(v.secret, v.signed as string), expected);
+  });
+}
+test("the spec carries the purge vectors", () => {
+  assert.ok(purges >= 6, `${purges} purge vectors`);
+  assert.ok(expiringPurges >= 3, `${expiringPurges} expiring purge vectors`);
+});
+
+test("expiring purge signatures cover the expiry", () => {
+  const target = "300x200/https://example.com/a.jpg";
+  assert.notEqual(
+    purgeSignature("test-secret", target, 1893456000),
+    purgeSignature("test-secret", target, 1893456001),
+  );
+  assert.notEqual(purgeSignature("test-secret", target, 1893456000), purgeSignature("test-secret", target));
+  assert.notEqual(
+    purgeGroupSignature("test-secret", "thumb", 1893456000),
+    purgeSignature("test-secret", "thumb", 1893456000),
+  );
+  // An expiry the server's grammar cannot read is refused
+  // at mint time, for both endpoints.
+  for (const bad of [1.5, -1, NaN, Infinity, 2 ** 53]) {
+    assert.throws(() => purgeSignature("test-secret", target, bad), /expires must be/);
+    assert.throws(() => purgeGroupSignature("test-secret", "thumb", bad), /expires must be/);
+  }
+  assert.match(purgeGroupSignature("test-secret", "thumb", 0), /^[0-9a-f]{64}$/);
 });
 
 test("upload signatures match the published vectors", () => {

@@ -82,8 +82,14 @@ fn main() {
                     Err(e) => format!("ERROR:{e:?}"),
                 }
             }
-            "purge_sig" => purge_signature(secret.unwrap(), s(&c["target"])),
-            "group_sig" => purge_group_signature(secret.unwrap(), s(&c["group"])),
+            "purge_sig" => match opt_u64(&c["expires"]) {
+                Some(e) => purge_signature_with_expiry(secret.unwrap(), s(&c["target"]), e),
+                None => purge_signature(secret.unwrap(), s(&c["target"])),
+            },
+            "group_sig" => match opt_u64(&c["expires"]) {
+                Some(e) => purge_group_signature_with_expiry(secret.unwrap(), s(&c["group"]), e),
+                None => purge_group_signature(secret.unwrap(), s(&c["group"])),
+            },
             "upload_sig" => match opt_u64(&c["expires"]) {
                 Some(e) => upload_signature_with_expiry(secret.unwrap(), s(&c["name"]), e),
                 None => upload_signature(secret.unwrap(), s(&c["name"])),

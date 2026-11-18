@@ -38,6 +38,7 @@ SIGNED_VECTORS = [v for v in VECTORS if "signature" in v]
 SEALED_VECTORS = [v for v in VECTORS if v.get("sealed")]
 REFUSAL_VECTORS = [v for v in VECTORS if "refuses" in v]
 RESERVED_VECTORS = [v for v in VECTORS if v.get("reserved")]
+PURGE_VECTORS = [v for v in VECTORS if "purge_signature" in v]
 RESERVED_MESSAGE = (
     'remainder begins with the reserved segment "crabcrop": '
     "it is kept for key derivation, and no image URL may begin with it"
@@ -189,6 +190,47 @@ class TestPurgeSignatures(unittest.TestCase):
             purge_group_signature("test-secret", "thumb"),
             purge_signature("test-secret", "thumb"),
         )
+
+    def test_purge_vectors(self):
+        # Each endpoint's helper, plain or expiring, reproduces
+        # the spec's signature, and the expiring form is the
+        # plain signature over the signed string, which is
+        # also what follows the signature segment in the path.
+        self.assertGreaterEqual(len(PURGE_VECTORS), 6)
+        self.assertGreaterEqual(len([v for v in PURGE_VECTORS if "expires" in v]), 3)
+        helpers = {"purge": purge_signature, "purge-group": purge_group_signature}
+        for v in PURGE_VECTORS:
+            with self.subTest(description=v["description"]):
+                helper = helpers[v["endpoint"]]
+                self.assertEqual(
+                    helper(v["secret"], v["target"], v.get("expires")),
+                    v["purge_signature"],
+                )
+                self.assertEqual(helper(v["secret"], v["signed"]), v["purge_signature"])
+
+    def test_expiring_form_covers_the_expiry(self):
+        target = "300x200/https://example.com/a.jpg"
+        self.assertNotEqual(
+            purge_signature("test-secret", target, 1893456000),
+            purge_signature("test-secret", target, 1893456001),
+        )
+        self.assertNotEqual(
+            purge_signature("test-secret", target, 1893456000),
+            purge_signature("test-secret", target),
+        )
+        self.assertNotEqual(
+            purge_group_signature("test-secret", "thumb", 1893456000),
+            purge_signature("test-secret", "thumb", 1893456000),
+        )
+        # An expiry the server's grammar cannot read is
+        # refused at mint time, for both endpoints.
+        for bad in (1.5, -1, True, "1893456000", 2**64):
+            with self.subTest(expires=bad):
+                with self.assertRaises(ValueError):
+                    purge_signature("test-secret", target, bad)
+                with self.assertRaises(ValueError):
+                    purge_group_signature("test-secret", "thumb", bad)
+        self.assertRegex(purge_group_signature("test-secret", "thumb", 0), "^[0-9a-f]{64}$")
 
 
 class TestUploadSignatures(unittest.TestCase):
