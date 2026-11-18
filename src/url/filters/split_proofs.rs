@@ -140,10 +140,15 @@ fn check(
 }
 
 /// Fail with every difference, or print what was compared.
+/// "main" is the grammar frozen at 6b30e25: a change made to
+/// the grammar on purpose fails here too, and then this
+/// module goes, as [`frozen`] says.
 fn conclude(what: &str, tally: &Tally, bad: &[String]) {
     assert!(
         bad.is_empty(),
-        "{what}: {} differences from main in {} remainders:\n{}",
+        "{what}: {} differences from main in {} remainders (main is the grammar frozen at \
+         6b30e25 in split_proofs/frozen.rs; if the grammar changed on purpose, delete \
+         split_proofs.rs and split_proofs/):\n{}",
         bad.len(),
         tally.remainders,
         bad.join("\n")
