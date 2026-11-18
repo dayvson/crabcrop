@@ -221,16 +221,20 @@ pub(in crate::server) fn compose_annotation(
     }
 }
 
-/// Where an annotation section gets the render's pixels.
-pub(in crate::server) trait FrameSource {
+/// Where an annotation section gets the render's pixels. A
+/// section moves a clone into its blocking task and asks for
+/// the frame there, so the decode runs on the blocking pool
+/// beside the inference it feeds, never on a runtime worker
+/// (issue #736).
+pub(in crate::server) trait FrameSource: Clone + Send + Sync + 'static {
     /// The decoded render, or `None` when it does not
     /// decode.
     fn frame(&self) -> Option<Arc<image::DynamicImage>>;
 }
 
-/// A render on its own, decoded again for every section
-/// that asks: what each section did before the document
-/// shared a frame. The tests hold the shared frame to it.
+/// A render on its own, decoded again for every call: what
+/// the sections did before the document shared a frame. The
+/// tests hold the shared frame to it.
 #[cfg(test)]
 impl FrameSource for crate::engine::ProcessedImage {
     fn frame(&self) -> Option<Arc<image::DynamicImage>> {
@@ -238,49 +242,107 @@ impl FrameSource for crate::engine::ProcessedImage {
     }
 }
 
+/// How a meta document's render is decoded: the engine's
+/// decoder in production, a counting or waiting one in the
+/// tests.
+pub(in crate::server) type FrameDecoder =
+    fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>;
+
 /// The render as the annotation sections of one meta
 /// document read it (issue #676): decoded by the first
 /// section that needs pixels and shared by the sections
 /// after it, where each used to decode the bytes for
-/// itself. The sections run one after the other and only
-/// read the frame, so each sees the pixels it would have
-/// decoded. One decoded frame is alive at a time, as
-/// before: it is now the same one from the first section
-/// to the last. A render that does not decode is not
-/// remembered: every section that asks tries for itself and
-/// reports its own failure, as it always did.
-pub(in crate::server) struct DocumentFrame<'a> {
-    bytes: &'a [u8],
-    decode: fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>,
-    decoded: std::sync::OnceLock<Arc<image::DynamicImage>>,
+/// itself. The sections only read the frame, so each sees
+/// the pixels it would have decoded. One decoded frame is
+/// alive at a time, as before: it is now the same one from
+/// the first section to the last.
+///
+/// The decode runs in the blocking task of the section that
+/// asks first, beside its inference and under its AI permit
+/// (issue #736). On the runtime worker, where it ran before
+/// each section's blocking task, a large render's decode
+/// held that worker from every other request scheduled on
+/// it. A decoder that panics is caught there and answers as
+/// a render that does not decode, so the section fails the
+/// way it fails on bytes that do not decode and the request
+/// still gets its document, where the panic used to unwind
+/// the request's task. A section that asks while another
+/// decodes waits for that decode and shares its frame. A
+/// render that does not decode is not remembered: every
+/// section that asks tries for itself and reports its own
+/// failure, as it always did.
+///
+/// Cloning is cheap: the clones share the render and the
+/// frame.
+#[derive(Clone)]
+pub(in crate::server) struct DocumentFrame(Arc<SharedFrame>);
+
+struct SharedFrame {
+    render: Arc<crate::engine::ProcessedImage>,
+    decode: FrameDecoder,
+    /// The frame, once a section has decoded it. The lock is
+    /// held through the decode, so a section that asks
+    /// meanwhile waits for this frame instead of decoding a
+    /// second one.
+    decoded: std::sync::Mutex<Option<Arc<image::DynamicImage>>>,
 }
 
-impl<'a> DocumentFrame<'a> {
-    pub(in crate::server) fn new(processed: &'a crate::engine::ProcessedImage) -> Self {
-        Self::with_decoder(processed, crate::engine::decode_image)
+impl DocumentFrame {
+    pub(in crate::server) fn new(render: Arc<crate::engine::ProcessedImage>) -> Self {
+        Self::with_decoder(render, crate::engine::decode_image)
     }
 
-    /// A frame decoded by `decode`: the engine's decoder in
-    /// production, a counting one in the tests.
+    /// A frame decoded by `decode`.
     pub(in crate::server) fn with_decoder(
-        processed: &'a crate::engine::ProcessedImage,
-        decode: fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>,
+        render: Arc<crate::engine::ProcessedImage>,
+        decode: FrameDecoder,
     ) -> Self {
-        Self {
-            bytes: &processed.bytes,
+        Self(Arc::new(SharedFrame {
+            render,
             decode,
-            decoded: std::sync::OnceLock::new(),
-        }
+            decoded: std::sync::Mutex::new(None),
+        }))
     }
 }
 
-impl FrameSource for DocumentFrame<'_> {
+impl FrameSource for DocumentFrame {
     fn frame(&self) -> Option<Arc<image::DynamicImage>> {
-        if let Some(frame) = self.decoded.get() {
-            return Some(frame.clone());
+        let shared = &*self.0;
+        // Nothing panics while the lock is held (the decode's
+        // panic is caught below), so it is never poisoned; if
+        // it were, its value is replaced whole and still a
+        // frame or none.
+        let mut decoded = shared
+            .decoded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(frame) = decoded.as_ref() {
+            return Some(Arc::clone(frame));
         }
-        let frame = Arc::new((self.decode)(self.bytes).ok()?);
-        Some(self.decoded.get_or_init(|| frame).clone())
+        let frame = Arc::new(decode_contained(shared.decode, &shared.render.bytes)?);
+        *decoded = Some(Arc::clone(&frame));
+        Some(frame)
+    }
+}
+
+/// Decode a render with `decode`, a panic in the decoder
+/// answering as a render that does not decode (issue #736),
+/// as the engine contains a panic in its run
+/// (`run_process`). The panic hook has already printed the
+/// panic; the line here says what the request did about it.
+fn decode_contained(decode: FrameDecoder, bytes: &[u8]) -> Option<image::DynamicImage> {
+    match std::panic::catch_unwind(move || decode(bytes)) {
+        Ok(decoded) => decoded.ok(),
+        Err(_) => {
+            use std::io::Write as _;
+            // Not `eprintln!`, which panics when stderr is
+            // closed.
+            let _ = writeln!(
+                std::io::stderr(),
+                "meta: decoding the render panicked; the sections that need its pixels answer without them"
+            );
+            None
+        }
     }
 }
 
@@ -311,25 +373,33 @@ pub(in crate::server) async fn annotate_meta(
         .await
         .ok()?
         .ok()?;
-    let img = render.frame()?;
     let tagger = tagger.clone();
+    // The render decodes in the blocking task as well, never
+    // on the runtime worker (issue #736): see
+    // `DocumentFrame`. Every section below does the same.
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        tagger.scores(&img)
+        render.frame().map(|img| tagger.scores(&img))
     })
     .await
     {
-        Ok(Ok(scores)) => match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
-            Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
-            Err(e) => {
-                eprintln!("annotation error: {e}");
-                None
+        Ok(Some(Ok(scores))) => {
+            match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
+                Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
+                Err(e) => {
+                    eprintln!("annotation error: {e}");
+                    None
+                }
             }
-        },
-        Ok(Err(e)) => {
+        }
+        Ok(Some(Err(e))) => {
             eprintln!("annotation error: {e}");
             None
         }
+        // The render does not decode: there is nothing to
+        // tag.
+        Ok(None) => None,
         Err(e) => {
             eprintln!("annotation task failed: {e}");
             None
@@ -373,20 +443,21 @@ pub(in crate::server) async fn detect_meta(
             .ok()?
             .ok()?,
     );
-    let img = render.frame()?;
     let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
     let mut any_answered = false;
     for (name, provider) in providers {
-        // Every provider reads the one frame.
-        let provider_img = Arc::clone(&img);
+        // Every provider reads the one frame: the first
+        // provider's blocking task decodes it, and the
+        // others share it.
+        let render = render.clone();
         let task_permit = permit.clone();
         match tokio::task::spawn_blocking(move || {
             let _permit = task_permit;
-            provider.detect(&provider_img)
+            render.frame().map(|img| provider.detect(&img))
         })
         .await
         {
-            Ok(Ok(detections)) => {
+            Ok(Some(Ok(detections))) => {
                 match check_finite_scores("a detector", detections.iter().map(|d| d.score)) {
                     Ok(()) => {
                         any_answered = true;
@@ -397,9 +468,13 @@ pub(in crate::server) async fn detect_meta(
                     }
                 }
             }
-            Ok(Err(e)) => {
+            Ok(Some(Err(e))) => {
                 eprintln!("detection error from {name}: {e}");
             }
+            // The render does not decode, which only the
+            // first provider's task finds: no provider can
+            // run, and the section is left out.
+            Ok(None) => return None,
             Err(e) => {
                 eprintln!("detection task failed for {name}: {e}");
             }
@@ -482,17 +557,15 @@ pub(in crate::server) async fn moderate_meta(
             Ok(Ok(permit)) => permit,
             _ => return ModerationMeta::Unavailable("busy"),
         };
-    let Some(img) = render.frame() else {
-        return ModerationMeta::Unavailable("inference_failed");
-    };
     let provider = provider.clone();
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        provider.moderate(&img)
+        render.frame().map(|img| provider.moderate(&img))
     })
     .await
     {
-        Ok(Ok(report)) => match check_finite_scores(
+        Ok(Some(Ok(report))) => match check_finite_scores(
             "the moderation provider",
             report
                 .scores
@@ -506,10 +579,11 @@ pub(in crate::server) async fn moderate_meta(
                 ModerationMeta::Unavailable("inference_failed")
             }
         },
-        Ok(Err(e)) => {
+        Ok(Some(Err(e))) => {
             eprintln!("moderation error: {e}");
             ModerationMeta::Unavailable("inference_failed")
         }
+        Ok(None) => ModerationMeta::Unavailable("inference_failed"),
         Err(e) => {
             eprintln!("moderation task failed: {e}");
             ModerationMeta::Unavailable("inference_failed")
@@ -663,17 +737,15 @@ pub(in crate::server) async fn embed_meta(
             Ok(Ok(permit)) => permit,
             _ => return EmbeddingMeta::Unavailable("busy"),
         };
-    let Some(img) = render.frame() else {
-        return EmbeddingMeta::Unavailable("inference_failed");
-    };
     let provider = provider.clone();
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        provider.embed(&img)
+        render.frame().map(|img| provider.embed(&img))
     })
     .await
     {
-        Ok(Ok(embedding)) => {
+        Ok(Some(Ok(embedding))) => {
             match check_finite_scores("the embedding provider", embedding.vector.iter().copied()) {
                 Ok(()) => EmbeddingMeta::Report(embedding),
                 Err(e) => {
@@ -682,10 +754,11 @@ pub(in crate::server) async fn embed_meta(
                 }
             }
         }
-        Ok(Err(e)) => {
+        Ok(Some(Err(e))) => {
             eprintln!("embedding error: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
         }
+        Ok(None) => EmbeddingMeta::Unavailable("inference_failed"),
         Err(e) => {
             eprintln!("embedding task failed: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
@@ -749,17 +822,17 @@ pub(in crate::server) async fn ocr_meta(
             Ok(Ok(permit)) => permit,
             _ => return OcrMeta::Unavailable("busy"),
         };
-    let Some(img) = render.frame() else {
-        return OcrMeta::Unavailable("inference_failed");
-    };
     let provider = provider.clone();
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        provider.recognize_deadline(&img, deadline)
+        render
+            .frame()
+            .map(|img| provider.recognize_deadline(&img, deadline))
     })
     .await
     {
-        Ok(Ok(report)) => {
+        Ok(Some(Ok(report))) => {
             match check_finite_scores("the OCR provider", report.lines.iter().map(|l| l.score)) {
                 Ok(()) => OcrMeta::Report(compose_ocr(&report)),
                 Err(e) => {
@@ -768,10 +841,11 @@ pub(in crate::server) async fn ocr_meta(
                 }
             }
         }
-        Ok(Err(e)) => {
+        Ok(Some(Err(e))) => {
             eprintln!("OCR error: {e}");
             OcrMeta::Unavailable("inference_failed")
         }
+        Ok(None) => OcrMeta::Unavailable("inference_failed"),
         Err(e) => {
             eprintln!("OCR task failed: {e}");
             OcrMeta::Unavailable("inference_failed")
