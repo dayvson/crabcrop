@@ -1,20 +1,21 @@
 //! The threads the filters run their row bands on (issue #739).
 //!
-//! A filter that splits a large frame into row bands used to
-//! ask the host for its core count at every call, and to start
-//! a thread per band for every pass. The bands now run on one
-//! pool, started once: at boot in the server (see
-//! [`start_band_pool`]), or at the first banded pass in a
-//! process that boots no server. The pool has a thread for
-//! each core the process may use, the count the stills lane
-//! takes its permits from, and a pass still splits into at
-//! most [`MAX_BANDS`] bands. The render that runs a pass
-//! waits while the pool runs its bands, as a render waits
-//! while an AVIF encode pool runs its encode, so the band
-//! work of every render at once keeps at most a thread per
-//! core busy. Each render used to start up to four threads of
-//! its own per pass, so a full stills lane could put up to
-//! four band threads per core on the CPU.
+//! A filter that splits a large frame into row bands used
+//! to ask the host for its core count at every call, and to
+//! start a thread per band for every pass. The bands now
+//! run on one pool, started once: at boot in the server
+//! (see [`start_band_pool`]), or in a process that boots no
+//! server the first time a filter that bands runs, whether
+//! or not that frame is large enough to split. The pool has
+//! a thread for each core the process may use, the count
+//! the stills lane takes its permits from, and a pass still
+//! splits into at most [`MAX_BANDS`] bands. The render that
+//! runs a pass waits while the pool runs its bands, as a
+//! render waits while an AVIF encode pool runs its encode,
+//! so the band work of every render at once keeps at most a
+//! thread per core busy. Each render used to start up to
+//! four threads of its own per pass, so a full stills lane
+//! could put up to four band threads per core on the CPU.
 //!
 //! A band reads nothing another band of the same pass writes,
 //! so the bytes do not depend on how a pass is split or on
@@ -137,8 +138,9 @@ pub(crate) fn band_pool() -> &'static BandPool {
 /// Start the pool the filters run their row bands on, unless
 /// it has started (issue #739). The server calls this at
 /// boot, so the host's parallelism is read and the threads
-/// are up before the first render; a process that does not
-/// starts the pool at its first banded pass.
+/// are up before the first render; in a process that does
+/// not, the pool starts the first time a filter that bands
+/// runs.
 pub fn start_band_pool() {
     shared();
 }
