@@ -1,18 +1,23 @@
-"""The Python explainer against the TypeScript one (issue #716), on
-inputs generated from the two grammar corpora: their remainders with
-segments dropped, repeated and swapped, filters dropped and repeated,
-characters changed, and numbers set to the edges of the ranges the
-grammar checks, under every signature shape and URL form the
-explainer reads. Every field of every explanation must agree: the
-signature, each segment's kind, title, detail, error and expiry flag,
-the source, the remainder and the errors, message for message.
+"""The Python explainer and URL verifier against the TypeScript ones
+(issue #716), on inputs generated from the two grammar corpora: their
+remainders with segments dropped, repeated and swapped, filters
+dropped and repeated, characters changed, and numbers set to the edges
+of the ranges the grammar checks, under every signature shape and URL
+form the explainer reads. Every field of every explanation must agree:
+the signature, each segment's kind, title, detail, error and expiry
+flag, the source, the remainder and the errors, message for message.
+So must every answer of the two verifiers, asked about each input as
+generated and re-signed with a known secret, under one secret and
+under keyrings.
 
-The TypeScript explainer runs on Node from its source,
-sdks/typescript/src/explain.ts, which imports nothing but limits.ts,
+The TypeScript SDK runs on Node from its sources, sdks/typescript/src,
 so the run needs Node 22.18 or newer (or 23.6 or newer), where type
-stripping is on by default, and no build or npm install. Without it
-the test is skipped. scripts/test_all.sh runs it on the Node its
-TypeScript steps use.
+stripping is on by default, and no build or npm install: the harness
+resolves the `#crypto` import, which package.json maps to the build
+output, to the sources' crypto/node.ts. Without such a Node the tests
+are skipped, unless CRABCROP_DIFF_REQUIRE_NODE=1, which
+scripts/test_all.sh sets, since its TypeScript steps need that Node
+anyway: then they fail.
 
 The inputs are a function of the seed, so a failure repeats. To run
 it alone, or on a larger or different set:
@@ -23,6 +28,8 @@ it alone, or on a larger or different set:
         python3 -m unittest tests.test_explain_differential -v
 """
 
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -38,24 +45,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import crabcrop_url as cc  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
-EXPLAIN_TS = REPO / "sdks" / "typescript" / "src" / "explain.ts"
+INDEX_TS = REPO / "sdks" / "typescript" / "src" / "index.ts"
 VERDICTS = json.loads((REPO / "spec" / "explain-verdicts.json").read_text(encoding="utf-8"))
 VECTORS = json.loads((REPO / "spec" / "operation-vectors.json").read_text(encoding="utf-8"))
 
 DEFAULT_CASES = 6000
 CASES = int(os.environ.get("CRABCROP_DIFF_CASES", str(DEFAULT_CASES)))
 SEED = int(os.environ.get("CRABCROP_DIFF_SEED", "716"))
+REQUIRE_NODE = os.environ.get("CRABCROP_DIFF_REQUIRE_NODE") == "1"
 NOW = 1700000000
+SECRET = "s3cr3t"
 
-# Reads {"now", "inputs"} on stdin and writes the TypeScript
-# explanations, in order, on stdout.
+# Reads {"now", "inputs", "verify"} on stdin and writes the TypeScript
+# explanations and verifier answers, in order, on stdout. The SDK's
+# index.ts imports `#crypto`, which package.json maps to the build
+# output; from the sources it is crypto/node.ts.
 HARNESS = """
-const { explainUrl } = await import(process.argv[1]);
+import { register } from "node:module";
+const hook = `export async function resolve(specifier, context, next) {
+  const target = specifier === "#crypto" ? new URL("./crypto/node.ts", context.parentURL).href : specifier;
+  return next(target, context);
+}`;
+register("data:text/javascript," + encodeURIComponent(hook));
+const { explainUrl, verifyUrlSignature } = await import(process.argv[1]);
 let text = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) text += chunk;
-const { now, inputs } = JSON.parse(text);
-process.stdout.write(JSON.stringify(inputs.map((input) => explainUrl(input, now))));
+const { now, inputs, verify } = JSON.parse(text);
+process.stdout.write(JSON.stringify({
+  explanations: inputs.map((input) => explainUrl(input, now)),
+  verdicts: verify.map(([secret, input]) => verifyUrlSignature(secret, input)),
+}));
 """
 
 # The tag shapes the explainer tells apart, and the URL forms around
@@ -294,15 +314,53 @@ def node_with_type_stripping():
 NODE = node_with_type_stripping()
 
 
-@unittest.skipIf(NODE is None, "needs Node 22.18+ (or 23.6+) on PATH to run the TypeScript explainer")
+def verifier_questions(inputs):
+    """What the two verifiers are asked about the inputs: each input
+    that carries an HMAC tag, as generated and re-signed under SECRET,
+    under one secret, right and wrong, and under keyrings that hold the
+    right key under the URL's ID, the right secret under another ID,
+    or neither; any other input under one secret."""
+    questions = []
+    for given in inputs:
+        explained = cc.explain_url(given, NOW)
+        signature = explained.signature
+        if signature is None or signature.kind != "hmac":
+            questions.append([SECRET, given])
+            continue
+        remainder = explained.remainder.encode("utf-8", "surrogatepass")
+        tag = hmac.new(SECRET.encode("utf-8"), remainder, hashlib.sha256).hexdigest()
+        named = signature.key_id or "k1"
+        for url in (given, given.replace(signature.value, tag, 1)):
+            questions += [
+                [SECRET, url],
+                ["other", url],
+                [{named: SECRET}, url],
+                [{named: "other", "k-other": SECRET}, url],
+                [{"k-old": "other", "k-new": SECRET}, url],
+                [{}, url],
+            ]
+    return questions
+
+
+@unittest.skipIf(
+    NODE is None and not REQUIRE_NODE, "needs Node 22.18+ (or 23.6+) on PATH to run the TypeScript SDK"
+)
 class TestDifferential(unittest.TestCase):
-    def test_python_and_typescript_explainers_agree(self):
+    @classmethod
+    def setUpClass(cls):
+        if NODE is None:
+            raise AssertionError(
+                "CRABCROP_DIFF_REQUIRE_NODE=1, and no Node 22.18+ (or 23.6+) is on PATH to run the TypeScript SDK"
+            )
+
+    def test_python_and_typescript_explainers_and_verifiers_agree(self):
         inputs = generate_inputs(CASES, SEED)
         self.assertEqual(len(inputs), CASES)
         self.assertGreater(len(set(inputs)), CASES * 0.9, "the generator repeats itself")
+        questions = verifier_questions(inputs)
         run = subprocess.run(
-            [NODE, "--input-type=module", "-e", HARNESS, EXPLAIN_TS.as_uri()],
-            input=json.dumps({"now": NOW, "inputs": inputs}),
+            [NODE, "--input-type=module", "-e", HARNESS, INDEX_TS.as_uri()],
+            input=json.dumps({"now": NOW, "inputs": inputs, "verify": questions}),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -310,9 +368,10 @@ class TestDifferential(unittest.TestCase):
         )
         self.assertEqual(run.returncode, 0, run.stderr)
         typescript = json.loads(run.stdout)
-        self.assertEqual(len(typescript), len(inputs))
+        self.assertEqual(len(typescript["explanations"]), len(inputs))
+        self.assertEqual(len(typescript["verdicts"]), len(questions))
         mismatches = []
-        for given, want in zip(inputs, typescript):
+        for given, want in zip(inputs, typescript["explanations"]):
             got = typescript_shape(cc.explain_url(given, NOW))
             if got != want:
                 mismatches.append((given, got, want))
@@ -325,6 +384,24 @@ class TestDifferential(unittest.TestCase):
             0,
             f"{len(mismatches)} of {len(inputs)} inputs explain differently (seed {SEED}):\n{shown}",
         )
+        answers = {None: 0, True: 0, False: 0}
+        disagreements = []
+        for (key, given), want in zip(questions, typescript["verdicts"]):
+            got = cc.verify_url_signature(key, given)
+            answers[got] += 1
+            if got is not want:
+                disagreements.append((key, given, got, want))
+        shown = "\n".join(
+            f"verify_url_signature({key!r}, {given!r})\n  python {got}, typescript {want}"
+            for key, given, got, want in disagreements[:5]
+        )
+        self.assertEqual(
+            len(disagreements),
+            0,
+            f"{len(disagreements)} of {len(questions)} verifier answers differ (seed {SEED}):\n{shown}",
+        )
+        # The questions reach every answer, True included.
+        self.assertGreater(min(answers.values()), len(inputs) // 20, answers)
 
     def test_class_names_take_the_letters_and_digits_the_typescript_explainer_takes(self):
         # The class-name table is Unicode 17.0's, written out whole; on
