@@ -538,3 +538,8 @@ pub(super) fn unpickle(bytes: &[u8]) -> Result<PickleValue, String> {
 
 #[cfg(test)]
 mod tests;
+
+// The opcode handlers, pinned against a frozen copy of the
+// single loop they replaced (issue #741).
+#[cfg(test)]
+mod handler_proofs;
