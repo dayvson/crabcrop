@@ -187,7 +187,7 @@ impl UploadStore {
         prefix: String,
         endpoint: Option<String>,
         region: String,
-        creds: Option<crate::sigv4::Credentials>,
+        creds: Option<crate::credentials::AwsCredentials>,
         max_bytes: u64,
         allow_overwrite: bool,
     ) -> Result<Self, reqwest::Error> {
@@ -200,7 +200,8 @@ impl UploadStore {
         // The upload path moves raw objects only (put_raw
         // and get_raw store bytes verbatim, with no entry
         // framing), so the entry MAC key is never used
-        // here; an empty one keeps that explicit.
+        // here; an empty one keeps that explicit. Its log
+        // lines say they are the upload bucket's (issue #709).
         let store = S3Store::new(
             bucket.clone(),
             prefix.clone(),
@@ -208,7 +209,8 @@ impl UploadStore {
             region,
             creds,
             Vec::new(),
-        )?;
+        )?
+        .logging_as("upload storage");
         Ok(Self {
             backend: Backend::S3 {
                 store: Arc::new(store),
@@ -219,6 +221,17 @@ impl UploadStore {
             allow_overwrite,
             ref_prefix: String::new(),
         })
+    }
+
+    /// The existence checks the upload bucket refused, failed
+    /// or did not answer so far (issue #709), each read as no
+    /// object; `None` for a local destination. Surfaced on
+    /// /metrics as `crabcrop_upload_exists_checks_failed_total`.
+    pub fn exists_checks_failed(&self) -> Option<u64> {
+        match &self.backend {
+            Backend::Local(_) => None,
+            Backend::S3 { store, .. } => Some(store.exists_checks_failed()),
+        }
     }
 
     /// The local destination directory, when the backend
@@ -248,7 +261,9 @@ impl UploadStore {
     /// Whether an object already exists under `name`.
     /// Backend errors read as "does not exist" for S3
     /// (its store contract degrades failures to misses);
-    /// the write that follows surfaces a real failure.
+    /// the write that follows surfaces a real failure. Each
+    /// one counts in [`UploadStore::exists_checks_failed`]
+    /// and is logged at a limited rate (issue #709).
     /// The S3 answer is a HEAD, never a download of the
     /// existing object (issue #192, audit R2-23).
     pub async fn exists(&self, name: &str) -> bool {
@@ -836,7 +851,7 @@ mod tests {
             "orig/".to_string(),
             Some(fake.endpoint.clone()),
             "us-east-1".to_string(),
-            None,
+            Some(crate::s3store::test_support::test_aws()),
             1024,
             false,
         )
@@ -865,7 +880,7 @@ mod tests {
             String::new(),
             Some(fake.endpoint.clone()),
             "us-east-1".to_string(),
-            None,
+            Some(crate::s3store::test_support::test_aws()),
             1024,
             false,
         )

@@ -895,12 +895,124 @@ fn source_config_construction_enforces_pairing_and_the_bucket_policy() {
     ]))
     .unwrap();
     assert_eq!(sources.allowed_buckets, ["photos", "backups"]);
-    let creds = sources.aws_creds.as_ref().unwrap();
+    let creds = sources.aws_creds.as_ref().unwrap().fixed().unwrap();
     assert_eq!(creds.session_token.as_deref(), Some("token"));
     // Nothing configured also constructs: unsigned
     // fetches, every bucket allowed.
     let sources = build_source_config(env_of(&[])).unwrap();
     assert!(sources.aws_creds.is_none() && sources.allowed_buckets.is_empty());
+}
+
+#[test]
+fn container_credentials_apply_only_without_the_static_keys() {
+    // Issue #709: with no AWS_ACCESS_KEY_ID, the container
+    // credentials endpoint ECS and EKS Pod Identity serve is
+    // the source. The platform sets it for every task with a
+    // role, so it does not trip the bucket policy: a deployment
+    // that boots today keeps booting, and an empty allowlist
+    // still refuses every bucket at fetch time.
+    let ecs = [(
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "/v2/credentials/task-1",
+    )];
+    let sources = build_source_config(env_of(&ecs)).unwrap();
+    let creds = sources.aws_creds.as_ref().unwrap();
+    assert!(creds.is_container() && creds.fixed().is_none());
+    assert!(sources.allowed_buckets.is_empty());
+    // Static keys win, exactly as before: the endpoint is
+    // never asked.
+    let both = build_source_config(env_of(&[
+        ecs[0],
+        ("AWS_ACCESS_KEY_ID", "AKID"),
+        ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ("CRABCROP_ALLOWED_BUCKETS", "photos"),
+    ]))
+    .unwrap();
+    let fixed = both.aws_creds.as_ref().unwrap();
+    assert!(!fixed.is_container());
+    assert_eq!(fixed.fixed().unwrap().access_key, "AKID");
+    // A plain-http endpoint off the agents is refused at boot,
+    // naming the variable.
+    let err = build_source_config(env_of(&[(
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "http://credentials.example/creds",
+    )]))
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Invalid {
+                var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // A token that is not one header line is refused without
+    // its value.
+    let err = build_source_config(env_of(&[
+        ecs[0],
+        (
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "token-value\nX-Injected: 1",
+        ),
+    ]))
+    .err()
+    .unwrap();
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        rendered.contains("AWS_CONTAINER_AUTHORIZATION_TOKEN"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("token-value"), "{rendered}");
+    // A refused endpoint keeps its value only where it can carry
+    // no credential: ECS's relative URI names the task's
+    // credentials, and a full URI can hold a user and password.
+    for (var, value, secret) in [
+        (
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "v2/credentials/task-guid-1234",
+            "task-guid-1234",
+        ),
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "https://user:hunter2@credentials.example/creds",
+            "hunter2",
+        ),
+    ] {
+        let err = build_source_config(env_of(&[(var, value)])).err().unwrap();
+        let rendered = format!("{err} {err:?}");
+        assert!(rendered.contains(var), "{rendered}");
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    // CRABCROP_S3_CONTAINER_CREDENTIALS=off keeps a role out of
+    // every request, for a store that allows anonymous access:
+    // ECS sets the endpoint variable for every task with a role,
+    // over any value the task definition gives it. A value that
+    // is not a switch stops the boot.
+    let off = build_source_config(env_of(&[
+        ecs[0],
+        ("CRABCROP_S3_CONTAINER_CREDENTIALS", "off"),
+    ]))
+    .unwrap();
+    assert!(off.aws_creds.is_none());
+    let err = build_source_config(env_of(&[
+        ecs[0],
+        ("CRABCROP_S3_CONTAINER_CREDENTIALS", "of"),
+    ]))
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Invalid {
+                var: "CRABCROP_S3_CONTAINER_CREDENTIALS",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

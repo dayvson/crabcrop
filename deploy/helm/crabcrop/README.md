@@ -56,7 +56,7 @@ helm upgrade crabcrop deploy/helm/crabcrop \
   --set resultBucket.credentialsSecret=crabcrop-aws
 ```
 
-`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with environment-provided AWS credentials only, because the server reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` once at startup and does not fetch credentials from a pod IAM role or any other part of the AWS credential chain. `resultBucket.credentialsSecret` names the Secret that holds them, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with the keys in `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`, read once at startup, or, with none set, with the pod's role through EKS Pod Identity: its agent sets `AWS_CONTAINER_CREDENTIALS_FULL_URI` and the token file, and the server asks it for credentials before its first request and again 15 minutes before they expire. IAM roles for service accounts (IRSA, a web identity token) and the node's instance role are not used: give such a deployment keys. `resultBucket.credentialsSecret` names the Secret that holds the keys, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials, which then expire until a restart. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
 
 ## Secrets
 

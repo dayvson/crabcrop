@@ -1055,9 +1055,54 @@ pub fn build_source_config(
             )),
         }
     };
-    sources.aws_creds = cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?;
-    if let Some(creds) = &mut sources.aws_creds {
-        creds.session_token = nonempty("AWS_SESSION_TOKEN");
+    sources.aws_creds =
+        cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?.map(|mut creds| {
+            creds.session_token = nonempty("AWS_SESSION_TOKEN");
+            creds.into()
+        });
+    // With no static keys, the container credentials endpoint
+    // ECS and EKS Pod Identity serve, refreshed before each
+    // expiry (issue #709). The static keys, when set, are used
+    // exactly as before and the endpoint is never asked.
+    // CRABCROP_S3_CONTAINER_CREDENTIALS=off keeps a task's role
+    // out of every request, for a store that allows anonymous
+    // access: ECS sets the endpoint variable for every task with
+    // a role, over any value the task definition gives it.
+    let container_credentials = parse_bool_value(
+        "CRABCROP_S3_CONTAINER_CREDENTIALS",
+        get("CRABCROP_S3_CONTAINER_CREDENTIALS"),
+        true,
+    )?;
+    if sources.aws_creds.is_none()
+        && container_credentials
+        && let Some(endpoint) =
+            crate::credentials::container_endpoint(&get).map_err(|(var, reason)| {
+                // The token is a credential, ECS's relative URI
+                // names the task's credentials, and a full URI
+                // can carry a user and password: a refused one
+                // keeps only the fact that it was set, as a
+                // store endpoint with an `@` does. No message
+                // quotes the value.
+                let value = get(var).unwrap_or_default();
+                match var {
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI" if !value.contains('@') => {
+                        ConfigError::invalid(var, &value, reason)
+                    }
+                    _ => ConfigError::invalid_redacted(var, reason),
+                }
+            })?
+    {
+        let var = endpoint.var;
+        let creds = crate::credentials::AwsCredentials::container(endpoint).map_err(|e| {
+            ConfigError::build(
+                Some(var),
+                format!(
+                    "cannot build the container credentials client: {}",
+                    with_causes(&e)
+                ),
+            )
+        })?;
+        sources.aws_creds = Some(creds);
     }
     if let Some(endpoint) = nonempty("CRABCROP_GCS_ENDPOINT") {
         sources.gcs_endpoint = store_endpoint("CRABCROP_GCS_ENDPOINT", &endpoint)?;
@@ -1074,8 +1119,16 @@ pub fn build_source_config(
                 .collect()
         })
         .unwrap_or_default();
+    // Container credentials do not count: the platform sets
+    // their endpoint for every task or pod with a role, so a
+    // deployment that boots today keeps booting. An empty
+    // bucket allowlist still refuses every bucket fetch.
     check_bucket_policy(
-        sources.aws_creds.is_some() || sources.gcs_creds.is_some(),
+        sources
+            .aws_creds
+            .as_ref()
+            .is_some_and(|creds| !creds.is_container())
+            || sources.gcs_creds.is_some(),
         &sources.allowed_buckets,
     )?;
     // A configured store endpoint is where every bucket

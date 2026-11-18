@@ -58,6 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, Url, header, redirect};
 
+use crate::credentials::AwsCredentials;
 use crate::sigv4::{self, Credentials};
 
 /// Default cap on response bodies: 10 MiB, the default of
@@ -1151,8 +1152,12 @@ pub struct SourceConfig {
     pub s3_endpoint: Option<String>,
     /// AWS region for endpoint derivation and signing.
     pub s3_region: String,
-    /// Ambient AWS credentials, when configured.
-    pub aws_creds: Option<Credentials>,
+    /// The AWS signing credentials, when configured: the
+    /// static keys from the environment, or the container
+    /// credentials endpoint's, refreshed (issue #709). The
+    /// upload and shared result stores sign with the same
+    /// source.
+    pub aws_creds: Option<AwsCredentials>,
     /// Base URL of the GCS XML API (or a fake, in tests).
     pub gcs_endpoint: String,
     /// Credential scope region for GCS signing.
@@ -1725,13 +1730,16 @@ impl Loader {
                 };
                 (
                     url,
-                    self.sources.aws_creds.as_ref(),
+                    self.sources
+                        .aws_creds
+                        .as_ref()
+                        .and_then(AwsCredentials::current),
                     self.sources.s3_region.as_str(),
                 )
             }
             StoreKind::Gcs => (
                 format!("{}/{bucket}/{encoded_key}", self.sources.gcs_endpoint),
-                self.sources.gcs_creds.as_ref(),
+                self.sources.gcs_creds.clone().map(std::sync::Arc::new),
                 self.sources.gcs_region.as_str(),
             ),
         };
@@ -1757,7 +1765,7 @@ impl Loader {
                 sign_headers.push(("x-amz-security-token", token.as_str()));
             }
             let authorization = sigv4::authorization(
-                creds,
+                &creds,
                 &sigv4::SignRequest {
                     method: "GET",
                     path: url.path(),
@@ -3136,7 +3144,7 @@ mod tests {
         let (base, captured) = spawn_capturing_server().await;
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             allowed_buckets: vec!["photos".to_string()],
             ..Default::default()
         });
@@ -3229,7 +3237,7 @@ mod tests {
         // check, before any request is signed (audit R2-05).
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             allowed_buckets: vec!["photos".to_string()],
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             gcs_creds: Some(test_creds()),
             ..Default::default()
         });
@@ -4455,7 +4463,7 @@ mod tests {
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
             allowed_buckets: vec!["*".to_string()],
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             ..Default::default()
         });
         for url in [

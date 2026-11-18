@@ -20,6 +20,7 @@ mod avif;
 pub mod cache;
 pub mod cli;
 pub mod color;
+pub mod credentials;
 pub mod crop;
 pub mod debugview;
 pub mod engine;
