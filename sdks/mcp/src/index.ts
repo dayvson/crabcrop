@@ -2,7 +2,10 @@
 /**
  * A first-party MCP server for crabcrop: four tools over
  * stdio, thin wrappers on the TypeScript SDK and the HTTP
- * surface. No dependencies.
+ * surface. Its one runtime dependency is that SDK,
+ * @crabcrop/url, which the published package bundles
+ * (bundleDependencies): installing the package fetches
+ * nothing else.
  *
  *   sign_url     build and sign a crabcrop URL
  *   explain_url  parse a URL back into its segments, flagging errors
@@ -16,12 +19,26 @@
  * agentic clients persist tool arguments in transcripts, so
  * the environment is the right home for the secret.
  *
+ * Protocol: JSON-RPC 2.0, one message per line on stdin and
+ * stdout, at any MCP version in PROTOCOL_VERSIONS.
+ *
  * Run: node src/index.ts   (Node >= 22.18, for type stripping)
  */
-import { buildURL, explainUrl, purgeSignature, sign } from "@crabcrop/url";
+import { buildURL, explainUrl, purgeSignature } from "@crabcrop/url";
 
 const SERVER = { name: "crabcrop", version: "0.13.1" };
-const PROTOCOL = "2024-11-05";
+
+/**
+ * The MCP versions this server speaks, newest first (issue
+ * #716). `initialize` answers with the version the client
+ * asks for when it is one of these, and with the newest
+ * otherwise, as the spec's version negotiation says; a client
+ * that cannot speak that one disconnects. The tools, their
+ * results and the stdio framing are the same in all four.
+ * 2025-03-26 also requires a server to accept JSON-RPC
+ * batches, which this server does at every version.
+ */
+const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const envBase = process.env.CRABCROP_BASE ?? "";
 const envSecret = process.env.CRABCROP_SECRET ?? null;
@@ -426,21 +443,57 @@ const TOOLS = [
   },
 ];
 
-interface JsonRpcRequest {
-  jsonrpc: string;
-  id?: string | number | null;
-  method: string;
-  params?: Record<string, unknown>;
+/** The JSON-RPC 2.0 error codes this server answers with. */
+const PARSE_ERROR = -32700;
+const INVALID_REQUEST = -32600;
+const METHOD_NOT_FOUND = -32601;
+const INVALID_PARAMS = -32602;
+const INTERNAL_ERROR = -32603;
+
+type RequestId = string | number;
+type JsonObject = Record<string, unknown>;
+
+/** A method's JSON-RPC error answer, thrown by its handler. */
+class RpcError extends Error {
+  code: number;
+
+  constructor(code: number, message: string) {
+    super(message);
+    this.code = code;
+  }
 }
 
-async function handle(req: JsonRpcRequest): Promise<unknown> {
-  switch (req.method) {
-    case "initialize":
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A request ID as MCP defines it: a string or a number. Null
+ * is not one (MCP forbids it), and neither is a number JSON
+ * read as infinite, which would go back out as null.
+ */
+function isRequestId(value: unknown): value is RequestId {
+  return typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
+}
+
+function errorResponse(id: RequestId | null, code: number, message: string): JsonObject {
+  return { jsonrpc: "2.0", id, error: { code, message } };
+}
+
+/** Run one request's method: its result, or an RpcError. */
+async function call(method: string, params: JsonObject): Promise<unknown> {
+  switch (method) {
+    case "initialize": {
+      const requested = params.protocolVersion;
+      if (typeof requested !== "string") {
+        throw new RpcError(INVALID_PARAMS, "Invalid params: initialize needs a protocolVersion string");
+      }
       return {
-        protocolVersion: PROTOCOL,
+        protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
         serverInfo: SERVER,
       };
+    }
     case "ping":
       return {};
     case "tools/list":
@@ -452,51 +505,142 @@ async function handle(req: JsonRpcRequest): Promise<unknown> {
         })),
       };
     case "tools/call": {
-      const params = req.params ?? {};
-      const tool = TOOLS.find((t) => t.name === params.name);
+      // A request the tool cannot even start on is a protocol
+      // error, as the spec's tools section has it; a bad
+      // argument value is the tool's own error result below,
+      // which the model reads and can correct.
+      const name = params.name;
+      if (typeof name !== "string") {
+        throw new RpcError(INVALID_PARAMS, "Invalid params: tools/call needs a tool name string");
+      }
+      const tool = TOOLS.find((t) => t.name === name);
       if (!tool) {
-        return textResult(`unknown tool: ${String(params.name)}`, true);
+        throw new RpcError(INVALID_PARAMS, `Unknown tool: ${name}`);
+      }
+      const args = params.arguments ?? {};
+      if (!isObject(args)) {
+        throw new RpcError(INVALID_PARAMS, "Invalid params: tools/call arguments must be an object");
       }
       try {
-        return await tool.run((params.arguments as Record<string, unknown>) ?? {});
+        return await tool.run(args);
       } catch (err) {
         return textResult(`error: ${err instanceof Error ? err.message : String(err)}`, true);
       }
     }
     default:
-      return undefined; // Notifications and unknown methods: no reply.
+      throw new RpcError(METHOD_NOT_FOUND, `Method not found: ${method}`);
   }
+}
+
+/**
+ * Answer one JSON-RPC message (issue #716): the response to
+ * write, or null when nothing is owed. A notification (no
+ * id) never gets an answer, and this server acts on none, so
+ * one that names a request method (a tools/call without an
+ * id) runs nothing either. A response from the client, to a
+ * request this server never sends, gets none. Anything else
+ * that is not a request object is -32600, under the request's
+ * id when it has a usable one and null otherwise.
+ */
+async function answer(message: unknown): Promise<JsonObject | null> {
+  if (!isObject(message)) {
+    return errorResponse(null, INVALID_REQUEST, "Invalid Request: a message must be a JSON object");
+  }
+  const hasId = Object.hasOwn(message, "id");
+  const { id, method, params } = message;
+  if (
+    method === undefined &&
+    hasId &&
+    (Object.hasOwn(message, "result") || Object.hasOwn(message, "error"))
+  ) {
+    return null;
+  }
+  const replyId = isRequestId(id) ? id : null;
+  if (message.jsonrpc !== "2.0") {
+    return errorResponse(replyId, INVALID_REQUEST, 'Invalid Request: jsonrpc must be "2.0"');
+  }
+  if (typeof method !== "string") {
+    return errorResponse(replyId, INVALID_REQUEST, "Invalid Request: method must be a string");
+  }
+  if (hasId && !isRequestId(id)) {
+    return errorResponse(null, INVALID_REQUEST, "Invalid Request: id must be a string or a number");
+  }
+  if (params !== undefined && (typeof params !== "object" || params === null)) {
+    return errorResponse(replyId, INVALID_REQUEST, "Invalid Request: params must be an object");
+  }
+  if (!hasId) {
+    return null;
+  }
+  const requestId = id as RequestId;
+  if (params !== undefined && !isObject(params)) {
+    return errorResponse(requestId, INVALID_PARAMS, "Invalid params: params must be an object, not an array");
+  }
+  try {
+    return { jsonrpc: "2.0", id: requestId, result: await call(method, params ?? {}) };
+  } catch (err) {
+    if (err instanceof RpcError) {
+      return errorResponse(requestId, err.code, err.message);
+    }
+    return errorResponse(
+      requestId,
+      INTERNAL_ERROR,
+      `Internal error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Answer one line: a single message, or a batch (an array of
+ * them), whose answers go back as one array in the order the
+ * batch named them. A batch of notifications alone gets no
+ * answer, and an empty one is a single -32600.
+ */
+async function answerLine(line: string): Promise<unknown> {
+  let message: unknown;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return errorResponse(null, PARSE_ERROR, "Parse error: the line is not valid JSON");
+  }
+  if (!Array.isArray(message)) {
+    return answer(message);
+  }
+  if (message.length === 0) {
+    return errorResponse(null, INVALID_REQUEST, "Invalid Request: an empty batch");
+  }
+  const answers: JsonObject[] = [];
+  for (const entry of message) {
+    const reply = await answer(entry);
+    if (reply !== null) answers.push(reply);
+  }
+  return answers.length > 0 ? answers : null;
 }
 
 // Transport: newline-delimited JSON-RPC over stdio. Lines
 // are capped (readline would buffer an unbounded line in
 // memory) and requests are handled one at a time through a
 // promise chain, so side-effecting calls cannot race
-// (audit PL-9).
+// (audit PL-9). The chain never rejects: a line that threw
+// would otherwise drop every line after it, and the
+// unhandled rejection would end the process.
 const MAX_LINE_BYTES = 1024 * 1024;
 let chain: Promise<void> = Promise.resolve();
 let buffered = "";
 let discarding = false;
 
 function enqueue(line: string): void {
-  chain = chain.then(async () => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    let req: JsonRpcRequest;
-    try {
-      req = JSON.parse(trimmed) as JsonRpcRequest;
-    } catch {
-      return;
-    }
-    if (req.id === undefined || req.id === null) {
-      await handle(req); // A notification: handle silently.
-      return;
-    }
-    const result = await handle(req);
-    process.stdout.write(
-      `${JSON.stringify({ jsonrpc: "2.0", id: req.id, result: result ?? {} })}\n`,
-    );
-  });
+  chain = chain
+    .then(async () => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      const reply = await answerLine(trimmed);
+      if (reply !== null) {
+        process.stdout.write(`${JSON.stringify(reply)}\n`);
+      }
+    })
+    .catch((err: unknown) => {
+      process.stderr.write(`crabcrop-mcp: ${err instanceof Error ? err.message : String(err)}\n`);
+    });
 }
 
 process.stdin.setEncoding("utf8");
@@ -520,7 +664,7 @@ process.stdin.on("data", (chunk: string) => {
         buffered = "";
         discarding = true;
         process.stdout.write(
-          `${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "request line too large" } })}\n`,
+          `${JSON.stringify(errorResponse(null, INVALID_REQUEST, "request line too large"))}\n`,
         );
       }
       return;
