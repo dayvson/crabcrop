@@ -144,7 +144,7 @@ impl Samples for Angle {
 
 /// Spellings for the rows with a sub-grammar of their own,
 /// which no kind can generate: (name, accepted, refused).
-const CUSTOM_SAMPLES: &[(&str, &[&str], &[&str])] = &[
+pub(super) const CUSTOM_SAMPLES: &[(&str, &[&str], &[&str])] = &[
     (
         "curve",
         &[

@@ -801,4 +801,6 @@ fn format_spec_args(spec: &FormatSpec) -> String {
 }
 
 #[cfg(test)]
+mod split_proofs;
+#[cfg(test)]
 mod tests;
