@@ -291,7 +291,7 @@ impl AwsCredentials {
                 wait = match container.refresh().await {
                     Ok(fetched) => container.next_wait(&fetched),
                     Err(why) => {
-                        eprintln!(
+                        stderr_line!(
                             "aws credentials: cannot refresh from the container credentials \
                              endpoint: {why}; {}, retrying in {}s",
                             container.standing(),

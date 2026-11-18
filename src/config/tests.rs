@@ -2000,6 +2000,110 @@ fn from_env_reads_the_avif_tile_count() {
 }
 
 #[test]
+fn from_env_reads_the_tools_address_space_caps() {
+    // Issue #738: each tool's cap was a constant. Unset, each
+    // is that constant still; set, it is read in megabytes.
+    const MB: u64 = 1024 * 1024;
+    let config = config_of(&[]).unwrap();
+    assert_eq!(
+        config.video.encoder_address_space,
+        crate::video::DEFAULT_ENCODER_ADDRESS_SPACE
+    );
+    assert_eq!(config.video.encoder_address_space, 8192 * MB);
+    assert_eq!(
+        config.video.decoder_address_space,
+        crate::frames::DEFAULT_DECODER_ADDRESS_SPACE
+    );
+    assert_eq!(config.video.decoder_address_space, 3072 * MB);
+    assert_eq!(
+        config.pdf.renderer_address_space,
+        crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE
+    );
+    assert_eq!(config.pdf.renderer_address_space, 3072 * MB);
+    assert_eq!(
+        config.svg_worker_address_space,
+        crate::svg::DEFAULT_WORKER_ADDRESS_SPACE
+    );
+    assert_eq!(config.svg_worker_address_space, 4096 * MB);
+    let cap = |config: &Config, var: &str| match var {
+        "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB" => config.video.encoder_address_space,
+        "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB" => config.video.decoder_address_space,
+        "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB" => config.pdf.renderer_address_space,
+        "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB" => config.svg_worker_address_space,
+        other => panic!("{other}"),
+    };
+    // Each from the least its tool needs to start to 64 GiB.
+    let fingerprint = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().config_fingerprint;
+    let unset = fingerprint(&[]);
+    let mut seen = vec![unset.clone()];
+    for (var, least, tool) in [
+        (
+            "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB",
+            crate::video::MIN_ENCODER_ADDRESS_SPACE,
+            "video encoder",
+        ),
+        (
+            "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB",
+            crate::frames::MIN_DECODER_ADDRESS_SPACE,
+            "video decoder",
+        ),
+        (
+            "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB",
+            crate::pdf::MIN_RENDERER_ADDRESS_SPACE,
+            "PDF renderer",
+        ),
+        (
+            "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB",
+            crate::svg::MIN_WORKER_ADDRESS_SPACE,
+            "SVG worker",
+        ),
+    ] {
+        let least = least / MB;
+        for mb in [least, 5000, 65_536] {
+            let config = config_of(&[(var, &mb.to_string())]).unwrap();
+            assert_eq!(cap(&config, var), mb * MB, "{var}={mb}");
+        }
+        for bad in [least - 1, 0, 65_537] {
+            let bad = bad.to_string();
+            let err = refusal(&[(var, &bad)]);
+            match &err {
+                ConfigError::Invalid {
+                    var: named, value, ..
+                } => {
+                    assert_eq!(named, &var);
+                    assert_eq!(*value, ConfigValue::Text(bad.clone()));
+                }
+                other => panic!("{var}={bad}: {other:?}"),
+            }
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "{var} must be between {least} (what the {tool} needs to start) and 65536, \
+                     got {bad}"
+                )
+            );
+        }
+        for bad in ["x", "-1", "1.5", " 2048", ""] {
+            let err = refusal(&[(var, bad)]);
+            assert!(
+                matches!(&err, ConfigError::Invalid { var: named, .. } if named == &var),
+                "{var}={bad:?}: {err:?}"
+            );
+            assert_eq!(err.to_string(), format!("invalid {var}: {bad:?}"));
+        }
+        // A cap is part of the fingerprint when it is not the
+        // default: what a tool returns can depend on it. The
+        // default, set or not, keeps the fingerprint the
+        // default configuration has always had.
+        let default = (cap(&config_of(&[]).unwrap(), var) / MB).to_string();
+        assert_eq!(fingerprint(&[(var, &default)]), unset, "{var}");
+        let set = fingerprint(&[(var, &least.to_string())]);
+        assert!(!seen.contains(&set), "{var}: {set}");
+        seen.push(set);
+    }
+}
+
+#[test]
 fn from_env_refusals_are_typed_and_keep_the_boot_text() {
     // Missing: the one variable boot cannot do without.
     let err = Config::from_env(env_of(&[])).map(|_| ()).unwrap_err();

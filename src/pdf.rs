@@ -43,8 +43,10 @@
 //! The raster clamp bounds the surface the renderer draws,
 //! not the images a page draws on it: Poppler decodes an
 //! embedded image at its full declared size before scaling
-//! it onto the page. On Linux both tools run under a 3 GiB
-//! address-space cap (`RENDERER_MAX_ADDRESS_SPACE`), which
+//! it onto the page. On Linux both tools run under an
+//! address-space cap, 3 GiB unless
+//! `CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB` says otherwise
+//! (`DEFAULT_RENDERER_ADDRESS_SPACE`, issue #738), which
 //! bounds every decode and surface a document can ask for:
 //! an image whose decode needs more fails in the renderer,
 //! which leaves that image out of the page, and a page whose
@@ -129,18 +131,27 @@ const MIN_RENDER_DPI: f64 = 1.0;
 /// headroom for chatty builds.
 const PROBE_REPORT_CAP: usize = 1024 * 1024;
 
-/// The PDF tools' address-space cap on Linux, 3 GiB, the
-/// frame extractor's. With Poppler 24.02, a 64 megapixel
-/// page (the raster budget) that nests five transparency
-/// groups under a soft mask peaked at 2.8 GB, a page drawing
-/// a 14000x14000 RGB JPEG 2000 image at 3.1 GB, and a 64
-/// megapixel page drawing a 12000x12000 JPEG at 1.1 GB; all
-/// three render the same bytes as without the cap. Work past
-/// the cap fails in the tool: an image whose decode needs
-/// more is left out of the page, and a page whose surfaces
-/// need more fails to render. A decode that fails near the
-/// cap can take several seconds to get there.
-const RENDERER_MAX_ADDRESS_SPACE: u64 = 3 << 30;
+/// The PDF tools' address-space cap on Linux when
+/// `CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB` is unset,
+/// 3 GiB, the frame extractor's. With Poppler 24.02, a 64
+/// megapixel page (the raster budget) that nests five
+/// transparency groups under a soft mask peaked at 2.8 GB, a
+/// page drawing a 14000x14000 RGB JPEG 2000 image at 3.1 GB,
+/// and a 64 megapixel page drawing a 12000x12000 JPEG at
+/// 1.1 GB; all three render the same bytes as without the
+/// cap. Work past the cap fails in the tool: an image whose
+/// decode needs more is left out of the page, and a page
+/// whose surfaces need more fails to render. A decode that
+/// fails near the cap can take several seconds to get there.
+pub const DEFAULT_RENDERER_ADDRESS_SPACE: u64 = 3 << 30;
+
+/// The least the cap may be set to, 256 MiB (issue #738):
+/// what the tools need to start, with room for other builds
+/// and for hosts with many fonts. With Poppler 24.02 and
+/// glibc 2.39, the boot check's document ran in 34 MiB
+/// through the probe and in 38 MiB through the renderer, and
+/// a letter page of Helvetica text rendered in 47 MiB.
+pub const MIN_RENDERER_ADDRESS_SPACE: u64 = 256 << 20;
 
 /// The two markers that open every JPEG 2000 codestream:
 /// SOC (start of codestream) and SIZ (image and tile size),
@@ -281,6 +292,10 @@ pub struct PdfRenderer {
     program: PathBuf,
     probe_program: PathBuf,
     timeout: Duration,
+    /// Both tools' address-space cap, in bytes:
+    /// [`DEFAULT_RENDERER_ADDRESS_SPACE`] unless
+    /// [`Self::with_address_space`] set another.
+    max_address_space: u64,
 }
 
 impl PdfRenderer {
@@ -304,7 +319,21 @@ impl PdfRenderer {
             program,
             probe_program,
             timeout,
+            max_address_space: DEFAULT_RENDERER_ADDRESS_SPACE,
         })
+    }
+
+    /// The renderer with every run of both tools capped at
+    /// `bytes` of address space, as
+    /// `CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB` sets it
+    /// (issue #738), and the JPEG 2000 pre-check held to the
+    /// same cap. The configuration holds it between
+    /// [`MIN_RENDERER_ADDRESS_SPACE`] and its own ceiling.
+    pub fn with_address_space(self, bytes: u64) -> Self {
+        Self {
+            max_address_space: bytes,
+            ..self
+        }
     }
 
     /// The boot check (issue #715): render the page of a
@@ -436,10 +465,10 @@ impl PdfRenderer {
         // One deadline for the scan, the probe and the
         // render together (issue #362).
         let deadline = Instant::now() + self.timeout;
-        if let Some(image) = oversized_jpx(pdf) {
+        if let Some(image) = oversized_jpx(pdf, self.max_address_space) {
             return Err(PdfError::NotPdf(format!(
                 "the document embeds a {}x{} JPEG 2000 image with {} {}, whose decode needs \
-                 about {} bytes, past the renderer's {RENDERER_MAX_ADDRESS_SPACE} byte cap",
+                 about {} bytes, past the renderer's {} byte cap",
                 image.width,
                 image.height,
                 image.components,
@@ -449,6 +478,7 @@ impl PdfRenderer {
                     "components"
                 },
                 image.decode_bytes(),
+                self.max_address_space,
             )));
         }
         let probe = self.probe_until(pdf, page, deadline)?;
@@ -563,7 +593,7 @@ impl PdfRenderer {
             max_stderr: PROBE_REPORT_CAP,
             deadline,
             cpu_limit: tool_cpu_limit(self.timeout),
-            max_address_space: RENDERER_MAX_ADDRESS_SPACE,
+            max_address_space: self.max_address_space,
         })
         .map_err(|e| {
             PdfError::Failed(match e {
@@ -760,10 +790,10 @@ impl JpxSize {
 }
 
 /// The first JPEG 2000 image the document stores as is
-/// whose decode cannot fit the renderer's address-space cap
-/// (see [`JpxSize::decode_bytes`]), or `None`. Such an
-/// image could only fail in the renderer, after it had
-/// taken all of the cap. A `JPXDecode` stream holds the
+/// whose decode cannot fit the renderer's address-space cap,
+/// `cap` bytes (see [`JpxSize::decode_bytes`]), or `None`.
+/// Such an image could only fail in the renderer, after it
+/// had taken all of the cap. A `JPXDecode` stream holds the
 /// codestream itself, so its SOC and SIZ markers sit in the
 /// document's bytes, and the SIZ segment declares the size
 /// the renderer's decoder allocates for. The scan reads
@@ -774,7 +804,7 @@ impl JpxSize {
 /// [`JPX_SCAN_COMPONENTS`] component entries in all and
 /// stops there. A codestream it does not read is bounded by
 /// the cap instead.
-fn oversized_jpx(pdf: &[u8]) -> Option<JpxSize> {
+fn oversized_jpx(pdf: &[u8], cap: u64) -> Option<JpxSize> {
     let mut components_left = JPX_SCAN_COMPONENTS;
     let mut at = 0;
     while let Some(found) = pdf[at..].iter().position(|&b| b == JPX_SOC_SIZ[0]) {
@@ -782,7 +812,7 @@ fn oversized_jpx(pdf: &[u8]) -> Option<JpxSize> {
         if pdf[start..].starts_with(&JPX_SOC_SIZ) {
             let size = parse_jpx_siz(&pdf[start + JPX_SOC_SIZ.len()..], &mut components_left);
             if let Some(size) = size
-                && size.decode_bytes() > RENDERER_MAX_ADDRESS_SPACE
+                && size.decode_bytes() > cap
             {
                 return Some(size);
             }
@@ -861,6 +891,11 @@ fn not_pdf() -> PdfError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JPEG 2000 scan against the renderer's default cap.
+    fn oversized(pdf: &[u8]) -> Option<JpxSize> {
+        oversized_jpx(pdf, DEFAULT_RENDERER_ADDRESS_SPACE)
+    }
 
     /// A whole-document probe report, recorded from the
     /// reference probe on a real two-page document.
@@ -1776,8 +1811,8 @@ exit 0\n";
         // four more for each of the largest component's: an
         // RGB image takes 16 bytes a pixel, so 16384x12288 fits
         // the 3 GiB cap exactly; a gray one takes 8.
-        assert_eq!(RENDERER_MAX_ADDRESS_SPACE, 3 << 30);
-        let at = |bytes: Vec<u8>| oversized_jpx(&bytes);
+        assert_eq!(DEFAULT_RENDERER_ADDRESS_SPACE, 3 << 30);
+        let at = |bytes: Vec<u8>| oversized(&bytes);
         assert_eq!(at(jpx_siz(16384, 12288, 0, 0, RGB)), None);
         assert!(at(jpx_siz(16384, 12289, 0, 0, RGB)).is_some());
         assert_eq!(at(jpx_siz(16384, 24576, 0, 0, &[(1, 1)])), None);
@@ -1813,7 +1848,7 @@ exit 0\n";
         document.extend_from_slice(&jpx_siz(64, 64, 0, 0, RGB));
         document.extend_from_slice(b" more ");
         document.extend_from_slice(&jpx_siz(24000, 24000, 0, 0, &[(1, 1)]));
-        assert_eq!(oversized_jpx(&document).map(|s| s.width), Some(24000));
+        assert_eq!(oversized(&document).map(|s| s.width), Some(24000));
     }
 
     /// A document of `bytes` that packs well-formed SIZ
@@ -1853,7 +1888,7 @@ exit 0\n";
         let first = parse_jpx_siz(&packed[13..], &mut unbounded).expect("well formed");
         assert_eq!((first.width, first.components), (1, 0x3F3F));
         let started = Instant::now();
-        assert_eq!(oversized_jpx(&packed), None);
+        assert_eq!(oversized(&packed), None);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the scan took {:?}",
@@ -1862,7 +1897,7 @@ exit 0\n";
         // An image before them is still found.
         let mut before = jpx_siz(16000, 16000, 0, 0, RGB);
         before.extend_from_slice(&packed);
-        assert!(oversized_jpx(&before).is_some());
+        assert!(oversized(&before).is_some());
     }
 
     #[test]
@@ -1871,20 +1906,20 @@ exit 0\n";
         // The length must match the component count.
         let mut wrong_length = big.clone();
         wrong_length[5] += 1;
-        assert_eq!(oversized_jpx(&wrong_length), None);
+        assert_eq!(oversized(&wrong_length), None);
         // No components, or a zero subsampling.
-        assert_eq!(oversized_jpx(&jpx_siz(16000, 16000, 0, 0, &[])), None);
+        assert_eq!(oversized(&jpx_siz(16000, 16000, 0, 0, &[])), None);
         assert_eq!(
-            oversized_jpx(&jpx_siz(16000, 16000, 0, 0, &[(1, 1), (0, 1)])),
+            oversized(&jpx_siz(16000, 16000, 0, 0, &[(1, 1), (0, 1)])),
             None
         );
         // An empty image (no extent past its offset).
-        assert_eq!(oversized_jpx(&jpx_siz(16000, 16000, 16000, 0, RGB)), None);
+        assert_eq!(oversized(&jpx_siz(16000, 16000, 16000, 0, RGB)), None);
         // Cut short anywhere.
         for end in 0..big.len() {
-            assert_eq!(oversized_jpx(&big[..end]), None, "cut at {end}");
+            assert_eq!(oversized(&big[..end]), None, "cut at {end}");
         }
-        assert!(oversized_jpx(&big).is_some());
+        assert!(oversized(&big).is_some());
     }
 
     /// The JPEG 2000 file (a JP2 box sequence around its
@@ -2065,6 +2100,35 @@ exit 0\n";
         assert!(marker.exists());
     }
 
+    #[test]
+    fn the_jpeg_2000_check_holds_images_to_the_configured_cap() {
+        // Issue #738: with the cap set, the check reads each
+        // image against that cap. An 8192x8192 RGB image takes
+        // 16 bytes a pixel to decode, 1 GiB: it fits the default
+        // cap, so the tools render the page, and is refused
+        // under a 1023 MiB one before either runs, with the cap
+        // in force named.
+        let dir = temp_dir("jpx-configured");
+        let marker = dir.join("ran");
+        let document = third_page_image_pdf(&jpx_siz(8192, 8192, 0, 0, RGB), 8192, 8192);
+        let capped = marking_renderer(&dir, &marker, 3).with_address_space(1023 << 20);
+        let err = capped.render_page(&document, 1).unwrap_err();
+        assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+        assert!(
+            err.to_string().ends_with(&format!(
+                "needs about {} bytes, past the renderer's {} byte cap",
+                1u64 << 30,
+                1023u64 << 20
+            )),
+            "{err}"
+        );
+        assert!(!marker.exists(), "no tool may run");
+        marking_renderer(&dir, &marker, 3)
+            .render_page(&document, 1)
+            .unwrap();
+        assert!(marker.exists());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn the_pdf_tools_run_under_the_renderer_address_space_cap() {
@@ -2096,7 +2160,7 @@ exit 0\n";
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         renderer.render_page(b"%PDF- fake", 1).unwrap();
         let recorded = std::fs::read_to_string(&record).unwrap();
-        let cap = RENDERER_MAX_ADDRESS_SPACE.to_string();
+        let cap = DEFAULT_RENDERER_ADDRESS_SPACE.to_string();
         assert_eq!(cap, (3u64 << 30).to_string());
         let expected: Vec<&str> = [cap.as_str(), "1000"].repeat(2);
         assert_eq!(

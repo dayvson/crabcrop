@@ -1343,7 +1343,7 @@ exit 1\n",
         .extract_frame(b"video bytes", FrameSelection::Poster)
         .unwrap();
     let recorded = std::fs::read_to_string(&record).unwrap();
-    let cap = DECODER_MAX_ADDRESS_SPACE.to_string();
+    let cap = DEFAULT_DECODER_ADDRESS_SPACE.to_string();
     assert_eq!(cap, (3u64 << 30).to_string());
     let expected: Vec<&str> = [cap.as_str(), "1000"].repeat(2);
     assert_eq!(

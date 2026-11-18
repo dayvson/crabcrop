@@ -217,7 +217,7 @@ pub async fn serve_connections(
             // waits a second before the next try, as
             // `axum::serve` did.
             Err(e) => {
-                eprintln!("crabcrop: cannot accept a connection: {e}; trying again in 1 s");
+                stderr_line!("crabcrop: cannot accept a connection: {e}; trying again in 1 s");
                 tokio::select! {
                     biased;
                     () = stop.cancelled() => break,
@@ -352,7 +352,7 @@ impl Refusals {
         if self.next_line.is_some_and(|at| now < at) {
             return;
         }
-        eprintln!(
+        stderr_line!(
             "crabcrop: closed {} connection(s) from clients already holding {share} \
              (CRABCROP_MAX_CONNECTIONS_PER_CLIENT)",
             self.unreported
