@@ -105,7 +105,16 @@ moxcms = { version = "0.9", features = ["in_place"] }
 oxideav-heif = { version = "=0.0.13", default-features = false, features = ["registry"] }
 oxideav-h265 = "=0.0.16"
 oxideav-webp = { version = "0.3.1", default-features = false }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# One TLS crypto provider (issue #742): ring. c2pa builds
+# ureq with its `rustls` feature, which turns ring on, and
+# reqwest's own `rustls` feature would compile aws-lc-rs
+# and AWS-LC beside it. So reqwest takes no provider
+# (`rustls-no-provider`), and src/tls.rs installs ring as
+# the process default that its clients and ureq's use.
+# rustls is already in the tree through both: naming it
+# adds no crate.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # The timestamp authority transport for C2PA signing
 # (issue #365): c2pa's own ureq resolver leaves every
 # timeout unset, so provenance.rs hands the SDK a

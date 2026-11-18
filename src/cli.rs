@@ -1069,7 +1069,7 @@ fn health_addresses(bind: Option<String>) -> Result<Vec<std::net::IpAddr>, CliEr
 /// proxy set for source fetches never carries a probe of
 /// the server on this host.
 async fn probe_health(addresses: &[std::net::SocketAddr]) -> Result<String, CliError> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()
         .timeout(HEALTH_TIMEOUT)
         .no_proxy()
         .build()
@@ -1107,7 +1107,7 @@ async fn health_at(
 }
 
 fn http_client() -> Result<reqwest::Client, CliError> {
-    reqwest::Client::builder()
+    crate::tls::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(CliError::Client)

@@ -1035,7 +1035,7 @@ async fn spawn_app_with_fallback() -> String {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::new()
+    crate::tls::client_builder().build().unwrap()
 }
 
 fn now_unix() -> u64 {

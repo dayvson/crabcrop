@@ -464,11 +464,11 @@ impl S3Store {
             // No client-wide total (issue #550): every request
             // gets its own bound, sized to what it moves (see
             // `send`).
-            client: reqwest::Client::builder()
+            client: crate::tls::client_builder()
                 .connect_timeout(STORE_CONNECT_TIMEOUT)
                 .read_timeout(STORE_TIMEOUT)
                 .build()?,
-            put_client: reqwest::Client::builder()
+            put_client: crate::tls::client_builder()
                 .connect_timeout(STORE_CONNECT_TIMEOUT)
                 .build()?,
             bucket,
@@ -6075,7 +6075,7 @@ mod tests {
         assert!(s.get("k").await.is_some());
         assert_eq!((s.errors(), fake.refused().len()), (0, 0));
         // Unsigned: S3's AccessDenied, as XML.
-        let resp = reqwest::Client::builder()
+        let resp = crate::tls::client_builder()
             .no_proxy()
             .build()
             .unwrap()

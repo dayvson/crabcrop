@@ -1122,7 +1122,7 @@ impl reqwest::dns::Resolve for SlotResolver {
 /// them itself, re-checking the policy on every hop), and
 /// host names resolved on `lookups`.
 fn source_client(timeout: Duration, lookups: &HostLookups) -> Result<Client, LoadError> {
-    Client::builder()
+    crate::tls::client_builder()
         .timeout(timeout)
         .redirect(redirect::Policy::none())
         .dns_resolver(SlotResolver(lookups.clone()))
@@ -1245,7 +1245,7 @@ impl Loader {
     pub fn new(max_bytes: u64, timeout: Duration) -> Result<Self, LoadError> {
         let lookups = HostLookups::system();
         let client = source_client(timeout, &lookups)?;
-        let store_client = Client::builder()
+        let store_client = crate::tls::client_builder()
             .timeout(timeout)
             // A store's 3xx surfaces as its status.
             .redirect(redirect::Policy::none())
@@ -1946,7 +1946,7 @@ impl Loader {
         if let Some(client) = self.pinned_clients.lock().unwrap().get(&key) {
             return Ok(client.clone());
         }
-        let client = Client::builder()
+        let client = crate::tls::client_builder()
             .timeout(self.timeout)
             .redirect(redirect::Policy::none())
             .no_proxy()

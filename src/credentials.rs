@@ -197,7 +197,7 @@ impl AwsCredentials {
         // rule (see `container_endpoint`) holds for the URL the
         // environment names, and a redirect could lead the
         // fetch anywhere else, over anything.
-        let client = reqwest::Client::builder()
+        let client = crate::tls::client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)

@@ -1,0 +1,10 @@
+# reqwest is built without a TLS crypto provider (issue #742), and
+# building a client before one is installed panics. Every client
+# starts from crabcrop::tls::client_builder, which installs ring as
+# the process default first.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "use crate::tls::client_builder, which installs the TLS crypto provider" },
+    { path = "reqwest::Client::new", reason = "use crate::tls::client_builder, which installs the TLS crypto provider" },
+    { path = "reqwest::ClientBuilder::new", reason = "use crate::tls::client_builder, which installs the TLS crypto provider" },
+    { path = "reqwest::get", reason = "use crate::tls::client_builder, which installs the TLS crypto provider" },
+]

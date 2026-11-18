@@ -46,6 +46,7 @@ pub mod svg;
 mod test_support;
 pub mod text;
 pub mod thumbhash;
+pub mod tls;
 pub mod tokenizer;
 pub mod toolrun;
 pub mod upload;

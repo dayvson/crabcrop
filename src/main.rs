@@ -92,6 +92,11 @@ fn main() {
     // environment holds no secret, and it sets its own OOM
     // score through `/proc`.
     not_dumpable();
+    // The TLS crypto provider (issue #742), installed before
+    // any HTTPS client exists. The reqwest clients would
+    // install it as they are built; the timestamp
+    // authority's ureq agent only reads it.
+    crabcrop::tls::install_crypto_provider();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

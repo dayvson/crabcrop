@@ -51,14 +51,6 @@ grant.
 
 <!-- include: crate=libwebp-sys path=vendor/PATENTS sha256=cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c -->
 
-### AWS-LC
-
-aws-lc-sys compiles AWS-LC, the cryptography library under the HTTPS client
-(rustls, through aws-lc-rs), from the sources it vendors. Its LICENSE file
-names the license of each of its parts and reproduces their texts:
-
-<!-- include: crate=aws-lc-sys path=aws-lc/LICENSE sha256=977c541bd25ffe36975dde25c028c0cd15ddf3d08243983b58e8a6a3d9447523 -->
-
 ### dav1d
 
 The release binaries decode AVIF with dav1d 1.5.1, which
