@@ -16,8 +16,8 @@ use crate::url::{
 
 mod bands;
 
-use bands::band_pool;
 pub use bands::start_band_pool;
+use bands::{BandPool, band_pool};
 
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1601,12 +1601,12 @@ pub(crate) fn blur_gray_within(
 }
 
 /// The rows of one band when a permutation or a per-pixel
-/// map splits `rows` rows of `total_subpx` subpixels on the
-/// filters' pool: all of them, one band on the calling
-/// thread, under 3,000,000 subpixels or without a second
-/// thread.
-fn perm_band_rows(rows: usize, total_subpx: usize) -> usize {
-    let bands = band_pool().bands();
+/// map splits `rows` rows of `total_subpx` subpixels on
+/// `pool`, the pool the pass then runs on: all of them, one
+/// band on the calling thread, under 3,000,000 subpixels or
+/// without a second thread.
+fn perm_band_rows(pool: &BandPool, rows: usize, total_subpx: usize) -> usize {
+    let bands = pool.bands();
     if bands > 1 && total_subpx >= 3_000_000 {
         rows.div_ceil(bands)
     } else {
@@ -1622,14 +1622,15 @@ fn map_pixels_bands<const CH: usize>(
     let total = buf.len();
     let px = buf.as_chunks_mut::<CH>().0;
     let rows = px.len() / width.max(1);
-    let br = perm_band_rows(rows, total);
+    let pool = band_pool();
+    let br = perm_band_rows(pool, rows, total);
     if br >= rows {
         for p in px {
             f(p);
         }
         return;
     }
-    band_pool().run(px.chunks_mut(br * width), |band| {
+    pool.run(px.chunks_mut(br * width), |band| {
         for p in band {
             f(p);
         }
@@ -1637,8 +1638,9 @@ fn map_pixels_bands<const CH: usize>(
 }
 
 fn rot270_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
-    let br = perm_band_rows(w, w * h * CH);
-    band_pool().run(dst.chunks_mut(br * h).enumerate(), |(bi, band)| {
+    let pool = band_pool();
+    let br = perm_band_rows(pool, w, w * h * CH);
+    pool.run(dst.chunks_mut(br * h).enumerate(), |(bi, band)| {
         let y0 = bi * br;
         let tile = 64usize;
         let mut ty = 0usize;
@@ -1695,8 +1697,9 @@ fn rot90_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u
 
 fn rot180_px<const CH: usize>(src: &[[u8; CH]], _w: usize, _h: usize, dst: &mut [[u8; CH]]) {
     let n = src.len();
-    let br = perm_band_rows(n, n * CH);
-    band_pool().run(dst.chunks_mut(br).enumerate(), |(bi, head)| {
+    let pool = band_pool();
+    let br = perm_band_rows(pool, n, n * CH);
+    pool.run(dst.chunks_mut(br).enumerate(), |(bi, head)| {
         let st = bi * br;
         for (i, px) in head.iter_mut().enumerate() {
             *px = src[n - 1 - (st + i)];
@@ -1705,8 +1708,9 @@ fn rot180_px<const CH: usize>(src: &[[u8; CH]], _w: usize, _h: usize, dst: &mut 
 }
 
 fn fliph_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
-    let br = perm_band_rows(h, w * h * CH);
-    band_pool().run(
+    let pool = band_pool();
+    let br = perm_band_rows(pool, h, w * h * CH);
+    pool.run(
         src.chunks(br * w).zip(dst.chunks_mut(br * w)),
         |(sband, dband)| {
             for (srow, drow) in sband.chunks(w).zip(dband.chunks_mut(w)) {
@@ -1719,8 +1723,9 @@ fn fliph_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u
 }
 
 fn flipv_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
-    let br = perm_band_rows(h, w * h * CH);
-    band_pool().run(dst.chunks_mut(br * w).enumerate(), |(bi, head)| {
+    let pool = band_pool();
+    let br = perm_band_rows(pool, h, w * h * CH);
+    pool.run(dst.chunks_mut(br * w).enumerate(), |(bi, head)| {
         let y0 = bi * br;
         let rows = head.len() / w;
         let src_rows = &src[(h - y0 - rows) * w..(h - y0) * w];
