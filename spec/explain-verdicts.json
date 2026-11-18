@@ -1,5 +1,5 @@
 {
- "description": "Explainer verdict corpus (audit P-3 / AP-23): remainders with the verdict the server's grammar gives them and the source the remainder resolves to. Consumed by the TypeScript SDK tests, the playground tests, and the server crate's differential tests (issue #353): every surface that reads a remainder must agree with every entry. The generated combination corpus lives in operation-vectors.json.",
+ "description": "Explainer verdict corpus (audit P-3 / AP-23): remainders with the verdict the server's grammar gives them and the source the remainder resolves to. Consumed by the TypeScript and Python SDK tests, the playground tests, and the server crate's differential tests (issues #353 and #716): every surface that reads a remainder must agree with every entry. The generated combination corpus lives in operation-vectors.json.",
  "version": 1,
  "cases": [
   {

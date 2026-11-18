@@ -11,6 +11,7 @@ import sys
 import unicodedata
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -290,14 +291,14 @@ class TestTypedSpellings(unittest.TestCase):
         cases = [
             (ops.crop_objects(100, 100, [" person", "PERSON\t"]), "crop:100x100:objects(person):1"),
             (ops.crop_objects(100, 100, [" traffic light "]), "crop:100x100:objects(traffic%20light):1"),
-            (filter.blur_class("\u0085person　"), "blurclass(person)"),
+            (filter.blur_class("\u0085person\u3000"), "blurclass(person)"),
             (filter.pixelate_class("\nperson"), "pixelateclass(person)"),
         ]
         for got, want in cases:
             self.assertEqual(got, want)
         # The server keeps U+FEFF and the information separators,
         # which Python's str.strip() would remove.
-        for kept in ("﻿person", "person\x1c", "\x1fperson"):
+        for kept in ("\ufeffperson", "person\x1c", "\x1fperson"):
             with self.assertRaises(ValueError, msg=repr(kept)):
                 filter.blur_class(kept)
         # Only A to Z fold: the Kelvin sign is its own class.
@@ -324,22 +325,37 @@ class TestTypedSpellings(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(refused)):
                 filter.blur_class(refused)
 
-    def test_the_alphabetic_table_holds_only_what_the_categories_miss(self):
-        # The written-out ranges are sorted, apart, and hold no
-        # character this Python already reads as L or N.
-        starts, ends = _grammar._MORE_STARTS, _grammar._MORE_ENDS
-        self.assertGreater(len(starts), 200)
+    def test_the_alphanumeric_table_holds_every_letter_and_digit_this_python_knows(self):
+        # The written-out ranges are sorted and apart, and hold every
+        # character this Python's unicodedata reads as L or N: its
+        # Unicode version is the table's (17.0) or older, and an older
+        # one knows fewer of them.
+        starts, ends = _grammar._ALPHANUMERIC_STARTS, _grammar._ALPHANUMERIC_ENDS
+        self.assertGreater(len(starts), 800)
         for index, (start, end) in enumerate(zip(starts, ends)):
             self.assertLessEqual(start, end)
             if index:
                 self.assertLess(ends[index - 1] + 1, start)
-            for code in range(start, end + 1):
-                self.assertNotIn(unicodedata.category(chr(code))[0], "LN", hex(code))
-                self.assertTrue(_grammar.is_alphanumeric(chr(code)), hex(code))
+        missed = [
+            hex(code)
+            for code in range(0x110000)
+            if unicodedata.category(chr(code))[0] in "LN" and not _grammar.is_alphanumeric(chr(code))
+        ]
+        self.assertEqual(missed, [])
         for char in "aZ\u0663\u2160\u00bd":
             self.assertTrue(_grammar.is_alphanumeric(char), repr(char))
-        for char in " _;\u0301\u20dd\u200b\U0001f600":
+        for char in " _;\u0301\u20dd\u200b\U0001f600\ud800":
             self.assertFalse(_grammar.is_alphanumeric(char), repr(char))
+
+    def test_class_names_take_the_letters_unicode_added_after_this_python(self):
+        # Letters from Unicode 14.0 (Toto), 15.0 (Kawi), 16.0 (Garay)
+        # and 17.0 (a Latin capital and a CJK Extension J ideograph),
+        # which the server's Rust reads as alphanumeric: Python 3.9's
+        # unicodedata knows none of them, 3.14's only the first three.
+        for char in "\U0001e290\U00011f04\U00010d50\ua7ce\U000323b0":
+            with self.subTest(char=f"U+{ord(char):04X}"):
+                self.assertTrue(_grammar.is_alphanumeric(char))
+                self.assertEqual(filter.blur_class(char), f"blurclass({quote(char, safe='')})")
 
     def test_builders_refuse_what_the_server_refuses(self):
         bad = [
