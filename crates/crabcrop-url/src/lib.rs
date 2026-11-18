@@ -32,6 +32,12 @@
 //! ([`is_reserved_remainder`]): a signature over a label
 //! would be that label's subkey.
 //!
+//! With the `zeroize` feature, off by default, the subkeys the
+//! crate derives for its own signing and sealing are overwritten
+//! with zeros when it drops them, and so is the state `hmac`,
+//! `sha2` and `aes-gcm` keep from a key. A subkey returned to the
+//! caller ([`purge_key`] and the like) is the caller's to clear.
+//!
 //! ```
 //! let url = crabcrop_url::build_url(
 //!     "https://images.example.com",
@@ -116,6 +122,36 @@ fn derive_subkey(secret: &[u8], label: &str) -> Vec<u8> {
     debug_assert!(is_reserved_remainder(label));
     hmac_sha256(secret, label.as_bytes()).to_vec()
 }
+
+/// A subkey this crate derives for its own signing or sealing,
+/// and drops when that is done. With the `zeroize` feature, its
+/// bytes are overwritten with zeros when it is dropped, before
+/// its buffer is freed; without the feature the buffer is freed
+/// as it is. A subkey returned to the caller ([`purge_key`] and
+/// the like) is the caller's to clear.
+struct Subkey(Vec<u8>);
+
+impl Subkey {
+    fn derive(secret: &[u8], label: &str) -> Self {
+        Subkey(derive_subkey(secret, label))
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Drop for Subkey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// The label [`purge_key`] is derived from.
+const PURGE_KEY_LABEL: &str = "crabcrop/purge-key";
+/// The label [`purge_group_key`] is derived from.
+const PURGE_GROUP_KEY_LABEL: &str = "crabcrop/purge-group-key";
+/// The label [`upload_key`] is derived from.
+const UPLOAD_KEY_LABEL: &str = "crabcrop/upload-key";
+/// The label [`seal_key`] is derived from.
+const SEAL_KEY_LABEL: &str = "crabcrop/seal-key";
 
 /// A signature under a derived subkey: the lowercase hex
 /// HMAC-SHA256 of `message`. The message space is the
@@ -299,7 +335,7 @@ fn write_invalid_character(
 /// purge endpoint. That holds because [`sign`] never signs
 /// the label itself (see [`RESERVED_SEGMENT`]).
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/purge-key")
+    derive_subkey(secret, PURGE_KEY_LABEL)
 }
 
 /// The purge signature for a target path (the request
@@ -318,7 +354,7 @@ pub fn purge_key(secret: &[u8]) -> Vec<u8> {
 /// is not part of its cache key: drop it from the target
 /// and the purge evicts the same entries.
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
-    sign_under_subkey(&purge_key(secret), target)
+    sign_under_subkey(&Subkey::derive(secret, PURGE_KEY_LABEL).0, target)
 }
 
 /// The signed string a purge or purge-group signature
@@ -358,7 +394,7 @@ pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) ->
 /// can never be transplanted to `/purge-group`, whatever
 /// target string it was minted over (audit R2-14).
 pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/purge-group-key")
+    derive_subkey(secret, PURGE_GROUP_KEY_LABEL)
 }
 
 /// The purge-group signature for a cache group: HMAC-SHA256
@@ -370,7 +406,7 @@ pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
 /// [`purge_group_signature_with_expiry`] for one that stops
 /// working at a given second.
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
-    sign_under_subkey(&purge_group_key(secret), group)
+    sign_under_subkey(&Subkey::derive(secret, PURGE_GROUP_KEY_LABEL).0, group)
 }
 
 /// The expiring purge-group signature for a cache group:
@@ -393,14 +429,14 @@ pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u6
 /// for an image URL (or a purge) does not verify at the
 /// upload endpoint (issue #168).
 pub fn upload_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/upload-key")
+    derive_subkey(secret, UPLOAD_KEY_LABEL)
 }
 
 /// The upload signature for an object name: HMAC-SHA256 of
 /// the name under the upload subkey. This is the signature
 /// segment for `PUT /upload/<signature>/<name>`.
 pub fn upload_signature(secret: &[u8], name: &str) -> String {
-    sign_under_subkey(&upload_key(secret), name)
+    sign_under_subkey(&Subkey::derive(secret, UPLOAD_KEY_LABEL).0, name)
 }
 
 /// The seal subkey: the raw bytes of the HMAC-SHA256 of
@@ -413,7 +449,7 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
 /// this same derivation, and the rotation window for
 /// signatures is the rotation window for tokens.
 pub fn seal_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/seal-key")
+    derive_subkey(secret, SEAL_KEY_LABEL)
 }
 
 /// The version marker that opens a sealed token segment:
@@ -517,12 +553,13 @@ impl std::fmt::Display for SealError {
 
 impl std::error::Error for SealError {}
 
+/// The cipher a token seals and opens under: AES-256-GCM keyed
+/// with the seal subkey, which is dropped once the cipher holds
+/// it.
 fn seal_cipher(secret: &[u8]) -> aes_gcm::Aes256Gcm {
     use aes_gcm::KeyInit as _;
-    let key = seal_key(secret);
-    let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::try_from(key.as_slice())
-        .expect("an HMAC-SHA256 tag is 32 bytes");
-    aes_gcm::Aes256Gcm::new(&key)
+    let key = Subkey::derive(secret, SEAL_KEY_LABEL);
+    aes_gcm::Aes256Gcm::new_from_slice(&key.0).expect("an HMAC-SHA256 tag is 32 bytes")
 }
 
 /// The nonce array for a 12-byte nonce, the one length
@@ -850,7 +887,7 @@ pub fn upload_signed_string(name: &str, expires: Option<u64>) -> String {
 /// rotates.
 pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
     sign_under_subkey(
-        &upload_key(secret),
+        &Subkey::derive(secret, UPLOAD_KEY_LABEL).0,
         &upload_signed_string(name, Some(expires)),
     )
 }

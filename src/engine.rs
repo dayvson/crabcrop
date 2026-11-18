@@ -4092,7 +4092,7 @@ impl TrimWindows {
 
 /// The geometry the frames of one animated render share, so
 /// the frames come out on one canvas, cut from the same part
-/// of the scene.
+/// of the scene, and the scaled overlay parts they all draw.
 #[derive(Debug, Default)]
 struct FrameShare {
     /// One smart crop window per crop (issue #376), on the
@@ -4101,6 +4101,78 @@ struct FrameShare {
     smart_windows: SmartWindows,
     /// One trim window per trim filter (issue #465).
     trims: TrimWindows,
+    /// The parts `overlay(...,width)` scaled, kept for the
+    /// frames after the one that scaled them.
+    overlays: ScaledOverlays,
+}
+
+/// The scaled overlay parts the frames of one animated render
+/// share. `overlay(...,width)` scales the part of the overlay
+/// that lands on the image, and those pixels depend on the
+/// overlay, the size it is scaled to and the part that lands,
+/// nothing else. The frames of a render share one canvas, so
+/// they all ask for the same part: the first frame scales it,
+/// and the frames after it draw the kept pixels, where each
+/// scaled them again. A part is kept under all three, so a
+/// frame of another size, or another overlay, asks for a part
+/// of its own and scales it. The overlay is named by the URL
+/// it was fetched from, which names one image for the whole
+/// render.
+///
+/// The frames render in turn, each chain borrowing the render's
+/// one share for its run (see [`render_frames`] and
+/// [`survey_trims`]), so the parts are never read and written at
+/// once. They hold at most as many pixels as the image they land
+/// on: a part past that is scaled for each frame, as before, so
+/// a chain of many scaled overlays keeps no more than one
+/// frame's worth of them.
+#[derive(Debug, Default)]
+struct ScaledOverlays {
+    entries: Vec<ScaledOverlay>,
+}
+
+/// One kept part: what its pixels depend on, and the pixels.
+#[derive(Debug)]
+struct ScaledOverlay {
+    url: String,
+    size: (u32, u32),
+    part: crate::filters::Rect,
+    pixels: std::sync::Arc<image::RgbaImage>,
+}
+
+impl ScaledOverlays {
+    /// The pixels of `part` of the overlay at `url` scaled to
+    /// `size`: the kept ones when an earlier frame scaled them,
+    /// or else what `scale` makes, kept while the kept parts
+    /// still hold no more than `room` pixels with them.
+    fn part<E>(
+        &mut self,
+        url: &str,
+        size: (u32, u32),
+        part: crate::filters::Rect,
+        room: u64,
+        scale: impl FnOnce() -> Result<image::RgbaImage, E>,
+    ) -> Result<std::sync::Arc<image::RgbaImage>, E> {
+        let pixels_of = |(_, _, w, h): crate::filters::Rect| u64::from(w) * u64::from(h);
+        if let Some(kept) = self
+            .entries
+            .iter()
+            .find(|e| e.url == url && e.size == size && e.part == part)
+        {
+            return Ok(std::sync::Arc::clone(&kept.pixels));
+        }
+        let pixels = std::sync::Arc::new(scale()?);
+        let held: u64 = self.entries.iter().map(|e| pixels_of(e.part)).sum();
+        if held + pixels_of(part) <= room {
+            self.entries.push(ScaledOverlay {
+                url: url.to_owned(),
+                size,
+                part,
+                pixels: std::sync::Arc::clone(&pixels),
+            });
+        }
+        Ok(pixels)
+    }
 }
 
 /// The smallest box holding both boxes; `None` stands for no
@@ -4229,8 +4301,9 @@ struct ChainState<'r, 'a> {
     dpr: f32,
     ctx: &'r ProcessContext<'a>,
     directives: &'r crate::url::RequestDirectives,
-    /// The geometry an animated render shares across its
-    /// frames (issues #376, #465); `None` on a still.
+    /// What an animated render shares across its frames: its
+    /// geometry (issues #376, #465) and its scaled overlay
+    /// parts; `None` on a still.
     share: Option<&'r mut FrameShare>,
     encode_opts: EncodeOptions,
     face_memo: FaceMemo,
@@ -5213,7 +5286,22 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     .ok_or_else(|| {
                         EngineError::Unsupported(format!("overlay was not resolved: {url}"))
                     })?;
-                img = blend_overlay(self.ctx, &img, ov, *x, *y, *alpha, *blend, *width)?;
+                // The frames of an animated render share the
+                // scaled part (see `ScaledOverlays`).
+                let kept = self
+                    .share
+                    .as_deref_mut()
+                    .map(|share| (url.as_str(), &mut share.overlays));
+                img = blend_overlay_keeping(
+                    self.ctx,
+                    &img,
+                    ov,
+                    (*x, *y),
+                    *alpha,
+                    *blend,
+                    *width,
+                    kept,
+                )?;
             }
             Filter::RemoveBg => {
                 let provider = self.ctx.mask_provider.ok_or_else(|| {
@@ -5779,16 +5867,23 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 /// deadline checked before each row and within a row that
 /// reads many source samples (see `overlay_scale`): the same
 /// pixels the whole scale gave there.
+///
+/// On a frame of an animated render, `kept` holds the URL the
+/// overlay was fetched from and the scaled parts the render's
+/// frames share (see [`ScaledOverlays`]): a part an earlier
+/// frame scaled is drawn from there, with the same pixels, and
+/// one this frame scales is kept there for the frames after
+/// it. A still passes `None`.
 #[allow(clippy::too_many_arguments)]
-fn blend_overlay(
+fn blend_overlay_keeping(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
     ov: &crate::filters::WatermarkImage,
-    x: i32,
-    y: i32,
+    (x, y): (i32, i32),
     alpha: u8,
     mode: crate::url::BlendMode,
     width_pct: Option<u32>,
+    kept: Option<(&str, &mut ScaledOverlays)>,
 ) -> Result<DynamicImage, EngineError> {
     // The deadline is checked before anything is copied or
     // scaled, as well as per row of the blend (issue #604).
@@ -5837,9 +5932,17 @@ fn blend_overlay(
         // Scaled to its own size, the overlay is itself.
         ov.rgba_part(part.0)
     } else {
-        let pixels =
-            overlay_scale::scaled_part(ov.image(), top_size, part.0, || ctx.check_deadline())?;
-        crate::filters::RgbaPart::copied(pixels, (part.0.0, part.0.1), top_size)
+        let scale =
+            || overlay_scale::scaled_part(ov.image(), top_size, part.0, || ctx.check_deadline());
+        let origin = (part.0.0, part.0.1);
+        match kept {
+            Some((url, kept)) => {
+                let room = u64::from(base.width()) * u64::from(base.height());
+                let pixels = kept.part(url, top_size, part.0, room, scale)?;
+                crate::filters::RgbaPart::shared(pixels, origin, top_size)
+            }
+            None => crate::filters::RgbaPart::copied(scale()?, origin, top_size),
+        }
     };
     // The blend walks every overlay pixel; a large legal pair
     // still runs long, so the deadline is honored per row
@@ -5852,6 +5955,23 @@ fn blend_overlay(
         || ctx.check_deadline(),
         |b, o| blend_channel(mode, b, o),
     )
+}
+
+/// [`blend_overlay_keeping`] on a still, with nothing kept:
+/// the form the tests call.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn blend_overlay(
+    ctx: &ProcessContext<'_>,
+    base: &DynamicImage,
+    ov: &crate::filters::WatermarkImage,
+    x: i32,
+    y: i32,
+    alpha: u8,
+    mode: crate::url::BlendMode,
+    width_pct: Option<u32>,
+) -> Result<DynamicImage, EngineError> {
+    blend_overlay_keeping(ctx, base, ov, (x, y), alpha, mode, width_pct, None)
 }
 
 /// Overlay `wm` onto `base` at (x, y) with `alpha` percent
