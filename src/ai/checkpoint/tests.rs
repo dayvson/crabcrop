@@ -292,11 +292,11 @@ fn aesthetic_head_refuses_a_pickle_that_left_a_stale_mark_without_a_panic() {
 
 #[test]
 fn aesthetic_head_refuses_a_head_with_a_stray_mark_before_its_build() {
-    // The synthetic head with a MARK before its BUILD tail:
-    // BUILD then uses the state dict and the root dict below
-    // the MARK. The load accepted it before issue #760;
-    // CPython's unpickler refuses it ("unexpected MARK
-    // found"), and so does the load now.
+    // The synthetic head with a MARK just before its closing
+    // BUILD: BUILD then uses the state dict and the root
+    // dict, both below the MARK. The load accepted it before
+    // issue #760; CPython's unpickler refuses it
+    // ("unexpected MARK found"), and so does the load now.
     let mut pkl = head_pickle(3, 1);
     assert!(pkl.ends_with(b"b."));
     pkl.insert(pkl.len() - 2, b'(');

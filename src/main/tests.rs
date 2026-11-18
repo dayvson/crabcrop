@@ -1292,8 +1292,9 @@ fn build_aesthetic_names_its_variable_for_a_head_that_reaches_below_a_mark() {
     // a MARK, which panicked the load and the boot with it.
     // The boot now stops on the configuration error every
     // malformed head file gets, for CRABCROP_AESTHETIC_HEAD.
-    // The CLIP models this needs at boot load before the
-    // head; the head's own step runs without them.
+    // Boot loads the CLIP models before the head, but
+    // build_aesthetic, the head's own step, needs none of
+    // them, so this runs without the models.
     let head = temp_file(
         "aesthetic-stale-mark",
         &crate::test_head_archive::head_archive(b"N}(bt.", &[]),

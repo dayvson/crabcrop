@@ -23,16 +23,17 @@
 //! The inputs are the checkpoint fixtures the unit tests
 //! build, the fence tests' pickles, and one more: the
 //! scalar opcodes at their edges, which none of those
-//! holds. The small ones run whole, cut
-//! at every length, with every byte deleted or overwritten,
-//! and with every span of up to eight bytes doubled: the
-//! head pickle's bytes take every value, the others' every
-//! opcode the loop reads and a few other bytes. The large
-//! ones, which run until a limit stops them, run whole and
-//! cut at a sample of lengths. As property tests, random
-//! opcode streams run, and the fixtures mutated, truncated
-//! and with spans repeated. An ignored test adds the LAION
-//! heads the AI workflow downloads.
+//! holds. The small ones run whole, cut at every length,
+//! with every byte deleted or overwritten, and with every
+//! span of up to eight bytes doubled: the head pickle's
+//! bytes take every value, the others' every opcode the
+//! loop reads and a few other bytes. The large ones, which
+//! run until a limit stops them, run whole and cut at a
+//! sample of lengths. As property tests, random opcode
+//! streams run, and the fixtures other than the fence
+//! tests' pickles mutated, truncated and with spans
+//! repeated. An ignored test adds the LAION heads the AI
+//! workflow downloads.
 //!
 //! The cases per property default to [`DEFAULT_CASES`];
 //! `PROPTEST_CASES` raises it (the nightly job does). A
