@@ -21,8 +21,8 @@ import check_locks  # noqa: E402
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 
 # A healthy root lock: one oxideav-h265 shared by crabcrop and
-# oxideav-heif, the three splits SPLITS allows, and a duplicate that is
-# no decoder.
+# oxideav-heif, the three splits SPLITS allows, a duplicate that is no
+# decoder, and one reqwest over one TLS crypto provider.
 ROOT_PACKAGES = [
     ("crabcrop", "0.10.0", None),
     ("image", "0.25.10", REGISTRY),
@@ -32,6 +32,8 @@ ROOT_PACKAGES = [
     ("moxcms", "0.9.2", REGISTRY),
     ("oxideav-h265", "0.0.16", REGISTRY),
     ("oxideav-heif", "0.0.13", REGISTRY),
+    ("reqwest", "0.13.5", REGISTRY),
+    ("ring", "0.17.14", REGISTRY),
     ("roxmltree", "0.20.0", REGISTRY),
     ("roxmltree", "0.21.2", REGISTRY),
     ("syn", "1.0.109", REGISTRY),
@@ -171,6 +173,38 @@ class CheckLocks(unittest.TestCase):
             root_packages=packages,
             fuzz_packages=[*packages, *FUZZ_ONLY],
         )
+
+    def test_a_second_reqwest_fails(self):
+        # The shape issue #742 found: c2pa's async HTTP stack compiled
+        # reqwest 0.12 beside crabcrop's 0.13.
+        packages = [*ROOT_PACKAGES, ("reqwest", "0.12.28", REGISTRY)]
+        output = self.assert_fails(
+            [
+                "Cargo.lock: reqwest is locked 2 times (0.12.28, 0.13.5), and the binary takes one HTTP client",
+                "cargo tree -i reqwest@0.12.28 shows who needs the other",
+            ],
+            root_packages=packages,
+            fuzz_packages=[*packages, *FUZZ_ONLY],
+        )
+        self.assertIn("fuzz/Cargo.lock: reqwest is locked 2 times", output)
+
+    def test_a_second_crypto_provider_fails(self):
+        # Issue #742: reqwest's `rustls` feature compiled aws-lc-rs beside
+        # the ring that c2pa's ureq brings.
+        packages = [*ROOT_PACKAGES, ("aws-lc-rs", "1.18.2", REGISTRY)]
+        self.assert_fails(
+            [
+                "Cargo.lock: rustls crypto providers ring and aws-lc-rs are both locked, and the binary takes one",
+                "cargo tree -e features -i rustls",
+            ],
+            root_packages=packages,
+            fuzz_packages=[*packages, *FUZZ_ONLY],
+        )
+        # Either provider alone is one provider.
+        alone = [p for p in packages if p[0] != "ring"]
+        code, output = self.run_check(root_packages=alone)
+        self.assertEqual(code, 0, output)
+        self.assertIn("one TLS crypto provider (aws-lc-rs)", output)
 
     def test_a_duplicate_that_decodes_nothing_passes(self):
         packages = [*ROOT_PACKAGES, ("thiserror", "1.0.69", REGISTRY), ("thiserror", "2.0.21", REGISTRY)]

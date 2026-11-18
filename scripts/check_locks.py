@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Check that the Cargo lockfiles give every decoder one version.
+"""Check the Cargo lockfiles: one version of each decoder, one HTTP client, one TLS provider.
 
-Two rules (issue #552), both read from Cargo.lock and fuzz/Cargo.lock:
+Three rules, all read from Cargo.lock and fuzz/Cargo.lock:
 
-1. No decoder in two versions. A crate in DECODERS, which parse request
-   or source-image bytes in the shipped binary, appears once per lockfile:
-   one version from one source.
+1. No decoder in two versions (issue #552). A crate in DECODERS, which
+   parse request or source-image bytes in the shipped binary, appears
+   once per lockfile: one version from one source.
    A second version means some input reaches a decoder that the tests,
    the fuzzing and the pre-checks do not run: #494's lock refresh left
    oxideav-heif decoding HEVC with oxideav-h265 0.0.15, while the SPS
@@ -15,11 +15,20 @@ Two rules (issue #552), both read from Cargo.lock and fuzz/Cargo.lock:
    no request bytes reach the second copy, and lists the same
    semver-compatible lines the lockfile carries.
 
-2. The fuzz lock matches the root lock. Every package both lockfiles
-   carry has the same versions and sources in each, so the fuzz harness
-   builds the decoders the server ships. A package only one lockfile
-   carries (libfuzzer-sys and its tree, the root's dev-dependencies) is
-   not compared. fuzz/README.md has the refresh recipe.
+2. The fuzz lock matches the root lock (issue #552). Every package both
+   lockfiles carry has the same versions and sources in each, so the fuzz
+   harness builds the decoders the server ships. A package only one
+   lockfile carries (libfuzzer-sys and its tree, the root's
+   dev-dependencies) is not compared. fuzz/README.md has the refresh
+   recipe.
+
+3. One HTTP client and one TLS crypto provider (issue #742). reqwest
+   appears once per lockfile, and at most one of the rustls crypto
+   providers in PROVIDERS does. A second reqwest is a second HTTP and TLS
+   client to build and ship, a second provider a second cryptography
+   library, and every TLS or cryptography advisory then has to be
+   checked against both. c2pa builds ureq with ring, so ring is the
+   provider (src/tls.rs).
 
 DECODERS covers the image decoders and the parsers crabcrop's own
 pre-checks share with them (oxideav-h265 for HEIC, roxmltree and
@@ -105,6 +114,12 @@ SPLITS = {
         "fontconfig files; SVG is parsed by usvg and src/svg.rs with 0.21",
     ),
 }
+
+# Rule 3's crates (issue #742): the HTTP client every source, bucket and
+# CLI request goes through, and the crypto providers rustls can be built
+# with.
+HTTP_CLIENT = "reqwest"
+PROVIDERS = ("ring", "aws-lc-rs")
 
 FIELD = re.compile(r'^(name|version|source) = "([^"]*)"$')
 
@@ -208,6 +223,24 @@ def check_decoders(lock, found):
     return problems
 
 
+def check_tls(lock, found):
+    problems = []
+    clients = found.get(HTTP_CLIENT, set())
+    if len(clients) > 1:
+        oldest = sorted(clients, key=lambda entry: version_key(entry[0]))[0][0]
+        problems.append(
+            f"{lock}: {HTTP_CLIENT} is locked {len(clients)} times ({describe(clients)}), and the binary "
+            f"takes one HTTP client: cargo tree -i {HTTP_CLIENT}@{oldest} shows who needs the other"
+        )
+    providers = [name for name in PROVIDERS if name in found]
+    if len(providers) > 1:
+        problems.append(
+            f"{lock}: rustls crypto providers {' and '.join(providers)} are both locked, and the binary "
+            "takes one (src/tls.rs): cargo tree -e features -i rustls shows which crate turns on each"
+        )
+    return problems
+
+
 def describe(entries):
     return ", ".join(version if source != "path" else f"{version} (path)" for version, source in sorted(entries))
 
@@ -239,6 +272,7 @@ def check(root):
             problems.append(f"{lock}: cannot read it: {error}")
             continue
         problems += check_decoders(lock, found[lock])
+        problems += check_tls(lock, found[lock])
     if len(found) == len(LOCKS):
         problems += check_agreement(found["Cargo.lock"], found["fuzz/Cargo.lock"])
     return found, problems
@@ -257,8 +291,11 @@ def main(argv=None):
     root_found = found["Cargo.lock"]
     shared = set(root_found) & set(found["fuzz/Cargo.lock"])
     decoders = sorted(n for n in root_found if decoder_label(n))
+    clients = describe(root_found.get(HTTP_CLIENT, set())) or "none"
+    providers = ", ".join(name for name in PROVIDERS if name in root_found) or "none"
     print(
         f"{len(decoders)} decoder crates at one version each (splits allowed: {', '.join(sorted(SPLITS))}); "
+        f"at most one {HTTP_CLIENT} ({clients}) and one TLS crypto provider ({providers}); "
         f"fuzz/Cargo.lock agrees with Cargo.lock on all {len(shared)} shared packages"
     )
     return 0
