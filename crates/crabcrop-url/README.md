@@ -162,8 +162,8 @@ let expiring = upload_signature_with_expiry(b"your-secret", "photo.jpg", 1893456
 
 The `zeroize` feature, off by default, clears key material when it is dropped: the subkeys the crate derives for its own purge, upload and seal operations, and, through the `zeroize` features of `hmac`, `sha2` and `aes-gcm`, the state those crates keep from a key. It adds the [`zeroize`](https://crates.io/crates/zeroize) crate as a dependency. A subkey that `purge_key`, `purge_group_key`, `upload_key` or `seal_key` returns is the caller's to clear, for example by holding it in `zeroize::Zeroizing`.
 
-```toml
-crabcrop-url = { version = "0.13", features = ["zeroize"] }
+```sh
+cargo add crabcrop-url --features zeroize
 ```
 
 ## Unsigned mode
