@@ -1142,6 +1142,62 @@ mod tests {
         }
     }
 
+    /// The purge vectors from `spec/test-vectors.json`: each
+    /// endpoint's helper, plain or expiring, reproduces the
+    /// signature, `purge_signed_string` the signed string,
+    /// which is also what follows the signature segment in
+    /// the request path, and the expiring form is the plain
+    /// signature over that string under the endpoint's own
+    /// subkey.
+    #[test]
+    fn purge_test_vectors() {
+        type Plain = fn(&[u8], &str) -> String;
+        type Expiring = fn(&[u8], &str, u64) -> String;
+        type Subkey = fn(&[u8]) -> Vec<u8>;
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(VECTORS).unwrap();
+        let purges: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v.get("purge_signature").is_some())
+            .collect();
+        assert!(purges.len() >= 6, "the spec carries purge vectors");
+        let mut expiring = 0;
+        for v in purges {
+            let description = v["description"].as_str().unwrap();
+            let secret = v["secret"].as_str().unwrap().as_bytes();
+            let target = v["target"].as_str().unwrap();
+            let expires = v.get("expires").map(|e| e.as_u64().unwrap());
+            let signed = v["signed"].as_str().unwrap();
+            let expected = v["purge_signature"].as_str().unwrap();
+            let (plain, with_expiry, subkey): (Plain, Expiring, Subkey) =
+                match v["endpoint"].as_str().unwrap() {
+                    "purge" => (purge_signature, purge_signature_with_expiry, purge_key),
+                    "purge-group" => (
+                        purge_group_signature,
+                        purge_group_signature_with_expiry,
+                        purge_group_key,
+                    ),
+                    other => panic!("{description}: unknown endpoint {other}"),
+                };
+            assert_eq!(
+                purge_signed_string(target, expires),
+                signed,
+                "{description}"
+            );
+            let minted = match expires {
+                Some(exp) => {
+                    expiring += 1;
+                    with_expiry(secret, target, exp)
+                }
+                None => plain(secret, target),
+            };
+            assert_eq!(minted, expected, "{description}");
+            assert_eq!(plain(secret, signed), expected, "{description}");
+            assert!(verify(&subkey(secret), expected, signed), "{description}");
+            assert!(!verify(secret, expected, signed), "{description}");
+        }
+        assert!(expiring >= 3, "the spec carries expiring purge vectors");
+    }
+
     /// The refusal vectors from `spec/test-vectors.json`
     /// (issue #472): every builder refuses each input with
     /// the typed error naming the input and the character,

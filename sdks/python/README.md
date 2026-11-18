@@ -45,9 +45,14 @@ ok = verify("your-secret", signature, "300x200/https://example.com/photo.jpg")
 
 # Purge signatures for the server's /purge and /purge-group endpoints
 # are domain-separated under a derived subkey; the helpers sign the
-# right strings so callers never assemble them by hand.
+# right strings so callers never assemble them by hand. Pass an
+# expiry (unix seconds) for a purge URL that stops working then;
+# its path is /purge/<signature>/exp:<expiry>/<path> (or
+# /purge-group/<signature>/exp:<expiry>/<group>).
 purge = purge_signature("your-secret", "300x200/https://example.com/photo.jpg")
 group = purge_group_signature("your-secret", "thumb")
+expiring_purge = purge_signature("your-secret", "300x200/https://example.com/photo.jpg", 1893456000)
+expiring_group = purge_group_signature("your-secret", "thumb", 1893456000)
 
 # Upload signatures for the server's PUT /upload/<signature>/<name>
 # endpoint live in a third domain, under their own derived subkey.

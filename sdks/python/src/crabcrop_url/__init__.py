@@ -171,12 +171,43 @@ def purge_key(secret: Union[str, bytes]) -> bytes:
     return _subkey(secret, "crabcrop/purge-key")
 
 
-def purge_signature(secret: Union[str, bytes], target: str) -> str:
+def _purge_signed_string(target: str, expires: Optional[int]) -> str:
+    """The signed string of a purge or purge-group signature:
+    the target, or ``exp:<expires>/`` and the target. It is
+    also what follows the signature segment in the request
+    path."""
+    if expires is None:
+        return target
+    _validate_expires(expires)
+    return f"exp:{expires}/{target}"
+
+
+def purge_signature(
+    secret: Union[str, bytes], target: str, expires: Optional[int] = None
+) -> str:
     """The signature segment for
     ``POST /purge/<signature>/<path>``: HMAC-SHA256 of the
-    target path under the purge subkey."""
+    target path under the purge subkey.
+
+    With ``expires`` (unix seconds), the signature covers
+    ``exp:<expires>/<path>`` and the request path is
+    ``POST /purge/<signature>/exp:<expires>/<path>``: the
+    expiry sits inside the signed string, so it can neither
+    be stripped nor extended, and the server refuses the
+    purge once that second is reached. Without it the
+    signature authorizes the purge until the secret rotates.
+    An expiry that is not a non-negative integer raises
+    ``ValueError``.
+
+    The server reads a leading ``exp:`` segment of the path
+    as the purge's own expiry, so a target that opens with an
+    image URL's ``exp:`` is refused once that second has
+    passed. An image's ``exp:`` is not part of its cache key:
+    drop it from the target and the purge evicts the same
+    entries."""
     key = purge_key(secret)
-    return hmac.new(key, target.encode("utf-8"), hashlib.sha256).hexdigest()
+    signed = _purge_signed_string(target, expires)
+    return hmac.new(key, signed.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def purge_group_key(secret: Union[str, bytes]) -> bytes:
@@ -189,13 +220,22 @@ def purge_group_key(secret: Union[str, bytes]) -> bytes:
     return _subkey(secret, "crabcrop/purge-group-key")
 
 
-def purge_group_signature(secret: Union[str, bytes], group: str) -> str:
+def purge_group_signature(
+    secret: Union[str, bytes], group: str, expires: Optional[int] = None
+) -> str:
     """The signature segment for
     ``POST /purge-group/<signature>/<group>``: HMAC-SHA256
     of the group name under the purge-group subkey. The
-    helper exists so nobody has to know the signed string."""
+    helper exists so nobody has to know the signed string.
+
+    With ``expires`` (unix seconds), the signature covers
+    ``exp:<expires>/<group>``, the request path is
+    ``POST /purge-group/<signature>/exp:<expires>/<group>``,
+    and the server refuses the purge once that second is
+    reached, as for `purge_signature`."""
     key = purge_group_key(secret)
-    return hmac.new(key, group.encode("utf-8"), hashlib.sha256).hexdigest()
+    signed = _purge_signed_string(group, expires)
+    return hmac.new(key, signed.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def upload_key(secret: Union[str, bytes]) -> bytes:
