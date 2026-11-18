@@ -1504,10 +1504,13 @@ fn build_video_encoder(
             })?
             .with_address_space(config.encoder_address_space);
             boot_line!(
-                "video encoder: {path} (timeout {}s, output cap {} MB, address space {} MB)",
+                "video encoder: {path} (timeout {}s, output cap {} MB{})",
                 config.timeout_secs,
                 config.max_mb,
-                config.encoder_address_space >> 20
+                address_space_note(
+                    config.encoder_address_space,
+                    crate::video::DEFAULT_ENCODER_ADDRESS_SPACE
+                )
             );
             Ok(Some(Arc::new(encoder)))
         }
@@ -1538,13 +1541,28 @@ fn build_video_decoder(
             })?
             .with_address_space(config.decoder_address_space);
             boot_line!(
-                "video decoder: {path} (timeout {}s, address space {} MB)",
+                "video decoder: {path} (timeout {}s{})",
                 config.timeout_secs,
-                config.decoder_address_space >> 20
+                address_space_note(
+                    config.decoder_address_space,
+                    crate::frames::DEFAULT_DECODER_ADDRESS_SPACE
+                )
             );
             Ok(Some(Arc::new(extractor)))
         }
         None => Ok(None),
+    }
+}
+
+/// What a tool's boot line says of its address-space cap
+/// (issue #738): nothing at the default, so a server that
+/// sets no cap prints the line it always has, and the cap in
+/// megabytes otherwise.
+fn address_space_note(cap: u64, default: u64) -> String {
+    if cap == default {
+        String::new()
+    } else {
+        format!(", address space {} MB", cap >> 20)
     }
 }
 
@@ -1656,8 +1674,12 @@ fn build_pdf_renderer(
                 )
             })?;
             boot_line!(
-                "PDF renderer: {path} (timeout {}s, address space {cap_mb} MB)",
-                config.timeout_secs
+                "PDF renderer: {path} (timeout {}s{})",
+                config.timeout_secs,
+                address_space_note(
+                    config.renderer_address_space,
+                    crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE
+                )
             );
             Ok(Some(Arc::new(renderer)))
         }

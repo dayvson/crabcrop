@@ -235,7 +235,9 @@ fn each_cap_reaches_its_tools_limit() {
     // binary, which sets its limit itself from the cap the
     // server passes it: its `/proc` entry is read while it
     // renders a document slower than the deadline. Every cap
-    // is set to a value no default has.
+    // is set to a value no default has. A boot with no cap
+    // set comes first: its boot lines are the ones the tools
+    // had before the caps were settings.
     let dir = common::scratch_dir("tool-caps-reach");
     let record = |name: &str| dir.join(format!("{name}.limits"));
     std::fs::write(dir.join("page.png"), png()).unwrap();
@@ -284,11 +286,29 @@ fn each_cap_reaches_its_tools_limit() {
         .env("CRABCROP_VIDEO_DECODER", &decoder)
         .env("CRABCROP_VIDEO_ENCODER", &encoder)
         .env("CRABCROP_PROCESS_TIMEOUT_SECS", "5");
+    // No cap set: the boot lines name none, and the boot
+    // check runs the PDF tools under the 3 GiB they always
+    // had.
+    {
+        let (_server, _, _, printed) = common::serve_printing(&mut command);
+        for line in [
+            format!("PDF renderer: {} (timeout 30s)", renderer.display()),
+            format!("video decoder: {} (timeout 30s)", decoder.display()),
+            format!(
+                "video encoder: {} (timeout 30s, output cap 64 MB)",
+                encoder.display()
+            ),
+        ] {
+            assert!(printed.contains(&line), "no {line:?} in {printed:#?}");
+        }
+    }
+    assert_eq!(recorded(&record("pdfinfo")), [3072 * MB]);
+    assert_eq!(recorded(&record("pdftocairo")), [3072 * MB]);
     for (name, mb) in caps {
         command.env(name, mb.to_string());
     }
     let (mut server, port, _, printed) = common::serve_printing(&mut command);
-    // The boot lines name the caps in force.
+    // The boot lines name the caps set.
     for line in [
         format!(
             "PDF renderer: {} (timeout 30s, address space 768 MB)",
@@ -305,9 +325,9 @@ fn each_cap_reaches_its_tools_limit() {
     ] {
         assert!(printed.contains(&line), "no {line:?} in {printed:#?}");
     }
-    // The boot check ran both PDF tools, once each.
-    assert_eq!(recorded(&record("pdfinfo")), [768 * MB]);
-    assert_eq!(recorded(&record("pdftocairo")), [768 * MB]);
+    // Its boot check ran both PDF tools, once each.
+    assert_eq!(recorded(&record("pdfinfo")), [3072 * MB, 768 * MB]);
+    assert_eq!(recorded(&record("pdftocairo")), [3072 * MB, 768 * MB]);
     // The probe fails, so the request fails, after the run.
     assert_ne!(
         get(port, "/unsafe/frame:poster/40x30/file:///clip.mp4"),
@@ -320,8 +340,11 @@ fn each_cap_reaches_its_tools_limit() {
     );
     assert_eq!(recorded(&record("encoder")), [1536 * MB]);
     // The worker: found among the server's children while it
-    // renders, its limit read once it has set it.
+    // renders, its limit read once it has set it, which is
+    // when the limit differs from the one it inherited from
+    // the server.
     let server_pid = server.0.id();
+    let inherited = address_space_limit(server_pid);
     let render = std::thread::spawn(move || get(port, "/unsafe/file:///slow.svg"));
     let deadline = Instant::now() + LONG;
     let limit = loop {
@@ -329,7 +352,10 @@ fn each_cap_reaches_its_tools_limit() {
             std::fs::read(format!("/proc/{pid}/cmdline"))
                 .is_ok_and(|cmdline| cmdline.split(|&b| b == 0).any(|arg| arg == b"--svg-worker"))
         });
-        if let Some(limit) = worker.and_then(address_space_limit) {
+        if let Some(limit) = worker
+            .and_then(address_space_limit)
+            .filter(|&limit| Some(limit) != inherited)
+        {
             break limit;
         }
         assert!(
