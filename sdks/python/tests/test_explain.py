@@ -561,6 +561,9 @@ class TestLimits(unittest.TestCase):
                 self.assertLess(seconds, 1, f"{site} with {tail}: explain_url took {seconds:.3f} s")
                 self.assertEqual(len(out.errors), 1, f"{site} with {tail}")
                 self.assertNotIn("longer than 64 KiB", out.errors[0])
+                verdict, seconds = timed(cc.verify_url_signature, "secret", url)
+                self.assertLess(seconds, 1, f"{site} with {tail}: verify_url_signature took {seconds:.3f} s")
+                self.assertIs(verdict, False)
 
     def test_the_float_grammar_accepts_and_rejects_what_it_did_before(self):
         # The pattern the TypeScript explainer replaced, kept as the
@@ -612,9 +615,11 @@ class TestLimits(unittest.TestCase):
         ok = cc.explain_url(at_cap)
         self.assertEqual(ok.errors, [])
         self.assertEqual(ok.signature.kind, "hmac")
+        self.assertIs(cc.verify_url_signature(secret, at_cap), True)
 
-        # One byte over: one error and nothing else read, though the
-        # tag is right for its remainder.
+        # One byte over: one error, nothing else read, and the
+        # verifier answers None, as for any malformed URL, even
+        # though the tag is right for its remainder.
         over = signed(fill(cap + 1))
         out = cc.explain_url(over)
         self.assertEqual(
@@ -622,6 +627,8 @@ class TestLimits(unittest.TestCase):
             ["the URL is longer than 64 KiB (65536 bytes): the explainer does not read it"],
         )
         self.assertEqual((out.signature, out.segments, out.source, out.remainder), (None, [], "", ""))
+        self.assertIsNone(cc.verify_url_signature(secret, over))
+        self.assertIsNone(cc.verify_url_signature({"k": secret}, over))
 
         # The cap counts UTF-8 bytes, as the server reads them, not
         # characters: one `é` is two bytes, and a lone surrogate the
@@ -643,6 +650,7 @@ class TestLimits(unittest.TestCase):
         self.assertLess(seconds, 1)
         self.assertEqual(len(refused.errors), 1)
         self.assertIn("longer than 64 KiB", refused.errors[0])
+        self.assertIsNone(cc.verify_url_signature(secret, long))
 
 
 class TestTrim(unittest.TestCase):
@@ -790,6 +798,8 @@ class TestHostileInput(unittest.TestCase):
             )
             out = cc.explain_url(text)
             self.assertIsInstance(out, cc.Explanation)
+            self.assertIn(cc.verify_url_signature("secret", text), (None, True, False))
+            self.assertIn(cc.verify_url_signature({"k1": "secret"}, text), (None, True, False))
 
     def test_a_url_that_is_not_text_is_refused(self):
         for given in (b"https://x/unsafe/300x200/a.jpg", None, 7):

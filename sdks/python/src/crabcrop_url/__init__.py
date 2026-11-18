@@ -6,8 +6,9 @@ package from the ``crabcrop-url[seal]`` extra.
 The names follow the TypeScript SDK's, in Python's spelling
 (``buildURL`` is `build_url`, ``ops.cropObjects`` is
 `ops.crop_objects`), the typed operation builders, `ops`,
-`filter` and `join_ops`, mirror its builders, and `explain_url` is
-its explainer (issue #716).
+`filter` and `join_ops`, mirror its builders, and `explain_url`
+and `verify_url_signature` are its explainer and URL verifier
+(issue #716).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import base64
 import hashlib
 import hmac
 import os
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Mapping, Optional, Sequence, Union
 
 from ._explain import (
     FILTER_DESCRIPTIONS,
@@ -64,6 +65,7 @@ __all__ = [
     "Explanation",
     "FormatOptions",
     "ImageFormat",
+    "Keyring",
     "MaskShape",
     "PerFormatQualityFormat",
     "SealError",
@@ -96,9 +98,14 @@ __all__ = [
     "upload_key",
     "upload_signature",
     "verify",
+    "verify_url_signature",
 ]
 
 Secret = Union[str, bytes, None]
+
+#: Secrets by key ID, as a server in a rotation window holds them:
+#: what `verify_url_signature` takes in place of one secret.
+Keyring = Mapping[str, Union[str, bytes]]
 
 
 def _key(secret: Union[str, bytes]) -> bytes:
@@ -255,6 +262,47 @@ def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
     if is_reserved_remainder(remainder):
         return False
     return hmac.compare_digest(sign(secret, remainder), signature)
+
+
+def verify_url_signature(
+    secret_or_keyring: Union[str, bytes, Keyring], input: str
+) -> Optional[bool]:
+    """Verify a URL's signature locally, as the TypeScript SDK's
+    ``verifyUrlSignature`` does: ``True`` or ``False``, or ``None``
+    when the URL is unsigned (``unsafe``), sealed, malformed, or
+    longer than the 64 KiB `explain_url` reads. The URL is read the
+    way `explain_url` reads it, so a query or fragment is not part of
+    the signed path.
+
+    With one secret (``str`` or ``bytes``), the key ID a URL carries
+    is ignored: the question is whether this secret made the tag.
+    With a keyring (a mapping of key ID to secret), the server's
+    rotation rules apply: a keyed URL consults its named key only (an
+    unknown ID is ``False``), and an unkeyed URL consults every key.
+    A remainder that begins with `RESERVED_SEGMENT` is ``False``
+    whatever its tag. Each comparison is constant-time
+    (``hmac.compare_digest``), as in `verify`."""
+    explained = explain_url(input)
+    signature = explained.signature
+    if signature is None or signature.kind != "hmac":
+        return None
+    remainder = explained.remainder
+    # No signature over a reserved remainder is ever valid: the
+    # server refuses it whatever the signature, and this check
+    # must not confirm a derived subkey either.
+    if is_reserved_remainder(remainder):
+        return False
+    tag = signature.value
+
+    def made_by(secret: Union[str, bytes]) -> bool:
+        return hmac.compare_digest(sign(secret, remainder), tag)
+
+    if not isinstance(secret_or_keyring, Mapping):
+        return made_by(secret_or_keyring)
+    if signature.key_id is not None:
+        secret = secret_or_keyring.get(signature.key_id)
+        return secret is not None and made_by(secret)
+    return any(made_by(secret) for secret in secret_or_keyring.values())
 
 
 # ---------------------------------------------------------------------------
