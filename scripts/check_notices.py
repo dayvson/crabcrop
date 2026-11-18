@@ -12,12 +12,13 @@ That runs cargo-about (CARGO_ABOUT_VERSION exactly: INSTALL installs it)
 over Cargo.lock, for the features and targets dist-workspace.toml builds,
 with the accepted licenses and clarifications in scripts/notices/about.toml,
 and renders what it finds into scripts/notices/template.md. The template is
-the hand-written part: the native libraries, whose license texts it copies
-from the sources the crates vendor (pinned by SHA-256, so a changed text
-stops the generator until someone has read it) or from the copies under
-scripts/notices/ of the downloads the build pins. cargo-about refuses a
-crate whose license the accepted list does not satisfy, and the script
-refuses an accepted license no crate needs any more.
+the hand-written part: the native libraries and what the AI image adds,
+whose license texts it copies from the sources the crates vendor (pinned by
+SHA-256, so a changed text stops the generator until someone has read it) or
+from copies under scripts/notices/ of the license texts that cover the
+downloads the build pins. cargo-about refuses a crate whose license the
+accepted list does not satisfy, and the script refuses an accepted license
+no crate needs any more.
 
 With no flag, the script checks the file:
 
@@ -27,9 +28,9 @@ With no flag, the script checks the file:
   inputs   about.toml, the template, the files it copies and dist's targets
            and features are the ones the file was generated from.
   edited   The file is what the generator wrote.
-  pins     Every download the template's copies came from is still the one
-           its file pins (dav1d's tarball in scripts/build_dav1d.sh, ONNX
-           Runtime's in Dockerfile.ai).
+  pins     Every download whose license texts the template copies is still
+           the one its file pins (dav1d's tarball in scripts/build_dav1d.sh,
+           ONNX Runtime's package and the two models in Dockerfile.ai).
   ships    dist's include puts the file in the tarballs, and the Homebrew
            formula installs it. tests/deploy_recipes.rs checks the images.
   fresh    With cargo-about CARGO_ABOUT_VERSION installed: regenerating writes
