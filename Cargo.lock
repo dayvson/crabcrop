@@ -641,9 +641,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "c2pa"
-version = "0.91.11"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8e2a752d002206ccd431a9fe22cdc1205023d316c118dd60c4bf568cd493dea"
+checksum = "4caaefa6ebf384355a545ce1e2e7018c3db53bde513a0ee120a5170762b8c5af"
 dependencies = [
  "asn1-rs",
  "async-generic",
@@ -659,7 +659,6 @@ dependencies = [
  "c2pa_raw_crypto",
  "chrono",
  "console_log",
- "const-hex",
  "coset",
  "der 0.8.2",
  "ed25519-dalek 2.2.0",
@@ -700,7 +699,6 @@ dependencies = [
  "serde-transcode",
  "serde-wasm-bindgen",
  "serde_bytes",
- "serde_derive",
  "serde_json",
  "serde_with",
  "sha1",
@@ -1030,7 +1028,7 @@ dependencies = [
  "libm",
  "moxcms 0.9.2",
  "ort",
- "oxideav-h265",
+ "oxideav-h265 0.0.18",
  "oxideav-heif",
  "oxideav-webp",
  "png",
@@ -1074,9 +1072,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.2"
+version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
 dependencies = [
  "cfg-if",
 ]
@@ -1213,9 +1211,9 @@ dependencies = [
 
 [[package]]
 name = "cvvdp-lite"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91491ae7bc56795332ca50af9686d31d8f84389aa315c3daf9985dd1b55a0ab8"
+checksum = "aaeb961ccb8f98e81997f0460b1b00bff87c6a031c37dfd50243b3cb42b53a47"
 
 [[package]]
 name = "darling"
@@ -1685,9 +1683,9 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flate2"
-version = "1.1.10"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
@@ -1941,14 +1939,15 @@ dependencies = [
 
 [[package]]
 name = "harfrust"
-version = "0.12.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c03d949a14aa089bbb282f7dd76a498a7f684428e4257202efc119ec010376f9"
+checksum = "865dcc4105d51c323d8fedbb2d75b5e9c8ecddf5613f74c82f851d0afbc97114"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
  "read-fonts",
  "smallvec",
+ "yoke",
 ]
 
 [[package]]
@@ -2485,11 +2484,12 @@ dependencies = [
 
 [[package]]
 name = "jixel"
-version = "0.5.7"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13cd3bce0467732222e6f78045b40e72ead8723d236f8707211c4b2d75d1b403"
+checksum = "1384b1a9299f4ea6269afdbe345529e98997800ef4f03e8f4e76ca0d5f0f5e72"
 dependencies = [
  "cvvdp-lite",
+ "msssim-lite",
  "ssimu2-lite",
 ]
 
@@ -2613,9 +2613,9 @@ dependencies = [
 
 [[package]]
 name = "kamadak-exif"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
+checksum = "8772c92c0f41c4a672cbdee6728253e5ae8fcc1c5eb5c6c676579565684bbf68"
 dependencies = [
  "mutate_once",
 ]
@@ -2869,6 +2869,12 @@ dependencies = [
  "num-traits",
  "static_assertions",
 ]
+
+[[package]]
+name = "msssim-lite"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d263eaaf8ffe950431edabf34ca3fdf9739f72c026b7fe5f6fb16ba75329d25"
 
 [[package]]
 name = "mutate_once"
@@ -3146,9 +3152,18 @@ dependencies = [
 
 [[package]]
 name = "oxideav-h265"
-version = "0.0.16"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e3a6b34d2c009977b06424cc1cede2fdf5a54b4ff63848a5b9e0deed3433d16"
+checksum = "1b3361cbebe79d6b5fbcc8c36dede89acf3ce8b5d1b28f673f43f98760d5dc46"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
+name = "oxideav-h265"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0ba02fe8125ce424203a58f9a393843c00edac07303a7c3480e86c7837a965d"
 dependencies = [
  "oxideav-core",
 ]
@@ -3172,7 +3187,7 @@ dependencies = [
  "oxideav-av1",
  "oxideav-core",
  "oxideav-h264",
- "oxideav-h265",
+ "oxideav-h265 0.0.15",
  "oxideav-h266",
 ]
 
@@ -3951,13 +3966,16 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
-version = "0.41.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
+checksum = "bdaa4fffe9ff3ca2c353fa9729792805b9b3e324695ff5a081f860612e81b330"
 dependencies = [
  "bytemuck",
+ "foldhash",
  "font-types",
  "once_cell",
+ "smallvec",
+ "yoke",
 ]
 
 [[package]]
@@ -4052,9 +4070,9 @@ dependencies = [
 
 [[package]]
 name = "resvg"
-version = "0.49.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1572844b6727a1bf842190e9947641a68ac44bed83f50afb4bd1407a2564bee8"
+checksum = "77bb4b284cf8a5c8ae721594af53387fb755d2196fddb32b2acfb4fa9251fa0c"
 dependencies = [
  "bytemuck",
  "gif",
@@ -4611,12 +4629,15 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "skrifa"
-version = "0.44.0"
+version = "0.49.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
+checksum = "a7459fb60888ad9a5f367dd293fa2fb9df142cb451aa6bfd6cd66a7d6a9b739d"
 dependencies = [
  "bytemuck",
+ "once_cell",
  "read-fonts",
+ "smallvec",
+ "yoke",
 ]
 
 [[package]]
@@ -4699,9 +4720,9 @@ dependencies = [
 
 [[package]]
 name = "ssimu2-lite"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63fd96a981ba2ff73c6de84f325e98794495f4aa34dee418aaf186c79c20371d"
+checksum = "7395c9864b69d51d56fb925b15cd20e86b8cf317e361ea9917a1db2cbf8e477c"
 
 [[package]]
 name = "stable_deref_trait"
@@ -4769,9 +4790,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svgtypes"
-version = "0.16.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "695b5790b3131dafa99b3bbfd25a216edb3d216dad9ca208d4657bfb8f2abc3d"
+checksum = "9f12b12995e3638c70618c1facb1ce65302f6a6f706b675f07c58a5d7391120e"
 dependencies = [
  "kurbo",
  "siphasher",
@@ -5268,9 +5289,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.5.1"
+version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7be76686bdf7198002062423ca0d8cf9b75a27c8e1de804513b97e97b555d9d"
+checksum = "3ac5cecf619ca81f66a96482db09687c9f7465af65f4300a8c30cca05bd5a59d"
 dependencies = [
  "base64",
  "flate2",
@@ -5309,9 +5330,9 @@ dependencies = [
 
 [[package]]
 name = "usvg"
-version = "0.49.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d09b73ee83641d390ad7ffd9000f347b16eb128e437675b6ff277ea5c7fcf22c"
+checksum = "bdb896f04730b97805bbc3191fc57e4bf03face0f14577dd42e783c4d8c98802"
 dependencies = [
  "base64",
  "data-url",
