@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "crabcrop"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "ab_glyph",
  "axum",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "crabcrop-url"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "aes-gcm",
  "base64",
