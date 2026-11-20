@@ -19,7 +19,7 @@ use crate::url::{
 ///
 /// The image crate has no JPEG XL support of its own; the jxl-rs
 /// integration hooks its format detection and decoder in globally.
-fn ensure_jxl_decoder() {
+pub(in crate::engine) fn ensure_jxl_decoder() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         jxl_image_rs_integration::register_image_decoding_hook();
@@ -210,7 +210,7 @@ pub(crate) fn decode_watermarks(
 /// charged before it decodes, at four bytes a pixel of the
 /// size its header declares, and again after, at what it
 /// holds. The deadline is checked before each decode.
-fn decode_watermarks_within(
+pub(in crate::engine) fn decode_watermarks_within(
     sources: &[(String, Vec<u8>)],
     deadline: Option<std::time::Instant>,
     budget: u64,
@@ -287,7 +287,7 @@ fn decode_jpeg_direct(bytes: &[u8]) -> Option<DynamicImage> {
 /// scaled decode reads a file's header with the same ones
 /// ([`jpeg_scaled`]), so the size and the colour space it
 /// goes by are the ones a full-size decode would.
-fn zune_jpeg_options() -> zune_core::options::DecoderOptions {
+pub(in crate::engine) fn zune_jpeg_options() -> zune_core::options::DecoderOptions {
     use zune_core::colorspace::ColorSpace;
     zune_core::options::DecoderOptions::default()
         .jpeg_set_out_colorspace(ColorSpace::RGB)
@@ -324,7 +324,7 @@ pub fn decode_jpeg_scaled(bytes: &[u8], denominator: u32) -> Option<DynamicImage
 /// the bounded generic decode, which refuses the file: image-webp
 /// fails on the same header the probe could not read, or the
 /// probe already charged the budget on one it could.
-fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
+pub(in crate::engine) fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
     let features = webp::BitstreamFeatures::new(bytes)?;
     let (width, height) = (u64::from(features.width()), u64::from(features.height()));
     if width > MAX_DECODE_DIMENSION as u64
@@ -545,7 +545,7 @@ pub(crate) fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), En
 /// decoder ignores image-crate limits, so the declared size is
 /// probed from the header and rejected over budget before any
 /// full decode happens.
-fn check_jxl_dimensions(bytes: &[u8]) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_jxl_dimensions(bytes: &[u8]) -> Result<(), EngineError> {
     let (width, height) = jxl_dimensions(bytes)
         .ok_or_else(|| EngineError::Decode("JPEG XL header carried no size".to_string()))?;
     check_decoded_dimensions(width as u64, height as u64)
@@ -554,7 +554,7 @@ fn check_jxl_dimensions(bytes: &[u8]) -> Result<(), EngineError> {
 /// The dimensions in a JPEG XL header, from the decoder's
 /// basic-info event alone: no frame is decoded. `None` when
 /// the header does not parse or announces no size.
-fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+pub(in crate::engine) fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     jxl_header(bytes).map(|(width, height, _)| (width, height))
 }
 
@@ -583,7 +583,7 @@ fn jxl_header(bytes: &[u8]) -> Option<(u32, u32, usize)> {
 /// the bound every still is held to), each with its three
 /// colour samples and the extra ones. jxl-rs refuses a frame
 /// whose count reaches the limit, hence the one more.
-fn jxl_sample_limit(extra_channels: usize) -> usize {
+pub(in crate::engine) fn jxl_sample_limit(extra_channels: usize) -> usize {
     let pixels = usize::try_from(MAX_DECODE_ALLOC / 4).unwrap_or(usize::MAX);
     pixels.saturating_mul(3 + extra_channels).saturating_add(1)
 }
@@ -609,7 +609,7 @@ fn jxl_sample_limit(extra_channels: usize) -> usize {
 /// in, with the same errors. The hook still detects the format
 /// and reads the header for the size probe in [`decode_image`],
 /// which decodes no frame.
-fn decode_jxl(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
+pub(in crate::engine) fn decode_jxl(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     use image::error::{DecodingError, ImageFormatHint, LimitError, LimitErrorKind};
     use image::{ColorType, ImageBuffer, ImageError};
     use jxl::api::{
@@ -5438,7 +5438,7 @@ pub(crate) fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f
 
 /// The output container: detected source format, or JPEG when the
 /// source format is unknown or not one we emit.
-fn detect_format(bytes: &[u8]) -> ImageFormat {
+pub(in crate::engine) fn detect_format(bytes: &[u8]) -> ImageFormat {
     // The image crate's guess_format does not know JPEG XL.
     if is_jxl(bytes) {
         return ImageFormat::Jxl;
@@ -5455,7 +5455,7 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
 
 /// JPEG XL detection: the bare codestream signature, or the first
 /// bytes of the ISO BMFF container signature.
-fn is_jxl(bytes: &[u8]) -> bool {
+pub(in crate::engine) fn is_jxl(bytes: &[u8]) -> bool {
     is_jxl_codestream(bytes)
         || bytes.starts_with(&[
             0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
@@ -5473,7 +5473,7 @@ pub(crate) fn is_jxl_codestream(bytes: &[u8]) -> bool {
 /// `ftyp` box whose major brand is one of the HEVC image brands
 /// (or the generic HEIF brands). AVIF shares the container but
 /// not the brands, and is not matched.
-fn is_heic(bytes: &[u8]) -> bool {
+pub(in crate::engine) fn is_heic(bytes: &[u8]) -> bool {
     if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
         return false;
     }
