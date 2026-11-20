@@ -13,7 +13,7 @@ use crate::observe::RequestRecord;
 use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
 #[cfg(doc)]
-use super::admit_explained;
+use super::explain::admit_explained;
 #[cfg(doc)]
 use super::miss::build_job;
 #[cfg(doc)]

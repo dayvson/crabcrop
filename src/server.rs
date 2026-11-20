@@ -38,7 +38,9 @@ use crate::cache::Cache;
 use crate::cache::{CachedImage, etag_for_bytes};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
-use crate::observe::{Metrics, RequestLog, RequestRecord};
+#[cfg(test)]
+use crate::observe::RequestRecord;
+use crate::observe::{Metrics, RequestLog};
 #[cfg(test)]
 use crate::url::ImageFormat;
 use crate::url::{parse_operations_with_expiry, parse_signature};
@@ -85,8 +87,7 @@ pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
 
 mod response;
 pub(in crate::server) use response::{
-    ErrorParts, SOURCE_BUDGET_BUSY, accept_of, bad_signature_parts, busy_response, error_response,
-    load_busy_response, load_error_parts,
+    ErrorParts, SOURCE_BUDGET_BUSY, accept_of, busy_response, error_response,
 };
 #[cfg(test)]
 pub(in crate::server) use response::{
@@ -98,19 +99,18 @@ mod system;
 pub(in crate::server) use system::token_eq;
 pub(in crate::server) use system::{health, metrics};
 mod admission;
-pub(in crate::server) use admission::{
-    Credential, Opened, Refusal, Resolved, authenticate, resolve_request, unix_seconds,
-};
 #[cfg(test)]
-pub(in crate::server) use admission::{Expiry, Negotiated, negotiate_format};
+pub(in crate::server) use admission::{
+    Expiry, Negotiated, Refusal, Resolved, negotiate_format, resolve_request,
+};
 mod request;
+pub(in crate::server) use request::handle;
 #[cfg(test)]
 pub(in crate::server) use request::{
     DPR_HINT_HEADERS, MAX_HINT_WIDTH, OwedRecord, SAVE_DATA_HEADER, VARY_WITH_HINTS,
     VARY_WITHOUT_HINTS, WIDTH_HINT_HEADERS, cache_key_for, quantize_width, save_data_hint,
     width_hint,
 };
-pub(in crate::server) use request::{dpr_hint, handle};
 mod flight;
 #[cfg(test)]
 pub(in crate::server) use flight::MAX_FLIGHT_WAITS;
@@ -124,10 +124,12 @@ pub(in crate::server) use tiers::{
 };
 mod miss;
 pub use miss::Fallback;
-#[cfg(doc)]
-pub(in crate::server) use miss::render_miss;
 #[cfg(test)]
 pub(in crate::server) use miss::{MissWork, ai_gate_applies, build_job};
+mod explain;
+pub(in crate::server) use explain::explain_handle;
+#[cfg(test)]
+pub(in crate::server) use explain::probe_settled;
 
 /// Shared state for the handlers: one per server, built at
 /// boot and shared behind an `Arc` (issue #475). The router,
@@ -692,347 +694,6 @@ fn has_directive(cache_control: &str, directive: &str) -> bool {
             .next()
             .is_some_and(|name| name.trim().eq_ignore_ascii_case(directive))
     })
-}
-
-/// Whether a probe head settles the explain report's
-/// source facts: the probe knows the kind, and it either
-/// has the dimensions or the kind is one whose dimensions
-/// never live in headers (video, PDF). Anything else means
-/// the identifying header may still be on its way.
-///
-/// The load asks this after every chunk, on the async
-/// runtime, so it never sizes a kind whose probe is heavy
-/// ([`crate::engine::probe_is_heavy`]): an SVG's size needs
-/// the whole document anyway, an AVIF's a decode, and a
-/// HEIC's a walk of its item graph. Those read on to the end
-/// of the body (or the head cap), and [`explain_probe`]
-/// sizes them once, off the runtime.
-pub(in crate::server) fn probe_settled(head: &[u8]) -> bool {
-    let kind = crate::engine::probe_kind(head);
-    match kind {
-        "unknown" => false,
-        "video" | "pdf" => true,
-        _ if crate::engine::probe_is_heavy(kind) => false,
-        _ => crate::engine::probe_source(head).dimensions.is_some(),
-    }
-}
-
-/// How long an explain probe may wait for a probe slot
-/// before the server sheds it with a 503: the stills
-/// gate's wait.
-const PROBE_GATE_WAIT: std::time::Duration = PROCESS_GATE_WAIT;
-
-/// The explain report's source probe. A heavy probe (an
-/// SVG's parse in the worker, which may take the probe's
-/// whole 5 s, an AVIF's decode, or a HEIC's item graph
-/// walk) runs on a blocking thread under the probe gate,
-/// so the async runtime, and every route it serves, never
-/// waits on one; the permit moves into the job, so a probe
-/// whose request went away still counts until it ends.
-/// Every other kind's probe reads headers alone and runs
-/// inline. `None` means the gate stayed full past its wait.
-async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine::SourceProbe> {
-    let kind = crate::engine::probe_kind(&head);
-    if !crate::engine::probe_is_heavy(kind) {
-        return Some(crate::engine::probe_source(&head));
-    }
-    let permit = tokio::time::timeout(PROBE_GATE_WAIT, state.probe_gate.clone().acquire_owned())
-        .await
-        .ok()?
-        .ok()?;
-    let probe = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        crate::engine::probe_source(&head)
-    })
-    .await;
-    // A probe that panicked states the kind and no size, as
-    // one that failed does.
-    Some(probe.unwrap_or(crate::engine::SourceProbe {
-        kind,
-        dimensions: None,
-    }))
-}
-
-/// `GET /explain/<signature>/<operations...>/<image-url>`:
-/// the self-explaining URL report (issue #196; the report
-/// itself is built in [`crate::explain`]).
-///
-/// The request runs in stages. [`admit_explained`] admits
-/// it through the image path's own [`authenticate`] and
-/// [`resolve_request`], so a URL this route admits is one
-/// the image route admits, and a refusal is the image
-/// path's own status and body (issue #741). Only then is
-/// the source touched, once, through the loader with all
-/// of its guards ([`probe_explained`]), and the facts come
-/// from header probing (`crate::engine::probe_source`): no
-/// decode, no detection, no process, AI, or video gate (an
-/// SVG, AVIF, or HEIC probe takes the probe gate, see
-/// [`explain_probe`]), and nothing written to any cache
-/// tier. A bad signature, an over-cap operation list, or
-/// an expired URL therefore costs zero source fetches.
-/// [`explain_report`] builds the report and
-/// [`explain_response`] answers it.
-pub(in crate::server) async fn explain_handle(
-    State(state): State<Arc<AppState>>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-) -> Response {
-    let accept = accept_of(&headers);
-    let accept = accept.as_deref();
-    // With `CRABCROP_EXPLAIN=0` the route is off (issue #591):
-    // every request answers the router's own `404 not_found`
-    // before the signature is read, so the answer is the
-    // same whatever the URL, and no source is fetched.
-    if !state.explain_enabled {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "not found".to_string(),
-            accept,
-        );
-    }
-    let Some(tail) = uri.path().strip_prefix("/explain/") else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_path",
-            "expected /explain/<signature>/<target>".to_string(),
-            accept,
-        );
-    };
-    let full = format!("/{tail}");
-    let (credential, resolved) = match admit_explained(&state, &full) {
-        Ok((opened, resolved)) => (opened.credential, resolved),
-        // Only plain spellings are admitted here, so every
-        // refusal is the plain spelling's own answer, as on
-        // the image route.
-        Err(refusal) => return refusal.answer(false, accept),
-    };
-    let (source_bytes, probe) = match probe_explained(&state, &resolved, accept).await {
-        Ok(facts) => facts,
-        Err(response) => return *response,
-    };
-    let report = explain_report(
-        &state,
-        &headers,
-        credential,
-        resolved,
-        source_bytes,
-        probe,
-        full,
-    );
-    explain_response(&report, accept)
-}
-
-/// The first stage of [`explain_handle`]: the image path's
-/// admission, [`authenticate`] and [`resolve_request`]
-/// themselves (issue #741), so the two routes cannot
-/// disagree on which plain URLs they admit or on how they
-/// refuse the rest.
-///
-/// A sealed spelling is refused before either runs,
-/// wholesale (issue #255): the server never unseals as a
-/// service, because an endpoint that opens tokens would be
-/// an unsealing oracle for anyone who lifts one off a
-/// public page. Operators unseal locally (the CLI's
-/// `unseal` verb, under their own secret) and then explain
-/// the plain form. The refusal is the uniform
-/// `bad_signature`, and no source fetch happens for it.
-pub(in crate::server) fn admit_explained<'a>(
-    state: &AppState,
-    full: &'a str,
-) -> Result<(Opened<'a>, Resolved), Refusal> {
-    let nolead = full.strip_prefix('/').unwrap_or(full);
-    if crate::url::looks_sealed(nolead.split('/').next().unwrap_or("")) {
-        return Err(Refusal::AsIs(bad_signature_parts()));
-    }
-    // The stages time their work into a request record. An
-    // explain request owes the request log no line, so this
-    // one goes nowhere.
-    let mut record = RequestRecord::default();
-    let opened = authenticate(state, full, &mut record)?;
-    let resolved = resolve_request(state, &opened.remainder, &mut record)?;
-    Ok((opened, resolved))
-}
-
-/// The second stage of [`explain_handle`]: the single
-/// bounded source fetch, through the loader and its
-/// policy, and the probe of the head it read
-/// ([`explain_probe`]). Returns the source's encoded size
-/// when the fetch states it, and the probe; a failed fetch,
-/// or a probe shed for a full gate, is the answer instead,
-/// boxed as [`render_miss`] boxes its own (a bare `Response`
-/// is 128 bytes, too large for an `Err`: clippy's
-/// `result_large_err`).
-async fn probe_explained(
-    state: &AppState,
-    resolved: &Resolved,
-    accept: Option<&str>,
-) -> Result<(Option<usize>, crate::engine::SourceProbe), Box<Response>> {
-    // Watermark and overlay sources are operations' inputs,
-    // not the explained URL's source, and are never fetched:
-    // no fan-out. A `frame:` segment makes the source a
-    // video, so the loader may accept a `video/*`
-    // Content-Type for it (issue #214); a `page:` segment
-    // does the same for `application/pdf` (issue #215).
-    // Explain never runs either tool: the fetch is admitted,
-    // the probe stays the raw-bytes probe. Both are read
-    // from the merged list, the one the image request runs.
-    let admission = crate::loader::MediaAdmission {
-        video: resolved
-            .ops
-            .iter()
-            .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: resolved
-            .ops
-            .iter()
-            .any(|op| matches!(op, crate::url::Operation::Page(_))),
-    };
-    // The report reads the source's headers only, so the
-    // fetch is a probe load: it stops as soon as the head
-    // identifies the source instead of downloading the
-    // whole body (which also keeps this route off the
-    // result cache's coalescing path by construction: it
-    // never held a whole body to share). A root source is
-    // fetched at its expansion.
-    let crate::loader::ProbeLoad { head, total_bytes } = state
-        .loader
-        .load_probe(&resolved.source_url, admission, &probe_settled)
-        .await
-        .map_err(|e| Box::new(explain_load_error(e, accept)))?;
-    let Some(probe) = explain_probe(state, head).await else {
-        return Err(Box::new(busy_response(
-            "server busy: too many source probes running at once",
-            5,
-            accept,
-        )));
-    };
-    Ok((total_bytes.map(|n| n as usize), probe))
-}
-
-/// The third stage of [`explain_handle`]: the report on an
-/// admitted URL and its probed source.
-///
-/// The forecast, the canonical form and the admission all
-/// follow the operations the image request runs, the
-/// server-wide defaults merged in (issue #468); the
-/// report's operation list is the URL's own, so it never
-/// credits the URL with a default. The source is reported
-/// exactly as written, with a root's name, never the base
-/// URL a root reference resolves to (operator
-/// configuration, issue #248).
-fn explain_report(
-    state: &AppState,
-    headers: &HeaderMap,
-    credential: Credential,
-    resolved: Resolved,
-    source_bytes: Option<usize>,
-    probe: crate::engine::SourceProbe,
-    image_path: String,
-) -> crate::explain::Report {
-    let ops = resolved.own_ops().to_vec();
-    // Each referenced preset with the operations its
-    // definition expands to. Definitions were validated at
-    // boot; one that no longer parses (it cannot) is listed
-    // by name alone rather than failing the report.
-    let presets = resolved
-        .groups
-        .iter()
-        .map(|name| {
-            let entry_ops = state
-                .presets
-                .get(name)
-                .and_then(|definition| {
-                    crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
-                })
-                .unwrap_or_default();
-            crate::explain::preset_entry(name, &entry_ops)
-        })
-        .collect();
-    // The canonical form is the cache key's path form, of
-    // the merged list as the image path keys it. The key's
-    // config fingerprint suffix is operator state and stays
-    // unreported. A form past the key-length bound is shown
-    // in full, though the key carries its digest
-    // (`cache::bounded_key_base`). For a root source the
-    // form is built from the source as written: the key
-    // itself is keyed on the expansion, but printing that
-    // here would publish the root's base URL into the
-    // report.
-    let source_url = resolved.written_source();
-    let canonical = crate::url::canonical_form(&resolved.ops, &source_url);
-    let (signed, key_id) = match credential {
-        Credential::Signature(key_id) => (true, key_id),
-        Credential::Unsafe => (false, None),
-        // Never admitted here (see `admit_explained`).
-        Credential::Sealed => (true, None),
-    };
-    // The expiry verdict reads the clock the admission read,
-    // so the report never calls a URL it admitted expired.
-    let (expiry, now) = match resolved.expiry {
-        Some(expiry) => (Some(expiry.at), expiry.checked_at),
-        None => (None, unix_seconds()),
-    };
-    crate::explain::Report::new(crate::explain::ReportInput {
-        signed,
-        key_id,
-        expiry,
-        now,
-        source_url,
-        source_root: resolved.root.map(|r| r.name),
-        probe,
-        // The DPR hint is read as the image path reads it, so
-        // the forecast steps a hinted factor down as the image
-        // request does (issue #529), and not at all with
-        // client hints off.
-        dpr_hint: dpr_hint(headers).filter(|_| state.client_hints),
-        source_bytes,
-        ops,
-        merged_ops: resolved.ops,
-        presets,
-        canonical,
-        cache_group: resolved.groups.into_iter().next(),
-        image_path,
-    })
-}
-
-/// The last stage of [`explain_handle`]: the report as the
-/// client asked for it, JSON for a JSON `Accept` and the
-/// HTML page otherwise, stored nowhere and served under a
-/// policy that runs no script.
-fn explain_response(report: &crate::explain::Report, accept: Option<&str>) -> Response {
-    let (content_type, body) = if crate::explain::wants_json(accept) {
-        (
-            "application/json",
-            serde_json::to_string(&report.to_json()).unwrap_or_default(),
-        )
-    } else {
-        ("text/html; charset=utf-8", report.to_html())
-    };
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-store"),
-            (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-/// A probe failure on the explain route: the image path's
-/// statuses, with generic bodies throughout. The detailed
-/// cause goes to the server log only: a policy refusal can
-/// name a resolved address or a bucket, which are the
-/// operator's facts, not the caller's (issue #196,
-/// requirement 3).
-fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
-    if let Some(busy) = load_busy_response(&e, accept) {
-        return busy;
-    }
-    stderr_line!("explain load error: {e}");
-    let (status, code, message) = load_error_parts(e);
-    error_response(status, code, message, accept)
 }
 
 /// How many shared-tier objects one purge request scans
