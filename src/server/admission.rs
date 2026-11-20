@@ -3,16 +3,19 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use axum::response::Response;
 
+use super::request::quantize_width;
 use super::response::{
     ErrorParts, bad_signature_parts, error_response, parse_failure_parts, reserved_remainder_parts,
     sealed_refusal_response,
 };
-use super::{AppState, meta_cache_headers, quantize_width, wants_meta, wants_placeholders};
+use super::{AppState, meta_cache_headers, wants_meta, wants_placeholders};
 use crate::observe::RequestRecord;
 use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
 #[cfg(doc)]
-use super::{admit_explained, build_job, cache_key_for, serve};
+use super::request::{cache_key_for, serve};
+#[cfg(doc)]
+use super::{admit_explained, build_job};
 
 /// Why the image path refused a request before its cache
 /// lookup (issue #479). The stages of [`serve`] return
