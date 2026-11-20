@@ -2786,7 +2786,7 @@ async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Requ
 /// in one place, [`Refusal::answer`], so a refusal added to
 /// any stage keeps the sealed spelling's uniform 403
 /// (issues #255, #259) without a branch of its own.
-enum Refusal {
+pub(in crate::server) enum Refusal {
     /// A segment in the sealed spelling that does not
     /// open: the uniform refusal, whatever the request.
     Unopened,
@@ -2812,7 +2812,7 @@ impl Refusal {
     /// sealed spelling or not. A sealed payload refusal
     /// answers the uniform refusal without building its
     /// own answer first.
-    fn answer(self, sealed: bool, accept: Option<&str>) -> Response {
+    pub(in crate::server) fn answer(self, sealed: bool, accept: Option<&str>) -> Response {
         let own =
             |(status, code, message): ErrorParts| error_response(status, code, message, accept);
         match self {
@@ -2945,16 +2945,16 @@ fn keep_from_shared_caches(response: &mut Response) {
 }
 
 /// A remainder the request may run.
-struct Opened<'a> {
+pub(in crate::server) struct Opened<'a> {
     /// The remainder as presented, or as its sealed token
     /// decrypts.
-    remainder: std::borrow::Cow<'a, str>,
+    pub(in crate::server) remainder: std::borrow::Cow<'a, str>,
     /// What admitted it.
-    credential: Credential,
+    pub(in crate::server) credential: Credential,
 }
 
 /// What admitted a remainder (see [`authenticate`]).
-enum Credential {
+pub(in crate::server) enum Credential {
     /// A sealed token that opened: the request arrived in
     /// the sealed spelling (issue #255).
     Sealed,
@@ -2981,7 +2981,7 @@ enum Credential {
 /// decryption produces the pre-expansion string the HMAC
 /// form carries, the two spellings share one cache entry,
 /// one ETag, one purge target by construction.
-fn authenticate<'a>(
+pub(in crate::server) fn authenticate<'a>(
     state: &AppState,
     full: &'a str,
     record: &mut RequestRecord,
@@ -3046,38 +3046,38 @@ fn authenticate<'a>(
 }
 
 /// What a verified remainder resolves to.
-struct Resolved {
+pub(in crate::server) struct Resolved {
     /// The operations the engine runs: the remainder's
     /// own, with the server-wide defaults merged in.
-    ops: Vec<crate::url::Operation>,
+    pub(in crate::server) ops: Vec<crate::url::Operation>,
     /// How many of `ops` are the remainder's own: the
     /// last ones, since [`crate::url::merge_default_ops`]
     /// puts a request's operations after the defaults it
     /// keeps.
-    own_len: usize,
+    pub(in crate::server) own_len: usize,
     /// The source to fetch, a root source expanded.
-    source_url: String,
+    pub(in crate::server) source_url: String,
     /// The root reference the source was written as
     /// (issue #248), when it was one.
-    root: Option<crate::url::RootRef>,
+    pub(in crate::server) root: Option<crate::url::RootRef>,
     /// The cache groups (RFC 9875).
-    groups: Vec<String>,
+    pub(in crate::server) groups: Vec<String>,
     /// The `maxage:` cache lifetime (issue #159).
-    max_age: Option<u32>,
+    pub(in crate::server) max_age: Option<u32>,
     /// The `exp:` the URL carries, when it carries one.
-    expiry: Option<Expiry>,
+    pub(in crate::server) expiry: Option<Expiry>,
 }
 
 impl Resolved {
     /// The remainder's own operations, without the
     /// server-wide defaults.
-    fn own_ops(&self) -> &[crate::url::Operation] {
+    pub(in crate::server) fn own_ops(&self) -> &[crate::url::Operation] {
         &self.ops[self.ops.len() - self.own_len..]
     }
 
     /// The source as the URL wrote it: a root reference as
     /// written, never its expansion.
-    fn written_source(&self) -> String {
+    pub(in crate::server) fn written_source(&self) -> String {
         match &self.root {
             Some(root) => root.written(),
             None => self.source_url.clone(),
@@ -3088,13 +3088,13 @@ impl Resolved {
 /// A URL's `exp:` second and the clock reading it was
 /// admitted at, in unix seconds.
 #[derive(Clone, Copy)]
-struct Expiry {
-    at: u64,
-    checked_at: u64,
+pub(in crate::server) struct Expiry {
+    pub(in crate::server) at: u64,
+    pub(in crate::server) checked_at: u64,
 }
 
 /// The clock in whole unix seconds, the unit of `exp:`.
-fn unix_seconds() -> u64 {
+pub(in crate::server) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3110,7 +3110,7 @@ fn unix_seconds() -> u64 {
 /// It and [`authenticate`] are the explain route's
 /// admission too ([`admit_explained`]), so a refusal added
 /// to either holds on both routes.
-fn resolve_request(
+pub(in crate::server) fn resolve_request(
     state: &AppState,
     rest: &str,
     record: &mut RequestRecord,
@@ -3235,22 +3235,22 @@ fn resolve_request(
 
 /// How the request's directives and headers shape its
 /// response.
-struct Negotiated {
-    directives: crate::url::RequestDirectives,
+pub(in crate::server) struct Negotiated {
+    pub(in crate::server) directives: crate::url::RequestDirectives,
     /// The format negotiated from `Accept`, when the URL
     /// names none.
-    preferred: Option<ImageFormat>,
+    pub(in crate::server) preferred: Option<ImageFormat>,
     /// The DPR factor the response is rendered at.
-    effective_dpr: f32,
+    pub(in crate::server) effective_dpr: f32,
     /// The quantized width a width hint resolves to.
-    hinted_width: Option<u32>,
+    pub(in crate::server) hinted_width: Option<u32>,
     /// Whether `Save-Data` applies: the engine steps the
     /// quality of a format that carries one, and the key
     /// separates the entry.
-    save_data_applies: bool,
-    meta: bool,
-    debug: bool,
-    placeholders: bool,
+    pub(in crate::server) save_data_applies: bool,
+    pub(in crate::server) meta: bool,
+    pub(in crate::server) debug: bool,
+    pub(in crate::server) placeholders: bool,
 }
 
 impl Negotiated {
@@ -3265,7 +3265,7 @@ impl Negotiated {
     /// hint on a URL that sizes nothing, `Save-Data` on PNG
     /// output), and is set apart all the same: whether the
     /// bytes differ is only known after the render.
-    fn hint_shaped(&self) -> bool {
+    pub(in crate::server) fn hint_shaped(&self) -> bool {
         self.hinted_width.is_some()
             || self.save_data_applies
             || (self.directives.dpr.is_none() && self.effective_dpr != 1.0)
@@ -3276,7 +3276,7 @@ impl Negotiated {
 /// the client hints, and the negotiated format, and refuse
 /// a meta request this server or this output cannot
 /// answer.
-fn negotiate(
+pub(in crate::server) fn negotiate(
     state: &AppState,
     ops: &[crate::url::Operation],
     accept: Option<&str>,
@@ -5402,7 +5402,10 @@ async fn load_watermarks(
 /// the request already has it. [`negotiate`] counts them
 /// against the operation cap before it keeps the hint
 /// (issue #615), and [`build_job`] adds them.
-fn width_hint_ops(width: u32, no_upscale: bool) -> Vec<crate::url::Operation> {
+pub(in crate::server) fn width_hint_ops(
+    width: u32,
+    no_upscale: bool,
+) -> Vec<crate::url::Operation> {
     let mut ops = vec![crate::url::Operation::Size(crate::url::ImageSize {
         width: crate::url::Dimension::Pixels(width),
         height: crate::url::Dimension::Proportional,
@@ -5792,7 +5795,7 @@ async fn meta_document_from(
 /// `None` keeps the detected source format. Wildcards do
 /// not count as an offer: a bare `*/*` from a generic HTTP
 /// client should not trigger the expensive AVIF encode.
-fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
+pub(in crate::server) fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
     let accept = accept?;
     let (mut avif, mut jxl, mut webp) = (None, None, None);
     for part in accept.split(',') {
