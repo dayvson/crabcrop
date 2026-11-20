@@ -1488,17 +1488,17 @@ fn check_region(
 /// image, its encode options, and the records the
 /// operations produced for the meta response.
 #[derive(Debug)]
-struct ApplyOutcome {
-    img: DynamicImage,
-    encode_opts: EncodeOptions,
+pub(in crate::engine) struct ApplyOutcome {
+    pub(in crate::engine) img: DynamicImage,
+    pub(in crate::engine) encode_opts: EncodeOptions,
     /// The studio record (issue #197).
-    studio: Option<crate::studio::StudioRecord>,
+    pub(in crate::engine) studio: Option<crate::studio::StudioRecord>,
     /// The region-removal record (issue #176).
-    inpaint: Option<InpaintRecord>,
+    pub(in crate::engine) inpaint: Option<InpaintRecord>,
     /// The segmentation record (issue #175).
-    segments: Option<SegmentRecord>,
+    pub(in crate::engine) segments: Option<SegmentRecord>,
     /// The objects-crop record (issue #318).
-    objects_crop: Option<ObjectsCropRecord>,
+    pub(in crate::engine) objects_crop: Option<ObjectsCropRecord>,
 }
 
 /// A crop+resize fusion the chain qualifies for (issue
@@ -1515,13 +1515,13 @@ struct ApplyOutcome {
 /// fused shapes. Any chain the gates in [`fusion_plan`] do
 /// not accept runs the two-step path untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FusionPlan {
+pub(in crate::engine) struct FusionPlan {
     /// Index of the `crop-rect` operation in the chain.
-    crop_index: usize,
+    pub(in crate::engine) crop_index: usize,
     /// Index of the resize operation in the chain.
-    size_index: usize,
+    pub(in crate::engine) size_index: usize,
     /// The crop window: (left, top, width, height).
-    window: (u32, u32, u32, u32),
+    pub(in crate::engine) window: (u32, u32, u32, u32),
 }
 
 /// Decide whether the chain's crop and resize fuse (issue
@@ -1554,7 +1554,7 @@ struct FusionPlan {
 ///   renders a diagnostic of the exact pixels, so it stays
 ///   on the two-step path), and the rectangle has positive
 ///   area.
-fn fusion_plan(ops: &[Operation]) -> Option<FusionPlan> {
+pub(in crate::engine) fn fusion_plan(ops: &[Operation]) -> Option<FusionPlan> {
     // G1: one crop, and it is a crop-rect.
     let mut crop: Option<(usize, (u32, u32, u32, u32))> = None;
     for (index, op) in ops.iter().enumerate() {
@@ -1627,7 +1627,7 @@ type Window = (u32, u32, u32, u32);
 /// directives along the way. Shared by the still pipeline and
 /// the animated paths (GIF and WebP), which run it once per
 /// frame.
-fn apply_operations(
+pub(in crate::engine) fn apply_operations(
     img: DynamicImage,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
@@ -1645,7 +1645,7 @@ fn apply_operations(
 /// the focal and debug state a crop consumes, the inference
 /// memos for the image state in hand, and the records the
 /// meta response carries.
-struct ChainState<'r, 'a> {
+pub(in crate::engine) struct ChainState<'r, 'a> {
     /// The `no_upscale` cap: the (oriented) source
     /// dimensions, when the request asked for it.
     cap: Option<(u32, u32)>,
@@ -1707,7 +1707,7 @@ struct ChainState<'r, 'a> {
     /// chain's first operation, a plain resize, has
     /// resampled the frame to its target (see
     /// [`Engine::still_chain`]).
-    reduced: Option<jpeg_scaled::Reduced>,
+    pub(in crate::engine) reduced: Option<jpeg_scaled::Reduced>,
 }
 
 /// What a class filter paints (see
@@ -1722,7 +1722,7 @@ struct ClassTargets {
 }
 
 impl<'r, 'a> ChainState<'r, 'a> {
-    fn new(
+    pub(in crate::engine) fn new(
         ops: &[Operation],
         cap: Option<(u32, u32)>,
         dpr: f32,
@@ -1759,7 +1759,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
 
     /// Run the whole chain on `img`: every operation in
     /// order, then what the finished chain owes its caller.
-    fn run(
+    pub(in crate::engine) fn run(
         mut self,
         mut img: DynamicImage,
         ops: &[Operation],
@@ -1778,7 +1778,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// Run one operation of the chain, with what every
     /// operation owes the chain around it: the deadline, the
     /// detection memos, and the output budget.
-    fn step(
+    pub(in crate::engine) fn step(
         &mut self,
         img: DynamicImage,
         op_index: usize,
@@ -1829,7 +1829,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// resamples the whole frame reads it where it is (see
     /// [`ChainState::lent_step`]); after any other, the chain
     /// runs on a copy of the frame (issue #737).
-    fn run_to(
+    pub(in crate::engine) fn run_to(
         &mut self,
         frame: &mut DynamicImage,
         ops: &[Operation],
@@ -2473,7 +2473,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// the image in effect. The match names every variant
     /// (issue #741), so a new filter does not compile until
     /// it is applied here or is a [`PlainFilter`].
-    fn apply_filter(
+    pub(in crate::engine) fn apply_filter(
         &mut self,
         mut img: DynamicImage,
         filter: &Filter,
@@ -2762,7 +2762,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// the per-axis limit and the output budget, and hand
     /// back the image with the encode options and the
     /// records.
-    fn finish(self, mut img: DynamicImage) -> Result<ApplyOutcome, EngineError> {
+    pub(in crate::engine) fn finish(
+        self,
+        mut img: DynamicImage,
+    ) -> Result<ApplyOutcome, EngineError> {
         if self.debug_armed {
             // The debug view replaces the transform result. With
             // no capture, no crop followed the segment: the view
