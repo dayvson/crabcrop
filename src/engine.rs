@@ -2330,7 +2330,7 @@ fn upscale_image(
 /// they move nothing. Anything else drops the form: a new
 /// filter errs toward the crop's own alignment, never toward
 /// a stale position.
-fn filter_keeps_focal(filter: &Filter) -> bool {
+pub(in crate::engine) fn filter_keeps_focal(filter: &Filter) -> bool {
     filter_preserves_positions(filter)
         || matches!(
             filter,
@@ -2927,7 +2927,7 @@ struct ChainState<'r, 'a> {
 /// it, so the consuming crop never reads coordinates of an
 /// image that is gone.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct PendingFocal {
+pub(in crate::engine) struct PendingFocal {
     /// `None` for a rectangle, the zoom for a point.
     zoom: Option<f32>,
     /// (left, top, right, bottom) in the coordinates of a
@@ -2941,13 +2941,16 @@ struct PendingFocal {
 /// cuts: a rectangle in its pixels, or a point as fractions
 /// of it with the zoom.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Focal {
+pub(in crate::engine) enum Focal {
     Rect((u32, u32, u32, u32)),
     Point((f32, f32, f32)),
 }
 
 impl PendingFocal {
-    fn rect((left, top, right, bottom): (u32, u32, u32, u32), basis: (u32, u32)) -> Self {
+    pub(in crate::engine) fn rect(
+        (left, top, right, bottom): (u32, u32, u32, u32),
+        basis: (u32, u32),
+    ) -> Self {
         PendingFocal {
             zoom: None,
             edges: [left as f64, top as f64, right as f64, bottom as f64],
@@ -2955,7 +2958,7 @@ impl PendingFocal {
         }
     }
 
-    fn point((x, y, zoom): (f32, f32, f32), basis: (u32, u32)) -> Self {
+    pub(in crate::engine) fn point((x, y, zoom): (f32, f32, f32), basis: (u32, u32)) -> Self {
         let (px, py) = (x as f64 * basis.0 as f64, y as f64 * basis.1 as f64);
         PendingFocal {
             zoom: Some(zoom),
@@ -2966,7 +2969,7 @@ impl PendingFocal {
 
     /// Through a resize of the whole image to `to`, mirrored
     /// afterwards on the flipped axes.
-    fn scaled(self, to: (u32, u32), flip_h: bool, flip_v: bool) -> Self {
+    pub(in crate::engine) fn scaled(self, to: (u32, u32), flip_h: bool, flip_v: bool) -> Self {
         let ratio = |to: u32, from: u32| {
             if from == 0 {
                 0.0
@@ -2995,7 +2998,7 @@ impl PendingFocal {
     /// Whatever falls outside the window lands on its nearest
     /// edge, so a rectangle the cut removed entirely still
     /// pulls the crop toward the side it was on.
-    fn cropped(self, (x, y, w, h): Window) -> Self {
+    pub(in crate::engine) fn cropped(self, (x, y, w, h): Window) -> Self {
         let [left, top, right, bottom] = self.edges;
         let along =
             |v: f64, origin: u32, extent: u32| (v - origin as f64).clamp(0.0, extent as f64);
@@ -3014,7 +3017,7 @@ impl PendingFocal {
     /// Through a fit onto a larger canvas: the image scaled
     /// to `placed`'s size and set at its offset on a
     /// `canvas`-sized image.
-    fn placed(self, (x, y, w, h): Window, canvas: (u32, u32)) -> Self {
+    pub(in crate::engine) fn placed(self, (x, y, w, h): Window, canvas: (u32, u32)) -> Self {
         let fitted = self.scaled((w, h), false, false);
         let [left, top, right, bottom] = fitted.edges;
         let (dx, dy) = (x as f64, y as f64);
@@ -3028,7 +3031,7 @@ impl PendingFocal {
     /// Resolve against the `dims` image the crop cuts. The
     /// steps keep the basis in step with the image; a size
     /// change no step mapped scales over.
-    fn resolve(self, dims: (u32, u32)) -> Focal {
+    pub(in crate::engine) fn resolve(self, dims: (u32, u32)) -> Focal {
         let at = if self.basis == dims {
             self
         } else {
@@ -4173,7 +4176,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
 /// Build the debug capture for a crop that reported a
 /// [`crate::crop::CropTrace`]: the traced focal fraction
 /// becomes a pixel point on the canvas the crop ran on.
-fn capture_from_trace(
+pub(in crate::engine) fn capture_from_trace(
     canvas: DynamicImage,
     trace: crate::crop::CropTrace,
 ) -> crate::debugview::FocalCapture {
