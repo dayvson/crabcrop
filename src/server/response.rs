@@ -7,7 +7,9 @@ use crate::loader::LoadError;
 use crate::url::ImageFormat;
 
 #[cfg(doc)]
-use super::{Refusal, image_vary};
+use super::admission::Refusal;
+#[cfg(doc)]
+use super::image_vary;
 
 /// The `Accept` header's value, for [`error_response`].
 pub(in crate::server) fn accept_of(headers: &HeaderMap) -> Option<String> {
