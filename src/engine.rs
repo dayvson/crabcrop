@@ -2329,7 +2329,7 @@ fn upscale_image(
 /// positions. Anything not listed here invalidates: a
 /// new filter variant errs toward a fresh inference,
 /// never toward stale boxes.
-fn filter_preserves_positions(filter: &Filter) -> bool {
+pub(in crate::engine) fn filter_preserves_positions(filter: &Filter) -> bool {
     matches!(
         filter,
         Filter::Plain(
@@ -2400,7 +2400,7 @@ fn filter_keeps_focal(filter: &Filter) -> bool {
 
 /// Drop every detection memo: the chain step that just
 /// ran moved the content the memos' boxes describe.
-fn invalidate_detection_memos(
+pub(in crate::engine) fn invalidate_detection_memos(
     face_memo: &mut FaceMemo,
     detection_memos: &mut [DetectionMemo],
     segment_memo: &mut SegmentMemo,
@@ -2417,7 +2417,7 @@ fn invalidate_detection_memos(
 /// re-detects against the new state, and a step that moves
 /// content invalidates the memo outright (see
 /// `filter_preserves_positions`).
-type FaceMemo = Option<(
+pub(in crate::engine) type FaceMemo = Option<(
     u32,
     u32,
     Result<Vec<crate::ai::FaceBox>, crate::ai::AiError>,
@@ -2427,7 +2427,7 @@ type FaceMemo = Option<(
 /// serving the memoized result when the image state matches.
 /// The provider's failure surfaces as an inference error;
 /// callers with a fallback (the face crop) may downgrade it.
-fn detect_faces(
+pub(in crate::engine) fn detect_faces(
     memo: &mut FaceMemo,
     img: &DynamicImage,
     ctx: &ProcessContext<'_>,
@@ -2451,7 +2451,7 @@ fn detect_faces(
 /// Memoized object detection for one pipeline run, the
 /// face memo's twin: chained class filters on the same
 /// image state share one inference.
-type DetectionMemo = Option<(
+pub(in crate::engine) type DetectionMemo = Option<(
     u32,
     u32,
     Result<Vec<crate::ai::Detection>, crate::ai::AiError>,
@@ -2461,7 +2461,9 @@ type DetectionMemo = Option<(
 /// request, in resolution order (issue #166): the built-in
 /// detector first, then the declared detectors in
 /// declaration order.
-fn detection_providers<'a>(ctx: &ProcessContext<'a>) -> Vec<&'a dyn crate::ai::DetectionProvider> {
+pub(in crate::engine) fn detection_providers<'a>(
+    ctx: &ProcessContext<'a>,
+) -> Vec<&'a dyn crate::ai::DetectionProvider> {
     let mut providers: Vec<&dyn crate::ai::DetectionProvider> = Vec::new();
     if let Some(provider) = ctx.detect_provider {
         providers.push(provider);
@@ -2473,7 +2475,10 @@ fn detection_providers<'a>(ctx: &ProcessContext<'a>) -> Vec<&'a dyn crate::ai::D
 /// The slot of the first provider (in resolution order)
 /// whose vocabulary knows `class`: the one provider a
 /// class filter runs.
-fn resolve_detector(providers: &[&dyn crate::ai::DetectionProvider], class: &str) -> Option<usize> {
+pub(in crate::engine) fn resolve_detector(
+    providers: &[&dyn crate::ai::DetectionProvider],
+    class: &str,
+) -> Option<usize> {
     providers.iter().position(|p| p.knows_class(class))
 }
 
@@ -2501,7 +2506,7 @@ fn detect_objects(
 /// resolution picks for it (issue #166): each provider has
 /// its own memo slot, so chained class filters still share
 /// one run per provider per image state.
-fn detect_for_class(
+pub(in crate::engine) fn detect_for_class(
     memos: &mut [DetectionMemo],
     providers: &[&dyn crate::ai::DetectionProvider],
     img: &DynamicImage,
@@ -2540,7 +2545,7 @@ fn detections_of_class(
 /// expensive half of segmentation (the decoder runs per
 /// box), so chained class operations on the same image
 /// state share one encoding, like detection memoization.
-type SegmentMemo = Option<(
+pub(in crate::engine) type SegmentMemo = Option<(
     u32,
     u32,
     Result<crate::ai::SegmentEmbedding, crate::ai::AiError>,
@@ -2589,7 +2594,7 @@ pub(crate) const MAX_SEGMENT_DECODES: usize = 64;
 /// (nothing over half strength) still redacts its box's
 /// soft shape, it just contributes no geometry, so it
 /// leaves no record entry.
-fn segment_for_class(
+pub(in crate::engine) fn segment_for_class(
     memo: &mut SegmentMemo,
     provider: &dyn crate::ai::SegmentProvider,
     img: &DynamicImage,
