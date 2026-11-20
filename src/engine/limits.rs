@@ -1,7 +1,5 @@
-use super::{
-    EngineError, ProcessContext, SourceProbe, exif_orientation, is_heic, probe_source,
-    webp_animation_params,
-};
+use super::decode::{SourceProbe, exif_orientation, is_heic, probe_source};
+use super::{EngineError, ProcessContext, webp_animation_params};
 use crate::url::{Dimension, Operation};
 
 /// Shared resource limits for decoding and output sizing
