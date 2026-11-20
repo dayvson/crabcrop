@@ -57,7 +57,7 @@ fn bytes_of(img: &DynamicImage) -> Vec<u8> {
 }
 
 /// `filters` applied to a copy of `img`, as bytes.
-fn render(img: &DynamicImage, filters: &[Filter]) -> Vec<u8> {
+fn render(img: &DynamicImage, filters: &[PlainFilter]) -> Vec<u8> {
     bytes_of(&apply_filters(img.clone(), filters).0)
 }
 
@@ -111,7 +111,7 @@ fn every_blur_writes_the_same_bytes_at_every_pool_size() {
     for img in &layouts {
         for sigma in [2.5f32, 18.0] {
             at_every_pool_size(&format!("blur({sigma}) {:?}", img.color()), || {
-                render(img, &[Filter::Blur(sigma)])
+                render(img, &[PlainFilter::Blur(sigma)])
             });
         }
     }
@@ -135,21 +135,21 @@ fn every_per_pixel_filter_writes_the_same_bytes_at_every_pool_size() {
     let rgb = photo(1024, 1000);
     let rgba = with_alpha(&rgb);
     let filters = [
-        Filter::Grayscale,
-        Filter::Brighten(-37),
-        Filter::Contrast(35.0),
-        Filter::Gamma(2.2),
-        Filter::Exposure(0.8),
-        Filter::HighlightsShadows(40.0, -30.0),
-        Filter::HueRotate(77),
-        Filter::Saturation(1.6),
-        Filter::Vibrance(45.0),
-        Filter::Rgb(12, -30, 45),
-        Filter::Curve(CurveChannel::Rgb, vec![(0, 10), (90, 140), (255, 230)]),
-        Filter::Enhance,
-        Filter::Sepia,
-        Filter::Duotone([26, 26, 64], [255, 217, 160]),
-        Filter::Monochrome([255, 128, 0]),
+        PlainFilter::Grayscale,
+        PlainFilter::Brighten(-37),
+        PlainFilter::Contrast(35.0),
+        PlainFilter::Gamma(2.2),
+        PlainFilter::Exposure(0.8),
+        PlainFilter::HighlightsShadows(40.0, -30.0),
+        PlainFilter::HueRotate(77),
+        PlainFilter::Saturation(1.6),
+        PlainFilter::Vibrance(45.0),
+        PlainFilter::Rgb(12, -30, 45),
+        PlainFilter::Curve(CurveChannel::Rgb, vec![(0, 10), (90, 140), (255, 230)]),
+        PlainFilter::Enhance,
+        PlainFilter::Sepia,
+        PlainFilter::Duotone([26, 26, 64], [255, 217, 160]),
+        PlainFilter::Monochrome([255, 128, 0]),
     ];
     for img in [&rgb, &rgba] {
         for filter in &filters {
@@ -170,7 +170,7 @@ fn every_turn_and_flip_writes_the_same_bytes_at_every_pool_size() {
         (200.0, small.clone(), Some([9, 99, 199])),
     ] {
         at_every_pool_size(&format!("rotate({degrees}) {:?}", img.color()), || {
-            bytes_of(&apply_filters_filled(img.clone(), &[Filter::Rotate(degrees)], fill).0)
+            bytes_of(&apply_filters_filled(img.clone(), &[PlainFilter::Rotate(degrees)], fill).0)
         });
     }
     // The half and three-quarter turns and the flips band a
@@ -179,10 +179,10 @@ fn every_turn_and_flip_writes_the_same_bytes_at_every_pool_size() {
     // thread at every size (issue #648).
     for img in [photo(1160, 1160), with_alpha(&photo(1010, 1000))] {
         for filter in [
-            Filter::Rotate(180.0),
-            Filter::Rotate(270.0),
-            Filter::Flip(FlipDirection::Horizontal),
-            Filter::Flip(FlipDirection::Vertical),
+            PlainFilter::Rotate(180.0),
+            PlainFilter::Rotate(270.0),
+            PlainFilter::Flip(FlipDirection::Horizontal),
+            PlainFilter::Flip(FlipDirection::Vertical),
         ] {
             at_every_pool_size(&format!("{filter:?} {:?}", img.color()), || {
                 render(&img, std::slice::from_ref(&filter))
