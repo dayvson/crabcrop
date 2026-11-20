@@ -4487,7 +4487,7 @@ pub(in crate::engine) use encode::{encode_png_indexed, jxl_config};
 
 /// One channel of a blend mode: the CSS formulas on the
 /// 0-255 scale (`b` is the base channel, `o` the overlay's).
-fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
+pub(in crate::engine) fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
     use crate::url::BlendMode;
     match mode {
         BlendMode::Normal => o,
@@ -4523,7 +4523,7 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 /// one this frame scales is kept there for the frames after
 /// it. A still passes `None`.
 #[allow(clippy::too_many_arguments)]
-fn blend_overlay_keeping(
+pub(in crate::engine) fn blend_overlay_keeping(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
     ov: &crate::filters::WatermarkImage,
@@ -4609,7 +4609,7 @@ fn blend_overlay_keeping(
 /// the form the tests call.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn blend_overlay(
+pub(in crate::engine) fn blend_overlay(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
     ov: &crate::filters::WatermarkImage,
@@ -4633,7 +4633,7 @@ fn blend_overlay(
 /// lands on the base is read or copied (issue #604). A
 /// watermark that lands nowhere leaves the base as it was, in
 /// its own layout (issue #713).
-fn overlay_watermark(
+pub(in crate::engine) fn overlay_watermark(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
     wm: &crate::filters::WatermarkImage,
@@ -4664,7 +4664,7 @@ fn overlay_watermark(
 /// negative one, which anchors the far edge that many pixels
 /// in from the base's far edge, must be less than the base's
 /// extent. So it can be asked before an overlay is scaled.
-fn lands_on((width, height): (u32, u32), (x, y): (i32, i32)) -> bool {
+pub(in crate::engine) fn lands_on((width, height): (u32, u32), (x, y): (i32, i32)) -> bool {
     x.unsigned_abs() < width && y.unsigned_abs() < height
 }
 
@@ -4674,7 +4674,7 @@ fn lands_on((width, height): (u32, u32), (x, y): (i32, i32)) -> bool {
 /// negative coordinate anchors the top's right or bottom edge
 /// that many pixels in from the base's. `None` when no pixel
 /// lands.
-fn landing(
+pub(in crate::engine) fn landing(
     (bw, bh): (u32, u32),
     (tw, th): (u32, u32),
     (x, y): (i32, i32),
@@ -4713,7 +4713,7 @@ fn landing(
 /// The blend works in 8-bit RGBA, so a composite that lands
 /// is RGBA8; one that lands nowhere is the base as it was, in
 /// its own layout (issue #713).
-fn composite<E, T>(
+pub(in crate::engine) fn composite<E, T>(
     base: &DynamicImage,
     top: &T,
     (x, y): (i32, i32),
@@ -4754,7 +4754,7 @@ where
 /// `None` for every other format, a JPEG without a fill, and
 /// an image with no alpha to flatten, which encode as they
 /// are.
-fn flattened_for(
+pub(in crate::engine) fn flattened_for(
     img: &DynamicImage,
     format: StillFormat,
     fill: Option<[u8; 3]>,
@@ -4769,7 +4769,7 @@ fn flattened_for(
 
 /// Composite an image over a solid background color, dropping the
 /// alpha channel.
-fn flatten(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
+pub(in crate::engine) fn flatten(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
     let mut base = image::RgbaImage::from_pixel(
         img.width(),
         img.height(),
