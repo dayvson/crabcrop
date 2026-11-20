@@ -32,8 +32,8 @@ fn ensure_jxl_decoder() {
 /// request fails cheaply instead of allocating gigabytes.
 pub(crate) const MAX_DECODE_DIMENSION: u32 = 16_384;
 pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
-const MAX_ANIMATED_FRAMES: usize = 200;
-const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
+pub(in crate::engine) const MAX_ANIMATED_FRAMES: usize = 200;
+pub(in crate::engine) const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
 // The operation cap lives with the grammar (issue #469);
@@ -919,7 +919,7 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
 /// Reject an output size past the shared pixel budget, before
 /// anything allocates it. u64 math, so DPR-scaled dimensions
 /// cannot wrap past the check.
-fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
     if width as u64 * height as u64 > MAX_OUTPUT_PIXELS {
         return Err(EngineError::Unsupported(format!(
             "requested output {width}x{height} exceeds the {MAX_OUTPUT_PIXELS} pixel limit"
@@ -950,7 +950,11 @@ fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
 /// as decoded, and a later step can still bring it within
 /// the limit. Whatever the chain leaves at the end is held
 /// to the limit by [`check_final_output`].
-fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_output_size(
+    width: u32,
+    height: u32,
+    input: (u32, u32),
+) -> Result<(), EngineError> {
     let max = crate::url::MAX_DIMENSION;
     if (width, height) != input && (width > max || height > max) {
         return Err(EngineError::Unsupported(format!(
@@ -975,7 +979,7 @@ fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), E
 /// the steps' refusals do: it is the same refusal of an
 /// output size, made later, and whatever tells output-size
 /// refusals from others by that wording must count it too.
-fn check_final_output(width: u32, height: u32) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_final_output(width: u32, height: u32) -> Result<(), EngineError> {
     let max = crate::url::MAX_DIMENSION;
     if width > max || height > max {
         return Err(EngineError::Unsupported(format!(
@@ -994,13 +998,13 @@ fn check_final_output(width: u32, height: u32) -> Result<(), EngineError> {
 /// runs; charging each frame as it is produced rejects the
 /// request once the total passes the budget, so what is
 /// retained stays within the budget plus one frame.
-struct OutputBudget {
+pub(in crate::engine) struct OutputBudget {
     limit: u64,
     total: u64,
 }
 
 impl OutputBudget {
-    fn new() -> Self {
+    pub(in crate::engine) fn new() -> Self {
         Self {
             limit: MAX_OUTPUT_PIXELS,
             total: 0,
@@ -1008,12 +1012,12 @@ impl OutputBudget {
     }
 
     #[cfg(test)]
-    fn with_limit(limit: u64) -> Self {
+    pub(in crate::engine) fn with_limit(limit: u64) -> Self {
         Self { limit, total: 0 }
     }
 
     /// Charge one frame's output pixels against the budget.
-    fn charge(&mut self, width: u32, height: u32) -> Result<(), EngineError> {
+    pub(in crate::engine) fn charge(&mut self, width: u32, height: u32) -> Result<(), EngineError> {
         self.total = self
             .total
             .saturating_add(u64::from(width) * u64::from(height));
@@ -1032,7 +1036,12 @@ impl OutputBudget {
     /// budget's worth, with the message the charge gives. A
     /// hinted DPR factor tried and refused for it costs one
     /// frame this way (issue #529).
-    fn check_frames(&self, width: u32, height: u32, frames: usize) -> Result<(), EngineError> {
+    pub(in crate::engine) fn check_frames(
+        &self,
+        width: u32,
+        height: u32,
+        frames: usize,
+    ) -> Result<(), EngineError> {
         let run = (u64::from(width) * u64::from(height)).saturating_mul(frames as u64);
         if self.total.saturating_add(run) > self.limit {
             return Err(self.refusal());
@@ -1055,7 +1064,7 @@ impl OutputBudget {
 /// before any fetch (issue #469); this is the backstop for
 /// every other caller of the engine, with the same message
 /// and the same `unsupported_operation` class.
-fn check_operation_count(ops: &[Operation]) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_operation_count(ops: &[Operation]) -> Result<(), EngineError> {
     crate::url::check_operation_count(ops).map_err(|e| EngineError::Unsupported(e.to_string()))
 }
 
@@ -3294,7 +3303,7 @@ fn upscale_image(
 
 /// The effective DPR factor: an explicit `dpr(...)` directive
 /// wins, then the client hint carried on the context, else 1.
-fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
+pub(in crate::engine) fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
     explicit.or(ctx.dpr).unwrap_or(1.0)
 }
 
@@ -3306,7 +3315,7 @@ fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
 /// result at the largest factor that fits, or the refusal
 /// that stands. A refused try stops at the step that asks
 /// for the oversized image, before that step allocates it.
-fn step_down_hint<T>(
+pub(in crate::engine) fn step_down_hint<T>(
     bytes: &[u8],
     ops: &[Operation],
     directives: &crate::url::RequestDirectives,
@@ -3388,7 +3397,7 @@ fn hint_start(
 /// keeps its `400`, a refusal of any other kind is not the
 /// factor's doing, and a chain with no pixel size for the
 /// factor to scale renders the same at every factor.
-fn hint_step_down(
+pub(in crate::engine) fn hint_step_down(
     err: &EngineError,
     ops: &[Operation],
     directives: &crate::url::RequestDirectives,
@@ -3448,7 +3457,7 @@ fn is_output_size_refusal(err: &EngineError) -> bool {
 /// fit. The refusal is an output-size refusal, so the factor
 /// steps down. At factor 1 the render is the one the URL gets
 /// without the hint, under its own rules.
-fn check_hinted_output(width: u32, height: u32) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_hinted_output(width: u32, height: u32) -> Result<(), EngineError> {
     let max = crate::url::MAX_DIMENSION;
     if width > max || height > max {
         return Err(EngineError::Unsupported(format!(
