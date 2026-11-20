@@ -2516,7 +2516,12 @@ fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImag
 /// alone. A copy memory held keeps its groups in the new
 /// one (issue #572); returns those the slower tiers still
 /// have to learn.
-fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) -> Vec<String> {
+pub(in crate::server) fn put_memory_tier(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    entry: &CachedImage,
+) -> Vec<String> {
     if write_is_stale(state, snapshot, key, entry) {
         return Vec::new();
     }
@@ -2693,7 +2698,7 @@ fn adds_groups(existing: &[String], extra: &[String]) -> bool {
 /// [`finish_disk_write`]. Runs before the copy enters memory,
 /// so a memory hit that learns a group meanwhile reaches the
 /// write.
-fn begin_disk_write(
+pub(in crate::server) fn begin_disk_write(
     state: &AppState,
     snapshot: u64,
     key: &str,
@@ -2734,7 +2739,7 @@ fn begin_disk_write(
 /// copy lacks some of the entry's groups, because its group
 /// write-back was skipped (issue #709): the new record owes
 /// them, and its first hit sends them.
-async fn finish_disk_write(
+pub(in crate::server) async fn finish_disk_write(
     state: &AppState,
     snapshot: u64,
     key: &str,
@@ -2779,21 +2784,21 @@ async fn finish_disk_write(
 
 /// A render's disk write that its flight leader finishes
 /// after the followers are woken (issue #572).
-struct PendingDiskWrite {
-    snapshot: u64,
-    key: String,
-    entry: CachedImage,
-    claim: crate::storage::WriteClaim,
+pub(in crate::server) struct PendingDiskWrite {
+    pub(in crate::server) snapshot: u64,
+    pub(in crate::server) key: String,
+    pub(in crate::server) entry: CachedImage,
+    pub(in crate::server) claim: crate::storage::WriteClaim,
 }
 
 /// Where [`populate_tiers`] leaves a flight leader's disk
 /// write for the leader to finish once its guard is dropped.
-type DiskHandoff = Arc<std::sync::Mutex<Option<PendingDiskWrite>>>;
+pub(in crate::server) type DiskHandoff = Arc<std::sync::Mutex<Option<PendingDiskWrite>>>;
 
 /// Why a shared-tier write is made, which decides what it
 /// does when every write slot is taken (issue #463).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SharedWrite {
+pub(in crate::server) enum SharedWrite {
     /// A fresh render's write-through, on a miss. Skipped
     /// when every slot is taken: the bucket only misses a
     /// copy that the next replica to miss renders again.
@@ -2832,7 +2837,7 @@ enum SharedWrite {
 /// /metrics, and comes back [`Sent::Owed`], so the disk tier
 /// records that the bucket copy lacks the groups and its next
 /// hit sends them again.
-fn spawn_shared_put(
+pub(in crate::server) fn spawn_shared_put(
     state: &AppState,
     snapshot: u64,
     key: &str,
@@ -2895,7 +2900,7 @@ fn spawn_shared_put(
 
 /// How [`spawn_shared_put`] went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Sent {
+pub(in crate::server) enum Sent {
     /// A write was spawned, or one already queued carries the
     /// copy.
     Spawned,
@@ -2915,12 +2920,14 @@ enum Sent {
 /// reads, across every tier check the request makes. A
 /// lookup that runs out goes on to the shared tier or a
 /// render.
-const DISK_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+pub(in crate::server) const DISK_LOOKUP_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// How long a request waits for its own disk write, once
 /// (issue #572). A write with no disk slot by then is
 /// skipped.
-const DISK_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+pub(in crate::server) const DISK_WRITE_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 /// How long a purge waits for its disk deletions in all
 /// while they make progress (issue #572). It stops sooner, at
@@ -2944,30 +2951,33 @@ const PURGE_END_CAP: std::time::Duration = std::time::Duration::from_secs(600);
 /// waited for a long render before its next check still
 /// reads a healthy disk.
 #[derive(Debug)]
-struct DiskBudget {
+pub(in crate::server) struct DiskBudget {
     left: std::time::Duration,
 }
 
 impl DiskBudget {
-    fn new() -> Self {
+    pub(in crate::server) fn new() -> Self {
         DiskBudget {
             left: DISK_LOOKUP_BUDGET,
         }
     }
 
     #[cfg(test)]
-    fn with(left: std::time::Duration) -> Self {
+    pub(in crate::server) fn with(left: std::time::Duration) -> Self {
         DiskBudget { left }
     }
 
-    fn spent(&self) -> bool {
+    pub(in crate::server) fn spent(&self) -> bool {
         self.left.is_zero()
     }
 
     /// Wait for `wait` within what is left, and charge the
     /// time it took. `None`, at once once spent, when it ran
     /// out.
-    async fn spend<F: std::future::Future>(&mut self, wait: F) -> Option<F::Output> {
+    pub(in crate::server) async fn spend<F: std::future::Future>(
+        &mut self,
+        wait: F,
+    ) -> Option<F::Output> {
         if self.spent() {
             return None;
         }
@@ -3018,12 +3028,12 @@ impl LookupAnswer {
 }
 
 /// The `Cache-Status` of a disk hit.
-const DISK_HIT: &str = "crabcrop; hit; detail=\"disk\"";
+pub(in crate::server) const DISK_HIT: &str = "crabcrop; hit; detail=\"disk\"";
 
 /// [`lookup_tiers_within`] with a whole disk budget, as the
 /// tier tests drive one lookup.
 #[cfg(test)]
-async fn lookup_tiers(
+pub(in crate::server) async fn lookup_tiers(
     state: &Arc<AppState>,
     cache_key: &str,
     groups: &[String],
@@ -3038,7 +3048,13 @@ async fn lookup_tiers(
 /// the record learns in the index, and the drain writes the
 /// file. When the grown set falls under a purge, the copy
 /// leaves memory too, as the slower tiers' copies do.
-fn memory_hit(state: &AppState, snapshot: u64, key: &str, groups: &[String], hit: &CachedImage) {
+pub(in crate::server) fn memory_hit(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    groups: &[String],
+    hit: &CachedImage,
+) {
     if groups.is_empty() {
         return;
     }
@@ -3116,7 +3132,7 @@ fn memory_hit(state: &AppState, snapshot: u64, key: &str, groups: &[String], hit
 /// one dropped while it waits owes no tier anything.
 /// Returns the image and the `Cache-Status` value for
 /// the tier that served it.
-async fn lookup_tiers_within(
+pub(in crate::server) async fn lookup_tiers_within(
     state: &Arc<AppState>,
     cache_key: &str,
     groups: &[String],
@@ -4029,7 +4045,7 @@ async fn retry_on_fallback(
 /// flight leader's disk write is left there for the leader
 /// to finish after its followers are woken, but only when
 /// memory holds this copy for them to read.
-async fn populate_tiers(
+pub(in crate::server) async fn populate_tiers(
     state: &AppState,
     snapshot: u64,
     cache_key: &str,
