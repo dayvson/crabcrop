@@ -1609,8 +1609,8 @@ def explain_url(input: str, now_seconds: Optional[int] = None) -> Explanation:
     if signature.kind == "invalid":
         errors.append("malformed signature segment")
     # Remainders the server refuses before it reads an operation,
-    # whatever the signature (server.rs resolve_request): the segment
-    # key derivation owns, and the endpoints' own segments.
+    # whatever the signature (server/admission.rs resolve_request):
+    # the segment key derivation owns, and the endpoints' own segments.
     if is_reserved_remainder(remainder):
         errors.append(
             "the remainder begins with the reserved segment crabcrop, which key derivation owns: "
