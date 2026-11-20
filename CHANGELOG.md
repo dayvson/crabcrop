@@ -6,6 +6,12 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [0.14.0] - 2026-11-18
 
+- This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #713). Aspect crops, the redaction filters, and watermarks and overlays placed off the canvas now keep the source's layout and depth.
+- An upload body that falls behind 64 KiB a second after its first 10 seconds is now answered `408 upload_too_slow`. A build of `Dockerfile.ai` reaches `api.nuget.org` for ONNX Runtime instead of GitHub, whose release tarballs answer `404` (issue #733).
+- `crabcrop-url` 0.14 removes `entry_key`, deprecates `build_sealed_url` for `SealedUrl`, and makes `BuildError` and `SealError` non-exhaustive (issue #712).
+- The disk tier's boot scan no longer delays listening (issue #708), and an AI model a panic poisoned no longer fails every later request (issue #715).
+- A shared-tier purge pages the bucket's listing, and a bucket's refusal no longer counts as an answer (issue #709).
+
 ### Added
 
 - `CRABCROP_MAX_CONNECTIONS_PER_CLIENT` holds each client to a share of `CRABCROP_MAX_CONNECTIONS`, for a server that clients reach directly. A client is an IPv4 address, or the /64 an IPv6 address is in, since a host is usually given a whole /64. A connection past its client's share is closed as soon as it is accepted, with no answer, so one client can no longer hold every connection while the others wait in the listen queue. Stderr counts those closes, at most one line every 10 seconds and with no address. The default, `0`, sets no share, as a server behind a proxy, a load balancer or a CDN needs: every connection then comes from their few addresses. When a share is set, the boot's `connections:` line names it (`at most 16 per client`). The idle timeout keeps its 65-minute default, which stays above the time the common edges keep an idle pooled connection.
