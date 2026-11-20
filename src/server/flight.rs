@@ -5,18 +5,20 @@ use axum::response::{IntoResponse, Response};
 
 use super::request::OwedRecord;
 use super::response::{attach_cache_headers, finalize_validators, respond};
+use super::tiers::{DiskBudget, DiskHandoff, finish_disk_write, lookup_tiers_within};
 use super::{
-    AppState, DiskBudget, DiskHandoff, Flight, FlightSlot, LeaderGuard, MetaFlight, MissProgress,
-    MissWork, SharedFlight, SharedResponse, finish_disk_write, lookup_tiers_within, serve_miss,
-    wants_detections, wants_embeddings, wants_moderation, wants_ocr,
+    AppState, Flight, FlightSlot, LeaderGuard, MetaFlight, MissProgress, MissWork, SharedFlight,
+    SharedResponse, serve_miss, wants_detections, wants_embeddings, wants_moderation, wants_ocr,
 };
 use crate::cache::CachedImage;
 use crate::url::ImageFormat;
 
 #[cfg(doc)]
+use super::Background;
+#[cfg(doc)]
 use super::request::serve;
 #[cfg(doc)]
-use super::{Background, populate_tiers};
+use super::tiers::populate_tiers;
 
 /// The flight key of a meta request (issue #295): the
 /// cache key plus every fact the document depends on
