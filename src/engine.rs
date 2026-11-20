@@ -1400,7 +1400,7 @@ impl Engine {
 /// The placeholder of an animated or video render, when the
 /// caller asked for one: it describes the first processed
 /// frame.
-fn first_frame_placeholder(
+pub(in crate::engine) fn first_frame_placeholder(
     frames: &mut Frames,
     ctx: &ProcessContext<'_>,
 ) -> Option<crate::placeholder::Placeholder> {
@@ -1420,7 +1420,7 @@ fn first_frame_placeholder(
 /// the ops, not of a frame, so every frame reports the same
 /// ones; the first frame's copy is the request's and comes back
 /// with the frames.
-fn render_frames(
+pub(in crate::engine) fn render_frames(
     mut frames: Frames,
     ops: &[Operation],
     ctx: &ProcessContext<'_>,
@@ -1467,7 +1467,7 @@ fn render_frames(
 /// keeps the GIF encoder's defaults otherwise, as it always has.
 /// The frames are prepared on up to two threads (see
 /// [`gif_frame_workers`]) and written in frame order.
-fn encode_animated_gif(
+pub(in crate::engine) fn encode_animated_gif(
     frames: &Frames,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, EngineError> {
@@ -1486,14 +1486,19 @@ fn encode_animated_gif(
 /// about 1.6 times; with two it took 0.98 times as long, and a
 /// GIF render still got 1.76 times the throughput of one thread
 /// (four gave 2.34). The bytes are the same at any count.
-const GIF_FRAME_THREADS: usize = 2;
+pub(in crate::engine) const GIF_FRAME_THREADS: usize = 2;
 
 /// How many threads prepare the frames of an animated GIF on
 /// a host with `cores` cores (issue #667): the cores, at most
 /// [`GIF_FRAME_THREADS`], never more than the frames, and one
 /// for a single frame or for an animation under 64x64 pixels,
 /// too small to repay a thread.
-fn gif_frame_workers(cores: usize, frames: usize, width: u32, height: u32) -> usize {
+pub(in crate::engine) fn gif_frame_workers(
+    cores: usize,
+    frames: usize,
+    width: u32,
+    height: u32,
+) -> usize {
     if frames < 2 || u64::from(width) * u64::from(height) < 64 * 64 {
         return 1;
     }
@@ -1521,7 +1526,7 @@ fn gif_frame_workers(cores: usize, frames: usize, width: u32, height: u32) -> us
 /// four, so the frame cap and the pixel budgets that bound the
 /// frames bound them too. Each thread works on one frame at a
 /// time.
-fn encode_animated_gif_on(
+pub(in crate::engine) fn encode_animated_gif_on(
     frames: &Frames,
     deadline: Option<std::time::Instant>,
     workers: usize,
@@ -1597,7 +1602,7 @@ fn encode_animated_gif_on(
 /// returns, however it returns. A thread the host cannot
 /// start is one helper fewer, not a failure, since the
 /// calling thread takes indexes too.
-fn in_index_order<T: Send>(
+pub(in crate::engine) fn in_index_order<T: Send>(
     count: usize,
     workers: usize,
     work: impl Fn(usize) -> Result<T, EngineError> + Sync,
@@ -1667,7 +1672,7 @@ fn in_index_order<T: Send>(
 /// decoding on to its last frame. Errors when the source is
 /// malformed, over budget, or carries no frames. `format`
 /// names the source format in error messages.
-fn collect_frames(
+pub(in crate::engine) fn collect_frames(
     mut frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
     format: &str,
     deadline: Option<std::time::Instant>,
@@ -1716,17 +1721,17 @@ fn collect_frames(
 /// so the first frame is always there to read, the one a still
 /// conversion keeps and whose size an animated render starts
 /// from.
-struct Frames {
-    first: image::Frame,
-    rest: Vec<image::Frame>,
+pub(in crate::engine) struct Frames {
+    pub(in crate::engine) first: image::Frame,
+    pub(in crate::engine) rest: Vec<image::Frame>,
 }
 
 impl Frames {
-    fn len(&self) -> usize {
+    pub(in crate::engine) fn len(&self) -> usize {
         1 + self.rest.len()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &image::Frame> {
+    pub(in crate::engine) fn iter(&self) -> impl Iterator<Item = &image::Frame> {
         std::iter::once(&self.first).chain(&self.rest)
     }
 
@@ -1735,7 +1740,7 @@ impl Frames {
     }
 
     /// The first frame's width and height.
-    fn dimensions(&self) -> (u32, u32) {
+    pub(in crate::engine) fn dimensions(&self) -> (u32, u32) {
         self.first.buffer().dimensions()
     }
 
@@ -1743,7 +1748,7 @@ impl Frames {
     /// call (see [`lend_frame`]), where it was copied once for
     /// each look (issue #713): the quality pick and the
     /// placeholder each read the whole frame.
-    fn with_first<T>(&mut self, f: impl FnOnce(&DynamicImage) -> T) -> T {
+    pub(in crate::engine) fn with_first<T>(&mut self, f: impl FnOnce(&DynamicImage) -> T) -> T {
         lend_frame(&mut self.first, |img| f(img))
     }
 }
@@ -1765,7 +1770,7 @@ fn lend_frame<T>(frame: &mut image::Frame, f: impl FnOnce(&mut DynamicImage) -> 
 
 /// A copy of a lent frame, for a chain whose first step cannot
 /// read the frame where it is (see [`ChainState::run_to`]).
-fn copy_of_lent(frame: &DynamicImage) -> DynamicImage {
+pub(in crate::engine) fn copy_of_lent(frame: &DynamicImage) -> DynamicImage {
     #[cfg(test)]
     LENT_FRAME_COPIES.set(LENT_FRAME_COPIES.get() + 1);
     frame.clone()
@@ -1776,7 +1781,7 @@ thread_local! {
     /// How many lent frames [`copy_of_lent`] copied on this
     /// thread, so a test can see which chains read their frames
     /// where they are.
-    static LENT_FRAME_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(in crate::engine) static LENT_FRAME_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl IntoIterator for Frames {
@@ -1795,7 +1800,7 @@ impl IntoIterator for Frames {
 /// dimension/allocation limits (its defaults are none), and
 /// collection enforces the shared frame and pixel budgets and
 /// the request's deadline (see [`collect_frames`]).
-fn decode_gif_frames(
+pub(in crate::engine) fn decode_gif_frames(
     bytes: &[u8],
     deadline: Option<std::time::Instant>,
 ) -> Result<Frames, EngineError> {
@@ -1825,7 +1830,7 @@ fn decode_gif_frames(
 /// [`is_animated_gif`] does. A file the walk cannot read to its
 /// end is left to the decoder, which stops at the same point
 /// with its own error, past only frames counted here.
-fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let mut options = gif::DecodeOptions::new();
     options.skip_frame_decoding(true);
     let Ok(mut decoder) = options.read_info(bytes) else {
@@ -1881,7 +1886,7 @@ fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
 /// pixels charged here are the pixels it allocates. A container
 /// that does not parse this far states no canvas; the decoder
 /// then opens it and fails before it allocates a canvas.
-fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
+pub(in crate::engine) fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let Some(header) = webp_anim::header(bytes) else {
         return Ok(());
     };
@@ -1925,7 +1930,7 @@ fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
 /// source carries no ANIM chunk (a still) or its container
 /// does not parse; genuinely malformed files fail at decode
 /// either way.
-fn webp_animation_params(bytes: &[u8]) -> Option<(u16, [u8; 4])> {
+pub(in crate::engine) fn webp_animation_params(bytes: &[u8]) -> Option<(u16, [u8; 4])> {
     oxideav_webp::animation_params(bytes).ok().flatten()
 }
 
@@ -1999,7 +2004,7 @@ pub(crate) fn animated_output_format(
 /// video path, and every other format takes the first frame as
 /// a still.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnimatedFormat {
+pub(in crate::engine) enum AnimatedFormat {
     Gif,
     WebP,
 }
@@ -2008,7 +2013,7 @@ impl AnimatedFormat {
     /// The animated format `format` names, or `None` for one
     /// that cannot keep frames. Every format is listed, so a
     /// new one has to say which it is.
-    fn of(format: ImageFormat) -> Option<Self> {
+    pub(in crate::engine) fn of(format: ImageFormat) -> Option<Self> {
         match format {
             ImageFormat::Gif => Some(AnimatedFormat::Gif),
             ImageFormat::WebP => Some(AnimatedFormat::WebP),
@@ -2048,7 +2053,7 @@ impl From<AnimatedFormat> for ImageFormat {
 /// from the start, any file that walk does not handle, so an
 /// unusual or broken file gets the frames or the error it
 /// always got.
-fn decode_webp_frames(
+pub(in crate::engine) fn decode_webp_frames(
     bytes: &[u8],
     deadline: Option<std::time::Instant>,
 ) -> Result<Frames, EngineError> {
@@ -2076,7 +2081,7 @@ type OpenedWebp<'a> = (
 /// container checks and their errors, the decode limits, and
 /// the ANIM background color. Returns the decoder and the
 /// color it took, if any.
-fn open_webp_animation(bytes: &[u8]) -> Result<OpenedWebp<'_>, EngineError> {
+pub(in crate::engine) fn open_webp_animation(bytes: &[u8]) -> Result<OpenedWebp<'_>, EngineError> {
     use image::ImageDecoder;
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -2101,7 +2106,7 @@ fn open_webp_animation(bytes: &[u8]) -> Result<OpenedWebp<'_>, EngineError> {
 /// walk met something it does not handle, at any frame: the
 /// frames it had are dropped and the image crate's iterator
 /// decides.
-fn webp_frames_through_libwebp(
+pub(in crate::engine) fn webp_frames_through_libwebp(
     bytes: &[u8],
     background: Option<[u8; 4]>,
     deadline: Option<std::time::Instant>,
@@ -2163,7 +2168,7 @@ fn webp_frames_through_libwebp(
 /// duration beyond the i32 timestamp range (an animation
 /// longer than about 24 days) falls back to a zero-based
 /// timeline and that average.
-fn encode_animated_webp(
+pub(in crate::engine) fn encode_animated_webp(
     frames: &Frames,
     loop_count: u16,
     quality: Option<u8>,
@@ -2510,12 +2515,12 @@ struct SmartWindow {
 /// the chain and the frame dimensions it decided on, so
 /// a frame of a different size decides for itself.
 #[derive(Debug, Default)]
-struct SmartWindows {
+pub(in crate::engine) struct SmartWindows {
     entries: Vec<SmartWindow>,
 }
 
 impl SmartWindows {
-    fn get(&self, key: (usize, u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    pub(in crate::engine) fn get(&self, key: (usize, u32, u32)) -> Option<(u32, u32, u32, u32)> {
         self.entries
             .iter()
             .find(|e| (e.op_index, e.width, e.height) == key)
@@ -2531,7 +2536,7 @@ impl SmartWindows {
     /// position in the chain. A replayed window is handed
     /// back uncut, for the resize that closes the crop to
     /// read from the frame (issue #654).
-    fn crop(
+    pub(in crate::engine) fn crop(
         &mut self,
         img: DynamicImage,
         (tw, th): (u32, u32),
@@ -2588,10 +2593,10 @@ type Window = (u32, u32, u32, u32);
 /// the frames' own tolerance passes keep; `None` when every
 /// frame was uniform.
 #[derive(Debug)]
-struct TrimWindow {
+pub(in crate::engine) struct TrimWindow {
     key: (usize, usize),
-    dims: (u32, u32),
-    found: Option<Window>,
+    pub(in crate::engine) dims: (u32, u32),
+    pub(in crate::engine) found: Option<Window>,
 }
 
 /// Trim windows shared across the frames of one animated
@@ -2607,14 +2612,18 @@ struct TrimWindow {
 /// the frame dimensions, so a frame of a different size
 /// trims for itself.
 #[derive(Debug, Default)]
-struct TrimWindows {
-    entries: Vec<TrimWindow>,
+pub(in crate::engine) struct TrimWindows {
+    pub(in crate::engine) entries: Vec<TrimWindow>,
 }
 
 impl TrimWindows {
     /// The settled box for the trim at `key` on a frame of
     /// `dims`, or `None` when no window is settled for it.
-    fn get(&self, key: (usize, usize), dims: (u32, u32)) -> Option<Option<Window>> {
+    pub(in crate::engine) fn get(
+        &self,
+        key: (usize, usize),
+        dims: (u32, u32),
+    ) -> Option<Option<Window>> {
         self.entries
             .iter()
             .find(|e| e.key == key && e.dims == dims)
@@ -2631,16 +2640,16 @@ impl TrimWindows {
 /// the frames come out on one canvas, cut from the same part
 /// of the scene, and the scaled overlay parts they all draw.
 #[derive(Debug, Default)]
-struct FrameShare {
+pub(in crate::engine) struct FrameShare {
     /// One smart crop window per crop (issue #376), on the
     /// animated image and video paths alike: the video path
     /// let each frame decide its own until issue #713.
-    smart_windows: SmartWindows,
+    pub(in crate::engine) smart_windows: SmartWindows,
     /// One trim window per trim filter (issue #465).
-    trims: TrimWindows,
+    pub(in crate::engine) trims: TrimWindows,
     /// The parts `overlay(...,width)` scaled, kept for the
     /// frames after the one that scaled them.
-    overlays: ScaledOverlays,
+    pub(in crate::engine) overlays: ScaledOverlays,
 }
 
 /// The scaled overlay parts the frames of one animated render
@@ -2664,7 +2673,7 @@ struct FrameShare {
 /// a chain of many scaled overlays keeps no more than one
 /// frame's worth of them.
 #[derive(Debug, Default)]
-struct ScaledOverlays {
+pub(in crate::engine) struct ScaledOverlays {
     entries: Vec<ScaledOverlay>,
 }
 
@@ -2682,7 +2691,7 @@ impl ScaledOverlays {
     /// `size`: the kept ones when an earlier frame scaled them,
     /// or else what `scale` makes, kept while the kept parts
     /// still hold no more than `room` pixels with them.
-    fn part<E>(
+    pub(in crate::engine) fn part<E>(
         &mut self,
         url: &str,
         size: (u32, u32),
@@ -2746,7 +2755,7 @@ fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
 /// copy of the frame. A trim nothing runs before reads the
 /// frames where they are (issue #713): its survey is the
 /// tolerance pass alone.
-fn survey_trims(
+pub(in crate::engine) fn survey_trims(
     frames: &mut Frames,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
