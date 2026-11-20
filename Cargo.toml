@@ -1,6 +1,6 @@
 [package]
 name = "crabcrop"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.96"
 description = "On-demand image optimization service in Rust"
@@ -14,7 +14,7 @@ members = ["crates/crabcrop-url"]
 [dependencies]
 # The `zeroize` feature clears the subkeys the crate derives and
 # drops itself, and the HMAC and AES-GCM key state.
-crabcrop-url = { path = "crates/crabcrop-url", version = "0.13", features = ["zeroize"] }
+crabcrop-url = { path = "crates/crabcrop-url", version = "0.14", features = ["zeroize"] }
 ab_glyph = "0.2"
 axum = "0.8"
 # Standard base64 with padding for the meta response: the

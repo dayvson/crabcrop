@@ -1984,23 +1984,53 @@ impl S3Store {
     /// `MAX_SHARED_TOMBSTONES` count as never read (issue
     /// #572). Returns whether the refresh listed and read
     /// everything.
+    ///
+    /// The refresh runs in stages: [`Self::list_tombstones`],
+    /// [`plan_tombstone_reads`], [`Self::read_tombstones_by`],
+    /// [`settle_tombstone_reads`], [`take_spent_tombstones`],
+    /// [`Self::note_unread_tombstones`],
+    /// [`Self::put_tombstones_in_force`] and
+    /// [`Self::collect_spent_tombstones`].
     pub async fn refresh_tombstones_within(&self, guard: &PurgeGuard, limit: Duration) -> bool {
-        use futures_util::StreamExt as _;
         let deadline = tokio::time::Instant::now() + limit;
-        let late = || format!("not done within {}s", limit.as_secs_f32());
+        let Some(listing) = self.list_tombstones(deadline, limit).await else {
+            return false;
+        };
+        let previous = self.tombstones.lock().unwrap().clone();
+        let (mut fresh, to_read) = plan_tombstone_reads(listing.named, &previous);
+        let done = self.read_tombstones_by(deadline, &to_read).await;
+        let mut settled =
+            settle_tombstone_reads(&to_read, done, &previous, &mut fresh, listing.past_cap);
+        let spent = take_spent_tombstones(&mut fresh, now_ms());
+        self.note_unread_tombstones(&mut settled, to_read.len(), listing.past, &fresh, limit);
+        self.put_tombstones_in_force(guard, fresh, settled.unread.len(), listing.listed_ms);
+        self.collect_spent_tombstones(deadline, spent).await;
+        settled.failed + settled.unfinished == 0 && listing.past == 0
+    }
+
+    /// The first stage of [`Self::refresh_tombstones_within`]:
+    /// list the tombstone sub-prefix by `deadline`, and order
+    /// what it names newest first. `None` when the listing
+    /// failed or ran out of time, which is noted as a tier
+    /// error.
+    async fn list_tombstones(
+        &self,
+        deadline: tokio::time::Instant,
+        limit: Duration,
+    ) -> Option<TombstoneListing> {
         let prefix = self.tombstone_prefix();
         let Ok((listed, complete)) =
             tokio::time::timeout_at(deadline, self.list_under(&prefix)).await
         else {
-            self.note_error("cannot list purge tombstones", &late());
-            return false;
+            self.note_error("cannot list purge tombstones", &not_done_within(limit));
+            return None;
         };
         if !complete {
             self.note_error("cannot list purge tombstones", "listing failed");
-            return false;
+            return None;
         }
         let listed_ms = now_ms();
-        let mut named: Vec<(u64, u64, String, String)> = listed
+        let mut named: Vec<ListedTombstone> = listed
             .into_iter()
             .filter_map(|(object, etag)| {
                 let (start_ms, writer) = parse_tombstone_name(object.strip_prefix(&prefix)?)?;
@@ -2009,35 +2039,37 @@ impl S3Store {
             .collect();
         named.sort_by_key(|(start_ms, ..)| std::cmp::Reverse(*start_ms));
         // The ones past the cap are not read and do not apply
-        // (issue #572): they count as unread, and the line below
-        // names them, so a tombstone that newer ones pushed out
-        // does not lapse unseen.
+        // (issue #572): they count as unread, and the line
+        // `note_unread_tombstones` writes names them, so a
+        // tombstone that newer ones pushed out does not lapse
+        // unseen.
         let past_cap: Vec<(u64, String)> = named
             .split_off(MAX_SHARED_TOMBSTONES.min(named.len()))
             .into_iter()
             .map(|(start_ms, _, object, _)| (start_ms, object))
             .collect();
-        let past = past_cap.len();
-        let previous = self.tombstones.lock().unwrap().clone();
-        let mut fresh: HashMap<String, (String, Tombstone)> = HashMap::new();
-        let mut to_read = Vec::new();
-        for (start_ms, writer, object, etag) in named {
-            if !etag.is_empty()
-                && let Some((seen, tombstone)) = previous.get(&object)
-                && *seen == etag
-            {
-                fresh.insert(object, (etag, tombstone.clone()));
-                continue;
-            }
-            to_read.push((start_ms, writer, object, etag));
-        }
-        // Reads finish in any order; the ones still out at the
-        // deadline are dropped with the stream, and the ones
-        // not yet started never start. Each read owns its
-        // name, as in `purge_objects`.
+        Some(TombstoneListing {
+            named,
+            past: past_cap.len(),
+            past_cap,
+            listed_ms,
+        })
+    }
+
+    /// Read `to_read` by `deadline`, [`TOMBSTONE_READS_AT_ONCE`]
+    /// at a time. Reads finish in any order; the ones still out
+    /// at the deadline are dropped with the stream, and the ones
+    /// not yet started never start. Each read owns its name, as
+    /// in `purge_objects`.
+    async fn read_tombstones_by(
+        &self,
+        deadline: tokio::time::Instant,
+        to_read: &[ListedTombstone],
+    ) -> HashMap<String, TombstoneRead> {
+        use futures_util::StreamExt as _;
         let mut done: HashMap<String, TombstoneRead> = HashMap::new();
         let _ = tokio::time::timeout_at(deadline, async {
-            let mut reads = futures_util::stream::iter(to_read.clone())
+            let mut reads = futures_util::stream::iter(to_read.to_vec())
                 .map(|(start_ms, writer, object, _)| async move {
                     let read = self.read_tombstone(&object, start_ms, writer).await;
                     (object, read)
@@ -2048,91 +2080,85 @@ impl S3Store {
             }
         })
         .await;
-        // `failed` counts the reads the store answered with a
-        // failure, one error each, as every other store
-        // request counts. The reads the deadline cut off or
-        // kept from starting count one error together: their
-        // number grows with the tombstones listed, not with
-        // the requests the store failed.
-        let (mut failed, mut unfinished) = (0u64, 0u64);
-        let mut kept = Vec::new();
-        // The ones never read, with the start their names
-        // give (issue #577).
-        let mut unread: Vec<(u64, String)> = past_cap;
-        let mut first_failure = None;
-        for (start_ms, _, object, etag) in &to_read {
-            match done.remove(object) {
-                Some(TombstoneRead::Read(tombstone)) => {
-                    fresh.insert(object.clone(), (etag.clone(), tombstone));
-                    continue;
-                }
-                Some(TombstoneRead::Ignored) => continue,
-                Some(TombstoneRead::Failed(why)) => {
-                    failed += 1;
-                    first_failure.get_or_insert(why);
-                }
-                None => unfinished += 1,
-            }
-            // The version read before stays in force, under
-            // its own ETag, so the next refresh reads the
-            // object again.
-            if let Some(known) = previous.get(object) {
-                fresh.insert(object.clone(), known.clone());
-                kept.push(object.clone());
-            } else {
-                unread.push((*start_ms, object.clone()));
-            }
+        done
+    }
+
+    /// Note the reads this refresh could not make, when there
+    /// were any: `failed` counts the reads the store answered
+    /// with a failure, one error each, as every other store
+    /// request counts. The reads the deadline cut off or kept
+    /// from starting count one error together: their number
+    /// grows with the tombstones listed, not with the requests
+    /// the store failed. The tombstones listed past the cap
+    /// are no failure of the store, so no tier error: the
+    /// unread count shows them.
+    fn note_unread_tombstones(
+        &self,
+        settled: &mut SettledReads,
+        total: usize,
+        past: usize,
+        fresh: &HashMap<String, (String, Tombstone)>,
+        limit: Duration,
+    ) {
+        let SettledReads {
+            failed,
+            unfinished,
+            kept,
+            unread,
+            first_failure,
+        } = settled;
+        let (failed, unfinished) = (*failed, *unfinished);
+        if failed + unfinished == 0 && past == 0 {
+            return;
         }
-        let now = now_ms();
-        let spent: Vec<String> = fresh
-            .iter()
-            .filter(|(object, (_, tombstone))| {
-                !tombstone.live(now)
-                    || fresh
-                        .iter()
-                        .any(|(other, (_, newer))| other != *object && newer.supersedes(tombstone))
-            })
-            .map(|(object, _)| object.clone())
-            .collect();
-        for object in &spent {
-            fresh.remove(object);
+        // A kept version that turned out spent was dropped
+        // from the set and is collected at the end of the
+        // refresh, so only the kept versions still in force
+        // count as kept.
+        let kept_in_force = kept.iter().filter(|o| fresh.contains_key(*o)).count();
+        let mut what = Vec::new();
+        if let Some(why) = first_failure {
+            what.push(format!("{failed} of {total} reads failed (first: {why})"));
         }
-        if failed + unfinished > 0 || past > 0 {
-            // A kept version that turned out spent was just
-            // dropped above and is collected below, so only the
-            // kept versions still in force count as kept.
-            let kept_in_force = kept.iter().filter(|o| fresh.contains_key(*o)).count();
-            let total = to_read.len();
-            let mut what = Vec::new();
-            if let Some(why) = &first_failure {
-                what.push(format!("{failed} of {total} reads failed (first: {why})"));
-            }
-            if unfinished > 0 {
-                what.push(format!("{unfinished} of {total} {}", late()));
-            }
-            // Not a failure of the store, so no tier error: the
-            // unread count shows it.
-            if past > 0 {
-                what.push(format!(
-                    "{past} listed past the newest {MAX_SHARED_TOMBSTONES} not read"
-                ));
-            }
-            // The names come last, so a match on the text
-            // before them still holds.
-            let mut detail = format!(
-                "{}; kept as last read: {kept_in_force}; not in force until read: {}",
-                what.join(", "),
-                unread.len()
-            );
-            if !unread.is_empty() {
-                detail += &format!("; oldest not in force: {}", oldest_unread(&mut unread));
-            }
-            self.note_errors(
-                failed + u64::from(unfinished > 0),
-                "cannot read purge tombstones",
-                &detail,
-            );
+        if unfinished > 0 {
+            what.push(format!(
+                "{unfinished} of {total} {}",
+                not_done_within(limit)
+            ));
         }
+        if past > 0 {
+            what.push(format!(
+                "{past} listed past the newest {MAX_SHARED_TOMBSTONES} not read"
+            ));
+        }
+        // The names come last, so a match on the text
+        // before them still holds.
+        let mut detail = format!(
+            "{}; kept as last read: {kept_in_force}; not in force until read: {}",
+            what.join(", "),
+            unread.len()
+        );
+        if !unread.is_empty() {
+            detail += &format!("; oldest not in force: {}", oldest_unread(unread));
+        }
+        self.note_errors(
+            failed + u64::from(unfinished > 0),
+            "cannot read purge tombstones",
+            &detail,
+        );
+    }
+
+    /// Put the refreshed set in force: in `guard`, as the set
+    /// the next refresh compares against, and in the counts
+    /// `/metrics` reports, stored once the guard holds every
+    /// tombstone this listing read (issue #577).
+    fn put_tombstones_in_force(
+        &self,
+        guard: &PurgeGuard,
+        fresh: HashMap<String, (String, Tombstone)>,
+        unread: usize,
+        listed_ms: u64,
+    ) {
         guard.replace_shared(
             fresh
                 .iter()
@@ -2140,15 +2166,18 @@ impl S3Store {
                 .collect(),
         );
         *self.tombstones.lock().unwrap() = fresh;
-        // Stored once the guard holds every tombstone this
-        // listing read (issue #577).
         self.tombstones_unread
-            .store(unread.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            .store(unread as u64, std::sync::atomic::Ordering::Relaxed);
         self.tombstones_listed_ms
             .store(listed_ms, std::sync::atomic::Ordering::Relaxed);
-        // Collection can wait: a spent tombstone left in the
-        // bucket at the deadline is listed, read and deleted
-        // by a later refresh.
+    }
+
+    /// Delete the spent tombstones from the bucket by
+    /// `deadline`. Collection can wait: a spent tombstone left
+    /// in the bucket at the deadline is listed, read and
+    /// deleted by a later refresh.
+    async fn collect_spent_tombstones(&self, deadline: tokio::time::Instant, spent: Vec<String>) {
+        use futures_util::StreamExt as _;
         let _ = tokio::time::timeout_at(
             deadline,
             futures_util::stream::iter(spent).for_each_concurrent(
@@ -2159,8 +2188,139 @@ impl S3Store {
             ),
         )
         .await;
-        failed + unfinished == 0 && past == 0
     }
+}
+
+/// A listed tombstone: the start and writer its name gives,
+/// its object name, and its ETag.
+type ListedTombstone = (u64, u64, String, String);
+
+/// What a refresh's listing named (see
+/// [`S3Store::list_tombstones`]).
+struct TombstoneListing {
+    /// The newest [`MAX_SHARED_TOMBSTONES`], newest first.
+    named: Vec<ListedTombstone>,
+    /// The ones listed past them: the start each name gives,
+    /// and the name (issue #572).
+    past_cap: Vec<(u64, String)>,
+    /// How many of them there are.
+    past: usize,
+    /// When the listing completed, in unix milliseconds.
+    listed_ms: u64,
+}
+
+/// How a refresh's reads ended (see
+/// [`settle_tombstone_reads`]).
+struct SettledReads {
+    /// The reads the store answered with a failure.
+    failed: u64,
+    /// The reads the deadline cut off or kept from starting.
+    unfinished: u64,
+    /// The tombstones whose version read before stays in
+    /// force because their read failed or did not finish.
+    kept: Vec<String>,
+    /// The tombstones never read, with the start their names
+    /// give (issue #577): the ones listed past the cap, and
+    /// the ones read for the first time that failed or did
+    /// not finish.
+    unread: Vec<(u64, String)>,
+    /// Why the first failed read failed.
+    first_failure: Option<String>,
+}
+
+/// The listed tombstones split by whether they need reading:
+/// one listed under the ETag the last refresh read it with
+/// stands as read, in the set returned; the rest are to read.
+fn plan_tombstone_reads(
+    named: Vec<ListedTombstone>,
+    previous: &HashMap<String, (String, Tombstone)>,
+) -> (HashMap<String, (String, Tombstone)>, Vec<ListedTombstone>) {
+    let mut fresh: HashMap<String, (String, Tombstone)> = HashMap::new();
+    let mut to_read = Vec::new();
+    for (start_ms, writer, object, etag) in named {
+        if !etag.is_empty()
+            && let Some((seen, tombstone)) = previous.get(&object)
+            && *seen == etag
+        {
+            fresh.insert(object, (etag, tombstone.clone()));
+            continue;
+        }
+        to_read.push((start_ms, writer, object, etag));
+    }
+    (fresh, to_read)
+}
+
+/// Apply the reads that finished to `fresh`, and settle the
+/// rest: an authentic tombstone joins the set under its new
+/// ETag, an ignored one stays out, and one whose read failed
+/// or did not finish keeps the version read before, under
+/// its own ETag, so the next refresh reads the object again.
+/// One never read before is unread, with the ones listed past
+/// the cap (`past_cap`).
+fn settle_tombstone_reads(
+    to_read: &[ListedTombstone],
+    mut done: HashMap<String, TombstoneRead>,
+    previous: &HashMap<String, (String, Tombstone)>,
+    fresh: &mut HashMap<String, (String, Tombstone)>,
+    past_cap: Vec<(u64, String)>,
+) -> SettledReads {
+    let mut settled = SettledReads {
+        failed: 0,
+        unfinished: 0,
+        kept: Vec::new(),
+        unread: past_cap,
+        first_failure: None,
+    };
+    for (start_ms, _, object, etag) in to_read {
+        match done.remove(object) {
+            Some(TombstoneRead::Read(tombstone)) => {
+                fresh.insert(object.clone(), (etag.clone(), tombstone));
+                continue;
+            }
+            Some(TombstoneRead::Ignored) => continue,
+            Some(TombstoneRead::Failed(why)) => {
+                settled.failed += 1;
+                settled.first_failure.get_or_insert(why);
+            }
+            None => settled.unfinished += 1,
+        }
+        if let Some(known) = previous.get(object) {
+            fresh.insert(object.clone(), known.clone());
+            settled.kept.push(object.clone());
+        } else {
+            settled.unread.push((*start_ms, object.clone()));
+        }
+    }
+    settled
+}
+
+/// Take out of `fresh` the tombstones that are spent at
+/// `now`: those whose grace has passed, and those a newer one
+/// in the set supersedes. Returns their names, for
+/// collection.
+fn take_spent_tombstones(
+    fresh: &mut HashMap<String, (String, Tombstone)>,
+    now: u64,
+) -> Vec<String> {
+    let spent: Vec<String> = fresh
+        .iter()
+        .filter(|(object, (_, tombstone))| {
+            !tombstone.live(now)
+                || fresh
+                    .iter()
+                    .any(|(other, (_, newer))| other != *object && newer.supersedes(tombstone))
+        })
+        .map(|(object, _)| object.clone())
+        .collect();
+    for object in &spent {
+        fresh.remove(object);
+    }
+    spent
+}
+
+/// How a refresh that ran out of time words it.
+fn not_done_within(limit: Duration) -> String {
+    format!("not done within {}s", limit.as_secs_f32())
 }
 
 /// What reading one listed tombstone found (issue #549).
