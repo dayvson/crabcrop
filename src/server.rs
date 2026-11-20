@@ -753,7 +753,7 @@ fn upload_body_due(
 /// [`LoadError::Timeout`] for a body that falls behind
 /// [`upload_body_due`], and [`LoadError::Busy`] when the
 /// request's wait for budget ran out.
-async fn read_upload_body(
+pub(in crate::server) async fn read_upload_body(
     mut body: axum::body::Body,
     cap: usize,
     charge: &crate::loader::SourceCharge,
@@ -870,7 +870,7 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// and the `X-Crabcrop-Source` header is the exact
 /// reference: `201` for a new object, `200` when an
 /// allowed overwrite replaced one.
-async fn upload_handle(
+pub(in crate::server) async fn upload_handle(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
 ) -> Response {
