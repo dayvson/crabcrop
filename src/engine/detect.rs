@@ -1,3 +1,11 @@
+//! Detections (issue #741): the face, object and segmentation
+//! inference one chain runs, each memoized per image state,
+//! the provider a detection class resolves to, the cap on
+//! box-prompted decodes, and which filters keep the memos
+//! valid.
+//!
+//! engine.rs re-exports what the preflight and the tests use.
+
 use image::DynamicImage;
 
 use super::{EngineError, ProcessContext, SegmentObject};

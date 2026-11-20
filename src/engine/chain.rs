@@ -1,3 +1,11 @@
+//! The operation chain (issue #741): `ChainState` and its
+//! steps (crops, resizes, filters and the AI steps), the
+//! crop+resize fusion plan, the outcome a chain hands back,
+//! and the AI upscale and the region check its filter steps
+//! call.
+//!
+//! engine.rs re-exports what the pipeline and the tests use.
+
 use image::DynamicImage;
 
 use super::animated::{FrameShare, copy_of_lent};

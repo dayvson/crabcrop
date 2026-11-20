@@ -1,3 +1,14 @@
+//! Decoding (issue #741): every decode of untrusted source
+//! bytes under the shared limits (the generic bounded decode,
+//! the JPEG, WebP and JPEG XL paths, AVIF in the capped
+//! worker, the watermark and overlay images), format
+//! sniffing, the EXIF orientation, the SVG raster target, and
+//! the two reads that stop short of a render: upload
+//! validation and the `/explain` source probe.
+//!
+//! engine.rs re-exports what the pipeline, the server, the
+//! library API and the tests use.
+
 use std::io::Cursor;
 use std::sync::Once;
 

@@ -1,3 +1,11 @@
+//! Flights (issue #741): how concurrent requests for one key
+//! coalesce. `run_flight` answers a hit, takes a leader's
+//! shared response, or leads or follows the key's flight;
+//! meta requests coalesce through their own flights. The
+//! flight maps and the job runner are `process`.
+//!
+//! server.rs re-exports what the tests use.
+
 use std::sync::Arc;
 
 use axum::http::StatusCode;

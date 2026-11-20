@@ -1,3 +1,14 @@
+//! Animated sources (issue #741): decoding GIF and WebP
+//! frames under the animation budgets, the geometry and
+//! overlay parts the frames of one render share (smart crop
+//! and trim windows, scaled overlays), running the chain over
+//! every frame, and encoding the frames as an animated GIF or
+//! WebP. The video path in engine.rs renders its frames
+//! through the same functions.
+//!
+//! engine.rs re-exports what the pipeline, the server and the
+//! tests use.
+
 use std::io::Cursor;
 
 use image::DynamicImage;

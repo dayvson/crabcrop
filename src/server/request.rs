@@ -1,3 +1,11 @@
+//! The image route (issue #741): `handle` and `serve`, from
+//! the request to its flight; the record each request owes
+//! the log and the metrics; the request ID; the client hints
+//! the route reads and the `Vary` it names; the cache key; and
+//! the private marking of a hint-shaped answer.
+//!
+//! server.rs re-exports what the router and the tests use.
+
 use std::sync::Arc;
 use std::time::Instant;
 

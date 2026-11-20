@@ -1,3 +1,11 @@
+//! Focal points (issue #741): the pending focal form a
+//! `focal:` or `focalpoint:` segment names, mapped through
+//! each later step until a crop consumes it, which filters
+//! keep it, and the `debug:focal` capture of what a crop
+//! used.
+//!
+//! engine.rs re-exports what the tests use.
+
 use image::DynamicImage;
 
 use super::Window;

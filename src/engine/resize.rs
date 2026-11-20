@@ -1,3 +1,12 @@
+//! Sizing (issue #741): the resize, fit-in and pad steps, the
+//! size arithmetic behind them (the `no_upscale` cap, DPR
+//! scaling, proportional sides, the fit-in box), and the
+//! Lanczos3 resampling they share: whole, windowed, lent,
+//! cropped and reduced.
+//!
+//! engine.rs re-exports what the scaled JPEG decode, the
+//! crate and the tests use.
+
 use image::DynamicImage;
 
 use super::limits::check_output_size;

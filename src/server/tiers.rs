@@ -1,3 +1,11 @@
+//! The cache tiers (issue #741): the lookups across the
+//! memory, disk and shared tiers under one disk budget, the
+//! promotions and group write-backs a hit makes, the disk
+//! write a render hands off, the shared write-through, and
+//! `populate_tiers`, which stores a render.
+//!
+//! server.rs re-exports what the tests use.
+
 use std::sync::Arc;
 
 use super::{AppState, background};

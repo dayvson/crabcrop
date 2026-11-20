@@ -1,3 +1,11 @@
+//! Responses (issue #741): the image response and its
+//! validators, the cache observability headers, the error
+//! envelope and the `Accept` it reads, the busy and sealed
+//! refusals, and the mapping of load and engine errors to
+//! statuses and codes.
+//!
+//! server.rs re-exports what the router and the tests use.
+
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 

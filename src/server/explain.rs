@@ -1,3 +1,11 @@
+//! `/explain` (issue #741): the route's handler and its
+//! stages. It admits through the image path's own stages,
+//! probes the source under the probe gate, and answers with
+//! the report as JSON or HTML; the report itself is built in
+//! `crate::explain`.
+//!
+//! server.rs re-exports what the router and the tests use.
+
 use std::sync::Arc;
 
 use axum::extract::State;

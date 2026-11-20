@@ -1,3 +1,11 @@
+//! Uploads (issue #741): the `PUT /upload` handler and its
+//! stages, from authorization through the paced body read and
+//! validation under the process gate to the store. The store
+//! itself is `crate::upload`.
+//!
+//! server.rs re-exports what the router, the library API and
+//! the tests use.
+
 use std::sync::Arc;
 use std::time::Duration;
 

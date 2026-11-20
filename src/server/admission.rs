@@ -1,3 +1,13 @@
+//! Admission (issue #741): the stages that admit a request
+//! before its cache lookup. `authenticate` verifies the
+//! signature or opens the sealed token, `resolve_request`
+//! expands and parses the remainder and checks it, and
+//! `negotiate` settles the output; each returns a `Refusal`.
+//! The image route and `/explain` admit through the same
+//! stages since #762.
+//!
+//! server.rs re-exports what the tests use.
+
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;

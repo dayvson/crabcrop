@@ -1,3 +1,12 @@
+//! Compositing (issue #741): the blend modes, the overlay and
+//! watermark composites, where a placed image lands on its
+//! base, and the flatten onto a fill color that JPEG output
+//! and the encoders use. The scale behind
+//! `overlay(...,width)` is `overlay_scale`.
+//!
+//! engine.rs re-exports what the still encode, the
+//! encoders and the tests use.
+
 use image::DynamicImage;
 
 use super::animated::ScaledOverlays;

@@ -1,3 +1,12 @@
+//! Purges (issue #741): the per-URL and group purge handlers,
+//! the purge expiry check, the tombstones and their refresh,
+//! the purge of each tier (memory, disk, and shared with its
+//! walks), the purge's log line, and the purge of a replaced
+//! source that uploads run.
+//!
+//! server.rs re-exports what the router, main and the tests
+//! use.
+
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 

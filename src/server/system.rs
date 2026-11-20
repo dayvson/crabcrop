@@ -1,3 +1,10 @@
+//! The system endpoints (issue #741): the `/health` check and
+//! the `/metrics` exposition, with its bearer-token check and
+//! the gauge sections it writes.
+//!
+//! server.rs re-exports the handlers the router mounts and
+//! what the tests use.
+
 use std::sync::Arc;
 
 use axum::extract::State;

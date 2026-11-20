@@ -1,3 +1,14 @@
+//! Resource limits (issue #741): the shared decode, output
+//! and animation limits a render is held to, the checks that
+//! hold each step's output and the final image to them, the
+//! animated output budget across frames, the operation-count
+//! backstop, and the client hint's DPR factor, which steps
+//! down when only it pushes an output past the limits (issue
+//! #529).
+//!
+//! engine.rs re-exports what the pipeline, the crate and the
+//! tests use.
+
 use super::animated::webp_animation_params;
 use super::decode::{SourceProbe, exif_orientation, is_heic, probe_source};
 use super::{EngineError, ProcessContext};

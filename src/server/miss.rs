@@ -1,3 +1,12 @@
+//! The miss path (issue #741): what runs when no tier holds
+//! the answer. The gates and the lane a render takes, the
+//! source and watermark loads, the job the engine runs, the
+//! fallback image and its retry, and the work a flight hands
+//! its leader.
+//!
+//! server.rs re-exports what the state, the library API and
+//! the tests use.
+
 use std::sync::Arc;
 use std::time::Instant;
 
