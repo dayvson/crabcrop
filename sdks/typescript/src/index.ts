@@ -51,6 +51,19 @@ function subkey(secret: string, label: string): Uint8Array {
 }
 
 /**
+ * The signed string of a purge or purge-group signature:
+ * the target, or `exp:<expires>/` and the target. It is also
+ * what follows the signature segment in the request path.
+ */
+function purgeSignedString(target: string, expires: number | undefined): string {
+  if (expires === undefined) {
+    return target;
+  }
+  assertExpires(expires);
+  return `exp:${expires}/${target}`;
+}
+
+/**
  * The purge signature for a target path (the request
  * remainder without its signature): HMAC-SHA256 of the
  * path under a subkey derived from the secret (the raw
@@ -59,9 +72,26 @@ function subkey(secret: string, label: string): Uint8Array {
  * signature: no signer signs a label (see
  * {@link RESERVED_SEGMENT}). This is the signature segment
  * for `POST /purge/<signature>/<path>`.
+ *
+ * With `expires` (unix seconds), the signature covers
+ * `exp:<expires>/<path>` instead, and the request path is
+ * `POST /purge/<signature>/exp:<expires>/<path>`: the
+ * expiry sits inside the signed string, so it can neither
+ * be stripped nor extended, and the server refuses the
+ * purge once that second is reached. Without it the
+ * signature authorizes the purge until the secret rotates.
+ * An expiry that is not a non-negative integer throws.
+ *
+ * The server reads a leading `exp:` segment of the path as
+ * the purge's own expiry, so a target that opens with an
+ * image URL's `exp:` is refused from that second on. An
+ * image's `exp:` is not part of its cache key:
+ * drop it from the target and the purge evicts the same
+ * entries.
  */
-export function purgeSignature(secret: string, target: string): string {
-  return toHex(hmacSha256(subkey(secret, "crabcrop/purge-key"), target));
+export function purgeSignature(secret: string, target: string, expires?: number): string {
+  const signed = purgeSignedString(target, expires);
+  return toHex(hmacSha256(subkey(secret, "crabcrop/purge-key"), signed));
 }
 
 /**
@@ -74,9 +104,16 @@ export function purgeSignature(secret: string, target: string): string {
  * exists so nobody has to know the signed string. This is
  * the signature segment for
  * `POST /purge-group/<signature>/<group>`.
+ *
+ * With `expires` (unix seconds), the signature covers
+ * `exp:<expires>/<group>`, the request path is
+ * `POST /purge-group/<signature>/exp:<expires>/<group>`, and
+ * the server refuses the purge once that second is
+ * reached, as for {@link purgeSignature}.
  */
-export function purgeGroupSignature(secret: string, group: string): string {
-  return toHex(hmacSha256(subkey(secret, "crabcrop/purge-group-key"), group));
+export function purgeGroupSignature(secret: string, group: string, expires?: number): string {
+  const signed = purgeSignedString(group, expires);
+  return toHex(hmacSha256(subkey(secret, "crabcrop/purge-group-key"), signed));
 }
 
 /**

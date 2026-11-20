@@ -46,9 +46,14 @@ const ok = verifyUrlSignature("your-secret", url);
 
 // Purge signatures for the server's /purge and /purge-group endpoints
 // are domain-separated under a derived subkey; the helpers sign the
-// right strings so callers never assemble them by hand.
+// right strings so callers never assemble them by hand. Pass an
+// expiry (unix seconds) for a purge URL that stops working then;
+// its path is /purge/<signature>/exp:<expiry>/<path> (or
+// /purge-group/<signature>/exp:<expiry>/<group>).
 const purge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg");
 const group = purgeGroupSignature("your-secret", "thumb");
+const expiringPurge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg", 1893456000);
+const expiringGroup = purgeGroupSignature("your-secret", "thumb", 1893456000);
 
 // Upload signatures for the server's PUT /upload/<signature>/<name>
 // endpoint live in a third domain, under their own derived subkey.

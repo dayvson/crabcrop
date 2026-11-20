@@ -136,11 +136,23 @@ Builders always emit the canonical lowercase hex tag, and the server accepts onl
 Cache purge endpoints take their own signatures, domain-separated under a derived subkey, so a signature minted for an image URL does not verify at a purge endpoint (or the other way around). The helpers sign the right strings, so callers never assemble them by hand.
 
 ```rust
-use crabcrop_url::{purge_group_signature, purge_signature};
+use crabcrop_url::{
+    purge_group_signature, purge_group_signature_with_expiry, purge_signature,
+    purge_signature_with_expiry,
+};
 
 let purge = purge_signature(b"your-secret", "300x200/https://example.com/photo.jpg");
 let group = purge_group_signature(b"your-secret", "thumb");
 ```
+
+A plain purge signature authorizes its purge until the secret rotates. The expiring form signs an `exp:<unix-seconds>` segment along with the target, and the server refuses the purge from that second on; its path is `/purge/<signature>/exp:<unix-seconds>/<path>` (or `/purge-group/<signature>/exp:<unix-seconds>/<group>`), and `purge_signed_string` gives what follows the signature segment.
+
+```rust
+let purge = purge_signature_with_expiry(b"your-secret", "300x200/https://example.com/photo.jpg", 1893456000);
+let group = purge_group_signature_with_expiry(b"your-secret", "thumb", 1893456000);
+```
+
+The server reads a leading `exp:` segment of a purge path as the purge's own expiry. A target copied from an image URL that opens with the image's `exp:` segment is therefore refused from that second on; the image's expiry is not part of its cache key, so drop it from the target and the purge evicts the same entries.
 
 ## Upload signatures
 
@@ -156,6 +168,14 @@ For delegated upload tokens (handing a client a one-shot right to upload), alway
 
 ```rust
 let expiring = upload_signature_with_expiry(b"your-secret", "photo.jpg", 1893456000);
+```
+
+## Clearing keys from memory
+
+The `zeroize` feature, off by default, clears key material when it is dropped: the subkeys the crate derives for its own purge, upload and seal operations, and, through the `zeroize` features of `hmac`, `sha2` and `aes-gcm`, the state those crates keep from a key. It adds the [`zeroize`](https://crates.io/crates/zeroize) crate as a dependency. A subkey that `purge_key`, `purge_group_key`, `upload_key` or `seal_key` returns is the caller's to clear, for example by holding it in `zeroize::Zeroizing`.
+
+```sh
+cargo add crabcrop-url --features zeroize
 ```
 
 ## Unsigned mode

@@ -27,9 +27,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
-docker pull ghcr.io/dayvson/crabcrop:0.13.1
-docker pull ghcr.io/dayvson/crabcrop-ai:0.13.1
-docker run -e CRABCROP_SECRET="$(openssl rand -hex 32)" -p 3000:3000 ghcr.io/dayvson/crabcrop:0.13.1
+docker pull ghcr.io/dayvson/crabcrop:0.14.0
+docker pull ghcr.io/dayvson/crabcrop-ai:0.14.0
+docker run -e CRABCROP_SECRET="$(openssl rand -hex 32)" -p 3000:3000 ghcr.io/dayvson/crabcrop:0.14.0
 ```
 
 A secret of at least 16 bytes is the only required configuration; the server will not start without one, or with a placeholder from these docs. The command above makes a new secret on each run; to sign URLs, generate one once and keep it. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
@@ -102,7 +102,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 - **Reads the text in the picture.** Opt a meta request in and the answer reads the picture: the text lines in reading order, each with its box and a confidence score. The annotation never touches the image bytes.
 - **Provenance, checked and signed.** Meta reports the C2PA Content Credentials a source carries: manifest present, whether it validates, who signed it. With your own certificate, outputs are signed as served, the source recorded as the parent ingredient with how its own credentials validated. The source's manifest store, thumbnails and assertions included, never rides into an output, so the manifest carries none of the source's metadata under either `CRABCROP_METADATA` policy.
 - **Sealed URLs.** For links that stay public but unreadable: the whole recipe, operations and source, encrypted into one opaque token in the signature slot. Only the server opens it. The readable form stays the default.
-- **Presets and purge.** Server-side preset names keep templates short. Purge one result, or a whole preset group, with signatures from their own subkey.
+- **Presets and purge.** Server-side preset names keep templates short. Purge one result, or a whole preset group, with signatures from their own subkey, which can carry an expiry.
 - **URLs that explain themselves.** Put `explain/` in front of any signed URL and the server reports on it instead of serving the image.
 - **Sources on your terms.** The loader fetches only what your policy allows: host allowlists, private address blocking, the source policy re-checked on every redirect hop, and fixed fetch and decode bounds, so a small file cannot expand into gigabytes.
 

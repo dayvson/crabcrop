@@ -230,6 +230,7 @@ fn test_state() -> AppState {
         width_step: 100,
         client_hints: true,
         explain_enabled: true,
+        purge_require_expiry: false,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -1283,6 +1284,439 @@ async fn purge_evicts_expiry_variants() {
         2,
         "the exp variant was evicted too"
     );
+}
+
+/// POST a purge (`/purge/`) or group purge (`/purge-group/`)
+/// with `sig` over the remainder `rest`, as presented.
+async fn post_purge(base: &str, endpoint: &str, sig: &str, rest: &str) -> reqwest::Response {
+    client()
+        .post(format!("{base}/{endpoint}/{sig}/{rest}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[test]
+fn a_purge_expiry_holds_strictly_before_its_second() {
+    // The comparison image and upload URLs use: valid
+    // strictly before the `exp:` second, refused at it and
+    // after it.
+    let exp = 1_893_456_000;
+    for require in [false, true] {
+        assert_eq!(purge_expiry_refusal(Some(exp), exp - 1, require), None);
+        for now in [exp, exp + 1, u64::MAX] {
+            let (status, code, message) = purge_expiry_refusal(Some(exp), now, require).unwrap();
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(code, "signature_expired");
+            assert_eq!(message, "signature expired");
+        }
+        assert_eq!(
+            purge_expiry_refusal(Some(0), 0, require).unwrap().1,
+            "signature_expired"
+        );
+    }
+    // A purge with no expiry runs whatever the time, unless
+    // the server takes only expiring purge URLs.
+    assert_eq!(purge_expiry_refusal(None, u64::MAX, false), None);
+    let (status, code, message) = purge_expiry_refusal(None, 0, true).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(code, "expiry_required");
+    assert!(message.starts_with("expiry required"), "{message}");
+}
+
+#[tokio::test]
+async fn the_require_expiry_setting_refuses_unexpiring_purges_and_admits_expiring_ones() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        presets: preset_test_map(),
+        purge_require_expiry: true,
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
+        ..test_state()
+    })
+    .await;
+    let target = format!("100x50/{src}");
+    let grouped = format!("preset:small/{src}");
+    for remainder in [&target, &grouped] {
+        assert_eq!(get_signed(&base, remainder).await.status(), 200);
+    }
+    // A purge or group purge URL with no expiry is refused
+    // once its signature verifies, in either error mode,
+    // and purges nothing.
+    let required =
+        "expiry required: this server accepts only purge URLs that carry an exp: segment";
+    for url in [
+        format!(
+            "{base}/purge/{}/{target}",
+            crate::url::purge_signature(SECRET, &target)
+        ),
+        format!(
+            "{base}/purge-group/{}/small",
+            crate::url::purge_group_signature(SECRET, "small")
+        ),
+    ] {
+        let plain = client().post(&url).send().await.unwrap();
+        let json = client()
+            .post(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "expiry_required",
+            required,
+        )
+        .await;
+    }
+    // A bad signature is still a bad signature: the setting
+    // shows only to a caller holding the secret.
+    let resp = post_purge(&base, "purge", "deadbeef", &target).await;
+    assert_eq!(resp.text().await.unwrap(), "bad signature");
+    for remainder in [&target, &grouped] {
+        let resp = get_signed(&base, remainder).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit",
+            "{remainder}"
+        );
+    }
+    // The expiring forms purge.
+    let exp = now_unix() + 3600;
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &target, exp);
+    let resp = post_purge(&base, "purge", &sig, &format!("exp:{exp}/{target}")).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", exp);
+    let resp = post_purge(&base, "purge-group", &sig, &format!("exp:{exp}/small")).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(get_signed(&base, &target).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // A plain purge minted over an image remainder that
+    // opens with the image's own exp: reads, like every
+    // purge path, as an expiring purge, so it is taken
+    // before that second.
+    let expiring_image = format!("exp:{exp}/{target}");
+    let sig = crate::url::purge_signature(SECRET, &expiring_image);
+    let resp = post_purge(&base, "purge", &sig, &expiring_image).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    // Refused purges count: two refused in each of two
+    // modes, one bad signature, and three that ran.
+    let metrics = metrics_text(&base).await;
+    assert!(metrics.contains("crabcrop_purges_total 8"), "{metrics}");
+}
+
+#[tokio::test]
+async fn expiring_purges_run_before_their_second_and_are_refused_from_it() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let target = format!("100x50/{src}");
+    let render = || get_signed(&base, &target);
+    assert_eq!(render().await.status(), 200);
+    // Before its second, an expiring purge runs: the
+    // signature covers `exp:<n>/` and the target.
+    let future = now_unix() + 3600;
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &target, future);
+    let resp = post_purge(&base, "purge", &sig, &format!("exp:{future}/{target}")).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(render().await.status(), 200);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the purge evicted the entry"
+    );
+    // At its second and after it, the purge is refused as
+    // expired, in either error mode, and evicts nothing.
+    let now = now_unix();
+    for exp in [now, now - 1, 1] {
+        let sig = crate::url::purge_signature_with_expiry(SECRET, &target, exp);
+        let url = format!("{base}/purge/{sig}/exp:{exp}/{target}");
+        let plain = client().post(&url).send().await.unwrap();
+        let json = client()
+            .post(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired",
+        )
+        .await;
+    }
+    let resp = render().await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Refused purges count, as a bad signature's does: one
+    // that ran and six refused.
+    let metrics = metrics_text(&base).await;
+    assert!(metrics.contains("crabcrop_purges_total 7"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_changed_purge_expiry_is_a_bad_signature() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let target = format!("100x50/{src}");
+    assert_eq!(get_signed(&base, &target).await.status(), 200);
+    let grouped = format!("preset:small/{src}");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    let exp = now_unix() + 3600;
+    // The expiry is inside the signed string: extending it,
+    // moving it, or stripping it to replay the signature as
+    // a plain one fails as a bad signature, on both
+    // endpoints, and evicts nothing.
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &target, exp);
+    for rest in [
+        format!("exp:{}/{target}", exp + 3600),
+        format!("exp:{}/{target}", exp - 1),
+        target.clone(),
+    ] {
+        let resp = post_purge(&base, "purge", &sig, &rest).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+    let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", exp);
+    for rest in [format!("exp:{}/small", exp + 3600), "small".to_string()] {
+        let resp = post_purge(&base, "purge-group", &sig, &rest).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+    // And a plain signature gains no expiring form by
+    // presentation.
+    let plain = crate::url::purge_signature(SECRET, &target);
+    let resp = post_purge(&base, "purge", &plain, &format!("exp:{exp}/{target}")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    for remainder in [&target, &grouped] {
+        let resp = get_signed(&base, remainder).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit",
+            "{remainder}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn expiring_group_purges_run_before_their_second_and_are_refused_from_it() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let grouped = format!("preset:small/{src}");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    let future = now_unix() + 3600;
+    let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", future);
+    let resp = post_purge(&base, "purge-group", &sig, &format!("exp:{future}/small")).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "the group purge evicted it");
+    let now = now_unix();
+    for exp in [now, now - 1] {
+        let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", exp);
+        let resp = post_purge(&base, "purge-group", &sig, &format!("exp:{exp}/small")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "signature expired");
+    }
+    let resp = get_signed(&base, &grouped).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+}
+
+#[tokio::test]
+async fn a_purge_target_that_opens_with_an_image_expiry_reads_it_as_the_purges_own() {
+    // An image remainder may carry exp: among its
+    // operations, so a plain purge signed over such a
+    // remainder opens with `exp:<n>/`: the same bytes as the
+    // expiring form of the rest. The server reads that
+    // segment as the purge's own expiry, the one rule for
+    // every purge URL.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let target = format!("100x50/{src}");
+    let future = now_unix() + 3600;
+    let expiring_image = format!("exp:{future}/{target}");
+    assert_eq!(get_signed(&base, &expiring_image).await.status(), 200);
+    // Before that second, the purge evicts what it always
+    // did: an image's exp: is not part of its cache key, so
+    // the rest of the path names the same entry.
+    let sig = crate::url::purge_signature(SECRET, &expiring_image);
+    let resp = post_purge(&base, "purge", &sig, &expiring_image).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    let resp = get_signed(&base, &expiring_image).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Once that second has passed, the same kind of URL is
+    // refused as expired, though it names the same entry...
+    let past = format!("exp:{}/{target}", now_unix() - 60);
+    let sig = crate::url::purge_signature(SECRET, &past);
+    let resp = post_purge(&base, "purge", &sig, &past).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.text().await.unwrap(), "signature expired");
+    let resp = get_signed(&base, &expiring_image).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    // ... and the target without the image's exp: evicts
+    // it, as the expired spelling did before.
+    let sig = crate::url::purge_signature(SECRET, &target);
+    let resp = post_purge(&base, "purge", &sig, &target).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    let resp = get_signed(&base, &expiring_image).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    // An exp: after the first segment is the image's, part
+    // of the target, whatever its second.
+    let inner = format!("100x50/exp:1/{src}");
+    let sig = crate::url::purge_signature(SECRET, &inner);
+    let resp = post_purge(&base, "purge", &sig, &inner).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    // A sealed target's payload is the image's too: its
+    // exp: is inside the token, and the purge's own expiry,
+    // when it has one, leads the path before the token.
+    let sealed = sealed_path(&format!("exp:1/{target}"), Some("photo.png"));
+    assert_eq!(get_signed(&base, &target).await.status(), 200);
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &sealed, future);
+    let resp = post_purge(&base, "purge", &sig, &format!("exp:{future}/{sealed}")).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn a_sealed_target_under_the_key_id_exp_purges_by_its_plain_url() {
+    // `exp` is a valid key ID, so a token sealed under it
+    // opens with `exp:s1.`. That segment is the token, never
+    // the purge's own expiry: the plain purge of the sealed
+    // spelling, with or without a friendly name, evicts the
+    // entry it shares with the plain spelling, as it always
+    // did, and so does its expiring form.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        keyring: crate::url::Keyring {
+            current_id: "exp".to_string(),
+            current: SECRET.to_vec(),
+            previous: None,
+        },
+        ..test_state()
+    })
+    .await;
+    let target = format!("100x50/{src}");
+    let token = crabcrop_url::seal_with_key_id(SECRET, "exp", &target).unwrap();
+    assert!(token.starts_with("exp:s1."), "{token}");
+    let sealed = client()
+        .get(format!("{base}/{token}/photo.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sealed.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let future = now_unix() + 3600;
+    for (n, rest) in [
+        format!("{token}/photo.png"),
+        token.clone(),
+        format!("exp:{future}/{token}/photo.png"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sig = crate::url::purge_signature(SECRET, &rest);
+        let resp = post_purge(&base, "purge", &sig, &rest).await;
+        assert_eq!(resp.status(), 200, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "purged 1\n", "{rest}");
+        let resp = get_signed(&base, &target).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; fwd=uri-miss",
+            "{rest}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), n + 2, "{rest}");
+    }
+}
+
+#[tokio::test]
+async fn a_group_purge_reads_a_leading_exp_as_its_expiry() {
+    // A group is a preset name ([A-Za-z0-9_-]), and a group
+    // with a slash was refused, so `exp:<n>/<group>` named
+    // no group before: it is the expiring form now.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let grouped = format!("preset:small/{src}");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    let future = now_unix() + 3600;
+    let rest = format!("exp:{future}/small");
+    let sig = crate::url::purge_group_signature(SECRET, &rest);
+    let resp = post_purge(&base, "purge-group", &sig, &rest).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // A leading exp: segment that does not parse, or that
+    // nothing follows, is the upload grammar's error, before
+    // the signature is checked, as the group name's shape
+    // always was.
+    for rest in [
+        "exp:soon/small".to_string(),
+        "exp:+5/small".to_string(),
+        format!("exp:{future}"),
+    ] {
+        let sig = crate::url::purge_group_signature(SECRET, &rest);
+        for sig in [sig.as_str(), "deadbeef"] {
+            let url = format!("{base}/purge-group/{sig}/{rest}");
+            let resp = client()
+                .post(&url)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{rest}");
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], "invalid_expiry", "{rest}");
+        }
+    }
+    // What follows the expiry is held to the group's shape.
+    for rest in [format!("exp:{future}/"), format!("exp:{future}/a/b")] {
+        let sig = crate::url::purge_group_signature(SECRET, &rest);
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/{rest}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{rest}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_purge_group", "{rest}");
+    }
+    let resp = get_signed(&base, &grouped).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+}
+
+#[tokio::test]
+async fn a_purge_with_a_malformed_leading_expiry_is_a_bad_request() {
+    let base = spawn_app(false).await;
+    let target = "100x50/http://example.com/x.jpg";
+    for rest in [
+        format!("exp:soon/{target}"),
+        format!("exp:+5/{target}"),
+        "exp:1893456000".to_string(),
+    ] {
+        // Signed properly: verification passes, and the
+        // split refuses what it cannot read as an expiry.
+        let sig = crate::url::purge_signature(SECRET, &rest);
+        let resp = client()
+            .post(format!("{base}/purge/{sig}/{rest}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{rest}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_expiry", "{rest}");
+        // Unsigned, it is the bad signature it always was.
+        let resp = post_purge(&base, "purge", "deadbeef", &rest).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{rest}");
+    }
 }
 
 #[tokio::test]
@@ -7821,6 +8255,83 @@ async fn cli_purge_group_evicts_every_grouped_entry() {
     .await
     .unwrap();
     assert_eq!(out, "purged 0");
+}
+
+#[tokio::test]
+async fn cli_purges_with_expires_run_before_the_second_and_are_refused_after_it() {
+    let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        presets: preset_test_map(),
+        purge_require_expiry: true,
+        ..test_state()
+    })
+    .await;
+    let remainder = format!("40x24/{src}");
+    let grouped = format!("preset:small/{src}");
+    for rest in [&remainder, &grouped] {
+        assert_eq!(get_signed(&base, rest).await.status(), 200);
+    }
+    let future = (now_unix() + 3600).to_string();
+    let past = (now_unix() - 60).to_string();
+    let purge = |verb: &'static str, target: String, expires: Option<String>| {
+        let base = base.clone();
+        async move {
+            let mut argv = vec![verb, "--secret", "test-secret", "--base", &base];
+            if let Some(ts) = &expires {
+                argv.extend(["--expires", ts]);
+            }
+            argv.push(&target);
+            crate::cli::exec(&cli(&argv))
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    // On a server that takes only expiring purge URLs, a
+    // plain CLI purge is refused, and --expires purges.
+    let err = purge("purge", remainder.clone(), None).await.unwrap_err();
+    assert!(
+        err.contains("HTTP 403") && err.contains("expiry required"),
+        "{err}"
+    );
+    let err = purge("purge-group", "small".into(), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("expiry required"), "{err}");
+    let out = purge("purge", remainder.clone(), Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    let out = purge("purge-group", "small".into(), Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    assert_eq!(get_signed(&base, &remainder).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // An expiry that has passed is refused, and evicts
+    // nothing.
+    for verb in ["purge", "purge-group"] {
+        let target = if verb == "purge" {
+            remainder.clone()
+        } else {
+            "small".into()
+        };
+        let err = purge(verb, target, Some(past.clone())).await.unwrap_err();
+        assert!(
+            err.contains("HTTP 403") && err.contains("signature expired"),
+            "{err}"
+        );
+    }
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    // An image URL whose own exp: has passed still purges
+    // with --expires: the CLI drops the image's exp:, which
+    // the cache key does not carry, and the server never
+    // reads it as the purge's expiry.
+    let expired_image = format!(
+        "{base}/{}/exp:{past}/{remainder}",
+        sign(&format!("exp:{past}/{remainder}"))
+    );
+    let out = purge("purge", expired_image, Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
 }
 
 #[tokio::test]

@@ -196,6 +196,12 @@ pub struct AppState {
     /// `HEAD` to the route answers `404 not_found` before
     /// anything else.
     pub explain_enabled: bool,
+    /// Whether the purge endpoints take only the expiring
+    /// form (`CRABCROP_PURGE_REQUIRE_EXPIRY`, off by
+    /// default). On, a purge or purge-group URL with no
+    /// `exp:` segment answers `403 expiry_required` once its
+    /// signature has verified, and purges nothing.
+    pub purge_require_expiry: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -481,6 +487,7 @@ impl std::fmt::Debug for AppState {
             width_step,
             client_hints,
             explain_enabled,
+            purge_require_expiry,
             preserve_metadata,
             brand_color,
             presets,
@@ -1849,6 +1856,40 @@ async fn purge_log(log: &RequestLog, event: &str, target: &str, removed: Option<
     log.event(&line).await;
 }
 
+/// The current unix second, as the purge expiry check
+/// reads it.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Why a purge whose signature has verified may not run, by
+/// its expiry, at the unix second `now`. A purge URL is
+/// valid strictly before its `exp:` second, the comparison
+/// image and upload URLs use: from that second on it is
+/// refused as expired. One with no expiry runs, unless
+/// `require_expiry` (`CRABCROP_PURGE_REQUIRE_EXPIRY`) says
+/// the server takes only expiring purge URLs.
+fn purge_expiry_refusal(expiry: Option<u64>, now: u64, require_expiry: bool) -> Option<ErrorParts> {
+    match expiry {
+        Some(exp) if now >= exp => Some((
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired".to_string(),
+        )),
+        Some(_) => None,
+        None if require_expiry => Some((
+            StatusCode::FORBIDDEN,
+            "expiry_required",
+            "expiry required: this server accepts only purge URLs that carry an exp: segment"
+                .to_string(),
+        )),
+        None => None,
+    }
+}
+
 /// `POST /purge/<signature>/<path>`: invalidate every stored
 /// variant of one result. The removal spans this process's
 /// tiers (its memory, its disk store, and the shared store);
@@ -1859,7 +1900,13 @@ async fn purge_log(log: &RequestLog, event: &str, target: &str, removed: Option<
 /// [`crate::url::purge_key`]), so only the secret holder can
 /// purge and an image signature does not verify here (no
 /// signer signs the subkey's label); a bad signature is a
-/// 403 and purges nothing. Idempotent:
+/// 403 and purges nothing. The expiring form,
+/// `POST /purge/<signature>/exp:<unix-seconds>/<path>`, signs
+/// the `exp:` segment along with the path, and is a 403
+/// from its expiry second on (see
+/// [`crate::url::split_purge_remainder`]); with
+/// `CRABCROP_PURGE_REQUIRE_EXPIRY`, a URL without an expiry
+/// is a 403 as well. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<Arc<AppState>>,
@@ -1882,7 +1929,7 @@ async fn purge_handle(
         );
     };
     let full = format!("/{tail}");
-    let (signature, key_id, target) = match parse_signature(&full) {
+    let (signature, key_id, presented) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -1893,12 +1940,16 @@ async fn purge_handle(
             );
         }
     };
+    // Verification runs over the remainder exactly as
+    // presented: for the expiring form the `exp:` segment is
+    // part of the signed string, so a tampered or stripped
+    // expiry already fails here as a bad signature.
     if !state
         .keyring
-        .verify_purge(key_id.as_deref(), &signature, target)
+        .verify_purge(key_id.as_deref(), &signature, presented)
     {
         state.metrics.record_purge();
-        purge_log(&state.request_log, "purge", target, None).await;
+        purge_log(&state.request_log, "purge", presented, None).await;
         return error_response(
             StatusCode::FORBIDDEN,
             "bad_signature",
@@ -1906,12 +1957,36 @@ async fn purge_handle(
             accept.as_deref(),
         );
     }
+    // A leading `exp:` segment is the purge's own expiry,
+    // split off the verified remainder as the upload
+    // endpoint splits its own, and enforced before anything
+    // is touched. What follows it is the target.
+    let (expiry, target) = match crate::url::split_purge_remainder(presented) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
+    };
+    if let Some((status, code, message)) =
+        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
+    {
+        state.metrics.record_purge();
+        purge_log(&state.request_log, "purge", target, None).await;
+        return error_response(status, code, message, accept.as_deref());
+    }
     // A sealed target (issue #255) unseals here, the first
     // step of the chain, now that the purge signature has
-    // verified over the target as presented: the steps
-    // below continue with the decrypted remainder, so a
-    // purge by the sealed spelling evicts the entry its
-    // plain spelling serves, and the reverse. The decrypted
+    // verified over the target as presented and the purge's
+    // own expiry is off its front: the steps below continue
+    // with the decrypted remainder, so a purge by the sealed
+    // spelling evicts the entry its plain spelling serves,
+    // and the reverse. An `exp:` inside the payload is the
+    // image's, which the key form drops. The decrypted
     // remainder replaces the target wholesale (anything
     // after the token segment was the cosmetic friendly
     // name). A token that does not open under this keyring
@@ -2049,7 +2124,11 @@ async fn purge_handle(
 /// here, and neither does an image signature (no signer
 /// signs the subkey's label). A bad signature is a 403 and
 /// removes nothing; an unknown group answers 200 with a
-/// count of 0.
+/// count of 0. The expiring form,
+/// `POST /purge-group/<signature>/exp:<unix-seconds>/<group>`,
+/// signs the `exp:` segment along with the group name, and
+/// is a 403 from its expiry second on; the setting that
+/// refuses a URL without one applies here too.
 async fn purge_group_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -2070,7 +2149,22 @@ async fn purge_group_handle(
         );
     };
     let full = format!("/{tail}");
-    let (signature, key_id, group) = match parse_signature(&full) {
+    let (signature, key_id, presented) = match parse_signature(&full) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
+    };
+    // The group's shape is checked before its signature, as
+    // it always was, so the purge's own expiry comes off the
+    // front first (see `crate::url::split_purge_remainder`):
+    // what follows it is the group name.
+    let (expiry, group) = match crate::url::split_purge_remainder(presented) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -2090,9 +2184,11 @@ async fn purge_group_handle(
         );
     }
     let target = format!("purge-group/{group}");
+    // The signature covers the remainder as presented, the
+    // `exp:` segment included.
     if !state
         .keyring
-        .verify_purge_group(key_id.as_deref(), &signature, group)
+        .verify_purge_group(key_id.as_deref(), &signature, presented)
     {
         state.metrics.record_purge();
         purge_log(&state.request_log, "purge-group", &target, None).await;
@@ -2102,6 +2198,13 @@ async fn purge_group_handle(
             "bad signature".to_string(),
             accept.as_deref(),
         );
+    }
+    if let Some((status, code, message)) =
+        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
+    {
+        state.metrics.record_purge();
+        purge_log(&state.request_log, "purge-group", &target, None).await;
+        return error_response(status, code, message, accept.as_deref());
     }
     // The fan-out runs in a spawned task once the
     // signature has verified, as in the per-URL purge

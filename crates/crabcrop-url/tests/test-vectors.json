@@ -407,5 +407,65 @@
     "operations": "crabcrop/300x200",
     "source": "https://example.com/photo.jpg",
     "remainder": "crabcrop/300x200/https://example.com/photo.jpg"
+  },
+  {
+    "description": "purge: a per-URL purge signature, the purge subkey's HMAC over the path alone",
+    "endpoint": "purge",
+    "secret": "test-secret",
+    "target": "300x200/https://example.com/a.jpg",
+    "signed": "300x200/https://example.com/a.jpg",
+    "purge_signature": "9b58a43a984e47cbde3ec08333290acad06c48a5e9b85b99124ae725218e90e8"
+  },
+  {
+    "description": "purge: an expiring per-URL purge signature, over exp:<unix-seconds>/ and the path",
+    "endpoint": "purge",
+    "secret": "test-secret",
+    "target": "300x200/https://example.com/a.jpg",
+    "expires": 1893456000,
+    "signed": "exp:1893456000/300x200/https://example.com/a.jpg",
+    "purge_signature": "fb745f8bc540df658be4c4c954b49054e871bd7c6836be43edb74a34a01aacb0"
+  },
+  {
+    "description": "purge: an expiring purge of a preset URL, under another secret",
+    "endpoint": "purge",
+    "secret": "correct horse battery staple",
+    "target": "preset:thumb/https://example.com/photo.jpg",
+    "expires": 4102444800,
+    "signed": "exp:4102444800/preset:thumb/https://example.com/photo.jpg",
+    "purge_signature": "a43f022561c8ab2bf52523cdea9b75c3671cafead1226c8e3ff9a22c237aaef6"
+  },
+  {
+    "description": "purge: a plain purge of a path that opens with an image URL's exp: segment signs the same bytes as the expiring form of the rest, and the server reads that segment as the purge's own expiry",
+    "endpoint": "purge",
+    "secret": "test-secret",
+    "target": "exp:1893456000/300x200/https://example.com/a.jpg",
+    "signed": "exp:1893456000/300x200/https://example.com/a.jpg",
+    "purge_signature": "fb745f8bc540df658be4c4c954b49054e871bd7c6836be43edb74a34a01aacb0"
+  },
+  {
+    "description": "purge-group: a group purge signature, the purge-group subkey's HMAC over the group name alone",
+    "endpoint": "purge-group",
+    "secret": "test-secret",
+    "target": "thumb",
+    "signed": "thumb",
+    "purge_signature": "256634813bd6237179d251ba4526685f05db8a42ae056e4a04566f00042f0439"
+  },
+  {
+    "description": "purge-group: an expiring group purge signature, over exp:<unix-seconds>/ and the group name",
+    "endpoint": "purge-group",
+    "secret": "test-secret",
+    "target": "thumb",
+    "expires": 1893456000,
+    "signed": "exp:1893456000/thumb",
+    "purge_signature": "fd5eb666f654c3046374cd6f569a23f9a0254be1f1761ee16255c217a2b40a3f"
+  },
+  {
+    "description": "purge-group: an expiring group purge at the zero second, under another secret",
+    "endpoint": "purge-group",
+    "secret": "correct horse battery staple",
+    "target": "og-card",
+    "expires": 0,
+    "signed": "exp:0/og-card",
+    "purge_signature": "49a7328c30e7512b58d1a90dd3cc27490db29d0634e4372433befb1dcc4fa796"
   }
 ]

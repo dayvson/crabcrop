@@ -246,8 +246,19 @@ impl<'a> RgbaPart<'a> {
     /// whole image: a part made without the whole image, as a
     /// scaled overlay's is.
     pub fn copied(pixels: image::RgbaImage, origin: (u32, u32), size: (u32, u32)) -> Self {
+        Self::shared(std::sync::Arc::new(pixels), origin, size)
+    }
+
+    /// [`RgbaPart::copied`], for pixels other parts hold too: an
+    /// animated render draws one scaled overlay part on every
+    /// frame.
+    pub fn shared(
+        pixels: std::sync::Arc<image::RgbaImage>,
+        origin: (u32, u32),
+        size: (u32, u32),
+    ) -> Self {
         RgbaPart {
-            pixels: Pixels::Copied(std::sync::Arc::new(pixels)),
+            pixels: Pixels::Copied(pixels),
             origin,
             size,
         }
