@@ -2494,7 +2494,7 @@ const PURGE_END_CAP: std::time::Duration = std::time::Duration::from_secs(600);
 /// the request opts into, then the document itself. The
 /// sections' blocking tasks decode the render, so they share
 /// it (issue #736): it is not copied for them.
-async fn meta_document(
+pub(in crate::server) async fn meta_document(
     state: &AppState,
     processed: crate::engine::ProcessedImage,
     sealed: bool,
@@ -2508,7 +2508,7 @@ async fn meta_document(
 /// [`meta_document`] on the frame its sections share: the
 /// render is decoded once for all of them (issue #676), by
 /// the first that needs pixels.
-async fn meta_document_from(
+pub(in crate::server) async fn meta_document_from(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
     frame: impl FrameSource,
