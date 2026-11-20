@@ -713,7 +713,7 @@ fn has_directive(cache_control: &str, directive: &str) -> bool {
 /// copy written before the purge began a miss on every
 /// replica until the walk has removed it (issues #400,
 /// #461).
-const SHARED_PURGE_INLINE_SCAN: usize = 128;
+pub(in crate::server) const SHARED_PURGE_INLINE_SCAN: usize = 128;
 
 /// How often a replica re-reads the purge tombstones in the
 /// shared bucket (issue #461): the longest another replica's
@@ -729,7 +729,7 @@ const TOMBSTONE_REFRESH: std::time::Duration = std::time::Duration::from_secs(5)
 /// tombstone's object name, `None` when there is no shared
 /// tier or the write failed (counted and logged by the
 /// store; the purge then holds on this process only).
-async fn begin_purge(
+pub(in crate::server) async fn begin_purge(
     state: &AppState,
     target: crate::cache::PurgeTarget,
 ) -> (crate::cache::ActivePurge, Option<String>) {
@@ -761,7 +761,7 @@ async fn begin_purge(
 /// ends, then its tombstone is marked ended if the walk
 /// reached every object (see [`end_purge`]). Returns what
 /// the inline part removed.
-async fn purge_shared_tier(
+pub(in crate::server) async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
     background: &Background,
     log: &RequestLog,
@@ -926,10 +926,10 @@ async fn end_purge_apart(
 /// A purge that has begun, as its shared-tier half takes it:
 /// the running purge, its bucket tombstone, and the disk
 /// deletions its tombstone waits for (issue #572).
-struct BegunPurge {
-    active: crate::cache::ActivePurge,
-    tombstone: Option<String>,
-    disk: Option<crate::storage::DeletionWait>,
+pub(in crate::server) struct BegunPurge {
+    pub(in crate::server) active: crate::cache::ActivePurge,
+    pub(in crate::server) tombstone: Option<String>,
+    pub(in crate::server) disk: Option<crate::storage::DeletionWait>,
 }
 
 /// The disk tier's half of a purge (issue #572): remove the
@@ -941,7 +941,7 @@ struct BegunPurge {
 /// of the URL that ends meanwhile, with no deletions of its
 /// own, must not mark its tombstone ended while these files
 /// are there. Returns the count and the deletions queued.
-fn purge_disk_tier(
+pub(in crate::server) fn purge_disk_tier(
     state: &AppState,
     target: &crate::cache::PurgeTarget,
 ) -> (usize, Option<crate::storage::DeletionWait>) {
@@ -964,7 +964,7 @@ fn purge_disk_tier(
 /// deletions go on in the background. That counts as a stall
 /// only on a stuck disk, not on one busy with the deletions
 /// queued before these.
-async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
+pub(in crate::server) async fn wait_for_disk_purge(disk: Option<crate::storage::DeletionWait>) {
     let Some(disk) = disk else {
         return;
     };
@@ -1044,7 +1044,11 @@ fn unix_now() -> u64 {
 /// refused as expired. One with no expiry runs, unless
 /// `require_expiry` (`CRABCROP_PURGE_REQUIRE_EXPIRY`) says
 /// the server takes only expiring purge URLs.
-fn purge_expiry_refusal(expiry: Option<u64>, now: u64, require_expiry: bool) -> Option<ErrorParts> {
+pub(in crate::server) fn purge_expiry_refusal(
+    expiry: Option<u64>,
+    now: u64,
+    require_expiry: bool,
+) -> Option<ErrorParts> {
     match expiry {
         Some(exp) if now >= exp => Some((
             StatusCode::FORBIDDEN,
@@ -1080,7 +1084,7 @@ fn purge_expiry_refusal(expiry: Option<u64>, now: u64, require_expiry: bool) -> 
 /// `CRABCROP_PURGE_REQUIRE_EXPIRY`, a URL without an expiry
 /// is a 403 as well. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
-async fn purge_handle(
+pub(in crate::server) async fn purge_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
@@ -1301,7 +1305,7 @@ async fn purge_handle(
 /// signs the `exp:` segment along with the group name, and
 /// is a 403 from its expiry second on; the setting that
 /// refuses a URL without one applies here too.
-async fn purge_group_handle(
+pub(in crate::server) async fn purge_group_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
@@ -1564,7 +1568,10 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// removed. The upload
 /// overwrite path (audit R2-07) shares this with any
 /// future source-replacement flow.
-async fn purge_source_everywhere(state: &Arc<AppState>, source: &str) -> usize {
+pub(in crate::server) async fn purge_source_everywhere(
+    state: &Arc<AppState>,
+    source: &str,
+) -> usize {
     // The fan-out runs in a spawned task, as in the purge
     // handlers (issue #347): a purge that has started
     // completes and is logged even if the caller is
