@@ -666,11 +666,11 @@ fn has_directive(cache_control: &str, directive: &str) -> bool {
 
 /// The DPR hint headers [`dpr_hint`] reads, the
 /// structured one first.
-const DPR_HINT_HEADERS: [&str; 2] = ["Sec-CH-DPR", "DPR"];
+pub(in crate::server) const DPR_HINT_HEADERS: [&str; 2] = ["Sec-CH-DPR", "DPR"];
 
 /// The width hint headers [`width_hint`] reads, in the
 /// order it prefers them.
-const WIDTH_HINT_HEADERS: [&str; 4] = [
+pub(in crate::server) const WIDTH_HINT_HEADERS: [&str; 4] = [
     "Sec-CH-Width",
     "Width",
     "Sec-CH-Viewport-Width",
@@ -678,24 +678,24 @@ const WIDTH_HINT_HEADERS: [&str; 4] = [
 ];
 
 /// The header [`save_data_hint`] reads.
-const SAVE_DATA_HEADER: &str = "Save-Data";
+pub(in crate::server) const SAVE_DATA_HEADER: &str = "Save-Data";
 
 /// The `Vary` of every image-route answer while the server
 /// reads client hints: `Accept` and every header the hint
 /// readers above read, since each can change the bytes.
-const VARY_WITH_HINTS: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
+pub(in crate::server) const VARY_WITH_HINTS: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
 
 /// The `Vary` of every image-route answer with client hints
 /// off (`CRABCROP_CLIENT_HINTS=0`): no hint header is read,
 /// so only `Accept` can change an answer.
-const VARY_WITHOUT_HINTS: &str = "Accept";
+pub(in crate::server) const VARY_WITHOUT_HINTS: &str = "Accept";
 
 /// The `Vary` an image-route answer carries, success or
 /// error: an error's body follows `Accept` (plain text or
 /// the JSON envelope) and can follow a hint (a hinted size
 /// that runs past a limit or the deadline), just as an
 /// image does.
-fn image_vary(client_hints: bool) -> axum::http::HeaderValue {
+pub(in crate::server) fn image_vary(client_hints: bool) -> axum::http::HeaderValue {
     axum::http::HeaderValue::from_static(if client_hints {
         VARY_WITH_HINTS
     } else {
@@ -709,7 +709,7 @@ fn image_vary(client_hints: bool) -> axum::http::HeaderValue {
 /// that would push the output past its limits steps down
 /// in the engine rather than failing the request (issue
 /// #529).
-fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
+pub(in crate::server) fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
     let [first, legacy] = DPR_HINT_HEADERS;
     let raw = headers
         .get(first)
@@ -727,7 +727,7 @@ fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
 /// viewport widths). Advisory like every hint: an absent,
 /// unparsable, or out-of-range value is no hint, never an
 /// error.
-fn width_hint(headers: &HeaderMap) -> Option<u32> {
+pub(in crate::server) fn width_hint(headers: &HeaderMap) -> Option<u32> {
     for name in WIDTH_HINT_HEADERS {
         let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
@@ -749,7 +749,7 @@ fn width_hint(headers: &HeaderMap) -> Option<u32> {
 /// display width; the DPR hint still multiplies on top,
 /// and the hinted op never enlarges past the source either
 /// way.
-const MAX_HINT_WIDTH: u32 = 3840;
+pub(in crate::server) const MAX_HINT_WIDTH: u32 = 3840;
 const _: () = assert!(MAX_HINT_WIDTH <= crate::url::MAX_DIMENSION);
 
 /// Round a hinted width UP to the next multiple of the
@@ -762,13 +762,13 @@ const _: () = assert!(MAX_HINT_WIDTH <= crate::url::MAX_DIMENSION);
 /// bypasses parsing, so a near-cap hint at a coarse step
 /// must not mint a size the URL grammar itself would
 /// reject.
-fn quantize_width(width: u32, step: u32) -> u32 {
+pub(in crate::server) fn quantize_width(width: u32, step: u32) -> u32 {
     let step = step.max(1);
     (width.div_ceil(step) * step).min(MAX_HINT_WIDTH)
 }
 
 /// Whether the client sent `Save-Data: on`.
-fn save_data_hint(headers: &HeaderMap) -> bool {
+pub(in crate::server) fn save_data_hint(headers: &HeaderMap) -> bool {
     headers
         .get(SAVE_DATA_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -2637,7 +2637,7 @@ fn client_request_id(inbound: Option<&str>) -> Option<String> {
 /// handler takes before its wait for room in the request log, so
 /// the wait counts. A record dropped while its thread panics files
 /// nothing, as a request that panicked left no line before.
-struct OwedRecord {
+pub(in crate::server) struct OwedRecord {
     record: RequestRecord,
     started: Instant,
     /// The state it is owed to: `None` once it is filed, and for
@@ -2648,7 +2648,11 @@ struct OwedRecord {
 impl OwedRecord {
     /// `record`, for a request that started at `started`, owed
     /// to `state`'s metrics and request log.
-    fn new(record: RequestRecord, started: Instant, state: Arc<AppState>) -> Self {
+    pub(in crate::server) fn new(
+        record: RequestRecord,
+        started: Instant,
+        state: Arc<AppState>,
+    ) -> Self {
         Self {
             record,
             started,
@@ -2659,7 +2663,7 @@ impl OwedRecord {
     /// A record owed nowhere: filing or dropping it records
     /// nothing. For a request whose own record was filed where
     /// it was dropped.
-    fn settled() -> Self {
+    pub(in crate::server) fn settled() -> Self {
         Self {
             record: RequestRecord::default(),
             started: Instant::now(),
@@ -2668,7 +2672,7 @@ impl OwedRecord {
     }
 
     /// File the record: the request was answered with `status`.
-    fn file(mut self, status: u16) {
+    pub(in crate::server) fn file(mut self, status: u16) {
         self.record.status = status;
         self.file_now();
     }
@@ -2711,7 +2715,10 @@ impl std::ops::DerefMut for OwedRecord {
     }
 }
 
-async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+pub(in crate::server) async fn handle(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
     // The request's time runs from here, before its wait for
     // room in the request log, so its line and the latency
     // metrics count that wait (issue #707).
@@ -2797,7 +2804,7 @@ async fn handle(State(state): State<Arc<AppState>>, request: axum::extract::Requ
 /// here, the one place that knows the request's spelling;
 /// [`cache_key_for`] keys it; and [`run_flight`] serves it
 /// from the tiers or the miss path.
-async fn serve(
+pub(in crate::server) async fn serve(
     state: &Arc<AppState>,
     mut record: OwedRecord,
     path: &str,
@@ -2922,7 +2929,7 @@ fn keep_from_shared_caches(response: &mut Response) {
 /// source cannot make one entry's key, which every tier
 /// stores and the cache maps hold twice, tens of kilobytes
 /// long.
-fn cache_key_for(
+pub(in crate::server) fn cache_key_for(
     config_fingerprint: &str,
     ops: &[crate::url::Operation],
     source_url: &str,
