@@ -19123,9 +19123,9 @@ async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
 }
 
 /// A minimal, valid SVG that sizes instantly but carries
-/// [`crate::engine::SVG_PROBE_SLOW_MARKER`], so the probe's
-/// test hook sleeps while sizing it: a stand-in for an SVG
-/// whose parse is slow, without crafting a slow document.
+/// [`crate::engine::decode::SVG_PROBE_SLOW_MARKER`], so the
+/// probe's test hook sleeps while sizing it: a stand-in for an
+/// SVG whose parse is slow, without crafting a slow document.
 const SLOW_PROBE_SVG: &[u8] = b"<!--crabcrop-slow-probe--><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
 
 /// A blocking HTTP origin on its own OS thread (not the

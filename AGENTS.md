@@ -25,13 +25,28 @@ both SDKs must all pass.
   generates both its parser and its canonical spelling, and one
   variant: of `PlainFilter` when `filters.rs` applies it from the
   image alone, of `Filter` when the engine applies it itself),
-  pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
-  state in `engine/state.rs`), HTTP and caching in `server.rs`
-  (request coalescing in `server/process.rs`, metadata responses in
-  `server/meta.rs`), source fetching policy in `loader.rs`, AI
-  features in `ai/` (provider traits in `ai/mod.rs`, one file per
-  provider family, all re-exported from `crate::ai`) and
-  `studio.rs`. A large module keeps its unit tests in
+  pipeline in `engine.rs` (the `Engine` and its stages, with a file
+  per part under `engine/`: decoding in `decode.rs`, the resource
+  limits in `limits.rs`, the operation chain in `chain.rs`, animated
+  sources in `animated.rs`, sizing in `resize.rs`, compositing in
+  `overlay.rs`, detections in `detect.rs`, the focal form in
+  `focal.rs`, encoders in `encode.rs`, pipeline state in
+  `state.rs`, the reduced-scale JPEG decode in `jpeg_scaled.rs`,
+  the `overlay(...,width)` scale in `overlay_scale.rs`, animated
+  WebP frames through libwebp in `webp_anim.rs`), HTTP and caching
+  in `server.rs` (the state and the router, with a file per part
+  under `server/`: admission in `admission.rs`, the image route in
+  `request.rs`, flights in `flight.rs`, the cache tiers in
+  `tiers.rs`, the miss path in `miss.rs`, responses in
+  `response.rs`, the `/explain`, purge, upload and system endpoints
+  in `explain.rs`, `purge.rs`, `upload.rs` and `system.rs`, request
+  coalescing in `process.rs`, metadata responses in `meta.rs`, the
+  accept loop and its connection bounds in `listen.rs`, the work
+  handlers leave running and the shutdown drain in
+  `background.rs`), source fetching policy in
+  `loader.rs`, AI features in `ai/` (provider traits in
+  `ai/mod.rs`, one file per provider family, all re-exported from
+  `crate::ai`) and `studio.rs`. A large module keeps its unit tests in
   `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
   `server.rs`, `engine.rs`, `url.rs`, `filters.rs`, `frames.rs`
   and the files under `ai/` do; a second test module (the
