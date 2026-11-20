@@ -4779,7 +4779,7 @@ pub(crate) fn cap_dimensions(w: u32, h: u32, (cw, ch): (u32, u32)) -> (u32, u32)
 /// How the `no_upscale` cap (the oriented source dimensions)
 /// bounds an [`apply_size`] target.
 #[derive(Clone, Copy)]
-enum SizeCap {
+pub(in crate::engine) enum SizeCap {
     /// Clamp each axis independently at the source dimension.
     /// A plain size names an exact box and distorts to it by
     /// design, so the cap clamps the axes it names: a 300x200
@@ -4798,7 +4798,7 @@ enum SizeCap {
 
 /// One pixel target under DPR: whole pixels, never zero.
 /// A factor of 1 returns the input unchanged.
-fn scale_px(n: u32, dpr: f32) -> u32 {
+pub(in crate::engine) fn scale_px(n: u32, dpr: f32) -> u32 {
     if dpr == 1.0 {
         n
     } else {
@@ -4820,7 +4820,7 @@ fn scale_dimension(d: Dimension, dpr: f32) -> Dimension {
 /// and flips. Pixel targets are DPR-scaled first; `cap` (from
 /// `no_upscale`) bounds the result afterwards, so DPR can never
 /// push past the source when the cap is set.
-fn apply_size(
+pub(in crate::engine) fn apply_size(
     img: DynamicImage,
     size: &ImageSize,
     cap: Option<SizeCap>,
@@ -4831,7 +4831,7 @@ fn apply_size(
 
 /// What part of the frame in hand a resize reads.
 #[derive(Clone, Copy)]
-enum SourceWindow {
+pub(in crate::engine) enum SourceWindow {
     /// All of it.
     Whole,
     /// The rectangle a `crop-rect` named, resampled through
@@ -4858,7 +4858,7 @@ enum SourceWindow {
 /// as it resolves against the materialized crop in the
 /// two-step path, and the resample reads the window straight
 /// from the frame.
-fn apply_size_cropped(
+pub(in crate::engine) fn apply_size_cropped(
     img: DynamicImage,
     window: (u32, u32, u32, u32),
     size: &ImageSize,
@@ -4897,7 +4897,7 @@ fn check_nonzero_size(size: &ImageSize) -> Result<(), EngineError> {
 /// following the other side from `from` to `to`, floored and
 /// never below 1. A quotient past `u32` saturates rather than
 /// wraps, so the per-axis check always sees it (issue #521).
-fn proportional_side(side: u32, to: u32, from: u32) -> u32 {
+pub(in crate::engine) fn proportional_side(side: u32, to: u32, from: u32) -> u32 {
     let q = (side as u64 * to as u64) / from.max(1) as u64;
     u32::try_from(q).unwrap_or(u32::MAX).max(1)
 }
@@ -4909,7 +4909,7 @@ fn proportional_side(side: u32, to: u32, from: u32) -> u32 {
 /// it, and the scaled JPEG decode reads it ahead of the
 /// decode (issue #653), so the two cannot disagree on where
 /// a resize is heading.
-fn resize_target(
+pub(in crate::engine) fn resize_target(
     size: &ImageSize,
     dpr: f32,
     (sw, sh): (u32, u32),
@@ -4940,7 +4940,7 @@ fn resize_target(
     }
 }
 
-fn apply_size_windowed(
+pub(in crate::engine) fn apply_size_windowed(
     img: DynamicImage,
     size: &ImageSize,
     cap: Option<SizeCap>,
@@ -4990,7 +4990,7 @@ fn apply_size_windowed(
 /// [`resize_lanczos3_lent`]). `None` when the size is the
 /// frame's own, where [`apply_size`] hands on the frame itself,
 /// which a lent frame cannot be.
-fn apply_size_lent(
+pub(in crate::engine) fn apply_size_lent(
     frame: &mut DynamicImage,
     size: &ImageSize,
     cap: Option<SizeCap>,
@@ -5066,7 +5066,11 @@ fn lanczos3_options() -> fast_image_resize::ResizeOptions {
 /// and so does a size that needs no resample: the backend
 /// copies those pixels untouched, which a premultiply and a
 /// divide around the copy would not.
-fn resize_lanczos3_owned(mut img: DynamicImage, w: u32, h: u32) -> DynamicImage {
+pub(in crate::engine) fn resize_lanczos3_owned(
+    mut img: DynamicImage,
+    w: u32,
+    h: u32,
+) -> DynamicImage {
     use fast_image_resize::IntoImageView;
     let has_alpha_step = img
         .pixel_type()
@@ -5098,7 +5102,11 @@ fn resize_lanczos3_owned(mut img: DynamicImage, w: u32, h: u32) -> DynamicImage 
 /// and none for a GIF frame, whose pixels are opaque or
 /// transparent black. Any other layout, and a size that needs
 /// no resample, take [`resize_lanczos3`].
-fn resize_lanczos3_lent(img: &mut DynamicImage, w: u32, h: u32) -> DynamicImage {
+pub(in crate::engine) fn resize_lanczos3_lent(
+    img: &mut DynamicImage,
+    w: u32,
+    h: u32,
+) -> DynamicImage {
     let (sw, sh) = (img.width(), img.height());
     let resamples = (w, h) != (sw, sh) && w > 0 && h > 0 && sw > 0 && sh > 0;
     let changing = match &*img {
@@ -5119,19 +5127,19 @@ fn resize_lanczos3_lent(img: &mut DynamicImage, w: u32, h: u32) -> DynamicImage 
 
 /// The rows of an RGBA8 frame that a premultiply changes,
 /// copied out before it runs (see [`resize_lanczos3_lent`]).
-struct ChangingRows {
+pub(in crate::engine) struct ChangingRows {
     /// The bytes in a row of the frame.
     stride: usize,
     /// The row indexes, in order.
-    rows: Vec<usize>,
+    pub(in crate::engine) rows: Vec<usize>,
     /// Their bytes, one row after another.
-    bytes: Vec<u8>,
+    pub(in crate::engine) bytes: Vec<u8>,
 }
 
 impl ChangingRows {
     /// Copy out the rows of `frame` holding a pixel that is
     /// neither opaque nor black.
-    fn of(frame: &image::RgbaImage) -> Self {
+    pub(in crate::engine) fn of(frame: &image::RgbaImage) -> Self {
         let mut changing = ChangingRows {
             stride: frame.width() as usize * 4,
             rows: Vec::new(),
@@ -5223,7 +5231,7 @@ thread_local! {
     /// Makes [`convolve_lanczos3`] refuse on this thread, so
     /// a test can walk the path behind a backend refusal,
     /// which no input reaches.
-    static CONVOLVE_REFUSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(in crate::engine) static CONVOLVE_REFUSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A blank destination image of `img`'s own variant at
@@ -5258,7 +5266,12 @@ fn blank_like(img: &DynamicImage, w: u32, h: u32) -> Option<DynamicImage> {
 /// layout other than RGB8 and RGBA8, a window that needs no
 /// resample, a case [`view_holds_no_more`] turns away, and a
 /// backend refusal.
-fn resize_lanczos3_cut(img: DynamicImage, window: Window, w: u32, h: u32) -> DynamicImage {
+pub(in crate::engine) fn resize_lanczos3_cut(
+    img: DynamicImage,
+    window: Window,
+    w: u32,
+    h: u32,
+) -> DynamicImage {
     let (x, y, ww, wh) = window;
     let inside =
         x as u64 + ww as u64 <= img.width() as u64 && y as u64 + wh as u64 <= img.height() as u64;
@@ -5354,7 +5367,7 @@ fn resample_window(
 /// at the four that chain's had. The backend convolves down
 /// the columns first, into working rows no wider than the
 /// window and as tall as the output.
-fn view_holds_no_more(
+pub(in crate::engine) fn view_holds_no_more(
     frame_bytes: u64,
     channels: u64,
     (ww, wh): (u32, u32),
@@ -5433,7 +5446,7 @@ fn resize_lanczos3_reduced(
 /// the canvas, which the pending focal form follows (issue
 /// #465). The blurred fill checks `deadline` before each row
 /// (issue #614).
-fn apply_pad(
+pub(in crate::engine) fn apply_pad(
     img: DynamicImage,
     target_w: u32,
     target_h: u32,
@@ -5512,7 +5525,7 @@ fn apply_pad(
 /// inside `base` is written over it by rows, with no blend
 /// per pixel; one with alpha, or one that would be clipped,
 /// takes the crate's overlay.
-fn place_on(base: &mut image::RgbaImage, top: DynamicImage, x: u32, y: u32) {
+pub(in crate::engine) fn place_on(base: &mut image::RgbaImage, top: DynamicImage, x: u32, y: u32) {
     let (tw, th) = (top.width() as usize, top.height() as usize);
     let inside =
         x as u64 + tw as u64 <= base.width() as u64 && y as u64 + th as u64 <= base.height() as u64;
@@ -5552,7 +5565,12 @@ fn place_on(base: &mut image::RgbaImage, top: DynamicImage, x: u32, y: u32) {
 /// have no orientation to disagree with. A box without two
 /// pixel axes (a proportional or `orig` axis) likewise has no
 /// fixed orientation and never swaps.
-fn fit_in_box(size: &ImageSize, sw: u32, sh: u32, adaptive: bool) -> ImageSize {
+pub(in crate::engine) fn fit_in_box(
+    size: &ImageSize,
+    sw: u32,
+    sh: u32,
+    adaptive: bool,
+) -> ImageSize {
     if !adaptive {
         return *size;
     }
@@ -5579,7 +5597,7 @@ fn fit_in_box(size: &ImageSize, sw: u32, sh: u32, adaptive: bool) -> ImageSize {
 /// scales by `dpr` first, and with `adaptive` its axes swap to
 /// match the source's orientation (see [`fit_in_box`]); `cap`
 /// then shrinks the result to fit inside it (`no_upscale`).
-fn apply_fit_in(
+pub(in crate::engine) fn apply_fit_in(
     img: DynamicImage,
     size: &ImageSize,
     adaptive: bool,
@@ -5596,7 +5614,7 @@ fn apply_fit_in(
 /// [`apply_fit_in`] of a frame lent for the resize (issue
 /// #737), as [`apply_size_lent`] is of a resize: `None` when
 /// the fit-in leaves the frame as it is.
-fn apply_fit_in_lent(
+pub(in crate::engine) fn apply_fit_in_lent(
     frame: &mut DynamicImage,
     size: &ImageSize,
     adaptive: bool,
