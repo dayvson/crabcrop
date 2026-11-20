@@ -6,6 +6,8 @@
 //! and the expiry, key, sealing, preset, default-operation and
 //! source-root cases beside it, to both routes of one server
 //! whose source exists, and compares the answers.
+//!
+//! [`authenticate`]: crate::server::admission::authenticate
 
 use super::*;
 
@@ -192,6 +194,8 @@ impl Answer {
     /// Both stages run before anything touches the source, so
     /// an answer that fetched it was admitted: the engine's own
     /// `400 unsupported_operation` comes after the fetch.
+    ///
+    /// [`authenticate`]: crate::server::admission::authenticate
     fn refused(&self) -> bool {
         let code = self.code.as_deref();
         let refusal = match (self.status, code) {

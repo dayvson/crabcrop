@@ -1350,7 +1350,7 @@ export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
         errors.push("malformed signature segment");
     }
     // Remainders the server refuses before it reads an
-    // operation, whatever the signature (server.rs
+    // operation, whatever the signature (server/admission.rs
     // resolve_request): the segment key derivation owns, and
     // the endpoints' own segments.
     const head = remainder.split("/", 1)[0];
