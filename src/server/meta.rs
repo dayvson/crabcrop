@@ -1747,3 +1747,126 @@ pub(in crate::server) fn meta_cache_headers(mut response: Response) -> Response 
     );
     response
 }
+
+/// The meta document for a render: the annotation sections
+/// the request opts into, then the document itself. The
+/// sections' blocking tasks decode the render, so they share
+/// it (issue #736): it is not copied for them.
+pub(in crate::server) async fn meta_document(
+    state: &AppState,
+    processed: crate::engine::ProcessedImage,
+    sealed: bool,
+    accept: Option<&str>,
+) -> Response {
+    let processed = Arc::new(processed);
+    let frame = DocumentFrame::new(Arc::clone(&processed));
+    meta_document_from(state, &processed, frame, sealed, accept).await
+}
+
+/// [`meta_document`] on the frame its sections share: the
+/// render is decoded once for all of them (issue #676), by
+/// the first that needs pixels.
+pub(in crate::server) async fn meta_document_from(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    frame: impl FrameSource,
+    sealed: bool,
+    accept: Option<&str>,
+) -> Response {
+    // The annotation sections share one deadline, the
+    // same process budget the render ran under: a
+    // section that has not answered when it passes is
+    // left out (tags, detections) or reports itself
+    // unavailable with the "timed_out" reason
+    // (moderation, embedding, OCR), and the response
+    // goes out with the sections that made it. OCR also
+    // gets the deadline inside the run, so its per-line
+    // recognition stops gathering instead of only being
+    // cut off at the response.
+    let annotation_deadline = Instant::now() + state.process_timeout;
+    let annotation = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(annotation_deadline),
+        annotate_meta(state, &frame),
+    )
+    .await
+    .ok()
+    .flatten();
+    let detections = if wants_detections(accept) {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(annotation_deadline),
+            detect_meta(state, &frame),
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let moderation = if wants_moderation(accept) {
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                moderate_meta(state, &frame),
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(_) => ModerationMeta::Unavailable("timed_out"),
+            },
+        )
+    } else {
+        None
+    };
+    // The embedding run (issue #172) serves two
+    // fields: the embedding itself, when the client
+    // opted in, and the aesthetic score, whenever a
+    // head is configured. One run feeds both.
+    let want_embedding = wants_embeddings(accept);
+    let embedding_run = if want_embedding || state.providers.aesthetic.is_some() {
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                embed_meta(state, &frame),
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(_) => EmbeddingMeta::Unavailable("timed_out"),
+            },
+        )
+    } else {
+        None
+    };
+    let aesthetic = compose_aesthetic(state, embedding_run.as_ref());
+    let ocr = if wants_ocr(accept) {
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                ocr_meta(state, &frame, annotation_deadline),
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(_) => OcrMeta::Unavailable("timed_out"),
+            },
+        )
+    } else {
+        None
+    };
+    // The sections are done with the pixels.
+    drop(frame);
+    meta_response(
+        processed,
+        sealed,
+        annotation.as_ref(),
+        detections.as_deref(),
+        moderation.as_ref(),
+        if want_embedding {
+            embedding_run.as_ref()
+        } else {
+            None
+        },
+        aesthetic.as_ref(),
+        ocr.as_ref(),
+    )
+}

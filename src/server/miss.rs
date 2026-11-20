@@ -5,6 +5,7 @@ use axum::http::{StatusCode, header};
 use axum::response::Response;
 
 use super::admission::width_hint_ops;
+use super::meta::meta_document;
 use super::request::OwedRecord;
 use super::response::{
     attach_cache_headers, busy_response, engine_error_response, error_response,
@@ -13,8 +14,8 @@ use super::response::{
 use super::tiers::{DiskHandoff, populate_tiers};
 use super::{
     AI_GATE_WAIT, ANIM_GATE_WAIT, AppState, Gate, JobPermits, JobSource, Lane, MissProgress,
-    ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, VIDEO_GATE_WAIT, WatermarkSources,
-    meta_document, run_process, wants_animation_gate, wants_slow_lane,
+    ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, VIDEO_GATE_WAIT, WatermarkSources, run_process,
+    wants_animation_gate, wants_slow_lane,
 };
 use crate::cache::{CachedImage, etag_for_bytes};
 use crate::engine::EngineError;
