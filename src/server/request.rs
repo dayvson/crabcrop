@@ -7,7 +7,8 @@ use axum::response::Response;
 
 use super::admission::{Credential, Negotiated, authenticate, negotiate, resolve_request};
 use super::flight::run_flight;
-use super::{AppState, MissProgress, MissWork, has_directive};
+use super::miss::MissWork;
+use super::{AppState, MissProgress, has_directive};
 use crate::observe::RequestRecord;
 use crate::url::ImageFormat;
 

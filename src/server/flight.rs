@@ -3,12 +3,13 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+use super::miss::{MissWork, serve_miss};
 use super::request::OwedRecord;
 use super::response::{attach_cache_headers, finalize_validators, respond};
 use super::tiers::{DiskBudget, DiskHandoff, finish_disk_write, lookup_tiers_within};
 use super::{
-    AppState, Flight, FlightSlot, LeaderGuard, MetaFlight, MissProgress, MissWork, SharedFlight,
-    SharedResponse, serve_miss, wants_detections, wants_embeddings, wants_moderation, wants_ocr,
+    AppState, Flight, FlightSlot, LeaderGuard, MetaFlight, MissProgress, SharedFlight,
+    SharedResponse, wants_detections, wants_embeddings, wants_moderation, wants_ocr,
 };
 use crate::cache::CachedImage;
 use crate::url::ImageFormat;

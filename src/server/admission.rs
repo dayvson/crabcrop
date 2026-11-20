@@ -13,9 +13,11 @@ use crate::observe::RequestRecord;
 use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
 #[cfg(doc)]
-use super::request::{cache_key_for, serve};
+use super::admit_explained;
 #[cfg(doc)]
-use super::{admit_explained, build_job};
+use super::miss::build_job;
+#[cfg(doc)]
+use super::request::{cache_key_for, serve};
 
 /// Why the image path refused a request before its cache
 /// lookup (issue #479). The stages of [`serve`] return
