@@ -707,7 +707,7 @@ fn has_directive(cache_control: &str, directive: &str) -> bool {
 /// HEIC's a walk of its item graph. Those read on to the end
 /// of the body (or the head cap), and [`explain_probe`]
 /// sizes them once, off the runtime.
-fn probe_settled(head: &[u8]) -> bool {
+pub(in crate::server) fn probe_settled(head: &[u8]) -> bool {
     let kind = crate::engine::probe_kind(head);
     match kind {
         "unknown" => false,
@@ -772,7 +772,7 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// an expired URL therefore costs zero source fetches.
 /// [`explain_report`] builds the report and
 /// [`explain_response`] answers it.
-async fn explain_handle(
+pub(in crate::server) async fn explain_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
@@ -837,7 +837,10 @@ async fn explain_handle(
 /// `unseal` verb, under their own secret) and then explain
 /// the plain form. The refusal is the uniform
 /// `bad_signature`, and no source fetch happens for it.
-fn admit_explained<'a>(state: &AppState, full: &'a str) -> Result<(Opened<'a>, Resolved), Refusal> {
+pub(in crate::server) fn admit_explained<'a>(
+    state: &AppState,
+    full: &'a str,
+) -> Result<(Opened<'a>, Resolved), Refusal> {
     let nolead = full.strip_prefix('/').unwrap_or(full);
     if crate::url::looks_sealed(nolead.split('/').next().unwrap_or("")) {
         return Err(Refusal::AsIs(bad_signature_parts()));
