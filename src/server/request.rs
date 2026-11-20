@@ -6,14 +6,15 @@ use axum::http::{HeaderMap, header};
 use axum::response::Response;
 
 use super::admission::{Credential, Negotiated, authenticate, negotiate, resolve_request};
-use super::{AppState, MissProgress, MissWork, has_directive, run_flight};
+use super::flight::run_flight;
+use super::{AppState, MissProgress, MissWork, has_directive};
 use crate::observe::RequestRecord;
 use crate::url::ImageFormat;
 
 #[cfg(doc)]
 use super::admission::Refusal;
 #[cfg(doc)]
-use super::finish_started_miss;
+use super::flight::finish_started_miss;
 
 /// The DPR hint headers [`dpr_hint`] reads, the
 /// structured one first.
