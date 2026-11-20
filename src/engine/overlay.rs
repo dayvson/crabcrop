@@ -1,7 +1,8 @@
 use image::DynamicImage;
 
+use super::animated::ScaledOverlays;
 use super::limits::MAX_OUTPUT_PIXELS;
-use super::{EngineError, ProcessContext, ScaledOverlays, StillFormat, overlay_scale};
+use super::{EngineError, ProcessContext, StillFormat, overlay_scale};
 
 /// One channel of a blend mode: the CSS formulas on the
 /// 0-255 scale (`b` is the base channel, `o` the overlay's).
