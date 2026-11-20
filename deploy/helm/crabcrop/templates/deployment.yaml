@@ -156,9 +156,9 @@ spec:
             {{- if hasKey $allEnv "CRABCROP_SHUTDOWN_GRACE_SECS" }}
             {{- fail "set shutdownGraceSeconds, not CRABCROP_SHUTDOWN_GRACE_SECS in env or ai.env: the pod's terminationGracePeriodSeconds follows shutdownGraceSeconds" }}
             {{- end }}
-            {{- /* A secret in env, ai.env or a plain extraEnv value lands
-                 here as plain text. This release warns; a later one
-                 refuses it by default. */}}
+            {{- /* A secret in env, ai.env or a plain extraEnv value would
+                 land here as plain text, so the render fails unless
+                 refusePlainSecrets is false, which warns instead. */}}
             {{- $plainSecrets := include "crabcrop.plainSecrets" . | fromYaml }}
             {{- if and $plainSecrets .Values.refusePlainSecrets }}
             {{- $refused := list }}

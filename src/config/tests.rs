@@ -556,13 +556,6 @@ fn a_value_that_only_contains_a_placeholder_is_not_one() {
     assert!(config.metrics_token.is_some());
     let config = config_of(&[("CRABCROP_SECRET", "REPLACE_ME_signing_secret_2026")]);
     assert!(config.is_ok());
-    // A metrics token under 16 bytes still boots for this
-    // release; boot warns about it (tests/boot_smoke.rs).
-    let config = config_of(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]).unwrap();
-    assert_eq!(
-        config.metrics_token.as_ref().map(Secret::expose),
-        Some("fifteen-bytes!!")
-    );
     // An empty token is still no token, which closes /metrics.
     assert!(
         config_of(&[("CRABCROP_METRICS_TOKEN", "")])
@@ -581,17 +574,38 @@ fn a_secret_setting_zeroes_its_value() {
 }
 
 #[test]
-fn a_metrics_token_under_16_bytes_warns_without_quoting_it() {
-    let warning = metrics_token_warning(&Secret("fifteen-bytes!!".to_string()))
-        .expect("a warning for 15 bytes");
+fn a_metrics_token_under_16_bytes_is_refused() {
+    // Issue #632: from 0.12.0 a token under the signing
+    // secret's 16 bytes booted with a warning (issue #588).
+    // It is now refused as a short signing secret is, by its
+    // length (config_errors_never_carry_a_secret checks that
+    // the refusal never quotes it).
+    for token in ["a", "fifteen-bytes!!"] {
+        let err = refusal(&[("CRABCROP_METRICS_TOKEN", token)]);
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    var: "CRABCROP_METRICS_TOKEN",
+                    value: ConfigValue::Secret,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "CRABCROP_METRICS_TOKEN must be at least 16 bytes, got {}",
+                token.len()
+            )
+        );
+    }
+    let config = config_of(&[("CRABCROP_METRICS_TOKEN", "sixteen-bytes!!!")]).unwrap();
     assert_eq!(
-        warning,
-        "CRABCROP_METRICS_TOKEN is 15 bytes, under the 16 bytes a later release will \
-         require: generate a new one, for example with openssl rand -hex 32"
+        config.metrics_token.as_ref().map(Secret::expose),
+        Some("sixteen-bytes!!!")
     );
-    assert_no_secret("CRABCROP_METRICS_TOKEN", &warning, "fifteen-bytes!!");
-    assert!(metrics_token_warning(&Secret("a".to_string())).is_some());
-    assert!(metrics_token_warning(&Secret("sixteen-bytes!!!".to_string())).is_none());
 }
 
 #[test]
@@ -1955,7 +1969,7 @@ fn from_env_carries_what_it_read() {
     let config = config_of(&[
         ("CRABCROP_PORT", "8080"),
         ("PORT", "9090"),
-        ("CRABCROP_METRICS_TOKEN", "metrics-token"),
+        ("CRABCROP_METRICS_TOKEN", "metrics-token-0123456789"),
         ("CRABCROP_RESULT_STORAGE_DIR", "/var/cache/crabcrop"),
         ("CRABCROP_RESULT_STORAGE_MAX_MB", "64"),
         ("CRABCROP_RESULT_BUCKET", "results"),
@@ -1974,7 +1988,7 @@ fn from_env_carries_what_it_read() {
     assert_eq!(config.port, 8080);
     assert_eq!(
         config.metrics_token.as_ref().map(Secret::expose),
-        Some("metrics-token")
+        Some("metrics-token-0123456789")
     );
     let storage = config.result_storage.unwrap();
     assert_eq!(
@@ -2358,6 +2372,14 @@ fn config_errors_never_carry_a_secret() {
             vec![
                 ("CRABCROP_SECRET", SECRET),
                 ("CRABCROP_SECRET_PREVIOUS", "hunter2-prev"),
+            ],
+        ),
+        (
+            "CRABCROP_METRICS_TOKEN",
+            "hunter2-metrics",
+            vec![
+                ("CRABCROP_SECRET", SECRET),
+                ("CRABCROP_METRICS_TOKEN", "hunter2-metrics"),
             ],
         ),
     ] {
