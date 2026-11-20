@@ -4,9 +4,9 @@ use std::sync::Once;
 use image::DynamicImage;
 
 use super::limits::{MAX_DECODE_ALLOC, MAX_DECODE_DIMENSION};
+use super::resize::{fit_in_box, proportional_side, scale_px};
 use super::{
-    EngineError, decode_gif_frames, decode_webp_frames, fit_in_box, jpeg_scaled, proportional_side,
-    scale_px, state, webp_animation_params,
+    EngineError, decode_gif_frames, decode_webp_frames, jpeg_scaled, state, webp_animation_params,
 };
 use crate::url::{Dimension, ImageFormat, ImageSize, Operation};
 
