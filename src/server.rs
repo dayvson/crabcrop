@@ -2521,25 +2521,25 @@ const PURGE_END_CAP: std::time::Duration = std::time::Duration::from_secs(600);
 /// Everything the cache-miss path needs, bundled so the
 /// singleflight loop in `run_flight` can hand it to
 /// whichever request leads the miss.
-struct MissWork {
-    ops: Vec<crate::url::Operation>,
-    source_url: String,
-    directives: crate::url::RequestDirectives,
-    preferred: Option<ImageFormat>,
-    meta: bool,
-    debug: bool,
-    placeholders: bool,
-    hinted_width: Option<u32>,
-    dpr_hint: Option<f32>,
+pub(in crate::server) struct MissWork {
+    pub(in crate::server) ops: Vec<crate::url::Operation>,
+    pub(in crate::server) source_url: String,
+    pub(in crate::server) directives: crate::url::RequestDirectives,
+    pub(in crate::server) preferred: Option<ImageFormat>,
+    pub(in crate::server) meta: bool,
+    pub(in crate::server) debug: bool,
+    pub(in crate::server) placeholders: bool,
+    pub(in crate::server) hinted_width: Option<u32>,
+    pub(in crate::server) dpr_hint: Option<f32>,
     /// Whether Save-Data steps this render's quality:
     /// [`Negotiated::save_data_applies`], the rule the cache
     /// key and the private marking follow, not the raw
     /// header.
-    save_data: bool,
-    accept: Option<String>,
-    groups: Vec<String>,
-    cache_key: String,
-    max_age: Option<u32>,
+    pub(in crate::server) save_data: bool,
+    pub(in crate::server) accept: Option<String>,
+    pub(in crate::server) groups: Vec<String>,
+    pub(in crate::server) cache_key: String,
+    pub(in crate::server) max_age: Option<u32>,
     /// Whether the request arrived in the sealed spelling
     /// (issue #255). Meta for it redacts every operation and
     /// source text, and its image responses carry no
@@ -2548,14 +2548,14 @@ struct MissWork {
     /// both directions, so a plain meta request on the same
     /// render still reports in full, and a plain hit on an
     /// entry first served sealed still names its groups.
-    sealed: bool,
+    pub(in crate::server) sealed: bool,
     /// How far this miss has got (see [`MissProgress`]);
     /// its render jobs carry clones.
-    progress: MissProgress,
+    pub(in crate::server) progress: MissProgress,
     /// Where a flight leader's render leaves its disk write,
     /// to finish once its followers are woken (issue #572).
     /// `None` everywhere else.
-    disk_handoff: Option<DiskHandoff>,
+    pub(in crate::server) disk_handoff: Option<DiskHandoff>,
 }
 
 /// Whether a request runs inference and so takes an AI
@@ -2566,7 +2566,7 @@ struct MissWork {
 /// saliency statistic, no inference runs, and gating the
 /// request would let it consume permits and shed behind
 /// real AI work for nothing.
-fn ai_gate_applies(
+pub(in crate::server) fn ai_gate_applies(
     directives: &crate::url::RequestDirectives,
     face_provider: bool,
     focal_provider: bool,
@@ -2697,7 +2697,7 @@ struct RunPlan {
 }
 
 /// What a miss rendered.
-struct Rendered {
+pub(in crate::server) struct Rendered {
     processed: crate::engine::ProcessedImage,
     /// Whether it was rendered from the configured
     /// fallback rather than the source.
@@ -2719,7 +2719,7 @@ struct Rendered {
 /// its failure is answered here, the one place on the
 /// miss path that knows the request's spelling (issue
 /// #479).
-async fn serve_miss(
+pub(in crate::server) async fn serve_miss(
     state: &AppState,
     work: MissWork,
     mut record: OwedRecord,
@@ -2846,7 +2846,7 @@ async fn serve_miss(
 /// one. These stages box it: a bare `Response` is 128
 /// bytes, too large for an `Err` (clippy's
 /// `result_large_err`).
-async fn render_miss(
+pub(in crate::server) async fn render_miss(
     state: &AppState,
     work: &MissWork,
     record: &mut RequestRecord,
@@ -3032,7 +3032,7 @@ async fn load_watermarks(
 
 /// The engine job for a miss: the request's operations and
 /// directives with the server's providers and settings.
-fn build_job(
+pub(in crate::server) fn build_job(
     state: &AppState,
     work: &MissWork,
     watermark_sources: Arc<WatermarkSources>,
