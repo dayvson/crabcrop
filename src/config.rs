@@ -378,9 +378,6 @@ impl Config {
             ));
         }
         let metrics_token = metrics_token_config(&get)?;
-        if let Some(warning) = metrics_token.as_ref().and_then(metrics_token_warning) {
-            stderr_line!("warning: {warning}");
-        }
         let process_timeout_secs: u64 = parse_env_value(
             "CRABCROP_PROCESS_TIMEOUT_SECS",
             get("CRABCROP_PROCESS_TIMEOUT_SECS"),
@@ -1268,6 +1265,8 @@ pub fn parse_bool_value(
 /// secrets are brute-forceable, and an empty one is worse:
 /// empty-key HMAC is publicly computable, so every signed URL
 /// (and purge) is forgeable (security audit PL-3, P-6).
+/// `CRABCROP_SECRET_PREVIOUS` and `CRABCROP_METRICS_TOKEN` are
+/// held to it too (issue #632 for the token).
 const MIN_SECRET_BYTES: usize = 16;
 
 /// Values crabcrop's docs, deploy recipes and specs ship, or
@@ -1348,34 +1347,20 @@ fn validate_secret_named(name: &'static str, secret: &[u8]) -> Result<(), Config
 /// The `/metrics` bearer token (issue #270): an empty value
 /// is no token, and no token closes the endpoint rather than
 /// serving it publicly. A published placeholder is refused
-/// (issue #588).
+/// (issue #588), and so is a token under the signing
+/// secret's 16 bytes, which booted with a warning from
+/// 0.12.0 until issue #632. The refusal names the variable
+/// and the length, never the token.
 pub fn metrics_token_config(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Secret>, ConfigError> {
     match get("CRABCROP_METRICS_TOKEN") {
         Some(token) if !token.is_empty() => {
-            if is_published_placeholder(token.as_bytes()) {
-                return Err(placeholder_refusal("CRABCROP_METRICS_TOKEN"));
-            }
+            validate_secret_named("CRABCROP_METRICS_TOKEN", token.as_bytes())?;
             Ok(Some(Secret(token)))
         }
         _ => Ok(None),
     }
-}
-
-/// The boot warning for a metrics token under the signing
-/// secret's 16 bytes (issue #588). This release only warns;
-/// a later one refuses such a token. It names the length,
-/// never the token.
-pub fn metrics_token_warning(token: &Secret) -> Option<String> {
-    let len = token.expose().len();
-    (len < MIN_SECRET_BYTES).then(|| {
-        format!(
-            "CRABCROP_METRICS_TOKEN is {len} bytes, under the {MIN_SECRET_BYTES} bytes \
-             a later release will require: generate a new one, for example with \
-             openssl rand -hex 32"
-        )
-    })
 }
 
 /// The signing keyring (issue #143): the current secret under

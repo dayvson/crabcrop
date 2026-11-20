@@ -117,11 +117,12 @@ envFrom: []
 # A secret (CRABCROP_SECRET, CRABCROP_SECRET_PREVIOUS,
 # AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 # CRABCROP_GCS_SECRET_KEY or CRABCROP_METRICS_TOKEN) set in
-# env, in ai.env or as an extraEnv entry's value lands in the
-# Deployment as plain text. This release renders it with a
-# warning; true fails the render instead. A later release
-# will refuse it by default.
-refusePlainSecrets: false
+# env, in ai.env or as an extraEnv entry's value would land
+# in the Deployment as plain text, so the render fails and
+# names each one with the value to read it from instead.
+# false renders it, with a warning in the install notes and
+# a comment in the Deployment.
+refusePlainSecrets: true
 
 # The disk-backed result cache tier. Off by default: the
 # in-memory tier alone serves a single replica well. See the

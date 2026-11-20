@@ -60,7 +60,7 @@ helm upgrade crabcrop deploy/helm/crabcrop \
 
 ## Secrets
 
-The server treats six variables as secrets. Read each from a Secret you manage, through the value below. A value in `env` or `ai.env` lands in the Deployment as plain text, and anyone who can read the Deployment or its Pods can read it (the built-in `view` role can, though it cannot read Secrets).
+The server treats six variables as secrets. Read each from a Secret you manage, through the value below. A value in `env` or `ai.env` would land in the Deployment as plain text, where anyone who can read the Deployment or its Pods can read it (the built-in `view` role can, though it cannot read Secrets), so the chart refuses to render one (see below).
 
 | Variable | Value that reads it from a Secret |
 |---|---|
@@ -84,7 +84,7 @@ extraEnv:
         key: secret-access-key
 ```
 
-This release still renders a secret given in `env`, in `ai.env`, or as an `extraEnv` entry's `value`. It warns in the install notes and in a comment in the rendered Deployment, naming the value to set instead. Set `refusePlainSecrets: true` to fail the render instead. A later release will refuse these by default. To migrate, put each key in a Secret and set the value the warning names. Then remove the key from `env`, `ai.env` or `extraEnv`: an entry left there comes after the Secret's and wins. Move `AWS_ACCESS_KEY_ID` and `CRABCROP_GCS_ACCESS_KEY` with their secret keys the same way.
+A secret given in `env`, in `ai.env`, or as an `extraEnv` entry's `value` fails the render, with an error that names each such variable and the value to read it from instead (`refusePlainSecrets: true`, the default). To migrate, put each key in a Secret and set the value the error names. Then remove the key from `env`, `ai.env` or `extraEnv`: an entry left there comes after the Secret's and wins. Move `AWS_ACCESS_KEY_ID` and `CRABCROP_GCS_ACCESS_KEY` with their secret keys the same way. `refusePlainSecrets: false` renders such a value instead, with a warning in the install notes and in a comment in the rendered Deployment.
 
 ## Evaluation install
 

@@ -1492,7 +1492,7 @@ fn declared_detectors_refuse_unloadable_models_at_boot() {
 fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     let config = Config::from_env(env_of(&[
         ("CRABCROP_SECRET", "a production-grade secret"),
-        ("CRABCROP_METRICS_TOKEN", "metrics-token"),
+        ("CRABCROP_METRICS_TOKEN", "metrics-token-0123456789"),
         ("CRABCROP_SLOW_LANE_PERMITS", "3"),
         ("CRABCROP_META_MODE", "1"),
         ("CRABCROP_CLIENT_HINTS", "0"),
@@ -1515,7 +1515,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     // The settings reach the state as validated.
     assert_eq!(
         state.metrics_token.as_ref().map(|token| token.as_str()),
-        Some("metrics-token")
+        Some("metrics-token-0123456789")
     );
     assert!(state.meta_enabled);
     assert!(!state.client_hints);

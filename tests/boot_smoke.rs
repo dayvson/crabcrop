@@ -368,13 +368,14 @@ fn placeholder_secrets_from_the_docs_stop_the_boot() {
 }
 
 #[test]
-fn a_short_metrics_token_warns_at_boot_and_still_serves() {
+fn a_short_metrics_token_stops_the_boot_without_quoting_it() {
     // Issue #588: a metrics token only had to be non-empty.
-    // Under 16 bytes it warns for this release; a later one
-    // refuses it. The warning never quotes the token.
-    let stderr = boot_stderr(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]);
+    // From 0.12.0 a token under 16 bytes booted with a
+    // warning; it now stops the boot (issue #632), with an
+    // error that names the length and never the token.
+    let stderr = refused_boot(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]);
     assert!(
-        stderr.contains("warning: CRABCROP_METRICS_TOKEN is 15 bytes"),
+        stderr.starts_with("crabcrop: CRABCROP_METRICS_TOKEN must be at least 16 bytes, got 15"),
         "{stderr}"
     );
     assert!(!stderr.contains("fifteen-bytes!!"), "{stderr}");

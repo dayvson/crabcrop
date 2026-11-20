@@ -1024,11 +1024,12 @@ fn the_helm_chart_takes_env_entries_and_whole_secrets() {
 }
 
 #[test]
-fn the_helm_chart_warns_when_a_secret_variable_is_a_plain_value() {
-    // The owner's call on #589: for one release a secret in
-    // `env`, `ai.env` or a plain `extraEnv` value still
-    // renders, with a warning in the install notes and in the
-    // manifest; `refusePlainSecrets` fails the render instead.
+fn the_helm_chart_refuses_a_secret_variable_given_as_a_plain_value() {
+    // Issue #589, then #632: a secret in `env`, `ai.env` or a
+    // plain `extraEnv` value fails the render by default
+    // (`refusePlainSecrets`). Set to false, it renders such a
+    // value with a warning in the install notes and in the
+    // manifest, as the chart did by default from 0.12.0.
     let helpers = read("deploy/helm/crabcrop/templates/_helpers.tpl");
     let plain = template_define(&helpers, "crabcrop.plainSecrets")
         .expect("_helpers.tpl: defines crabcrop.plainSecrets")
@@ -1090,8 +1091,8 @@ fn the_helm_chart_warns_when_a_secret_variable_is_a_plain_value() {
     let values = read("deploy/helm/crabcrop/values.yaml");
     assert_eq!(
         yaml_scalar(&values, "refusePlainSecrets").as_deref(),
-        Some("false"),
-        "values.yaml: refusePlainSecrets is off for this release"
+        Some("true"),
+        "values.yaml: refusePlainSecrets is on by default (issue #632)"
     );
 }
 
