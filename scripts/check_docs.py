@@ -88,7 +88,6 @@ RESERVED = set()
 UNTESTED = {
     "invalid_path",
     "invalid_upload_name",
-    "meta_not_available",
     "processing_failed",
     "upload_media_mismatch",
     "upload_store_failed",

@@ -2576,6 +2576,14 @@ pub struct RootRef {
     pub path: String,
 }
 
+impl RootRef {
+    /// The reference as the URL wrote it, `root:<name>/<path>`:
+    /// the source [`expand_source_root`] read it from.
+    pub fn written(&self) -> String {
+        format!("root:{}/{}", self.name, self.path)
+    }
+}
+
 /// Expand a `root:<name>/<path>` short source against the
 /// server's named source roots (issue #248), returning the
 /// expanded source and the reference as written. A source

@@ -68,10 +68,10 @@ pub use listen::{
 };
 mod process;
 pub(in crate::server) use process::{
-    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
-    MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
-    SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process, wants_animation_gate,
-    wants_slow_lane,
+    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, LeaderGuard,
+    MetaFlight, MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT,
+    SharedFlight, SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process,
+    wants_animation_gate, wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -1249,29 +1249,28 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// the self-explaining URL report (issue #196; the report
 /// itself is built in [`crate::explain`]).
 ///
-/// The checks mirror the image path exactly and run in its
-/// order: signature grammar, signature verification, the
-/// reserved-segment guard, preset expansion, operation
-/// parsing, the operation cap, expiry. Only then is the
-/// source touched, once, through the loader with all of
-/// its guards, and the facts come from header probing
-/// (`crate::engine::probe_source`): no decode, no
-/// detection, no process, AI, or video gate (an SVG, AVIF,
-/// or HEIC probe takes the probe gate, see
+/// The request runs in stages. [`admit_explained`] admits
+/// it through the image path's own [`authenticate`] and
+/// [`resolve_request`], so a URL this route admits is one
+/// the image route admits, and a refusal is the image
+/// path's own status and body (issue #741). Only then is
+/// the source touched, once, through the loader with all
+/// of its guards ([`probe_explained`]), and the facts come
+/// from header probing (`crate::engine::probe_source`): no
+/// decode, no detection, no process, AI, or video gate (an
+/// SVG, AVIF, or HEIC probe takes the probe gate, see
 /// [`explain_probe`]), and nothing written to any cache
-/// tier. A bad signature, an over-cap operation list, or an
-/// expired URL therefore costs zero
-/// source fetches, and answers with the image path's own
-/// status and body.
+/// tier. A bad signature, an over-cap operation list, or
+/// an expired URL therefore costs zero source fetches.
+/// [`explain_report`] builds the report and
+/// [`explain_response`] answers it.
 async fn explain_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let accept = accept_of(&headers);
+    let accept = accept.as_deref();
     // With `CRABCROP_EXPLAIN=0` the route is off (issue #591):
     // every request answers the router's own `404 not_found`
     // before the signature is read, so the answer is the
@@ -1281,7 +1280,7 @@ async fn explain_handle(
             StatusCode::NOT_FOUND,
             "not_found",
             "not found".to_string(),
-            accept.as_deref(),
+            accept,
         );
     }
     let Some(tail) = uri.path().strip_prefix("/explain/") else {
@@ -1289,134 +1288,91 @@ async fn explain_handle(
             StatusCode::BAD_REQUEST,
             "invalid_path",
             "expected /explain/<signature>/<target>".to_string(),
-            accept.as_deref(),
+            accept,
         );
     };
     let full = format!("/{tail}");
-    // A sealed spelling is refused wholesale (issue #255):
-    // the server never unseals as a service, because an
-    // endpoint that opens tokens would be an unsealing
-    // oracle for anyone who lifts one off a public page.
-    // Operators unseal locally (the CLI's `unseal` verb,
-    // under their own secret) and then explain the plain
-    // form. The refusal is the uniform one and no source
-    // fetch happens for it.
-    let first_segment = tail.split('/').next().unwrap_or("");
-    if crate::url::looks_sealed(first_segment) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
-    }
-    let (signature, key_id, rest) = match parse_signature(&full) {
-        Ok(v) => v,
-        Err(e) => return parse_failure(&e, accept.as_deref()),
+    let (credential, resolved) = match admit_explained(&state, &full) {
+        Ok((opened, resolved)) => (opened.credential, resolved),
+        // Only plain spellings are admitted here, so every
+        // refusal is the plain spelling's own answer, as on
+        // the image route.
+        Err(refusal) => return refusal.answer(false, accept),
     };
-    // The reserved segment is refused before verification,
-    // as on the image path.
-    if crabcrop_url::is_reserved_remainder(rest) {
-        let (status, code, message) = reserved_remainder_parts();
-        return error_response(status, code, message, accept.as_deref());
-    }
-    if !state
-        .keyring
-        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
-    }
-    // The same domain separation as the image path: a
-    // remainder may not begin with a reserved segment.
-    if matches!(
-        rest.split('/').next(),
-        Some("purge" | "purge-group" | "upload")
-    ) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "reserved_segment",
-            "an image URL may not begin with a purge or upload segment".to_string(),
-            accept.as_deref(),
-        );
-    }
-    let groups = crate::url::preset_names(rest);
-    // Expansion always runs, even with no presets loaded:
-    // a `preset:` segment is a grammar error
-    // (`unknown_preset`) on every server, never source text.
-    let expanded;
-    let rest = match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
-        Ok(text) => {
-            expanded = text;
-            &expanded
-        }
-        Err(e) => return parse_failure(&e, accept.as_deref()),
+    let (source_bytes, probe) = match probe_explained(&state, &resolved, accept).await {
+        Ok(facts) => facts,
+        Err(response) => return *response,
     };
-    let (ops, source_url, expiry, _) = match parse_operations_with_expiry(rest) {
-        Ok(v) => v,
-        Err(e) => return parse_failure(&e, accept.as_deref()),
-    };
-    // The operation cap (issue #469) and the watermark URL
-    // cap (issue #613), on the list the image path counts
-    // (the defaults merged in) and at the same point: an
-    // over-cap URL answers its 400 here, before the probe
-    // fetch.
-    let counted = crate::url::merge_default_ops(&state.default_ops, ops.clone());
-    if let Err(e) = crate::url::check_operation_count(&counted)
-        .and_then(|()| crate::url::check_watermark_count(&counted))
-    {
-        return parse_failure(&e, accept.as_deref());
-    }
-    // A root source expands for the probe fetch only: the
-    // report below carries the source exactly as written
-    // and the root's name, never the base URL the reference
-    // resolves to (operator configuration, issue #248).
-    let (fetch_url, root_ref) =
-        match crate::url::expand_source_root(source_url, &state.source_roots) {
-            Ok(v) => v,
-            Err(e) => return parse_failure(&e, accept.as_deref()),
-        };
-    // Server-wide defaults merge here, once, exactly as the
-    // image path merges them: the admission, the canonical
-    // form, and the forecast all follow the list the image
-    // request runs (issue #468). The report's operation
-    // list stays `ops`, the URL's own, so it never credits
-    // the URL with a default.
-    let merged = crate::url::merge_default_ops(&state.default_ops, ops.clone());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(exp) = expiry
-        && now >= exp
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "signature_expired",
-            "signature expired".to_string(),
-            accept.as_deref(),
-        );
-    }
+    let report = explain_report(
+        &state,
+        &headers,
+        credential,
+        resolved,
+        source_bytes,
+        probe,
+        full,
+    );
+    explain_response(&report, accept)
+}
 
-    // The single bounded source fetch, through the loader
-    // and its policy. Watermark and overlay sources are
-    // operations' inputs, not the explained URL's source,
-    // and are never fetched: no fan-out. A `frame:`
-    // segment makes the source a video, so the loader may
-    // accept a `video/*` Content-Type for it (issue #214);
-    // a `page:` segment does the same for
-    // `application/pdf` (issue #215). Explain never runs
-    // either tool: the fetch is admitted, the probe stays
-    // the raw-bytes probe.
+/// The first stage of [`explain_handle`]: the image path's
+/// admission, [`authenticate`] and [`resolve_request`]
+/// themselves (issue #741), so the two routes cannot
+/// disagree on which plain URLs they admit or on how they
+/// refuse the rest.
+///
+/// A sealed spelling is refused before either runs,
+/// wholesale (issue #255): the server never unseals as a
+/// service, because an endpoint that opens tokens would be
+/// an unsealing oracle for anyone who lifts one off a
+/// public page. Operators unseal locally (the CLI's
+/// `unseal` verb, under their own secret) and then explain
+/// the plain form. The refusal is the uniform
+/// `bad_signature`, and no source fetch happens for it.
+fn admit_explained<'a>(state: &AppState, full: &'a str) -> Result<(Opened<'a>, Resolved), Refusal> {
+    let nolead = full.strip_prefix('/').unwrap_or(full);
+    if crate::url::looks_sealed(nolead.split('/').next().unwrap_or("")) {
+        return Err(Refusal::AsIs(bad_signature_parts()));
+    }
+    // The stages time their work into a request record. An
+    // explain request owes the request log no line, so this
+    // one goes nowhere.
+    let mut record = RequestRecord::default();
+    let opened = authenticate(state, full, &mut record)?;
+    let resolved = resolve_request(state, &opened.remainder, &mut record)?;
+    Ok((opened, resolved))
+}
+
+/// The second stage of [`explain_handle`]: the single
+/// bounded source fetch, through the loader and its
+/// policy, and the probe of the head it read
+/// ([`explain_probe`]). Returns the source's encoded size
+/// when the fetch states it, and the probe; a failed fetch,
+/// or a probe shed for a full gate, is the answer instead,
+/// boxed as [`render_miss`] boxes its own (a bare `Response`
+/// is 128 bytes, too large for an `Err`: clippy's
+/// `result_large_err`).
+async fn probe_explained(
+    state: &AppState,
+    resolved: &Resolved,
+    accept: Option<&str>,
+) -> Result<(Option<usize>, crate::engine::SourceProbe), Box<Response>> {
+    // Watermark and overlay sources are operations' inputs,
+    // not the explained URL's source, and are never fetched:
+    // no fan-out. A `frame:` segment makes the source a
+    // video, so the loader may accept a `video/*`
+    // Content-Type for it (issue #214); a `page:` segment
+    // does the same for `application/pdf` (issue #215).
+    // Explain never runs either tool: the fetch is admitted,
+    // the probe stays the raw-bytes probe. Both are read
+    // from the merged list, the one the image request runs.
     let admission = crate::loader::MediaAdmission {
-        video: merged
+        video: resolved
+            .ops
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: merged
+        pdf: resolved
+            .ops
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
@@ -1425,39 +1381,62 @@ async fn explain_handle(
     // identifies the source instead of downloading the
     // whole body (which also keeps this route off the
     // result cache's coalescing path by construction: it
-    // never held a whole body to share).
-    let fetched = match state
+    // never held a whole body to share). A root source is
+    // fetched at its expansion.
+    let crate::loader::ProbeLoad { head, total_bytes } = state
         .loader
-        .load_probe(&fetch_url, admission, &probe_settled)
+        .load_probe(&resolved.source_url, admission, &probe_settled)
         .await
-    {
-        Ok(fetched) => fetched,
-        Err(e) => return explain_load_error(e, accept.as_deref()),
-    };
-    let Some(probe) = explain_probe(&state, fetched.head).await else {
-        return busy_response(
+        .map_err(|e| Box::new(explain_load_error(e, accept)))?;
+    let Some(probe) = explain_probe(state, head).await else {
+        return Err(Box::new(busy_response(
             "server busy: too many source probes running at once",
             5,
-            accept.as_deref(),
-        );
+            accept,
+        )));
     };
+    Ok((total_bytes.map(|n| n as usize), probe))
+}
 
+/// The third stage of [`explain_handle`]: the report on an
+/// admitted URL and its probed source.
+///
+/// The forecast, the canonical form and the admission all
+/// follow the operations the image request runs, the
+/// server-wide defaults merged in (issue #468); the
+/// report's operation list is the URL's own, so it never
+/// credits the URL with a default. The source is reported
+/// exactly as written, with a root's name, never the base
+/// URL a root reference resolves to (operator
+/// configuration, issue #248).
+fn explain_report(
+    state: &AppState,
+    headers: &HeaderMap,
+    credential: Credential,
+    resolved: Resolved,
+    source_bytes: Option<usize>,
+    probe: crate::engine::SourceProbe,
+    image_path: String,
+) -> crate::explain::Report {
+    let ops = resolved.own_ops().to_vec();
     // Each referenced preset with the operations its
     // definition expands to. Definitions were validated at
     // boot; one that no longer parses (it cannot) is listed
     // by name alone rather than failing the report.
-    let mut presets = Vec::new();
-    for name in &groups {
-        let entry_ops = state
-            .presets
-            .get(name)
-            .and_then(|definition| {
-                crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
-            })
-            .unwrap_or_default();
-        presets.push(crate::explain::preset_entry(name, &entry_ops));
-    }
-
+    let presets = resolved
+        .groups
+        .iter()
+        .map(|name| {
+            let entry_ops = state
+                .presets
+                .get(name)
+                .and_then(|definition| {
+                    crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
+                })
+                .unwrap_or_default();
+            crate::explain::preset_entry(name, &entry_ops)
+        })
+        .collect();
     // The canonical form is the cache key's path form, of
     // the merged list as the image path keys it. The key's
     // config fingerprint suffix is operator state and stays
@@ -1468,30 +1447,49 @@ async fn explain_handle(
     // itself is keyed on the expansion, but printing that
     // here would publish the root's base URL into the
     // report.
-    let canonical = crate::url::canonical_form(&merged, source_url);
-    let report = crate::explain::Report::new(crate::explain::ReportInput {
-        signed: !matches!(signature, crate::url::Signature::Unsafe),
+    let source_url = resolved.written_source();
+    let canonical = crate::url::canonical_form(&resolved.ops, &source_url);
+    let (signed, key_id) = match credential {
+        Credential::Signature(key_id) => (true, key_id),
+        Credential::Unsafe => (false, None),
+        // Never admitted here (see `admit_explained`).
+        Credential::Sealed => (true, None),
+    };
+    // The expiry verdict reads the clock the admission read,
+    // so the report never calls a URL it admitted expired.
+    let (expiry, now) = match resolved.expiry {
+        Some(expiry) => (Some(expiry.at), expiry.checked_at),
+        None => (None, unix_seconds()),
+    };
+    crate::explain::Report::new(crate::explain::ReportInput {
+        signed,
         key_id,
         expiry,
         now,
-        source_url: source_url.to_string(),
-        source_root: root_ref.map(|r| r.name),
+        source_url,
+        source_root: resolved.root.map(|r| r.name),
         probe,
         // The DPR hint is read as the image path reads it, so
         // the forecast steps a hinted factor down as the image
         // request does (issue #529), and not at all with
         // client hints off.
-        dpr_hint: dpr_hint(&headers).filter(|_| state.client_hints),
-        source_bytes: fetched.total_bytes.map(|n| n as usize),
+        dpr_hint: dpr_hint(headers).filter(|_| state.client_hints),
+        source_bytes,
         ops,
-        merged_ops: merged,
+        merged_ops: resolved.ops,
         presets,
         canonical,
-        cache_group: groups.into_iter().next(),
-        image_path: full,
-    });
+        cache_group: resolved.groups.into_iter().next(),
+        image_path,
+    })
+}
 
-    let (content_type, body) = if crate::explain::wants_json(accept.as_deref()) {
+/// The last stage of [`explain_handle`]: the report as the
+/// client asked for it, JSON for a JSON `Accept` and the
+/// HTML page otherwise, stored nowhere and served under a
+/// policy that runs no script.
+fn explain_response(report: &crate::explain::Report, accept: Option<&str>) -> Response {
+    let (content_type, body) = if crate::explain::wants_json(accept) {
         (
             "application/json",
             serde_json::to_string(&report.to_json()).unwrap_or_default(),
@@ -3284,7 +3282,9 @@ async fn serve(
     let save_data = hints && save_data_hint(headers);
     let full = format!("/{path}");
     let opened = authenticate(state, &full, &mut record);
-    let sealed = opened.as_ref().is_ok_and(|opened| opened.sealed);
+    let sealed = opened
+        .as_ref()
+        .is_ok_and(|opened| matches!(opened.credential, Credential::Sealed));
     let admitted = opened.and_then(|opened| {
         let resolved = resolve_request(state, &opened.remainder, &mut record)?;
         let negotiated = negotiate(state, &resolved.ops, accept, dpr, width, save_data)?;
@@ -3378,9 +3378,20 @@ struct Opened<'a> {
     /// The remainder as presented, or as its sealed token
     /// decrypts.
     remainder: std::borrow::Cow<'a, str>,
-    /// Whether the request arrived in the sealed spelling
-    /// (issue #255).
-    sealed: bool,
+    /// What admitted it.
+    credential: Credential,
+}
+
+/// What admitted a remainder (see [`authenticate`]).
+enum Credential {
+    /// A sealed token that opened: the request arrived in
+    /// the sealed spelling (issue #255).
+    Sealed,
+    /// A signature that verified, with the key ID its
+    /// segment named, if any (issue #143).
+    Signature(Option<String>),
+    /// The `unsafe` segment, on a server that allows it.
+    Unsafe,
 }
 
 /// The first stage of [`serve`]: verify the signature over
@@ -3427,7 +3438,7 @@ fn authenticate<'a>(
         return match opened {
             Some(text) => Ok(Opened {
                 remainder: std::borrow::Cow::Owned(text),
-                sealed: true,
+                credential: Credential::Sealed,
             }),
             None => Err(Refusal::Unopened),
         };
@@ -3451,15 +3462,15 @@ fn authenticate<'a>(
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
     record.verify = verify_start.elapsed();
     if !verified {
-        return Err(Refusal::AsIs((
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-        )));
+        return Err(Refusal::AsIs(bad_signature_parts()));
     }
+    let credential = match signature {
+        crate::url::Signature::Hmac(_) => Credential::Signature(key_id),
+        crate::url::Signature::Unsafe => Credential::Unsafe,
+    };
     Ok(Opened {
         remainder: std::borrow::Cow::Borrowed(rest),
-        sealed: false,
+        credential,
     })
 }
 
@@ -3468,12 +3479,55 @@ struct Resolved {
     /// The operations the engine runs: the remainder's
     /// own, with the server-wide defaults merged in.
     ops: Vec<crate::url::Operation>,
+    /// How many of `ops` are the remainder's own: the
+    /// last ones, since [`crate::url::merge_default_ops`]
+    /// puts a request's operations after the defaults it
+    /// keeps.
+    own_len: usize,
     /// The source to fetch, a root source expanded.
     source_url: String,
+    /// The root reference the source was written as
+    /// (issue #248), when it was one.
+    root: Option<crate::url::RootRef>,
     /// The cache groups (RFC 9875).
     groups: Vec<String>,
     /// The `maxage:` cache lifetime (issue #159).
     max_age: Option<u32>,
+    /// The `exp:` the URL carries, when it carries one.
+    expiry: Option<Expiry>,
+}
+
+impl Resolved {
+    /// The remainder's own operations, without the
+    /// server-wide defaults.
+    fn own_ops(&self) -> &[crate::url::Operation] {
+        &self.ops[self.ops.len() - self.own_len..]
+    }
+
+    /// The source as the URL wrote it: a root reference as
+    /// written, never its expansion.
+    fn written_source(&self) -> String {
+        match &self.root {
+            Some(root) => root.written(),
+            None => self.source_url.clone(),
+        }
+    }
+}
+
+/// A URL's `exp:` second and the clock reading it was
+/// admitted at, in unix seconds.
+#[derive(Clone, Copy)]
+struct Expiry {
+    at: u64,
+    checked_at: u64,
+}
+
+/// The clock in whole unix seconds, the unit of `exp:`.
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The second stage of [`serve`]: expand and parse the
@@ -3481,6 +3535,10 @@ struct Resolved {
 /// what it may not ask for: a reserved segment, a preset
 /// or grammar failure, too many operations, an unknown
 /// source root, or an expired URL, in that order.
+///
+/// It and [`authenticate`] are the explain route's
+/// admission too ([`admit_explained`]), so a refusal added
+/// to either holds on both routes.
 fn resolve_request(
     state: &AppState,
     rest: &str,
@@ -3553,6 +3611,7 @@ fn resolve_request(
     // directive (format, quality, fill) by coming later. The
     // signature never covers the defaults: they are operator
     // configuration, not request content.
+    let own_len = ops.len();
     let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     // The operation cap (issue #469) counts this merged list,
     // the one the engine runs, and answers here: before the
@@ -3570,7 +3629,7 @@ fn resolve_request(
     // are one render, sharing a cache entry and a purge
     // target. The loader's checks evaluate the expanded
     // URL unchanged, the allowlist included.
-    let (source_url, _) =
+    let (source_url, root) =
         crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
@@ -3578,24 +3637,28 @@ fn resolve_request(
     // cache: an expired URL never serves, cached or not. The
     // comparison is exact: the URL is valid strictly before
     // its `exp` second.
-    if let Some(exp) = expiry {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now >= exp {
-            return Err(Refusal::AsIs((
-                StatusCode::FORBIDDEN,
-                "signature_expired",
-                "signature expired".to_string(),
-            )));
+    let expiry = match expiry {
+        Some(at) => {
+            let checked_at = unix_seconds();
+            if checked_at >= at {
+                return Err(Refusal::AsIs((
+                    StatusCode::FORBIDDEN,
+                    "signature_expired",
+                    "signature expired".to_string(),
+                )));
+            }
+            Some(Expiry { at, checked_at })
         }
-    }
+        None => None,
+    };
     Ok(Resolved {
         ops,
+        own_len,
         source_url,
+        root,
         groups,
         max_age,
+        expiry,
     })
 }
 
@@ -3837,22 +3900,62 @@ fn meta_flight_key(work: &MissWork) -> String {
 }
 
 /// The last stage of [`serve`]: serve the keyed request.
-/// A debug request runs the miss path on its own, a meta
-/// request coalesces through its own flights, and an image
-/// request reads the tiers and coalesces its miss.
+/// A debug request runs the miss path on its own, and a
+/// meta request coalesces through its own flights
+/// ([`serve_meta_flight`]).
+///
+/// An image request reads the tiers and coalesces its miss
+/// through its key's flight (audit R2-09): the first miss
+/// for a key leads (one fetch, one encode, under the miss
+/// path's gates); concurrent requests for the same key wait
+/// for the leader, then re-check the tiers and serve its
+/// entry. A leader whose result no tier stored (an error, a
+/// fallback, a render with the caches off) leaves its
+/// response in the flight's slot instead, and a waiter
+/// whose request is identical to the leader's answers with
+/// it (issue #407): it is the answer the waiter would have
+/// produced itself, and taking it keeps a burst on a
+/// failing origin at one fetch per flight rather than one
+/// per waiter. Identical means the same [`FlightIdentity`].
+/// The conditional header is left out of it: each waiter
+/// applies its own. A leader whose client goes away after
+/// its render has started still finishes the flight (see
+/// [`finish_started_miss`]). A waiter that cannot take the
+/// response (another spelling of the key, a body past the
+/// share cap, a leader whose request was dropped before its
+/// render started, a leader that forwent its fallback run
+/// because its client had gone, a run a purge of the key
+/// overtook) leads or follows the next flight. Waits are
+/// capped: a waiter whose flights keep ending without an
+/// answer for it stops queueing and runs the miss path
+/// itself (issue #375, [`own_miss`]), so it ends with the
+/// origin's real answer instead of a busy response masking
+/// it.
+///
+/// Each pass of the loop reads the tiers ([`answer_hit`]),
+/// takes what the flight it followed left for it
+/// ([`Following::take_shared`], [`answer_shared`]), and
+/// then leads the key's flight ([`lead_flight`]) or follows
+/// it ([`Following::wait`]). The loop stays in this function
+/// and the misses are awaited here: an async function holds
+/// its arguments for as long as it runs, so a stage of its
+/// own that takes the work would hold a second copy of it
+/// in every request's future.
 async fn run_flight(
     state: &Arc<AppState>,
     path: &str,
-    mut work: MissWork,
+    work: MissWork,
     if_none_match: Option<&str>,
-    mut record: OwedRecord,
+    record: OwedRecord,
 ) -> (Response, OwedRecord) {
     // The miss path is boxed at each of the four places this
-    // function reaches it (issue #638). Its future holds the
-    // loader's and the engine runner's state, about 20 KB.
-    // Awaited in line it made every request's future that
-    // large, and a request allocates and moves its future
-    // once, whether it goes on to miss or not.
+    // function reaches it (issue #638): the two below, and in
+    // the futures [`lead_flight`] and [`own_miss`] build. Its
+    // future holds the loader's and the engine runner's
+    // state, about 20 KB. Awaited in line it made every
+    // request's future that large, and a request allocates
+    // and moves its future once, whether it goes on to miss
+    // or not.
     // Debug requests bypass everything, per request.
     if work.debug {
         let (response, record, _) = Box::pin(serve_miss(state, work, record)).await;
@@ -3864,62 +3967,8 @@ async fn run_flight(
         let flight_key = meta_flight_key(&work);
         return Box::pin(serve_meta_flight(state, work, record, &flight_key)).await;
     }
-    // Singleflight (audit R2-09): the first miss for a key
-    // leads (one fetch, one encode, under the gates below);
-    // concurrent requests for the same key wait for the
-    // leader, then re-check the tiers and serve its entry.
-    // A leader whose result no tier stored (an error, a
-    // fallback, a render with the caches off) leaves its
-    // response in the flight's slot instead, and a waiter
-    // whose request is identical to the leader's answers
-    // with it (issue #407): it is the answer the waiter
-    // would have produced itself, and taking it keeps a
-    // burst on a failing origin at one fetch per flight
-    // rather than one per waiter. Identical means the same
-    // raw path (the sealing, the cache groups, and the
-    // cache lifetime all come from it) and the same header
-    // inputs as the miss path sees them: the negotiated
-    // format, not the raw Accept (on this path errors are
-    // plain text whatever it says), the quantized width,
-    // not the raw hint, and whether Save-Data applies, not
-    // the raw header, so browsers that phrase the same
-    // request differently still share one flight. The
-    // conditional header is left out: each waiter applies
-    // its own. A leader whose client goes away after its
-    // render has started still finishes the flight (see
-    // `finish_started_miss`). A waiter that cannot take
-    // the response (another spelling of the key, a body
-    // past the share cap, a leader whose request was
-    // dropped before its render started, a leader that
-    // forwent its fallback run because its client had
-    // gone, a run a purge of the key overtook) leads or
-    // follows the next flight.
-    // Waits are capped: a waiter whose flights
-    // keep ending without an answer for it stops queueing
-    // and runs the miss path itself (issue #375), so it
-    // ends with the origin's real answer instead of a busy
-    // response masking it.
-    let (preferred, dpr_hint, hinted_width, save_data) = (
-        work.preferred,
-        work.dpr_hint,
-        work.hinted_width,
-        work.save_data,
-    );
-    // That identity is built only by a request that leads
-    // or follows a flight (issue #641): a hit compares it
-    // with nothing. A follower builds it before it waits,
-    // and a leader once it holds the flight, never between
-    // a lookup that missed and the claim. Whatever a
-    // request does there widens the window in which the
-    // flight it would have followed can end unseen, and the
-    // request then leads a second flight for a render the
-    // first has just stored.
-    let flight_identity =
-        || format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
-    let mut flight_request: Option<String> = None;
-    let (max_age, sealed) = (work.max_age, work.sealed);
-    let mut waits = 0;
-    let mut followed: Option<Arc<FlightSlot>> = None;
+    let identity = FlightIdentity::of(path, &work);
+    let mut following = Following::default();
     // One disk budget for every tier check this request makes
     // (issue #572).
     let mut budget = DiskBudget::new();
@@ -3930,132 +3979,273 @@ async fn run_flight(
         if let Some((hit, cache_status)) =
             lookup_tiers_within(state, cache_key, groups, &mut budget).await
         {
-            record.cache_hit = true;
-            record.bytes_out = hit.bytes.len();
-            let mut response = respond(
-                hit.format,
-                hit.quality,
-                hit.bytes,
-                max_age,
-                state.client_hints,
-            );
-            attach_cache_headers(&mut response, cache_status, groups, sealed);
-            finalize_validators(&mut response, &hit.etag, if_none_match);
-            return (response, record);
+            return answer_hit(state, &work, hit, cache_status, if_none_match, record);
         }
-        let taken = followed
+        if let Some(shared) = following.take_shared(state, cache_key, groups) {
+            return answer_shared(&shared, if_none_match, record);
+        }
+        match state.inflight.lead(cache_key) {
+            Flight::Leader(guard, slot) => {
+                let request = following.request.take().unwrap_or_else(|| identity.text());
+                let (progress, lead) = lead_flight(state, work, guard, slot, request, record);
+                let answer = finish_started_miss(state, progress, lead).await;
+                return answer_miss(answer, if_none_match);
+            }
+            Flight::Follower(changed, slot) => {
+                if following.waits >= MAX_FLIGHT_WAITS {
+                    let (progress, miss) = own_miss(state, work, record);
+                    let answer = finish_started_miss(state, progress, miss).await;
+                    return answer_miss(answer, if_none_match);
+                }
+                following.wait(changed, slot, &identity).await;
+            }
+        }
+    }
+}
+
+/// What makes two image requests for one key identical for
+/// a flight's shared response (issue #407): the same raw
+/// path (the sealing, the cache groups, and the cache
+/// lifetime all come from it) and the same header inputs as
+/// the miss path sees them: the negotiated format, not the
+/// raw Accept (on this path errors are plain text whatever it
+/// says), the quantized width, not the raw hint, and whether
+/// Save-Data applies, not the raw header, so browsers that
+/// phrase the same request differently still share one
+/// flight.
+struct FlightIdentity<'a> {
+    path: &'a str,
+    preferred: Option<ImageFormat>,
+    dpr_hint: Option<f32>,
+    hinted_width: Option<u32>,
+    save_data: bool,
+}
+
+impl<'a> FlightIdentity<'a> {
+    fn of(path: &'a str, work: &MissWork) -> Self {
+        Self {
+            path,
+            preferred: work.preferred,
+            dpr_hint: work.dpr_hint,
+            hinted_width: work.hinted_width,
+            save_data: work.save_data,
+        }
+    }
+
+    /// The identity as a flight's slot records it
+    /// ([`SharedFlight::request`]).
+    ///
+    /// It is built only by a request that leads or follows a
+    /// flight (issue #641): a hit compares it with nothing. A
+    /// follower builds it before it waits, and a leader once
+    /// it holds the flight, never between a lookup that missed
+    /// and the claim. Whatever a request does there widens the
+    /// window in which the flight it would have followed can
+    /// end unseen, and the request then leads a second flight
+    /// for a render the first has just stored.
+    fn text(&self) -> String {
+        let Self {
+            path,
+            preferred,
+            dpr_hint,
+            hinted_width,
+            save_data,
+        } = self;
+        format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}")
+    }
+}
+
+/// An image request's part in the flights it has followed.
+#[derive(Default)]
+struct Following {
+    /// Its [`FlightIdentity`], once it has built it.
+    request: Option<String>,
+    /// How many flights it has waited on.
+    waits: u32,
+    /// The slot of the flight it waited on last, until the
+    /// next pass reads it.
+    slot: Option<Arc<FlightSlot>>,
+}
+
+impl Following {
+    /// The response the flight this request waited on last
+    /// left in its slot, when the request is identical to
+    /// the leader's and no purge covering the key has been
+    /// recorded since the leader's run began.
+    fn take_shared(
+        &mut self,
+        state: &AppState,
+        cache_key: &str,
+        groups: &[String],
+    ) -> Option<SharedFlight> {
+        self.slot
             .take()
             .and_then(|slot| {
                 slot.shared
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .filter(|shared| Some(&shared.request) == flight_request.as_ref())
+                    .filter(|shared| Some(&shared.request) == self.request.as_ref())
                     .cloned()
             })
             .filter(|shared| {
                 !state
                     .purge_guard
                     .purge_covers(shared.snapshot, cache_key, groups)
-            });
-        if let Some(shared) = taken {
-            record.bytes_out = shared.response.body.len();
-            record.fallback = shared.fallback;
-            let mut response = respond_shared(&shared.response);
-            if let Some(etag) = &shared.etag {
-                finalize_validators(&mut response, etag, if_none_match);
-            }
-            return (response, record);
-        }
-        match state.inflight.lead(cache_key) {
-            Flight::Leader(guard, slot) => {
-                let flight_request = flight_request.take().unwrap_or_else(flight_identity);
-                let snapshot = state.purge_guard.snapshot();
-                let progress = work.progress.clone();
-                let task_progress = progress.clone();
-                let task_state = state.clone();
-                // The render's disk write waits until the
-                // followers are woken (issue #572): they read
-                // the render from memory and never wait for it.
-                let handoff = DiskHandoff::default();
-                work.disk_handoff = Some(handoff.clone());
-                // The leader's whole part runs as one miss
-                // (see `finish_started_miss`): a render it
-                // starts is stored and answers the
-                // followers even when this request is gone,
-                // and the guard is held until it has. A
-                // miss that forwent a render for a client
-                // that had gone ends without its request's
-                // answer, so it shares nothing.
-                let lead = async move {
-                    let (response, record, render_etag) =
-                        Box::pin(serve_miss(&task_state, work, record)).await;
-                    let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
-                    if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
-                        *slot.shared.lock().unwrap() = Some(SharedFlight {
-                            request: flight_request,
-                            snapshot,
-                            response: shared,
-                            etag: render_etag.clone(),
-                            fallback: record.fallback,
-                        });
-                    }
-                    drop(guard);
-                    let pending = handoff.lock().unwrap().take();
-                    if let Some(pending) = pending {
-                        finish_disk_write(
-                            &task_state,
-                            pending.snapshot,
-                            &pending.key,
-                            &pending.entry,
-                            pending.claim,
-                            false,
-                        )
-                        .await;
-                    }
-                    (response, record, render_etag)
-                };
-                let (mut response, record, render_etag) =
-                    finish_started_miss(state, progress, lead).await;
-                if let Some(etag) = &render_etag {
-                    finalize_validators(&mut response, etag, if_none_match);
-                }
-                return (response, record);
-            }
-            Flight::Follower(mut changed, slot) => {
-                if waits >= MAX_FLIGHT_WAITS {
-                    // The wait cap is spent: run the miss
-                    // path, the same settlement the meta
-                    // flights use (issue #375). Shedding a
-                    // busy response here masked the origin's
-                    // real answer (its error, or a slow
-                    // success) behind a server_busy this
-                    // request never earned: the cap exists
-                    // to stop queueing behind failing leaders
-                    // forever, not to refuse a request that
-                    // has not had its own attempt.
-                    let progress = work.progress.clone();
-                    let task_state = state.clone();
-                    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
-                    let (mut response, record, render_etag) =
-                        finish_started_miss(state, progress, miss).await;
-                    if let Some(etag) = &render_etag {
-                        finalize_validators(&mut response, etag, if_none_match);
-                    }
-                    return (response, record);
-                }
-                waits += 1;
-                flight_request.get_or_insert_with(flight_identity);
-                // The leader always signals on drop; the
-                // timeout is only a backstop against a
-                // wedged leader, after which the waiter
-                // re-checks the tiers and may lead itself.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
-                    .await;
-                followed = Some(slot);
-            }
-        }
+            })
     }
+
+    /// Wait for the flight this request follows to end.
+    async fn wait(
+        &mut self,
+        mut changed: tokio::sync::watch::Receiver<bool>,
+        slot: Arc<FlightSlot>,
+        identity: &FlightIdentity<'_>,
+    ) {
+        self.waits += 1;
+        self.request.get_or_insert_with(|| identity.text());
+        // The leader always signals on drop; the timeout is
+        // only a backstop against a wedged leader, after which
+        // the waiter re-checks the tiers and may lead itself.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed()).await;
+        self.slot = Some(slot);
+    }
+}
+
+/// The answer to an image request from a tier hit.
+fn answer_hit(
+    state: &AppState,
+    work: &MissWork,
+    hit: CachedImage,
+    cache_status: &'static str,
+    if_none_match: Option<&str>,
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
+    record.cache_hit = true;
+    record.bytes_out = hit.bytes.len();
+    let mut response = respond(
+        hit.format,
+        hit.quality,
+        hit.bytes,
+        work.max_age,
+        state.client_hints,
+    );
+    attach_cache_headers(&mut response, cache_status, &work.groups, work.sealed);
+    finalize_validators(&mut response, &hit.etag, if_none_match);
+    (response, record)
+}
+
+/// The answer to an image request from the response the
+/// flight it followed shared (issue #407).
+fn answer_shared(
+    shared: &SharedFlight,
+    if_none_match: Option<&str>,
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
+    record.bytes_out = shared.response.body.len();
+    record.fallback = shared.fallback;
+    let mut response = respond_shared(&shared.response);
+    if let Some(etag) = &shared.etag {
+        finalize_validators(&mut response, etag, if_none_match);
+    }
+    (response, record)
+}
+
+/// The leader's part of the key's flight, as a miss to run
+/// (see [`finish_started_miss`]) with the progress it
+/// reports: run the miss, leave its response in the
+/// flight's slot for the followers (`request` is this
+/// request's [`FlightIdentity`]), wake them by dropping
+/// `guard`, and then finish the render's disk write.
+///
+/// The leader's whole part runs as one miss: a render it
+/// starts is stored and answers the followers even when
+/// this request is gone, and the guard is held until it
+/// has. A miss that forwent a render for a client that had
+/// gone ends without its request's answer, so it shares
+/// nothing.
+fn lead_flight(
+    state: &Arc<AppState>,
+    mut work: MissWork,
+    guard: LeaderGuard,
+    slot: Arc<FlightSlot>,
+    request: String,
+    record: OwedRecord,
+) -> (
+    MissProgress,
+    impl std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
+) {
+    let snapshot = state.purge_guard.snapshot();
+    let progress = work.progress.clone();
+    let task_progress = progress.clone();
+    let task_state = state.clone();
+    // The render's disk write waits until the followers are
+    // woken (issue #572): they read the render from memory
+    // and never wait for it.
+    let handoff = DiskHandoff::default();
+    work.disk_handoff = Some(handoff.clone());
+    let lead = async move {
+        let (response, record, render_etag) = Box::pin(serve_miss(&task_state, work, record)).await;
+        let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+        if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
+            *slot.shared.lock().unwrap() = Some(SharedFlight {
+                request,
+                snapshot,
+                response: shared,
+                etag: render_etag.clone(),
+                fallback: record.fallback,
+            });
+        }
+        drop(guard);
+        let pending = handoff.lock().unwrap().take();
+        if let Some(pending) = pending {
+            finish_disk_write(
+                &task_state,
+                pending.snapshot,
+                &pending.key,
+                &pending.entry,
+                pending.claim,
+                false,
+            )
+            .await;
+        }
+        (response, record, render_etag)
+    };
+    (progress, lead)
+}
+
+/// The miss of a request whose flight waits are spent, to
+/// run (see [`finish_started_miss`]) with the progress it
+/// reports: the same settlement the meta flights use (issue
+/// #375). Shedding a busy response here masked the origin's
+/// real answer (its error, or a slow success) behind a
+/// server_busy this request never earned: the cap exists to
+/// stop queueing behind failing leaders forever, not to
+/// refuse a request that has not had its own attempt.
+fn own_miss(
+    state: &Arc<AppState>,
+    work: MissWork,
+    record: OwedRecord,
+) -> (
+    MissProgress,
+    impl std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
+) {
+    let progress = work.progress.clone();
+    let task_state = state.clone();
+    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
+    (progress, miss)
+}
+
+/// A miss's answer to the request that ran it: the render's
+/// ETag answers the request's conditional headers.
+fn answer_miss(
+    (mut response, record, render_etag): (Response, OwedRecord, Option<String>),
+    if_none_match: Option<&str>,
+) -> (Response, OwedRecord) {
+    if let Some(etag) = &render_etag {
+        finalize_validators(&mut response, etag, if_none_match);
+    }
+    (response, record)
 }
 
 /// Run one image miss (`miss`: the miss path for a key,
@@ -6405,6 +6595,16 @@ fn reserved_remainder_parts() -> ErrorParts {
     )
 }
 
+/// The refusal for a signature that does not verify, and
+/// for a sealed spelling on the explain route.
+fn bad_signature_parts() -> ErrorParts {
+    (
+        StatusCode::FORBIDDEN,
+        "bad_signature",
+        "bad signature".to_string(),
+    )
+}
+
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.
 fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
@@ -6413,14 +6613,6 @@ fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
         e.code(),
         truncate_echo(&e.to_string()),
     )
-}
-
-/// A grammar failure's response: the parser's code and
-/// its (truncated) message, as plain text or the v2
-/// envelope per the client's Accept.
-fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
-    let (status, code, message) = parse_failure_parts(e);
-    error_response(status, code, message, accept)
 }
 
 /// The engine failure classes: status, stable code, and
