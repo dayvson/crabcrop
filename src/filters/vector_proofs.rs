@@ -191,12 +191,12 @@ fn sharpen_through_the_filter_matches_the_per_sample_sums() {
         let expected = old_filter3x3_rgb(&img, &sharpen_kernel(amount));
         let (out, _) = apply_filters(
             DynamicImage::ImageRgb8(img.clone()),
-            &[Filter::Sharpen(amount)],
+            &[PlainFilter::Sharpen(amount)],
         );
         assert_eq!(out.as_bytes(), expected.as_raw().as_slice(), "{amount}");
         let (out, _) = apply_filters(
             DynamicImage::ImageRgba8(rgba.clone()),
-            &[Filter::Sharpen(amount)],
+            &[PlainFilter::Sharpen(amount)],
         );
         let out = out.to_rgba8();
         for (ours, (color, original)) in out.pixels().zip(expected.pixels().zip(rgba.pixels())) {
@@ -215,7 +215,7 @@ fn old_grayscale(img: DynamicImage) -> DynamicImage {
 }
 
 fn new_grayscale(img: DynamicImage) -> DynamicImage {
-    apply_filters(img, &[Filter::Grayscale]).0
+    apply_filters(img, &[PlainFilter::Grayscale]).0
 }
 
 /// Saturation as it stood before issue #659.

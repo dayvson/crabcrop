@@ -17,7 +17,7 @@ fn opaque(w: u32, h: u32, color: [u8; 3]) -> DynamicImage {
 #[test]
 fn blur_at_the_sigma_cap_still_renders() {
     let img = opaque(16, 16, [120, 30, 200]);
-    let (out, _) = apply_filters(img, &[Filter::Blur(MAX_BLUR_SIGMA)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Blur(MAX_BLUR_SIGMA)]);
     assert_eq!((out.width(), out.height()), (16, 16));
 }
 
@@ -27,13 +27,13 @@ fn blur_sigma_guard_tames_out_of_contract_values() {
     assert_eq!(blur_sigma(1e9), MAX_BLUR_SIGMA);
     assert_eq!(blur_sigma(0.0), f32::MIN_POSITIVE);
     assert_eq!(blur_sigma(f32::NAN), f32::MIN_POSITIVE);
-    // A Filter built without the parser must not panic the
+    // A PlainFilter built without the parser must not panic the
     // image crate (subnormal sigma) or size a kernel by an
     // unbounded one.
     let img = opaque(8, 8, [10, 20, 30]);
-    let (out, _) = apply_filters(img.clone(), &[Filter::Blur(1e-45)]);
+    let (out, _) = apply_filters(img.clone(), &[PlainFilter::Blur(1e-45)]);
     assert_eq!((out.width(), out.height()), (8, 8));
-    let (out, _) = apply_filters(img, &[Filter::Blur(1e9)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Blur(1e9)]);
     assert_eq!((out.width(), out.height()), (8, 8));
 }
 
@@ -139,9 +139,9 @@ fn border_wider_than_half_paints_everything() {
 
 #[test]
 fn sepia_tones_with_the_standard_matrix() {
-    let (img, _) = apply_filters(solid(128, 128, 128), &[Filter::Sepia]);
+    let (img, _) = apply_filters(solid(128, 128, 128), &[PlainFilter::Sepia]);
     assert_eq!(first_pixel(&img), [173, 154, 120]);
-    let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::Sepia]);
+    let (img, _) = apply_filters(solid(0, 0, 0), &[PlainFilter::Sepia]);
     assert_eq!(first_pixel(&img), [0, 0, 0]);
 }
 
@@ -179,7 +179,7 @@ fn curve_identity_is_a_no_op() {
     ] {
         let (out, _) = apply_filters(
             img.clone(),
-            &[Filter::Curve(channel, vec![(0, 0), (255, 255)])],
+            &[PlainFilter::Curve(channel, vec![(0, 0), (255, 255)])],
         );
         assert_eq!(out.to_rgb8().into_raw(), before, "channel {channel:?}");
     }
@@ -193,7 +193,10 @@ fn curve_two_point_lift_matches_hand_computed_values() {
     let img = pixel_row(&[[0, 10, 20], [128, 10, 20], [255, 10, 20]]);
     let (out, _) = apply_filters(
         img,
-        &[Filter::Curve(CurveChannel::R, vec![(0, 64), (255, 255)])],
+        &[PlainFilter::Curve(
+            CurveChannel::R,
+            vec![(0, 64), (255, 255)],
+        )],
     );
     assert_eq!(
         row_rgb(&out),
@@ -210,10 +213,13 @@ fn curve_interpolation_rounds_half_away_from_zero() {
     let img = pixel_row(&[[0, 0, 0], [1, 0, 0], [2, 0, 0]]);
     let (out, _) = apply_filters(
         img.clone(),
-        &[Filter::Curve(CurveChannel::R, vec![(0, 0), (2, 1)])],
+        &[PlainFilter::Curve(CurveChannel::R, vec![(0, 0), (2, 1)])],
     );
     assert_eq!(row_rgb(&out), vec![[0, 0, 0], [1, 0, 0], [1, 0, 0]]);
-    let (out, _) = apply_filters(img, &[Filter::Curve(CurveChannel::R, vec![(0, 1), (2, 0)])]);
+    let (out, _) = apply_filters(
+        img,
+        &[PlainFilter::Curve(CurveChannel::R, vec![(0, 1), (2, 0)])],
+    );
     assert_eq!(row_rgb(&out), vec![[1, 0, 0], [0, 0, 0], [0, 0, 0]]);
 }
 
@@ -223,7 +229,10 @@ fn curve_channels_are_independent_and_alpha_survives() {
     img.as_mut_rgba8().unwrap().get_pixel_mut(0, 0).0 = [100, 150, 200, 77];
     let (out, _) = apply_filters(
         img,
-        &[Filter::Curve(CurveChannel::R, vec![(0, 64), (255, 255)])],
+        &[PlainFilter::Curve(
+            CurveChannel::R,
+            vec![(0, 64), (255, 255)],
+        )],
     );
     // Red: 64 + round(191 * 100 / 255) = 64 + 75 = 139.
     // Green, blue, and alpha are not the curve's business.
@@ -247,7 +256,10 @@ fn curve_clamps_outside_the_point_range() {
     ]);
     let (out, _) = apply_filters(
         img,
-        &[Filter::Curve(CurveChannel::Rgb, vec![(32, 10), (224, 245)])],
+        &[PlainFilter::Curve(
+            CurveChannel::Rgb,
+            vec![(32, 10), (224, 245)],
+        )],
     );
     let mapped: Vec<u8> = row_rgb(&out).iter().map(|p| p[0]).collect();
     assert_eq!(mapped, vec![10, 10, 10, 93, 128, 245, 245]);
@@ -262,7 +274,7 @@ fn curve_uses_the_segment_around_the_input() {
     let img = pixel_row(&[[64, 64, 64], [128, 128, 128], [200, 200, 200]]);
     let (out, _) = apply_filters(
         img,
-        &[Filter::Curve(
+        &[PlainFilter::Curve(
             CurveChannel::Rgb,
             vec![(0, 0), (128, 255), (255, 255)],
         )],
@@ -282,8 +294,8 @@ fn curves_compose_in_chain_order() {
     let (out, _) = apply_filters(
         img,
         &[
-            Filter::Curve(CurveChannel::Rgb, vec![(0, 0), (255, 128)]),
-            Filter::Curve(CurveChannel::R, vec![(0, 0), (128, 255)]),
+            PlainFilter::Curve(CurveChannel::Rgb, vec![(0, 0), (255, 128)]),
+            PlainFilter::Curve(CurveChannel::R, vec![(0, 0), (128, 255)]),
         ],
     );
     assert_eq!(row_rgb(&out), vec![[255, 128, 128]]);
@@ -325,7 +337,7 @@ fn convolution_identity_is_a_no_op() {
         (vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], true),
         (identity5, false),
     ] {
-        let (out, _) = apply_filters(img.clone(), &[Filter::Convolution(kernel.0, kernel.1)]);
+        let (out, _) = apply_filters(img.clone(), &[PlainFilter::Convolution(kernel.0, kernel.1)]);
         assert_eq!(out.to_rgb8().into_raw(), before);
     }
 }
@@ -340,7 +352,7 @@ fn convolution_sharpen_matches_hand_computed_pixels() {
     let img = gray_grid(&[&[0, 10, 0], &[10, 50, 10], &[0, 10, 0]]);
     let (out, _) = apply_filters(
         img,
-        &[Filter::Convolution(
+        &[PlainFilter::Convolution(
             vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
             false,
         )],
@@ -357,7 +369,7 @@ fn convolution_normalized_box_averages_the_window() {
     // average over the edge-replicated window: the center
     // is 360 / 9 = 40, the corner counts its replicated
     // taps (120 / 9, rounding to 13), and so on.
-    let (out, _) = apply_filters(gradient(), &[Filter::Convolution(vec![1.0; 9], true)]);
+    let (out, _) = apply_filters(gradient(), &[PlainFilter::Convolution(vec![1.0; 9], true)]);
     assert_eq!(
         gray_values(&out),
         vec![vec![13, 20, 27], vec![33, 40, 47], vec![53, 60, 67]]
@@ -366,7 +378,7 @@ fn convolution_normalized_box_averages_the_window() {
     // averages to 5 / 9 = 0.55..., which rounds up to 1
     // in every window (each contains the 5 exactly once).
     let lone = gray_grid(&[&[0, 0, 0], &[0, 5, 0], &[0, 0, 0]]);
-    let (out, _) = apply_filters(lone, &[Filter::Convolution(vec![1.0; 9], true)]);
+    let (out, _) = apply_filters(lone, &[PlainFilter::Convolution(vec![1.0; 9], true)]);
     assert_eq!(
         gray_values(&out),
         vec![vec![1, 1, 1], vec![1, 1, 1], vec![1, 1, 1]]
@@ -378,7 +390,7 @@ fn convolution_unnormalized_box_sums_and_clamps() {
     // The same kernel without normalize sums the window:
     // the top row stays under the ceiling, everything
     // from the middle row down clamps at 255.
-    let (out, _) = apply_filters(gradient(), &[Filter::Convolution(vec![1.0; 9], false)]);
+    let (out, _) = apply_filters(gradient(), &[PlainFilter::Convolution(vec![1.0; 9], false)]);
     assert_eq!(
         gray_values(&out),
         vec![
@@ -396,8 +408,11 @@ fn convolution_zero_sum_kernel_ignores_normalize() {
     // kernel exactly as written (center: the cross taps
     // sum to 10 + 30 + 50 + 70 = 160, minus 4 * 40, is 0).
     let kernel = vec![0.0, 1.0, 0.0, 1.0, -4.0, 1.0, 0.0, 1.0, 0.0];
-    let (plain, _) = apply_filters(gradient(), &[Filter::Convolution(kernel.clone(), false)]);
-    let (normalized, _) = apply_filters(gradient(), &[Filter::Convolution(kernel, true)]);
+    let (plain, _) = apply_filters(
+        gradient(),
+        &[PlainFilter::Convolution(kernel.clone(), false)],
+    );
+    let (normalized, _) = apply_filters(gradient(), &[PlainFilter::Convolution(kernel, true)]);
     assert_eq!(plain.to_rgb8().into_raw(), normalized.to_rgb8().into_raw());
     assert_eq!(gray_values(&normalized)[1][1], 0);
 }
@@ -416,7 +431,7 @@ fn convolution_five_by_five_applies_its_taps() {
     ]);
     let mut kernel = vec![0.0; 25];
     kernel[0] = 1.0;
-    let (out, _) = apply_filters(img, &[Filter::Convolution(kernel, false)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Convolution(kernel, false)]);
     assert_eq!(
         gray_values(&out),
         vec![
@@ -437,7 +452,7 @@ fn convolution_edges_replicate_at_the_corners() {
     let img = gray_grid(&[&[10, 20], &[30, 40]]);
     let (out, _) = apply_filters(
         img,
-        &[Filter::Convolution(
+        &[PlainFilter::Convolution(
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             false,
         )],
@@ -454,12 +469,15 @@ fn convolution_decimal_kernel_matches_hand_computed_values() {
     let gaussian = vec![
         0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625,
     ];
-    let (out, _) = apply_filters(gradient(), &[Filter::Convolution(gaussian.clone(), false)]);
+    let (out, _) = apply_filters(
+        gradient(),
+        &[PlainFilter::Convolution(gaussian.clone(), false)],
+    );
     assert_eq!(gray_values(&out)[1][1], 40);
     // On a flat field the weights summing to 1 leave the
     // value alone, exactly (every weight is dyadic).
     let flat = gray_grid(&[&[80, 80, 80], &[80, 80, 80], &[80, 80, 80]]);
-    let (out, _) = apply_filters(flat, &[Filter::Convolution(gaussian, false)]);
+    let (out, _) = apply_filters(flat, &[PlainFilter::Convolution(gaussian, false)]);
     assert_eq!(
         gray_values(&out),
         vec![vec![80, 80, 80], vec![80, 80, 80], vec![80, 80, 80]]
@@ -478,7 +496,7 @@ fn convolution_never_touches_alpha() {
     for (i, p) in img.as_mut_rgba8().unwrap().pixels_mut().enumerate() {
         *p = image::Rgba(px[i]);
     }
-    let (out, _) = apply_filters(img, &[Filter::Convolution(vec![1.0; 9], true)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Convolution(vec![1.0; 9], true)]);
     let rgba = out.to_rgba8();
     // The box average at (0, 0) weights the corner pixel
     // four times, its edge neighbors twice, and the far
@@ -496,12 +514,12 @@ fn noise_zero_is_a_byte_identical_no_op() {
         *p = image::Rgba([10 + 30 * i as u8, 20 + 20 * i as u8, 30 + 10 * i as u8, 77]);
     }
     let before = img.to_rgba8().into_raw();
-    let (out, _) = apply_filters(img, &[Filter::Noise(0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Noise(0)]);
     assert!(matches!(out, DynamicImage::ImageRgba8(_)));
     assert_eq!(out.to_rgba8().into_raw(), before);
     let img = striped();
     let before = img.to_rgb8().into_raw();
-    let (out, _) = apply_filters(img, &[Filter::Noise(0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Noise(0)]);
     assert_eq!(out.to_rgb8().into_raw(), before);
 }
 
@@ -517,12 +535,12 @@ fn noise_matches_the_documented_generator() {
     // and -238 (the last pixel clamps at 0), and the
     // amount-40 draws give -61, +20, and +22.
     let img = pixel_row(&[[10, 20, 30], [100, 110, 120], [200, 210, 220]]);
-    let (out, _) = apply_filters(img.clone(), &[Filter::Noise(100)]);
+    let (out, _) = apply_filters(img.clone(), &[PlainFilter::Noise(100)]);
     assert_eq!(
         row_rgb(&out),
         vec![[230, 240, 250], [231, 241, 251], [0, 0, 0]]
     );
-    let (out, _) = apply_filters(img, &[Filter::Noise(40)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Noise(40)]);
     assert_eq!(
         row_rgb(&out),
         vec![[0, 0, 0], [120, 130, 140], [222, 232, 242]]
@@ -535,10 +553,10 @@ fn noise_is_deterministic_and_depends_on_the_amount() {
     // every run; a different amount is a different
     // field (and a different image).
     let img = striped();
-    let (a, _) = apply_filters(img.clone(), &[Filter::Noise(60)]);
-    let (b, _) = apply_filters(img.clone(), &[Filter::Noise(60)]);
+    let (a, _) = apply_filters(img.clone(), &[PlainFilter::Noise(60)]);
+    let (b, _) = apply_filters(img.clone(), &[PlainFilter::Noise(60)]);
     assert_eq!(a.to_rgb8().into_raw(), b.to_rgb8().into_raw());
-    let (c, _) = apply_filters(img, &[Filter::Noise(61)]);
+    let (c, _) = apply_filters(img, &[PlainFilter::Noise(61)]);
     assert_ne!(a.to_rgb8().into_raw(), c.to_rgb8().into_raw());
 }
 
@@ -547,7 +565,7 @@ fn noise_full_strength_moves_a_flat_field_both_ways() {
     // On a flat mid-gray field at 100, some pixels land
     // above 128 and some below: the field swings both
     // ways and stays inside the byte range by clamping.
-    let (out, _) = apply_filters(opaque(64, 64, [128, 128, 128]), &[Filter::Noise(100)]);
+    let (out, _) = apply_filters(opaque(64, 64, [128, 128, 128]), &[PlainFilter::Noise(100)]);
     let raw = out.to_rgb8().into_raw();
     assert!(raw.iter().any(|&v| v > 128));
     assert!(raw.iter().any(|&v| v < 128));
@@ -575,7 +593,7 @@ fn noise_is_monochrome_and_preserves_alpha() {
     for (i, p) in img.as_mut_rgba8().unwrap().pixels_mut().enumerate() {
         *p = image::Rgba(src[i]);
     }
-    let (out, _) = apply_filters(img, &[Filter::Noise(20)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Noise(20)]);
     let rgba = out.to_rgba8();
     for (x, s) in src.iter().enumerate() {
         let o = rgba.get_pixel(x as u32, 0).0;
@@ -658,14 +676,17 @@ fn flip_mirrors_both_ways() {
     img.as_mut_rgb8().unwrap().get_pixel_mut(1, 0).0 = [0, 0, 255];
     let (out, _) = apply_filters(
         img.clone(),
-        &[Filter::Flip(crate::url::FlipDirection::Horizontal)],
+        &[PlainFilter::Flip(crate::url::FlipDirection::Horizontal)],
     );
     assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [0, 0, 255]);
     assert_eq!(out.to_rgb8().get_pixel(1, 0).0, [255, 0, 0]);
     let mut img = DynamicImage::new_rgb8(1, 2);
     img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = [255, 0, 0];
     img.as_mut_rgb8().unwrap().get_pixel_mut(0, 1).0 = [0, 0, 255];
-    let (out, _) = apply_filters(img, &[Filter::Flip(crate::url::FlipDirection::Vertical)]);
+    let (out, _) = apply_filters(
+        img,
+        &[PlainFilter::Flip(crate::url::FlipDirection::Vertical)],
+    );
     assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [0, 0, 255]);
     assert_eq!(out.to_rgb8().get_pixel(0, 1).0, [255, 0, 0]);
 }
@@ -1112,10 +1133,10 @@ fn later_directives_win() {
     let (img, opts) = apply_filters(
         striped(),
         &[
-            Filter::Quality(Quality::Value(10)),
-            Filter::Quality(Quality::Value(90)),
-            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
-            Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
+            PlainFilter::Quality(Quality::Value(10)),
+            PlainFilter::Quality(Quality::Value(90)),
+            PlainFilter::Format(FormatSpec::plain(ImageFormat::Png)),
+            PlainFilter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
         ],
     );
     assert_eq!((img.width(), img.height()), (64, 64));
@@ -1137,7 +1158,7 @@ fn later_directives_win() {
 #[test]
 fn no_upscale_is_collected_as_a_directive() {
     let img = DynamicImage::new_rgb8(8, 8);
-    let (_, opts) = apply_filters(img, &[Filter::NoUpscale]);
+    let (_, opts) = apply_filters(img, &[PlainFilter::NoUpscale]);
     assert!(opts.no_upscale);
 }
 
@@ -1149,7 +1170,7 @@ fn sharpen_increases_edge_contrast() {
         let v = if x < 8 { 100 } else { 200 };
         *p = Rgb([v, v, v]);
     }
-    let (img, _) = apply_filters(img, &[Filter::Sharpen(1.0)]);
+    let (img, _) = apply_filters(img, &[PlainFilter::Sharpen(1.0)]);
     let rgb = img.into_rgb8();
     let left = rgb.get_pixel(7, 8)[0] as i32;
     let right = rgb.get_pixel(8, 8)[0] as i32;
@@ -1158,20 +1179,20 @@ fn sharpen_increases_edge_contrast() {
 
 #[test]
 fn saturation_scales_color() {
-    let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::Saturation(0.0)]);
+    let (img, _) = apply_filters(solid(200, 100, 50), &[PlainFilter::Saturation(0.0)]);
     let p = first_pixel(&img);
     assert_eq!(p[0], p[1]);
     assert_eq!(p[1], p[2]);
-    let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::Saturation(1.0)]);
+    let (img, _) = apply_filters(solid(200, 100, 50), &[PlainFilter::Saturation(1.0)]);
     assert_eq!(first_pixel(&img), [200, 100, 50]);
-    let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::Saturation(2.0)]);
+    let (img, _) = apply_filters(solid(200, 100, 50), &[PlainFilter::Saturation(2.0)]);
     let p = first_pixel(&img);
     assert!(p[0] as i32 - p[2] as i32 > 150, "pixel {p:?}");
 }
 
 #[test]
 fn rgb_offsets_channels() {
-    let (img, _) = apply_filters(solid(100, 100, 100), &[Filter::Rgb(50, -30, 0)]);
+    let (img, _) = apply_filters(solid(100, 100, 100), &[PlainFilter::Rgb(50, -30, 0)]);
     assert_eq!(first_pixel(&img), [150, 70, 100]);
 }
 
@@ -1183,7 +1204,7 @@ fn equalize_spreads_the_range() {
         let v = 100 + ((x + y) % 8) as u8;
         *p = Rgb([v, v, v]);
     }
-    let (img, _) = apply_filters(img, &[Filter::Equalize]);
+    let (img, _) = apply_filters(img, &[PlainFilter::Equalize]);
     let rgb = img.into_rgb8();
     let min = rgb.pixels().map(|p| p[0]).min().unwrap();
     let max = rgb.pixels().map(|p| p[0]).max().unwrap();
@@ -1195,7 +1216,7 @@ fn equalize_spreads_the_range() {
 fn rotate_45_expands_the_canvas_and_fills_corners() {
     let img = DynamicImage::ImageRgb8(solid(255, 0, 0).to_rgb8());
     let img = img.resize_exact(4, 2, image::imageops::FilterType::Nearest);
-    let (out, _) = apply_filters(img, &[Filter::Rotate(45.0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Rotate(45.0)]);
     // ceil(4*cos45 + 2*sin45) = ceil(4.243) = 5 on both axes.
     assert_eq!((out.width(), out.height()), (5, 5));
     let rgb = out.to_rgb8();
@@ -1212,7 +1233,7 @@ fn rotate_45_uses_the_request_fill_for_corners() {
         2,
         image::imageops::FilterType::Nearest,
     );
-    let (out, _) = apply_filters_filled(img, &[Filter::Rotate(45.0)], Some([10, 20, 30]));
+    let (out, _) = apply_filters_filled(img, &[PlainFilter::Rotate(45.0)], Some([10, 20, 30]));
     assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [10, 20, 30]);
 }
 
@@ -1222,7 +1243,7 @@ fn rotate_45_keeps_alpha_corners_transparent() {
     for p in rgba.pixels_mut() {
         *p = image::Rgba([255, 0, 0, 255]);
     }
-    let (out, _) = apply_filters(DynamicImage::ImageRgba8(rgba), &[Filter::Rotate(45.0)]);
+    let (out, _) = apply_filters(DynamicImage::ImageRgba8(rgba), &[PlainFilter::Rotate(45.0)]);
     let rgba = out.to_rgba8();
     assert_eq!(rgba.get_pixel(0, 0).0[3], 0);
     assert_eq!(rgba.get_pixel(2, 2).0, [255, 0, 0, 255]);
@@ -1234,7 +1255,7 @@ fn rotate_positive_angles_turn_clockwise() {
     // a positive (clockwise) rotation, matching rotate90.
     let mut rgb = image::RgbImage::new(20, 20);
     rgb.put_pixel(10, 2, image::Rgb([255, 0, 0]));
-    let (out, _) = apply_filters(DynamicImage::ImageRgb8(rgb), &[Filter::Rotate(45.0)]);
+    let (out, _) = apply_filters(DynamicImage::ImageRgb8(rgb), &[PlainFilter::Rotate(45.0)]);
     let rgb = out.to_rgb8();
     // Track the reddest pixel (the white corners have no
     // red-over-green excess).
@@ -1253,7 +1274,7 @@ fn rotate_positive_angles_turn_clockwise() {
 
 #[test]
 fn rotate_full_turns_are_identity() {
-    let (out, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(360.0)]);
+    let (out, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[PlainFilter::Rotate(360.0)]);
     assert_eq!((out.width(), out.height()), (4, 2));
 }
 
@@ -1276,7 +1297,10 @@ fn rotations_land_on_the_predicted_canvas() {
         (7, 3, 359.9),
         (7, 3, 0.0001),
     ] {
-        let (out, _) = apply_filters(DynamicImage::new_rgb8(w, h), &[Filter::Rotate(degrees)]);
+        let (out, _) = apply_filters(
+            DynamicImage::new_rgb8(w, h),
+            &[PlainFilter::Rotate(degrees)],
+        );
         assert_eq!(
             (out.width(), out.height()),
             rotated_canvas(w, h, degrees),
@@ -1289,11 +1313,11 @@ fn rotations_land_on_the_predicted_canvas() {
 
 #[test]
 fn rotate_swaps_dimensions() {
-    let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(90.0)]);
+    let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[PlainFilter::Rotate(90.0)]);
     assert_eq!((img.width(), img.height()), (2, 4));
-    let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(-90.0)]);
+    let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[PlainFilter::Rotate(-90.0)]);
     assert_eq!((img.width(), img.height()), (2, 4));
-    let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(180.0)]);
+    let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[PlainFilter::Rotate(180.0)]);
     assert_eq!((img.width(), img.height()), (4, 2));
 }
 
@@ -1301,7 +1325,10 @@ fn rotate_swaps_dimensions() {
 fn fill_and_max_bytes_are_collected() {
     let (_, opts) = apply_filters(
         solid(1, 2, 3),
-        &[Filter::Fill([255, 136, 0]), Filter::MaxBytes(5000)],
+        &[
+            PlainFilter::Fill([255, 136, 0]),
+            PlainFilter::MaxBytes(5000),
+        ],
     );
     assert_eq!(opts.fill, Some([255, 136, 0]));
     assert_eq!(opts.max_bytes, Some(5000));
@@ -1354,7 +1381,7 @@ fn empty_filters_are_noop() {
 
 #[test]
 fn grayscale_desaturates() {
-    let (img, _) = apply_filters(striped(), &[Filter::Grayscale]);
+    let (img, _) = apply_filters(striped(), &[PlainFilter::Grayscale]);
     for p in img.into_rgb8().pixels() {
         assert_eq!(p[0], p[1]);
         assert_eq!(p[1], p[2]);
@@ -1372,13 +1399,13 @@ fn rgba_mixed() -> DynamicImage {
 
 #[test]
 fn color_filters_preserve_alpha() {
-    let cases: [(&str, Filter); 6] = [
-        ("grayscale", Filter::Grayscale),
-        ("contrast", Filter::Contrast(2.0)),
-        ("sharpen", Filter::Sharpen(1.0)),
-        ("saturation", Filter::Saturation(0.5)),
-        ("rgb", Filter::Rgb(10, -10, 20)),
-        ("equalize", Filter::Equalize),
+    let cases: [(&str, PlainFilter); 6] = [
+        ("grayscale", PlainFilter::Grayscale),
+        ("contrast", PlainFilter::Contrast(2.0)),
+        ("sharpen", PlainFilter::Sharpen(1.0)),
+        ("saturation", PlainFilter::Saturation(0.5)),
+        ("rgb", PlainFilter::Rgb(10, -10, 20)),
+        ("equalize", PlainFilter::Equalize),
     ];
     for (name, filter) in cases {
         let (out, _) = apply_filters(rgba_mixed(), std::slice::from_ref(&filter));
@@ -1398,7 +1425,10 @@ fn grayscale_then_radius_keeps_alpha_and_gray() {
     for p in img.as_mut_rgba8().unwrap().pixels_mut() {
         *p = image::Rgba([200, 120, 60, 255]);
     }
-    let (out, _) = apply_filters(img, &[Filter::Grayscale, Filter::Radius([8, 8, 8, 8])]);
+    let (out, _) = apply_filters(
+        img,
+        &[PlainFilter::Grayscale, PlainFilter::Radius([8, 8, 8, 8])],
+    );
     assert!(out.color().has_alpha());
     assert_eq!(alpha_at(&out, 0, 0), 0);
     let rgba = out.to_rgba8();
@@ -1410,19 +1440,19 @@ fn grayscale_then_radius_keeps_alpha_and_gray() {
 
 #[test]
 fn invert_flips_channels() {
-    let (img, _) = apply_filters(solid(10, 128, 250), &[Filter::Invert]);
+    let (img, _) = apply_filters(solid(10, 128, 250), &[PlainFilter::Invert]);
     assert_eq!(first_pixel(&img), [245, 127, 5]);
 }
 
 #[test]
 fn brighten_shifts_and_clamps() {
-    let (img, _) = apply_filters(solid(100, 150, 200), &[Filter::Brighten(10)]);
+    let (img, _) = apply_filters(solid(100, 150, 200), &[PlainFilter::Brighten(10)]);
     assert_eq!(first_pixel(&img), [110, 160, 210]);
 
-    let (img, _) = apply_filters(solid(200, 200, 200), &[Filter::Brighten(100)]);
+    let (img, _) = apply_filters(solid(200, 200, 200), &[PlainFilter::Brighten(100)]);
     assert_eq!(first_pixel(&img), [255, 255, 255]);
 
-    let (img, _) = apply_filters(solid(100, 150, 200), &[Filter::Brighten(-300)]);
+    let (img, _) = apply_filters(solid(100, 150, 200), &[PlainFilter::Brighten(-300)]);
     assert_eq!(first_pixel(&img), [0, 0, 0]);
 }
 
@@ -1433,7 +1463,7 @@ fn blur_smooths_a_hard_edge() {
         let v = if x < 16 { 0 } else { 255 };
         *p = Rgb([v, v, v]);
     }
-    let (img, _) = apply_filters(img, &[Filter::Blur(2.0)]);
+    let (img, _) = apply_filters(img, &[PlainFilter::Blur(2.0)]);
     let rgb = img.into_rgb8();
     // Pixels hugging the edge are now a blend of black and white.
     for (x, y, p) in rgb.enumerate_pixels() {
@@ -1445,13 +1475,13 @@ fn blur_smooths_a_hard_edge() {
 
 #[test]
 fn huerotate_rotates_and_comes_back() {
-    let (img, _) = apply_filters(solid(255, 0, 0), &[Filter::HueRotate(90)]);
+    let (img, _) = apply_filters(solid(255, 0, 0), &[PlainFilter::HueRotate(90)]);
     let px = first_pixel(&img);
     // The hue moved: pure red is gone.
     assert_ne!(px, [255, 0, 0]);
 
     // A full turn is (approximately) the identity.
-    let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::HueRotate(360)]);
+    let (img, _) = apply_filters(solid(200, 100, 50), &[PlainFilter::HueRotate(360)]);
     let px = first_pixel(&img);
     for (got, want) in px.iter().zip([200, 100, 50]) {
         assert!((*got as i16 - want as i16).abs() <= 1, "pixel = {px:?}");
@@ -1460,11 +1490,11 @@ fn huerotate_rotates_and_comes_back() {
 
 #[test]
 fn contrast_pushes_values_from_mid_gray() {
-    let (img, _) = apply_filters(solid(100, 100, 100), &[Filter::Contrast(2.0)]);
+    let (img, _) = apply_filters(solid(100, 100, 100), &[PlainFilter::Contrast(2.0)]);
     let px = first_pixel(&img);
     assert!(px[0] < 100, "pixel = {px:?}");
 
-    let (img, _) = apply_filters(solid(200, 200, 200), &[Filter::Contrast(2.0)]);
+    let (img, _) = apply_filters(solid(200, 200, 200), &[PlainFilter::Contrast(2.0)]);
     let px = first_pixel(&img);
     assert!(px[0] > 200, "pixel = {px:?}");
 }
@@ -1475,7 +1505,7 @@ fn gamma_one_is_the_identity() {
     for (i, entry) in lut.iter().enumerate() {
         assert_eq!(*entry, i as u8);
     }
-    let (img, _) = apply_filters(solid(37, 128, 250), &[Filter::Gamma(1.0)]);
+    let (img, _) = apply_filters(solid(37, 128, 250), &[PlainFilter::Gamma(1.0)]);
     assert_eq!(first_pixel(&img), [37, 128, 250]);
 }
 
@@ -1483,12 +1513,12 @@ fn gamma_one_is_the_identity() {
 fn gamma_moves_midtones_and_keeps_the_endpoints() {
     // 255 * (64 / 255)^(1/2) rounds to 128; squared
     // (gamma 0.5) it rounds to 16.
-    let (img, _) = apply_filters(solid(64, 64, 64), &[Filter::Gamma(2.0)]);
+    let (img, _) = apply_filters(solid(64, 64, 64), &[PlainFilter::Gamma(2.0)]);
     assert_eq!(first_pixel(&img), [128, 128, 128]);
-    let (img, _) = apply_filters(solid(64, 64, 64), &[Filter::Gamma(0.5)]);
+    let (img, _) = apply_filters(solid(64, 64, 64), &[PlainFilter::Gamma(0.5)]);
     assert_eq!(first_pixel(&img), [16, 16, 16]);
     for gamma in [0.45, 2.2, 10.0] {
-        let (img, _) = apply_filters(solid(0, 255, 0), &[Filter::Gamma(gamma)]);
+        let (img, _) = apply_filters(solid(0, 255, 0), &[PlainFilter::Gamma(gamma)]);
         assert_eq!(first_pixel(&img), [0, 255, 0], "gamma {gamma}");
     }
     // The table is monotone at the extremes of the range.
@@ -1505,7 +1535,7 @@ fn gamma_preserves_alpha() {
         2,
         image::Rgba([64, 32, 16, 128]),
     ));
-    let (out, _) = apply_filters(img, &[Filter::Gamma(2.0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Gamma(2.0)]);
     let px = out.to_rgba8().get_pixel(0, 0).0;
     assert_eq!(px[3], 128);
     assert_eq!(px[0], 128);
@@ -1529,7 +1559,7 @@ fn exposure_zero_stops_is_the_identity() {
     for (i, entry) in lut.iter().enumerate() {
         assert_eq!(*entry, i as u8);
     }
-    let (img, _) = apply_filters(solid(37, 128, 250), &[Filter::Exposure(0.0)]);
+    let (img, _) = apply_filters(solid(37, 128, 250), &[PlainFilter::Exposure(0.0)]);
     assert_eq!(first_pixel(&img), [37, 128, 250]);
 }
 
@@ -1543,24 +1573,24 @@ fn exposure_multiplies_in_linear_light() {
     // 106: the same stop count moves shadows less than
     // highlights in encoded values, which is the point
     // of working in linear light.
-    let (img, _) = apply_filters(solid(128, 128, 128), &[Filter::Exposure(1.0)]);
+    let (img, _) = apply_filters(solid(128, 128, 128), &[PlainFilter::Exposure(1.0)]);
     assert_eq!(first_pixel(&img), [176, 176, 176]);
-    let (img, _) = apply_filters(solid(128, 128, 128), &[Filter::Exposure(-1.0)]);
+    let (img, _) = apply_filters(solid(128, 128, 128), &[PlainFilter::Exposure(-1.0)]);
     assert_eq!(first_pixel(&img), [92, 92, 92]);
-    let (img, _) = apply_filters(solid(64, 64, 64), &[Filter::Exposure(2.0)]);
+    let (img, _) = apply_filters(solid(64, 64, 64), &[PlainFilter::Exposure(2.0)]);
     assert_eq!(first_pixel(&img), [125, 125, 125]);
-    let (img, _) = apply_filters(solid(200, 200, 200), &[Filter::Exposure(-2.0)]);
+    let (img, _) = apply_filters(solid(200, 200, 200), &[PlainFilter::Exposure(-2.0)]);
     assert_eq!(first_pixel(&img), [106, 106, 106]);
     // Black stays black at any setting; white stays
     // white under brightening and gives ground only
     // under darkening (255 at minus one stop is 188).
     for stops in [-10.0, -1.0, 0.5, 3.0, 10.0] {
-        let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::Exposure(stops)]);
+        let (img, _) = apply_filters(solid(0, 0, 0), &[PlainFilter::Exposure(stops)]);
         assert_eq!(first_pixel(&img), [0, 0, 0], "stops {stops}");
     }
-    let (img, _) = apply_filters(solid(255, 255, 255), &[Filter::Exposure(1.0)]);
+    let (img, _) = apply_filters(solid(255, 255, 255), &[PlainFilter::Exposure(1.0)]);
     assert_eq!(first_pixel(&img), [255, 255, 255]);
-    let (img, _) = apply_filters(solid(255, 255, 255), &[Filter::Exposure(-1.0)]);
+    let (img, _) = apply_filters(solid(255, 255, 255), &[PlainFilter::Exposure(-1.0)]);
     assert_eq!(first_pixel(&img), [188, 188, 188]);
     // The table is monotone across the range.
     for stops in [-10.0, -0.5, 0.5, 10.0] {
@@ -1576,7 +1606,7 @@ fn exposure_preserves_alpha() {
         2,
         image::Rgba([128, 64, 32, 128]),
     ));
-    let (out, _) = apply_filters(img, &[Filter::Exposure(1.0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Exposure(1.0)]);
     let px = out.to_rgba8().get_pixel(0, 0).0;
     assert_eq!(px[3], 128);
     assert_eq!(px[0], 176);
@@ -1597,7 +1627,10 @@ fn exposure_lut_sanitizes_out_of_contract_values() {
 
 #[test]
 fn highlights_shadows_zero_zero_is_the_identity() {
-    let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::HighlightsShadows(0.0, 0.0)]);
+    let (img, _) = apply_filters(
+        solid(200, 100, 50),
+        &[PlainFilter::HighlightsShadows(0.0, 0.0)],
+    );
     assert_eq!(first_pixel(&img), [200, 100, 50]);
 }
 
@@ -1606,21 +1639,27 @@ fn highlights_shadows_move_their_own_ends() {
     // Pure black under full shadows lifts by the full
     // quarter scale, 64 levels; under full highlights
     // it does not move at all.
-    let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 100.0)]);
+    let (img, _) = apply_filters(
+        solid(0, 0, 0),
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
+    );
     assert_eq!(first_pixel(&img), [64, 64, 64]);
-    let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(100.0, 0.0)]);
+    let (img, _) = apply_filters(
+        solid(0, 0, 0),
+        &[PlainFilter::HighlightsShadows(100.0, 0.0)],
+    );
     assert_eq!(first_pixel(&img), [0, 0, 0]);
     // Pure white under full negative highlights gives
     // back the same 64 levels; under full shadows it
     // does not move.
     let (img, _) = apply_filters(
         solid(255, 255, 255),
-        &[Filter::HighlightsShadows(-100.0, 0.0)],
+        &[PlainFilter::HighlightsShadows(-100.0, 0.0)],
     );
     assert_eq!(first_pixel(&img), [191, 191, 191]);
     let (img, _) = apply_filters(
         solid(255, 255, 255),
-        &[Filter::HighlightsShadows(0.0, 100.0)],
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
     );
     assert_eq!(first_pixel(&img), [255, 255, 255]);
     // A mid gray feels both ends at about a quarter of
@@ -1629,12 +1668,12 @@ fn highlights_shadows_move_their_own_ends() {
     // highlights to 112.
     let (img, _) = apply_filters(
         solid(128, 128, 128),
-        &[Filter::HighlightsShadows(0.0, 100.0)],
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
     );
     assert_eq!(first_pixel(&img), [144, 144, 144]);
     let (img, _) = apply_filters(
         solid(128, 128, 128),
-        &[Filter::HighlightsShadows(-100.0, 0.0)],
+        &[PlainFilter::HighlightsShadows(-100.0, 0.0)],
     );
     assert_eq!(first_pixel(&img), [112, 112, 112]);
 }
@@ -1644,18 +1683,24 @@ fn highlights_shadows_weight_by_luminance() {
     // A dark pixel (32) is a shadow pixel: full shadows
     // move it 49 levels, full highlights only 1. A
     // bright pixel (224) is the mirror image.
-    let (img, _) = apply_filters(solid(32, 32, 32), &[Filter::HighlightsShadows(0.0, 100.0)]);
+    let (img, _) = apply_filters(
+        solid(32, 32, 32),
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
+    );
     assert_eq!(first_pixel(&img), [81, 81, 81]);
-    let (img, _) = apply_filters(solid(32, 32, 32), &[Filter::HighlightsShadows(100.0, 0.0)]);
+    let (img, _) = apply_filters(
+        solid(32, 32, 32),
+        &[PlainFilter::HighlightsShadows(100.0, 0.0)],
+    );
     assert_eq!(first_pixel(&img), [33, 33, 33]);
     let (img, _) = apply_filters(
         solid(224, 224, 224),
-        &[Filter::HighlightsShadows(0.0, 100.0)],
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
     );
     assert_eq!(first_pixel(&img), [225, 225, 225]);
     let (img, _) = apply_filters(
         solid(224, 224, 224),
-        &[Filter::HighlightsShadows(-100.0, 0.0)],
+        &[PlainFilter::HighlightsShadows(-100.0, 0.0)],
     );
     assert_eq!(first_pixel(&img), [175, 175, 175]);
     // The offset is shared by the channels: a color
@@ -1665,12 +1710,12 @@ fn highlights_shadows_weight_by_luminance() {
     // by 15).
     let (img, _) = apply_filters(
         solid(200, 100, 50),
-        &[Filter::HighlightsShadows(0.0, 100.0)],
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
     );
     assert_eq!(first_pixel(&img), [217, 117, 67]);
     let (img, _) = apply_filters(
         solid(200, 100, 50),
-        &[Filter::HighlightsShadows(100.0, 0.0)],
+        &[PlainFilter::HighlightsShadows(100.0, 0.0)],
     );
     assert_eq!(first_pixel(&img), [215, 115, 65]);
 }
@@ -1682,7 +1727,7 @@ fn highlights_shadows_preserves_alpha() {
         2,
         image::Rgba([0, 0, 0, 128]),
     ));
-    let (out, _) = apply_filters(img, &[Filter::HighlightsShadows(0.0, 100.0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::HighlightsShadows(0.0, 100.0)]);
     let px = out.to_rgba8().get_pixel(0, 0).0;
     assert_eq!(px[3], 128);
     assert_eq!(px[0], 64);
@@ -1695,17 +1740,23 @@ fn highlights_shadows_sanitizes_out_of_contract_values() {
     // out-of-range amount.
     let (img, _) = apply_filters(
         solid(128, 128, 128),
-        &[Filter::HighlightsShadows(f32::NAN, f32::INFINITY)],
+        &[PlainFilter::HighlightsShadows(f32::NAN, f32::INFINITY)],
     );
     assert_eq!(first_pixel(&img), [128, 128, 128]);
-    let (clamped, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 250.0)]);
-    let (at_cap, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 100.0)]);
+    let (clamped, _) = apply_filters(
+        solid(0, 0, 0),
+        &[PlainFilter::HighlightsShadows(0.0, 250.0)],
+    );
+    let (at_cap, _) = apply_filters(
+        solid(0, 0, 0),
+        &[PlainFilter::HighlightsShadows(0.0, 100.0)],
+    );
     assert_eq!(first_pixel(&clamped), first_pixel(&at_cap));
 }
 
 #[test]
 fn vibrance_zero_is_the_identity() {
-    let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(0.0)]);
+    let (img, _) = apply_filters(solid(140, 120, 110), &[PlainFilter::Vibrance(0.0)]);
     assert_eq!(first_pixel(&img), [140, 120, 110]);
 }
 
@@ -1714,25 +1765,25 @@ fn vibrance_weights_muted_colors_most() {
     // (140, 120, 110) has HSV saturation about 0.214,
     // so at +100 its factor is about 1.786 and at -100
     // about 0.214: the full swing, in both directions.
-    let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(100.0)]);
+    let (img, _) = apply_filters(solid(140, 120, 110), &[PlainFilter::Vibrance(100.0)]);
     assert_eq!(first_pixel(&img), [151, 116, 98]);
-    let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(-100.0)]);
+    let (img, _) = apply_filters(solid(140, 120, 110), &[PlainFilter::Vibrance(-100.0)]);
     assert_eq!(first_pixel(&img), [128, 123, 121]);
     // A fully saturated pixel does not move at either
     // extreme: its weight is zero.
     for amount in [-100.0, 100.0] {
-        let (img, _) = apply_filters(solid(255, 0, 0), &[Filter::Vibrance(amount)]);
+        let (img, _) = apply_filters(solid(255, 0, 0), &[PlainFilter::Vibrance(amount)]);
         assert_eq!(first_pixel(&img), [255, 0, 0], "amount {amount}");
     }
     // A gray pixel has no chroma to scale and does not
     // move either.
-    let (img, _) = apply_filters(solid(100, 100, 100), &[Filter::Vibrance(100.0)]);
+    let (img, _) = apply_filters(solid(100, 100, 100), &[PlainFilter::Vibrance(100.0)]);
     assert_eq!(first_pixel(&img), [100, 100, 100]);
     // Between the extremes, the more saturated pixel
     // moves proportionally less: (200, 80, 40) has
     // saturation 0.8, so its factor is only 1.2, where
     // the muted pixel above took 1.786.
-    let (img, _) = apply_filters(solid(200, 80, 40), &[Filter::Vibrance(100.0)]);
+    let (img, _) = apply_filters(solid(200, 80, 40), &[PlainFilter::Vibrance(100.0)]);
     assert_eq!(first_pixel(&img), [217, 73, 25]);
 }
 
@@ -1743,7 +1794,7 @@ fn vibrance_preserves_alpha() {
         2,
         image::Rgba([140, 120, 110, 128]),
     ));
-    let (out, _) = apply_filters(img, &[Filter::Vibrance(100.0)]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Vibrance(100.0)]);
     let px = out.to_rgba8().get_pixel(0, 0).0;
     assert_eq!(px[3], 128);
     assert_eq!(&px[..3], &[151, 116, 98]);
@@ -1751,10 +1802,10 @@ fn vibrance_preserves_alpha() {
 
 #[test]
 fn vibrance_sanitizes_out_of_contract_values() {
-    let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(f32::NAN)]);
+    let (img, _) = apply_filters(solid(140, 120, 110), &[PlainFilter::Vibrance(f32::NAN)]);
     assert_eq!(first_pixel(&img), [140, 120, 110]);
-    let (clamped, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(250.0)]);
-    let (at_cap, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(100.0)]);
+    let (clamped, _) = apply_filters(solid(140, 120, 110), &[PlainFilter::Vibrance(250.0)]);
+    let (at_cap, _) = apply_filters(solid(140, 120, 110), &[PlainFilter::Vibrance(100.0)]);
     assert_eq!(first_pixel(&clamped), first_pixel(&at_cap));
 }
 
@@ -1783,7 +1834,7 @@ fn enhance_stretches_a_compressed_range() {
     // 30 maps to 0, 220 to 255, and 100 lands on
     // ((100 - 30) * 255 + 95) / 190 = 94.
     let img = census_image(&[(30, 100), (100, 9800), (220, 100)], 100);
-    let (out, _) = apply_filters(img, &[Filter::Enhance]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Enhance]);
     let rgb = out.to_rgb8();
     assert_eq!(rgb.get_pixel(0, 0)[0], 0);
     assert_eq!(rgb.get_pixel(50, 50)[0], 94);
@@ -1793,19 +1844,19 @@ fn enhance_stretches_a_compressed_range() {
 #[test]
 fn enhance_leaves_flat_and_full_range_images_alone() {
     // A flat channel has no span to stretch.
-    let (out, _) = apply_filters(solid(100, 100, 100), &[Filter::Enhance]);
+    let (out, _) = apply_filters(solid(100, 100, 100), &[PlainFilter::Enhance]);
     assert_eq!(first_pixel(&out), [100, 100, 100]);
     // A near-flat channel (span 10, under the floor of
     // 16) is left unmapped too.
     let img = census_image(&[(100, 5000), (110, 5000)], 100);
-    let (out, _) = apply_filters(img, &[Filter::Enhance]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Enhance]);
     let rgb = out.to_rgb8();
     assert_eq!(rgb.get_pixel(0, 0)[0], 100);
     assert_eq!(rgb.get_pixel(99, 99)[0], 110);
     // An image already spanning the range maps its
     // percentiles to the same ends and stays put.
     let img = census_image(&[(0, 5000), (255, 5000)], 100);
-    let (out, _) = apply_filters(img, &[Filter::Enhance]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Enhance]);
     let rgb = out.to_rgb8();
     assert_eq!(rgb.get_pixel(0, 0)[0], 0);
     assert_eq!(rgb.get_pixel(99, 99)[0], 255);
@@ -1818,9 +1869,9 @@ fn enhance_is_gentler_than_equalize() {
     // leaves the mid value at 100, while equalize
     // redistributes it to 170.
     let img = census_image(&[(0, 2500), (100, 5000), (255, 2500)], 100);
-    let (out, _) = apply_filters(img.clone(), &[Filter::Enhance]);
+    let (out, _) = apply_filters(img.clone(), &[PlainFilter::Enhance]);
     assert_eq!(out.to_rgb8().get_pixel(50, 50)[0], 100);
-    let (out, _) = apply_filters(img, &[Filter::Equalize]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Equalize]);
     assert_eq!(out.to_rgb8().get_pixel(50, 50)[0], 170);
 }
 
@@ -1842,7 +1893,7 @@ fn enhance_stretches_channels_independently() {
             *p = image::Rgb([r, 90, 200]);
         }
     }
-    let (out, _) = apply_filters(img, &[Filter::Enhance]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Enhance]);
     let rgb = out.to_rgb8();
     assert_eq!(rgb.get_pixel(0, 0).0, [0, 90, 200]);
     assert_eq!(rgb.get_pixel(50, 50).0, [94, 90, 200]);
@@ -1865,7 +1916,7 @@ fn enhance_preserves_alpha() {
             *p = image::Rgba([v, v, v, 128]);
         }
     }
-    let (out, _) = apply_filters(img, &[Filter::Enhance]);
+    let (out, _) = apply_filters(img, &[PlainFilter::Enhance]);
     let px = out.to_rgba8().get_pixel(50, 50).0;
     assert_eq!(px[3], 128);
     assert_eq!(px[0], 94);
@@ -1873,24 +1924,27 @@ fn enhance_preserves_alpha() {
 
 #[test]
 fn palette_filter_sets_the_encode_directive() {
-    let (_, opts) = apply_filters(solid(10, 20, 30), &[Filter::Palette(64)]);
+    let (_, opts) = apply_filters(solid(10, 20, 30), &[PlainFilter::Palette(64)]);
     assert_eq!(opts.palette, Some(64));
     // The last one in the chain wins, like quality.
     let (_, opts) = apply_filters(
         solid(10, 20, 30),
-        &[Filter::Palette(64), Filter::Palette(16)],
+        &[PlainFilter::Palette(64), PlainFilter::Palette(16)],
     );
     assert_eq!(opts.palette, Some(16));
     // And the pixels pass through untouched: the
     // directive only steers the encoder.
-    let (img, _) = apply_filters(solid(10, 20, 30), &[Filter::Palette(2)]);
+    let (img, _) = apply_filters(solid(10, 20, 30), &[PlainFilter::Palette(2)]);
     assert_eq!(first_pixel(&img), [10, 20, 30]);
 }
 
 #[test]
 fn new_filters_compose_in_order() {
     // invert then brighten(10): (10 -> 245 -> 255).
-    let (img, _) = apply_filters(solid(10, 10, 10), &[Filter::Invert, Filter::Brighten(10)]);
+    let (img, _) = apply_filters(
+        solid(10, 10, 10),
+        &[PlainFilter::Invert, PlainFilter::Brighten(10)],
+    );
     assert_eq!(first_pixel(&img), [255, 255, 255]);
 }
 
@@ -1909,7 +1963,10 @@ fn bordered(bg: [u8; 3], fg: [u8; 3]) -> DynamicImage {
 
 #[test]
 fn trim_crops_to_the_inner_box() {
-    let (img, _) = apply_filters(bordered([255, 255, 255], [255, 0, 0]), &[Filter::Trim(0)]);
+    let (img, _) = apply_filters(
+        bordered([255, 255, 255], [255, 0, 0]),
+        &[PlainFilter::Trim(0)],
+    );
     assert_eq!((img.width(), img.height()), (20, 14));
     assert_eq!(first_pixel(&img), [255, 0, 0]);
 }
@@ -1931,16 +1988,16 @@ fn trim_tolerance_decides_what_counts_as_border() {
         img
     };
     // Tolerance 10: the ring (10 away) is still border.
-    let (img, _) = apply_filters(build(), &[Filter::Trim(10)]);
+    let (img, _) = apply_filters(build(), &[PlainFilter::Trim(10)]);
     assert_eq!((img.width(), img.height()), (10, 10));
     // Tolerance 5: the ring is content.
-    let (img, _) = apply_filters(build(), &[Filter::Trim(5)]);
+    let (img, _) = apply_filters(build(), &[PlainFilter::Trim(5)]);
     assert_eq!((img.width(), img.height()), (20, 20));
 }
 
 #[test]
 fn trim_uniform_image_is_a_noop() {
-    let (img, _) = apply_filters(solid(77, 77, 77), &[Filter::Trim(10)]);
+    let (img, _) = apply_filters(solid(77, 77, 77), &[PlainFilter::Trim(10)]);
     assert_eq!((img.width(), img.height()), (4, 4));
     assert_eq!(first_pixel(&img), [77, 77, 77]);
 }
@@ -1953,21 +2010,21 @@ fn trim_sides_shaves_after_the_tolerance_pass() {
     // tolerance pass found the same inner box).
     let (img, _) = apply_filters(
         bordered([255, 255, 255], [255, 0, 0]),
-        &[Filter::TrimSides(0, [5, 2, 5, 2])],
+        &[PlainFilter::TrimSides(0, [5, 2, 5, 2])],
     );
     assert_eq!((img.width(), img.height()), (10, 10));
     assert_eq!(first_pixel(&img), [255, 0, 0]);
     // Zero sides are exactly the tolerance-only form.
     let (img, _) = apply_filters(
         bordered([255, 255, 255], [255, 0, 0]),
-        &[Filter::TrimSides(0, [0, 0, 0, 0])],
+        &[PlainFilter::TrimSides(0, [0, 0, 0, 0])],
     );
     assert_eq!((img.width(), img.height()), (20, 14));
     // On a uniform image the tolerance pass is a no-op
     // and the sides still apply.
     let (img, _) = apply_filters(
         DynamicImage::new_rgb8(10, 6),
-        &[Filter::TrimSides(10, [2, 1, 2, 1])],
+        &[PlainFilter::TrimSides(10, [2, 1, 2, 1])],
     );
     assert_eq!((img.width(), img.height()), (6, 4));
 }
@@ -1979,7 +2036,7 @@ fn trim_sides_clamps_to_one_surviving_pixel() {
     // dimension first, the far side from what is left.
     let (img, _) = apply_filters(
         bordered([255, 255, 255], [255, 0, 0]),
-        &[Filter::TrimSides(0, [100, 100, 100, 100])],
+        &[PlainFilter::TrimSides(0, [100, 100, 100, 100])],
     );
     assert_eq!((img.width(), img.height()), (1, 1));
     assert_eq!(first_pixel(&img), [255, 0, 0]);
@@ -1987,7 +2044,7 @@ fn trim_sides_clamps_to_one_surviving_pixel() {
     // box leaves one column; the right amount gets 0.
     let (img, _) = apply_filters(
         bordered([255, 255, 255], [255, 0, 0]),
-        &[Filter::TrimSides(0, [19, 0, 19, 0])],
+        &[PlainFilter::TrimSides(0, [19, 0, 19, 0])],
     );
     assert_eq!((img.width(), img.height()), (1, 14));
 }
@@ -2000,7 +2057,7 @@ fn trim_window_shaves_the_sides_off_the_found_box() {
     let img = bordered([255, 255, 255], [255, 0, 0]);
     let found = trim_box(&img, 0);
     let window = trim_window((img.width(), img.height()), found, [5, 2, 5, 2]);
-    let (cut, _) = apply_filters(img.clone(), &[Filter::TrimSides(0, [5, 2, 5, 2])]);
+    let (cut, _) = apply_filters(img.clone(), &[PlainFilter::TrimSides(0, [5, 2, 5, 2])]);
     assert_eq!((window.2, window.3), (cut.width(), cut.height()));
     let (x, y, w, h) = window;
     assert_eq!(
@@ -2186,7 +2243,7 @@ fn blur_stops_at_the_deadline() {
     assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     // The plain filter path passes the deadline down.
     assert_eq!(
-        apply_filters_within(img, &[Filter::Blur(512.0)], None, past).map(|_| ()),
+        apply_filters_within(img, &[PlainFilter::Blur(512.0)], None, past).map(|_| ()),
         Err(DeadlinePassed)
     );
 }
@@ -2505,7 +2562,7 @@ fn sharpen_past_its_bound_renders_as_the_bound() {
         Rgb([v, v / 2 + 30, 255 - v])
     }));
     let sharpened = |a: f32| {
-        apply_filters(src.clone(), &[Filter::Sharpen(a)])
+        apply_filters(src.clone(), &[PlainFilter::Sharpen(a)])
             .0
             .to_rgb8()
     };
@@ -2548,7 +2605,7 @@ fn huerotate_turns_by_the_angle_its_degrees_reduce_to() {
     }));
     let deep = DynamicImage::ImageRgb16(rich.to_rgb16());
     for img in [rich, deep] {
-        let turned = |d: i32| apply_filters(img.clone(), &[Filter::HueRotate(d)]).0;
+        let turned = |d: i32| apply_filters(img.clone(), &[PlainFilter::HueRotate(d)]).0;
         for (degrees, reduced) in [
             (450, 90),
             (810, 90),

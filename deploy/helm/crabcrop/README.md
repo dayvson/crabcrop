@@ -56,7 +56,7 @@ helm upgrade crabcrop deploy/helm/crabcrop \
   --set resultBucket.credentialsSecret=crabcrop-aws
 ```
 
-`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with environment-provided AWS credentials only, because the server reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` once at startup and does not fetch credentials from a pod IAM role or any other part of the AWS credential chain. `resultBucket.credentialsSecret` names the Secret that holds them, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with the keys in `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`, read once at startup, or, with none set, with the pod's role through EKS Pod Identity: its agent sets `AWS_CONTAINER_CREDENTIALS_FULL_URI` and the token file, and the server asks it for credentials before its first request and again 15 minutes before they expire. IAM roles for service accounts (IRSA, a web identity token) and the node's instance role are not used: give such a deployment keys. `resultBucket.credentialsSecret` names the Secret that holds the keys, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials, which then expire until a restart. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
 
 ## Secrets
 
@@ -98,11 +98,11 @@ helm install crabcrop deploy/helm/crabcrop \
 Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. For a quick trial only, `--set secret=<value>` lets the chart create the Secret itself; do not use that route for anything real. To run your own build instead:
 
 ```bash
-docker build -t your-registry/crabcrop:0.13.1 .
-docker push your-registry/crabcrop:0.13.1
+docker build -t your-registry/crabcrop:0.14.0 .
+docker push your-registry/crabcrop:0.14.0
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
-  --set image.tag=0.13.1 \
+  --set image.tag=0.14.0 \
   --set existingSecret=crabcrop-secret
 ```
 
@@ -158,7 +158,7 @@ The server writes only to `/tmp` and to the volumes it mounts, such as the `resu
 
 `resources` requests 100m of CPU and 128Mi of memory by default and sets no limits: no limit suits every workload, so set them for yours. `values-production.yaml` sets both. Without a CPU limit the server sizes its stills lane and its default source buffer budget from the node's cores, so on a large node set a limit, or `CRABCROP_SOURCE_BUFFER_MAX_MB` in `env`. If you set only limits, Kubernetes no longer sets the requests equal to them; set requests too. The HPA's CPU target is a share of the CPU request, so set requests that fit your load before you turn on `autoscaling.enabled` (`values-production.yaml` requests 500m).
 
-`networkPolicy.enabled: true` adds a NetworkPolicy for the pods. It allows ingress to the HTTP port, from the peers in `networkPolicy.ingressFrom` or from anywhere when that is empty. It allows egress to DNS and to public IPv4 addresses, but not to the private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, the cloud metadata address) or `100.64.0.0/10`. That covers what `CRABCROP_BLOCK_PRIVATE_SOURCES` does not: hosts in `CRABCROP_ALLOWED_SOURCES` skip the address check, and code running in the pod is not bound by it. A source, a bucket or an S3-compatible endpoint on a private address needs its own rule in `networkPolicy.extraEgress`, and so does any IPv6 destination. The policy needs a network plugin that enforces NetworkPolicy.
+`networkPolicy.enabled: true` adds a NetworkPolicy for the pods. It allows ingress to the HTTP port, from the peers in `networkPolicy.ingressFrom` or from anywhere when that is empty. It allows egress to DNS and to public IPv4 addresses, but not to the private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, the cloud metadata address) or `100.64.0.0/10`. That covers what `CRABCROP_BLOCK_PRIVATE_SOURCES` does not: hosts in `CRABCROP_ALLOWED_SOURCES` skip the address check (unless `CRABCROP_CHECK_ALLOWED_SOURCES` is on), and code running in the pod is not bound by it. A source, a bucket or an S3-compatible endpoint on a private address needs its own rule in `networkPolicy.extraEgress`, and so does any IPv6 destination. The policy needs a network plugin that enforces NetworkPolicy.
 
 ```yaml
 networkPolicy:

@@ -961,6 +961,163 @@ fn ai_construction_refuses_misconfiguration_before_any_load() {
     assert!(ai.ocr.is_none());
 }
 
+/// A label set the CLIP loads in the tests below give back:
+/// the labels it was handed, each scored alike, and a fixed
+/// embedding.
+#[derive(Debug)]
+struct FakeLabelSet(Vec<String>);
+
+impl crate::ai::TagProvider for FakeLabelSet {
+    fn scores(
+        &self,
+        _img: &image::DynamicImage,
+    ) -> Result<Vec<crate::ai::TagScore>, crate::ai::AiError> {
+        Ok(self
+            .0
+            .iter()
+            .map(|label| crate::ai::TagScore {
+                label: label.clone(),
+                score: 0.25,
+            })
+            .collect())
+    }
+
+    fn embedding(
+        &self,
+        _img: &image::DynamicImage,
+    ) -> Result<Option<Vec<f32>>, crate::ai::AiError> {
+        Ok(Some(vec![0.6, 0.8]))
+    }
+}
+
+/// What a CLIP load gives back for `label_sets`, faked: a set
+/// for each, in order.
+fn fake_label_sets(label_sets: Vec<Vec<String>>) -> Vec<ClipLabelSet> {
+    label_sets
+        .into_iter()
+        .map(|labels| {
+            let count = labels.len();
+            let set: Arc<dyn crate::ai::TagProvider> = Arc::new(FakeLabelSet(labels));
+            (set, count)
+        })
+        .collect()
+}
+
+fn labels_of(scores: Vec<crate::ai::TagScore>) -> Vec<String> {
+    scores.into_iter().map(|score| score.label).collect()
+}
+
+fn owned(labels: &[&str]) -> Vec<String> {
+    labels.iter().map(|label| label.to_string()).collect()
+}
+
+#[test]
+fn the_tags_and_the_clip_moderation_prompts_share_one_clip_load() {
+    // Issue #736: with moderation on CLIP prompts, boot loaded
+    // the CLIP models a second time for the prompts: two vision
+    // sessions in memory, each with an embedding memo of its
+    // own, so a meta request that asked for tags and moderation
+    // embedded its image twice. Both label files now go to one
+    // load, and the tags, the embedding and the review signals
+    // are built over the sets it gives back.
+    let tags = temp_file("clip-tags", b"beach\nforest\n");
+    let prompts = temp_file("clip-prompts", b"# reviewed by hand\nweapon\nblood\n");
+    let clip_env = [
+        ("CRABCROP_CLIP_IMAGE_MODEL", "/models/clip-vision.onnx"),
+        ("CRABCROP_CLIP_TEXT_MODEL", "/models/clip-text.onnx"),
+        ("CRABCROP_CLIP_TOKENIZER", "/models/tokenizer.json"),
+        ("CRABCROP_CLIP_LABELS", tags.as_str()),
+    ];
+    let with = |more: &[(&'static str, &str)]| {
+        let pairs: Vec<(&str, &str)> = clip_env.iter().chain(more).copied().collect();
+        ai_config(env_of(&pairs)).unwrap()
+    };
+    let config = with(&[("CRABCROP_MODERATION_LABELS", prompts.as_str())]);
+    let mut loads: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+    let clip = build_clip_from(
+        config.clip.as_ref(),
+        config.moderation.as_ref(),
+        |clip, label_sets| {
+            loads.push((clip.image_model.clone(), label_sets.clone()));
+            Ok(fake_label_sets(label_sets))
+        },
+    )
+    .unwrap()
+    .expect("the CLIP set is configured");
+    assert_eq!(
+        loads,
+        [(
+            "/models/clip-vision.onnx".to_string(),
+            vec![owned(&["beach", "forest"]), owned(&["weapon", "blood"])]
+        )]
+    );
+    let img = image::DynamicImage::new_rgb8(8, 8);
+    assert_eq!(
+        labels_of(clip.tagger.scores(&img).unwrap()),
+        ["beach", "forest"]
+    );
+    let embedding = clip.embeddings.embed(&img).unwrap();
+    assert_eq!(embedding.model, "clip-vision.onnx");
+    assert_eq!(embedding.vector, [0.6, 0.8]);
+    let report = clip
+        .moderation
+        .expect("moderation on CLIP prompts is built with the tags")
+        .moderate(&img)
+        .unwrap();
+    assert_eq!(report.model, "clip-vision.onnx");
+    assert!(report.scores.is_empty(), "{report:?}");
+    assert_eq!(labels_of(report.signals), ["weapon", "blood"]);
+    // A verdict model, or no moderation at all, leaves the
+    // load the tags alone.
+    for moderation in [
+        &[("CRABCROP_MODERATION_MODEL", "/models/moderation.onnx")][..],
+        &[],
+    ] {
+        let config = with(moderation);
+        let mut loads = Vec::new();
+        let clip = build_clip_from(
+            config.clip.as_ref(),
+            config.moderation.as_ref(),
+            |_, label_sets| {
+                loads.push(label_sets.clone());
+                Ok(fake_label_sets(label_sets))
+            },
+        )
+        .unwrap()
+        .expect("the CLIP set is configured");
+        assert_eq!(loads, [vec![owned(&["beach", "forest"])]], "{moderation:?}");
+        assert!(clip.moderation.is_none(), "{moderation:?}");
+    }
+    // A prompts file that cannot be read still names its own
+    // variable, and nothing loads.
+    let missing = missing_path("clip-prompts");
+    let config = with(&[("CRABCROP_MODERATION_LABELS", missing.as_str())]);
+    let err = build_clip_from(
+        config.clip.as_ref(),
+        config.moderation.as_ref(),
+        |_, _| -> Result<Vec<ClipLabelSet>, crate::ai::AiError> {
+            panic!("the CLIP models loaded for an unreadable prompts file")
+        },
+    )
+    .map(|_| ())
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Build {
+                var: Some("CRABCROP_MODERATION_LABELS"),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("cannot load the CLIP moderation fallback: cannot read the label file"),
+        "{err}"
+    );
+}
+
 /// Configured-but-unloadable models refuse construction
 /// with the boot wording. Ignored, gated exactly like the
 /// src/ai.rs load tests (issue #179, item 2): a load only
@@ -1127,6 +1284,41 @@ fn ai_construction_with_real_models_builds_every_provider() {
     assert!(ai.detect.is_some());
     assert_eq!(ai.moderation.is_some(), want_moderation);
     assert_eq!(ai.aesthetic.is_some(), want_aesthetic);
+}
+
+#[test]
+fn build_aesthetic_names_its_variable_for_a_head_that_reaches_below_a_mark() {
+    // Issue #760: this head's pickle takes a value from below
+    // a MARK, which panicked the load and the boot with it.
+    // The boot now stops on the configuration error every
+    // malformed head file gets, for CRABCROP_AESTHETIC_HEAD.
+    // Boot loads the CLIP models before the head, but
+    // build_aesthetic, the head's own step, needs none of
+    // them, so this runs without the models.
+    let head = temp_file(
+        "aesthetic-stale-mark",
+        &crate::test_head_archive::head_archive(b"N}(bt.", &[]),
+    );
+    let err = build_aesthetic(Some(head.as_str()))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Build {
+                var: Some("CRABCROP_AESTHETIC_HEAD"),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.starts_with("cannot load the aesthetic head: the aesthetic head ")
+            && message
+                .ends_with(" is not usable: a pickle BUILD uses a value from below an open MARK"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1305,6 +1497,7 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
         ("CRABCROP_META_MODE", "1"),
         ("CRABCROP_CLIENT_HINTS", "0"),
         ("CRABCROP_EXPLAIN", "0"),
+        ("CRABCROP_PURGE_REQUIRE_EXPIRY", "1"),
         ("CRABCROP_AVIF_TILES", "16"),
     ]))
     .unwrap();
@@ -1320,10 +1513,14 @@ fn build_state_builds_the_configured_state_and_sizes_the_gates() {
     assert_eq!(state.process_gate.capacity(), config.process_permits);
     assert_eq!(state.slow_gate.capacity(), 3);
     // The settings reach the state as validated.
-    assert_eq!(state.metrics_token.as_deref(), Some("metrics-token"));
+    assert_eq!(
+        state.metrics_token.as_ref().map(|token| token.as_str()),
+        Some("metrics-token")
+    );
     assert!(state.meta_enabled);
     assert!(!state.client_hints);
     assert!(!state.explain_enabled);
+    assert!(state.purge_require_expiry);
     assert_eq!(state.avif_tiles.count(), 16);
     assert_eq!(state.config_fingerprint, config.config_fingerprint);
     assert_eq!(

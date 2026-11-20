@@ -131,6 +131,43 @@ fn explain_defaults_to_on_and_turns_off_by_the_boolean_spellings() {
 }
 
 #[test]
+fn purge_require_expiry_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
+    // Unset is off, so the purge URLs a deployment already
+    // holds keep working after the upgrade.
+    assert_eq!(
+        purge_require_expiry_config(env_of(&[])).map_err(|e| e.to_string()),
+        Ok(false)
+    );
+    let set = |v: &str| {
+        purge_require_expiry_config(env_of(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", v)]))
+            .map_err(|e| e.to_string())
+    };
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(set(v), Ok(true), "{v}");
+    }
+    for v in ["0", "false", "no", "OFF"] {
+        assert_eq!(set(v), Ok(false), "{v}");
+    }
+    // A typo is a boot error naming the variable, never a
+    // silent default that leaves plain purge URLs working.
+    for bad in ["", "required", "onn", "2"] {
+        let err = expect_err(set(bad));
+        assert!(
+            err.contains("CRABCROP_PURGE_REQUIRE_EXPIRY"),
+            "{bad:?}: {err}"
+        );
+    }
+    // The setting reaches the configuration.
+    let config = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRABCROP_SECRET", "a production-grade secret")];
+        env.extend_from_slice(extra);
+        Config::from_env(env_of(&env)).unwrap()
+    };
+    assert!(!config(&[]).purge_require_expiry);
+    assert!(config(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", "1")]).purge_require_expiry);
+}
+
+#[test]
 fn log_sync_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
     // Issue #642: unset, request lines go through the
     // writer thread.
@@ -320,8 +357,17 @@ fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
         &default_policy,
     )
     .expect("a warning under the default policy");
-    assert!(warning.contains("(HTTPS_PROXY)"), "{warning}");
-    assert!(warning.contains("CRABCROP_ALLOWED_SOURCES"), "{warning}");
+    // Word for word what boot printed before the allowlist
+    // opt-in gave the warning a second form.
+    assert_eq!(
+        warning,
+        "a proxy is configured (HTTPS_PROXY), but source fetches bypass it: with \
+         private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
+         CRABCROP_ALLOWED_SOURCES, each source host is pinned to the address the check \
+         validated and connected to directly, so under proxy-only egress those fetches \
+         fail. List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through \
+         the proxy (see docs/configuration.md)"
+    );
     // The value is never echoed: a proxy URL can carry
     // credentials.
     assert!(!warning.contains("hunter2"), "{warning}");
@@ -375,6 +421,53 @@ fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
             "{pairs:?}"
         );
     }
+    // With the check kept for allowlisted hosts, they are
+    // pinned too, and listing them no longer routes them
+    // through the proxy: the warning says so.
+    let policy = build_source_policy(env_of(&[
+        ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+        ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+    ]))
+    .unwrap();
+    assert!(policy.pins_hostnames());
+    let warning = proxy_bypass_warning(proxied("HTTPS_PROXY"), &policy).unwrap();
+    assert!(
+        warning.contains("Turn CRABCROP_CHECK_ALLOWED_SOURCES off"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn allowlisted_hosts_can_be_held_to_the_private_address_check() {
+    // Off by default: listed hosts skip the check, as the
+    // configuration reference has always said.
+    let listed = ("CRABCROP_ALLOWED_SOURCES", "images.example.com,10.0.0.5");
+    let policy = build_source_policy(env_of(&[listed])).unwrap();
+    assert!(policy.block_private && !policy.check_allowlisted);
+    assert!(!policy.checks(true) && policy.checks(false));
+    let policy =
+        build_source_policy(env_of(&[listed, ("CRABCROP_CHECK_ALLOWED_SOURCES", "1")])).unwrap();
+    assert!(policy.check_allowlisted);
+    assert!(policy.checks(true) && policy.checks(false));
+    // Asking for the check while switching it off is a
+    // contradiction, refused at boot whichever switch does it.
+    for off in [
+        ("CRABCROP_BLOCK_PRIVATE_SOURCES", "0"),
+        ("CRABCROP_ALLOW_ANY_SOURCE", "1"),
+    ] {
+        let err = expect_err(build_source_policy(env_of(&[
+            listed,
+            ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            off,
+        ])));
+        assert!(err.contains("CRABCROP_CHECK_ALLOWED_SOURCES"), "{err}");
+        assert!(err.contains(off.0), "{err}");
+    }
+    let err = expect_err(build_source_policy(env_of(&[(
+        "CRABCROP_CHECK_ALLOWED_SOURCES",
+        "maybe",
+    )])));
+    assert!(err.contains("CRABCROP_CHECK_ALLOWED_SOURCES"), "{err}");
 }
 
 #[test]
@@ -480,6 +573,14 @@ fn a_value_that_only_contains_a_placeholder_is_not_one() {
 }
 
 #[test]
+fn a_secret_setting_zeroes_its_value() {
+    // What dropping a secret setting runs.
+    let mut token = Secret("a-metrics-token-of-32-bytes-0123".to_string());
+    zeroize::Zeroize::zeroize(&mut token);
+    assert_eq!(token.expose(), "");
+}
+
+#[test]
 fn a_metrics_token_under_16_bytes_warns_without_quoting_it() {
     let warning = metrics_token_warning(&Secret("fifteen-bytes!!".to_string()))
         .expect("a warning for 15 bytes");
@@ -499,7 +600,7 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
     // allowlist's host count and the private-address check.
     let presets = temp_file("posture-presets", b"thumb = 300x200\n");
     let presets = presets.path.as_str();
-    let cases: [(&[(&str, &str)], &str); 8] = [
+    let cases: [(&[(&str, &str)], &str); 11] = [
         (
             &[],
             "request mode: signed; source allowlist: none; private-address check: on",
@@ -525,14 +626,21 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
         ),
         (
             &[("CRABCROP_ALLOWED_SOURCES", "images.example.com")],
-            "request mode: signed; source allowlist: 1 host; private-address check: on",
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
+        ),
+        (
+            &[("CRABCROP_ALLOWED_SOURCES", "192.0.2.10")],
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
         ),
         (
             &[(
                 "CRABCROP_ALLOWED_SOURCES",
                 "a.example, ,b.example,.c.example",
             )],
-            "request mode: signed; source allowlist: 3 hosts; private-address check: on",
+            "request mode: signed; source allowlist: 3 hosts; \
+             private-address check: on, allowlisted hosts exempt",
         ),
         (
             &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
@@ -541,6 +649,20 @@ fn the_posture_line_names_the_mode_the_allowlist_and_the_check() {
         (
             &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
             "request mode: signed; source allowlist: none; private-address check: off",
+        ),
+        (
+            &[
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+                ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            ],
+            "request mode: signed; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts included",
+        ),
+        (
+            // With no allowlist, holding listed hosts to the check
+            // changes nothing, so the line says only that it is on.
+            &[("CRABCROP_CHECK_ALLOWED_SOURCES", "1")],
+            "request mode: signed; source allowlist: none; private-address check: on",
         ),
     ];
     for (pairs, line) in cases {
@@ -810,12 +932,124 @@ fn source_config_construction_enforces_pairing_and_the_bucket_policy() {
     ]))
     .unwrap();
     assert_eq!(sources.allowed_buckets, ["photos", "backups"]);
-    let creds = sources.aws_creds.as_ref().unwrap();
+    let creds = sources.aws_creds.as_ref().unwrap().fixed().unwrap();
     assert_eq!(creds.session_token.as_deref(), Some("token"));
     // Nothing configured also constructs: unsigned
     // fetches, every bucket allowed.
     let sources = build_source_config(env_of(&[])).unwrap();
     assert!(sources.aws_creds.is_none() && sources.allowed_buckets.is_empty());
+}
+
+#[test]
+fn container_credentials_apply_only_without_the_static_keys() {
+    // Issue #709: with no AWS_ACCESS_KEY_ID, the container
+    // credentials endpoint ECS and EKS Pod Identity serve is
+    // the source. The platform sets it for every task with a
+    // role, so it does not trip the bucket policy: a deployment
+    // that boots today keeps booting, and an empty allowlist
+    // still refuses every bucket at fetch time.
+    let ecs = [(
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "/v2/credentials/task-1",
+    )];
+    let sources = build_source_config(env_of(&ecs)).unwrap();
+    let creds = sources.aws_creds.as_ref().unwrap();
+    assert!(creds.is_container() && creds.fixed().is_none());
+    assert!(sources.allowed_buckets.is_empty());
+    // Static keys win, exactly as before: the endpoint is
+    // never asked.
+    let both = build_source_config(env_of(&[
+        ecs[0],
+        ("AWS_ACCESS_KEY_ID", "AKID"),
+        ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ("CRABCROP_ALLOWED_BUCKETS", "photos"),
+    ]))
+    .unwrap();
+    let fixed = both.aws_creds.as_ref().unwrap();
+    assert!(!fixed.is_container());
+    assert_eq!(fixed.fixed().unwrap().access_key, "AKID");
+    // A plain-http endpoint off the agents is refused at boot,
+    // naming the variable.
+    let err = build_source_config(env_of(&[(
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "http://credentials.example/creds",
+    )]))
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Invalid {
+                var: "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // A token that is not one header line is refused without
+    // its value.
+    let err = build_source_config(env_of(&[
+        ecs[0],
+        (
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "token-value\nX-Injected: 1",
+        ),
+    ]))
+    .err()
+    .unwrap();
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        rendered.contains("AWS_CONTAINER_AUTHORIZATION_TOKEN"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("token-value"), "{rendered}");
+    // A refused endpoint keeps its value only where it can carry
+    // no credential: ECS's relative URI names the task's
+    // credentials, and a full URI can hold a user and password.
+    for (var, value, secret) in [
+        (
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "v2/credentials/task-guid-1234",
+            "task-guid-1234",
+        ),
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "https://user:hunter2@credentials.example/creds",
+            "hunter2",
+        ),
+    ] {
+        let err = build_source_config(env_of(&[(var, value)])).err().unwrap();
+        let rendered = format!("{err} {err:?}");
+        assert!(rendered.contains(var), "{rendered}");
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    // CRABCROP_S3_CONTAINER_CREDENTIALS=off keeps a role out of
+    // every request, for a store that allows anonymous access:
+    // ECS sets the endpoint variable for every task with a role,
+    // over any value the task definition gives it. A value that
+    // is not a switch stops the boot.
+    let off = build_source_config(env_of(&[
+        ecs[0],
+        ("CRABCROP_S3_CONTAINER_CREDENTIALS", "off"),
+    ]))
+    .unwrap();
+    assert!(off.aws_creds.is_none());
+    let err = build_source_config(env_of(&[
+        ecs[0],
+        ("CRABCROP_S3_CONTAINER_CREDENTIALS", "of"),
+    ]))
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Invalid {
+                var: "CRABCROP_S3_CONTAINER_CREDENTIALS",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -1291,6 +1525,42 @@ fn the_connection_bounds_default_and_check_their_range() {
 }
 
 #[test]
+fn the_per_client_share_is_off_unless_set() {
+    // A directly exposed server can hold each client to a
+    // share of the connection cap; 0, the default, is no
+    // share, as it must be behind a proxy.
+    let set = |v: &str| connection_limits(&env_of(&[("CRABCROP_MAX_CONNECTIONS_PER_CLIENT", v)]));
+    assert_eq!(connection_limits(&env_of(&[])).unwrap().per_client, None);
+    assert_eq!(set("0").unwrap().per_client, None);
+    assert_eq!(set("1").unwrap().per_client, Some(1));
+    assert_eq!(set("16").unwrap().per_client, Some(16));
+    for bad in ["-1", "1000001", "some", ""] {
+        let err = expect_err(set(bad));
+        assert!(
+            err.contains("CRABCROP_MAX_CONNECTIONS_PER_CLIENT"),
+            "{bad:?}: {err}"
+        );
+    }
+    // The boot line names the share only when one is set,
+    // so the line is unchanged for every server without it.
+    let line = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().connections_line();
+    let plain = line(&[("CRABCROP_MAX_CONNECTIONS", "100")]);
+    assert_eq!(
+        plain,
+        "connections: bind 0.0.0.0, at most 100 open, header timeout 30s, idle timeout 3900s"
+    );
+    let shared = line(&[
+        ("CRABCROP_MAX_CONNECTIONS", "100"),
+        ("CRABCROP_MAX_CONNECTIONS_PER_CLIENT", "8"),
+    ]);
+    assert_eq!(
+        shared,
+        "connections: bind 0.0.0.0, at most 100 open, at most 8 per client, \
+         header timeout 30s, idle timeout 3900s"
+    );
+}
+
+#[test]
 fn the_source_buffer_budget_follows_the_configured_fetch_cap() {
     const MB: u64 = 1024 * 1024;
     let budget = |pairs: &[(&str, &str)], permits| source_buffer_budget(env_of(pairs), permits);
@@ -1637,6 +1907,7 @@ fn from_env_reads_every_default() {
             ),
             idle_timeout: std::time::Duration::from_secs(crate::server::DEFAULT_IDLE_TIMEOUT_SECS),
             max_connections: default_max_connections(),
+            per_client: None,
         }
     );
     let lanes = (config.process_permits + config.slow_lane_permits) as u64;
@@ -1761,6 +2032,110 @@ fn from_env_reads_the_avif_tile_count() {
     for count in ["1", "2", "8", "16"] {
         let set = fingerprint(&[("CRABCROP_AVIF_TILES", count)]);
         assert!(!seen.contains(&set), "{count}: {set}");
+        seen.push(set);
+    }
+}
+
+#[test]
+fn from_env_reads_the_tools_address_space_caps() {
+    // Issue #738: each tool's cap was a constant. Unset, each
+    // is that constant still; set, it is read in megabytes.
+    const MB: u64 = 1024 * 1024;
+    let config = config_of(&[]).unwrap();
+    assert_eq!(
+        config.video.encoder_address_space,
+        crate::video::DEFAULT_ENCODER_ADDRESS_SPACE
+    );
+    assert_eq!(config.video.encoder_address_space, 8192 * MB);
+    assert_eq!(
+        config.video.decoder_address_space,
+        crate::frames::DEFAULT_DECODER_ADDRESS_SPACE
+    );
+    assert_eq!(config.video.decoder_address_space, 3072 * MB);
+    assert_eq!(
+        config.pdf.renderer_address_space,
+        crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE
+    );
+    assert_eq!(config.pdf.renderer_address_space, 3072 * MB);
+    assert_eq!(
+        config.svg_worker_address_space,
+        crate::svg::DEFAULT_WORKER_ADDRESS_SPACE
+    );
+    assert_eq!(config.svg_worker_address_space, 4096 * MB);
+    let cap = |config: &Config, var: &str| match var {
+        "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB" => config.video.encoder_address_space,
+        "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB" => config.video.decoder_address_space,
+        "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB" => config.pdf.renderer_address_space,
+        "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB" => config.svg_worker_address_space,
+        other => panic!("{other}"),
+    };
+    // Each from the least its tool needs to start to 64 GiB.
+    let fingerprint = |pairs: &[(&str, &str)]| config_of(pairs).unwrap().config_fingerprint;
+    let unset = fingerprint(&[]);
+    let mut seen = vec![unset.clone()];
+    for (var, least, tool) in [
+        (
+            "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB",
+            crate::video::MIN_ENCODER_ADDRESS_SPACE,
+            "video encoder",
+        ),
+        (
+            "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB",
+            crate::frames::MIN_DECODER_ADDRESS_SPACE,
+            "video decoder",
+        ),
+        (
+            "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB",
+            crate::pdf::MIN_RENDERER_ADDRESS_SPACE,
+            "PDF renderer",
+        ),
+        (
+            "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB",
+            crate::svg::MIN_WORKER_ADDRESS_SPACE,
+            "SVG worker",
+        ),
+    ] {
+        let least = least / MB;
+        for mb in [least, 5000, 65_536] {
+            let config = config_of(&[(var, &mb.to_string())]).unwrap();
+            assert_eq!(cap(&config, var), mb * MB, "{var}={mb}");
+        }
+        for bad in [least - 1, 0, 65_537] {
+            let bad = bad.to_string();
+            let err = refusal(&[(var, &bad)]);
+            match &err {
+                ConfigError::Invalid {
+                    var: named, value, ..
+                } => {
+                    assert_eq!(named, &var);
+                    assert_eq!(*value, ConfigValue::Text(bad.clone()));
+                }
+                other => panic!("{var}={bad}: {other:?}"),
+            }
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "{var} must be between {least} (what the {tool} needs to start) and 65536, \
+                     got {bad}"
+                )
+            );
+        }
+        for bad in ["x", "-1", "1.5", " 2048", ""] {
+            let err = refusal(&[(var, bad)]);
+            assert!(
+                matches!(&err, ConfigError::Invalid { var: named, .. } if named == &var),
+                "{var}={bad:?}: {err:?}"
+            );
+            assert_eq!(err.to_string(), format!("invalid {var}: {bad:?}"));
+        }
+        // A cap is part of the fingerprint when it is not the
+        // default: what a tool returns can depend on it. The
+        // default, set or not, keeps the fingerprint the
+        // default configuration has always had.
+        let default = (cap(&config_of(&[]).unwrap(), var) / MB).to_string();
+        assert_eq!(fingerprint(&[(var, &default)]), unset, "{var}");
+        let set = fingerprint(&[(var, &least.to_string())]);
+        assert!(!seen.contains(&set), "{var}: {set}");
         seen.push(set);
     }
 }

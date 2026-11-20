@@ -12,7 +12,7 @@ use crate::filters::EncodeOptions;
 use crate::quality::auto_quality;
 use crate::url::{
     Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill,
-    ResolvedQuality,
+    PlainFilter, ResolvedQuality,
 };
 
 /// Register the JPEG XL decoder with the image crate, once.
@@ -2390,7 +2390,7 @@ fn first_frame_placeholder(
 /// ones; the first frame's copy is the request's and comes back
 /// with the frames.
 fn render_frames(
-    frames: Frames,
+    mut frames: Frames,
     ops: &[Operation],
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
@@ -2403,7 +2403,7 @@ fn render_frames(
         None
     };
     let dpr = dpr_factor(directives.dpr, ctx);
-    survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
+    survey_trims(&mut frames, ops, cap, dpr, ctx, directives, &mut share)?;
     let frame_count = frames.len();
     let mut budget = OutputBudget::new();
     let mut render = |frame: image::Frame| {
@@ -2699,23 +2699,53 @@ impl Frames {
         std::iter::once(&self.first).chain(&self.rest)
     }
 
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut image::Frame> {
+        std::iter::once(&mut self.first).chain(&mut self.rest)
+    }
+
     /// The first frame's width and height.
     fn dimensions(&self) -> (u32, u32) {
         self.first.buffer().dimensions()
     }
 
-    /// `f` of the first frame as a `DynamicImage`. The frame's
-    /// buffer is lent for the call and put back, where it was
-    /// copied once for each look (issue #713): the quality pick
-    /// and the placeholder each read the whole frame.
+    /// `f` of the first frame as a `DynamicImage`, lent for the
+    /// call (see [`lend_frame`]), where it was copied once for
+    /// each look (issue #713): the quality pick and the
+    /// placeholder each read the whole frame.
     fn with_first<T>(&mut self, f: impl FnOnce(&DynamicImage) -> T) -> T {
-        let (left, top, delay) = (self.first.left(), self.first.top(), self.first.delay());
-        let empty = image::Frame::new(image::RgbaImage::new(0, 0));
-        let img = DynamicImage::ImageRgba8(std::mem::replace(&mut self.first, empty).into_buffer());
-        let out = f(&img);
-        self.first = image::Frame::from_parts(img.into_rgba8(), left, top, delay);
-        out
+        lend_frame(&mut self.first, |img| f(img))
     }
+}
+
+/// `f` of `frame` as a `DynamicImage`: the frame's buffer is
+/// lent for the call and put back, with the frame's position
+/// and delay, instead of copied (issues #713, #737). `f` may
+/// work on the pixels where they sit, as the trim survey's
+/// resize does (see [`resize_lanczos3_lent`]), as long as it
+/// leaves them as they came.
+fn lend_frame<T>(frame: &mut image::Frame, f: impl FnOnce(&mut DynamicImage) -> T) -> T {
+    let (left, top, delay) = (frame.left(), frame.top(), frame.delay());
+    let empty = image::Frame::new(image::RgbaImage::new(0, 0));
+    let mut img = DynamicImage::ImageRgba8(std::mem::replace(frame, empty).into_buffer());
+    let out = f(&mut img);
+    *frame = image::Frame::from_parts(img.into_rgba8(), left, top, delay);
+    out
+}
+
+/// A copy of a lent frame, for a chain whose first step cannot
+/// read the frame where it is (see [`ChainState::run_to`]).
+fn copy_of_lent(frame: &DynamicImage) -> DynamicImage {
+    #[cfg(test)]
+    LENT_FRAME_COPIES.set(LENT_FRAME_COPIES.get() + 1);
+    frame.clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many lent frames [`copy_of_lent`] copied on this
+    /// thread, so a test can see which chains read their frames
+    /// where they are.
+    static LENT_FRAME_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl IntoIterator for Frames {
@@ -3463,32 +3493,39 @@ pub(crate) fn scales_with_dpr(ops: &[Operation]) -> bool {
 fn filter_preserves_positions(filter: &Filter) -> bool {
     matches!(
         filter,
-        Filter::Grayscale
-            | Filter::Invert
-            | Filter::Blur(_)
-            | Filter::Brighten(_)
-            | Filter::Contrast(_)
-            | Filter::Gamma(_)
-            | Filter::Exposure(_)
-            | Filter::HighlightsShadows(..)
-            | Filter::Vibrance(_)
-            | Filter::HueRotate(_)
-            | Filter::Sharpen(_)
-            | Filter::Saturation(_)
-            | Filter::Rgb(..)
-            | Filter::Curve(..)
-            | Filter::Convolution(..)
-            | Filter::Noise(_)
-            | Filter::Equalize
-            | Filter::Enhance
-            | Filter::Sepia
-            | Filter::Duotone(..)
-            | Filter::Monochrome(_)
-            | Filter::Pixelate(_)
-            | Filter::Fill(_)
-            | Filter::Radius(_)
-            | Filter::Mask(_)
-            | Filter::BlurFaces
+        Filter::Plain(
+            PlainFilter::Grayscale
+                | PlainFilter::Invert
+                | PlainFilter::Blur(_)
+                | PlainFilter::Brighten(_)
+                | PlainFilter::Contrast(_)
+                | PlainFilter::Gamma(_)
+                | PlainFilter::Exposure(_)
+                | PlainFilter::HighlightsShadows(..)
+                | PlainFilter::Vibrance(_)
+                | PlainFilter::HueRotate(_)
+                | PlainFilter::Sharpen(_)
+                | PlainFilter::Saturation(_)
+                | PlainFilter::Rgb(..)
+                | PlainFilter::Curve(..)
+                | PlainFilter::Convolution(..)
+                | PlainFilter::Noise(_)
+                | PlainFilter::Equalize
+                | PlainFilter::Enhance
+                | PlainFilter::Sepia
+                | PlainFilter::Duotone(..)
+                | PlainFilter::Monochrome(_)
+                | PlainFilter::Pixelate(_)
+                | PlainFilter::Fill(_)
+                | PlainFilter::Radius(_)
+                | PlainFilter::Mask(_)
+                | PlainFilter::KeepProfile
+                | PlainFilter::MaxBytes(_)
+                | PlainFilter::Quality(_)
+                | PlainFilter::Palette(_)
+                | PlainFilter::Format(_)
+                | PlainFilter::NoUpscale
+        ) | Filter::BlurFaces
             | Filter::PixelateFaces
             | Filter::BlurClass(_)
             | Filter::PixelateClass(_)
@@ -3497,13 +3534,7 @@ fn filter_preserves_positions(filter: &Filter) -> bool {
             | Filter::BlurRegion { .. }
             | Filter::PixelateRegion { .. }
             | Filter::RemoveRegion { .. }
-            | Filter::KeepProfile
             | Filter::Dpr(_)
-            | Filter::MaxBytes(_)
-            | Filter::Quality(_)
-            | Filter::Palette(_)
-            | Filter::Format(_)
-            | Filter::NoUpscale
     )
 }
 
@@ -3523,7 +3554,7 @@ fn filter_keeps_focal(filter: &Filter) -> bool {
             Filter::Watermark { .. }
                 | Filter::Overlay { .. }
                 | Filter::Text { .. }
-                | Filter::Border(..)
+                | Filter::Plain(PlainFilter::Border(..))
                 | Filter::RemoveBg
         )
 }
@@ -4062,7 +4093,7 @@ impl TrimWindows {
 
 /// The geometry the frames of one animated render share, so
 /// the frames come out on one canvas, cut from the same part
-/// of the scene.
+/// of the scene, and the scaled overlay parts they all draw.
 #[derive(Debug, Default)]
 struct FrameShare {
     /// One smart crop window per crop (issue #376), on the
@@ -4071,6 +4102,78 @@ struct FrameShare {
     smart_windows: SmartWindows,
     /// One trim window per trim filter (issue #465).
     trims: TrimWindows,
+    /// The parts `overlay(...,width)` scaled, kept for the
+    /// frames after the one that scaled them.
+    overlays: ScaledOverlays,
+}
+
+/// The scaled overlay parts the frames of one animated render
+/// share. `overlay(...,width)` scales the part of the overlay
+/// that lands on the image, and those pixels depend on the
+/// overlay, the size it is scaled to and the part that lands,
+/// nothing else. The frames of a render share one canvas, so
+/// they all ask for the same part: the first frame scales it,
+/// and the frames after it draw the kept pixels, where each
+/// scaled them again. A part is kept under all three, so a
+/// frame of another size, or another overlay, asks for a part
+/// of its own and scales it. The overlay is named by the URL
+/// it was fetched from, which names one image for the whole
+/// render.
+///
+/// The frames render in turn, each chain borrowing the render's
+/// one share for its run (see [`render_frames`] and
+/// [`survey_trims`]), so the parts are never read and written at
+/// once. They hold at most as many pixels as the image they land
+/// on: a part past that is scaled for each frame, as before, so
+/// a chain of many scaled overlays keeps no more than one
+/// frame's worth of them.
+#[derive(Debug, Default)]
+struct ScaledOverlays {
+    entries: Vec<ScaledOverlay>,
+}
+
+/// One kept part: what its pixels depend on, and the pixels.
+#[derive(Debug)]
+struct ScaledOverlay {
+    url: String,
+    size: (u32, u32),
+    part: crate::filters::Rect,
+    pixels: std::sync::Arc<image::RgbaImage>,
+}
+
+impl ScaledOverlays {
+    /// The pixels of `part` of the overlay at `url` scaled to
+    /// `size`: the kept ones when an earlier frame scaled them,
+    /// or else what `scale` makes, kept while the kept parts
+    /// still hold no more than `room` pixels with them.
+    fn part<E>(
+        &mut self,
+        url: &str,
+        size: (u32, u32),
+        part: crate::filters::Rect,
+        room: u64,
+        scale: impl FnOnce() -> Result<image::RgbaImage, E>,
+    ) -> Result<std::sync::Arc<image::RgbaImage>, E> {
+        let pixels_of = |(_, _, w, h): crate::filters::Rect| u64::from(w) * u64::from(h);
+        if let Some(kept) = self
+            .entries
+            .iter()
+            .find(|e| e.url == url && e.size == size && e.part == part)
+        {
+            return Ok(std::sync::Arc::clone(&kept.pixels));
+        }
+        let pixels = std::sync::Arc::new(scale()?);
+        let held: u64 = self.entries.iter().map(|e| pixels_of(e.part)).sum();
+        if held + pixels_of(part) <= room {
+            self.entries.push(ScaledOverlay {
+                url: url.to_owned(),
+                size,
+                part,
+                pixels: std::sync::Arc::clone(&pixels),
+            });
+        }
+        Ok(pixels)
+    }
 }
 
 /// The smallest box holding both boxes; `None` stands for no
@@ -4097,14 +4200,18 @@ fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
 /// the render's own deadline. A lone frame has nothing to
 /// share and trims for itself.
 ///
-/// A prefix runs on a copy of each frame, since its steps
-/// take the frame they work on (a resize premultiplies its
-/// own frame where it sits) and the render needs the frames
-/// as they came. A trim nothing runs before reads the frames
-/// where they are (issue #713): its survey is the tolerance
-/// pass alone, and copying every frame for it was the cost.
+/// The render needs the frames as they came, and a prefix's
+/// steps work on the image they are handed (a resize
+/// premultiplies its own frame where it sits), so each frame
+/// is lent to its prefix and comes back unchanged (issue
+/// #737). A prefix that starts with a resize or a fit-in that
+/// resamples the whole frame reads the lent frame where it is
+/// (see [`ChainState::run_to`]); any other prefix runs on a
+/// copy of the frame. A trim nothing runs before reads the
+/// frames where they are (issue #713): its survey is the
+/// tolerance pass alone.
 fn survey_trims(
-    frames: &Frames,
+    frames: &mut Frames,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
     dpr: f32,
@@ -4122,14 +4229,16 @@ fn survey_trims(
         };
         for (filter_index, filter) in filters.iter().enumerate() {
             let tolerance = match filter {
-                Filter::Trim(tolerance) | Filter::TrimSides(tolerance, _) => *tolerance,
+                Filter::Plain(
+                    PlainFilter::Trim(tolerance) | PlainFilter::TrimSides(tolerance, _),
+                ) => *tolerance,
                 _ => continue,
             };
             let key = (op_index, filter_index);
             let first_step = op_index == 0 && filter_index == 0;
             // The first frame's dimensions and the union so far.
             let mut surveyed: Option<((u32, u32), Option<Window>)> = None;
-            for frame in frames.iter() {
+            for frame in frames.iter_mut() {
                 ctx.check_deadline()?;
                 let (dims, found) = if first_step {
                     let rgba = frame.buffer();
@@ -4138,14 +4247,15 @@ fn survey_trims(
                         crate::filters::trim_box_rgba(rgba, tolerance),
                     )
                 } else {
-                    let img = DynamicImage::ImageRgba8(frame.buffer().clone());
-                    let mut chain =
-                        ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
-                    let img = chain.run_to(img, ops, key)?;
-                    (
-                        (img.width(), img.height()),
-                        crate::filters::trim_box(&img, tolerance),
-                    )
+                    lend_frame(frame, |lent| {
+                        let mut chain =
+                            ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
+                        let img = chain.run_to(lent, ops, key)?;
+                        Ok::<_, EngineError>((
+                            (img.width(), img.height()),
+                            crate::filters::trim_box(&img, tolerance),
+                        ))
+                    })?
                 };
                 match &mut surveyed {
                     None => surveyed = Some((dims, found)),
@@ -4194,8 +4304,9 @@ struct ChainState<'r, 'a> {
     dpr: f32,
     ctx: &'r ProcessContext<'a>,
     directives: &'r crate::url::RequestDirectives,
-    /// The geometry an animated render shares across its
-    /// frames (issues #376, #465); `None` on a still.
+    /// What an animated render shares across its frames: its
+    /// geometry (issues #376, #465) and its scaled overlay
+    /// parts; `None` on a still.
     share: Option<&'r mut FrameShare>,
     encode_opts: EncodeOptions,
     face_memo: FaceMemo,
@@ -4460,12 +4571,19 @@ impl<'r, 'a> ChainState<'r, 'a> {
     /// detection memos, and the output budget.
     fn step(
         &mut self,
-        mut img: DynamicImage,
+        img: DynamicImage,
         op_index: usize,
         op: &Operation,
     ) -> Result<DynamicImage, EngineError> {
         self.ctx.check_deadline()?;
-        img = self.apply_op(img, op_index, op)?;
+        let img = self.apply_op(img, op_index, op)?;
+        self.stepped(img, op)
+    }
+
+    /// What an operation owes the chain once it has run (see
+    /// [`ChainState::step`]): the detection memos and the
+    /// output budget.
+    fn stepped(&mut self, img: DynamicImage, op: &Operation) -> Result<DynamicImage, EngineError> {
         // Every operation other than the filters segment
         // sizes, crops, or pads, so the detection memos never
         // survive one (issue #373); the filters arm
@@ -4494,17 +4612,29 @@ impl<'r, 'a> ChainState<'r, 'a> {
         Ok(img)
     }
 
-    /// Run the chain on `img` up to the filter at `key` (the
-    /// operation and filter indexes) and return the image
-    /// that filter receives: the trim survey's view of a
-    /// frame (see [`survey_trims`]).
+    /// Run the chain up to the filter at `key` (the operation
+    /// and filter indexes) on a frame lent for the run, and
+    /// return the image that filter receives: the trim
+    /// survey's view of a frame (see [`survey_trims`]). The
+    /// frame comes back as it was. A first operation that
+    /// resamples the whole frame reads it where it is (see
+    /// [`ChainState::lent_step`]); after any other, the chain
+    /// runs on a copy of the frame (issue #737).
     fn run_to(
         &mut self,
-        mut img: DynamicImage,
+        frame: &mut DynamicImage,
         ops: &[Operation],
         (op_index, filter_index): (usize, usize),
     ) -> Result<DynamicImage, EngineError> {
-        for (index, op) in ops.iter().enumerate().take(op_index) {
+        let lent = match ops.first() {
+            Some(first) if op_index > 0 => self.lent_step(frame, first)?,
+            _ => None,
+        };
+        let (mut img, next) = match lent {
+            Some(img) => (img, 1),
+            None => (copy_of_lent(frame), 0),
+        };
+        for (index, op) in ops.iter().enumerate().take(op_index).skip(next) {
             img = self.step(img, index, op)?;
         }
         if let Some(Operation::Filters(filters)) = ops.get(op_index) {
@@ -4513,6 +4643,49 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
         }
         Ok(img)
+    }
+
+    /// The chain's first operation, `op`, on a frame lent for
+    /// it (issue #737): a resize or a fit-in that resamples the
+    /// whole frame reads it where it is (see
+    /// [`resize_lanczos3_lent`]) and returns the image it
+    /// makes, with what [`ChainState::step`] owes the chain
+    /// around it. `None` for any other operation, and for a
+    /// resize that leaves the frame at its size, which hands
+    /// on the frame itself: those run on a copy.
+    fn lent_step(
+        &mut self,
+        frame: &mut DynamicImage,
+        op: &Operation,
+    ) -> Result<Option<DynamicImage>, EngineError> {
+        self.ctx.check_deadline()?;
+        let img = match op {
+            Operation::Size(size) if self.fused_window.is_none() && self.reduced.is_none() => {
+                let cap = self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch));
+                let Some(img) = apply_size_lent(frame, size, cap, self.dpr)? else {
+                    return Ok(None);
+                };
+                self.focal_resized(&img, size.flip_horizontal, size.flip_vertical);
+                img
+            }
+            Operation::FitIn { size, adaptive } => {
+                let Some(img) = apply_fit_in_lent(frame, size, *adaptive, self.cap, self.dpr)?
+                else {
+                    return Ok(None);
+                };
+                self.focal_resized(&img, false, false);
+                img
+            }
+            _ => return Ok(None),
+        };
+        self.stepped(img, op).map(Some)
+    }
+
+    /// Carry the pending focal form through a resize of the
+    /// whole image to `img`, mirrored on the axes it flipped.
+    fn focal_resized(&mut self, img: &DynamicImage, flip_h: bool, flip_v: bool) {
+        let dims = (img.width(), img.height());
+        self.focal = self.focal.map(|f| f.scaled(dims, flip_h, flip_v));
     }
 
     /// Apply one operation of the chain to the image in hand.
@@ -4564,15 +4737,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         self.dpr,
                     )?
                 };
-                let dims = (img.width(), img.height());
-                self.focal = self
-                    .focal
-                    .map(|f| f.scaled(dims, size.flip_horizontal, size.flip_vertical));
+                self.focal_resized(&img, size.flip_horizontal, size.flip_vertical);
             }
             Operation::FitIn { size, adaptive } => {
                 img = apply_fit_in(img, size, *adaptive, self.cap, self.dpr)?;
-                let dims = (img.width(), img.height());
-                self.focal = self.focal.map(|f| f.scaled(dims, false, false));
+                self.focal_resized(&img, false, false);
             }
             Operation::Pad { size, fill } => {
                 let (tw, th) = match (size.width, size.height) {
@@ -4692,8 +4861,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
         self.ctx.check_deadline()?;
         let before = (img.width(), img.height());
         let img = match filter {
-            Filter::Trim(tolerance) => self.trim(img, key, *tolerance, [0; 4]),
-            Filter::TrimSides(tolerance, sides) => self.trim(img, key, *tolerance, *sides),
+            Filter::Plain(PlainFilter::Trim(tolerance)) => self.trim(img, key, *tolerance, [0; 4]),
+            Filter::Plain(PlainFilter::TrimSides(tolerance, sides)) => {
+                self.trim(img, key, *tolerance, *sides)
+            }
             _ => {
                 let img = self.apply_filter(img, filter)?;
                 // A filter that moves pixels in a way the
@@ -5084,17 +5255,22 @@ impl<'r, 'a> ChainState<'r, 'a> {
         Ok(cropped)
     }
 
-    /// Apply one filter of a `filters:` segment: watermark
-    /// and overlay filters resolve against the
-    /// server-fetched images, the model and font filters run
-    /// through their providers, and everything else is a
-    /// plain filter (see [`ChainState::plain_filter`]).
+    /// Apply one filter of a `filters:` segment: a plain
+    /// filter runs through `crate::filters` (see
+    /// [`ChainState::plain_filter`]), watermark and overlay
+    /// filters resolve against the server-fetched images, the
+    /// model and font filters run through their providers,
+    /// and the region filters check their rectangle against
+    /// the image in effect. The match names every variant
+    /// (issue #741), so a new filter does not compile until
+    /// it is applied here or is a [`PlainFilter`].
     fn apply_filter(
         &mut self,
         mut img: DynamicImage,
         filter: &Filter,
     ) -> Result<DynamicImage, EngineError> {
         match filter {
+            Filter::Plain(plain) => img = self.plain_filter(img, plain)?,
             Filter::Watermark { url, x, y, alpha } => {
                 let wm = self
                     .ctx
@@ -5120,7 +5296,22 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     .ok_or_else(|| {
                         EngineError::Unsupported(format!("overlay was not resolved: {url}"))
                     })?;
-                img = blend_overlay(self.ctx, &img, ov, *x, *y, *alpha, *blend, *width)?;
+                // The frames of an animated render share the
+                // scaled part (see `ScaledOverlays`).
+                let kept = self
+                    .share
+                    .as_deref_mut()
+                    .map(|share| (url.as_str(), &mut share.overlays));
+                img = blend_overlay_keeping(
+                    self.ctx,
+                    &img,
+                    ov,
+                    (*x, *y),
+                    *alpha,
+                    *blend,
+                    *width,
+                    kept,
+                )?;
             }
             Filter::RemoveBg => {
                 let provider = self.ctx.mask_provider.ok_or_else(|| {
@@ -5180,9 +5371,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     img = crate::filters::recolor_detections(&img, &boxes, *color);
                 }
             }
-            // Padding is read from the request as a
-            // whole by the face crop; no pixels here.
-            Filter::FacePad(_) => {}
+            // Request-wide directives, read from the request
+            // as a whole: the face crop reads the padding, and
+            // the DPR factor scales the size targets before
+            // the chain runs. No pixels here.
+            Filter::FacePad(_) | Filter::Dpr(_) => {}
             Filter::Upscale(factor) => {
                 let provider = self.ctx.upscale_provider.ok_or_else(|| {
                     EngineError::NotConfigured(
@@ -5238,7 +5431,6 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         crate::text::DrawError::Failed(message) => EngineError::Render(message),
                     })?;
             }
-            other => img = self.plain_filter(img, other)?,
         }
         Ok(img)
     }
@@ -5327,12 +5519,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
     }
 
     /// A plain filter: pixels in, pixels out through
-    /// `apply_filters_filled`, with any encoding directive it
+    /// `apply_filters_within`, with any encoding directive it
     /// carries absorbed into the chain's encode options.
     fn plain_filter(
         &mut self,
         img: DynamicImage,
-        filter: &Filter,
+        filter: &PlainFilter,
     ) -> Result<DynamicImage, EngineError> {
         // Arbitrary-angle rotation is
         // the one plain filter that grows
@@ -5340,7 +5532,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // is about to allocate before it
         // allocates (issue #182, R2-12),
         // per axis too (issue #521).
-        if let Filter::Rotate(degrees) = filter {
+        if let PlainFilter::Rotate(degrees) = filter {
             let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
             check_output_size(cw, ch, (img.width(), img.height()))?;
         }
@@ -5645,6 +5837,7 @@ fn is_video_container(bytes: &[u8]) -> bool {
 
 mod encode;
 mod jpeg_scaled;
+mod overlay_scale;
 mod webp_anim;
 pub use encode::AvifTiles;
 pub(in crate::engine) use encode::{
@@ -5680,17 +5873,28 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 /// `overlay_watermark`, as does the alpha convention: the
 /// effective alpha is the overlay pixel's alpha times the
 /// opacity, and the base alpha channel is preserved, so
-/// `Normal` reproduces a watermark exactly.
+/// `Normal` reproduces a watermark exactly. A scaled overlay
+/// is scaled only where it lands, a row at a time, with the
+/// deadline checked before each row and within a row that
+/// reads many source samples (see `overlay_scale`): the same
+/// pixels the whole scale gave there.
+///
+/// On a frame of an animated render, `kept` holds the URL the
+/// overlay was fetched from and the scaled parts the render's
+/// frames share (see [`ScaledOverlays`]): a part an earlier
+/// frame scaled is drawn from there, with the same pixels, and
+/// one this frame scales is kept there for the frames after
+/// it. A still passes `None`.
 #[allow(clippy::too_many_arguments)]
-fn blend_overlay(
+fn blend_overlay_keeping(
     ctx: &ProcessContext<'_>,
     base: &DynamicImage,
     ov: &crate::filters::WatermarkImage,
-    x: i32,
-    y: i32,
+    (x, y): (i32, i32),
     alpha: u8,
     mode: crate::url::BlendMode,
     width_pct: Option<u32>,
+    kept: Option<(&str, &mut ScaledOverlays)>,
 ) -> Result<DynamicImage, EngineError> {
     // The deadline is checked before anything is copied or
     // scaled, as well as per row of the blend (issue #604).
@@ -5723,22 +5927,33 @@ fn blend_overlay(
     if !lands_on((base.width(), base.height()), (x, y)) {
         return Ok(base.clone());
     }
-    // The overlay is scaled first and its RGBA pixels read
-    // after, as before: the resize reads the decoded image.
-    let scaled = target.map(|target| {
-        ov.image()
-            .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
-    });
-    let top_size = match &scaled {
-        Some(scaled) => (scaled.width(), scaled.height()),
-        None => (ov.image().width(), ov.image().height()),
+    // The scaled size is known before anything is scaled, so
+    // only the part that lands is: a scale the pixel budget
+    // admits can still take long whole, and a sliver of it on
+    // the canvas no longer pays for the rest.
+    let source_size = (ov.image().width(), ov.image().height());
+    let top_size = match target {
+        Some(target) => overlay_scale::scaled_size(source_size, target),
+        None => source_size,
     };
     let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
         return Ok(base.clone());
     };
-    let top = match &scaled {
-        Some(scaled) => crate::filters::RgbaPart::of(scaled, part.0),
-        None => ov.rgba_part(part.0),
+    let top = if top_size == source_size {
+        // Scaled to its own size, the overlay is itself.
+        ov.rgba_part(part.0)
+    } else {
+        let scale =
+            || overlay_scale::scaled_part(ov.image(), top_size, part.0, || ctx.check_deadline());
+        let origin = (part.0.0, part.0.1);
+        match kept {
+            Some((url, kept)) => {
+                let room = u64::from(base.width()) * u64::from(base.height());
+                let pixels = kept.part(url, top_size, part.0, room, scale)?;
+                crate::filters::RgbaPart::shared(pixels, origin, top_size)
+            }
+            None => crate::filters::RgbaPart::copied(scale()?, origin, top_size),
+        }
     };
     // The blend walks every overlay pixel; a large legal pair
     // still runs long, so the deadline is honored per row
@@ -5751,6 +5966,23 @@ fn blend_overlay(
         || ctx.check_deadline(),
         |b, o| blend_channel(mode, b, o),
     )
+}
+
+/// [`blend_overlay_keeping`] on a still, with nothing kept:
+/// the form the tests call.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn blend_overlay(
+    ctx: &ProcessContext<'_>,
+    base: &DynamicImage,
+    ov: &crate::filters::WatermarkImage,
+    x: i32,
+    y: i32,
+    alpha: u8,
+    mode: crate::url::BlendMode,
+    width_pct: Option<u32>,
+) -> Result<DynamicImage, EngineError> {
+    blend_overlay_keeping(ctx, base, ov, (x, y), alpha, mode, width_pct, None)
 }
 
 /// Overlay `wm` onto `base` at (x, y) with `alpha` percent
@@ -6114,7 +6346,7 @@ fn apply_size_windowed(
     let (w, h) = resize_target(size, dpr, (sw, sh), cap);
     check_output_size(w, h, (sw, sh))?;
     let unchanged = w == sw && h == sh;
-    let mut img = match window {
+    let img = match window {
         // A reduced frame is not the size the target was
         // resolved against, so it is resampled whatever the
         // target is.
@@ -6129,13 +6361,39 @@ fn apply_size_windowed(
         SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
         SourceWindow::Whole => resize_lanczos3_owned(img, w, h),
     };
+    Ok(flipped(img, size))
+}
+
+/// [`apply_size`] of a frame lent for the resize (issue #737):
+/// the image it makes, with the frame back as it came (see
+/// [`resize_lanczos3_lent`]). `None` when the size is the
+/// frame's own, where [`apply_size`] hands on the frame itself,
+/// which a lent frame cannot be.
+fn apply_size_lent(
+    frame: &mut DynamicImage,
+    size: &ImageSize,
+    cap: Option<SizeCap>,
+    dpr: f32,
+) -> Result<Option<DynamicImage>, EngineError> {
+    check_nonzero_size(size)?;
+    let dims = (frame.width(), frame.height());
+    let (w, h) = resize_target(size, dpr, dims, cap);
+    check_output_size(w, h, dims)?;
+    if (w, h) == dims {
+        return Ok(None);
+    }
+    Ok(Some(flipped(resize_lanczos3_lent(frame, w, h), size)))
+}
+
+/// `img` mirrored on the axes `size` flips.
+fn flipped(mut img: DynamicImage, size: &ImageSize) -> DynamicImage {
     if size.flip_horizontal {
         img = crate::filters::fliph_fast(&img);
     }
     if size.flip_vertical {
         img = crate::filters::flipv_fast(&img);
     }
-    Ok(img)
+    img
 }
 
 /// Resize to (w, h) with the SIMD backend (fast_image_resize),
@@ -6203,6 +6461,89 @@ fn resize_lanczos3_owned(mut img: DynamicImage, w: u32, h: u32) -> DynamicImage 
         dst
     } else {
         resize_lanczos3(&img, w, h)
+    }
+}
+
+/// [`resize_lanczos3_owned`] of a frame lent for the resize
+/// (issue #737): the same bytes, and the frame back as it came.
+/// Read through [`resize_lanczos3`], a frame with alpha would be
+/// premultiplied into a second buffer the size of the frame. An
+/// RGBA8 frame is premultiplied where it sits instead, as an
+/// owned frame is, with each row the premultiply changes copied
+/// out before it and written back after the resample. The
+/// premultiply rounds `c * alpha / 255`, which keeps a pixel at
+/// full alpha and a black one as they are, so the rows to copy
+/// are those holding any other pixel: none for an opaque frame,
+/// and none for a GIF frame, whose pixels are opaque or
+/// transparent black. Any other layout, and a size that needs
+/// no resample, take [`resize_lanczos3`].
+fn resize_lanczos3_lent(img: &mut DynamicImage, w: u32, h: u32) -> DynamicImage {
+    let (sw, sh) = (img.width(), img.height());
+    let resamples = (w, h) != (sw, sh) && w > 0 && h > 0 && sw > 0 && sh > 0;
+    let changing = match &*img {
+        DynamicImage::ImageRgba8(rgba) if resamples => ChangingRows::of(rgba),
+        _ => return resize_lanczos3(img, w, h),
+    };
+    let mut dst = DynamicImage::new_rgba8(w, h);
+    let done = resample_premultiplying(img, &mut dst);
+    if let DynamicImage::ImageRgba8(rgba) = img {
+        changing.put_back(rgba);
+    }
+    if done {
+        dst
+    } else {
+        resize_lanczos3(img, w, h)
+    }
+}
+
+/// The rows of an RGBA8 frame that a premultiply changes,
+/// copied out before it runs (see [`resize_lanczos3_lent`]).
+struct ChangingRows {
+    /// The bytes in a row of the frame.
+    stride: usize,
+    /// The row indexes, in order.
+    rows: Vec<usize>,
+    /// Their bytes, one row after another.
+    bytes: Vec<u8>,
+}
+
+impl ChangingRows {
+    /// Copy out the rows of `frame` holding a pixel that is
+    /// neither opaque nor black.
+    fn of(frame: &image::RgbaImage) -> Self {
+        let mut changing = ChangingRows {
+            stride: frame.width() as usize * 4,
+            rows: Vec::new(),
+            bytes: Vec::new(),
+        };
+        if changing.stride == 0 {
+            return changing;
+        }
+        let rows = frame.as_raw().chunks_exact(changing.stride);
+        for (y, row) in rows.take(frame.height() as usize).enumerate() {
+            let changes = row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|&[r, g, b, a]| a != u8::MAX && (r | g | b) != 0);
+            if changes {
+                changing.rows.push(y);
+                changing.bytes.extend_from_slice(row);
+            }
+        }
+        changing
+    }
+
+    /// Write the copied rows back into `frame`, the frame they
+    /// were copied from.
+    fn put_back(&self, frame: &mut image::RgbaImage) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let pixels: &mut [u8] = frame;
+        for (&y, row) in self.rows.iter().zip(self.bytes.chunks_exact(self.stride)) {
+            pixels[y * self.stride..][..self.stride].copy_from_slice(row);
+        }
     }
 }
 
@@ -6624,6 +6965,40 @@ fn apply_fit_in(
     cap: Option<(u32, u32)>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
+    let dims = (img.width(), img.height());
+    match fit_in_target(size, adaptive, cap, dpr, dims)? {
+        Some((w, h)) if (w, h) != dims => Ok(resize_lanczos3_owned(img, w, h)),
+        _ => Ok(img),
+    }
+}
+
+/// [`apply_fit_in`] of a frame lent for the resize (issue
+/// #737), as [`apply_size_lent`] is of a resize: `None` when
+/// the fit-in leaves the frame as it is.
+fn apply_fit_in_lent(
+    frame: &mut DynamicImage,
+    size: &ImageSize,
+    adaptive: bool,
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+) -> Result<Option<DynamicImage>, EngineError> {
+    let dims = (frame.width(), frame.height());
+    Ok(match fit_in_target(size, adaptive, cap, dpr, dims)? {
+        Some((w, h)) if (w, h) != dims => Some(resize_lanczos3_lent(frame, w, h)),
+        _ => None,
+    })
+}
+
+/// The size a fit-in to `size` leaves a `sw` by `sh` image at,
+/// checked against the output bounds; `None` when the box
+/// bounds neither axis, so the image passes as it is.
+fn fit_in_target(
+    size: &ImageSize,
+    adaptive: bool,
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+    (sw, sh): (u32, u32),
+) -> Result<Option<(u32, u32)>, EngineError> {
     check_nonzero_size(size)?;
     let scaled = ImageSize {
         width: scale_dimension(size.width, dpr),
@@ -6631,7 +7006,6 @@ fn apply_fit_in(
         flip_horizontal: size.flip_horizontal,
         flip_vertical: size.flip_vertical,
     };
-    let (sw, sh) = (img.width(), img.height());
     let size = &fit_in_box(&scaled, sw, sh, adaptive);
     let mut scale = f64::INFINITY;
     match size.width {
@@ -6645,7 +7019,7 @@ fn apply_fit_in(
         Dimension::Proportional => {}
     }
     if !scale.is_finite() {
-        return Ok(img);
+        return Ok(None);
     }
     let w = ((sw as f64 * scale).round() as u32).max(1);
     let h = ((sh as f64 * scale).round() as u32).max(1);
@@ -6654,11 +7028,7 @@ fn apply_fit_in(
         None => (w, h),
     };
     check_output_size(w, h, (sw, sh))?;
-    if w == sw && h == sh {
-        Ok(img)
-    } else {
-        Ok(resize_lanczos3_owned(img, w, h))
-    }
+    Ok(Some((w, h)))
 }
 
 #[cfg(test)]

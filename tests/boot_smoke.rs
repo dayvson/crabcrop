@@ -552,7 +552,8 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
                     "images.example.com, cdn.example.com",
                 ),
             ],
-            "request mode: unsafe; source allowlist: 2 hosts; private-address check: on",
+            "request mode: unsafe; source allowlist: 2 hosts; \
+             private-address check: on, allowlisted hosts exempt",
             None,
         ),
         (
@@ -572,7 +573,26 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
                 presets_file,
                 ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
             ],
-            "request mode: presets-only; source allowlist: 1 host; private-address check: on",
+            "request mode: presets-only; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
+            None,
+        ),
+        (
+            vec![
+                unsafe_on,
+                only_presets,
+                presets_file,
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+                ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            ],
+            "request mode: presets-only; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts included",
+            None,
+        ),
+        (
+            vec![unsafe_on, ("CRABCROP_ALLOWED_SOURCES", "192.0.2.10")],
+            "request mode: unsafe; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
             None,
         ),
         (
@@ -648,6 +668,83 @@ fn explain_off_answers_404_while_images_still_render() {
     let stderr = refused_boot(&[("CRABCROP_EXPLAIN", "of")]);
     assert!(
         stderr.starts_with("crabcrop: invalid CRABCROP_EXPLAIN"),
+        "{stderr}"
+    );
+}
+
+/// One HTTP/1.0 POST with no body on `port`: the
+/// response's status line and its body.
+fn post(port: u16, path: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    let status = response.lines().next().unwrap_or("").to_string();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn purge_require_expiry_refuses_plain_purges_and_boot_says_so() {
+    // With `CRABCROP_PURGE_REQUIRE_EXPIRY=1` a purge URL
+    // with no expiry answers 403, boot says so, and the
+    // expiring form still purges. Unset, both purge.
+    let secret = "boot-smoke-secret-0123456789";
+    let target = "100x50/https://example.com/a.jpg";
+    let plain = format!(
+        "/purge/{}/{target}",
+        crabcrop_url::purge_signature(secret.as_bytes(), target)
+    );
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let expiring = format!(
+        "/purge/{}/exp:{exp}/{target}",
+        crabcrop_url::purge_signature_with_expiry(secret.as_bytes(), target, exp)
+    );
+    for (value, plain_status, says_so) in [(None, "200", false), (Some("1"), "403", true)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+        command.env_clear().env("CRABCROP_SECRET", secret);
+        if let Some(value) = value {
+            command.env("CRABCROP_PURGE_REQUIRE_EXPIRY", value);
+        }
+        let (_server, port, _, printed) = common::serve_printing(&mut command);
+        let (status, body) = post(port, &plain);
+        assert!(
+            status.contains(plain_status),
+            "{value:?}: {status:?} {body:?}"
+        );
+        assert_eq!(
+            body.starts_with("expiry required"),
+            says_so,
+            "{value:?}: {body:?}"
+        );
+        let (status, body) = post(port, &expiring);
+        assert!(status.contains("200"), "{value:?}: {status:?} {body:?}");
+        assert_eq!(
+            printed.iter().any(|l| l == "purges: expiring URLs only"),
+            says_so,
+            "{value:?}: {printed:#?}"
+        );
+    }
+    // A typo stops the boot and names the variable, rather
+    // than leaving plain purge URLs working.
+    let stderr = refused_boot(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", "required")]);
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_PURGE_REQUIRE_EXPIRY"),
         "{stderr}"
     );
 }
@@ -1617,6 +1714,26 @@ fn serving(env: &[(&str, &str)]) -> (ServerGuard, u16, Vec<String>) {
     (server, port, printed)
 }
 
+/// Bind `port` on `ip` without listening, so that a
+/// connection there is refused for as long as the socket is
+/// held, or `None` when something already holds the port on
+/// that address. The kernel picks a server's port for the
+/// address the server binds, and the same number can be in
+/// use on another loopback address, by another test's server
+/// or origin: a test that expects a refusal there holds the
+/// port first.
+#[cfg(target_os = "linux")]
+fn hold_unlistened(ip: std::net::Ipv4Addr, port: u16) -> Option<rustix::fd::OwnedFd> {
+    let socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::STREAM,
+        None,
+    )
+    .ok()?;
+    rustix::net::bind(&socket, &std::net::SocketAddrV4::new(ip, port)).ok()?;
+    Some(socket)
+}
+
 #[test]
 fn a_connection_that_never_finishes_its_request_head_is_closed_at_the_header_timeout() {
     // Issue #607: the server never set a timer on its
@@ -1775,7 +1892,17 @@ fn crabcrop_bind_listens_on_the_named_address_only() {
         TcpStream::connect(("127.0.0.2", port)).is_ok(),
         "by default the server listens on every IPv4 interface"
     );
-    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+    // The kernel picks the port for 127.0.0.1 only, so it can
+    // be in use on 127.0.0.2 already, by the health verb
+    // test's server: hold it there, bound but not listening,
+    // so a connection is refused for certain.
+    let (_server, port, printed, _held) = (0..8)
+        .find_map(|_| {
+            let (server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+            hold_unlistened(std::net::Ipv4Addr::new(127, 0, 0, 2), port)
+                .map(|held| (server, port, printed, held))
+        })
+        .expect("in 8 tries, a server port that nothing holds on 127.0.0.2");
     assert!(status_line(port, "/health", "").contains("200"));
     let refused = TcpStream::connect(("127.0.0.2", port)).map(|_| ());
     assert_eq!(
@@ -1848,7 +1975,18 @@ fn the_health_verb_probes_the_address_crabcrop_bind_names() {
     // failed on a healthy server. The verb reads
     // CRABCROP_BIND as the server does and probes that
     // address. 127.0.0.2 is a loopback address on Linux.
-    let (_server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+    // The check without the setting needs nothing to listen
+    // on 127.0.0.1 at the server's port. The kernel picks the
+    // port for 127.0.0.2 only, so another test's server or
+    // origin can listen on 127.0.0.1 at the same number: the
+    // test holds the port there, bound but not listening, and
+    // starts another server when something else holds it.
+    let (_server, port, _held) = (0..8)
+        .find_map(|_| {
+            let (server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+            hold_unlistened(std::net::Ipv4Addr::LOCALHOST, port).map(|held| (server, port, held))
+        })
+        .expect("in 8 tries, a server port that nothing holds on 127.0.0.1");
     let health = |vars: &[(&str, &str)]| {
         Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .arg("health")

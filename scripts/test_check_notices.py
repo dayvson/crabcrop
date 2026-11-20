@@ -378,9 +378,19 @@ class CheckNotices(unittest.TestCase):
         self.assertFalse((self.root / check_notices.NOTICES).exists())
 
     def test_a_moved_download_pin_fails(self):
+        # A pin covers texts copied from the download itself (dav1d's) or
+        # from where its authors publish them (a model's): the message
+        # sends the reader to the license either way (issue #702).
         self.generate()
         self.write("scripts/build_lib.sh", "LIB_SHA256=" + "cd" * 32 + "\n")
-        self.assert_fails([f"scripts/build_lib.sh no longer pins the download with sha256 {PIN}"])
+        line = TEMPLATE.split("\n").index(f"<!-- pinned: file=scripts/build_lib.sh sha256={PIN} -->") + 1
+        self.assert_fails(
+            [
+                f"scripts/build_lib.sh no longer pins the download with sha256 {PIN}, whose license texts "
+                f"scripts/notices/template.md copies after line {line}: read the license of the download it pins "
+                "now, copy its texts again, then update that line"
+            ]
+        )
 
     def test_an_artifact_that_drops_the_file_fails(self):
         self.generate()

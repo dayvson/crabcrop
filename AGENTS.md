@@ -22,7 +22,9 @@ both SDKs must all pass.
   `main.rs` is the binary, reading configuration and booting the
   server. The operation parser and canonical forms in `url.rs`
   (a filter is one row of the table in `url/filters.rs`, which
-  generates both its parser and its canonical spelling),
+  generates both its parser and its canonical spelling, and one
+  variant: of `PlainFilter` when `filters.rs` applies it from the
+  image alone, of `Filter` when the engine applies it itself),
   pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in
@@ -99,9 +101,11 @@ both SDKs must all pass.
   in CI fails. `scripts/check_locks.py` fails CI when the two lockfiles
   disagree on a package both carry, or when either locks a decoder at
   two versions: one decoder version is what ships, pre-checks and
-  fuzzes. A Dependabot cargo pull request moves the root lockfile only,
-  so one that moves a package both carry fails that check until the
-  refresh is pushed to its branch.
+  fuzzes. It also fails on a second reqwest (issue #742): c2pa's async
+  HTTP stack, which crabcrop never calls, compiled reqwest 0.12 beside
+  crabcrop's 0.13. A Dependabot cargo pull request moves the
+  root lockfile only, so one that moves a package both carry fails that
+  check until the refresh is pushed to its branch.
 - `THIRD-PARTY-NOTICES.md`, which every artifact ships, is generated
   from `Cargo.lock` for the release build (`scripts/check_notices.py
   --write`, with the cargo-about version the script pins; RELEASING.md,

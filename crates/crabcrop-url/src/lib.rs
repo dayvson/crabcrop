@@ -21,7 +21,9 @@
 //!   URLs.
 //! - **Purge and upload signatures**: the same HMAC under
 //!   domain-separated derived subkeys, so a signature
-//!   minted for one endpoint verifies at no other.
+//!   minted for one endpoint verifies at no other. Each
+//!   has an expiring form, with an `exp:` segment inside
+//!   the signed text.
 //!
 //! Each subkey is the HMAC of a fixed label under the
 //! secret, and every label begins with the segment
@@ -29,6 +31,12 @@
 //! segment, so every signer here refuses such a remainder
 //! ([`is_reserved_remainder`]): a signature over a label
 //! would be that label's subkey.
+//!
+//! With the `zeroize` feature, off by default, the subkeys the
+//! crate derives for its own signing and sealing are overwritten
+//! with zeros when it drops them, and so is the state `hmac`,
+//! `sha2` and `aes-gcm` keep from a key. A subkey returned to the
+//! caller ([`purge_key`] and the like) is the caller's to clear.
 //!
 //! ```
 //! let url = crabcrop_url::build_url(
@@ -114,6 +122,36 @@ fn derive_subkey(secret: &[u8], label: &str) -> Vec<u8> {
     debug_assert!(is_reserved_remainder(label));
     hmac_sha256(secret, label.as_bytes()).to_vec()
 }
+
+/// A subkey this crate derives for its own signing or sealing,
+/// and drops when that is done. With the `zeroize` feature, its
+/// bytes are overwritten with zeros when it is dropped, before
+/// its buffer is freed; without the feature the buffer is freed
+/// as it is. A subkey returned to the caller ([`purge_key`] and
+/// the like) is the caller's to clear.
+struct Subkey(Vec<u8>);
+
+impl Subkey {
+    fn derive(secret: &[u8], label: &str) -> Self {
+        Subkey(derive_subkey(secret, label))
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Drop for Subkey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// The label [`purge_key`] is derived from.
+const PURGE_KEY_LABEL: &str = "crabcrop/purge-key";
+/// The label [`purge_group_key`] is derived from.
+const PURGE_GROUP_KEY_LABEL: &str = "crabcrop/purge-group-key";
+/// The label [`upload_key`] is derived from.
+const UPLOAD_KEY_LABEL: &str = "crabcrop/upload-key";
+/// The label [`seal_key`] is derived from.
+const SEAL_KEY_LABEL: &str = "crabcrop/seal-key";
 
 /// A signature under a derived subkey: the lowercase hex
 /// HMAC-SHA256 of `message`. The message space is the
@@ -297,15 +335,54 @@ fn write_invalid_character(
 /// purge endpoint. That holds because [`sign`] never signs
 /// the label itself (see [`RESERVED_SEGMENT`]).
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/purge-key")
+    derive_subkey(secret, PURGE_KEY_LABEL)
 }
 
 /// The purge signature for a target path (the request
 /// remainder without its signature): HMAC-SHA256 of the
 /// path under the purge subkey. This is the signature
-/// segment for `POST /purge/<signature>/<path>`.
+/// segment for `POST /purge/<signature>/<path>`. It
+/// authorizes the purge until the secret rotates; see
+/// [`purge_signature_with_expiry`] for one that stops
+/// working at a given second.
+///
+/// The server reads a leading `exp:<unix-seconds>` segment
+/// of a purge path as the purge's own expiry, so a target
+/// that opens with an image URL's `exp:` segment signs the
+/// same bytes as the expiring form of the rest, and is
+/// refused once that second is reached. An image's `exp:`
+/// is not part of its cache key: drop it from the target
+/// and the purge evicts the same entries.
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
-    sign_under_subkey(&purge_key(secret), target)
+    sign_under_subkey(&Subkey::derive(secret, PURGE_KEY_LABEL).0, target)
+}
+
+/// The signed string a purge or purge-group signature
+/// covers: the target path or group name alone, or, for the
+/// expiring form, an `exp:<unix-seconds>` segment in front
+/// of it. It is also exactly what follows the signature
+/// segment in the request path, so a URL assembled from it
+/// carries the bytes its signature covers.
+pub fn purge_signed_string(target: &str, expires: Option<u64>) -> String {
+    match expires {
+        Some(exp) => format!("exp:{exp}/{target}"),
+        None => target.to_string(),
+    }
+}
+
+/// The expiring purge signature for a target path:
+/// HMAC-SHA256 of `exp:<expires>/<target>` under the purge
+/// subkey. The request path is
+/// `POST /purge/<signature>/exp:<expires>/<target>`; the
+/// expiry sits inside the signed string, so it can neither
+/// be stripped nor extended without the secret, and the
+/// server refuses the purge once the expiry second is
+/// reached, the comparison image and upload URLs use.
+pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) -> String {
+    sign_under_subkey(
+        &purge_key(secret),
+        &purge_signed_string(target, Some(expires)),
+    )
 }
 
 /// The purge-group subkey: the raw bytes of the
@@ -317,16 +394,32 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
 /// can never be transplanted to `/purge-group`, whatever
 /// target string it was minted over (audit R2-14).
 pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/purge-group-key")
+    derive_subkey(secret, PURGE_GROUP_KEY_LABEL)
 }
 
 /// The purge-group signature for a cache group: HMAC-SHA256
 /// of the group name under the purge-group subkey. This is
 /// the signature segment for
 /// `POST /purge-group/<signature>/<group>`; the helper
-/// exists so nobody has to know the signed string.
+/// exists so nobody has to know the signed string. It
+/// authorizes the purge until the secret rotates; see
+/// [`purge_group_signature_with_expiry`] for one that stops
+/// working at a given second.
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
-    sign_under_subkey(&purge_group_key(secret), group)
+    sign_under_subkey(&Subkey::derive(secret, PURGE_GROUP_KEY_LABEL).0, group)
+}
+
+/// The expiring purge-group signature for a cache group:
+/// HMAC-SHA256 of `exp:<expires>/<group>` under the
+/// purge-group subkey. The request path is
+/// `POST /purge-group/<signature>/exp:<expires>/<group>`,
+/// and the server refuses the purge once the expiry second
+/// is reached, as for [`purge_signature_with_expiry`].
+pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u64) -> String {
+    sign_under_subkey(
+        &purge_group_key(secret),
+        &purge_signed_string(group, Some(expires)),
+    )
 }
 
 /// The upload subkey: the raw bytes of the HMAC-SHA256 of
@@ -336,14 +429,14 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
 /// for an image URL (or a purge) does not verify at the
 /// upload endpoint (issue #168).
 pub fn upload_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/upload-key")
+    derive_subkey(secret, UPLOAD_KEY_LABEL)
 }
 
 /// The upload signature for an object name: HMAC-SHA256 of
 /// the name under the upload subkey. This is the signature
 /// segment for `PUT /upload/<signature>/<name>`.
 pub fn upload_signature(secret: &[u8], name: &str) -> String {
-    sign_under_subkey(&upload_key(secret), name)
+    sign_under_subkey(&Subkey::derive(secret, UPLOAD_KEY_LABEL).0, name)
 }
 
 /// The seal subkey: the raw bytes of the HMAC-SHA256 of
@@ -356,7 +449,7 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
 /// this same derivation, and the rotation window for
 /// signatures is the rotation window for tokens.
 pub fn seal_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/seal-key")
+    derive_subkey(secret, SEAL_KEY_LABEL)
 }
 
 /// The version marker that opens a sealed token segment:
@@ -460,12 +553,13 @@ impl std::fmt::Display for SealError {
 
 impl std::error::Error for SealError {}
 
+/// The cipher a token seals and opens under: AES-256-GCM keyed
+/// with the seal subkey, which is dropped once the cipher holds
+/// it.
 fn seal_cipher(secret: &[u8]) -> aes_gcm::Aes256Gcm {
     use aes_gcm::KeyInit as _;
-    let key = seal_key(secret);
-    let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::try_from(key.as_slice())
-        .expect("an HMAC-SHA256 tag is 32 bytes");
-    aes_gcm::Aes256Gcm::new(&key)
+    let key = Subkey::derive(secret, SEAL_KEY_LABEL);
+    aes_gcm::Aes256Gcm::new_from_slice(&key.0).expect("an HMAC-SHA256 tag is 32 bytes")
 }
 
 /// The nonce array for a 12-byte nonce, the one length
@@ -793,7 +887,7 @@ pub fn upload_signed_string(name: &str, expires: Option<u64>) -> String {
 /// rotates.
 pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
     sign_under_subkey(
-        &upload_key(secret),
+        &Subkey::derive(secret, UPLOAD_KEY_LABEL).0,
         &upload_signed_string(name, Some(expires)),
     )
 }
@@ -1083,6 +1177,62 @@ mod tests {
             assert_eq!(unseal(secret, token).unwrap(), remainder);
             assert_eq!(unseal(b"wrong-secret", token), Err(SealError::OpenFailed));
         }
+    }
+
+    /// The purge vectors from `spec/test-vectors.json`: each
+    /// endpoint's helper, plain or expiring, reproduces the
+    /// signature, `purge_signed_string` the signed string,
+    /// which is also what follows the signature segment in
+    /// the request path, and the expiring form is the plain
+    /// signature over that string under the endpoint's own
+    /// subkey.
+    #[test]
+    fn purge_test_vectors() {
+        type Plain = fn(&[u8], &str) -> String;
+        type Expiring = fn(&[u8], &str, u64) -> String;
+        type Subkey = fn(&[u8]) -> Vec<u8>;
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(VECTORS).unwrap();
+        let purges: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v.get("purge_signature").is_some())
+            .collect();
+        assert!(purges.len() >= 6, "the spec carries purge vectors");
+        let mut expiring = 0;
+        for v in purges {
+            let description = v["description"].as_str().unwrap();
+            let secret = v["secret"].as_str().unwrap().as_bytes();
+            let target = v["target"].as_str().unwrap();
+            let expires = v.get("expires").map(|e| e.as_u64().unwrap());
+            let signed = v["signed"].as_str().unwrap();
+            let expected = v["purge_signature"].as_str().unwrap();
+            let (plain, with_expiry, subkey): (Plain, Expiring, Subkey) =
+                match v["endpoint"].as_str().unwrap() {
+                    "purge" => (purge_signature, purge_signature_with_expiry, purge_key),
+                    "purge-group" => (
+                        purge_group_signature,
+                        purge_group_signature_with_expiry,
+                        purge_group_key,
+                    ),
+                    other => panic!("{description}: unknown endpoint {other}"),
+                };
+            assert_eq!(
+                purge_signed_string(target, expires),
+                signed,
+                "{description}"
+            );
+            let minted = match expires {
+                Some(exp) => {
+                    expiring += 1;
+                    with_expiry(secret, target, exp)
+                }
+                None => plain(secret, target),
+            };
+            assert_eq!(minted, expected, "{description}");
+            assert_eq!(plain(secret, signed), expected, "{description}");
+            assert!(verify(&subkey(secret), expected, signed), "{description}");
+            assert!(!verify(secret, expected, signed), "{description}");
+        }
+        assert!(expiring >= 3, "the spec carries expiring purge vectors");
     }
 
     /// The refusal vectors from `spec/test-vectors.json`
@@ -1702,6 +1852,56 @@ mod tests {
             purge_signature(b"test-secret", "thumb")
         );
         assert_ne!(purge_group_key(b"test-secret"), purge_key(b"test-secret"));
+    }
+
+    #[test]
+    fn expiring_purge_signatures_cover_the_expiry() {
+        // Pinned literals, computed with Python's hmac module
+        // and with OpenSSL: the expiring form signs
+        // `exp:<expires>/` and the target under each
+        // endpoint's own subkey.
+        let secret = b"test-secret";
+        let target = "300x200/https://example.com/a.jpg";
+        let exp = 1893456000;
+        assert_eq!(purge_signed_string(target, None), target);
+        assert_eq!(
+            purge_signed_string("thumb", Some(exp)),
+            "exp:1893456000/thumb"
+        );
+        assert_eq!(
+            purge_signature_with_expiry(secret, target, exp),
+            "fb745f8bc540df658be4c4c954b49054e871bd7c6836be43edb74a34a01aacb0"
+        );
+        assert_eq!(
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            "fd5eb666f654c3046374cd6f569a23f9a0254be1f1761ee16255c217a2b40a3f"
+        );
+        // Bound to the expiry, the target and the endpoint,
+        // and never the plain signature.
+        assert_ne!(
+            purge_signature_with_expiry(secret, target, exp),
+            purge_signature_with_expiry(secret, target, exp + 1)
+        );
+        assert_ne!(
+            purge_signature_with_expiry(secret, target, exp),
+            purge_signature(secret, target)
+        );
+        assert_ne!(
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            purge_group_signature(secret, "thumb")
+        );
+        assert_ne!(
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            purge_signature_with_expiry(secret, "thumb", exp)
+        );
+        // A plain target that opens with an image URL's exp:
+        // segment signs the same bytes as the expiring form
+        // of the rest, which is why the server reads that
+        // segment as the purge's own expiry.
+        assert_eq!(
+            purge_signature(secret, &format!("exp:{exp}/{target}")),
+            purge_signature_with_expiry(secret, target, exp)
+        );
     }
 
     #[test]

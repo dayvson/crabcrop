@@ -45,6 +45,9 @@ pub use ocr::{OCR_MAX_LINES, OnnxOcrProvider, read_ocr_dict};
 pub use sam::{
     MaskGeometry, OnnxSegmentProvider, mask_geometry, segment_box_coords, segment_preprocess,
 };
+pub(crate) use session::lock_recoveries;
+#[cfg(test)]
+pub(crate) use session::recover_a_poisoned_lock;
 pub use upscale::OnnxUpscaleProvider;
 
 /// How an AI operation failed, typed so callers can map the

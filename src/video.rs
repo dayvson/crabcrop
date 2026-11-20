@@ -71,14 +71,25 @@ pub const GATE_PERMITS: usize = 2;
 /// grid) expresses every delay a real animation carries.
 pub const MAX_FPS: u32 = 100;
 
-/// The encoder's address-space cap on Linux, 8 GiB: room
-/// for an encode at the output budgets, whose frames come
-/// from crabcrop's own pipeline, with the encoder's
-/// lookahead and reference frames and its threads, while a
-/// runaway allocation still ends as an encoder error. The
-/// frame and page tools, which read source bytes, have caps
-/// of their own, sized to their decode budgets.
-const ENCODER_MAX_ADDRESS_SPACE: u64 = 8 << 30;
+/// The encoder's address-space cap on Linux when
+/// `CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB` is unset,
+/// 8 GiB: room for an encode at the output budgets, whose
+/// frames come from crabcrop's own pipeline, with the
+/// encoder's lookahead and reference frames and its threads,
+/// while a runaway allocation still ends as an encoder
+/// error. The frame and page tools, which read source bytes,
+/// have caps of their own, sized to their decode budgets.
+pub const DEFAULT_ENCODER_ADDRESS_SPACE: u64 = 8 << 30;
+
+/// The least the cap may be set to, 1 GiB (issue #738): what
+/// the encoder needs to start, with room for other builds.
+/// With FFmpeg 6.1 (Ubuntu 24.04's build) and glibc 2.39, ten
+/// 64x48 frames encoded in 568 MiB to MP4 and in 501 MiB to
+/// WebM, and ten 1280x720 frames in 695 MiB to MP4 and in
+/// 903 MiB to WebM when the encoder saw 16 or 64 cores. MP4
+/// runs on six threads whatever the host; WebM sizes its
+/// thread pools from the cores the encoder sees.
+pub const MIN_ENCODER_ADDRESS_SPACE: u64 = 1 << 30;
 
 /// The longest animation video output accepts, in
 /// milliseconds of summed frame delays. The input bounds
@@ -380,6 +391,10 @@ pub struct VideoEncoder {
     program: PathBuf,
     timeout: Duration,
     max_output_bytes: usize,
+    /// The encoder's address-space cap, in bytes:
+    /// [`DEFAULT_ENCODER_ADDRESS_SPACE`] unless
+    /// [`Self::with_address_space`] set another.
+    max_address_space: u64,
 }
 
 impl VideoEncoder {
@@ -407,7 +422,20 @@ impl VideoEncoder {
             program,
             timeout,
             max_output_bytes,
+            max_address_space: DEFAULT_ENCODER_ADDRESS_SPACE,
         })
+    }
+
+    /// The encoder with every encode capped at `bytes` of
+    /// address space, as
+    /// `CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB` sets it
+    /// (issue #738). The configuration holds it between
+    /// [`MIN_ENCODER_ADDRESS_SPACE`] and its own ceiling.
+    pub fn with_address_space(self, bytes: u64) -> Self {
+        Self {
+            max_address_space: bytes,
+            ..self
+        }
     }
 
     /// An encoder with the default bounds (30 s, 64 MiB).
@@ -557,7 +585,7 @@ impl VideoEncoder {
             max_stderr: 8192,
             deadline: Instant::now() + self.timeout,
             cpu_limit: tool_cpu_limit(self.timeout),
-            max_address_space: ENCODER_MAX_ADDRESS_SPACE,
+            max_address_space: self.max_address_space,
         })
         .map_err(|e| {
             VideoError::Failed(match e {

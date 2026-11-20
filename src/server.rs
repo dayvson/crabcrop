@@ -21,7 +21,7 @@
 //! decode, no gates) and writes nothing anywhere.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -57,7 +57,10 @@ impl std::fmt::Debug for NamedDetector {
 }
 
 mod background;
-pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PUTS_AT_ONCE};
+pub use background::{
+    Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_GROUP_WRITES_WAITING,
+    SHARED_PUTS_AT_ONCE,
+};
 mod listen;
 pub use listen::{
     ConnectionLimits, DEFAULT_HEADER_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, RequestsInFlight,
@@ -65,10 +68,10 @@ pub use listen::{
 };
 mod process;
 pub(in crate::server) use process::{
-    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
-    MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
-    SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process, wants_animation_gate,
-    wants_slow_lane,
+    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, LeaderGuard,
+    MetaFlight, MissProgress, PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT,
+    SharedFlight, SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process,
+    wants_animation_gate, wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -109,8 +112,9 @@ pub struct AppState {
     /// The bearer token `/metrics` requires (issue #270),
     /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
     /// endpoint: it answers 403 rather than serving the
-    /// exposition unauthenticated.
-    pub metrics_token: Option<String>,
+    /// exposition unauthenticated. Zeroed when the state is
+    /// dropped.
+    pub metrics_token: Option<zeroize::Zeroizing<String>>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
     /// The provider and renderer handles (see
@@ -192,6 +196,12 @@ pub struct AppState {
     /// `HEAD` to the route answers `404 not_found` before
     /// anything else.
     pub explain_enabled: bool,
+    /// Whether the purge endpoints take only the expiring
+    /// form (`CRABCROP_PURGE_REQUIRE_EXPIRY`, off by
+    /// default). On, a purge or purge-group URL with no
+    /// `exp:` segment answers `403 expiry_required` once its
+    /// signature has verified, and purges nothing.
+    pub purge_require_expiry: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -477,6 +487,7 @@ impl std::fmt::Debug for AppState {
             width_step,
             client_hints,
             explain_enabled,
+            purge_require_expiry,
             preserve_metadata,
             brand_color,
             presets,
@@ -720,11 +731,36 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     state.metrics.render_into(&mut out);
     lane_metrics(&state, &mut out);
     gate_metrics(&state, &mut out);
+    ai_metrics(&mut out);
     request_log_metrics(&state, &mut out);
     source_buffer_metrics(&state, &mut out);
     source_lookup_metrics(&state, &mut out);
     tier_metrics(&state, &mut out);
+    upload_metrics(&state, &mut out);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+}
+
+/// The upload bucket's failed existence checks for `/metrics`
+/// (issue #709), with a bucket destination: a HEAD the bucket
+/// refused, failed or did not answer reads as no object, so a
+/// bucket that stops answering them shows here, not in an
+/// upload's answer. The upload bucket's store is not the shared
+/// tier, and does not count in its series.
+fn upload_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(failed) = state
+        .upload
+        .as_ref()
+        .and_then(|upload| upload.exists_checks_failed())
+    else {
+        return;
+    };
+    let _ = write!(
+        out,
+        "# HELP crabcrop_upload_exists_checks_failed_total Upload existence checks the upload bucket refused, failed or did not answer; each read as no object.\n\
+         # TYPE crabcrop_upload_exists_checks_failed_total counter\n\
+         crabcrop_upload_exists_checks_failed_total {failed}\n"
+    );
 }
 
 /// Per-lane occupancy for `/metrics` (issue #324): how
@@ -792,6 +828,23 @@ fn gate_metrics(state: &AppState, out: &mut String) {
             gate.capacity()
         );
     }
+}
+
+/// AI model lock recoveries for `/metrics` (issue #736): the
+/// locks on the models' sessions and memos that a request's
+/// panic poisoned and a later request took back (issue #715),
+/// counted since boot. Each is also a line on stderr; a count
+/// that keeps rising is a model that panics on what it is
+/// given.
+fn ai_metrics(out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.\n\
+         # TYPE crabcrop_ai_lock_recoveries_total counter\n\
+         crabcrop_ai_lock_recoveries_total {}\n",
+        crate::ai::lock_recoveries()
+    );
 }
 
 /// The request log's queue for `/metrics` (issue #707): the
@@ -877,9 +930,11 @@ fn source_lookup_metrics(state: &AppState, out: &mut String) {
 /// stores count their own failures as they log them; the
 /// exposition reads the counters live at scrape time,
 /// one series per configured tier. With a shared tier, its
-/// write-through slots and skips follow (issue #463), then
-/// what its last complete listing of the purge tombstones
-/// found unread, and when that was (issue #577).
+/// write-through slots and skips follow (issue #463), the
+/// group write-backs waiting for a slot and skipped, and the
+/// requests the bucket refused (issue #709), then what its
+/// last complete listing of the purge tombstones found
+/// unread, and when that was (issue #577).
 fn tier_metrics(state: &AppState, out: &mut String) {
     use std::fmt::Write as _;
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
@@ -912,8 +967,12 @@ fn tier_metrics(state: &AppState, out: &mut String) {
              crabcrop_cache_disk_groups_behind {behind}\n\
              # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.\n\
              # TYPE crabcrop_cache_disk_deletions_queued gauge\n\
-             crabcrop_cache_disk_deletions_queued {deletions}\n",
-            store.ops_in_flight()
+             crabcrop_cache_disk_deletions_queued {deletions}\n\
+             # HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete or the boot scan failed to remove, left on disk out of the index.\n\
+             # TYPE crabcrop_cache_disk_unlinks_failed_total counter\n\
+             crabcrop_cache_disk_unlinks_failed_total {}\n",
+            store.ops_in_flight(),
+            store.unlinks_failed()
         );
     }
     if let Some(store) = &state.shared_store {
@@ -931,11 +990,35 @@ fn tier_metrics(state: &AppState, out: &mut String) {
              crabcrop_cache_shared_puts_capacity {}\n\
              # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.\n\
              # TYPE crabcrop_cache_shared_puts_skipped_total counter\n\
-             crabcrop_cache_shared_puts_skipped_total {}\n",
+             crabcrop_cache_shared_puts_skipped_total {}\n\
+             # HELP crabcrop_cache_shared_group_writes_waiting Shared tier group write-backs waiting for a write slot.\n\
+             # TYPE crabcrop_cache_shared_group_writes_waiting gauge\n\
+             crabcrop_cache_shared_group_writes_waiting {}\n\
+             # HELP crabcrop_cache_shared_group_writes_skipped_total Shared tier group write-backs skipped with as many waiting for a slot as may.\n\
+             # TYPE crabcrop_cache_shared_group_writes_skipped_total counter\n\
+             crabcrop_cache_shared_group_writes_skipped_total {}\n",
             background.puts_in_flight(),
             background.put_capacity(),
-            background.puts_skipped()
+            background.puts_skipped(),
+            background.group_writes_waiting(),
+            background.group_writes_skipped()
         );
+        // The requests the bucket refused (issue #709): a
+        // lookup answered with an error that is neither a 404
+        // nor a store failure, and a purge read or delete
+        // refused.
+        out.push_str(
+            "# HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.\n\
+             # TYPE crabcrop_cache_shared_refused_total counter\n",
+        );
+        for kind in crate::s3store::Refused::ALL {
+            let _ = writeln!(
+                out,
+                "crabcrop_cache_shared_refused_total{{request=\"{}\"}} {}",
+                kind.label(),
+                store.refused(kind)
+            );
+        }
         // The tombstone gap (issue #577): the unread count
         // stays as of the last complete listing, so a listing
         // time that stops moving is the sign of a failing
@@ -1166,29 +1249,28 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// the self-explaining URL report (issue #196; the report
 /// itself is built in [`crate::explain`]).
 ///
-/// The checks mirror the image path exactly and run in its
-/// order: signature grammar, signature verification, the
-/// reserved-segment guard, preset expansion, operation
-/// parsing, the operation cap, expiry. Only then is the
-/// source touched, once, through the loader with all of
-/// its guards, and the facts come from header probing
-/// (`crate::engine::probe_source`): no decode, no
-/// detection, no process, AI, or video gate (an SVG, AVIF,
-/// or HEIC probe takes the probe gate, see
+/// The request runs in stages. [`admit_explained`] admits
+/// it through the image path's own [`authenticate`] and
+/// [`resolve_request`], so a URL this route admits is one
+/// the image route admits, and a refusal is the image
+/// path's own status and body (issue #741). Only then is
+/// the source touched, once, through the loader with all
+/// of its guards ([`probe_explained`]), and the facts come
+/// from header probing (`crate::engine::probe_source`): no
+/// decode, no detection, no process, AI, or video gate (an
+/// SVG, AVIF, or HEIC probe takes the probe gate, see
 /// [`explain_probe`]), and nothing written to any cache
-/// tier. A bad signature, an over-cap operation list, or an
-/// expired URL therefore costs zero
-/// source fetches, and answers with the image path's own
-/// status and body.
+/// tier. A bad signature, an over-cap operation list, or
+/// an expired URL therefore costs zero source fetches.
+/// [`explain_report`] builds the report and
+/// [`explain_response`] answers it.
 async fn explain_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let accept = accept_of(&headers);
+    let accept = accept.as_deref();
     // With `CRABCROP_EXPLAIN=0` the route is off (issue #591):
     // every request answers the router's own `404 not_found`
     // before the signature is read, so the answer is the
@@ -1198,7 +1280,7 @@ async fn explain_handle(
             StatusCode::NOT_FOUND,
             "not_found",
             "not found".to_string(),
-            accept.as_deref(),
+            accept,
         );
     }
     let Some(tail) = uri.path().strip_prefix("/explain/") else {
@@ -1206,134 +1288,91 @@ async fn explain_handle(
             StatusCode::BAD_REQUEST,
             "invalid_path",
             "expected /explain/<signature>/<target>".to_string(),
-            accept.as_deref(),
+            accept,
         );
     };
     let full = format!("/{tail}");
-    // A sealed spelling is refused wholesale (issue #255):
-    // the server never unseals as a service, because an
-    // endpoint that opens tokens would be an unsealing
-    // oracle for anyone who lifts one off a public page.
-    // Operators unseal locally (the CLI's `unseal` verb,
-    // under their own secret) and then explain the plain
-    // form. The refusal is the uniform one and no source
-    // fetch happens for it.
-    let first_segment = tail.split('/').next().unwrap_or("");
-    if crate::url::looks_sealed(first_segment) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
-    }
-    let (signature, key_id, rest) = match parse_signature(&full) {
-        Ok(v) => v,
-        Err(e) => return parse_failure(&e, accept.as_deref()),
+    let (credential, resolved) = match admit_explained(&state, &full) {
+        Ok((opened, resolved)) => (opened.credential, resolved),
+        // Only plain spellings are admitted here, so every
+        // refusal is the plain spelling's own answer, as on
+        // the image route.
+        Err(refusal) => return refusal.answer(false, accept),
     };
-    // The reserved segment is refused before verification,
-    // as on the image path.
-    if crabcrop_url::is_reserved_remainder(rest) {
-        let (status, code, message) = reserved_remainder_parts();
-        return error_response(status, code, message, accept.as_deref());
-    }
-    if !state
-        .keyring
-        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
-    }
-    // The same domain separation as the image path: a
-    // remainder may not begin with a reserved segment.
-    if matches!(
-        rest.split('/').next(),
-        Some("purge" | "purge-group" | "upload")
-    ) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "reserved_segment",
-            "an image URL may not begin with a purge or upload segment".to_string(),
-            accept.as_deref(),
-        );
-    }
-    let groups = crate::url::preset_names(rest);
-    // Expansion always runs, even with no presets loaded:
-    // a `preset:` segment is a grammar error
-    // (`unknown_preset`) on every server, never source text.
-    let expanded;
-    let rest = match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
-        Ok(text) => {
-            expanded = text;
-            &expanded
-        }
-        Err(e) => return parse_failure(&e, accept.as_deref()),
+    let (source_bytes, probe) = match probe_explained(&state, &resolved, accept).await {
+        Ok(facts) => facts,
+        Err(response) => return *response,
     };
-    let (ops, source_url, expiry, _) = match parse_operations_with_expiry(rest) {
-        Ok(v) => v,
-        Err(e) => return parse_failure(&e, accept.as_deref()),
-    };
-    // The operation cap (issue #469) and the watermark URL
-    // cap (issue #613), on the list the image path counts
-    // (the defaults merged in) and at the same point: an
-    // over-cap URL answers its 400 here, before the probe
-    // fetch.
-    let counted = crate::url::merge_default_ops(&state.default_ops, ops.clone());
-    if let Err(e) = crate::url::check_operation_count(&counted)
-        .and_then(|()| crate::url::check_watermark_count(&counted))
-    {
-        return parse_failure(&e, accept.as_deref());
-    }
-    // A root source expands for the probe fetch only: the
-    // report below carries the source exactly as written
-    // and the root's name, never the base URL the reference
-    // resolves to (operator configuration, issue #248).
-    let (fetch_url, root_ref) =
-        match crate::url::expand_source_root(source_url, &state.source_roots) {
-            Ok(v) => v,
-            Err(e) => return parse_failure(&e, accept.as_deref()),
-        };
-    // Server-wide defaults merge here, once, exactly as the
-    // image path merges them: the admission, the canonical
-    // form, and the forecast all follow the list the image
-    // request runs (issue #468). The report's operation
-    // list stays `ops`, the URL's own, so it never credits
-    // the URL with a default.
-    let merged = crate::url::merge_default_ops(&state.default_ops, ops.clone());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(exp) = expiry
-        && now >= exp
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "signature_expired",
-            "signature expired".to_string(),
-            accept.as_deref(),
-        );
-    }
+    let report = explain_report(
+        &state,
+        &headers,
+        credential,
+        resolved,
+        source_bytes,
+        probe,
+        full,
+    );
+    explain_response(&report, accept)
+}
 
-    // The single bounded source fetch, through the loader
-    // and its policy. Watermark and overlay sources are
-    // operations' inputs, not the explained URL's source,
-    // and are never fetched: no fan-out. A `frame:`
-    // segment makes the source a video, so the loader may
-    // accept a `video/*` Content-Type for it (issue #214);
-    // a `page:` segment does the same for
-    // `application/pdf` (issue #215). Explain never runs
-    // either tool: the fetch is admitted, the probe stays
-    // the raw-bytes probe.
+/// The first stage of [`explain_handle`]: the image path's
+/// admission, [`authenticate`] and [`resolve_request`]
+/// themselves (issue #741), so the two routes cannot
+/// disagree on which plain URLs they admit or on how they
+/// refuse the rest.
+///
+/// A sealed spelling is refused before either runs,
+/// wholesale (issue #255): the server never unseals as a
+/// service, because an endpoint that opens tokens would be
+/// an unsealing oracle for anyone who lifts one off a
+/// public page. Operators unseal locally (the CLI's
+/// `unseal` verb, under their own secret) and then explain
+/// the plain form. The refusal is the uniform
+/// `bad_signature`, and no source fetch happens for it.
+fn admit_explained<'a>(state: &AppState, full: &'a str) -> Result<(Opened<'a>, Resolved), Refusal> {
+    let nolead = full.strip_prefix('/').unwrap_or(full);
+    if crate::url::looks_sealed(nolead.split('/').next().unwrap_or("")) {
+        return Err(Refusal::AsIs(bad_signature_parts()));
+    }
+    // The stages time their work into a request record. An
+    // explain request owes the request log no line, so this
+    // one goes nowhere.
+    let mut record = RequestRecord::default();
+    let opened = authenticate(state, full, &mut record)?;
+    let resolved = resolve_request(state, &opened.remainder, &mut record)?;
+    Ok((opened, resolved))
+}
+
+/// The second stage of [`explain_handle`]: the single
+/// bounded source fetch, through the loader and its
+/// policy, and the probe of the head it read
+/// ([`explain_probe`]). Returns the source's encoded size
+/// when the fetch states it, and the probe; a failed fetch,
+/// or a probe shed for a full gate, is the answer instead,
+/// boxed as [`render_miss`] boxes its own (a bare `Response`
+/// is 128 bytes, too large for an `Err`: clippy's
+/// `result_large_err`).
+async fn probe_explained(
+    state: &AppState,
+    resolved: &Resolved,
+    accept: Option<&str>,
+) -> Result<(Option<usize>, crate::engine::SourceProbe), Box<Response>> {
+    // Watermark and overlay sources are operations' inputs,
+    // not the explained URL's source, and are never fetched:
+    // no fan-out. A `frame:` segment makes the source a
+    // video, so the loader may accept a `video/*`
+    // Content-Type for it (issue #214); a `page:` segment
+    // does the same for `application/pdf` (issue #215).
+    // Explain never runs either tool: the fetch is admitted,
+    // the probe stays the raw-bytes probe. Both are read
+    // from the merged list, the one the image request runs.
     let admission = crate::loader::MediaAdmission {
-        video: merged
+        video: resolved
+            .ops
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: merged
+        pdf: resolved
+            .ops
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
@@ -1342,39 +1381,62 @@ async fn explain_handle(
     // identifies the source instead of downloading the
     // whole body (which also keeps this route off the
     // result cache's coalescing path by construction: it
-    // never held a whole body to share).
-    let fetched = match state
+    // never held a whole body to share). A root source is
+    // fetched at its expansion.
+    let crate::loader::ProbeLoad { head, total_bytes } = state
         .loader
-        .load_probe(&fetch_url, admission, &probe_settled)
+        .load_probe(&resolved.source_url, admission, &probe_settled)
         .await
-    {
-        Ok(fetched) => fetched,
-        Err(e) => return explain_load_error(e, accept.as_deref()),
-    };
-    let Some(probe) = explain_probe(&state, fetched.head).await else {
-        return busy_response(
+        .map_err(|e| Box::new(explain_load_error(e, accept)))?;
+    let Some(probe) = explain_probe(state, head).await else {
+        return Err(Box::new(busy_response(
             "server busy: too many source probes running at once",
             5,
-            accept.as_deref(),
-        );
+            accept,
+        )));
     };
+    Ok((total_bytes.map(|n| n as usize), probe))
+}
 
+/// The third stage of [`explain_handle`]: the report on an
+/// admitted URL and its probed source.
+///
+/// The forecast, the canonical form and the admission all
+/// follow the operations the image request runs, the
+/// server-wide defaults merged in (issue #468); the
+/// report's operation list is the URL's own, so it never
+/// credits the URL with a default. The source is reported
+/// exactly as written, with a root's name, never the base
+/// URL a root reference resolves to (operator
+/// configuration, issue #248).
+fn explain_report(
+    state: &AppState,
+    headers: &HeaderMap,
+    credential: Credential,
+    resolved: Resolved,
+    source_bytes: Option<usize>,
+    probe: crate::engine::SourceProbe,
+    image_path: String,
+) -> crate::explain::Report {
+    let ops = resolved.own_ops().to_vec();
     // Each referenced preset with the operations its
     // definition expands to. Definitions were validated at
     // boot; one that no longer parses (it cannot) is listed
     // by name alone rather than failing the report.
-    let mut presets = Vec::new();
-    for name in &groups {
-        let entry_ops = state
-            .presets
-            .get(name)
-            .and_then(|definition| {
-                crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
-            })
-            .unwrap_or_default();
-        presets.push(crate::explain::preset_entry(name, &entry_ops));
-    }
-
+    let presets = resolved
+        .groups
+        .iter()
+        .map(|name| {
+            let entry_ops = state
+                .presets
+                .get(name)
+                .and_then(|definition| {
+                    crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
+                })
+                .unwrap_or_default();
+            crate::explain::preset_entry(name, &entry_ops)
+        })
+        .collect();
     // The canonical form is the cache key's path form, of
     // the merged list as the image path keys it. The key's
     // config fingerprint suffix is operator state and stays
@@ -1385,30 +1447,49 @@ async fn explain_handle(
     // itself is keyed on the expansion, but printing that
     // here would publish the root's base URL into the
     // report.
-    let canonical = crate::url::canonical_form(&merged, source_url);
-    let report = crate::explain::Report::new(crate::explain::ReportInput {
-        signed: !matches!(signature, crate::url::Signature::Unsafe),
+    let source_url = resolved.written_source();
+    let canonical = crate::url::canonical_form(&resolved.ops, &source_url);
+    let (signed, key_id) = match credential {
+        Credential::Signature(key_id) => (true, key_id),
+        Credential::Unsafe => (false, None),
+        // Never admitted here (see `admit_explained`).
+        Credential::Sealed => (true, None),
+    };
+    // The expiry verdict reads the clock the admission read,
+    // so the report never calls a URL it admitted expired.
+    let (expiry, now) = match resolved.expiry {
+        Some(expiry) => (Some(expiry.at), expiry.checked_at),
+        None => (None, unix_seconds()),
+    };
+    crate::explain::Report::new(crate::explain::ReportInput {
+        signed,
         key_id,
         expiry,
         now,
-        source_url: source_url.to_string(),
-        source_root: root_ref.map(|r| r.name),
+        source_url,
+        source_root: resolved.root.map(|r| r.name),
         probe,
         // The DPR hint is read as the image path reads it, so
         // the forecast steps a hinted factor down as the image
         // request does (issue #529), and not at all with
         // client hints off.
-        dpr_hint: dpr_hint(&headers).filter(|_| state.client_hints),
-        source_bytes: fetched.total_bytes.map(|n| n as usize),
+        dpr_hint: dpr_hint(headers).filter(|_| state.client_hints),
+        source_bytes,
         ops,
-        merged_ops: merged,
+        merged_ops: resolved.ops,
         presets,
         canonical,
-        cache_group: groups.into_iter().next(),
-        image_path: full,
-    });
+        cache_group: resolved.groups.into_iter().next(),
+        image_path,
+    })
+}
 
-    let (content_type, body) = if crate::explain::wants_json(accept.as_deref()) {
+/// The last stage of [`explain_handle`]: the report as the
+/// client asked for it, JSON for a JSON `Accept` and the
+/// HTML page otherwise, stored nowhere and served under a
+/// policy that runs no script.
+fn explain_response(report: &crate::explain::Report, accept: Option<&str>) -> Response {
+    let (content_type, body) = if crate::explain::wants_json(accept) {
         (
             "application/json",
             serde_json::to_string(&report.to_json()).unwrap_or_default(),
@@ -1438,7 +1519,7 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
-    eprintln!("explain load error: {e}");
+    stderr_line!("explain load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
 }
@@ -1447,10 +1528,13 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// inline (issue #368): the shared walk reads one entry
 /// header per object (a bounded number at a time, issue
 /// #462), so its inline cost must not grow with the whole
-/// bucket. A walk that outgrows the budget finishes in a
-/// background task, waiting for one of the
-/// [`crate::s3store::PURGE_WALKS_AT_ONCE`] turns, and logs
-/// its own count on completion. Correctness does not wait
+/// bucket. Nor does its listing (issue #709): the request
+/// lists one page, of no more names than this. A walk that
+/// outgrows the budget finishes in a background task,
+/// waiting for one of the
+/// [`crate::s3store::PURGE_WALKS_AT_ONCE`] turns with the
+/// listing's continuation token, and logs its own count on
+/// completion. Correctness does not wait
 /// for it: the generation tombstone keeps writes begun
 /// before the purge out (issue #350), and the purge's
 /// stamped tombstone, here and in the bucket, makes every
@@ -1772,6 +1856,40 @@ async fn purge_log(log: &RequestLog, event: &str, target: &str, removed: Option<
     log.event(&line).await;
 }
 
+/// The current unix second, as the purge expiry check
+/// reads it.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Why a purge whose signature has verified may not run, by
+/// its expiry, at the unix second `now`. A purge URL is
+/// valid strictly before its `exp:` second, the comparison
+/// image and upload URLs use: from that second on it is
+/// refused as expired. One with no expiry runs, unless
+/// `require_expiry` (`CRABCROP_PURGE_REQUIRE_EXPIRY`) says
+/// the server takes only expiring purge URLs.
+fn purge_expiry_refusal(expiry: Option<u64>, now: u64, require_expiry: bool) -> Option<ErrorParts> {
+    match expiry {
+        Some(exp) if now >= exp => Some((
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired".to_string(),
+        )),
+        Some(_) => None,
+        None if require_expiry => Some((
+            StatusCode::FORBIDDEN,
+            "expiry_required",
+            "expiry required: this server accepts only purge URLs that carry an exp: segment"
+                .to_string(),
+        )),
+        None => None,
+    }
+}
+
 /// `POST /purge/<signature>/<path>`: invalidate every stored
 /// variant of one result. The removal spans this process's
 /// tiers (its memory, its disk store, and the shared store);
@@ -1782,7 +1900,13 @@ async fn purge_log(log: &RequestLog, event: &str, target: &str, removed: Option<
 /// [`crate::url::purge_key`]), so only the secret holder can
 /// purge and an image signature does not verify here (no
 /// signer signs the subkey's label); a bad signature is a
-/// 403 and purges nothing. Idempotent:
+/// 403 and purges nothing. The expiring form,
+/// `POST /purge/<signature>/exp:<unix-seconds>/<path>`, signs
+/// the `exp:` segment along with the path, and is a 403
+/// from its expiry second on (see
+/// [`crate::url::split_purge_remainder`]); with
+/// `CRABCROP_PURGE_REQUIRE_EXPIRY`, a URL without an expiry
+/// is a 403 as well. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<Arc<AppState>>,
@@ -1805,7 +1929,7 @@ async fn purge_handle(
         );
     };
     let full = format!("/{tail}");
-    let (signature, key_id, target) = match parse_signature(&full) {
+    let (signature, key_id, presented) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -1816,12 +1940,16 @@ async fn purge_handle(
             );
         }
     };
+    // Verification runs over the remainder exactly as
+    // presented: for the expiring form the `exp:` segment is
+    // part of the signed string, so a tampered or stripped
+    // expiry already fails here as a bad signature.
     if !state
         .keyring
-        .verify_purge(key_id.as_deref(), &signature, target)
+        .verify_purge(key_id.as_deref(), &signature, presented)
     {
         state.metrics.record_purge();
-        purge_log(&state.request_log, "purge", target, None).await;
+        purge_log(&state.request_log, "purge", presented, None).await;
         return error_response(
             StatusCode::FORBIDDEN,
             "bad_signature",
@@ -1829,12 +1957,36 @@ async fn purge_handle(
             accept.as_deref(),
         );
     }
+    // A leading `exp:` segment is the purge's own expiry,
+    // split off the verified remainder as the upload
+    // endpoint splits its own, and enforced before anything
+    // is touched. What follows it is the target.
+    let (expiry, target) = match crate::url::split_purge_remainder(presented) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
+    };
+    if let Some((status, code, message)) =
+        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
+    {
+        state.metrics.record_purge();
+        purge_log(&state.request_log, "purge", target, None).await;
+        return error_response(status, code, message, accept.as_deref());
+    }
     // A sealed target (issue #255) unseals here, the first
     // step of the chain, now that the purge signature has
-    // verified over the target as presented: the steps
-    // below continue with the decrypted remainder, so a
-    // purge by the sealed spelling evicts the entry its
-    // plain spelling serves, and the reverse. The decrypted
+    // verified over the target as presented and the purge's
+    // own expiry is off its front: the steps below continue
+    // with the decrypted remainder, so a purge by the sealed
+    // spelling evicts the entry its plain spelling serves,
+    // and the reverse. An `exp:` inside the payload is the
+    // image's, which the key form drops. The decrypted
     // remainder replaces the target wholesale (anything
     // after the token segment was the cosmetic friendly
     // name). A token that does not open under this keyring
@@ -1972,7 +2124,11 @@ async fn purge_handle(
 /// here, and neither does an image signature (no signer
 /// signs the subkey's label). A bad signature is a 403 and
 /// removes nothing; an unknown group answers 200 with a
-/// count of 0.
+/// count of 0. The expiring form,
+/// `POST /purge-group/<signature>/exp:<unix-seconds>/<group>`,
+/// signs the `exp:` segment along with the group name, and
+/// is a 403 from its expiry second on; the setting that
+/// refuses a URL without one applies here too.
 async fn purge_group_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -1993,7 +2149,22 @@ async fn purge_group_handle(
         );
     };
     let full = format!("/{tail}");
-    let (signature, key_id, group) = match parse_signature(&full) {
+    let (signature, key_id, presented) = match parse_signature(&full) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
+    };
+    // The group's shape is checked before its signature, as
+    // it always was, so the purge's own expiry comes off the
+    // front first (see `crate::url::split_purge_remainder`):
+    // what follows it is the group name.
+    let (expiry, group) = match crate::url::split_purge_remainder(presented) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -2013,9 +2184,11 @@ async fn purge_group_handle(
         );
     }
     let target = format!("purge-group/{group}");
+    // The signature covers the remainder as presented, the
+    // `exp:` segment included.
     if !state
         .keyring
-        .verify_purge_group(key_id.as_deref(), &signature, group)
+        .verify_purge_group(key_id.as_deref(), &signature, presented)
     {
         state.metrics.record_purge();
         purge_log(&state.request_log, "purge-group", &target, None).await;
@@ -2025,6 +2198,13 @@ async fn purge_group_handle(
             "bad signature".to_string(),
             accept.as_deref(),
         );
+    }
+    if let Some((status, code, message)) =
+        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
+    {
+        state.metrics.record_purge();
+        purge_log(&state.request_log, "purge-group", &target, None).await;
+        return error_response(status, code, message, accept.as_deref());
     }
     // The fan-out runs in a spawned task once the
     // signature has verified, as in the per-URL purge
@@ -2090,13 +2270,40 @@ async fn upload_log(log: &RequestLog, name: &str, outcome: &str) {
     .await;
 }
 
+/// How long an upload body may take before its pace counts:
+/// the body must arrive within this long plus one second for
+/// every [`crate::loader::MIN_BODY_RATE`] bytes (64 KiB) it
+/// has delivered (see [`upload_body_due`]).
+pub const UPLOAD_BODY_GRACE: Duration = Duration::from_secs(10);
+
+/// When an upload body whose read started at `started`, and
+/// which has delivered `received` bytes, must have delivered
+/// more: [`UPLOAD_BODY_GRACE`] plus one second per
+/// [`crate::loader::MIN_BODY_RATE`] bytes, plus `waited`, the
+/// time the server itself spent waiting for budget. A body
+/// that keeps 64 KiB a second after the grace never meets
+/// it, and one that trickles or stalls does, so a client
+/// cannot hold its connection and its budget for longer than
+/// the body's own size accounts for: a body at the 10 MiB
+/// default cap is done within 10 + 160 seconds, plus the
+/// budget wait.
+fn upload_body_due(
+    started: tokio::time::Instant,
+    received: usize,
+    waited: Duration,
+) -> tokio::time::Instant {
+    let paced = (received as u64).saturating_mul(1000) / crate::loader::MIN_BODY_RATE as u64;
+    started + UPLOAD_BODY_GRACE + Duration::from_millis(paced) + waited
+}
+
 /// Read an upload body of at most `cap` bytes, charging it
 /// to `charge` as it arrives (issue #403), in steps so a
 /// trickling client does not touch the budget per frame.
 /// [`LoadError::TooLarge`] past the cap,
-/// [`LoadError::Network`] for an unreadable body, and
-/// [`LoadError::Busy`] when the request's wait for budget
-/// ran out.
+/// [`LoadError::Network`] for an unreadable body,
+/// [`LoadError::Timeout`] for a body that falls behind
+/// [`upload_body_due`], and [`LoadError::Busy`] when the
+/// request's wait for budget ran out.
 async fn read_upload_body(
     mut body: axum::body::Body,
     cap: usize,
@@ -2104,10 +2311,17 @@ async fn read_upload_body(
 ) -> Result<Vec<u8>, LoadError> {
     use axum::body::HttpBody as _;
     const STEP: usize = 256 * 1024;
+    let started = tokio::time::Instant::now();
+    let mut waited = Duration::ZERO;
     let mut out = Vec::new();
-    while let Some(frame) =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
-    {
+    loop {
+        let due = upload_body_due(started, out.len(), waited);
+        let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx));
+        let frame = match tokio::time::timeout_at(due, next).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => return Err(LoadError::Timeout),
+        };
         let frame = frame.map_err(|e| LoadError::Network(e.to_string()))?;
         let Ok(data) = frame.into_data() else {
             continue;
@@ -2117,7 +2331,9 @@ async fn read_upload_body(
             return Err(LoadError::TooLarge { limit: cap as u64 });
         }
         let step = received.div_ceil(STEP).saturating_mul(STEP);
+        let waiting = tokio::time::Instant::now();
         charge.grow_to(step.min(cap).max(received)).await?;
+        waited += waiting.elapsed();
         out.extend_from_slice(&data);
     }
     charge.shrink_to(out.len());
@@ -2573,8 +2789,24 @@ async fn read_upload(
                 ),
             ));
         }
+        Err(LoadError::Timeout) => {
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:too-slow",
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    "upload_too_slow",
+                    format!(
+                        "upload body arrived too slowly: it may take {} seconds plus one second \
+                         for every {} KiB it sends",
+                        UPLOAD_BODY_GRACE.as_secs(),
+                        crate::loader::MIN_BODY_RATE / 1024
+                    ),
+                ),
+            ));
+        }
         Err(e) => {
-            eprintln!("upload body read failed: {e}");
+            stderr_line!("upload body read failed: {e}");
             return Err(UploadOutcome::rejected(
                 name,
                 "rejected:unreadable",
@@ -2633,7 +2865,7 @@ async fn validate_upload(
     let prepared = match run_upload_validation(state, bytes).await {
         UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
-            eprintln!("upload rejected: {e}");
+            stderr_line!("upload rejected: {e}");
             return Err(UploadOutcome::rejected(
                 name,
                 "rejected:not-an-image",
@@ -2709,7 +2941,7 @@ async fn store_upload(
         }),
         Err(crate::upload::UploadError::AlreadyExists) => Err(upload_exists(name)),
         Err(crate::upload::UploadError::Backend(cause)) => {
-            eprintln!("upload failed: {cause}");
+            stderr_line!("upload failed: {cause}");
             Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
@@ -2721,7 +2953,7 @@ async fn store_upload(
             ))
         }
         Err(crate::upload::UploadError::Io(cause)) => {
-            eprintln!("upload failed: {cause}");
+            stderr_line!("upload failed: {cause}");
             Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
@@ -3050,7 +3282,9 @@ async fn serve(
     let save_data = hints && save_data_hint(headers);
     let full = format!("/{path}");
     let opened = authenticate(state, &full, &mut record);
-    let sealed = opened.as_ref().is_ok_and(|opened| opened.sealed);
+    let sealed = opened
+        .as_ref()
+        .is_ok_and(|opened| matches!(opened.credential, Credential::Sealed));
     let admitted = opened.and_then(|opened| {
         let resolved = resolve_request(state, &opened.remainder, &mut record)?;
         let negotiated = negotiate(state, &resolved.ops, accept, dpr, width, save_data)?;
@@ -3144,9 +3378,20 @@ struct Opened<'a> {
     /// The remainder as presented, or as its sealed token
     /// decrypts.
     remainder: std::borrow::Cow<'a, str>,
-    /// Whether the request arrived in the sealed spelling
-    /// (issue #255).
-    sealed: bool,
+    /// What admitted it.
+    credential: Credential,
+}
+
+/// What admitted a remainder (see [`authenticate`]).
+enum Credential {
+    /// A sealed token that opened: the request arrived in
+    /// the sealed spelling (issue #255).
+    Sealed,
+    /// A signature that verified, with the key ID its
+    /// segment named, if any (issue #143).
+    Signature(Option<String>),
+    /// The `unsafe` segment, on a server that allows it.
+    Unsafe,
 }
 
 /// The first stage of [`serve`]: verify the signature over
@@ -3193,7 +3438,7 @@ fn authenticate<'a>(
         return match opened {
             Some(text) => Ok(Opened {
                 remainder: std::borrow::Cow::Owned(text),
-                sealed: true,
+                credential: Credential::Sealed,
             }),
             None => Err(Refusal::Unopened),
         };
@@ -3217,15 +3462,15 @@ fn authenticate<'a>(
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
     record.verify = verify_start.elapsed();
     if !verified {
-        return Err(Refusal::AsIs((
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-        )));
+        return Err(Refusal::AsIs(bad_signature_parts()));
     }
+    let credential = match signature {
+        crate::url::Signature::Hmac(_) => Credential::Signature(key_id),
+        crate::url::Signature::Unsafe => Credential::Unsafe,
+    };
     Ok(Opened {
         remainder: std::borrow::Cow::Borrowed(rest),
-        sealed: false,
+        credential,
     })
 }
 
@@ -3234,12 +3479,55 @@ struct Resolved {
     /// The operations the engine runs: the remainder's
     /// own, with the server-wide defaults merged in.
     ops: Vec<crate::url::Operation>,
+    /// How many of `ops` are the remainder's own: the
+    /// last ones, since [`crate::url::merge_default_ops`]
+    /// puts a request's operations after the defaults it
+    /// keeps.
+    own_len: usize,
     /// The source to fetch, a root source expanded.
     source_url: String,
+    /// The root reference the source was written as
+    /// (issue #248), when it was one.
+    root: Option<crate::url::RootRef>,
     /// The cache groups (RFC 9875).
     groups: Vec<String>,
     /// The `maxage:` cache lifetime (issue #159).
     max_age: Option<u32>,
+    /// The `exp:` the URL carries, when it carries one.
+    expiry: Option<Expiry>,
+}
+
+impl Resolved {
+    /// The remainder's own operations, without the
+    /// server-wide defaults.
+    fn own_ops(&self) -> &[crate::url::Operation] {
+        &self.ops[self.ops.len() - self.own_len..]
+    }
+
+    /// The source as the URL wrote it: a root reference as
+    /// written, never its expansion.
+    fn written_source(&self) -> String {
+        match &self.root {
+            Some(root) => root.written(),
+            None => self.source_url.clone(),
+        }
+    }
+}
+
+/// A URL's `exp:` second and the clock reading it was
+/// admitted at, in unix seconds.
+#[derive(Clone, Copy)]
+struct Expiry {
+    at: u64,
+    checked_at: u64,
+}
+
+/// The clock in whole unix seconds, the unit of `exp:`.
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The second stage of [`serve`]: expand and parse the
@@ -3247,6 +3535,10 @@ struct Resolved {
 /// what it may not ask for: a reserved segment, a preset
 /// or grammar failure, too many operations, an unknown
 /// source root, or an expired URL, in that order.
+///
+/// It and [`authenticate`] are the explain route's
+/// admission too ([`admit_explained`]), so a refusal added
+/// to either holds on both routes.
 fn resolve_request(
     state: &AppState,
     rest: &str,
@@ -3319,6 +3611,7 @@ fn resolve_request(
     // directive (format, quality, fill) by coming later. The
     // signature never covers the defaults: they are operator
     // configuration, not request content.
+    let own_len = ops.len();
     let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     // The operation cap (issue #469) counts this merged list,
     // the one the engine runs, and answers here: before the
@@ -3336,7 +3629,7 @@ fn resolve_request(
     // are one render, sharing a cache entry and a purge
     // target. The loader's checks evaluate the expanded
     // URL unchanged, the allowlist included.
-    let (source_url, _) =
+    let (source_url, root) =
         crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
@@ -3344,24 +3637,28 @@ fn resolve_request(
     // cache: an expired URL never serves, cached or not. The
     // comparison is exact: the URL is valid strictly before
     // its `exp` second.
-    if let Some(exp) = expiry {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now >= exp {
-            return Err(Refusal::AsIs((
-                StatusCode::FORBIDDEN,
-                "signature_expired",
-                "signature expired".to_string(),
-            )));
+    let expiry = match expiry {
+        Some(at) => {
+            let checked_at = unix_seconds();
+            if checked_at >= at {
+                return Err(Refusal::AsIs((
+                    StatusCode::FORBIDDEN,
+                    "signature_expired",
+                    "signature expired".to_string(),
+                )));
+            }
+            Some(Expiry { at, checked_at })
         }
-    }
+        None => None,
+    };
     Ok(Resolved {
         ops,
+        own_len,
         source_url,
+        root,
         groups,
         max_age,
+        expiry,
     })
 }
 
@@ -3603,22 +3900,62 @@ fn meta_flight_key(work: &MissWork) -> String {
 }
 
 /// The last stage of [`serve`]: serve the keyed request.
-/// A debug request runs the miss path on its own, a meta
-/// request coalesces through its own flights, and an image
-/// request reads the tiers and coalesces its miss.
+/// A debug request runs the miss path on its own, and a
+/// meta request coalesces through its own flights
+/// ([`serve_meta_flight`]).
+///
+/// An image request reads the tiers and coalesces its miss
+/// through its key's flight (audit R2-09): the first miss
+/// for a key leads (one fetch, one encode, under the miss
+/// path's gates); concurrent requests for the same key wait
+/// for the leader, then re-check the tiers and serve its
+/// entry. A leader whose result no tier stored (an error, a
+/// fallback, a render with the caches off) leaves its
+/// response in the flight's slot instead, and a waiter
+/// whose request is identical to the leader's answers with
+/// it (issue #407): it is the answer the waiter would have
+/// produced itself, and taking it keeps a burst on a
+/// failing origin at one fetch per flight rather than one
+/// per waiter. Identical means the same [`FlightIdentity`].
+/// The conditional header is left out of it: each waiter
+/// applies its own. A leader whose client goes away after
+/// its render has started still finishes the flight (see
+/// [`finish_started_miss`]). A waiter that cannot take the
+/// response (another spelling of the key, a body past the
+/// share cap, a leader whose request was dropped before its
+/// render started, a leader that forwent its fallback run
+/// because its client had gone, a run a purge of the key
+/// overtook) leads or follows the next flight. Waits are
+/// capped: a waiter whose flights keep ending without an
+/// answer for it stops queueing and runs the miss path
+/// itself (issue #375, [`own_miss`]), so it ends with the
+/// origin's real answer instead of a busy response masking
+/// it.
+///
+/// Each pass of the loop reads the tiers ([`answer_hit`]),
+/// takes what the flight it followed left for it
+/// ([`Following::take_shared`], [`answer_shared`]), and
+/// then leads the key's flight ([`lead_flight`]) or follows
+/// it ([`Following::wait`]). The loop stays in this function
+/// and the misses are awaited here: an async function holds
+/// its arguments for as long as it runs, so a stage of its
+/// own that takes the work would hold a second copy of it
+/// in every request's future.
 async fn run_flight(
     state: &Arc<AppState>,
     path: &str,
-    mut work: MissWork,
+    work: MissWork,
     if_none_match: Option<&str>,
-    mut record: OwedRecord,
+    record: OwedRecord,
 ) -> (Response, OwedRecord) {
     // The miss path is boxed at each of the four places this
-    // function reaches it (issue #638). Its future holds the
-    // loader's and the engine runner's state, about 20 KB.
-    // Awaited in line it made every request's future that
-    // large, and a request allocates and moves its future
-    // once, whether it goes on to miss or not.
+    // function reaches it (issue #638): the two below, and in
+    // the futures [`lead_flight`] and [`own_miss`] build. Its
+    // future holds the loader's and the engine runner's
+    // state, about 20 KB. Awaited in line it made every
+    // request's future that large, and a request allocates
+    // and moves its future once, whether it goes on to miss
+    // or not.
     // Debug requests bypass everything, per request.
     if work.debug {
         let (response, record, _) = Box::pin(serve_miss(state, work, record)).await;
@@ -3630,62 +3967,8 @@ async fn run_flight(
         let flight_key = meta_flight_key(&work);
         return Box::pin(serve_meta_flight(state, work, record, &flight_key)).await;
     }
-    // Singleflight (audit R2-09): the first miss for a key
-    // leads (one fetch, one encode, under the gates below);
-    // concurrent requests for the same key wait for the
-    // leader, then re-check the tiers and serve its entry.
-    // A leader whose result no tier stored (an error, a
-    // fallback, a render with the caches off) leaves its
-    // response in the flight's slot instead, and a waiter
-    // whose request is identical to the leader's answers
-    // with it (issue #407): it is the answer the waiter
-    // would have produced itself, and taking it keeps a
-    // burst on a failing origin at one fetch per flight
-    // rather than one per waiter. Identical means the same
-    // raw path (the sealing, the cache groups, and the
-    // cache lifetime all come from it) and the same header
-    // inputs as the miss path sees them: the negotiated
-    // format, not the raw Accept (on this path errors are
-    // plain text whatever it says), the quantized width,
-    // not the raw hint, and whether Save-Data applies, not
-    // the raw header, so browsers that phrase the same
-    // request differently still share one flight. The
-    // conditional header is left out: each waiter applies
-    // its own. A leader whose client goes away after its
-    // render has started still finishes the flight (see
-    // `finish_started_miss`). A waiter that cannot take
-    // the response (another spelling of the key, a body
-    // past the share cap, a leader whose request was
-    // dropped before its render started, a leader that
-    // forwent its fallback run because its client had
-    // gone, a run a purge of the key overtook) leads or
-    // follows the next flight.
-    // Waits are capped: a waiter whose flights
-    // keep ending without an answer for it stops queueing
-    // and runs the miss path itself (issue #375), so it
-    // ends with the origin's real answer instead of a busy
-    // response masking it.
-    let (preferred, dpr_hint, hinted_width, save_data) = (
-        work.preferred,
-        work.dpr_hint,
-        work.hinted_width,
-        work.save_data,
-    );
-    // That identity is built only by a request that leads
-    // or follows a flight (issue #641): a hit compares it
-    // with nothing. A follower builds it before it waits,
-    // and a leader once it holds the flight, never between
-    // a lookup that missed and the claim. Whatever a
-    // request does there widens the window in which the
-    // flight it would have followed can end unseen, and the
-    // request then leads a second flight for a render the
-    // first has just stored.
-    let flight_identity =
-        || format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
-    let mut flight_request: Option<String> = None;
-    let (max_age, sealed) = (work.max_age, work.sealed);
-    let mut waits = 0;
-    let mut followed: Option<Arc<FlightSlot>> = None;
+    let identity = FlightIdentity::of(path, &work);
+    let mut following = Following::default();
     // One disk budget for every tier check this request makes
     // (issue #572).
     let mut budget = DiskBudget::new();
@@ -3696,131 +3979,273 @@ async fn run_flight(
         if let Some((hit, cache_status)) =
             lookup_tiers_within(state, cache_key, groups, &mut budget).await
         {
-            record.cache_hit = true;
-            record.bytes_out = hit.bytes.len();
-            let mut response = respond(
-                hit.format,
-                hit.quality,
-                hit.bytes,
-                max_age,
-                state.client_hints,
-            );
-            attach_cache_headers(&mut response, cache_status, groups, sealed);
-            finalize_validators(&mut response, &hit.etag, if_none_match);
-            return (response, record);
+            return answer_hit(state, &work, hit, cache_status, if_none_match, record);
         }
-        let taken = followed
+        if let Some(shared) = following.take_shared(state, cache_key, groups) {
+            return answer_shared(&shared, if_none_match, record);
+        }
+        match state.inflight.lead(cache_key) {
+            Flight::Leader(guard, slot) => {
+                let request = following.request.take().unwrap_or_else(|| identity.text());
+                let (progress, lead) = lead_flight(state, work, guard, slot, request, record);
+                let answer = finish_started_miss(state, progress, lead).await;
+                return answer_miss(answer, if_none_match);
+            }
+            Flight::Follower(changed, slot) => {
+                if following.waits >= MAX_FLIGHT_WAITS {
+                    let (progress, miss) = own_miss(state, work, record);
+                    let answer = finish_started_miss(state, progress, miss).await;
+                    return answer_miss(answer, if_none_match);
+                }
+                following.wait(changed, slot, &identity).await;
+            }
+        }
+    }
+}
+
+/// What makes two image requests for one key identical for
+/// a flight's shared response (issue #407): the same raw
+/// path (the sealing, the cache groups, and the cache
+/// lifetime all come from it) and the same header inputs as
+/// the miss path sees them: the negotiated format, not the
+/// raw Accept (on this path errors are plain text whatever it
+/// says), the quantized width, not the raw hint, and whether
+/// Save-Data applies, not the raw header, so browsers that
+/// phrase the same request differently still share one
+/// flight.
+struct FlightIdentity<'a> {
+    path: &'a str,
+    preferred: Option<ImageFormat>,
+    dpr_hint: Option<f32>,
+    hinted_width: Option<u32>,
+    save_data: bool,
+}
+
+impl<'a> FlightIdentity<'a> {
+    fn of(path: &'a str, work: &MissWork) -> Self {
+        Self {
+            path,
+            preferred: work.preferred,
+            dpr_hint: work.dpr_hint,
+            hinted_width: work.hinted_width,
+            save_data: work.save_data,
+        }
+    }
+
+    /// The identity as a flight's slot records it
+    /// ([`SharedFlight::request`]).
+    ///
+    /// It is built only by a request that leads or follows a
+    /// flight (issue #641): a hit compares it with nothing. A
+    /// follower builds it before it waits, and a leader once
+    /// it holds the flight, never between a lookup that missed
+    /// and the claim. Whatever a request does there widens the
+    /// window in which the flight it would have followed can
+    /// end unseen, and the request then leads a second flight
+    /// for a render the first has just stored.
+    fn text(&self) -> String {
+        let Self {
+            path,
+            preferred,
+            dpr_hint,
+            hinted_width,
+            save_data,
+        } = self;
+        format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}")
+    }
+}
+
+/// An image request's part in the flights it has followed.
+#[derive(Default)]
+struct Following {
+    /// Its [`FlightIdentity`], once it has built it.
+    request: Option<String>,
+    /// How many flights it has waited on.
+    waits: u32,
+    /// The slot of the flight it waited on last, until the
+    /// next pass reads it.
+    slot: Option<Arc<FlightSlot>>,
+}
+
+impl Following {
+    /// The response the flight this request waited on last
+    /// left in its slot, when the request is identical to
+    /// the leader's and no purge covering the key has been
+    /// recorded since the leader's run began.
+    fn take_shared(
+        &mut self,
+        state: &AppState,
+        cache_key: &str,
+        groups: &[String],
+    ) -> Option<SharedFlight> {
+        self.slot
             .take()
             .and_then(|slot| {
                 slot.shared
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .filter(|shared| Some(&shared.request) == flight_request.as_ref())
+                    .filter(|shared| Some(&shared.request) == self.request.as_ref())
                     .cloned()
             })
             .filter(|shared| {
                 !state
                     .purge_guard
                     .purge_covers(shared.snapshot, cache_key, groups)
-            });
-        if let Some(shared) = taken {
-            record.bytes_out = shared.response.body.len();
-            record.fallback = shared.fallback;
-            let mut response = respond_shared(&shared.response);
-            if let Some(etag) = &shared.etag {
-                finalize_validators(&mut response, etag, if_none_match);
-            }
-            return (response, record);
-        }
-        match state.inflight.lead(cache_key) {
-            Flight::Leader(guard, slot) => {
-                let flight_request = flight_request.take().unwrap_or_else(flight_identity);
-                let snapshot = state.purge_guard.snapshot();
-                let progress = work.progress.clone();
-                let task_progress = progress.clone();
-                let task_state = state.clone();
-                // The render's disk write waits until the
-                // followers are woken (issue #572): they read
-                // the render from memory and never wait for it.
-                let handoff = DiskHandoff::default();
-                work.disk_handoff = Some(handoff.clone());
-                // The leader's whole part runs as one miss
-                // (see `finish_started_miss`): a render it
-                // starts is stored and answers the
-                // followers even when this request is gone,
-                // and the guard is held until it has. A
-                // miss that forwent a render for a client
-                // that had gone ends without its request's
-                // answer, so it shares nothing.
-                let lead = async move {
-                    let (response, record, render_etag) =
-                        Box::pin(serve_miss(&task_state, work, record)).await;
-                    let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
-                    if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
-                        *slot.shared.lock().unwrap() = Some(SharedFlight {
-                            request: flight_request,
-                            snapshot,
-                            response: shared,
-                            etag: render_etag.clone(),
-                            fallback: record.fallback,
-                        });
-                    }
-                    drop(guard);
-                    let pending = handoff.lock().unwrap().take();
-                    if let Some(pending) = pending {
-                        finish_disk_write(
-                            &task_state,
-                            pending.snapshot,
-                            &pending.key,
-                            &pending.entry,
-                            pending.claim,
-                        )
-                        .await;
-                    }
-                    (response, record, render_etag)
-                };
-                let (mut response, record, render_etag) =
-                    finish_started_miss(state, progress, lead).await;
-                if let Some(etag) = &render_etag {
-                    finalize_validators(&mut response, etag, if_none_match);
-                }
-                return (response, record);
-            }
-            Flight::Follower(mut changed, slot) => {
-                if waits >= MAX_FLIGHT_WAITS {
-                    // The wait cap is spent: run the miss
-                    // path, the same settlement the meta
-                    // flights use (issue #375). Shedding a
-                    // busy response here masked the origin's
-                    // real answer (its error, or a slow
-                    // success) behind a server_busy this
-                    // request never earned: the cap exists
-                    // to stop queueing behind failing leaders
-                    // forever, not to refuse a request that
-                    // has not had its own attempt.
-                    let progress = work.progress.clone();
-                    let task_state = state.clone();
-                    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
-                    let (mut response, record, render_etag) =
-                        finish_started_miss(state, progress, miss).await;
-                    if let Some(etag) = &render_etag {
-                        finalize_validators(&mut response, etag, if_none_match);
-                    }
-                    return (response, record);
-                }
-                waits += 1;
-                flight_request.get_or_insert_with(flight_identity);
-                // The leader always signals on drop; the
-                // timeout is only a backstop against a
-                // wedged leader, after which the waiter
-                // re-checks the tiers and may lead itself.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
-                    .await;
-                followed = Some(slot);
-            }
-        }
+            })
     }
+
+    /// Wait for the flight this request follows to end.
+    async fn wait(
+        &mut self,
+        mut changed: tokio::sync::watch::Receiver<bool>,
+        slot: Arc<FlightSlot>,
+        identity: &FlightIdentity<'_>,
+    ) {
+        self.waits += 1;
+        self.request.get_or_insert_with(|| identity.text());
+        // The leader always signals on drop; the timeout is
+        // only a backstop against a wedged leader, after which
+        // the waiter re-checks the tiers and may lead itself.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed()).await;
+        self.slot = Some(slot);
+    }
+}
+
+/// The answer to an image request from a tier hit.
+fn answer_hit(
+    state: &AppState,
+    work: &MissWork,
+    hit: CachedImage,
+    cache_status: &'static str,
+    if_none_match: Option<&str>,
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
+    record.cache_hit = true;
+    record.bytes_out = hit.bytes.len();
+    let mut response = respond(
+        hit.format,
+        hit.quality,
+        hit.bytes,
+        work.max_age,
+        state.client_hints,
+    );
+    attach_cache_headers(&mut response, cache_status, &work.groups, work.sealed);
+    finalize_validators(&mut response, &hit.etag, if_none_match);
+    (response, record)
+}
+
+/// The answer to an image request from the response the
+/// flight it followed shared (issue #407).
+fn answer_shared(
+    shared: &SharedFlight,
+    if_none_match: Option<&str>,
+    mut record: OwedRecord,
+) -> (Response, OwedRecord) {
+    record.bytes_out = shared.response.body.len();
+    record.fallback = shared.fallback;
+    let mut response = respond_shared(&shared.response);
+    if let Some(etag) = &shared.etag {
+        finalize_validators(&mut response, etag, if_none_match);
+    }
+    (response, record)
+}
+
+/// The leader's part of the key's flight, as a miss to run
+/// (see [`finish_started_miss`]) with the progress it
+/// reports: run the miss, leave its response in the
+/// flight's slot for the followers (`request` is this
+/// request's [`FlightIdentity`]), wake them by dropping
+/// `guard`, and then finish the render's disk write.
+///
+/// The leader's whole part runs as one miss: a render it
+/// starts is stored and answers the followers even when
+/// this request is gone, and the guard is held until it
+/// has. A miss that forwent a render for a client that had
+/// gone ends without its request's answer, so it shares
+/// nothing.
+fn lead_flight(
+    state: &Arc<AppState>,
+    mut work: MissWork,
+    guard: LeaderGuard,
+    slot: Arc<FlightSlot>,
+    request: String,
+    record: OwedRecord,
+) -> (
+    MissProgress,
+    impl std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
+) {
+    let snapshot = state.purge_guard.snapshot();
+    let progress = work.progress.clone();
+    let task_progress = progress.clone();
+    let task_state = state.clone();
+    // The render's disk write waits until the followers are
+    // woken (issue #572): they read the render from memory
+    // and never wait for it.
+    let handoff = DiskHandoff::default();
+    work.disk_handoff = Some(handoff.clone());
+    let lead = async move {
+        let (response, record, render_etag) = Box::pin(serve_miss(&task_state, work, record)).await;
+        let (response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+        if let Some(shared) = shared.filter(|_| !task_progress.forwent_render()) {
+            *slot.shared.lock().unwrap() = Some(SharedFlight {
+                request,
+                snapshot,
+                response: shared,
+                etag: render_etag.clone(),
+                fallback: record.fallback,
+            });
+        }
+        drop(guard);
+        let pending = handoff.lock().unwrap().take();
+        if let Some(pending) = pending {
+            finish_disk_write(
+                &task_state,
+                pending.snapshot,
+                &pending.key,
+                &pending.entry,
+                pending.claim,
+                false,
+            )
+            .await;
+        }
+        (response, record, render_etag)
+    };
+    (progress, lead)
+}
+
+/// The miss of a request whose flight waits are spent, to
+/// run (see [`finish_started_miss`]) with the progress it
+/// reports: the same settlement the meta flights use (issue
+/// #375). Shedding a busy response here masked the origin's
+/// real answer (its error, or a slow success) behind a
+/// server_busy this request never earned: the cap exists to
+/// stop queueing behind failing leaders forever, not to
+/// refuse a request that has not had its own attempt.
+fn own_miss(
+    state: &Arc<AppState>,
+    work: MissWork,
+    record: OwedRecord,
+) -> (
+    MissProgress,
+    impl std::future::Future<Output = (Response, OwedRecord, Option<String>)> + Send + 'static,
+) {
+    let progress = work.progress.clone();
+    let task_state = state.clone();
+    let miss = async move { Box::pin(serve_miss(&task_state, work, record)).await };
+    (progress, miss)
+}
+
+/// A miss's answer to the request that ran it: the render's
+/// ETag answers the request's conditional headers.
+fn answer_miss(
+    (mut response, record, render_etag): (Response, OwedRecord, Option<String>),
+    if_none_match: Option<&str>,
+) -> (Response, OwedRecord) {
+    if let Some(etag) = &render_etag {
+        finalize_validators(&mut response, etag, if_none_match);
+    }
+    (response, record)
 }
 
 /// Run one image miss (`miss`: the miss path for a key,
@@ -4043,7 +4468,7 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
             // miss path answers with (the size hint above
             // already vouched for the body); the status
             // and headers survive, the body does not.
-            eprintln!("flight: leader body could not be collected for sharing");
+            stderr_line!("flight: leader body could not be collected for sharing");
             (Response::from_parts(parts, axum::body::Body::empty()), None)
         }
     }
@@ -4154,11 +4579,14 @@ fn promote_memory_tier(
 
 /// What a learn tells the disk tier about the bucket copy,
 /// given how its write went (issue #572): only a write that
-/// was spawned, or is queued, carries the groups.
+/// was spawned, or is queued, carries the groups, and one
+/// skipped past the waiting cap leaves the bucket copy without
+/// them (issue #709).
 fn bucket_for(sent: Sent, groups: &[String]) -> crate::storage::Bucket<'_> {
     match sent {
         Sent::Spawned => crate::storage::Bucket::Carries(groups),
         Sent::Skipped => crate::storage::Bucket::Skipped,
+        Sent::Owed => crate::storage::Bucket::Lacks,
         Sent::Nothing => crate::storage::Bucket::Unknown,
     }
 }
@@ -4292,13 +4720,17 @@ fn begin_disk_write(
 /// runs to its end on its thread. The write lands with every
 /// group learned meanwhile, and the reconcile after it checks
 /// those under the write's own snapshot: a purge that lands
-/// while the write is in flight wins.
+/// while the write is in flight wins. With `owes`, the bucket
+/// copy lacks some of the entry's groups, because its group
+/// write-back was skipped (issue #709): the new record owes
+/// them, and its first hit sends them.
 async fn finish_disk_write(
     state: &AppState,
     snapshot: u64,
     key: &str,
     entry: &CachedImage,
     claim: crate::storage::WriteClaim,
+    owes: bool,
 ) {
     let Some(store) = state.store.clone() else {
         return;
@@ -4319,9 +4751,13 @@ async fn finish_disk_write(
         if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
             return;
         }
-        if let Some(landed) = store.land(claim, &entry)
-            && guard.write_covered(snapshot, &key, &landed.groups, entry.written)
-        {
+        let Some(landed) = store.land(claim, &entry) else {
+            return;
+        };
+        if owes {
+            store.owe_shared(&key, landed.id);
+        }
+        if guard.write_covered(snapshot, &key, &landed.groups, entry.written) {
             // Queued, not deleted inline: a failed delete is
             // retried, and the purge holds its tombstones for it
             // (see `DiskStore::forget_if`).
@@ -4376,11 +4812,16 @@ enum SharedWrite {
 /// backlog, a [`SharedWrite::Render`] is skipped and counted
 /// on /metrics: the local tiers hold the entry, so the cost
 /// is a render on the next replica that misses. A
-/// [`SharedWrite::Groups`] write-back is never skipped: it
-/// waits for a slot in its own task. One for the same copy,
-/// snapshot and groups as one already queued is not spawned
-/// again (issue #572): the queued one carries them, so a
-/// stall cannot queue one per request.
+/// [`SharedWrite::Groups`] write-back waits for a slot in its
+/// own task. One for the same copy, snapshot and groups as
+/// one already queued is not spawned again (issue #572): the
+/// queued one carries them, so a stall cannot queue one per
+/// request. And at most
+/// [`SHARED_GROUP_WRITES_WAITING`] wait (issue
+/// #709): past them a write-back is skipped and counted on
+/// /metrics, and comes back [`Sent::Owed`], so the disk tier
+/// records that the bucket copy lacks the groups and its next
+/// hit sends them again.
 fn spawn_shared_put(
     state: &AppState,
     snapshot: u64,
@@ -4404,8 +4845,9 @@ fn spawn_shared_put(
             None => return Sent::Skipped,
         },
         SharedWrite::Groups => match state.background.queue_groups_write(key, snapshot, &entry) {
-            Some(queued) => (None, Some(queued)),
-            None => return Sent::Spawned,
+            background::GroupsQueued::Queued(queued, slot) => (slot, Some(queued)),
+            background::GroupsQueued::Carried => return Sent::Spawned,
+            background::GroupsQueued::Skipped => return Sent::Owed,
         },
     };
     let background = state.background.clone();
@@ -4414,7 +4856,7 @@ fn spawn_shared_put(
     // The handle is dropped: the write is detached, and
     // tracked for the shutdown drain.
     let _detached = state.background.spawn(async move {
-        let _queued = queued;
+        let mut queued = queued;
         let _slot = match slot {
             Some(slot) => slot,
             None => match background.wait_put_slot().await {
@@ -4422,6 +4864,9 @@ fn spawn_shared_put(
                 None => return,
             },
         };
+        if let Some(queued) = &mut queued {
+            queued.got_slot();
+        }
         // Checked again with the slot held: a purge can begin
         // while the write waits for one.
         if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
@@ -4447,6 +4892,9 @@ enum Sent {
     /// A render's write-through found every slot taken (issue
     /// #463).
     Skipped,
+    /// A group write-back found as many waiting as may (issue
+    /// #709): the bucket copy lacks its groups.
+    Owed,
     /// Nothing to write: no shared tier, or a purge covers the
     /// copy.
     Nothing,
@@ -4759,7 +5207,9 @@ async fn lookup_tiers_within(
         let sent = if adds_groups(&image.groups, &wanted) {
             image.groups = crate::cache::union_groups(&image.groups, &wanted);
             // Off the response path, like the write-through
-            // put, but never skipped.
+            // put, and skipped only past the waiting cap
+            // (issue #709), which the disk write below records
+            // as a debt.
             spawn_shared_put(
                 state,
                 snapshot,
@@ -4784,7 +5234,15 @@ async fn lookup_tiers_within(
         let took = promote_memory_tier(state, snapshot, cache_key, &image);
         teach_slower_tiers(state, snapshot, cache_key, &image, took);
         if let Some(claim) = disk {
-            finish_disk_write(state, snapshot, cache_key, &image, claim).await;
+            finish_disk_write(
+                state,
+                snapshot,
+                cache_key,
+                &image,
+                claim,
+                sent == Sent::Owed,
+            )
+            .await;
         }
         return Some((image, "crabcrop; hit; detail=\"shared\""));
     }
@@ -4833,11 +5291,15 @@ async fn lookup_disk_tier(
     }
     let hit = store.learn_hit(&key, id, &groups)?;
     image.groups = hit.groups;
-    if hit.grew || hit.owed {
-        // The record grew, or a skipped render write left the
-        // bucket copy without some of its groups: the shared
-        // tier's copy learns them (issue #350).
-        spawn_shared_put(&state, snapshot, &key, image.clone(), SharedWrite::Groups);
+    if (hit.grew || hit.owed)
+        // The record grew, or a skipped write left the bucket
+        // copy without some of its groups: the shared tier's
+        // copy learns them (issue #350). A write-back skipped
+        // past the waiting cap leaves the debt with the record
+        // again, for the next hit (issue #709).
+        && spawn_shared_put(&state, snapshot, &key, image.clone(), SharedWrite::Groups) == Sent::Owed
+    {
+        store.owe_shared(&key, id);
     }
     if hit.grew
         && state
@@ -5130,7 +5592,7 @@ async fn serve_miss(
     }
     record.bytes_out = processed.bytes.len();
     let mut response = if meta {
-        meta_document(state, &processed, sealed, accept).await
+        meta_document(state, processed, sealed, accept).await
     } else {
         respond(
             processed.format,
@@ -5378,7 +5840,7 @@ fn width_hint_ops(width: u32, no_upscale: bool) -> Vec<crate::url::Operation> {
     })];
     if !no_upscale {
         ops.push(crate::url::Operation::Filters(vec![
-            crate::url::Filter::NoUpscale,
+            crate::url::Filter::Plain(crate::url::PlainFilter::NoUpscale),
         ]));
     }
     ops
@@ -5624,19 +6086,22 @@ async fn populate_tiers(
         });
         return;
     }
-    finish_disk_write(state, snapshot, cache_key, &entry, claim).await;
+    finish_disk_write(state, snapshot, cache_key, &entry, claim, false).await;
 }
 
 /// The meta document for a render: the annotation sections
-/// the request opts into, then the document itself.
+/// the request opts into, then the document itself. The
+/// sections' blocking tasks decode the render, so they share
+/// it (issue #736): it is not copied for them.
 async fn meta_document(
     state: &AppState,
-    processed: &crate::engine::ProcessedImage,
+    processed: crate::engine::ProcessedImage,
     sealed: bool,
     accept: Option<&str>,
 ) -> Response {
-    let frame = DocumentFrame::new(processed);
-    meta_document_from(state, processed, frame, sealed, accept).await
+    let processed = Arc::new(processed);
+    let frame = DocumentFrame::new(Arc::clone(&processed));
+    meta_document_from(state, &processed, frame, sealed, accept).await
 }
 
 /// [`meta_document`] on the frame its sections share: the
@@ -5805,9 +6270,9 @@ mod meta;
 /// only for test builds, where they are used.
 #[cfg(test)]
 pub(in crate::server) use meta::{
-    AestheticMeta, AestheticOutcome, Annotation, compose_annotation, compose_moderation,
-    f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json, pack_embedding, score_list,
-    segments_json, studio_json,
+    AestheticMeta, AestheticOutcome, Annotation, FrameDecoder, compose_annotation,
+    compose_moderation, f32_to_f16_bits, moderation_json, objects_crop_json, ocr_json,
+    pack_embedding, score_list, segments_json, studio_json,
 };
 pub(in crate::server) use meta::{
     DocumentFrame, FrameSource, annotate_meta, compose_aesthetic, detect_meta, embed_meta,
@@ -6047,7 +6512,7 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
-    eprintln!("load error: {e}");
+    stderr_line!("load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
 }
@@ -6130,6 +6595,16 @@ fn reserved_remainder_parts() -> ErrorParts {
     )
 }
 
+/// The refusal for a signature that does not verify, and
+/// for a sealed spelling on the explain route.
+fn bad_signature_parts() -> ErrorParts {
+    (
+        StatusCode::FORBIDDEN,
+        "bad_signature",
+        "bad signature".to_string(),
+    )
+}
+
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.
 fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
@@ -6138,14 +6613,6 @@ fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
         e.code(),
         truncate_echo(&e.to_string()),
     )
-}
-
-/// A grammar failure's response: the parser's code and
-/// its (truncated) message, as plain text or the v2
-/// envelope per the client's Accept.
-fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
-    let (status, code, message) = parse_failure_parts(e);
-    error_response(status, code, message, accept)
 }
 
 /// The engine failure classes: status, stable code, and
@@ -6226,7 +6693,7 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
 const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
 
 fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
-    eprintln!("engine error: {e}");
+    stderr_line!("engine error: {e}");
     let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
     let mut response = error_response(status, code, message, accept);

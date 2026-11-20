@@ -38,9 +38,9 @@ for c in cases:
                 else:
                     raise
         elif kind == "purge_sig":
-            v = sdk.purge_signature(secret, c["target"])
+            v = sdk.purge_signature(secret, c["target"], c.get("expires"))
         elif kind == "group_sig":
-            v = sdk.purge_group_signature(secret, c["group"])
+            v = sdk.purge_group_signature(secret, c["group"], c.get("expires"))
         elif kind == "upload_sig":
             v = sdk.upload_signature(secret, c["name"], c.get("expires"))
         else:

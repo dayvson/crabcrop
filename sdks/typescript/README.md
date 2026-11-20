@@ -1,6 +1,6 @@
 # @crabcrop/url
 
-Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript, on Node or in the browser. No dependencies: Node signs and seals with `node:crypto`, and browser bundles get a built-in TypeScript implementation of the same functions (see [Browsers and bundlers](#browsers-and-bundlers)). The signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite and the server crate's differential tests run as well.
+Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript, on Node or in the browser. No dependencies: Node signs and seals with `node:crypto`, and browser bundles get a built-in TypeScript implementation of the same functions (see [Browsers and bundlers](#browsers-and-bundlers)). The signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite, the Python SDK's suite and the server crate's differential tests run as well.
 
 ## Usage
 
@@ -46,9 +46,14 @@ const ok = verifyUrlSignature("your-secret", url);
 
 // Purge signatures for the server's /purge and /purge-group endpoints
 // are domain-separated under a derived subkey; the helpers sign the
-// right strings so callers never assemble them by hand.
+// right strings so callers never assemble them by hand. Pass an
+// expiry (unix seconds) for a purge URL that stops working then;
+// its path is /purge/<signature>/exp:<expiry>/<path> (or
+// /purge-group/<signature>/exp:<expiry>/<group>).
 const purge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg");
 const group = purgeGroupSignature("your-secret", "thumb");
+const expiringPurge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg", 1893456000);
+const expiringGroup = purgeGroupSignature("your-secret", "thumb", 1893456000);
 
 // Upload signatures for the server's PUT /upload/<signature>/<name>
 // endpoint live in a third domain, under their own derived subkey.

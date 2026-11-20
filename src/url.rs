@@ -755,12 +755,122 @@ fn parse_studio(p: &str) -> Option<StudioSpec> {
     Some(spec)
 }
 
-/// One filter from a `filters:...` segment.
+/// One filter from a `filters:...` segment, as the engine
+/// routes it (issue #741). A [`PlainFilter`] needs nothing
+/// but the image it is given, and `crate::filters` applies
+/// it. Every other variant needs something only the engine
+/// holds: the images the server fetched, a model, the font,
+/// the bounds of the image in effect, or the request as a
+/// whole. The engine applies those itself. The engine's
+/// match names every variant, and the match in
+/// `crate::filters` every plain one, so a new filter does
+/// not compile until one side applies it.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
 /// for the tests and the pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
+    /// A filter `crate::filters` applies from the image
+    /// alone.
+    Plain(PlainFilter),
+    /// Overlay another image at (x, y) with an opacity (0-100).
+    /// The URL is the percent-decoded watermark location; the
+    /// server fetches it before the engine runs. Negative
+    /// coordinates anchor from the right/bottom edges.
+    Watermark {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+    },
+    /// Composite another image over the result with a blend
+    /// mode, at (x, y) with an opacity (0-100), optionally
+    /// scaled to `width` percent of the base image's width.
+    /// The URL is the percent-decoded overlay location; the
+    /// server fetches it before the engine runs, through the
+    /// same prefetch as watermarks. Negative coordinates
+    /// anchor from the right/bottom edges.
+    Overlay {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+        blend: BlendMode,
+        width: Option<u32>,
+    },
+    /// Remove the background with the server's segmentation
+    /// model, keeping the subject over transparency. The model
+    /// is operator-configured; the engine applies its mask.
+    RemoveBg,
+    /// Studio mode (issues #197 and #198): one filter
+    /// naming an outcome, expanded deterministically in the
+    /// engine and reported in meta. `product` composites
+    /// the subject the segmentation model finds onto a
+    /// backdrop with a synthesized contact shadow, scaled
+    /// and centered to a pad margin; `scene` keeps the
+    /// photograph's scene, reframing it on the detected
+    /// subject and applying a per-image light and color
+    /// correction.
+    Studio(StudioSpec),
+    /// Blur every detected face (privacy redaction), backed by
+    /// the server's face model.
+    BlurFaces,
+    /// Pixelate every detected face (privacy redaction),
+    /// backed by the server's face model.
+    PixelateFaces,
+    /// Blur every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    BlurClass(String),
+    /// Pixelate every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    PixelateClass(String),
+    /// Recolor every detected object of the named class to
+    /// the given RGB color (issue #175), backed by the
+    /// server's detection model. With a segment provider
+    /// configured the paint follows the object's
+    /// silhouette; without one it fills the box.
+    RecolorClass(String, [u8; 3]),
+    /// Padding for `crop:*:face`, as a fraction of the face
+    /// size added on every side. A request-wide directive,
+    /// like `no_upscale`.
+    FacePad(f32),
+    /// AI super-resolution by the given factor (2 or 4),
+    /// backed by the server's upscale model.
+    Upscale(u32),
+    /// Device-pixel-ratio directive: scale size and crop
+    /// targets by the factor (1, 1.5, 2, or 3) before the
+    /// no-upscale cap sees them.
+    Dpr(f32),
+    /// Rendered text overlaid at one of the nine grid anchors.
+    /// The text is the percent-decoded label; color is RGBA.
+    Text {
+        text: String,
+        size: u32,
+        color: [u8; 4],
+        anchor: Anchor,
+    },
+    /// Gaussian-blur the rectangle (x, y, w, h), in the
+    /// pixels of the image at the point the filter runs.
+    /// Redaction of plates, screens, documents.
+    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Pixelate the rectangle (x, y, w, h), same coordinate
+    /// convention as `BlurRegion`.
+    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Erase the rectangle (x, y, w, h) and inpaint it from
+    /// the surrounding pixels, same coordinate convention
+    /// and bounds discipline as `BlurRegion`. Backed by the
+    /// server's inpainting model (issue #176).
+    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
+}
+
+/// A filter that needs nothing but the image it is given
+/// (issue #741): a pixel filter, which `crate::filters`
+/// applies in URL order, or an encoding directive, which it
+/// records for the encoder. [`Filter::Plain`] carries it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlainFilter {
     /// Desaturate the image.
     Grayscale,
     /// Invert every channel.
@@ -866,87 +976,9 @@ pub enum Filter {
     /// counts, clamped by the engine so at least one pixel
     /// survives on each axis.
     TrimSides(u8, [u32; 4]),
-    /// Overlay another image at (x, y) with an opacity (0-100).
-    /// The URL is the percent-decoded watermark location; the
-    /// server fetches it before the engine runs. Negative
-    /// coordinates anchor from the right/bottom edges.
-    Watermark {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-    },
-    /// Composite another image over the result with a blend
-    /// mode, at (x, y) with an opacity (0-100), optionally
-    /// scaled to `width` percent of the base image's width.
-    /// The URL is the percent-decoded overlay location; the
-    /// server fetches it before the engine runs, through the
-    /// same prefetch as watermarks. Negative coordinates
-    /// anchor from the right/bottom edges.
-    Overlay {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-        blend: BlendMode,
-        width: Option<u32>,
-    },
-    /// Remove the background with the server's segmentation
-    /// model, keeping the subject over transparency. The model
-    /// is operator-configured; the engine applies its mask.
-    RemoveBg,
-    /// Studio mode (issues #197 and #198): one filter
-    /// naming an outcome, expanded deterministically in the
-    /// engine and reported in meta. `product` composites
-    /// the subject the segmentation model finds onto a
-    /// backdrop with a synthesized contact shadow, scaled
-    /// and centered to a pad margin; `scene` keeps the
-    /// photograph's scene, reframing it on the detected
-    /// subject and applying a per-image light and color
-    /// correction.
-    Studio(StudioSpec),
     /// Keep the source ICC profile instead of converting
     /// to sRGB (`filters:keep_profile`).
     KeepProfile,
-    /// Blur every detected face (privacy redaction), backed by
-    /// the server's face model.
-    BlurFaces,
-    /// Pixelate every detected face (privacy redaction),
-    /// backed by the server's face model.
-    PixelateFaces,
-    /// Blur every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    BlurClass(String),
-    /// Pixelate every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    PixelateClass(String),
-    /// Recolor every detected object of the named class to
-    /// the given RGB color (issue #175), backed by the
-    /// server's detection model. With a segment provider
-    /// configured the paint follows the object's
-    /// silhouette; without one it fills the box.
-    RecolorClass(String, [u8; 3]),
-    /// Padding for `crop:*:face`, as a fraction of the face
-    /// size added on every side. A request-wide directive,
-    /// like `no_upscale`.
-    FacePad(f32),
-    /// AI super-resolution by the given factor (2 or 4),
-    /// backed by the server's upscale model.
-    Upscale(u32),
-    /// Device-pixel-ratio directive: scale size and crop
-    /// targets by the factor (1, 1.5, 2, or 3) before the
-    /// no-upscale cap sees them.
-    Dpr(f32),
-    /// Rendered text overlaid at one of the nine grid anchors.
-    /// The text is the percent-decoded label; color is RGBA.
-    Text {
-        text: String,
-        size: u32,
-        color: [u8; 4],
-        anchor: Anchor,
-    },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Rounded corners: radii in pixels, CSS order (top-left,
@@ -972,18 +1004,6 @@ pub enum Filter {
     Pixelate(u32),
     /// Mirror the image, horizontally or vertically.
     Flip(FlipDirection),
-    /// Gaussian-blur the rectangle (x, y, w, h), in the
-    /// pixels of the image at the point the filter runs.
-    /// Redaction of plates, screens, documents.
-    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Pixelate the rectangle (x, y, w, h), same coordinate
-    /// convention as `BlurRegion`.
-    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Erase the rectangle (x, y, w, h) and inpaint it from
-    /// the surrounding pixels, same coordinate convention
-    /// and bounds discipline as `BlurRegion`. Backed by the
-    /// server's inpainting model (issue #176).
-    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -2359,16 +2379,16 @@ pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec
         matches!(
             op,
             Operation::Filters(filters)
-                if filters.iter().any(|f| matches!(f, Filter::MaxBytes(_)))
+                if filters.iter().any(|f| matches!(f, Filter::Plain(PlainFilter::MaxBytes(_))))
         )
     });
     let keep_default_filter = |f: &Filter| -> bool {
         match f {
-            Filter::Format(_) => directives.explicit_format.is_none(),
-            Filter::Quality(_) => !directives.quality_directive,
-            Filter::Fill(_) => directives.fill.is_none(),
+            Filter::Plain(PlainFilter::Format(_)) => directives.explicit_format.is_none(),
+            Filter::Plain(PlainFilter::Quality(_)) => !directives.quality_directive,
+            Filter::Plain(PlainFilter::Fill(_)) => directives.fill.is_none(),
             Filter::Dpr(_) => directives.dpr.is_none(),
-            Filter::MaxBytes(_) => !url_has_max_bytes,
+            Filter::Plain(PlainFilter::MaxBytes(_)) => !url_has_max_bytes,
             _ => true,
         }
     };
@@ -2574,6 +2594,14 @@ pub const MAX_EXPANDED_LEN: usize = 256 * 1024;
 pub struct RootRef {
     pub name: String,
     pub path: String,
+}
+
+impl RootRef {
+    /// The reference as the URL wrote it, `root:<name>/<path>`:
+    /// the source [`expand_source_root`] read it from.
+    pub fn written(&self) -> String {
+        format!("root:{}/{}", self.name, self.path)
+    }
 }
 
 /// Expand a `root:<name>/<path>` short source against the
@@ -2833,25 +2861,25 @@ impl RequestDirectives {
             if let Operation::Filters(filters) = op {
                 for f in filters {
                     match f {
-                        Filter::Format(spec) => {
+                        Filter::Plain(PlainFilter::Format(spec)) => {
                             d.explicit_format = Some(spec.format);
                             d.format_options = spec.options;
                         }
-                        Filter::NoUpscale => d.no_upscale = true,
-                        Filter::Fill(color) => d.fill = Some(*color),
+                        Filter::Plain(PlainFilter::NoUpscale) => d.no_upscale = true,
+                        Filter::Plain(PlainFilter::Fill(color)) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
                         Filter::Studio(_) => d.studio = true,
                         Filter::RemoveRegion { .. } => d.remove_region = true,
-                        Filter::Radius(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Radius(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("radius")
                         }
-                        Filter::Mask(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Mask(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("mask")
                         }
                         Filter::Upscale(_) => d.upscale = true,
                         Filter::Dpr(factor) => d.dpr = Some(*factor),
-                        Filter::KeepProfile => d.keep_profile = true,
-                        Filter::Quality(_) => d.quality_directive = true,
+                        Filter::Plain(PlainFilter::KeepProfile) => d.keep_profile = true,
+                        Filter::Plain(PlainFilter::Quality(_)) => d.quality_directive = true,
                         Filter::Text { .. } => d.text = true,
                         Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
                         Filter::BlurClass(name)
@@ -3264,6 +3292,15 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
     crabcrop_url::purge_signature(secret, target)
 }
 
+/// The expiring purge signature for a target path: HMAC of
+/// `exp:<expires>/<target>` under the derived purge key.
+/// Delegates to the crate helper; this mints, for operators
+/// and tests.
+#[allow(dead_code)]
+pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) -> String {
+    crabcrop_url::purge_signature_with_expiry(secret, target, expires)
+}
+
 /// Derive the purge-group signing key from the server
 /// secret. Purge-group signatures live in their own domain
 /// beside the purge domain (audit R2-14), under this
@@ -3282,6 +3319,57 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     crabcrop_url::purge_group_signature(secret, group)
 }
 
+/// The expiring purge-group signature for a cache group:
+/// HMAC of `exp:<expires>/<group>` under the derived
+/// purge-group key. Delegates to the crate helper.
+#[allow(dead_code)]
+pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u64) -> String {
+    crabcrop_url::purge_group_signature_with_expiry(secret, group, expires)
+}
+
+/// Split a purge or purge-group request remainder (what
+/// follows the signature segment) into its optional expiry
+/// and the target: the purge path, or the group name. The
+/// expiring form leads with an `exp:<unix-seconds>` segment,
+/// the upload endpoint's spelling (see
+/// [`split_upload_remainder`]), and only a leading segment
+/// is the purge's expiry.
+///
+/// An image remainder may carry `exp:` among its operations,
+/// so a plain purge minted over such a remainder can open
+/// with `exp:<n>/`. Its signature covers the same bytes as
+/// the expiring form of the rest, so it verifies either way,
+/// and it is read the one way every purge URL is: that
+/// segment is the purge's expiry. The purge evicts what it
+/// evicted before, because an image's `exp:` is not part of
+/// its cache key ([`canonical_key_form`] drops it), so the
+/// rest of the path names the same entries; from that
+/// second on it is refused as expired instead. A group
+/// name never begins with `exp:` (groups are preset names,
+/// `[A-Za-z0-9_-]`, and a name with a `/` was refused), so
+/// for the purge-group endpoint the spelling was free.
+///
+/// A sealed target signed under the key ID `exp` opens with
+/// `exp:s1.` ([`split_sealed_segment`]): that segment is the
+/// token, which the purge unseals, and never an expiry,
+/// whose seconds are digits. It stays in the target, so the
+/// plain purge URL of such a sealed URL evicts what it
+/// always did.
+///
+/// As for uploads, any other leading segment that starts
+/// with `exp:` but does not parse, or that nothing follows,
+/// is a grammar error (`invalid_expiry`), never part of the
+/// target. The signature covers the remainder exactly as
+/// presented, expiry included, so verification runs on the
+/// unsplit string.
+pub fn split_purge_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let first = rest.split_once('/').map_or(rest, |(first, _)| first);
+    if split_sealed_segment(first).is_some() {
+        return Ok((None, rest));
+    }
+    split_leading_expiry(rest)
+}
+
 /// Verify a purge signature. Purges are the server's only
 /// destructive operation, so they never honor `unsafe`
 /// (review Q3): an HMAC under the purge subkey is always
@@ -3290,7 +3378,11 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
 pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => crabcrop_url::verify(&purge_key(secret), hex_digest, target),
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(purge_key(secret)),
+            hex_digest,
+            target,
+        ),
     }
 }
 
@@ -3301,9 +3393,11 @@ pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool 
 pub fn verify_purge_group(secret: &[u8], signature: &Signature, group: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => {
-            crabcrop_url::verify(&purge_group_key(secret), hex_digest, group)
-        }
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(purge_group_key(secret)),
+            hex_digest,
+            group,
+        ),
     }
 }
 
@@ -3352,10 +3446,18 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
 /// expiry included, so verification runs on the unsplit
 /// string before this is called.
 pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
-    let Some((first, name)) = rest.split_once('/') else {
-        // No slash: the remainder is one segment. It is a
-        // name, unless it spells an expiry with no name
-        // after it, which is malformed.
+    split_leading_expiry(rest)
+}
+
+/// Split an optional leading `exp:<unix-seconds>` segment
+/// off a remainder, the expiring spelling the upload, purge
+/// and purge-group endpoints share. A remainder that does
+/// not open with `exp:` comes back whole.
+fn split_leading_expiry(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let Some((first, tail)) = rest.split_once('/') else {
+        // No slash: the remainder is one segment. It is
+        // what the endpoint names, unless it spells an
+        // expiry with nothing after it, which is malformed.
         if rest.starts_with("exp:") {
             return Err(ParseError::InvalidExpiry(rest.to_string()));
         }
@@ -3364,7 +3466,7 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
     let Some(ts) = first.strip_prefix("exp:") else {
         return Ok((None, rest));
     };
-    Ok((Some(parse_expiry(ts, first)?), name))
+    Ok((Some(parse_expiry(ts, first)?), tail))
 }
 
 /// Verify an upload signature. Like purges, uploads are
@@ -3374,7 +3476,11 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
 pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => crabcrop_url::verify(&upload_key(secret), hex_digest, name),
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(upload_key(secret)),
+            hex_digest,
+            name,
+        ),
     }
 }
 
@@ -3390,8 +3496,9 @@ pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
 /// from any other forgery attempt.
 ///
 /// Its `Debug` prints the key IDs and redacts the keys
-/// (issue #455). It is not `PartialEq`: nothing compares
-/// rings, and a derived comparison of key bytes would not be
+/// (issue #455), and the keys are zeroed when it is dropped.
+/// It is not `PartialEq`: nothing compares rings, and a
+/// derived comparison of key bytes would not be
 /// constant-time.
 #[derive(Clone)]
 pub struct Keyring {
@@ -3399,6 +3506,23 @@ pub struct Keyring {
     pub current: Vec<u8>,
     pub previous: Option<(String, Vec<u8>)>,
 }
+
+impl zeroize::Zeroize for Keyring {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.current);
+        if let Some((_, previous)) = &mut self.previous {
+            zeroize::Zeroize::zeroize(previous);
+        }
+    }
+}
+
+impl Drop for Keyring {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Keyring {}
 
 impl std::fmt::Debug for Keyring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

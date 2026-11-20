@@ -1236,8 +1236,9 @@ fn runtime_images_carry_no_curl() {
     );
 
     // The AI image keeps the base image's check. ONNX Runtime
-    // comes from a download stage that checks both hashes;
-    // the runtime stage copies the library and its notices.
+    // comes from a download stage that checks both hashes,
+    // the package's and the library's; the runtime stage
+    // copies the library and its notices.
     let ai = stages(&read("Dockerfile.ai"));
     let [download, runtime] = &ai[..] else {
         panic!("Dockerfile.ai: a download stage, then the runtime stage: {ai:#?}");
@@ -1250,7 +1251,7 @@ fn runtime_images_carry_no_curl() {
     assert_eq!(
         fetch.matches("sha256sum -c").count(),
         2,
-        "Dockerfile.ai: the tarball and the library are both checked: {fetch}"
+        "Dockerfile.ai: the package and the library are both checked: {fetch}"
     );
     assert!(
         runtime
@@ -1284,8 +1285,10 @@ fn images_carry_the_third_party_notices() {
     // code its binary contains, with crabcrop's own license,
     // where Debian keeps a package's. The AI image adds ONNX
     // Runtime's license and its own third-party notices,
-    // copied from the tarball its download stage checks, which
-    // THIRD-PARTY-NOTICES.md tells the reader to look for.
+    // extracted from the package its download stage checks
+    // (issue #733), which THIRD-PARTY-NOTICES.md tells the
+    // reader to look for, and the license texts of the
+    // models it adds (issue #702).
     const COPY: &str = "COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/crabcrop/";
     for rel in ["Dockerfile", "Dockerfile.release"] {
         let stage = final_stage(&read(rel));
@@ -1302,13 +1305,13 @@ fn images_carry_the_third_party_notices() {
         .iter()
         .find(|i| i.contains("curl -fsSL "))
         .expect("Dockerfile.ai: the download stage fetches ONNX Runtime");
-    for file in ["LICENSE", "ThirdPartyNotices.txt"] {
-        let copied = format!("-1.31.0/{file}\"");
-        assert!(
-            fetch.contains(&copied) && fetch.contains("/opt/onnxruntime-notices/;"),
-            "Dockerfile.ai: the download stage copies the tarball's {file} to /opt/onnxruntime-notices/: {fetch}"
-        );
-    }
+    assert!(
+        fetch.contains(
+            "unzip -q /tmp/ort.nupkg LICENSE ThirdPartyNotices.txt -d /opt/onnxruntime-notices;"
+        ),
+        "Dockerfile.ai: the download stage extracts the package's LICENSE and ThirdPartyNotices.txt to \
+         /opt/onnxruntime-notices: {fetch}"
+    );
     let notices = "/usr/share/doc/crabcrop/onnxruntime";
     assert!(
         runtime
@@ -1319,6 +1322,101 @@ fn images_carry_the_third_party_notices() {
     assert!(
         read("THIRD-PARTY-NOTICES.md").contains(&format!("`{notices}/ThirdPartyNotices.txt`")),
         "THIRD-PARTY-NOTICES.md: points the reader at ONNX Runtime's notices in the AI image"
+    );
+
+    // The models' license texts are committed in
+    // scripts/notices/models/, in a directory for each model
+    // the runtime stage adds, named after its file in /models,
+    // and the runtime stage installs them all.
+    // THIRD-PARTY-NOTICES.md names each model with the
+    // checksum its ADD pins, and each text by its path in the
+    // image. The notices template pins the same checksums, so
+    // a model replaced without its notice fails both this test
+    // and scripts/check_notices.py; one added without its
+    // texts, or texts left for a model the image dropped, fail
+    // this test.
+    let models = "/usr/share/doc/crabcrop/models";
+    assert!(
+        runtime
+            .iter()
+            .any(|i| i == &format!("COPY scripts/notices/models {models}")),
+        "Dockerfile.ai: the runtime stage installs the models' license texts at {models}: {runtime:#?}"
+    );
+    // The file wraps its prose: read line breaks as spaces.
+    let listed = read("THIRD-PARTY-NOTICES.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let texts = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/notices/models");
+    let mut added = Vec::new();
+    for add in runtime.iter().filter(|i| i.starts_with("ADD ")) {
+        let words: Vec<&str> = add.split_whitespace().collect();
+        let sha = words
+            .iter()
+            .find_map(|w| w.strip_prefix("--checksum=sha256:"))
+            .unwrap_or_else(|| panic!("Dockerfile.ai: an ADD with no SHA-256 pin: {add}"));
+        let path = words.last().expect("an ADD names its destination");
+        let name = path
+            .strip_prefix("/models/")
+            .and_then(|file| Path::new(file).file_stem())
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_else(|| {
+                panic!("Dockerfile.ai: an ADD that is not a model in /models: {add}")
+            });
+        let dir = texts.join(name);
+        assert!(
+            dir.is_dir() && !files_under(&dir).is_empty(),
+            "Dockerfile.ai adds {path}, and scripts/notices/models/{name}/ holds no license text for it"
+        );
+        assert!(
+            listed.contains(&format!("`{path}` (SHA-256 `{sha}`)")),
+            "THIRD-PARTY-NOTICES.md: names {path} with the SHA-256 Dockerfile.ai pins for it, {sha}"
+        );
+        added.push(name);
+    }
+    assert!(
+        !added.is_empty(),
+        "Dockerfile.ai: the runtime stage adds the models: {runtime:#?}"
+    );
+    for file in files_under(&texts) {
+        let rel = file.strip_prefix(&texts).unwrap().to_str().unwrap();
+        let model = rel.split('/').next().unwrap();
+        assert!(
+            added.contains(&model),
+            "scripts/notices/models/{rel}: Dockerfile.ai adds no model named {model} to /models"
+        );
+        assert!(
+            listed.contains(&format!("`{models}/{rel}`")),
+            "THIRD-PARTY-NOTICES.md: names {models}/{rel}, a license text the AI image carries"
+        );
+    }
+}
+
+#[test]
+fn the_ai_gate_runs_the_library_the_ai_image_ships() {
+    // The release waits for the real-model AI tests, which load
+    // the x64 ONNX Runtime library the AI workflow downloads and
+    // checks. That must be the library the amd64 AI image
+    // installs, byte for byte, whichever download each takes it
+    // from (issue #733): the gate's pin is the image's.
+    let ai = read("Dockerfile.ai");
+    let amd64 = ai
+        .split("amd64) ")
+        .nth(1)
+        .expect("Dockerfile.ai: the download stage has an amd64 case");
+    let pin = amd64
+        .split("so_sha=")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .expect("Dockerfile.ai: the amd64 case pins the library");
+    assert!(
+        pin.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Dockerfile.ai: the amd64 library pin is a SHA-256: {pin}"
+    );
+    let gate = read(".github/workflows/ai-models.yml");
+    assert!(
+        gate.contains(&format!("{pin}  libonnxruntime.so")),
+        ".github/workflows/ai-models.yml: checks libonnxruntime.so against Dockerfile.ai's amd64 pin {pin}"
     );
 }
 

@@ -22,7 +22,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ConnectionLimits, Frames, RequestsInFlight, Running, Sending, Watch, bind_listener,
+    ClientKey, ConnectionLimits, Frames, RequestsInFlight, Running, Sending, Watch, bind_listener,
     serve_connection, serve_connections,
 };
 use crate::test_support::Rng;
@@ -45,6 +45,7 @@ async fn start(
         header_timeout,
         idle_timeout,
         max_connections: 64,
+        per_client: None,
     };
     let served = tokio::spawn(serve_connections(
         listener,
@@ -482,6 +483,7 @@ fn a_request_counts_in_flight_until_its_body_is_sent_or_it_is_dropped() {
         header_timeout: Duration::from_secs(30),
         idle_timeout: Duration::from_secs(30),
         max_connections: 2,
+        per_client: None,
     };
     let one = Arc::new(Watch::new(limits, in_flight.clone()));
     let two = Arc::new(Watch::new(limits, in_flight.clone()));
@@ -574,6 +576,99 @@ async fn one_request(stream: &mut TcpStream) {
     let (head, body) = read_response(stream).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(body, "ok");
+}
+
+/// Connect to `addr` from the local address `from`, or
+/// `None` when this host cannot bind it.
+async fn connect_from(from: std::net::IpAddr, addr: SocketAddr) -> Option<TcpStream> {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(SocketAddr::new(from, 0)).ok()?;
+    Some(socket.connect(addr).await.unwrap())
+}
+
+#[tokio::test]
+async fn a_client_past_its_share_is_closed_and_other_clients_are_served() {
+    // With a share of 2, a client's third connection is
+    // closed unanswered while its first two stay open and
+    // keep being served; once it closes one, it may open
+    // another. Off by default (`start` passes none).
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let limits = ConnectionLimits {
+        header_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+        max_connections: 64,
+        per_client: Some(2),
+    };
+    tokio::spawn(serve_connections(
+        listener,
+        router(),
+        limits,
+        stop.clone(),
+        RequestsInFlight::default(),
+    ));
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    one_request(&mut first).await;
+    one_request(&mut second).await;
+    let mut third = TcpStream::connect(addr).await.unwrap();
+    let _ = third.write_all(GET_ROOT).await;
+    assert!(
+        closed_within(&mut third, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "the third connection was not closed"
+    );
+    one_request(&mut first).await;
+    one_request(&mut second).await;
+    // Another client is not held to the first one's share.
+    // All of 127/8 is the loopback on Linux; elsewhere only
+    // 127.0.0.1 may be configured, and this part is skipped.
+    let other = std::net::IpAddr::from([127, 0, 0, 2]);
+    if let Some(mut other) = connect_from(other, addr).await {
+        one_request(&mut other).await;
+    }
+    drop(first);
+    // The server sees the close once it reads the socket:
+    // retry until the freed place is taken.
+    let mut fourth = None;
+    for _ in 0..50 {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut answer = [0u8; 12];
+        if stream.write_all(GET_ROOT).await.is_ok() && stream.read_exact(&mut answer).await.is_ok()
+        {
+            assert_eq!(&answer, b"HTTP/1.1 200");
+            fourth = Some(stream);
+            break;
+        }
+        sleep(ms(20)).await;
+    }
+    assert!(fourth.is_some(), "the freed place was never given out");
+    stop.cancel();
+}
+
+#[test]
+fn a_client_is_an_ipv4_address_or_an_ipv6_slash_64() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    let mapped = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 7).to_ipv6_mapped());
+    assert_eq!(ClientKey::of(v4), ClientKey::of(mapped));
+    assert_ne!(
+        ClientKey::of(v4),
+        ClientKey::of(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)))
+    );
+    let host: Ipv6Addr = "2001:db8:1:2::1".parse().unwrap();
+    let same_net: Ipv6Addr = "2001:db8:1:2:ffff:ffff:ffff:fffe".parse().unwrap();
+    let next_net: Ipv6Addr = "2001:db8:1:3::1".parse().unwrap();
+    assert_eq!(
+        ClientKey::of(IpAddr::V6(host)),
+        ClientKey::of(IpAddr::V6(same_net))
+    );
+    assert_ne!(
+        ClientKey::of(IpAddr::V6(host)),
+        ClientKey::of(IpAddr::V6(next_net))
+    );
 }
 
 #[tokio::test]
@@ -804,6 +899,7 @@ async fn a_keep_alive_request_polls_its_connection_once() {
         header_timeout: Duration::from_secs(30),
         idle_timeout: Duration::from_secs(30),
         max_connections: 1,
+        per_client: None,
     };
     let slot = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
     let polls = Arc::new(AtomicUsize::new(0));
@@ -949,6 +1045,7 @@ impl Driven {
                 header_timeout,
                 idle_timeout,
                 max_connections: 1,
+                per_client: None,
             },
             RequestsInFlight::default(),
         ));

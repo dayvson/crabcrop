@@ -198,7 +198,8 @@ impl std::error::Error for ConfigError {
 }
 
 /// A secret setting's value. `Debug` prints `[redacted]`
-/// (issue #455).
+/// (issue #455), and its bytes are zeroed when it is
+/// dropped.
 #[derive(Clone)]
 pub struct Secret(String);
 
@@ -207,6 +208,20 @@ impl Secret {
         &self.0
     }
 }
+
+impl zeroize::Zeroize for Secret {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Secret {}
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -277,6 +292,10 @@ pub struct Config {
     pub fallback_image: Option<String>,
     pub video: VideoConfig,
     pub pdf: PdfConfig,
+    /// The SVG worker's address-space cap, in bytes
+    /// (`CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB`, issue
+    /// #738). AVIF decodes run in the same worker.
+    pub svg_worker_address_space: u64,
     pub provenance: Option<ProvenanceConfig>,
     /// Meta mode (issue #453).
     pub meta_enabled: bool,
@@ -290,6 +309,9 @@ pub struct Config {
     /// (`CRABCROP_LOG_SYNC`, issue #642), instead of by the
     /// request log's writer thread.
     pub log_sync: bool,
+    /// Whether the purge endpoints refuse a URL that carries
+    /// no expiry (`CRABCROP_PURGE_REQUIRE_EXPIRY`).
+    pub purge_require_expiry: bool,
 }
 
 /// Disk result storage: `CRABCROP_RESULT_STORAGE_DIR`, with
@@ -357,7 +379,7 @@ impl Config {
         }
         let metrics_token = metrics_token_config(&get)?;
         if let Some(warning) = metrics_token.as_ref().and_then(metrics_token_warning) {
-            eprintln!("warning: {warning}");
+            stderr_line!("warning: {warning}");
         }
         let process_timeout_secs: u64 = parse_env_value(
             "CRABCROP_PROCESS_TIMEOUT_SECS",
@@ -448,7 +470,7 @@ impl Config {
         })?;
         let policy = build_source_policy(&get)?;
         if let Some(warning) = proxy_bypass_warning(&get, &policy) {
-            eprintln!("warning: {warning}");
+            stderr_line!("warning: {warning}");
         }
         let mut sources = build_source_config(&get)?;
         // The upload destination (issue #168), resolved after
@@ -555,11 +577,19 @@ impl Config {
         let fallback_image = get("CRABCROP_FALLBACK_IMAGE").filter(|v| !v.is_empty());
         let video = video_config(&get)?;
         let pdf = pdf_config(&get)?;
+        let svg_worker_address_space = address_space_cap(
+            &get,
+            "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB",
+            "SVG worker",
+            crate::svg::DEFAULT_WORKER_ADDRESS_SPACE,
+            crate::svg::MIN_WORKER_ADDRESS_SPACE,
+        )?;
         let provenance = provenance_config(&get)?;
         let meta_enabled = meta_mode_config(&get)?;
         let client_hints = client_hints_config(&get)?;
         let explain_enabled = explain_config(&get)?;
         let log_sync = log_sync_config(&get)?;
+        let purge_require_expiry = purge_require_expiry_config(&get)?;
         Ok(Config {
             keyring,
             allow_unsafe,
@@ -597,11 +627,13 @@ impl Config {
             fallback_image,
             video,
             pdf,
+            svg_worker_address_space,
             provenance,
             meta_enabled,
             client_hints,
             explain_enabled,
             log_sync,
+            purge_require_expiry,
         })
     }
 }
@@ -610,7 +642,9 @@ impl Config {
     /// The boot line that names the request and source
     /// posture (issue #590): the request mode, the source
     /// allowlist's host count, and the private-address
-    /// check.
+    /// check, including whether listed hosts are exempt from
+    /// it (the default) or held to it
+    /// (`CRABCROP_CHECK_ALLOWED_SOURCES`).
     pub fn posture_line(&self) -> String {
         let mode = match (self.allow_unsafe, self.only_presets) {
             (false, false) => "signed",
@@ -623,10 +657,16 @@ impl Config {
             1 => "1 host".to_string(),
             n => format!("{n} hosts"),
         };
-        let check = if self.policy.block_private {
-            "on"
-        } else {
-            "off"
+        let listed = !self.policy.allowed_suffixes.is_empty();
+        let check = match (
+            self.policy.block_private,
+            listed,
+            self.policy.check_allowlisted,
+        ) {
+            (false, _, _) => "off",
+            (true, false, _) => "on",
+            (true, true, false) => "on, allowlisted hosts exempt",
+            (true, true, true) => "on, allowlisted hosts included",
         };
         format!(
             "request mode: {mode}; source allowlist: {allowlist}; private-address check: {check}"
@@ -638,8 +678,12 @@ impl Config {
     /// default comes from the open-file limit, so the line
     /// says what it came to.
     pub fn connections_line(&self) -> String {
+        let per_client = match self.connections.per_client {
+            Some(share) => format!(", at most {share} per client"),
+            None => String::new(),
+        };
         format!(
-            "connections: bind {}, at most {} open, header timeout {}s, idle timeout {}s",
+            "connections: bind {}, at most {} open{per_client}, header timeout {}s, idle timeout {}s",
             self.bind,
             self.connections.max_connections,
             self.connections.header_timeout.as_secs(),
@@ -898,7 +942,9 @@ pub fn check_bucket_policy(
 /// `CRABCROP_ALLOW_ANY_SOURCE` is the deliberate full
 /// opt-out: it switches the private-address check off
 /// entirely. A configured allowlist still applies either
-/// way.
+/// way. `CRABCROP_CHECK_ALLOWED_SOURCES` applies the check
+/// to allowlisted hosts too, which asks for a check the
+/// other two switch off, so it is refused with either.
 ///
 /// A set allowlist must name at least one host (issue
 /// #590). A value that normalizes to no entries (empty,
@@ -924,7 +970,27 @@ pub fn build_source_policy(
         get("CRABCROP_ALLOW_ANY_SOURCE"),
         false,
     )?;
-    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any);
+    let check_allowlisted = parse_bool_value(
+        "CRABCROP_CHECK_ALLOWED_SOURCES",
+        get("CRABCROP_CHECK_ALLOWED_SOURCES"),
+        false,
+    )?;
+    if check_allowlisted && (!block_private || allow_any) {
+        let off = if allow_any {
+            "CRABCROP_ALLOW_ANY_SOURCE"
+        } else {
+            "CRABCROP_BLOCK_PRIVATE_SOURCES"
+        };
+        return Err(ConfigError::conflict(
+            &["CRABCROP_CHECK_ALLOWED_SOURCES", off],
+            format!(
+                "CRABCROP_CHECK_ALLOWED_SOURCES applies the private-address check to \
+                 allowlisted hosts, but {off} switches the check off: set one of them"
+            ),
+        ));
+    }
+    let policy = SourcePolicy::new(allowed_sources, block_private && !allow_any)
+        .with_allowlisted_checked(check_allowlisted);
     if let Some(raw) = &raw
         && policy.allowed_suffixes.is_empty()
     {
@@ -1006,9 +1072,54 @@ pub fn build_source_config(
             )),
         }
     };
-    sources.aws_creds = cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?;
-    if let Some(creds) = &mut sources.aws_creds {
-        creds.session_token = nonempty("AWS_SESSION_TOKEN");
+    sources.aws_creds =
+        cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?.map(|mut creds| {
+            creds.session_token = nonempty("AWS_SESSION_TOKEN");
+            creds.into()
+        });
+    // With no static keys, the container credentials endpoint
+    // ECS and EKS Pod Identity serve, refreshed before each
+    // expiry (issue #709). The static keys, when set, are used
+    // exactly as before and the endpoint is never asked.
+    // CRABCROP_S3_CONTAINER_CREDENTIALS=off keeps a task's role
+    // out of every request, for a store that allows anonymous
+    // access: ECS sets the endpoint variable for every task with
+    // a role, over any value the task definition gives it.
+    let container_credentials = parse_bool_value(
+        "CRABCROP_S3_CONTAINER_CREDENTIALS",
+        get("CRABCROP_S3_CONTAINER_CREDENTIALS"),
+        true,
+    )?;
+    if sources.aws_creds.is_none()
+        && container_credentials
+        && let Some(endpoint) =
+            crate::credentials::container_endpoint(&get).map_err(|(var, reason)| {
+                // The token is a credential, ECS's relative URI
+                // names the task's credentials, and a full URI
+                // can carry a user and password: a refused one
+                // keeps only the fact that it was set, as a
+                // store endpoint with an `@` does. No message
+                // quotes the value.
+                let value = get(var).unwrap_or_default();
+                match var {
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI" if !value.contains('@') => {
+                        ConfigError::invalid(var, &value, reason)
+                    }
+                    _ => ConfigError::invalid_redacted(var, reason),
+                }
+            })?
+    {
+        let var = endpoint.var;
+        let creds = crate::credentials::AwsCredentials::container(endpoint).map_err(|e| {
+            ConfigError::build(
+                Some(var),
+                format!(
+                    "cannot build the container credentials client: {}",
+                    with_causes(&e)
+                ),
+            )
+        })?;
+        sources.aws_creds = Some(creds);
     }
     if let Some(endpoint) = nonempty("CRABCROP_GCS_ENDPOINT") {
         sources.gcs_endpoint = store_endpoint("CRABCROP_GCS_ENDPOINT", &endpoint)?;
@@ -1025,8 +1136,16 @@ pub fn build_source_config(
                 .collect()
         })
         .unwrap_or_default();
+    // Container credentials do not count: the platform sets
+    // their endpoint for every task or pod with a role, so a
+    // deployment that boots today keeps booting. An empty
+    // bucket allowlist still refuses every bucket fetch.
     check_bucket_policy(
-        sources.aws_creds.is_some() || sources.gcs_creds.is_some(),
+        sources
+            .aws_creds
+            .as_ref()
+            .is_some_and(|creds| !creds.is_container())
+            || sources.gcs_creds.is_some(),
         &sources.allowed_buckets,
     )?;
     // A configured store endpoint is where every bucket
@@ -1417,9 +1536,11 @@ const MAX_CONNECTIONS_LIMIT: usize = 1_000_000;
 /// (issue #607): `CRABCROP_HEADER_TIMEOUT_SECS`, 1 to 600
 /// like the other wall-clock limits;
 /// `CRABCROP_IDLE_TIMEOUT_SECS`, 1 to 86400, since an edge
-/// may pool connections for longer than 10 minutes; and
+/// may pool connections for longer than 10 minutes;
 /// `CRABCROP_MAX_CONNECTIONS`, 1 to a million, by default
-/// three quarters of the open-file limit.
+/// three quarters of the open-file limit; and
+/// `CRABCROP_MAX_CONNECTIONS_PER_CLIENT`, how many of those
+/// one client may hold, 0 (the default) for no share.
 pub fn connection_limits(
     get: &impl Fn(&str) -> Option<String>,
 ) -> Result<crate::server::ConnectionLimits, ConfigError> {
@@ -1461,10 +1582,25 @@ pub fn connection_limits(
             ),
         ));
     }
+    let per_client: usize = parse_env_value(
+        "CRABCROP_MAX_CONNECTIONS_PER_CLIENT",
+        get("CRABCROP_MAX_CONNECTIONS_PER_CLIENT"),
+        0,
+    )?;
+    if per_client > MAX_CONNECTIONS_LIMIT {
+        return Err(ConfigError::invalid(
+            "CRABCROP_MAX_CONNECTIONS_PER_CLIENT",
+            &get("CRABCROP_MAX_CONNECTIONS_PER_CLIENT").unwrap_or_default(),
+            format!(
+                "CRABCROP_MAX_CONNECTIONS_PER_CLIENT must be between 0 and {MAX_CONNECTIONS_LIMIT}, got {per_client}"
+            ),
+        ));
+    }
     Ok(crate::server::ConnectionLimits {
         header_timeout: std::time::Duration::from_secs(header),
         idle_timeout: std::time::Duration::from_secs(idle),
         max_connections,
+        per_client: (per_client > 0).then_some(per_client),
     })
 }
 
@@ -1512,6 +1648,20 @@ pub fn proxy_bypass_warning(
     if !policy.pins_hostnames() {
         return None;
     }
+    let (why, fix) = if policy.allowed_suffixes.is_empty() {
+        (
+            "with private-address blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no \
+             CRABCROP_ALLOWED_SOURCES,",
+            "List the source hosts in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy",
+        )
+    } else {
+        (
+            "with CRABCROP_CHECK_ALLOWED_SOURCES on, the private-address check covers the \
+             allowlisted hosts too, and",
+            "Turn CRABCROP_CHECK_ALLOWED_SOURCES off to fetch the allowlisted hosts through \
+             the proxy",
+        )
+    };
     let set: Vec<&str> = PROXY_VARIABLES
         .iter()
         .filter_map(|pair| {
@@ -1525,12 +1675,9 @@ pub fn proxy_bypass_warning(
         return None;
     }
     Some(format!(
-        "a proxy is configured ({}), but source fetches bypass it: with private-address \
-         blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no CRABCROP_ALLOWED_SOURCES, \
-         each source host is pinned to the address the check validated and connected to \
-         directly, so under proxy-only egress those fetches fail. List the source hosts \
-         in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy \
-         (see docs/configuration.md)",
+        "a proxy is configured ({}), but source fetches bypass it: {why} each source host \
+         is pinned to the address the check validated and connected to directly, so under \
+         proxy-only egress those fetches fail. {fix} (see docs/configuration.md)",
         set.join(", ")
     ))
 }
@@ -1900,6 +2047,24 @@ pub fn log_sync_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, Con
     parse_bool_value("CRABCROP_LOG_SYNC", get("CRABCROP_LOG_SYNC"), false)
 }
 
+/// Whether the purge and purge-group endpoints refuse a URL
+/// that carries no expiry: `CRABCROP_PURGE_REQUIRE_EXPIRY`,
+/// off by default, so the purge URLs a deployment already
+/// holds keep working. On, only the expiring form
+/// (`/purge/<signature>/exp:<unix-seconds>/<path>`) purges,
+/// for an operator who mints only expiring purge URLs: one
+/// without an expiry answers `403 expiry_required`, so every
+/// purge URL the server takes stops working at its expiry.
+pub fn purge_require_expiry_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    parse_bool_value(
+        "CRABCROP_PURGE_REQUIRE_EXPIRY",
+        get("CRABCROP_PURGE_REQUIRE_EXPIRY"),
+        false,
+    )
+}
+
 /// The AI settings: every model path, checked for
 /// completeness and with its options parsed, so a provider
 /// that `build_state` loads fails only on its files. Every
@@ -1944,9 +2109,10 @@ pub enum ModerationConfig {
         labels: Option<String>,
     },
     /// No model: the labels file holds zero-shot prompts for
-    /// the CLIP fallback, which loads the CLIP set again
-    /// with these labels.
-    ClipPrompts { labels: String, clip: ClipConfig },
+    /// the CLIP fallback, which scores them over the CLIP set
+    /// the tagger loads (issue #736), so the set must be
+    /// configured.
+    ClipPrompts { labels: String },
 }
 
 /// The OCR pipeline (issue #177): detection and recognition
@@ -2006,10 +2172,7 @@ pub fn ai_config(get: impl Fn(&str) -> Option<String>) -> Result<AiConfig, Confi
         // Labels without a model are zero-shot prompts for
         // the CLIP fallback, which needs the CLIP set.
         (None, Some(labels)) => match &clip {
-            Some(clip) => Some(ModerationConfig::ClipPrompts {
-                labels,
-                clip: clip.clone(),
-            }),
+            Some(_) => Some(ModerationConfig::ClipPrompts { labels }),
             None => {
                 return Err(ConfigError::conflict(
                     &["CRABCROP_MODERATION_LABELS", "CRABCROP_MODERATION_MODEL"],
@@ -2368,15 +2531,20 @@ pub fn parse_detector_declarations(text: &str) -> Result<Vec<DetectorDeclaration
 }
 
 /// The video tools' settings: the shared wall-clock limit
-/// (issue #214), the encoder's output cap, and the encoder
-/// (issue #162) and frame extractor programs. The bounds
-/// parse whether or not a tool is configured: a typo'd
-/// bound is a boot error even before the tool is set.
+/// (issue #214), the encoder's output cap, each tool's
+/// address-space cap (issue #738), and the encoder (issue
+/// #162) and frame extractor programs. The bounds parse
+/// whether or not a tool is configured: a typo'd bound is a
+/// boot error even before the tool is set.
 #[derive(Debug)]
 pub struct VideoConfig {
     pub timeout_secs: u64,
     pub max_mb: usize,
     pub max_bytes: usize,
+    /// The encoder's address-space cap, in bytes.
+    pub encoder_address_space: u64,
+    /// The frame extractor's address-space cap, in bytes.
+    pub decoder_address_space: u64,
     pub encoder: Option<String>,
     pub decoder: Option<String>,
 }
@@ -2402,10 +2570,26 @@ pub fn video_config(get: impl Fn(&str) -> Option<String>) -> Result<VideoConfig,
             "CRABCROP_VIDEO_MAX_MB is too large",
         )
     })?;
+    let encoder_address_space = address_space_cap(
+        &get,
+        "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB",
+        "video encoder",
+        crate::video::DEFAULT_ENCODER_ADDRESS_SPACE,
+        crate::video::MIN_ENCODER_ADDRESS_SPACE,
+    )?;
+    let decoder_address_space = address_space_cap(
+        &get,
+        "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB",
+        "video decoder",
+        crate::frames::DEFAULT_DECODER_ADDRESS_SPACE,
+        crate::frames::MIN_DECODER_ADDRESS_SPACE,
+    )?;
     Ok(VideoConfig {
         timeout_secs,
         max_mb,
         max_bytes,
+        encoder_address_space,
+        decoder_address_space,
         encoder: get("CRABCROP_VIDEO_ENCODER").filter(|v| !v.is_empty()),
         decoder: get("CRABCROP_VIDEO_DECODER").filter(|v| !v.is_empty()),
     })
@@ -2432,13 +2616,17 @@ fn video_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Conf
 }
 
 /// The PDF renderer's settings (issue #215): its program,
-/// and its own wall-clock limit rather than the video
-/// tools', because a page render's cost profile differs
-/// from a frame extraction's. The limit parses even when
-/// no renderer is configured, like the video bounds.
+/// its own wall-clock limit rather than the video tools',
+/// because a page render's cost profile differs from a frame
+/// extraction's, and the address-space cap of both its tools
+/// (issue #738). The bounds parse even when no renderer is
+/// configured, like the video bounds.
 #[derive(Debug)]
 pub struct PdfConfig {
     pub timeout_secs: u64,
+    /// The renderer's and the probe's address-space cap, in
+    /// bytes.
+    pub renderer_address_space: u64,
     pub renderer: Option<String>,
 }
 
@@ -2455,10 +2643,56 @@ pub fn pdf_config(get: impl Fn(&str) -> Option<String>) -> Result<PdfConfig, Con
             format!("CRABCROP_PDF_TIMEOUT_SECS must be between 1 and 600, got {timeout_secs}"),
         ));
     }
+    let renderer_address_space = address_space_cap(
+        &get,
+        "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB",
+        "PDF renderer",
+        crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE,
+        crate::pdf::MIN_RENDERER_ADDRESS_SPACE,
+    )?;
     Ok(PdfConfig {
         timeout_secs,
+        renderer_address_space,
         renderer: get("CRABCROP_PDF_RENDERER").filter(|v| !v.is_empty()),
     })
+}
+
+/// The most a tool's address-space cap may be set to, in
+/// megabytes: 64 GiB, the most the source buffer budget may
+/// be. A cap that large bounds nothing these tools do, and
+/// a value past it is more likely a cap written in bytes or
+/// kilobytes than one meant.
+const MAX_ADDRESS_SPACE_MB: u64 = 65_536;
+
+/// One tool's address-space cap, in bytes (issue #738):
+/// `var`, in megabytes, from the least the tool needs to
+/// start (`min`, in bytes) to [`MAX_ADDRESS_SPACE_MB`], or
+/// `default` (in bytes) when it is unset. A value under the
+/// least stops the boot, naming the variable: the `tool`
+/// would fail every run. The caps are not derived from the
+/// container's memory limit: an address-space cap is not a
+/// limit on resident memory.
+fn address_space_cap(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    tool: &str,
+    default: u64,
+    min: u64,
+) -> Result<u64, ConfigError> {
+    const MB: u64 = 1024 * 1024;
+    let mb: u64 = parse_env_value(var, get(var), default / MB)?;
+    let min_mb = min / MB;
+    if !(min_mb..=MAX_ADDRESS_SPACE_MB).contains(&mb) {
+        return Err(ConfigError::invalid(
+            var,
+            &get(var).unwrap_or_default(),
+            format!(
+                "{var} must be between {min_mb} (what the {tool} needs to start) and \
+                 {MAX_ADDRESS_SPACE_MB}, got {mb}"
+            ),
+        ));
+    }
+    Ok(mb * MB)
 }
 
 /// The C2PA signing identity (issue #173): a PEM

@@ -1079,7 +1079,9 @@ fn a_proportional_side_and_the_cap_come_from_the_declared_size() {
                 flip_horizontal: false,
                 flip_vertical: false,
             }),
-            Operation::Filters(vec![crate::url::Filter::NoUpscale]),
+            Operation::Filters(vec![crate::url::Filter::Plain(
+                crate::url::PlainFilter::NoUpscale,
+            )]),
         ];
         ops.extend(ops_of("filters:grayscale"));
         ops

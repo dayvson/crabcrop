@@ -677,7 +677,8 @@ pub struct DiskStore {
     /// secret (issue #190): entries are written and
     /// verified under it, so an entry planted in the
     /// directory by anyone without the secret is a miss.
-    entry_key: Vec<u8>,
+    /// Zeroed when the store is dropped.
+    entry_key: zeroize::Zeroizing<Vec<u8>>,
     inner: Mutex<Inner>,
     /// Write failures, counted and logged as they happen
     /// (issue #367): a cache stays best-effort, but a tier
@@ -708,6 +709,15 @@ pub struct DiskStore {
     /// How far the directory check and the boot scan have come
     /// (issue #708).
     boot: BootScan,
+    /// Deletes of entry files that failed (issue #709): an
+    /// evicted entry's, a doomed write's, a corrupt one's, and
+    /// the boot scan's (issue #708). Each also counts in
+    /// `errors`.
+    unlinks_failed: AtomicU64,
+    /// Rate-limits the inline ones' log lines: a disk that
+    /// refuses deletes refuses one per eviction. The boot scan
+    /// logs its own in `boot`.
+    unlink_log: StallLog,
     /// Test-only: run at every entry read (after the bytes are
     /// in, as a read stuck in the kernel has its file open),
     /// write and delete, the boot scan's and the directory
@@ -763,7 +773,8 @@ pub struct ScanReport {
     /// stale copies of keys written since the boot.
     pub deleted: u64,
     /// The entry files it could not delete. Each also counts
-    /// in the tier's errors.
+    /// in the tier's errors and in
+    /// [`DiskStore::unlinks_failed`].
     pub undeleted: u64,
 }
 
@@ -959,10 +970,10 @@ fn read_open_capped(mut file: std::fs::File, len: u64, cap: usize) -> Option<Vec
 /// does not follow a symlink either: the check would then
 /// see the target, and the boot scan skips symlinks.
 ///
-/// `file://` sources open their canonical path through this
-/// too (issue #708): that path names no symlink, so refusing
-/// one refuses only a link swapped in after the path was
-/// resolved.
+/// `file://` sources open their file with [`open_regular_at`]
+/// (issue #708), relative to the directory that holds it,
+/// which the loader reaches from the file root a component at
+/// a time (see `load_file` in `loader.rs`).
 ///
 /// Returns the file with the metadata that check read. An
 /// error is the open's own, `NotFound` for a path with nothing
@@ -970,8 +981,21 @@ fn read_open_capped(mut file: std::fs::File, len: u64, cap: usize) -> Option<Vec
 /// a regular file.
 #[cfg(unix)]
 pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    open_regular_at(rustix::fs::CWD, path)
+}
+
+/// [`open_regular`] for `path` relative to the open directory
+/// `dir`, with the same flags and the same check: the open
+/// does not wait for a FIFO's writer, does not follow a
+/// symlink, and what it opened must be a regular file.
+#[cfg(unix)]
+pub(crate) fn open_regular_at(
+    dir: impl std::os::fd::AsFd,
+    path: impl rustix::path::Arg,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
+    let fd = rustix::fs::openat(
+        dir,
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
@@ -1093,7 +1117,7 @@ impl DiskStore {
         Self {
             dir: dir.to_path_buf(),
             max_bytes,
-            entry_key,
+            entry_key: zeroize::Zeroizing::new(entry_key),
             inner: Mutex::new(Inner::new()),
             errors: std::sync::atomic::AtomicU64::new(0),
             permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
@@ -1113,6 +1137,8 @@ impl DiskStore {
                 changed: Condvar::new(),
                 stop: AtomicBool::new(false),
             },
+            unlinks_failed: AtomicU64::new(0),
+            unlink_log: StallLog::new("entry file deletes failed"),
             #[cfg(test)]
             hold: Mutex::new(None),
         }
@@ -1273,7 +1299,7 @@ impl DiskStore {
     fn note_error(&self, what: &str, e: &std::io::Error) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("result storage: {what}: {e}");
+        stderr_line!("result storage: {what}: {e}");
     }
 
     /// Count and log one failed run of a background job. It
@@ -1283,7 +1309,7 @@ impl DiskStore {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(line) = self.job_log.note(monotonic_ms(), &format!("{what}: {e}")) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -1294,7 +1320,7 @@ impl DiskStore {
     pub(crate) fn note_task_failure(&self, what: &str) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("result storage: disk task failed: {what}");
+        stderr_line!("result storage: disk task failed: {what}");
     }
 
     /// Whether the index holds `key`, without touching
@@ -1316,7 +1342,7 @@ impl DiskStore {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(line) = self.stall_log.note(monotonic_ms(), stall.what()) {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -1439,7 +1465,7 @@ impl DiskStore {
             // file is left in place, since the store did not
             // make it, and logged so the operator sees it.
             if !meta.is_file() {
-                eprintln!(
+                stderr_line!(
                     "result storage: skipping {}: not a regular file",
                     path.display()
                 );
@@ -1685,8 +1711,10 @@ impl DiskStore {
     /// the reason `why`, under the claim or the stem the caller
     /// holds. The scan deleted silently (issue #708): every file
     /// it deletes now counts in its report, and every one it
-    /// cannot delete counts in the tier's errors as well. It
-    /// stays on disk, out of the index, until the next boot.
+    /// cannot delete counts in the tier's errors as well, and
+    /// with the inline deletes that fail (issue #709) in
+    /// `crabcrop_cache_disk_unlinks_failed_total`. It stays on
+    /// disk, out of the index, until the next boot.
     /// Both are logged, each kind the first at once and then at
     /// most one line every 10 seconds with a count of the rest.
     /// A file already gone is neither.
@@ -1705,6 +1733,7 @@ impl DiskStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 self.boot.undeleted.fetch_add(1, Ordering::Relaxed);
+                self.unlinks_failed.fetch_add(1, Ordering::Relaxed);
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 self.boot.undeleted_log.note(
                     monotonic_ms(),
@@ -1716,7 +1745,7 @@ impl DiskStore {
             }
         };
         if let Some(line) = line {
-            eprintln!("{line}");
+            stderr_line!("{line}");
         }
     }
 
@@ -1874,6 +1903,19 @@ impl DiskStore {
         match learned {
             Learned::Indexed { grew, groups, .. } => Some(HitLearn { grew, owed, groups }),
             _ => None,
+        }
+    }
+
+    /// Record that the bucket copy of `key` lacks groups copy
+    /// `id`'s record holds (issue #709): a write-back that was
+    /// to carry them was skipped, so the next disk hit sends
+    /// them again. No-op when the record is gone or replaced.
+    pub fn owe_shared(&self, key: &str, id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(record) = inner.entries.get_mut(key)
+            && record.id == id
+        {
+            record.owes_shared = true;
         }
     }
 
@@ -2492,11 +2534,37 @@ impl DiskStore {
 
     /// Delete an entry file under the claim the caller holds,
     /// best-effort: a file left behind by a failure is one the
-    /// next boot indexes again or deletes as corrupt.
+    /// next boot indexes again or deletes as corrupt. A failure
+    /// is no longer silent (issue #709): it counts in
+    /// `crabcrop_cache_disk_unlinks_failed_total` and the
+    /// tier's errors, and is logged, the first at once and then
+    /// at most one line every 10 seconds. A file already gone
+    /// is no failure.
     fn unlink(&self, path: &Path) {
-        let _ = self
+        match self
             .held(OpKind::Unlink, path)
-            .and_then(|()| std::fs::remove_file(path));
+            .and_then(|()| std::fs::remove_file(path))
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                self.unlinks_failed.fetch_add(1, Ordering::Relaxed);
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                let line = format!(
+                    "cannot delete a cache entry file; it stays on disk, out of the index, until the next boot finds it: {e}"
+                );
+                if let Some(line) = self.unlink_log.note_now(&line) {
+                    stderr_line!("{line}");
+                }
+            }
+        }
+    }
+
+    /// Deletes of entry files that failed so far, inline (issue
+    /// #709) or the boot scan's (issue #708), surfaced on
+    /// /metrics as `crabcrop_cache_disk_unlinks_failed_total`.
+    pub fn unlinks_failed(&self) -> u64 {
+        self.unlinks_failed.load(Ordering::Relaxed)
     }
 
     /// Run every queued job now, on this thread, retry times
@@ -2850,6 +2918,9 @@ fn learn_locked(inner: &mut Inner, key: &str, groups: &[String], bucket: Bucket<
                 inner.order.insert(stamp, key);
             }
         }
+        if matches!(bucket, Bucket::Lacks) {
+            record.owes_shared = true;
+        }
         if let Bucket::Carries(carried) = bucket
             && record.groups.iter().all(|g| carried.contains(g))
         {
@@ -3101,6 +3172,10 @@ pub enum Bucket<'a> {
     /// slot (issue #463): groups the record learns now are
     /// owed to the bucket.
     Skipped,
+    /// A group write-back was skipped past the waiting cap
+    /// (issue #709): the bucket copy lacks groups the record
+    /// holds, grown now or not, so the record owes them.
+    Lacks,
     /// Nothing is known: the debt stays as it is.
     Unknown,
 }
@@ -3265,8 +3340,9 @@ impl Stall {
     }
 }
 
-/// A rate-limited log of one kind of disk trouble: disk waits
-/// that ran out, or background jobs that failed. The first
+/// A rate-limited log of one kind of tier trouble: disk waits
+/// that ran out, background jobs or inline deletes that
+/// failed, or (issue #709) bucket requests refused. The first
 /// line comes at once, then at most one every
 /// [`STALL_LOG_EVERY_MS`], with how many were left out since
 /// the last one. Its times are [`monotonic_ms`]: on the wall
@@ -3276,17 +3352,31 @@ impl Stall {
 pub(crate) struct StallLog {
     next_line_ms: AtomicU64,
     since: AtomicU64,
+    /// The tier the lines speak for, at their start.
+    tier: &'static str,
     /// What the left-out ones are, after their count.
     rest: &'static str,
 }
 
 impl StallLog {
+    /// A log of the disk tier's, `result storage:` lines.
     pub(crate) fn new(rest: &'static str) -> Self {
+        Self::for_tier("result storage", rest)
+    }
+
+    /// A log whose lines start with `tier`.
+    pub(crate) fn for_tier(tier: &'static str, rest: &'static str) -> Self {
         StallLog {
             next_line_ms: AtomicU64::new(0),
             since: AtomicU64::new(0),
+            tier,
             rest,
         }
+    }
+
+    /// [`StallLog::note`] at the time now.
+    pub(crate) fn note_now(&self, what: &str) -> Option<String> {
+        self.note(monotonic_ms(), what)
     }
 
     /// Count one stall at `now_ms`, and return the line to
@@ -3308,10 +3398,10 @@ impl StallLog {
             return None;
         }
         Some(match self.since.swap(0, Ordering::Relaxed) {
-            0 => format!("result storage: {what}"),
+            0 => format!("{}: {what}", self.tier),
             more => format!(
-                "result storage: {what}; {more} more {} since the last line",
-                self.rest
+                "{}: {what}; {more} more {} since the last line",
+                self.tier, self.rest
             ),
         })
     }
@@ -3744,9 +3834,10 @@ const TOMBSTONE_MAGIC: &str = "CRABPURGE1";
 pub(crate) const MAX_TOMBSTONE_BYTES: usize = 64 * 1024;
 
 /// The tombstone MAC key: the entry key under a label of
-/// its own.
-fn tombstone_mac_key(entry_key: &[u8]) -> [u8; 32] {
-    entry_mac(entry_key, b"crabcrop purge tombstone v1")
+/// its own, zeroed when the caller is done with it, like the
+/// entry key itself.
+fn tombstone_mac_key(entry_key: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    zeroize::Zeroizing::new(entry_mac(entry_key, b"crabcrop purge tombstone v1"))
 }
 
 fn target_parts(target: &PurgeTarget) -> (&'static str, &str) {
@@ -3769,7 +3860,7 @@ pub(crate) fn serialize_tombstone(tombstone: &Tombstone, entry_key: &[u8]) -> Ve
     }));
     let mut body = format!("{kind}\n{start}\n{ended}\n{}\n", name.len()).into_bytes();
     body.extend_from_slice(name.as_bytes());
-    let mac = entry_mac(&tombstone_mac_key(entry_key), &body);
+    let mac = entry_mac(tombstone_mac_key(entry_key).as_slice(), &body);
     let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
     let mut out = format!("{TOMBSTONE_MAGIC}\n{mac_hex}\n").into_bytes();
     out.extend_from_slice(&body);
@@ -3795,7 +3886,7 @@ pub(crate) fn parse_tombstone(data: &[u8], entry_key: &[u8]) -> Option<Tombstone
     let mac_vec = hex_decode(mac_line)?;
     let mut mac = [0u8; 32];
     mac.copy_from_slice(&mac_vec);
-    if !verify_entry_mac(&tombstone_mac_key(entry_key), &data[pos..], &mac) {
+    if !verify_entry_mac(tombstone_mac_key(entry_key).as_slice(), &data[pos..], &mac) {
         return None;
     }
     let kind = take_line(data, &mut pos)?;
@@ -4147,7 +4238,7 @@ mod tests {
         // Well-MACed but malformed bodies: an unknown kind,
         // an unstamped start, a bad end, a lying length.
         let signed = |body: &str| {
-            let mac = entry_mac(&tombstone_mac_key(&key), body.as_bytes());
+            let mac = entry_mac(tombstone_mac_key(&key).as_slice(), body.as_bytes());
             let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
             format!("{TOMBSTONE_MAGIC}\n{mac_hex}\n{body}").into_bytes()
         };
@@ -4190,6 +4281,42 @@ mod tests {
         assert!(total <= budget, "total {total}");
         assert!(store.get("a").is_none(), "the LRU entry went first");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_inline_delete_is_counted_not_silent() {
+        // Issue #709: an evicted entry's file is deleted inline,
+        // best-effort, and a delete that failed was silent: the
+        // file stayed on disk out of the index, and the next boot
+        // indexed it again, with nothing in the log or on
+        // /metrics. Each failure now counts, in the tier's errors
+        // and on its own series, and is logged at a limited
+        // rate. A file that is already gone is no failure.
+        let dir = temp_dir("unlink-fails");
+        let payload = vec![7u8; 100];
+        let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
+        let one = entry_charge("a", file, &[]);
+        let store = DiskStore::open(&dir, 2 * one + one / 2, test_entry_key()).unwrap();
+        store.put("a", &image(&payload));
+        store.put("b", &image(&payload));
+        store.set_hold(Some(Arc::new(|kind, _| match kind {
+            OpKind::Unlink => Err(std::io::Error::from_raw_os_error(30)),
+            _ => Ok(()),
+        })));
+        let errors = store.errors();
+        // `c` evicts `a`, whose file the disk will not delete.
+        store.put("c", &image(&payload));
+        assert!(store.get("a").is_none());
+        assert_eq!(store.unlinks_failed(), 1);
+        assert_eq!(store.errors(), errors + 1);
+        assert!(dir.join(format!("{}.bin", key_stem("a"))).exists());
+        // `d` evicts `b`, whose file is already gone.
+        store.set_hold(None);
+        std::fs::remove_file(dir.join(format!("{}.bin", key_stem("b")))).unwrap();
+        store.put("d", &image(&payload));
+        assert!(store.get("b").is_none());
+        assert_eq!(store.unlinks_failed(), 1);
+        assert_eq!(store.errors(), errors + 1);
     }
 
     #[test]
@@ -6843,6 +6970,42 @@ mod tests {
             assert!(store.file_for(&key_stem(key)).exists(), "{key}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delete_the_boot_scan_cannot_make_counts_with_the_inline_ones() {
+        // Issue #708 counts a delete the boot scan cannot make
+        // in its report and the tier's errors, and issue #709 an
+        // inline one that fails in
+        // `crabcrop_cache_disk_unlinks_failed_total`, which
+        // counts the scan's too: either way the file stays on
+        // disk, out of the index, until the next boot.
+        let dir = temp_dir("scan-unlink-fails");
+        let bad = dir.join(format!("{}.bin", key_stem("bad")));
+        std::fs::write(&bad, b"CRABDISK6\nnot an entry").unwrap();
+        let store = Arc::new(DiskStore::unscanned(&dir, 1_000_000, test_entry_key()));
+        store.set_hold(Some(Arc::new(|kind, _| match kind {
+            OpKind::Unlink => Err(std::io::Error::from_raw_os_error(30)),
+            _ => Ok(()),
+        })));
+        store.begin_scan();
+        let report = scan_ended(&store);
+        assert_eq!(report.phase, ScanPhase::Done);
+        assert_eq!((report.deleted, report.undeleted), (0, 1));
+        assert_eq!(store.unlinks_failed(), 1);
+        assert_eq!(store.errors(), 1);
+        assert!(bad.exists());
+        // A delete the scan makes counts in neither.
+        let dir = temp_dir("scan-unlink-works");
+        std::fs::write(
+            dir.join(format!("{}.bin", key_stem("bad"))),
+            b"CRABDISK6\nnot an entry",
+        )
+        .unwrap();
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert_eq!(store.scan_report().deleted, 1);
+        assert_eq!(store.unlinks_failed(), 0);
+        assert_eq!(store.errors(), 0);
     }
 
     /// The index's bookkeeping as it was before issue #708: the

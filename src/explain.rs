@@ -36,7 +36,9 @@
 //! off with `CRABCROP_EXPLAIN=0`.
 
 use crate::engine::SourceProbe;
-use crate::url::{Dimension, Filter, Operation, RequestDirectives, canonical_form, format_text};
+use crate::url::{
+    Dimension, Filter, Operation, PlainFilter, RequestDirectives, canonical_form, format_text,
+};
 
 /// One operation in the report: its canonical segment and
 /// its plain-language gloss lines, from the CLI explain
@@ -419,7 +421,7 @@ fn forecast_at(
                             let n = *n as u64;
                             cur = cur.map(|(w, h)| (w.saturating_mul(n), h.saturating_mul(n)));
                         }
-                        Filter::Rotate(degrees) => {
+                        Filter::Plain(PlainFilter::Rotate(degrees)) => {
                             cur = cur.map(|(w, h)| {
                                 let (w, h) = crate::filters::rotated_canvas(
                                     saturate(w),
@@ -434,7 +436,9 @@ fn forecast_at(
                             }
                         }
                         // The trimmed size depends on the pixels.
-                        Filter::Trim(_) | Filter::TrimSides(..) => cur = None,
+                        Filter::Plain(PlainFilter::Trim(_) | PlainFilter::TrimSides(..)) => {
+                            cur = None
+                        }
                         _ => {}
                     }
                     step_past_budget |= past_budget(cur);

@@ -471,7 +471,7 @@ def prepare_origin():
 
 def main():
     binary = os.environ.get(
-        "CRABCROP_BIN", os.path.join(WORK, "crabcrop-v0.13.1", "target", "release", "crabcrop")
+        "CRABCROP_BIN", os.path.join(WORK, "crabcrop-v0.14.0", "target", "release", "crabcrop")
     )
     if not os.path.exists(binary):
         print(f"crabcrop binary not found: {binary} (run setup.sh first)", file=sys.stderr)

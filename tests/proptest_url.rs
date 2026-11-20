@@ -29,8 +29,8 @@
 
 use crabcrop::url::{
     self, Align, Anchor, BlendMode, CurveChannel, Dimension, Filter, FlipDirection, FormatOptions,
-    FormatSpec, FrameSelection, ImageFormat, ImageSize, MaskShape, Operation, PadFill, Quality,
-    QualityValue, Signature, StudioBg, StudioMode, StudioShadow, StudioSpec, Subsampling,
+    FormatSpec, FrameSelection, ImageFormat, ImageSize, MaskShape, Operation, PadFill, PlainFilter,
+    Quality, QualityValue, Signature, StudioBg, StudioMode, StudioShadow, StudioSpec, Subsampling,
 };
 use proptest::prelude::*;
 use proptest::sample::select;
@@ -251,11 +251,11 @@ fn bare(filter: Filter, name: &'static str) -> BoxedStrategy<Spelled<Filter>> {
 fn tone_filter() -> BoxedStrategy<Spelled<Filter>> {
     let percent = || prop_oneof![-100.0f32..=100.0, Just(-100.0), Just(100.0), Just(-0.0)];
     prop_oneof![
-        bare(Filter::Grayscale, "grayscale"),
-        bare(Filter::Invert, "invert"),
-        bare(Filter::Sepia, "sepia"),
-        bare(Filter::Equalize, "equalize"),
-        bare(Filter::Enhance, "enhance"),
+        bare(Filter::Plain(PlainFilter::Grayscale), "grayscale"),
+        bare(Filter::Plain(PlainFilter::Invert), "invert"),
+        bare(Filter::Plain(PlainFilter::Sepia), "sepia"),
+        bare(Filter::Plain(PlainFilter::Equalize), "equalize"),
+        bare(Filter::Plain(PlainFilter::Enhance), "enhance"),
         spelled(
             prop_oneof![
                 f32::MIN_POSITIVE..=url::MAX_BLUR_SIGMA,
@@ -263,11 +263,11 @@ fn tone_filter() -> BoxedStrategy<Spelled<Filter>> {
             ],
             |v| call("blur", &[decimal32(*v)])
         )
-        .prop_map(|(v, s)| (Filter::Blur(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Blur(v)), s)),
         spelled(-255i32..=255, |v| call("brighten", &[int(*v)]))
-            .prop_map(|(v, s)| (Filter::Brighten(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Brighten(v)), s)),
         spelled(percent(), |v| call("contrast", &[decimal32(*v)]))
-            .prop_map(|(v, s)| (Filter::Contrast(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Contrast(v)), s)),
         spelled(
             prop_oneof![
                 (0.0f32..=url::MAX_GAMMA).prop_filter("positive", |v| *v > 0.0),
@@ -276,37 +276,38 @@ fn tone_filter() -> BoxedStrategy<Spelled<Filter>> {
             ],
             |v| call("gamma", &[decimal32(*v)])
         )
-        .prop_map(|(v, s)| (Filter::Gamma(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Gamma(v)), s)),
         spelled(-url::MAX_EXPOSURE..=url::MAX_EXPOSURE, |v| call(
             "exposure",
             &[decimal32(*v)]
         ))
-        .prop_map(|(v, s)| (Filter::Exposure(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Exposure(v)), s)),
         spelled((percent(), percent()), |(h, s)| call(
             "highlights_shadows",
             &[decimal32(*h), decimal32(*s)]
         ))
-        .prop_map(|((h, sh), s)| (Filter::HighlightsShadows(h, sh), s)),
+        .prop_map(|((h, sh), s)| (Filter::Plain(PlainFilter::HighlightsShadows(h, sh)), s)),
         spelled(percent(), |v| call("vibrance", &[decimal32(*v)]))
-            .prop_map(|(v, s)| (Filter::Vibrance(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Vibrance(v)), s)),
         spelled(any::<i32>(), |v| call("huerotate", &[int(*v)]))
-            .prop_map(|(v, s)| (Filter::HueRotate(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::HueRotate(v)), s)),
         spelled(
             prop_oneof![1e-3f32..=100.0, Just(f32::MAX), Just(f32::from_bits(1))],
             |v| call("sharpen", &[decimal32(*v)])
         )
-        .prop_map(|(v, s)| (Filter::Sharpen(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Sharpen(v)), s)),
         spelled(prop_oneof![0.0f32..=255.0, Just(255.0)], |v| call(
             "saturation",
             &[decimal32(*v)]
         ))
-        .prop_map(|(v, s)| (Filter::Saturation(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Saturation(v)), s)),
         spelled(
             (-255i32..=255, -255i32..=255, -255i32..=255),
             |(r, g, b)| call("rgb", &[int(*r), int(*g), int(*b)])
         )
-        .prop_map(|((r, g, b), s)| (Filter::Rgb(r, g, b), s)),
-        spelled(0u8..=100, |v| call("noise", &[uint(*v)])).prop_map(|(v, s)| (Filter::Noise(v), s)),
+        .prop_map(|((r, g, b), s)| (Filter::Plain(PlainFilter::Rgb(r, g, b)), s)),
+        spelled(0u8..=100, |v| call("noise", &[uint(*v)]))
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Noise(v)), s)),
     ]
     .boxed()
 }
@@ -335,11 +336,12 @@ fn color_filter() -> BoxedStrategy<Spelled<Filter>> {
         any::<bool>(),
     );
     prop_oneof![
-        spelled(rgb(), |c| call("fill", &[hex(c)])).prop_map(|(c, s)| (Filter::Fill(c), s)),
+        spelled(rgb(), |c| call("fill", &[hex(c)]))
+            .prop_map(|(c, s)| (Filter::Plain(PlainFilter::Fill(c)), s)),
         spelled(rgb(), |c| call("monochrome", &[hex(c)]))
-            .prop_map(|(c, s)| (Filter::Monochrome(c), s)),
+            .prop_map(|(c, s)| (Filter::Plain(PlainFilter::Monochrome(c)), s)),
         spelled((rgb(), rgb()), |(a, b)| call("duotone", &[hex(a), hex(b)]))
-            .prop_map(|((a, b), s)| (Filter::Duotone(a, b), s)),
+            .prop_map(|((a, b), s)| (Filter::Plain(PlainFilter::Duotone(a, b)), s)),
         spelled((channel, points), |((_, name), points)| {
             // Two spellings: every coordinate bare, or every
             // coordinate with a leading zero.
@@ -353,7 +355,10 @@ fn color_filter() -> BoxedStrategy<Spelled<Filter>> {
                 })
                 .collect()
         })
-        .prop_map(|((channel, points), s)| (Filter::Curve(channel.0, points), s)),
+        .prop_map(|((channel, points), s)| (
+            Filter::Plain(PlainFilter::Curve(channel.0, points)),
+            s
+        )),
         spelled(kernel, |(values, normalize)| {
             let flag = if *normalize { "1" } else { "0" };
             (0..2)
@@ -374,7 +379,10 @@ fn color_filter() -> BoxedStrategy<Spelled<Filter>> {
                 })
                 .collect()
         })
-        .prop_map(|((values, normalize), s)| (Filter::Convolution(values, normalize), s)),
+        .prop_map(|((values, normalize), s)| (
+            Filter::Plain(PlainFilter::Convolution(values, normalize)),
+            s
+        )),
     ]
     .boxed()
 }
@@ -410,7 +418,7 @@ fn geometry_filter() -> BoxedStrategy<Spelled<Filter>> {
                 call("rotate", &[decimal(text)])
             }
         )
-        .prop_map(|(v, s)| (Filter::Rotate(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Rotate(v)), s)),
         spelled(any::<u8>(), |v| {
             let mut all = call("trim", &[uint(*v)]);
             if *v == 10 {
@@ -418,11 +426,11 @@ fn geometry_filter() -> BoxedStrategy<Spelled<Filter>> {
             }
             all
         })
-        .prop_map(|(v, s)| (Filter::Trim(v), s)),
+        .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Trim(v)), s)),
         spelled((any::<u8>(), any::<[u32; 4]>()), |(t, [l, tp, r, b])| {
             call("trim", &[uint(*t), uint(*l), uint(*tp), uint(*r), uint(*b)])
         })
-        .prop_map(|((t, sides), s)| (Filter::TrimSides(t, sides), s)),
+        .prop_map(|((t, sides), s)| (Filter::Plain(PlainFilter::TrimSides(t, sides)), s)),
         spelled(
             select(vec![
                 (FlipDirection::Horizontal, "h"),
@@ -430,7 +438,7 @@ fn geometry_filter() -> BoxedStrategy<Spelled<Filter>> {
             ]),
             |(_, name)| call("flip", &[vec![name.to_string()]])
         )
-        .prop_map(|((d, _), s)| (Filter::Flip(d), s)),
+        .prop_map(|((d, _), s)| (Filter::Plain(PlainFilter::Flip(d)), s)),
         spelled(
             prop_oneof![
                 (0..=MAX_DIMENSION).prop_map(|r| [r; 4]),
@@ -444,12 +452,12 @@ fn geometry_filter() -> BoxedStrategy<Spelled<Filter>> {
                 all
             }
         )
-        .prop_map(|(r, s)| (Filter::Radius(r), s)),
+        .prop_map(|(r, s)| (Filter::Plain(PlainFilter::Radius(r)), s)),
         spelled((0..=MAX_DIMENSION, rgb()), |(w, c)| call(
             "border",
             &[uint(*w), hex(c)]
         ))
-        .prop_map(|((w, c), s)| (Filter::Border(w, c), s)),
+        .prop_map(|((w, c), s)| (Filter::Plain(PlainFilter::Border(w, c)), s)),
         spelled(
             select(vec![
                 (MaskShape::Circle, "circle"),
@@ -457,9 +465,9 @@ fn geometry_filter() -> BoxedStrategy<Spelled<Filter>> {
             ]),
             |(_, name)| call("mask", &[vec![name.to_string()]])
         )
-        .prop_map(|((m, _), s)| (Filter::Mask(m), s)),
+        .prop_map(|((m, _), s)| (Filter::Plain(PlainFilter::Mask(m)), s)),
         spelled(1..=MAX_DIMENSION, |v| call("pixelate", &[uint(*v)]))
-            .prop_map(|(v, s)| (Filter::Pixelate(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Pixelate(v)), s)),
         region("blur_region").prop_map(|((x, y, w, h), s)| (Filter::BlurRegion { x, y, w, h }, s)),
         region("pixelate_region")
             .prop_map(|((x, y, w, h), s)| (Filter::PixelateRegion { x, y, w, h }, s)),
@@ -608,19 +616,21 @@ fn encoding_filter() -> BoxedStrategy<Spelled<Filter>> {
         per_format_quality().prop_map(Quality::PerFormat),
     ];
     prop_oneof![
-        spelled(quality, quality_spellings).prop_map(|(q, s)| (Filter::Quality(q), s)),
-        spelled(format_spec(), format_spec_spellings).prop_map(|(f, s)| (Filter::Format(f), s)),
+        spelled(quality, quality_spellings)
+            .prop_map(|(q, s)| (Filter::Plain(PlainFilter::Quality(q)), s)),
+        spelled(format_spec(), format_spec_spellings)
+            .prop_map(|(f, s)| (Filter::Plain(PlainFilter::Format(f)), s)),
         spelled(2u16..=256, |v| call("palette", &[uint(*v)]))
-            .prop_map(|(v, s)| (Filter::Palette(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::Palette(v)), s)),
         spelled(1u64..=u64::MAX, |v| call("max_bytes", &[uint(*v)]))
-            .prop_map(|(v, s)| (Filter::MaxBytes(v), s)),
+            .prop_map(|(v, s)| (Filter::Plain(PlainFilter::MaxBytes(v)), s)),
         spelled(select(vec![1.0f32, 1.5, 2.0, 3.0]), |v| call(
             "dpr",
             &[decimal32(*v)]
         ))
         .prop_map(|(v, s)| (Filter::Dpr(v), s)),
-        bare(Filter::NoUpscale, "no_upscale"),
-        bare(Filter::KeepProfile, "keep_profile"),
+        bare(Filter::Plain(PlainFilter::NoUpscale), "no_upscale"),
+        bare(Filter::Plain(PlainFilter::KeepProfile), "keep_profile"),
     ]
     .boxed()
 }
@@ -1300,10 +1310,10 @@ fn normalize(ops: &[Operation]) -> Vec<Operation> {
             Operation::Filters(list) => Operation::Filters(
                 list.iter()
                     .map(|f| match f {
-                        Filter::Quality(Quality::PerFormat(entries)) => {
+                        Filter::Plain(PlainFilter::Quality(Quality::PerFormat(entries))) => {
                             let mut entries = entries.clone();
                             sort_quality(&mut entries);
-                            Filter::Quality(Quality::PerFormat(entries))
+                            Filter::Plain(PlainFilter::Quality(Quality::PerFormat(entries)))
                         }
                         other => other.clone(),
                     })

@@ -1,11 +1,11 @@
 # crabcrop_url
 
-Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from Python. Standard library only; the signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md) and this package runs the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json) as its test suite, so it cannot drift from the server.
+Build, sign, verify and explain [crabcrop](https://github.com/dayvson/crabcrop) URLs from Python. Standard library only; the signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md) and this package runs the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json) as its test suite, so it cannot drift from the server. The explainer runs the grammar corpora [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), as the TypeScript SDK's does.
 
 ## Usage
 
 ```python
-from crabcrop_url import build_sealed_url, build_url, build_srcset, purge_group_signature, purge_signature, seal, sign, unseal, upload_signature, verify
+from crabcrop_url import build_sealed_url, build_url, build_srcset, purge_group_signature, purge_signature, seal, sign, unseal, upload_signature, verify, verify_url_signature
 
 # A signed URL. The operation string is passed verbatim and may
 # contain several segments and preset: references.
@@ -43,11 +43,20 @@ signature = sign("your-secret", "300x200/https://example.com/photo.jpg")
 # Verify a signature in constant time (malformed tags return False).
 ok = verify("your-secret", signature, "300x200/https://example.com/photo.jpg")
 
+# Verify a signed URL's signature, in constant time (unsigned or
+# malformed URLs return None, and so do URLs longer than 64 KiB).
+ok = verify_url_signature("your-secret", url)
+
 # Purge signatures for the server's /purge and /purge-group endpoints
 # are domain-separated under a derived subkey; the helpers sign the
-# right strings so callers never assemble them by hand.
+# right strings so callers never assemble them by hand. Pass an
+# expiry (unix seconds) for a purge URL that stops working then;
+# its path is /purge/<signature>/exp:<expiry>/<path> (or
+# /purge-group/<signature>/exp:<expiry>/<group>).
 purge = purge_signature("your-secret", "300x200/https://example.com/photo.jpg")
 group = purge_group_signature("your-secret", "thumb")
+expiring_purge = purge_signature("your-secret", "300x200/https://example.com/photo.jpg", 1893456000)
+expiring_group = purge_group_signature("your-secret", "thumb", 1893456000)
 
 # Upload signatures for the server's PUT /upload/<signature>/<name>
 # endpoint live in a third domain, under their own derived subkey.
@@ -70,6 +79,38 @@ sealed_url = build_sealed_url(
 )
 remainder = unseal("your-secret", seal("your-secret", "300x200/https://example.com/photo.jpg"))
 ```
+
+## Explaining and verifying URLs
+
+`explain_url` and `verify_url_signature` are the TypeScript SDK's `explainUrl` and `verifyUrlSignature`, with the same answers and, for `explain_url`, the same messages: the test suite runs the two explainers, and the two verifiers, against each other on generated inputs (see [Tests](#tests)).
+
+| TypeScript | Python |
+|---|---|
+| `explainUrl(input, nowSeconds?)` | `explain_url(input, now_seconds=None)` |
+| `verifyUrlSignature(secret, input)`, where `secret` is a string or a `Record<string, string>` keyring | `verify_url_signature(secret_or_keyring, input)`, where the secret is a `str` or `bytes`, and a keyring is a mapping of key ID to secret (`Keyring`) |
+| `Explanation`, `ExplainedSegment`, `SegmentKind`, `SignatureKind` | the same names: `Explanation` and `ExplainedSegment` are frozen dataclasses, and the signature is an `ExplainedSignature` |
+| an absent `detail`, `error`, `expired` or `keyId` | `None` in `detail`, `error`, `expired` or `key_id` |
+| `null` from `verifyUrlSignature` | `None` |
+| `FILTER_DESCRIPTIONS` | `FILTER_DESCRIPTIONS`, read only |
+
+```python
+from crabcrop_url import explain_url, verify_url_signature
+
+url = "https://images.example.com/62d8085a0734c070c0f42e45b3c5e1f818f50afd56e38ad0de3a451b10d660e5/crop:1200x630:smart/filters:blur(600)/https://example.com/photo.jpg"
+out = explain_url(url)
+out.signature.kind      # "hmac"
+out.segments[0].detail  # "crop to the aspect of 1200x630 and resize to it; alignment: smart"
+out.segments[1].error   # "the server rejects this filter: blur(600)"
+out.source              # "https://example.com/photo.jpg"
+out.errors              # ["the server rejects this filter: blur(600)"], a 400 (invalid_filters) from the server
+
+verify_url_signature("your-secret", url)  # True
+verify_url_signature({"2026-10": "new-secret", "2026-04": "your-secret"}, url)  # True
+```
+
+`explain_url(url)` parses a URL, or a bare path, back into its signature, its explained segments and its source, and lists every error. Each segment carries its `raw` text, a `kind` (`expiry`, `maxage`, `debug`, `preset` or `operation`), a `title`, and a `detail` or an `error`; a well-formed `exp:` segment also says whether the URL had `expired` at `now_seconds` (the current time unless you pass one). `remainder` is the text the signature covers, and an empty `errors` is the server's verdict that the request parses. Its verdict is the server's: it reads each number as the server's types read it (a decimal as the 32-bit float the server reads, or the 64-bit one for a `convolution` value or a `frame:` selector, its range applied to the rounded value), and it reports what the server refuses before and after the parse: a remainder that begins with `crabcrop`, `purge`, `purge-group` or `upload`, more than 100 operations, and more than 16 distinct watermark and overlay URLs. It cannot see preset definitions or the server's default operations, so it counts each `preset:` reference as one operation. A class name's letters and digits are Unicode 17.0's, as the server's Rust reads them, whatever the Unicode version of the interpreter's `unicodedata`; the typed builders read them the same way. It reads the path as written, not through a URL parser, so dot segments stay literal and a query or fragment is cut off, as the server does. It reads at most 64 KiB (65,536 bytes of UTF-8), which bounds the time one call takes: a longer input gets a single error and no signature. A string that holds surrogate code points, as `surrogateescape` decoding makes for bytes that are not UTF-8, reads as JavaScript reads the same UTF-16: a surrogate pair is the character it encodes.
+
+`verify_url_signature` reads the URL the same way and answers `True` or `False`, or `None` when the URL is unsigned (`unsafe`), sealed, malformed, or longer than 64 KiB. A remainder that begins with the reserved segment `crabcrop` is `False` whatever its tag. With one secret, the key ID a URL carries is ignored: the question is whether this secret made the tag. With a keyring, the server's rotation rules apply: a keyed URL (`<key-id>:<tag>`) consults its named key only, so an ID the keyring does not hold is `False`, and an unkeyed URL consults every key. Tags compare in constant time (`hmac.compare_digest`), as in `verify`. A lone surrogate, in the URL or in a secret, is hashed as U+FFFD, the bytes the TypeScript SDK's HMAC hashes for it, so no URL and no secret of text makes it raise.
 
 ## Typed builders
 
@@ -101,4 +142,10 @@ The builders raise `ValueError` on operations or a source that can never verify:
 
 ```bash
 python3 -m unittest discover -s tests
+```
+
+`tests/test_explain_differential.py` runs this package's explainer and the TypeScript SDK's on 6,000 inputs generated from the grammar corpora (their remainders with segments and filters dropped, repeated and swapped, characters changed, and numbers at the edges of their ranges), asks the two verifiers about each input as generated and re-signed, under one secret and under keyrings, and fails on any difference in any field or answer. It runs the TypeScript SDK from its sources with Node 22.18 or newer (or 23.6 or newer), which needs no build or `npm install`, and is skipped when no such `node` is on `PATH`, unless `CRABCROP_DIFF_REQUIRE_NODE=1`, which `scripts/test_all.sh` sets: then it fails. The inputs follow from a seed, so a failure repeats; to run more of them, or another set:
+
+```bash
+CRABCROP_DIFF_CASES=100000 CRABCROP_DIFF_SEED=7 python3 -m unittest tests.test_explain_differential -v
 ```

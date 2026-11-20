@@ -8,9 +8,12 @@ use tokio::net::TcpListener;
 mod disk_hang;
 mod disk_scan;
 mod disk_stall;
+mod explain_admission;
 mod meta_frame;
 mod request_log;
+mod shared_bounds;
 mod shared_state;
+mod upload_pace;
 
 const SECRET: &[u8] = b"test-secret";
 
@@ -227,6 +230,7 @@ fn test_state() -> AppState {
         width_step: 100,
         client_hints: true,
         explain_enabled: true,
+        purge_require_expiry: false,
         preserve_metadata: false,
         brand_color: None,
         presets: std::collections::HashMap::new(),
@@ -254,7 +258,7 @@ fn providers_mut(state: &mut AppState) -> &mut Providers {
 fn base_test_state(allow_unsafe: bool, metrics_token: Option<String>) -> AppState {
     AppState {
         allow_unsafe,
-        metrics_token,
+        metrics_token: metrics_token.map(Into::into),
         ..test_state()
     }
 }
@@ -1280,6 +1284,439 @@ async fn purge_evicts_expiry_variants() {
         2,
         "the exp variant was evicted too"
     );
+}
+
+/// POST a purge (`/purge/`) or group purge (`/purge-group/`)
+/// with `sig` over the remainder `rest`, as presented.
+async fn post_purge(base: &str, endpoint: &str, sig: &str, rest: &str) -> reqwest::Response {
+    client()
+        .post(format!("{base}/{endpoint}/{sig}/{rest}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[test]
+fn a_purge_expiry_holds_strictly_before_its_second() {
+    // The comparison image and upload URLs use: valid
+    // strictly before the `exp:` second, refused at it and
+    // after it.
+    let exp = 1_893_456_000;
+    for require in [false, true] {
+        assert_eq!(purge_expiry_refusal(Some(exp), exp - 1, require), None);
+        for now in [exp, exp + 1, u64::MAX] {
+            let (status, code, message) = purge_expiry_refusal(Some(exp), now, require).unwrap();
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(code, "signature_expired");
+            assert_eq!(message, "signature expired");
+        }
+        assert_eq!(
+            purge_expiry_refusal(Some(0), 0, require).unwrap().1,
+            "signature_expired"
+        );
+    }
+    // A purge with no expiry runs whatever the time, unless
+    // the server takes only expiring purge URLs.
+    assert_eq!(purge_expiry_refusal(None, u64::MAX, false), None);
+    let (status, code, message) = purge_expiry_refusal(None, 0, true).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(code, "expiry_required");
+    assert!(message.starts_with("expiry required"), "{message}");
+}
+
+#[tokio::test]
+async fn the_require_expiry_setting_refuses_unexpiring_purges_and_admits_expiring_ones() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        presets: preset_test_map(),
+        purge_require_expiry: true,
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
+        ..test_state()
+    })
+    .await;
+    let target = format!("100x50/{src}");
+    let grouped = format!("preset:small/{src}");
+    for remainder in [&target, &grouped] {
+        assert_eq!(get_signed(&base, remainder).await.status(), 200);
+    }
+    // A purge or group purge URL with no expiry is refused
+    // once its signature verifies, in either error mode,
+    // and purges nothing.
+    let required =
+        "expiry required: this server accepts only purge URLs that carry an exp: segment";
+    for url in [
+        format!(
+            "{base}/purge/{}/{target}",
+            crate::url::purge_signature(SECRET, &target)
+        ),
+        format!(
+            "{base}/purge-group/{}/small",
+            crate::url::purge_group_signature(SECRET, "small")
+        ),
+    ] {
+        let plain = client().post(&url).send().await.unwrap();
+        let json = client()
+            .post(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "expiry_required",
+            required,
+        )
+        .await;
+    }
+    // A bad signature is still a bad signature: the setting
+    // shows only to a caller holding the secret.
+    let resp = post_purge(&base, "purge", "deadbeef", &target).await;
+    assert_eq!(resp.text().await.unwrap(), "bad signature");
+    for remainder in [&target, &grouped] {
+        let resp = get_signed(&base, remainder).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit",
+            "{remainder}"
+        );
+    }
+    // The expiring forms purge.
+    let exp = now_unix() + 3600;
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &target, exp);
+    let resp = post_purge(&base, "purge", &sig, &format!("exp:{exp}/{target}")).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", exp);
+    let resp = post_purge(&base, "purge-group", &sig, &format!("exp:{exp}/small")).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(get_signed(&base, &target).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // A plain purge minted over an image remainder that
+    // opens with the image's own exp: reads, like every
+    // purge path, as an expiring purge, so it is taken
+    // before that second.
+    let expiring_image = format!("exp:{exp}/{target}");
+    let sig = crate::url::purge_signature(SECRET, &expiring_image);
+    let resp = post_purge(&base, "purge", &sig, &expiring_image).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    // Refused purges count: two refused in each of two
+    // modes, one bad signature, and three that ran.
+    let metrics = metrics_text(&base).await;
+    assert!(metrics.contains("crabcrop_purges_total 8"), "{metrics}");
+}
+
+#[tokio::test]
+async fn expiring_purges_run_before_their_second_and_are_refused_from_it() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let target = format!("100x50/{src}");
+    let render = || get_signed(&base, &target);
+    assert_eq!(render().await.status(), 200);
+    // Before its second, an expiring purge runs: the
+    // signature covers `exp:<n>/` and the target.
+    let future = now_unix() + 3600;
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &target, future);
+    let resp = post_purge(&base, "purge", &sig, &format!("exp:{future}/{target}")).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(render().await.status(), 200);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the purge evicted the entry"
+    );
+    // At its second and after it, the purge is refused as
+    // expired, in either error mode, and evicts nothing.
+    let now = now_unix();
+    for exp in [now, now - 1, 1] {
+        let sig = crate::url::purge_signature_with_expiry(SECRET, &target, exp);
+        let url = format!("{base}/purge/{sig}/exp:{exp}/{target}");
+        let plain = client().post(&url).send().await.unwrap();
+        let json = client()
+            .post(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired",
+        )
+        .await;
+    }
+    let resp = render().await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Refused purges count, as a bad signature's does: one
+    // that ran and six refused.
+    let metrics = metrics_text(&base).await;
+    assert!(metrics.contains("crabcrop_purges_total 7"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_changed_purge_expiry_is_a_bad_signature() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let target = format!("100x50/{src}");
+    assert_eq!(get_signed(&base, &target).await.status(), 200);
+    let grouped = format!("preset:small/{src}");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    let exp = now_unix() + 3600;
+    // The expiry is inside the signed string: extending it,
+    // moving it, or stripping it to replay the signature as
+    // a plain one fails as a bad signature, on both
+    // endpoints, and evicts nothing.
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &target, exp);
+    for rest in [
+        format!("exp:{}/{target}", exp + 3600),
+        format!("exp:{}/{target}", exp - 1),
+        target.clone(),
+    ] {
+        let resp = post_purge(&base, "purge", &sig, &rest).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+    let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", exp);
+    for rest in [format!("exp:{}/small", exp + 3600), "small".to_string()] {
+        let resp = post_purge(&base, "purge-group", &sig, &rest).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+    // And a plain signature gains no expiring form by
+    // presentation.
+    let plain = crate::url::purge_signature(SECRET, &target);
+    let resp = post_purge(&base, "purge", &plain, &format!("exp:{exp}/{target}")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    for remainder in [&target, &grouped] {
+        let resp = get_signed(&base, remainder).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit",
+            "{remainder}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn expiring_group_purges_run_before_their_second_and_are_refused_from_it() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let grouped = format!("preset:small/{src}");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    let future = now_unix() + 3600;
+    let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", future);
+    let resp = post_purge(&base, "purge-group", &sig, &format!("exp:{future}/small")).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "the group purge evicted it");
+    let now = now_unix();
+    for exp in [now, now - 1] {
+        let sig = crate::url::purge_group_signature_with_expiry(SECRET, "small", exp);
+        let resp = post_purge(&base, "purge-group", &sig, &format!("exp:{exp}/small")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "signature expired");
+    }
+    let resp = get_signed(&base, &grouped).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+}
+
+#[tokio::test]
+async fn a_purge_target_that_opens_with_an_image_expiry_reads_it_as_the_purges_own() {
+    // An image remainder may carry exp: among its
+    // operations, so a plain purge signed over such a
+    // remainder opens with `exp:<n>/`: the same bytes as the
+    // expiring form of the rest. The server reads that
+    // segment as the purge's own expiry, the one rule for
+    // every purge URL.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let target = format!("100x50/{src}");
+    let future = now_unix() + 3600;
+    let expiring_image = format!("exp:{future}/{target}");
+    assert_eq!(get_signed(&base, &expiring_image).await.status(), 200);
+    // Before that second, the purge evicts what it always
+    // did: an image's exp: is not part of its cache key, so
+    // the rest of the path names the same entry.
+    let sig = crate::url::purge_signature(SECRET, &expiring_image);
+    let resp = post_purge(&base, "purge", &sig, &expiring_image).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    let resp = get_signed(&base, &expiring_image).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Once that second has passed, the same kind of URL is
+    // refused as expired, though it names the same entry...
+    let past = format!("exp:{}/{target}", now_unix() - 60);
+    let sig = crate::url::purge_signature(SECRET, &past);
+    let resp = post_purge(&base, "purge", &sig, &past).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.text().await.unwrap(), "signature expired");
+    let resp = get_signed(&base, &expiring_image).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    // ... and the target without the image's exp: evicts
+    // it, as the expired spelling did before.
+    let sig = crate::url::purge_signature(SECRET, &target);
+    let resp = post_purge(&base, "purge", &sig, &target).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    let resp = get_signed(&base, &expiring_image).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    // An exp: after the first segment is the image's, part
+    // of the target, whatever its second.
+    let inner = format!("100x50/exp:1/{src}");
+    let sig = crate::url::purge_signature(SECRET, &inner);
+    let resp = post_purge(&base, "purge", &sig, &inner).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    // A sealed target's payload is the image's too: its
+    // exp: is inside the token, and the purge's own expiry,
+    // when it has one, leads the path before the token.
+    let sealed = sealed_path(&format!("exp:1/{target}"), Some("photo.png"));
+    assert_eq!(get_signed(&base, &target).await.status(), 200);
+    let sig = crate::url::purge_signature_with_expiry(SECRET, &sealed, future);
+    let resp = post_purge(&base, "purge", &sig, &format!("exp:{future}/{sealed}")).await;
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn a_sealed_target_under_the_key_id_exp_purges_by_its_plain_url() {
+    // `exp` is a valid key ID, so a token sealed under it
+    // opens with `exp:s1.`. That segment is the token, never
+    // the purge's own expiry: the plain purge of the sealed
+    // spelling, with or without a friendly name, evicts the
+    // entry it shares with the plain spelling, as it always
+    // did, and so does its expiring form.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        keyring: crate::url::Keyring {
+            current_id: "exp".to_string(),
+            current: SECRET.to_vec(),
+            previous: None,
+        },
+        ..test_state()
+    })
+    .await;
+    let target = format!("100x50/{src}");
+    let token = crabcrop_url::seal_with_key_id(SECRET, "exp", &target).unwrap();
+    assert!(token.starts_with("exp:s1."), "{token}");
+    let sealed = client()
+        .get(format!("{base}/{token}/photo.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sealed.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let future = now_unix() + 3600;
+    for (n, rest) in [
+        format!("{token}/photo.png"),
+        token.clone(),
+        format!("exp:{future}/{token}/photo.png"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sig = crate::url::purge_signature(SECRET, &rest);
+        let resp = post_purge(&base, "purge", &sig, &rest).await;
+        assert_eq!(resp.status(), 200, "{rest}");
+        assert_eq!(resp.text().await.unwrap(), "purged 1\n", "{rest}");
+        let resp = get_signed(&base, &target).await;
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; fwd=uri-miss",
+            "{rest}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), n + 2, "{rest}");
+    }
+}
+
+#[tokio::test]
+async fn a_group_purge_reads_a_leading_exp_as_its_expiry() {
+    // A group is a preset name ([A-Za-z0-9_-]), and a group
+    // with a slash was refused, so `exp:<n>/<group>` named
+    // no group before: it is the expiring form now.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let grouped = format!("preset:small/{src}");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    let future = now_unix() + 3600;
+    let rest = format!("exp:{future}/small");
+    let sig = crate::url::purge_group_signature(SECRET, &rest);
+    let resp = post_purge(&base, "purge-group", &sig, &rest).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "purged 1\n");
+    assert_eq!(get_signed(&base, &grouped).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // A leading exp: segment that does not parse, or that
+    // nothing follows, is the upload grammar's error, before
+    // the signature is checked, as the group name's shape
+    // always was.
+    for rest in [
+        "exp:soon/small".to_string(),
+        "exp:+5/small".to_string(),
+        format!("exp:{future}"),
+    ] {
+        let sig = crate::url::purge_group_signature(SECRET, &rest);
+        for sig in [sig.as_str(), "deadbeef"] {
+            let url = format!("{base}/purge-group/{sig}/{rest}");
+            let resp = client()
+                .post(&url)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{rest}");
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], "invalid_expiry", "{rest}");
+        }
+    }
+    // What follows the expiry is held to the group's shape.
+    for rest in [format!("exp:{future}/"), format!("exp:{future}/a/b")] {
+        let sig = crate::url::purge_group_signature(SECRET, &rest);
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/{rest}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{rest}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_purge_group", "{rest}");
+    }
+    let resp = get_signed(&base, &grouped).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+}
+
+#[tokio::test]
+async fn a_purge_with_a_malformed_leading_expiry_is_a_bad_request() {
+    let base = spawn_app(false).await;
+    let target = "100x50/http://example.com/x.jpg";
+    for rest in [
+        format!("exp:soon/{target}"),
+        format!("exp:+5/{target}"),
+        "exp:1893456000".to_string(),
+    ] {
+        // Signed properly: verification passes, and the
+        // split refuses what it cannot read as an expiry.
+        let sig = crate::url::purge_signature(SECRET, &rest);
+        let resp = client()
+            .post(format!("{base}/purge/{sig}/{rest}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{rest}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_expiry", "{rest}");
+        // Unsigned, it is the bad signature it always was.
+        let resp = post_purge(&base, "purge", "deadbeef", &rest).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{rest}");
+    }
 }
 
 #[tokio::test]
@@ -3348,13 +3785,15 @@ fn resolve_by_three_walks(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    let own_len = ops.len();
     let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     crate::url::check_operation_count(&ops).map_err(grammar)?;
     crate::url::check_watermark_count(&ops).map_err(grammar)?;
-    let (source_url, _) =
+    let (source_url, root) =
         crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
+    let checked_at = now_unix();
     if let Some(exp) = expiry
-        && now_unix() >= exp
+        && checked_at >= exp
     {
         return Err(Refusal::AsIs((
             StatusCode::FORBIDDEN,
@@ -3364,15 +3803,27 @@ fn resolve_by_three_walks(
     }
     Ok(Resolved {
         ops,
+        own_len,
         source_url,
+        root,
         groups,
         max_age,
+        expiry: expiry.map(|at| Expiry { at, checked_at }),
     })
 }
 
-/// A resolved request: its operations, source, groups and
-/// cache lifetime.
-type ResolvedParts = (Vec<crate::url::Operation>, String, Vec<String>, Option<u32>);
+/// A resolved request: its operations, how many of them are
+/// its own, its source and the root reference it was written
+/// as, its groups, its cache lifetime and its expiry.
+type ResolvedParts = (
+    Vec<crate::url::Operation>,
+    usize,
+    String,
+    Option<crate::url::RootRef>,
+    Vec<String>,
+    Option<u32>,
+    Option<u64>,
+);
 
 /// A refusal: its kind, and its answer when it has its own.
 type RefusalParts = (&'static str, Option<ErrorParts>);
@@ -3383,9 +3834,12 @@ fn resolved_parts(resolved: Result<Resolved, Refusal>) -> Result<ResolvedParts, 
     match resolved {
         Ok(resolved) => Ok((
             resolved.ops,
+            resolved.own_len,
             resolved.source_url,
+            resolved.root,
             resolved.groups,
             resolved.max_age,
+            resolved.expiry.map(|expiry| expiry.at),
         )),
         Err(Refusal::Unopened) => Err(("unopened", None)),
         Err(Refusal::Payload(parts)) => Err(("payload", Some(parts))),
@@ -7804,6 +8258,83 @@ async fn cli_purge_group_evicts_every_grouped_entry() {
 }
 
 #[tokio::test]
+async fn cli_purges_with_expires_run_before_the_second_and_are_refused_after_it() {
+    let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_state(AppState {
+        presets: preset_test_map(),
+        purge_require_expiry: true,
+        ..test_state()
+    })
+    .await;
+    let remainder = format!("40x24/{src}");
+    let grouped = format!("preset:small/{src}");
+    for rest in [&remainder, &grouped] {
+        assert_eq!(get_signed(&base, rest).await.status(), 200);
+    }
+    let future = (now_unix() + 3600).to_string();
+    let past = (now_unix() - 60).to_string();
+    let purge = |verb: &'static str, target: String, expires: Option<String>| {
+        let base = base.clone();
+        async move {
+            let mut argv = vec![verb, "--secret", "test-secret", "--base", &base];
+            if let Some(ts) = &expires {
+                argv.extend(["--expires", ts]);
+            }
+            argv.push(&target);
+            crate::cli::exec(&cli(&argv))
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    // On a server that takes only expiring purge URLs, a
+    // plain CLI purge is refused, and --expires purges.
+    let err = purge("purge", remainder.clone(), None).await.unwrap_err();
+    assert!(
+        err.contains("HTTP 403") && err.contains("expiry required"),
+        "{err}"
+    );
+    let err = purge("purge-group", "small".into(), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("expiry required"), "{err}");
+    let out = purge("purge", remainder.clone(), Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    let out = purge("purge-group", "small".into(), Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    assert_eq!(get_signed(&base, &remainder).await.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // An expiry that has passed is refused, and evicts
+    // nothing.
+    for verb in ["purge", "purge-group"] {
+        let target = if verb == "purge" {
+            remainder.clone()
+        } else {
+            "small".into()
+        };
+        let err = purge(verb, target, Some(past.clone())).await.unwrap_err();
+        assert!(
+            err.contains("HTTP 403") && err.contains("signature expired"),
+            "{err}"
+        );
+    }
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    // An image URL whose own exp: has passed still purges
+    // with --expires: the CLI drops the image's exp:, which
+    // the cache key does not carry, and the server never
+    // reads it as the purge's expiry.
+    let expired_image = format!(
+        "{base}/{}/exp:{past}/{remainder}",
+        sign(&format!("exp:{past}/{remainder}"))
+    );
+    let out = purge("purge", expired_image, Some(future.clone())).await;
+    assert_eq!(out.as_deref(), Ok("purged 1"));
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+}
+
+#[tokio::test]
 async fn cli_purge_with_a_key_id_verifies_against_a_rotating_keyring() {
     let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
@@ -8610,13 +9141,15 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
                 .unwrap(),
             )
         }),
+        // Signed with the fake's credentials: it refuses any
+        // request whose signature does not verify (issue #709).
         shared_store: Some(Arc::new(
             crate::s3store::S3Store::new(
                 "results".into(),
                 String::new(),
                 Some(endpoint.into()),
                 "us-east-1".into(),
-                None,
+                Some(crate::s3store::test_support::test_aws()),
                 crate::url::entry_key(b"disk-key-test"),
             )
             .unwrap(),
@@ -10237,13 +10770,13 @@ fn mif1_heic() -> Vec<u8> {
 /// A JPEG XL still as a bare codestream, the form the
 /// engine writes.
 fn bare_jxl() -> Vec<u8> {
-    use crate::url::{Filter, FormatSpec, Operation};
+    use crate::url::{Filter, FormatSpec, Operation, PlainFilter};
     let jxl = Engine
         .process(
             &test_png(),
-            &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-                ImageFormat::Jxl,
-            ))])],
+            &[Operation::Filters(vec![Filter::Plain(
+                PlainFilter::Format(FormatSpec::plain(ImageFormat::Jxl)),
+            )])],
         )
         .unwrap()
         .bytes;
@@ -11522,7 +12055,7 @@ async fn slow_lane_overflow_waits_in_its_own_lane() {
 /// lane occupancy exposition can be read back.
 async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>) -> String {
     let state = AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         process_gate,
         slow_gate,
         ..test_state()
@@ -11578,7 +12111,7 @@ async fn metrics_expose_each_gates_occupancy() {
     // permits in use against their capacity the same way,
     // read live: holding permits by hand moves the gauges.
     let state = Arc::new(AppState {
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         ai_gate: Arc::new(Gate::new(3)),
         ..test_state()
     });
@@ -12556,7 +13089,7 @@ async fn spawn_app_with_upload_gate(
                 file_root: Some(dir.clone()),
                 ..Default::default()
             }),
-        metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+        metrics_token: Some(TEST_METRICS_TOKEN.to_string().into()),
         upload: Some(Arc::new(crate::upload::UploadStore::local(
             dir,
             max_bytes,
@@ -15287,7 +15820,7 @@ async fn a_replica_that_cannot_read_a_tombstone_serves_what_it_covers_until_the_
     let fake = crate::s3store::test_support::start_fake().await;
     let dir = crate::test_support::scratch_dir("srv-unread-gap");
     let mut state = tier_test_state(Some(&dir), &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
     let disk = state.store.clone().unwrap();
@@ -18031,13 +18564,13 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
     // tier and the request log's queue every section is
     // there, and at rest every value is known: the request
     // counters as `Metrics::render` gives them, then the
-    // lanes, the gates and the request log (issue #707),
-    // the source buffer, the lookups and the tiers, each
-    // line the text it was when a string was formatted for
-    // it.
+    // lanes, the gates, the AI lock recoveries (issue #736)
+    // and the request log (issue #707), the source buffer,
+    // the lookups and the tiers, each line the text it was
+    // when a string was formatted for it.
     let dir = crate::test_support::scratch_dir("metrics-one-buffer");
     let mut state = tier_test_state(Some(dir.path()), "http://127.0.0.1:9");
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     state.request_log = RequestLog::queued_to(crate::observe::FakeStdout::default());
     let state = Arc::new(state);
     let base = serve_state(&state).await;
@@ -18048,7 +18581,16 @@ async fn the_metrics_exposition_is_the_text_it_was_formatted_to() {
         ..Default::default()
     });
     state.metrics.record_purge();
-    let scraped = scrape(&base, "metrics-token").await;
+    // The lock recovery count is the process's, which other
+    // tests can move: the scrape compared is one they did not
+    // move it during.
+    let (scraped, recoveries) = loop {
+        let before = crate::ai::lock_recoveries();
+        let scraped = scrape(&base, "metrics-token").await;
+        if crate::ai::lock_recoveries() == before {
+            break (scraped, before);
+        }
+    };
     let requests = state.metrics.render();
     assert!(requests.contains("crabcrop_bytes_served_total 1234\n"));
     let sections = scraped
@@ -18079,6 +18621,9 @@ crabcrop_gate_capacity{{gate="ai"}} 2
 crabcrop_gate_capacity{{gate="video"}} 2
 crabcrop_gate_capacity{{gate="animation"}} 1
 crabcrop_gate_capacity{{gate="probe"}} 2
+# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.
+# TYPE crabcrop_ai_lock_recoveries_total counter
+crabcrop_ai_lock_recoveries_total {recoveries}
 # HELP crabcrop_request_log_queue_bytes Bytes of request log lines held for standard output, queued or being written.
 # TYPE crabcrop_request_log_queue_bytes gauge
 crabcrop_request_log_queue_bytes 0
@@ -18116,6 +18661,9 @@ crabcrop_cache_disk_groups_behind 0
 # HELP crabcrop_cache_disk_deletions_queued Purged or evicted disk entries whose file is not deleted yet.
 # TYPE crabcrop_cache_disk_deletions_queued gauge
 crabcrop_cache_disk_deletions_queued 0
+# HELP crabcrop_cache_disk_unlinks_failed_total Disk entry files an inline delete or the boot scan failed to remove, left on disk out of the index.
+# TYPE crabcrop_cache_disk_unlinks_failed_total counter
+crabcrop_cache_disk_unlinks_failed_total 0
 # HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.
 # TYPE crabcrop_cache_shared_puts_in_flight gauge
 crabcrop_cache_shared_puts_in_flight 0
@@ -18125,6 +18673,16 @@ crabcrop_cache_shared_puts_capacity {puts}
 # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.
 # TYPE crabcrop_cache_shared_puts_skipped_total counter
 crabcrop_cache_shared_puts_skipped_total 0
+# HELP crabcrop_cache_shared_group_writes_waiting Shared tier group write-backs waiting for a write slot.
+# TYPE crabcrop_cache_shared_group_writes_waiting gauge
+crabcrop_cache_shared_group_writes_waiting 0
+# HELP crabcrop_cache_shared_group_writes_skipped_total Shared tier group write-backs skipped with as many waiting for a slot as may.
+# TYPE crabcrop_cache_shared_group_writes_skipped_total counter
+crabcrop_cache_shared_group_writes_skipped_total 0
+# HELP crabcrop_cache_shared_refused_total Shared tier requests the bucket refused, by request.
+# TYPE crabcrop_cache_shared_refused_total counter
+crabcrop_cache_shared_refused_total{{request="lookup"}} 0
+crabcrop_cache_shared_refused_total{{request="purge"}} 0
 # HELP crabcrop_cache_shared_tombstones_unread Purge tombstones the last complete listing named that this replica has never read; their purges do not apply here until read.
 # TYPE crabcrop_cache_shared_tombstones_unread gauge
 crabcrop_cache_shared_tombstones_unread 0
@@ -18142,6 +18700,54 @@ crabcrop_cache_shared_tombstones_listed_timestamp_seconds 0.000
 }
 
 #[tokio::test]
+async fn model_lock_recoveries_count_on_metrics() {
+    // Issue #736: since issue #715 a model lock that a
+    // request's panic poisoned is taken back by the next
+    // request and counted, but the count was only in the line
+    // on stderr. `/metrics` shows it as a counter, which a
+    // recovery moves.
+    let state = Arc::new(AppState {
+        metrics_token: Some("metrics-token".to_string().into()),
+        ..test_state()
+    });
+    let base = serve_state(&state).await;
+    let counted = |metrics: &str| -> u64 {
+        metrics
+            .lines()
+            .find_map(|line| line.strip_prefix("crabcrop_ai_lock_recoveries_total "))
+            .unwrap_or_else(|| panic!("/metrics has no lock recovery counter:\n{metrics}"))
+            .parse()
+            .unwrap()
+    };
+    let before = scrape(&base, "metrics-token").await;
+    assert!(
+        before.contains(
+            "# HELP crabcrop_ai_lock_recoveries_total AI model locks taken back after a request panicked while it held one.\n\
+             # TYPE crabcrop_ai_lock_recoveries_total counter\n"
+        ),
+        "/metrics does not describe the lock recovery counter:\n{before}"
+    );
+    let at_first = counted(&before);
+    crate::ai::recover_a_poisoned_lock();
+    let after = scrape(&base, "metrics-token").await;
+    // Other tests in this process can recover locks of their
+    // own meanwhile: the counter rises by this one at least.
+    assert!(
+        counted(&after) > at_first,
+        "a recovery left the counter at {at_first}:\n{after}"
+    );
+    assert_eq!(
+        crate::observe::undescribed_series(&after),
+        Vec::<String>::new()
+    );
+    // The endpoints page lists it with the other series.
+    assert!(
+        include_str!("../../docs/endpoints.md").contains("`crabcrop_ai_lock_recoveries_total`"),
+        "docs/endpoints.md does not list the lock recovery counter"
+    );
+}
+
+#[tokio::test]
 async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     // Issue #463: every shared write-through was a bare
     // spawn, so a stalled bucket let them pile up, one per
@@ -18151,7 +18757,7 @@ async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
     let fake = crate::s3store::test_support::start_fake().await;
     fake.hold_puts.store(true, Ordering::SeqCst);
     let mut state = tier_test_state(None, &fake.endpoint);
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     let shared = state.shared_store.clone().unwrap();
     let base = serve_state(&state).await;
@@ -18758,7 +19364,7 @@ async fn serve_loader(loader: Loader, fallback: Option<Fallback>) -> String {
     state.shared_store = None;
     state.loader = loader;
     state.fallback = fallback;
-    state.metrics_token = Some("metrics-token".to_string());
+    state.metrics_token = Some("metrics-token".to_string().into());
     let state = Arc::new(state);
     serve_state(&state).await
 }
