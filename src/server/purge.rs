@@ -408,6 +408,11 @@ pub(in crate::server) fn purge_expiry_refusal(
 /// `CRABCROP_PURGE_REQUIRE_EXPIRY`, a URL without an expiry
 /// is a 403 as well. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
+///
+/// The purge runs in stages: [`admit_purge`] checks the
+/// signature and the expiry, [`purge_key_form`] names the
+/// entries the target is stored under, and [`fan_out_purge`]
+/// removes them from every tier, in a task of its own.
 pub(in crate::server) async fn purge_handle(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -429,15 +434,58 @@ pub(in crate::server) async fn purge_handle(
         );
     };
     let full = format!("/{tail}");
-    let (signature, key_id, presented) = match parse_signature(&full) {
+    let target = match admit_purge(&state, &full) {
+        Ok(target) => target,
+        Err(PurgeRefusal::Malformed((status, code, message))) => {
+            return error_response(status, code, message, accept.as_deref());
+        }
+        Err(PurgeRefusal::Rejected(logged, (status, code, message))) => {
+            state.metrics.record_purge();
+            purge_log(&state.request_log, "purge", logged, None).await;
+            return error_response(status, code, message, accept.as_deref());
+        }
+    };
+    let (target, key_form) = purge_key_form(&state, target);
+    // The fan-out runs in a spawned task once the
+    // signature has verified (issue #347): a purge that
+    // has started completes and is logged even if the
+    // caller disconnects mid-purge; dropping the
+    // JoinHandle detaches the task instead of cancelling
+    // it. The caller waits for the count, so the response
+    // still carries it. The task is tracked (issue #463),
+    // so a shutdown waits for a purge whose caller left.
+    let task = state
+        .background
+        .spawn(fan_out_purge(state.clone(), key_form, target));
+    let removed = task.await.unwrap_or(0);
+    (StatusCode::OK, format!("purged {removed}\n")).into_response()
+}
+
+/// Why [`admit_purge`] turned a purge request away.
+enum PurgeRefusal<'a> {
+    /// The URL does not parse: it is answered and nothing
+    /// else is done.
+    Malformed(ErrorParts),
+    /// The signature or the expiry refused it: the purge is
+    /// counted and logged as rejected under the target named
+    /// here, then answered.
+    Rejected(&'a str, ErrorParts),
+}
+
+/// The first stage of [`purge_handle`]: parse the signature
+/// segment of `full` (the path after `/purge`), verify it
+/// over the remainder as presented, split the purge's own
+/// expiry off the front, and check it. Returns the target
+/// that follows the expiry.
+fn admit_purge<'a>(state: &AppState, full: &'a str) -> Result<&'a str, PurgeRefusal<'a>> {
+    let (signature, key_id, presented) = match parse_signature(full) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(
+            return Err(PurgeRefusal::Malformed((
                 StatusCode::BAD_REQUEST,
                 e.code(),
                 e.to_string(),
-                accept.as_deref(),
-            );
+            )));
         }
     };
     // Verification runs over the remainder exactly as
@@ -448,14 +496,14 @@ pub(in crate::server) async fn purge_handle(
         .keyring
         .verify_purge(key_id.as_deref(), &signature, presented)
     {
-        state.metrics.record_purge();
-        purge_log(&state.request_log, "purge", presented, None).await;
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
+        return Err(PurgeRefusal::Rejected(
+            presented,
+            (
+                StatusCode::FORBIDDEN,
+                "bad_signature",
+                "bad signature".to_string(),
+            ),
+        ));
     }
     // A leading `exp:` segment is the purge's own expiry,
     // split off the verified remainder as the upload
@@ -464,21 +512,26 @@ pub(in crate::server) async fn purge_handle(
     let (expiry, target) = match crate::url::split_purge_remainder(presented) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(
+            return Err(PurgeRefusal::Malformed((
                 StatusCode::BAD_REQUEST,
                 e.code(),
                 e.to_string(),
-                accept.as_deref(),
-            );
+            )));
         }
     };
-    if let Some((status, code, message)) =
-        purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry)
-    {
-        state.metrics.record_purge();
-        purge_log(&state.request_log, "purge", target, None).await;
-        return error_response(status, code, message, accept.as_deref());
+    if let Some(refusal) = purge_expiry_refusal(expiry, unix_now(), state.purge_require_expiry) {
+        return Err(PurgeRefusal::Rejected(target, refusal));
     }
+    Ok(target)
+}
+
+/// The second stage of [`purge_handle`]: the target the
+/// purge logs, and the key form of the entries it names,
+/// for a verified target. The target unseals, then expands
+/// its presets and its source root, as the image path would
+/// expand it; the key form is the canonical form of its
+/// operations merged with the defaults.
+fn purge_key_form(state: &AppState, target: &str) -> (String, String) {
     // A sealed target (issue #255) unseals here, the first
     // step of the chain, now that the purge signature has
     // verified over the target as presented and the purge's
@@ -548,69 +601,63 @@ pub(in crate::server) async fn purge_handle(
         }
         Err(_) => crate::cache::bounded_key_base(target.to_string(), ""),
     };
-    // The fan-out runs in a spawned task once the
-    // signature has verified (issue #347): a purge that
-    // has started completes and is logged even if the
-    // caller disconnects mid-purge; dropping the
-    // JoinHandle detaches the task instead of cancelling
-    // it. The caller waits for the count, so the response
-    // still carries it. The task is tracked (issue #463),
-    // so a shutdown waits for a purge whose caller left.
-    let task_state = state.clone();
-    let task_target = target.to_string();
-    let task = state.background.spawn(async move {
-        // The tombstones land before any tier is touched
-        // (issues #350, #461): a write begun before this
-        // purge can then see it whenever it tries to land,
-        // including after this handler has finished, and
-        // every replica treats the copies it covers as
-        // purged until the shared walk ends (issue #400).
-        let (active, tombstone) = begin_purge(
-            &task_state,
-            crate::cache::PurgeTarget::Key(key_form.clone()),
-        )
-        .await;
-        let mut removed = task_state.cache.purge_matching(&key_form);
-        let (on_disk, disk) = purge_disk_tier(
-            &task_state,
-            &crate::cache::PurgeTarget::Key(key_form.clone()),
-        );
-        removed += on_disk;
-        if let Some(shared) = &task_state.shared_store {
-            // The shared tier deletes the current epoch's
-            // enumerable variants directly by object name
-            // (audit R2-24); the fingerprint-free form drives
-            // its matching walk, which also reaches older
-            // epochs and hint-variant spellings.
-            let epoch_form = format!("{key_form}#cfg{}", task_state.config_fingerprint);
-            removed += purge_shared_tier(
-                shared,
-                &task_state.background,
-                &task_state.request_log,
-                BegunPurge {
-                    active,
-                    tombstone,
-                    disk: disk.clone(),
-                },
-                Some(epoch_form),
-                "purge",
-                &task_target,
-            )
-            .await;
-        }
-        wait_for_disk_purge(disk).await;
-        task_state.metrics.record_purge();
-        purge_log(
+    (target.to_string(), key_form)
+}
+
+/// The last stage of [`purge_handle`], the task it spawns:
+/// remove the entries `key_form` names from every tier of
+/// this process, then count the purge and log it under
+/// `target`. Returns how many entries it removed.
+async fn fan_out_purge(task_state: Arc<AppState>, key_form: String, task_target: String) -> usize {
+    // The tombstones land before any tier is touched
+    // (issues #350, #461): a write begun before this
+    // purge can then see it whenever it tries to land,
+    // including after this handler has finished, and
+    // every replica treats the copies it covers as
+    // purged until the shared walk ends (issue #400).
+    let (active, tombstone) = begin_purge(
+        &task_state,
+        crate::cache::PurgeTarget::Key(key_form.clone()),
+    )
+    .await;
+    let mut removed = task_state.cache.purge_matching(&key_form);
+    let (on_disk, disk) = purge_disk_tier(
+        &task_state,
+        &crate::cache::PurgeTarget::Key(key_form.clone()),
+    );
+    removed += on_disk;
+    if let Some(shared) = &task_state.shared_store {
+        // The shared tier deletes the current epoch's
+        // enumerable variants directly by object name
+        // (audit R2-24); the fingerprint-free form drives
+        // its matching walk, which also reaches older
+        // epochs and hint-variant spellings.
+        let epoch_form = format!("{key_form}#cfg{}", task_state.config_fingerprint);
+        removed += purge_shared_tier(
+            shared,
+            &task_state.background,
             &task_state.request_log,
+            BegunPurge {
+                active,
+                tombstone,
+                disk: disk.clone(),
+            },
+            Some(epoch_form),
             "purge",
             &task_target,
-            Some(removed),
         )
         .await;
-        removed
-    });
-    let removed = task.await.unwrap_or(0);
-    (StatusCode::OK, format!("purged {removed}\n")).into_response()
+    }
+    wait_for_disk_purge(disk).await;
+    task_state.metrics.record_purge();
+    purge_log(
+        &task_state.request_log,
+        "purge",
+        &task_target,
+        Some(removed),
+    )
+    .await;
+    removed
 }
 
 /// `POST /purge-group/<signature>/<group>`: invalidate every
