@@ -664,7 +664,10 @@ fn has_directive(cache_control: &str, directive: &str) -> bool {
 /// check included. The requests keep waiting and no line is
 /// dropped. The check reads two atomics and never waits on
 /// the queue.
-async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub(in crate::server) async fn health(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
     let Some(full) = state.request_log.stalled() else {
         return "ok".into_response();
     };
@@ -684,7 +687,7 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 /// sides are hashed first, so the comparison always runs
 /// over two 32-byte digests, however long the presented
 /// token is.
-fn token_eq(a: &[u8], b: &[u8]) -> bool {
+pub(in crate::server) fn token_eq(a: &[u8], b: &[u8]) -> bool {
     use sha2::Digest as _;
     let (a, b) = (sha2::Sha256::digest(a), sha2::Sha256::digest(b));
     let mut diff = 0u8;
@@ -694,7 +697,10 @@ fn token_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub(in crate::server) async fn metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
     // The exposition is operational data (issue #270,
     // the PL-5 residual): it serves only to a bearer of
     // the configured token, and an unconfigured server
