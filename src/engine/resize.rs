@@ -5,7 +5,7 @@ use super::{EngineError, Window, jpeg_scaled};
 use crate::url::{Dimension, ImageSize, PadFill};
 
 #[cfg(doc)]
-use super::fusion_plan;
+use super::chain::fusion_plan;
 
 /// Shrink `(w, h)` proportionally to fit inside `cap`. Never
 /// grows the size.

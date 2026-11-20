@@ -4,7 +4,7 @@ use super::{EngineError, ProcessContext, SegmentObject};
 use crate::url::{Filter, PlainFilter};
 
 #[cfg(doc)]
-use super::ChainState;
+use super::chain::ChainState;
 
 /// Whether a filter leaves every existing pixel where it
 /// was (issue #373): the detection memos key on the image

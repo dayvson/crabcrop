@@ -2,15 +2,13 @@ use std::io::Cursor;
 
 use image::DynamicImage;
 
+use super::chain::{ChainState, apply_operations};
 use super::decode::decode_limits;
 use super::limits::{
     MAX_ANIMATED_FRAMES, MAX_ANIMATED_PIXELS, MAX_DECODE_ALLOC, MAX_DECODE_DIMENSION, OutputBudget,
     check_operation_count, dpr_factor,
 };
-use super::{
-    ChainState, EngineError, ProcessContext, Window, apply_operations, gif_frame_quantized, state,
-    webp_anim,
-};
+use super::{EngineError, ProcessContext, Window, gif_frame_quantized, state, webp_anim};
 use crate::filters::EncodeOptions;
 use crate::url::{Align, Filter, FormatOptions, ImageFormat, Operation, PlainFilter};
 
