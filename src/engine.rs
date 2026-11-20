@@ -12,7 +12,7 @@ use crate::filters::EncodeOptions;
 use crate::quality::auto_quality;
 use crate::url::{
     Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill,
-    ResolvedQuality,
+    PlainFilter, ResolvedQuality,
 };
 
 /// Register the JPEG XL decoder with the image crate, once.
@@ -3493,32 +3493,39 @@ pub(crate) fn scales_with_dpr(ops: &[Operation]) -> bool {
 fn filter_preserves_positions(filter: &Filter) -> bool {
     matches!(
         filter,
-        Filter::Grayscale
-            | Filter::Invert
-            | Filter::Blur(_)
-            | Filter::Brighten(_)
-            | Filter::Contrast(_)
-            | Filter::Gamma(_)
-            | Filter::Exposure(_)
-            | Filter::HighlightsShadows(..)
-            | Filter::Vibrance(_)
-            | Filter::HueRotate(_)
-            | Filter::Sharpen(_)
-            | Filter::Saturation(_)
-            | Filter::Rgb(..)
-            | Filter::Curve(..)
-            | Filter::Convolution(..)
-            | Filter::Noise(_)
-            | Filter::Equalize
-            | Filter::Enhance
-            | Filter::Sepia
-            | Filter::Duotone(..)
-            | Filter::Monochrome(_)
-            | Filter::Pixelate(_)
-            | Filter::Fill(_)
-            | Filter::Radius(_)
-            | Filter::Mask(_)
-            | Filter::BlurFaces
+        Filter::Plain(
+            PlainFilter::Grayscale
+                | PlainFilter::Invert
+                | PlainFilter::Blur(_)
+                | PlainFilter::Brighten(_)
+                | PlainFilter::Contrast(_)
+                | PlainFilter::Gamma(_)
+                | PlainFilter::Exposure(_)
+                | PlainFilter::HighlightsShadows(..)
+                | PlainFilter::Vibrance(_)
+                | PlainFilter::HueRotate(_)
+                | PlainFilter::Sharpen(_)
+                | PlainFilter::Saturation(_)
+                | PlainFilter::Rgb(..)
+                | PlainFilter::Curve(..)
+                | PlainFilter::Convolution(..)
+                | PlainFilter::Noise(_)
+                | PlainFilter::Equalize
+                | PlainFilter::Enhance
+                | PlainFilter::Sepia
+                | PlainFilter::Duotone(..)
+                | PlainFilter::Monochrome(_)
+                | PlainFilter::Pixelate(_)
+                | PlainFilter::Fill(_)
+                | PlainFilter::Radius(_)
+                | PlainFilter::Mask(_)
+                | PlainFilter::KeepProfile
+                | PlainFilter::MaxBytes(_)
+                | PlainFilter::Quality(_)
+                | PlainFilter::Palette(_)
+                | PlainFilter::Format(_)
+                | PlainFilter::NoUpscale
+        ) | Filter::BlurFaces
             | Filter::PixelateFaces
             | Filter::BlurClass(_)
             | Filter::PixelateClass(_)
@@ -3527,13 +3534,7 @@ fn filter_preserves_positions(filter: &Filter) -> bool {
             | Filter::BlurRegion { .. }
             | Filter::PixelateRegion { .. }
             | Filter::RemoveRegion { .. }
-            | Filter::KeepProfile
             | Filter::Dpr(_)
-            | Filter::MaxBytes(_)
-            | Filter::Quality(_)
-            | Filter::Palette(_)
-            | Filter::Format(_)
-            | Filter::NoUpscale
     )
 }
 
@@ -3553,7 +3554,7 @@ fn filter_keeps_focal(filter: &Filter) -> bool {
             Filter::Watermark { .. }
                 | Filter::Overlay { .. }
                 | Filter::Text { .. }
-                | Filter::Border(..)
+                | Filter::Plain(PlainFilter::Border(..))
                 | Filter::RemoveBg
         )
 }
@@ -4228,7 +4229,9 @@ fn survey_trims(
         };
         for (filter_index, filter) in filters.iter().enumerate() {
             let tolerance = match filter {
-                Filter::Trim(tolerance) | Filter::TrimSides(tolerance, _) => *tolerance,
+                Filter::Plain(
+                    PlainFilter::Trim(tolerance) | PlainFilter::TrimSides(tolerance, _),
+                ) => *tolerance,
                 _ => continue,
             };
             let key = (op_index, filter_index);
@@ -4858,8 +4861,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
         self.ctx.check_deadline()?;
         let before = (img.width(), img.height());
         let img = match filter {
-            Filter::Trim(tolerance) => self.trim(img, key, *tolerance, [0; 4]),
-            Filter::TrimSides(tolerance, sides) => self.trim(img, key, *tolerance, *sides),
+            Filter::Plain(PlainFilter::Trim(tolerance)) => self.trim(img, key, *tolerance, [0; 4]),
+            Filter::Plain(PlainFilter::TrimSides(tolerance, sides)) => {
+                self.trim(img, key, *tolerance, *sides)
+            }
             _ => {
                 let img = self.apply_filter(img, filter)?;
                 // A filter that moves pixels in a way the
@@ -5250,17 +5255,22 @@ impl<'r, 'a> ChainState<'r, 'a> {
         Ok(cropped)
     }
 
-    /// Apply one filter of a `filters:` segment: watermark
-    /// and overlay filters resolve against the
-    /// server-fetched images, the model and font filters run
-    /// through their providers, and everything else is a
-    /// plain filter (see [`ChainState::plain_filter`]).
+    /// Apply one filter of a `filters:` segment: a plain
+    /// filter runs through `crate::filters` (see
+    /// [`ChainState::plain_filter`]), watermark and overlay
+    /// filters resolve against the server-fetched images, the
+    /// model and font filters run through their providers,
+    /// and the region filters check their rectangle against
+    /// the image in effect. The match names every variant
+    /// (issue #741), so a new filter does not compile until
+    /// it is applied here or is a [`PlainFilter`].
     fn apply_filter(
         &mut self,
         mut img: DynamicImage,
         filter: &Filter,
     ) -> Result<DynamicImage, EngineError> {
         match filter {
+            Filter::Plain(plain) => img = self.plain_filter(img, plain)?,
             Filter::Watermark { url, x, y, alpha } => {
                 let wm = self
                     .ctx
@@ -5361,9 +5371,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     img = crate::filters::recolor_detections(&img, &boxes, *color);
                 }
             }
-            // Padding is read from the request as a
-            // whole by the face crop; no pixels here.
-            Filter::FacePad(_) => {}
+            // Request-wide directives, read from the request
+            // as a whole: the face crop reads the padding, and
+            // the DPR factor scales the size targets before
+            // the chain runs. No pixels here.
+            Filter::FacePad(_) | Filter::Dpr(_) => {}
             Filter::Upscale(factor) => {
                 let provider = self.ctx.upscale_provider.ok_or_else(|| {
                     EngineError::NotConfigured(
@@ -5419,7 +5431,6 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         crate::text::DrawError::Failed(message) => EngineError::Render(message),
                     })?;
             }
-            other => img = self.plain_filter(img, other)?,
         }
         Ok(img)
     }
@@ -5508,12 +5519,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
     }
 
     /// A plain filter: pixels in, pixels out through
-    /// `apply_filters_filled`, with any encoding directive it
+    /// `apply_filters_within`, with any encoding directive it
     /// carries absorbed into the chain's encode options.
     fn plain_filter(
         &mut self,
         img: DynamicImage,
-        filter: &Filter,
+        filter: &PlainFilter,
     ) -> Result<DynamicImage, EngineError> {
         // Arbitrary-angle rotation is
         // the one plain filter that grows
@@ -5521,7 +5532,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // is about to allocate before it
         // allocates (issue #182, R2-12),
         // per axis too (issue #521).
-        if let Filter::Rotate(degrees) = filter {
+        if let PlainFilter::Rotate(degrees) = filter {
             let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
             check_output_size(cw, ch, (img.width(), img.height()))?;
         }

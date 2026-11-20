@@ -5840,7 +5840,7 @@ fn width_hint_ops(width: u32, no_upscale: bool) -> Vec<crate::url::Operation> {
     })];
     if !no_upscale {
         ops.push(crate::url::Operation::Filters(vec![
-            crate::url::Filter::NoUpscale,
+            crate::url::Filter::Plain(crate::url::PlainFilter::NoUpscale),
         ]));
     }
     ops

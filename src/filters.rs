@@ -3,14 +3,17 @@
 //! [`apply_filters_filled`] runs pixel filters in URL order and collects
 //! encoding directives. `Format`, `Quality`, `Fill`, and
 //! `MaxBytes` do not touch pixels; they are recorded for the
-//! encoder.
+//! encoder. It takes [`PlainFilter`]s, the filters that need
+//! nothing but the image (issue #741); the engine applies
+//! the rest of [`crate::url::Filter`] itself, many of them
+//! through the functions here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::DynamicImage;
 
 use crate::url::{
-    CurveChannel, Filter, FormatOptions, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA,
+    CurveChannel, FormatOptions, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA, PlainFilter,
     Quality,
 };
 
@@ -326,10 +329,10 @@ impl From<DynamicImage> for WatermarkImage {
 /// sharpens as 255 does.
 pub(crate) const MAX_SHARPEN_AMOUNT: f32 = 255.0;
 
-/// The strength a `Filter::Sharpen` works at: the amount the
-/// URL names, held to [`MAX_SHARPEN_AMOUNT`]. A NaN or an
-/// infinite amount, which the parser never hands over, takes
-/// the bound too, past which nothing changes.
+/// The strength a `PlainFilter::Sharpen` works at: the
+/// amount the URL names, held to [`MAX_SHARPEN_AMOUNT`]. A
+/// NaN or an infinite amount, which the parser never hands
+/// over, takes the bound too, past which nothing changes.
 fn sharpen_amount(amount: f32) -> f32 {
     if amount.is_finite() {
         amount.min(MAX_SHARPEN_AMOUNT)
@@ -338,8 +341,8 @@ fn sharpen_amount(amount: f32) -> f32 {
     }
 }
 
-/// The angle a `Filter::HueRotate` turns the hue by: the
-/// degrees the URL names, reduced modulo 360 in integer
+/// The angle a `PlainFilter::HueRotate` turns the hue by:
+/// the degrees the URL names, reduced modulo 360 in integer
 /// arithmetic before they become a float (issue #713). The
 /// remainder keeps the sign, so every angle from -359 to 359
 /// turns as it always did, and any other integer turns as the
@@ -352,8 +355,8 @@ fn hue_degrees(degrees: i32) -> i32 {
     degrees % 360
 }
 
-/// The sigma a `Filter::Blur` applies with. The parser caps
-/// sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,
+/// The sigma a `PlainFilter::Blur` applies with. The parser
+/// caps sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,
 /// but a filter built any other way must not reach the image
 /// crate's Gaussian setup with a sigma that panics it (a
 /// subnormal trips an `is_normal` assert) or sizes a kernel
@@ -373,7 +376,7 @@ fn blur_sigma(sigma: f32) -> f32 {
 /// Returns the transformed image plus the encoding directives.
 /// Later directives win when a filter repeats.
 #[cfg(test)]
-pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, EncodeOptions) {
+pub fn apply_filters(img: DynamicImage, filters: &[PlainFilter]) -> (DynamicImage, EncodeOptions) {
     apply_filters_filled(img, filters, None)
 }
 
@@ -382,7 +385,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
 /// turned image leaves uncovered (issue #144).
 pub fn apply_filters_filled(
     img: DynamicImage,
-    filters: &[Filter],
+    filters: &[PlainFilter],
     fill: Option<[u8; 3]>,
 ) -> (DynamicImage, EncodeOptions) {
     match apply_filters_within(img, filters, fill, None) {
@@ -394,10 +397,13 @@ pub fn apply_filters_filled(
 /// [`apply_filters_filled`] under the request's processing
 /// deadline (`None` for none), which a blur checks before
 /// each row (issue #614). Past the deadline it stops and
-/// answers [`DeadlinePassed`]; the image is dropped.
+/// answers [`DeadlinePassed`]; the image is dropped. Every
+/// arm of its match applies a filter or records a
+/// directive: a filter the engine applies itself is not a
+/// [`PlainFilter`], so none reaches it (issue #741).
 pub fn apply_filters_within(
     img: DynamicImage,
-    filters: &[Filter],
+    filters: &[PlainFilter],
     fill: Option<[u8; 3]>,
     deadline: Option<std::time::Instant>,
 ) -> Result<(DynamicImage, EncodeOptions), DeadlinePassed> {
@@ -405,7 +411,7 @@ pub fn apply_filters_within(
     let mut options = EncodeOptions::default();
     for filter in filters {
         match filter {
-            Filter::Grayscale => {
+            PlainFilter::Grayscale => {
                 img = map_rgb_lanes(img, |r, g, b| {
                     for i in 0..LANES {
                         let y = round_lane(luma_of(r[i], g[i], b[i]));
@@ -415,36 +421,36 @@ pub fn apply_filters_within(
                     }
                 });
             }
-            Filter::Invert => img.invert(),
-            Filter::Blur(sigma) => img = blur_fast_within(&img, blur_sigma(*sigma), deadline)?,
-            Filter::Brighten(amount) => img = brighten_fast(img, *amount),
-            Filter::Contrast(amount) => {
+            PlainFilter::Invert => img.invert(),
+            PlainFilter::Blur(sigma) => img = blur_fast_within(&img, blur_sigma(*sigma), deadline)?,
+            PlainFilter::Brighten(amount) => img = brighten_fast(img, *amount),
+            PlainFilter::Contrast(amount) => {
                 img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
             }
-            Filter::Gamma(gamma) => {
+            PlainFilter::Gamma(gamma) => {
                 img = gamma_correct(img, *gamma);
             }
-            Filter::Exposure(stops) => {
+            PlainFilter::Exposure(stops) => {
                 img = exposure_correct(img, *stops);
             }
-            Filter::HighlightsShadows(highlights, shadows) => {
+            PlainFilter::HighlightsShadows(highlights, shadows) => {
                 img = highlights_shadows(&img, *highlights, *shadows);
             }
-            Filter::HueRotate(degrees) => img = huerotate_fast(img, hue_degrees(*degrees)),
-            Filter::Sharpen(amount) => {
+            PlainFilter::HueRotate(degrees) => img = huerotate_fast(img, hue_degrees(*degrees)),
+            PlainFilter::Sharpen(amount) => {
                 // Unsharp mask as a 3x3 convolution: the center is
                 // boosted, the cross neighbors subtracted.
                 let a = sharpen_amount(*amount);
                 let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
                 img = map_rgb_image(img, |rgb| filter3x3_rgb(&rgb, &kernel));
             }
-            Filter::Saturation(amount) => {
+            PlainFilter::Saturation(amount) => {
                 img = map_rgb_image(img, |rgb| saturate(rgb, *amount));
             }
-            Filter::Vibrance(amount) => {
+            PlainFilter::Vibrance(amount) => {
                 img = map_rgb_image(img, |rgb| vibrance(rgb, *amount));
             }
-            Filter::Rgb(r, g, b) => {
+            PlainFilter::Rgb(r, g, b) => {
                 img = map_rgb(img, |pr, pg, pb| {
                     [
                         (pr as i32 + r).clamp(0, 255) as u8,
@@ -453,22 +459,22 @@ pub fn apply_filters_within(
                     ]
                 });
             }
-            Filter::Curve(channel, points) => {
+            PlainFilter::Curve(channel, points) => {
                 img = tone_curve(&img, *channel, points);
             }
-            Filter::Convolution(values, normalize) => {
+            PlainFilter::Convolution(values, normalize) => {
                 img = convolve(&img, values, *normalize);
             }
-            Filter::Noise(amount) => {
+            PlainFilter::Noise(amount) => {
                 img = add_noise(&img, *amount);
             }
-            Filter::Equalize => {
+            PlainFilter::Equalize => {
                 img = map_rgb_image(img, equalize);
             }
-            Filter::Enhance => {
+            PlainFilter::Enhance => {
                 img = map_rgb_image(img, auto_levels);
             }
-            Filter::Rotate(degrees) => {
+            PlainFilter::Rotate(degrees) => {
                 let normalized = fold_degrees(*degrees);
                 img = if normalized == 90.0 {
                     rotate90_fast(&img)
@@ -482,70 +488,28 @@ pub fn apply_filters_within(
                     rotate_arbitrary(img, normalized, fill)
                 };
             }
-            Filter::Trim(tolerance) => img = trim(img, *tolerance),
-            Filter::TrimSides(tolerance, sides) => img = trim_sides(img, *tolerance, *sides),
-            // Watermarks are applied by the engine, which owns
-            // the resolved images; one reaching this function is
-            // unresolved by construction and leaves pixels alone.
-            // (The engine never routes them here.)
-            // Region redaction runs in the engine, which
-            // validates the rectangle against the image size
-            // in effect at that point. (Same routing.)
-            Filter::BlurRegion { .. } | Filter::PixelateRegion { .. } => {}
-            // Region removal runs in the engine, which owns
-            // the inpainting provider. (Same routing as the
-            // other region filters.)
-            Filter::RemoveRegion { .. } => {}
-            Filter::Watermark { .. } => {}
-            // Overlays are applied by the engine, which owns
-            // the resolved images. (Same routing as above.)
-            Filter::Overlay { .. } => {}
-            // Background removal is applied by the engine, which
-            // owns the mask provider. (Same routing as above.)
-            Filter::RemoveBg => {}
-            // Studio mode is applied by the engine, which owns
-            // the mask provider and the brand color. (Same
-            // routing as above.)
-            Filter::Studio(_) => {}
-            // Upscaling is applied by the engine, which owns the
-            // upscale provider. (Same routing.)
-            Filter::Upscale(_) => {}
-            // Text is drawn by the engine, which owns the
-            // configured font renderer. (Same routing.)
-            Filter::Text { .. } => {}
-            // Face operations run in the engine, which owns the
-            // face provider and the shared detection memo. Face
-            // padding is a directive the face crop reads from
-            // the request as a whole. (Same routing.)
-            Filter::BlurFaces | Filter::PixelateFaces | Filter::FacePad(_) => {}
-            // Class operations are engine-routed (they need
-            // the detection provider), like the face filters
-            // above.
-            Filter::BlurClass(_) | Filter::PixelateClass(_) | Filter::RecolorClass(..) => {}
-            // DPR scales size targets in the engine, which
-            // resolves it against the request as a whole (with
-            // the client-hint fallback). (Same routing.)
-            Filter::Dpr(_) => {}
-            Filter::Sepia => img = sepia(img),
-            Filter::Duotone(shadow, highlight) => img = duotone(img, *shadow, *highlight),
-            Filter::Monochrome(color) => img = monochrome(img, *color),
-            Filter::Pixelate(block) => img = pixelate(&img, *block),
-            Filter::Flip(direction) => {
+            PlainFilter::Trim(tolerance) => img = trim(img, *tolerance),
+            PlainFilter::TrimSides(tolerance, sides) => img = trim_sides(img, *tolerance, *sides),
+            PlainFilter::Sepia => img = sepia(img),
+            PlainFilter::Duotone(shadow, highlight) => img = duotone(img, *shadow, *highlight),
+            PlainFilter::Monochrome(color) => img = monochrome(img, *color),
+            PlainFilter::Pixelate(block) => img = pixelate(&img, *block),
+            PlainFilter::Flip(direction) => {
                 img = match direction {
                     crate::url::FlipDirection::Horizontal => fliph_fast(&img),
                     crate::url::FlipDirection::Vertical => flipv_fast(&img),
                 }
             }
-            Filter::Radius(radii) => img = rounded_corners(&img, *radii),
-            Filter::Border(width, color) => img = draw_border(&img, *width, *color),
-            Filter::Mask(shape) => img = mask_shape(&img, *shape),
-            Filter::Fill(color) => options.fill = Some(*color),
-            Filter::MaxBytes(n) => options.max_bytes = Some(*n),
-            Filter::KeepProfile => options.keep_profile = true,
-            Filter::Quality(q) => options.quality = Some(q.clone()),
-            Filter::Palette(n) => options.palette = Some(*n),
-            Filter::NoUpscale => options.no_upscale = true,
-            Filter::Format(spec) => {
+            PlainFilter::Radius(radii) => img = rounded_corners(&img, *radii),
+            PlainFilter::Border(width, color) => img = draw_border(&img, *width, *color),
+            PlainFilter::Mask(shape) => img = mask_shape(&img, *shape),
+            PlainFilter::Fill(color) => options.fill = Some(*color),
+            PlainFilter::MaxBytes(n) => options.max_bytes = Some(*n),
+            PlainFilter::KeepProfile => options.keep_profile = true,
+            PlainFilter::Quality(q) => options.quality = Some(q.clone()),
+            PlainFilter::Palette(n) => options.palette = Some(*n),
+            PlainFilter::NoUpscale => options.no_upscale = true,
+            PlainFilter::Format(spec) => {
                 options.format = Some(spec.format);
                 options.format_options = spec.options;
             }

@@ -755,12 +755,122 @@ fn parse_studio(p: &str) -> Option<StudioSpec> {
     Some(spec)
 }
 
-/// One filter from a `filters:...` segment.
+/// One filter from a `filters:...` segment, as the engine
+/// routes it (issue #741). A [`PlainFilter`] needs nothing
+/// but the image it is given, and `crate::filters` applies
+/// it. Every other variant needs something only the engine
+/// holds: the images the server fetched, a model, the font,
+/// the bounds of the image in effect, or the request as a
+/// whole. The engine applies those itself. The engine's
+/// match names every variant, and the match in
+/// `crate::filters` every plain one, so a new filter does
+/// not compile until one side applies it.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
 /// for the tests and the pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
+    /// A filter `crate::filters` applies from the image
+    /// alone.
+    Plain(PlainFilter),
+    /// Overlay another image at (x, y) with an opacity (0-100).
+    /// The URL is the percent-decoded watermark location; the
+    /// server fetches it before the engine runs. Negative
+    /// coordinates anchor from the right/bottom edges.
+    Watermark {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+    },
+    /// Composite another image over the result with a blend
+    /// mode, at (x, y) with an opacity (0-100), optionally
+    /// scaled to `width` percent of the base image's width.
+    /// The URL is the percent-decoded overlay location; the
+    /// server fetches it before the engine runs, through the
+    /// same prefetch as watermarks. Negative coordinates
+    /// anchor from the right/bottom edges.
+    Overlay {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+        blend: BlendMode,
+        width: Option<u32>,
+    },
+    /// Remove the background with the server's segmentation
+    /// model, keeping the subject over transparency. The model
+    /// is operator-configured; the engine applies its mask.
+    RemoveBg,
+    /// Studio mode (issues #197 and #198): one filter
+    /// naming an outcome, expanded deterministically in the
+    /// engine and reported in meta. `product` composites
+    /// the subject the segmentation model finds onto a
+    /// backdrop with a synthesized contact shadow, scaled
+    /// and centered to a pad margin; `scene` keeps the
+    /// photograph's scene, reframing it on the detected
+    /// subject and applying a per-image light and color
+    /// correction.
+    Studio(StudioSpec),
+    /// Blur every detected face (privacy redaction), backed by
+    /// the server's face model.
+    BlurFaces,
+    /// Pixelate every detected face (privacy redaction),
+    /// backed by the server's face model.
+    PixelateFaces,
+    /// Blur every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    BlurClass(String),
+    /// Pixelate every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    PixelateClass(String),
+    /// Recolor every detected object of the named class to
+    /// the given RGB color (issue #175), backed by the
+    /// server's detection model. With a segment provider
+    /// configured the paint follows the object's
+    /// silhouette; without one it fills the box.
+    RecolorClass(String, [u8; 3]),
+    /// Padding for `crop:*:face`, as a fraction of the face
+    /// size added on every side. A request-wide directive,
+    /// like `no_upscale`.
+    FacePad(f32),
+    /// AI super-resolution by the given factor (2 or 4),
+    /// backed by the server's upscale model.
+    Upscale(u32),
+    /// Device-pixel-ratio directive: scale size and crop
+    /// targets by the factor (1, 1.5, 2, or 3) before the
+    /// no-upscale cap sees them.
+    Dpr(f32),
+    /// Rendered text overlaid at one of the nine grid anchors.
+    /// The text is the percent-decoded label; color is RGBA.
+    Text {
+        text: String,
+        size: u32,
+        color: [u8; 4],
+        anchor: Anchor,
+    },
+    /// Gaussian-blur the rectangle (x, y, w, h), in the
+    /// pixels of the image at the point the filter runs.
+    /// Redaction of plates, screens, documents.
+    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Pixelate the rectangle (x, y, w, h), same coordinate
+    /// convention as `BlurRegion`.
+    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Erase the rectangle (x, y, w, h) and inpaint it from
+    /// the surrounding pixels, same coordinate convention
+    /// and bounds discipline as `BlurRegion`. Backed by the
+    /// server's inpainting model (issue #176).
+    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
+}
+
+/// A filter that needs nothing but the image it is given
+/// (issue #741): a pixel filter, which `crate::filters`
+/// applies in URL order, or an encoding directive, which it
+/// records for the encoder. [`Filter::Plain`] carries it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlainFilter {
     /// Desaturate the image.
     Grayscale,
     /// Invert every channel.
@@ -866,87 +976,9 @@ pub enum Filter {
     /// counts, clamped by the engine so at least one pixel
     /// survives on each axis.
     TrimSides(u8, [u32; 4]),
-    /// Overlay another image at (x, y) with an opacity (0-100).
-    /// The URL is the percent-decoded watermark location; the
-    /// server fetches it before the engine runs. Negative
-    /// coordinates anchor from the right/bottom edges.
-    Watermark {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-    },
-    /// Composite another image over the result with a blend
-    /// mode, at (x, y) with an opacity (0-100), optionally
-    /// scaled to `width` percent of the base image's width.
-    /// The URL is the percent-decoded overlay location; the
-    /// server fetches it before the engine runs, through the
-    /// same prefetch as watermarks. Negative coordinates
-    /// anchor from the right/bottom edges.
-    Overlay {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-        blend: BlendMode,
-        width: Option<u32>,
-    },
-    /// Remove the background with the server's segmentation
-    /// model, keeping the subject over transparency. The model
-    /// is operator-configured; the engine applies its mask.
-    RemoveBg,
-    /// Studio mode (issues #197 and #198): one filter
-    /// naming an outcome, expanded deterministically in the
-    /// engine and reported in meta. `product` composites
-    /// the subject the segmentation model finds onto a
-    /// backdrop with a synthesized contact shadow, scaled
-    /// and centered to a pad margin; `scene` keeps the
-    /// photograph's scene, reframing it on the detected
-    /// subject and applying a per-image light and color
-    /// correction.
-    Studio(StudioSpec),
     /// Keep the source ICC profile instead of converting
     /// to sRGB (`filters:keep_profile`).
     KeepProfile,
-    /// Blur every detected face (privacy redaction), backed by
-    /// the server's face model.
-    BlurFaces,
-    /// Pixelate every detected face (privacy redaction),
-    /// backed by the server's face model.
-    PixelateFaces,
-    /// Blur every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    BlurClass(String),
-    /// Pixelate every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    PixelateClass(String),
-    /// Recolor every detected object of the named class to
-    /// the given RGB color (issue #175), backed by the
-    /// server's detection model. With a segment provider
-    /// configured the paint follows the object's
-    /// silhouette; without one it fills the box.
-    RecolorClass(String, [u8; 3]),
-    /// Padding for `crop:*:face`, as a fraction of the face
-    /// size added on every side. A request-wide directive,
-    /// like `no_upscale`.
-    FacePad(f32),
-    /// AI super-resolution by the given factor (2 or 4),
-    /// backed by the server's upscale model.
-    Upscale(u32),
-    /// Device-pixel-ratio directive: scale size and crop
-    /// targets by the factor (1, 1.5, 2, or 3) before the
-    /// no-upscale cap sees them.
-    Dpr(f32),
-    /// Rendered text overlaid at one of the nine grid anchors.
-    /// The text is the percent-decoded label; color is RGBA.
-    Text {
-        text: String,
-        size: u32,
-        color: [u8; 4],
-        anchor: Anchor,
-    },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Rounded corners: radii in pixels, CSS order (top-left,
@@ -972,18 +1004,6 @@ pub enum Filter {
     Pixelate(u32),
     /// Mirror the image, horizontally or vertically.
     Flip(FlipDirection),
-    /// Gaussian-blur the rectangle (x, y, w, h), in the
-    /// pixels of the image at the point the filter runs.
-    /// Redaction of plates, screens, documents.
-    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Pixelate the rectangle (x, y, w, h), same coordinate
-    /// convention as `BlurRegion`.
-    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Erase the rectangle (x, y, w, h) and inpaint it from
-    /// the surrounding pixels, same coordinate convention
-    /// and bounds discipline as `BlurRegion`. Backed by the
-    /// server's inpainting model (issue #176).
-    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -2359,16 +2379,16 @@ pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec
         matches!(
             op,
             Operation::Filters(filters)
-                if filters.iter().any(|f| matches!(f, Filter::MaxBytes(_)))
+                if filters.iter().any(|f| matches!(f, Filter::Plain(PlainFilter::MaxBytes(_))))
         )
     });
     let keep_default_filter = |f: &Filter| -> bool {
         match f {
-            Filter::Format(_) => directives.explicit_format.is_none(),
-            Filter::Quality(_) => !directives.quality_directive,
-            Filter::Fill(_) => directives.fill.is_none(),
+            Filter::Plain(PlainFilter::Format(_)) => directives.explicit_format.is_none(),
+            Filter::Plain(PlainFilter::Quality(_)) => !directives.quality_directive,
+            Filter::Plain(PlainFilter::Fill(_)) => directives.fill.is_none(),
             Filter::Dpr(_) => directives.dpr.is_none(),
-            Filter::MaxBytes(_) => !url_has_max_bytes,
+            Filter::Plain(PlainFilter::MaxBytes(_)) => !url_has_max_bytes,
             _ => true,
         }
     };
@@ -2841,25 +2861,25 @@ impl RequestDirectives {
             if let Operation::Filters(filters) = op {
                 for f in filters {
                     match f {
-                        Filter::Format(spec) => {
+                        Filter::Plain(PlainFilter::Format(spec)) => {
                             d.explicit_format = Some(spec.format);
                             d.format_options = spec.options;
                         }
-                        Filter::NoUpscale => d.no_upscale = true,
-                        Filter::Fill(color) => d.fill = Some(*color),
+                        Filter::Plain(PlainFilter::NoUpscale) => d.no_upscale = true,
+                        Filter::Plain(PlainFilter::Fill(color)) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
                         Filter::Studio(_) => d.studio = true,
                         Filter::RemoveRegion { .. } => d.remove_region = true,
-                        Filter::Radius(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Radius(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("radius")
                         }
-                        Filter::Mask(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Mask(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("mask")
                         }
                         Filter::Upscale(_) => d.upscale = true,
                         Filter::Dpr(factor) => d.dpr = Some(*factor),
-                        Filter::KeepProfile => d.keep_profile = true,
-                        Filter::Quality(_) => d.quality_directive = true,
+                        Filter::Plain(PlainFilter::KeepProfile) => d.keep_profile = true,
+                        Filter::Plain(PlainFilter::Quality(_)) => d.quality_directive = true,
                         Filter::Text { .. } => d.text = true,
                         Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
                         Filter::BlurClass(name)

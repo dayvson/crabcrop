@@ -21,7 +21,7 @@ pub use crabcrop::{color, engine, filters, svg, url};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use url::{Dimension, Filter, Operation, Signature};
+use url::{Dimension, Filter, Operation, PlainFilter, Signature};
 
 /// The preset map `check` expands requests against: a
 /// fixed stand-in for operator configuration (issue
@@ -485,11 +485,13 @@ pub enum ChainOutcome {
 /// The operation-chain invariants (issues #387, #415,
 /// #476). A parsed request runs through two legs.
 ///
-/// The filter leg applies the filters of every `filters:`
-/// segment, one at a time in URL order, to the synthetic
-/// source with the request's `fill` color (resolved the way
-/// the engine resolves it) for the corners an arbitrary
-/// rotation uncovers. Application is total, and every
+/// The filter leg applies the plain filters
+/// ([`url::PlainFilter`]) of every `filters:` segment, one
+/// at a time in URL order, to the synthetic source with the
+/// request's `fill` color (resolved the way the engine
+/// resolves it) for the corners an arbitrary rotation
+/// uncovers; the filters the engine applies itself run in
+/// the engine leg alone. Application is total, and every
 /// filter lands on the canvas its kind predicts:
 ///
 /// - a rotation lands on [`filters::rotated_canvas`] of the
@@ -537,16 +539,20 @@ pub fn check_chain(input: &str) -> ChainOutcome {
 }
 
 /// The filter leg of [`check_chain`]. Returns how many
-/// filters it applied before the chain ended or a budget
-/// stopped it.
+/// plain filters it applied before the chain ended or a
+/// budget stopped it; the others are not counted.
 fn check_filter_leg(ops: &[Operation]) -> usize {
-    let chain: Vec<&Filter> = ops
+    let chain: Vec<&PlainFilter> = ops
         .iter()
         .filter_map(|op| match op {
             Operation::Filters(filters) => Some(filters.iter()),
             _ => None,
         })
         .flatten()
+        .filter_map(|filter| match filter {
+            Filter::Plain(plain) => Some(plain),
+            _ => None,
+        })
         .collect();
     let fill = url::RequestDirectives::analyze(ops).fill;
     let mut img = synthetic_image();
@@ -555,15 +561,15 @@ fn check_filter_leg(ops: &[Operation]) -> usize {
     for filter in chain {
         let (w, h) = (img.width(), img.height());
         let predicted = match filter {
-            Filter::Rotate(degrees) => {
+            PlainFilter::Rotate(degrees) => {
                 let (rw, rh) = filters::rotated_canvas(w, h, *degrees);
                 if rw as u64 * rh as u64 > CHAIN_MAX_PIXELS {
                     return applied;
                 }
                 Some((rw, rh))
             }
-            Filter::Trim(_) | Filter::TrimSides(..) => None,
-            Filter::Blur(sigma) => {
+            PlainFilter::Trim(_) | PlainFilter::TrimSides(..) => None,
+            PlainFilter::Blur(sigma) => {
                 blur_spent =
                     blur_spent.saturating_add(blur_work(u64::from(w) * u64::from(h), *sigma));
                 if blur_spent > CHAIN_MAX_BLUR_WORK {
@@ -774,7 +780,7 @@ pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
             Operation::Filters(filters) => {
                 for filter in filters {
                     cur = match filter {
-                        Filter::Rotate(degrees) => {
+                        Filter::Plain(PlainFilter::Rotate(degrees)) => {
                             // The rotated bounding box grows with
                             // either side, so the bounds rotate
                             // with their ends.
@@ -785,7 +791,7 @@ pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
                                 Axis::around(lo.1 as f64, hi.1 as f64),
                             ))?
                         }
-                        Filter::Trim(_) | Filter::TrimSides(..) => (
+                        Filter::Plain(PlainFilter::Trim(_) | PlainFilter::TrimSides(..)) => (
                             Axis {
                                 lo: 1,
                                 hi: cur.0.hi,
@@ -795,7 +801,7 @@ pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
                                 hi: cur.1.hi,
                             },
                         ),
-                        Filter::Blur(sigma) => {
+                        Filter::Plain(PlainFilter::Blur(sigma)) => {
                             spend(cur.0.hi.saturating_mul(cur.1.hi), *sigma)?;
                             cur
                         }

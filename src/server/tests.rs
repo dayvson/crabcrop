@@ -10770,13 +10770,13 @@ fn mif1_heic() -> Vec<u8> {
 /// A JPEG XL still as a bare codestream, the form the
 /// engine writes.
 fn bare_jxl() -> Vec<u8> {
-    use crate::url::{Filter, FormatSpec, Operation};
+    use crate::url::{Filter, FormatSpec, Operation, PlainFilter};
     let jxl = Engine
         .process(
             &test_png(),
-            &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-                ImageFormat::Jxl,
-            ))])],
+            &[Operation::Filters(vec![Filter::Plain(
+                PlainFilter::Format(FormatSpec::plain(ImageFormat::Jxl)),
+            )])],
         )
         .unwrap()
         .bytes;
