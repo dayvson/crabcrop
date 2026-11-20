@@ -552,7 +552,7 @@ pub fn app(state: impl Into<Arc<AppState>>) -> Router {
 }
 
 /// The `Accept` header's value, for [`error_response`].
-fn accept_of(headers: &HeaderMap) -> Option<String> {
+pub(in crate::server) fn accept_of(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -2990,7 +2990,7 @@ fn sf_quote(value: &str) -> String {
 /// of the recipe the token hides. Group purges still reach
 /// its entry, because the groups are recorded on the cache
 /// entry, never read back from this header.
-fn attach_cache_headers(
+pub(in crate::server) fn attach_cache_headers(
     response: &mut Response,
     cache_status: &'static str,
     groups: &[String],
@@ -6293,7 +6293,7 @@ pub use meta::{EmbeddingMeta, ModerationMeta, OcrMeta};
 /// it is dropped, because a response that is stale on arrival
 /// cannot also promise to never change, and the pair would tell
 /// caches to pin what the caller just asked them to revalidate.
-fn respond(
+pub(in crate::server) fn respond(
     format: ImageFormat,
     quality: Option<u8>,
     bytes: bytes::Bytes,
@@ -6340,7 +6340,7 @@ fn respond(
     (headers, bytes).into_response()
 }
 
-fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
+pub(in crate::server) fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
     let inm = if_none_match.trim();
     if inm == "*" {
         return true;
@@ -6351,7 +6351,11 @@ fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
     })
 }
 
-fn finalize_validators(response: &mut Response, etag: &str, if_none_match: Option<&str>) {
+pub(in crate::server) fn finalize_validators(
+    response: &mut Response,
+    etag: &str,
+    if_none_match: Option<&str>,
+) {
     let cacheable = response
         .headers()
         .get(header::CACHE_CONTROL)
@@ -6379,7 +6383,8 @@ fn source_budget_busy(accept: Option<&str>) -> Response {
     busy_response(SOURCE_BUDGET_BUSY, 1, accept)
 }
 
-const SOURCE_BUDGET_BUSY: &str = "server busy: too many source images held in memory";
+pub(in crate::server) const SOURCE_BUDGET_BUSY: &str =
+    "server busy: too many source images held in memory";
 
 const SOURCE_LOOKUP_BUSY: &str = "server busy: too many source host lookups waiting";
 
@@ -6388,7 +6393,10 @@ const SOURCE_LOOKUP_BUSY: &str = "server busy: too many source host lookups wait
 /// [`crate::loader::LOOKUP_SLOTS`]), which carries the gates'
 /// Retry-After, since a slot that stayed taken for the whole
 /// wait is held by a lookup the resolver is not answering.
-fn load_busy_response(e: &LoadError, accept: Option<&str>) -> Option<Response> {
+pub(in crate::server) fn load_busy_response(
+    e: &LoadError,
+    accept: Option<&str>,
+) -> Option<Response> {
     match e {
         LoadError::Busy => Some(source_budget_busy(accept)),
         LoadError::LookupBusy => Some(busy_response(SOURCE_LOOKUP_BUSY, 5, accept)),
@@ -6401,7 +6409,11 @@ fn load_busy_response(e: &LoadError, accept: Option<&str>) -> Option<Response> {
 /// them retry straight into the same full queue; the value
 /// is sized to the gate (the AI gate's jobs run seconds,
 /// the process gate's run in well under one).
-fn busy_response(message: &'static str, retry_after_secs: u64, accept: Option<&str>) -> Response {
+pub(in crate::server) fn busy_response(
+    message: &'static str,
+    retry_after_secs: u64,
+    accept: Option<&str>,
+) -> Response {
     let mut response = error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         "server_busy",
@@ -6420,13 +6432,13 @@ fn busy_response(message: &'static str, retry_after_secs: u64, accept: Option<&s
 /// with the same 403, so a lifted token reveals nothing
 /// about the payload it carries. The real error still
 /// reaches the server log through the normal builders.
-fn sealed_refusal_response() -> Response {
+pub(in crate::server) fn sealed_refusal_response() -> Response {
     (StatusCode::FORBIDDEN, "bad signature").into_response()
 }
 
 /// `resp` for a plain request, the uniform sealed refusal
 /// for a sealed one.
-fn sealed_or(sealed: bool, resp: Response) -> Response {
+pub(in crate::server) fn sealed_or(sealed: bool, resp: Response) -> Response {
     if sealed {
         sealed_refusal_response()
     } else {
@@ -6446,7 +6458,7 @@ fn sealed_or(sealed: bool, resp: Response) -> Response {
 /// A host name that resolves to a non-public address is a
 /// [`LoadError::Network`] cause, so it answers exactly as a
 /// name that does not resolve.
-fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
+pub(in crate::server) fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
     match e {
         LoadError::Forbidden(_) => (
             StatusCode::FORBIDDEN,
@@ -6508,7 +6520,7 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
     }
 }
 
-fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
+pub(in crate::server) fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
     if let Some(busy) = load_busy_response(&e, accept) {
         return busy;
     }
@@ -6535,7 +6547,7 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
 /// no-store`, which the router's response-header layer
 /// adds on every route, and on the image route with the
 /// same `Vary` as an image ([`image_vary`]).
-fn error_response(
+pub(in crate::server) fn error_response(
     status: StatusCode,
     code: &str,
     message: String,
@@ -6576,7 +6588,7 @@ fn truncate_echo(message: &str) -> String {
 /// stable code, and the message. A refusal that carries
 /// them leaves the answer to the one place that knows how
 /// the request may be answered (see [`Refusal::answer`]).
-type ErrorParts = (StatusCode, &'static str, String);
+pub(in crate::server) type ErrorParts = (StatusCode, &'static str, String);
 
 /// The refusal for an image remainder that begins with
 /// [`crabcrop_url::RESERVED_SEGMENT`]. Every derived subkey
@@ -6584,7 +6596,7 @@ type ErrorParts = (StatusCode, &'static str, String);
 /// HMAC of a label under that segment, so no image URL may
 /// begin with it, and no source can: it names no scheme the
 /// loader fetches.
-fn reserved_remainder_parts() -> ErrorParts {
+pub(in crate::server) fn reserved_remainder_parts() -> ErrorParts {
     (
         StatusCode::BAD_REQUEST,
         "reserved_segment",
@@ -6597,7 +6609,7 @@ fn reserved_remainder_parts() -> ErrorParts {
 
 /// The refusal for a signature that does not verify, and
 /// for a sealed spelling on the explain route.
-fn bad_signature_parts() -> ErrorParts {
+pub(in crate::server) fn bad_signature_parts() -> ErrorParts {
     (
         StatusCode::FORBIDDEN,
         "bad_signature",
@@ -6607,7 +6619,7 @@ fn bad_signature_parts() -> ErrorParts {
 
 /// A grammar failure's parts: the parser's code and its
 /// (truncated) message.
-fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
+pub(in crate::server) fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
     (
         StatusCode::BAD_REQUEST,
         e.code(),
@@ -6692,7 +6704,7 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
 /// bound before it fails again.
 const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
 
-fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
+pub(in crate::server) fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
     stderr_line!("engine error: {e}");
     let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
