@@ -2555,7 +2555,7 @@ fn meta_flight_key(work: &MissWork) -> String {
 /// its arguments for as long as it runs, so a stage of its
 /// own that takes the work would hold a second copy of it
 /// in every request's future.
-async fn run_flight(
+pub(in crate::server) async fn run_flight(
     state: &Arc<AppState>,
     path: &str,
     work: MissWork,
@@ -2903,7 +2903,7 @@ fn answer_miss(
 /// request in flight, which the shutdown drain counts as
 /// such; one whose client has gone is counted as a render
 /// left running (see [`Background::spawn_miss`]).
-async fn finish_started_miss<F>(
+pub(in crate::server) async fn finish_started_miss<F>(
     state: &AppState,
     progress: MissProgress,
     miss: F,
@@ -3095,7 +3095,7 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
 /// settles on the first flight (issue #407), so the
 /// cap only comes into play for waiters no flight could
 /// answer.
-const MAX_FLIGHT_WAITS: u32 = 3;
+pub(in crate::server) const MAX_FLIGHT_WAITS: u32 = 3;
 
 /// Whether `entry` must not stand in any tier: a purge
 /// recorded after `snapshot` covers it, so the write that
