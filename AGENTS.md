@@ -31,14 +31,19 @@ both SDKs must all pass.
   sources in `animated.rs`, sizing in `resize.rs`, compositing in
   `overlay.rs`, detections in `detect.rs`, the focal form in
   `focal.rs`, encoders in `encode.rs`, pipeline state in
-  `state.rs`), HTTP and caching in `server.rs` (the state and the
-  router, with a file per part under `server/`: admission in
-  `admission.rs`, the image route in `request.rs`, flights in
-  `flight.rs`, the cache tiers in `tiers.rs`, the miss path in
-  `miss.rs`, responses in `response.rs`, the `/explain`, purge,
-  upload and system endpoints in `explain.rs`, `purge.rs`,
-  `upload.rs` and `system.rs`, request coalescing in `process.rs`,
-  metadata responses in `meta.rs`), source fetching policy in
+  `state.rs`, the reduced-scale JPEG decode in `jpeg_scaled.rs`,
+  the `overlay(...,width)` scale in `overlay_scale.rs`, animated
+  WebP frames through libwebp in `webp_anim.rs`), HTTP and caching
+  in `server.rs` (the state and the router, with a file per part
+  under `server/`: admission in `admission.rs`, the image route in
+  `request.rs`, flights in `flight.rs`, the cache tiers in
+  `tiers.rs`, the miss path in `miss.rs`, responses in
+  `response.rs`, the `/explain`, purge, upload and system endpoints
+  in `explain.rs`, `purge.rs`, `upload.rs` and `system.rs`, request
+  coalescing in `process.rs`, metadata responses in `meta.rs`, the
+  accept loop and its connection bounds in `listen.rs`, the work
+  handlers leave running and the shutdown drain in
+  `background.rs`), source fetching policy in
   `loader.rs`, AI features in `ai/` (provider traits in
   `ai/mod.rs`, one file per provider family, all re-exported from
   `crate::ai`) and `studio.rs`. A large module keeps its unit tests in
