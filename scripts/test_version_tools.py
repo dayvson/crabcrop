@@ -128,6 +128,29 @@ def dav1d_pin(rel, text, pos):
     )
 
 
+# A Rust #[deprecated] attribute names the release its deprecation began
+# in, `since = "X.Y.Z"` (crabcrop-url's build_sealed_url, issue #712).
+# That is history a bump keeps, as the rendering version's entries are:
+# every later release still says when the deprecation began. Only the
+# value of `since` inside such an attribute is skipped; the attribute's
+# note, and any other mention, counts.
+DEPRECATED_OPEN = re.compile(r"#\[\s*deprecated\s*\(")
+SINCE_VALUE = re.compile(r'\bsince\s*=\s*"\Z')
+
+
+def deprecation_since(rel, text, pos):
+    """Whether offset `pos` of a Rust file is the `since` value of a
+    `#[deprecated(...)]` attribute that is still open there."""
+    if not rel.endswith(".rs"):
+        return False
+    opened = None
+    for opened in DEPRECATED_OPEN.finditer(text, 0, pos):
+        pass
+    if opened is None or ")]" in text[opened.end() : pos]:
+        return False
+    return SINCE_VALUE.search(text, opened.end(), pos) is not None
+
+
 # The Helm README's own-build snippet builds and pushes an image, then
 # installs it with `--set image.tag=`. A release that moves the first
 # two and not the third leaves the chart pulling a tag the snippet
@@ -204,10 +227,10 @@ class VersionToolsTest(unittest.TestCase):
 
     def leftovers(self, old):
         """`git grep -nwF old` over the copy: each line a bump left the
-        old version on. Third-party lockfile entries, EXAMPLES and the
-        rendering version's history entries do not count, nor does a
-        prerelease or build of the old version (0.10.0-rc.1 in an
-        example), which is another version."""
+        old version on. Third-party lockfile entries, EXAMPLES, the
+        rendering version's history entries and a deprecation's `since`
+        do not count, nor does a prerelease or build of the old version
+        (0.10.0-rc.1 in an example), which is another version."""
         word = re.compile(rf"(?<![0-9A-Za-z_]){re.escape(old)}(?![0-9A-Za-z_])(?![-+][0-9A-Za-z])")
         hits = []
         for rel in self.files:
@@ -219,6 +242,7 @@ class VersionToolsTest(unittest.TestCase):
                     third_party(rel, text, match.start())
                     or rendering_history(rel, text, match.start())
                     or dav1d_pin(rel, text, match.start())
+                    or deprecation_since(rel, text, match.start())
                 ):
                     continue
                 line = text.count("\n", 0, match.start())
@@ -327,9 +351,23 @@ class VersionToolsTest(unittest.TestCase):
         (self.tree / "changelog.d/1.feature.md").write_text("A thing (issue #1).\n", encoding="utf-8")
         snapshot = self.snapshot()
         code, out, err = self.run_tool("bump_version.py", bumped(self.version, "patch"))
-        self.assert_reported(code, out, err, ["changelog.d/1.feature.md: unknown section 'feature': use one of added, changed, deprecated, removed, fixed, security"])
+        self.assert_reported(code, out, err, ["changelog.d/1.feature.md: unknown section 'feature': use one of added, changed, deprecated, removed, fixed, security, or summary"])
         self.assertIn("nothing was written", err)
         self.assertEqual(self.snapshot(), snapshot, "a refused bump wrote files")
+
+    def test_a_bump_writes_the_summary_first(self):
+        # A summary fragment's lines open the release's section, above its
+        # first heading (RELEASING.md step 1, issue #740).
+        new = bumped(self.version, "patch")
+        (self.tree / "changelog.d/1.fixed.md").write_text("A bump fragment (issue #1).\n", encoding="utf-8")
+        (self.tree / "changelog.d/1.summary.md").write_text("- Upgrade for the fix (issue #1).\n", encoding="utf-8")
+        code, out, err = self.run_tool("bump_version.py", new, "--date", "2026-02-03")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("opens with a summary of 1 line(s)", out)
+        self.assertIn("removed changelog.d/1.summary.md", out)
+        text = (self.tree / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{new}] - 2026-02-03\n\n- Upgrade for the fix (issue #1).\n\n### ", text)
+        self.assertEqual(list((self.tree / "changelog.d").iterdir()), [])
 
     def test_the_check_fails_on_a_stale_helm_image_tag(self):
         # A pin that was stale before a bump is not the old version
@@ -403,6 +441,39 @@ class VersionToolsTest(unittest.TestCase):
                 f"/// Built by crabcrop {old}.",
                 f"// the first release after {old}",
                 f'pub const PINNED: &str = "{old}";',
+            ],
+        )
+
+    def test_the_scan_skips_only_a_deprecations_since(self):
+        # The release a deprecation began in stays when the version moves
+        # on (issue #712's build_sealed_url). Its note, an attribute that
+        # is closed, another key spelled since, and a file that is not
+        # Rust all count.
+        old = self.version
+        rel, doc = "crates/example/src/lib.rs", "docs/example.md"
+        lines = (
+            f'#[deprecated(since = "{old}", note = "use `b`")]',
+            "pub fn a() {}",
+            "#[deprecated(",
+            f'    since = "{old}",',
+            f'    note = "gone in the release after {old}"',
+            ")]",
+            "pub fn c() {}",
+            f'#[cfg_attr(docsrs, doc = "since = \\"{old}\\"")]',
+            f'pub const PINNED: &str = "{old}";',
+        )
+        for name, body in ((rel, lines), (doc, (f'#[deprecated(since = "{old}")]',))):
+            (self.tree / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.tree / name).write_text("\n".join(body) + "\n", encoding="utf-8")
+            self.files.append(name)
+        found = [hit for hit in self.leftovers(old) if hit.startswith((f"{rel}:", f"{doc}:"))]
+        self.assertEqual(
+            found,
+            [
+                f'{rel}:5: note = "gone in the release after {old}"',
+                f'{rel}:8: #[cfg_attr(docsrs, doc = "since = \\"{old}\\"")]',
+                f'{rel}:9: pub const PINNED: &str = "{old}";',
+                f'{doc}:1: #[deprecated(since = "{old}")]',
             ],
         )
 

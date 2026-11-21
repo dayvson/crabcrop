@@ -221,16 +221,20 @@ pub(in crate::server) fn compose_annotation(
     }
 }
 
-/// Where an annotation section gets the render's pixels.
-pub(in crate::server) trait FrameSource {
+/// Where an annotation section gets the render's pixels. A
+/// section moves a clone into its blocking task and asks for
+/// the frame there, so the decode runs on the blocking pool
+/// beside the inference it feeds, never on a runtime worker
+/// (issue #736).
+pub(in crate::server) trait FrameSource: Clone + Send + Sync + 'static {
     /// The decoded render, or `None` when it does not
     /// decode.
     fn frame(&self) -> Option<Arc<image::DynamicImage>>;
 }
 
-/// A render on its own, decoded again for every section
-/// that asks: what each section did before the document
-/// shared a frame. The tests hold the shared frame to it.
+/// A render on its own, decoded again for every call: what
+/// the sections did before the document shared a frame. The
+/// tests hold the shared frame to it.
 #[cfg(test)]
 impl FrameSource for crate::engine::ProcessedImage {
     fn frame(&self) -> Option<Arc<image::DynamicImage>> {
@@ -238,49 +242,103 @@ impl FrameSource for crate::engine::ProcessedImage {
     }
 }
 
+/// How a meta document's render is decoded: the engine's
+/// decoder in production, a counting or waiting one in the
+/// tests.
+pub(in crate::server) type FrameDecoder =
+    fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>;
+
 /// The render as the annotation sections of one meta
 /// document read it (issue #676): decoded by the first
 /// section that needs pixels and shared by the sections
 /// after it, where each used to decode the bytes for
-/// itself. The sections run one after the other and only
-/// read the frame, so each sees the pixels it would have
-/// decoded. One decoded frame is alive at a time, as
-/// before: it is now the same one from the first section
-/// to the last. A render that does not decode is not
-/// remembered: every section that asks tries for itself and
-/// reports its own failure, as it always did.
-pub(in crate::server) struct DocumentFrame<'a> {
-    bytes: &'a [u8],
-    decode: fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>,
-    decoded: std::sync::OnceLock<Arc<image::DynamicImage>>,
+/// itself. The sections only read the frame, so each sees
+/// the pixels it would have decoded. One decoded frame is
+/// alive at a time, as before: it is now the same one from
+/// the first section to the last.
+///
+/// The decode runs in the blocking task of the section that
+/// asks first, beside its inference and under its AI permit
+/// (issue #736). On the runtime worker, where it ran before
+/// each section's blocking task, a large render's decode
+/// held that worker from every other request scheduled on
+/// it. A decoder that panics is caught there and answers as
+/// a render that does not decode, so the section fails the
+/// way it fails on bytes that do not decode and the request
+/// still gets its document, where the panic used to unwind
+/// the request's task. A section that asks while another
+/// decodes waits for that decode and shares its frame. A
+/// render that does not decode is not remembered: every
+/// section that asks tries for itself and reports its own
+/// failure, as it always did.
+///
+/// Cloning is cheap: the clones share the render and the
+/// frame.
+#[derive(Clone)]
+pub(in crate::server) struct DocumentFrame(Arc<SharedFrame>);
+
+struct SharedFrame {
+    render: Arc<crate::engine::ProcessedImage>,
+    decode: FrameDecoder,
+    /// The frame, once a section has decoded it. The lock is
+    /// held through the decode, so a section that asks
+    /// meanwhile waits for this frame instead of decoding a
+    /// second one.
+    decoded: std::sync::Mutex<Option<Arc<image::DynamicImage>>>,
 }
 
-impl<'a> DocumentFrame<'a> {
-    pub(in crate::server) fn new(processed: &'a crate::engine::ProcessedImage) -> Self {
-        Self::with_decoder(processed, crate::engine::decode_image)
+impl DocumentFrame {
+    pub(in crate::server) fn new(render: Arc<crate::engine::ProcessedImage>) -> Self {
+        Self::with_decoder(render, crate::engine::decode_image)
     }
 
-    /// A frame decoded by `decode`: the engine's decoder in
-    /// production, a counting one in the tests.
+    /// A frame decoded by `decode`.
     pub(in crate::server) fn with_decoder(
-        processed: &'a crate::engine::ProcessedImage,
-        decode: fn(&[u8]) -> Result<image::DynamicImage, crate::engine::EngineError>,
+        render: Arc<crate::engine::ProcessedImage>,
+        decode: FrameDecoder,
     ) -> Self {
-        Self {
-            bytes: &processed.bytes,
+        Self(Arc::new(SharedFrame {
+            render,
             decode,
-            decoded: std::sync::OnceLock::new(),
-        }
+            decoded: std::sync::Mutex::new(None),
+        }))
     }
 }
 
-impl FrameSource for DocumentFrame<'_> {
+impl FrameSource for DocumentFrame {
     fn frame(&self) -> Option<Arc<image::DynamicImage>> {
-        if let Some(frame) = self.decoded.get() {
-            return Some(frame.clone());
+        let shared = &*self.0;
+        // Nothing panics while the lock is held (the decode's
+        // panic is caught below), so it is never poisoned; if
+        // it were, its value is replaced whole and still a
+        // frame or none.
+        let mut decoded = shared
+            .decoded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(frame) = decoded.as_ref() {
+            return Some(Arc::clone(frame));
         }
-        let frame = Arc::new((self.decode)(self.bytes).ok()?);
-        Some(self.decoded.get_or_init(|| frame).clone())
+        let frame = Arc::new(decode_contained(shared.decode, &shared.render.bytes)?);
+        *decoded = Some(Arc::clone(&frame));
+        Some(frame)
+    }
+}
+
+/// Decode a render with `decode`, a panic in the decoder
+/// answering as a render that does not decode (issue #736),
+/// as the engine contains a panic in its run
+/// (`run_process`). The panic hook has already printed the
+/// panic; the line here says what the request did about it.
+fn decode_contained(decode: FrameDecoder, bytes: &[u8]) -> Option<image::DynamicImage> {
+    match std::panic::catch_unwind(move || decode(bytes)) {
+        Ok(decoded) => decoded.ok(),
+        Err(_) => {
+            stderr_line!(
+                "meta: decoding the render panicked; the sections that need its pixels answer without them"
+            );
+            None
+        }
     }
 }
 
@@ -311,27 +369,35 @@ pub(in crate::server) async fn annotate_meta(
         .await
         .ok()?
         .ok()?;
-    let img = render.frame()?;
     let tagger = tagger.clone();
+    // The render decodes in the blocking task as well, never
+    // on the runtime worker (issue #736): see
+    // `DocumentFrame`. Every section below does the same.
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        tagger.scores(&img)
+        render.frame().map(|img| tagger.scores(&img))
     })
     .await
     {
-        Ok(Ok(scores)) => match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
-            Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
-            Err(e) => {
-                eprintln!("annotation error: {e}");
-                None
+        Ok(Some(Ok(scores))) => {
+            match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
+                Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
+                Err(e) => {
+                    stderr_line!("annotation error: {e}");
+                    None
+                }
             }
-        },
-        Ok(Err(e)) => {
-            eprintln!("annotation error: {e}");
+        }
+        Ok(Some(Err(e))) => {
+            stderr_line!("annotation error: {e}");
             None
         }
+        // The render does not decode: there is nothing to
+        // tag.
+        Ok(None) => None,
         Err(e) => {
-            eprintln!("annotation task failed: {e}");
+            stderr_line!("annotation task failed: {e}");
             None
         }
     }
@@ -373,35 +439,40 @@ pub(in crate::server) async fn detect_meta(
             .ok()?
             .ok()?,
     );
-    let img = render.frame()?;
     let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
     let mut any_answered = false;
     for (name, provider) in providers {
-        // Every provider reads the one frame.
-        let provider_img = Arc::clone(&img);
+        // Every provider reads the one frame: the first
+        // provider's blocking task decodes it, and the
+        // others share it.
+        let render = render.clone();
         let task_permit = permit.clone();
         match tokio::task::spawn_blocking(move || {
             let _permit = task_permit;
-            provider.detect(&provider_img)
+            render.frame().map(|img| provider.detect(&img))
         })
         .await
         {
-            Ok(Ok(detections)) => {
+            Ok(Some(Ok(detections))) => {
                 match check_finite_scores("a detector", detections.iter().map(|d| d.score)) {
                     Ok(()) => {
                         any_answered = true;
                         aggregated.extend(detections.into_iter().map(|d| (name.clone(), d)));
                     }
                     Err(e) => {
-                        eprintln!("detection error from {name}: {e}");
+                        stderr_line!("detection error from {name}: {e}");
                     }
                 }
             }
-            Ok(Err(e)) => {
-                eprintln!("detection error from {name}: {e}");
+            Ok(Some(Err(e))) => {
+                stderr_line!("detection error from {name}: {e}");
             }
+            // The render does not decode, which only the
+            // first provider's task finds: no provider can
+            // run, and the section is left out.
+            Ok(None) => return None,
             Err(e) => {
-                eprintln!("detection task failed for {name}: {e}");
+                stderr_line!("detection task failed for {name}: {e}");
             }
         }
     }
@@ -482,17 +553,15 @@ pub(in crate::server) async fn moderate_meta(
             Ok(Ok(permit)) => permit,
             _ => return ModerationMeta::Unavailable("busy"),
         };
-    let Some(img) = render.frame() else {
-        return ModerationMeta::Unavailable("inference_failed");
-    };
     let provider = provider.clone();
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        provider.moderate(&img)
+        render.frame().map(|img| provider.moderate(&img))
     })
     .await
     {
-        Ok(Ok(report)) => match check_finite_scores(
+        Ok(Some(Ok(report))) => match check_finite_scores(
             "the moderation provider",
             report
                 .scores
@@ -502,16 +571,17 @@ pub(in crate::server) async fn moderate_meta(
         ) {
             Ok(()) => ModerationMeta::Report(compose_moderation(&report)),
             Err(e) => {
-                eprintln!("moderation error: {e}");
+                stderr_line!("moderation error: {e}");
                 ModerationMeta::Unavailable("inference_failed")
             }
         },
-        Ok(Err(e)) => {
-            eprintln!("moderation error: {e}");
+        Ok(Some(Err(e))) => {
+            stderr_line!("moderation error: {e}");
             ModerationMeta::Unavailable("inference_failed")
         }
+        Ok(None) => ModerationMeta::Unavailable("inference_failed"),
         Err(e) => {
-            eprintln!("moderation task failed: {e}");
+            stderr_line!("moderation task failed: {e}");
             ModerationMeta::Unavailable("inference_failed")
         }
     }
@@ -663,31 +733,30 @@ pub(in crate::server) async fn embed_meta(
             Ok(Ok(permit)) => permit,
             _ => return EmbeddingMeta::Unavailable("busy"),
         };
-    let Some(img) = render.frame() else {
-        return EmbeddingMeta::Unavailable("inference_failed");
-    };
     let provider = provider.clone();
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        provider.embed(&img)
+        render.frame().map(|img| provider.embed(&img))
     })
     .await
     {
-        Ok(Ok(embedding)) => {
+        Ok(Some(Ok(embedding))) => {
             match check_finite_scores("the embedding provider", embedding.vector.iter().copied()) {
                 Ok(()) => EmbeddingMeta::Report(embedding),
                 Err(e) => {
-                    eprintln!("embedding error: {e}");
+                    stderr_line!("embedding error: {e}");
                     EmbeddingMeta::Unavailable("inference_failed")
                 }
             }
         }
-        Ok(Err(e)) => {
-            eprintln!("embedding error: {e}");
+        Ok(Some(Err(e))) => {
+            stderr_line!("embedding error: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
         }
+        Ok(None) => EmbeddingMeta::Unavailable("inference_failed"),
         Err(e) => {
-            eprintln!("embedding task failed: {e}");
+            stderr_line!("embedding task failed: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
         }
     }
@@ -749,31 +818,32 @@ pub(in crate::server) async fn ocr_meta(
             Ok(Ok(permit)) => permit,
             _ => return OcrMeta::Unavailable("busy"),
         };
-    let Some(img) = render.frame() else {
-        return OcrMeta::Unavailable("inference_failed");
-    };
     let provider = provider.clone();
+    let render = render.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        provider.recognize_deadline(&img, deadline)
+        render
+            .frame()
+            .map(|img| provider.recognize_deadline(&img, deadline))
     })
     .await
     {
-        Ok(Ok(report)) => {
+        Ok(Some(Ok(report))) => {
             match check_finite_scores("the OCR provider", report.lines.iter().map(|l| l.score)) {
                 Ok(()) => OcrMeta::Report(compose_ocr(&report)),
                 Err(e) => {
-                    eprintln!("OCR error: {e}");
+                    stderr_line!("OCR error: {e}");
                     OcrMeta::Unavailable("inference_failed")
                 }
             }
         }
-        Ok(Err(e)) => {
-            eprintln!("OCR error: {e}");
+        Ok(Some(Err(e))) => {
+            stderr_line!("OCR error: {e}");
             OcrMeta::Unavailable("inference_failed")
         }
+        Ok(None) => OcrMeta::Unavailable("inference_failed"),
         Err(e) => {
-            eprintln!("OCR task failed: {e}");
+            stderr_line!("OCR task failed: {e}");
             OcrMeta::Unavailable("inference_failed")
         }
     }
@@ -1409,7 +1479,7 @@ pub(in crate::server) fn ocr_json(meta: &OcrMeta) -> OcrJson {
 /// typed values and serialized with serde. Field order
 /// in this struct is the wire order; optional fields
 /// are skipped when absent.
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 struct MetaBody {
     width: u32,
     height: u32,
@@ -1471,6 +1541,14 @@ struct MetaBody {
 
 /// The meta response: what the pipeline produced, as JSON,
 /// without the image bytes.
+///
+/// The document is built in stages: the facts measured from
+/// the render ([`MetaBody::of_render`]), the sections the
+/// annotations made ([`MetaBody::annotate`]), the operation
+/// records ([`MetaBody::record_operations`]) and the
+/// placeholder fields ([`MetaBody::describe_placeholder`]).
+/// Each stage fills its own fields; the wire order is the
+/// struct's.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) fn meta_response(
     processed: &crate::engine::ProcessedImage,
@@ -1487,151 +1565,22 @@ pub(in crate::server) fn meta_response(
     // image-derived section (tags, detections,
     // moderation, embedding, aesthetic, OCR, placeholder,
     // ssimulacra2), never a field that reports operation
-    // or source text. Below, that means the operation
+    // or source text. Here, that means the operation
     // records (video, pdf, studio, inpaint, segments,
     // objects_crop) are skipped: each resolves or echoes
     // a URL argument, the recipe text the token exists
     // to hide. Model identities inside moderation and
     // OCR are deployment facts the plain meta of any URL
-    // already publishes, and the base fields above are
+    // already publishes, and the base fields are
     // measured from the render.
-    let tags = annotation.and_then(|a| score_list(&a.tags));
-    let alt_text = match (annotation, &tags) {
-        // The alt text rides whenever the tags render,
-        // even when it is empty: the pair is one section.
-        (Some(a), Some(_)) => Some(a.alt_text.clone()),
-        _ => None,
-    };
-    let meta = MetaBody {
-        width: processed.width,
-        height: processed.height,
-        format: format_name(processed.format),
-        bytes: processed.bytes.len(),
-        source_width: processed.source_width,
-        source_height: processed.source_height,
-        sealed: if sealed { Some(true) } else { None },
-        tags,
-        alt_text,
-        detections: detections.and_then(|pairs| {
-            // A non-finite score has no JSON
-            // representation (issue #352): the whole
-            // section is dropped rather than print a
-            // malformed value. The meta helper rejects
-            // non-finite boxes before this point, so
-            // this is the serializer's own guard: the
-            // number constructor refuses and the collect
-            // propagates the refusal.
-            pairs
-                .iter()
-                .map(|(detector, d)| {
-                    Some(DetectionJson {
-                        label: d.label.clone(),
-                        score: MetaNum::display(d.score)?,
-                        x: d.x,
-                        y: d.y,
-                        w: d.w,
-                        h: d.h,
-                        detector: detector.clone(),
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-        }),
-        moderation: moderation.map(moderation_json),
-        embedding: match embedding {
-            Some(EmbeddingMeta::Report(report)) => {
-                Some(EmbeddingJson::Packed(pack_embedding(&report.vector)))
-            }
-            Some(EmbeddingMeta::Unavailable(_)) => Some(EmbeddingJson::Absent),
-            None => None,
-        },
-        embedding_model: match embedding {
-            Some(EmbeddingMeta::Report(report)) => Some(report.model.clone()),
-            _ => None,
-        },
-        embedding_dim: match embedding {
-            Some(EmbeddingMeta::Report(report)) => Some(report.vector.len()),
-            _ => None,
-        },
-        embedding_encoding: match embedding {
-            Some(EmbeddingMeta::Report(_)) => Some("f16le-base64"),
-            _ => None,
-        },
-        embedding_normalized: match embedding {
-            Some(EmbeddingMeta::Report(_)) => Some(true),
-            _ => None,
-        },
-        embedding_reason: match embedding {
-            Some(EmbeddingMeta::Unavailable(reason)) => Some(*reason),
-            _ => None,
-        },
-        aesthetic: aesthetic.map(aesthetic_json),
-        // The verified auto-quality score, on the meta
-        // of the response it gated (issue #41). One
-        // decimal: the score is a ranking signal, not a
-        // measurement. A non-finite score cannot occur
-        // (ssimulacra2 returns a bounded dissimilarity),
-        // but the field guards anyway rather than print
-        // a malformed value.
-        ssimulacra2: processed.ssimulacra2.and_then(MetaNum::fixed1),
-        provenance: processed.provenance.as_ref().map(|facts| ProvenanceJson {
-            signing_configured: facts.signing_configured,
-            source: facts.source.as_ref().map(manifest_json),
-            output: facts.output.as_ref().map(manifest_json),
-        }),
-        video: if sealed {
-            None
-        } else {
-            processed.video.as_ref().map(|v| VideoJson {
-                width: v.width,
-                height: v.height,
-                frame_timestamp: MetaNum::seconds(v.frame_seconds),
-                duration: v.duration_seconds.and_then(MetaNum::seconds),
-            })
-        },
-        pdf: if sealed {
-            None
-        } else {
-            processed.pdf.as_ref().map(|pdf| PdfJson {
-                pages: pdf.pages,
-                page: pdf.page,
-                page_width: MetaNum::points(pdf.page_width),
-                page_height: MetaNum::points(pdf.page_height),
-            })
-        },
-        studio: if sealed {
-            None
-        } else {
-            processed.studio.as_ref().map(studio_json)
-        },
-        inpaint: if sealed {
-            None
-        } else {
-            processed.inpaint.as_ref().map(|record| InpaintJson {
-                regions: record.regions.clone(),
-            })
-        },
-        segments: if sealed {
-            None
-        } else {
-            processed.segments.as_ref().and_then(segments_json)
-        },
-        objects_crop: if sealed {
-            None
-        } else {
-            processed.objects_crop.as_ref().and_then(objects_crop_json)
-        },
-        ocr: ocr.map(ocr_json),
-        dominant_color: processed
-            .placeholder
-            .as_ref()
-            .map(|ph| ph.dominant_color.clone()),
-        placeholder: processed.placeholder.as_ref().map(|ph| ph.data_uri.clone()),
-        palette: processed.placeholder.as_ref().map(|ph| ph.palette.clone()),
-        thumbhash: processed
-            .placeholder
-            .as_ref()
-            .map(|ph| ph.thumbhash.clone()),
-    };
+    let mut meta = MetaBody::of_render(processed, sealed);
+    meta.annotate(
+        annotation, detections, moderation, embedding, aesthetic, ocr,
+    );
+    if !sealed {
+        meta.record_operations(processed);
+    }
+    meta.describe_placeholder(processed);
     let body = serde_json::to_string(&meta).unwrap_or_default();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
@@ -1639,6 +1588,149 @@ pub(in crate::server) fn meta_response(
         HeaderValue::from_static("application/json"),
     );
     meta_cache_headers((StatusCode::OK, headers, body).into_response())
+}
+
+impl MetaBody {
+    /// The facts measured from the render: its size, format
+    /// and length, the source's size, the verified
+    /// auto-quality score, the provenance facts, and the
+    /// sealed marker. Every other field starts absent.
+    fn of_render(processed: &crate::engine::ProcessedImage, sealed: bool) -> Self {
+        MetaBody {
+            width: processed.width,
+            height: processed.height,
+            format: format_name(processed.format),
+            bytes: processed.bytes.len(),
+            source_width: processed.source_width,
+            source_height: processed.source_height,
+            sealed: if sealed { Some(true) } else { None },
+            // The verified auto-quality score, on the meta
+            // of the response it gated (issue #41). One
+            // decimal: the score is a ranking signal, not a
+            // measurement. A non-finite score cannot occur
+            // (ssimulacra2 returns a bounded dissimilarity),
+            // but the field guards anyway rather than print
+            // a malformed value.
+            ssimulacra2: processed.ssimulacra2.and_then(MetaNum::fixed1),
+            provenance: processed.provenance.as_ref().map(|facts| ProvenanceJson {
+                signing_configured: facts.signing_configured,
+                source: facts.source.as_ref().map(manifest_json),
+                output: facts.output.as_ref().map(manifest_json),
+            }),
+            ..MetaBody::default()
+        }
+    }
+
+    /// The sections the annotations made: the tags with
+    /// their alt text, the detections, moderation, the
+    /// embedding, the aesthetic score and OCR.
+    fn annotate(
+        &mut self,
+        annotation: Option<&Annotation>,
+        detections: Option<&[(String, crate::ai::Detection)]>,
+        moderation: Option<&ModerationMeta>,
+        embedding: Option<&EmbeddingMeta>,
+        aesthetic: Option<&AestheticMeta>,
+        ocr: Option<&OcrMeta>,
+    ) {
+        self.tags = annotation.and_then(|a| score_list(&a.tags));
+        self.alt_text = match (annotation, &self.tags) {
+            // The alt text rides whenever the tags render,
+            // even when it is empty: the pair is one section.
+            (Some(a), Some(_)) => Some(a.alt_text.clone()),
+            _ => None,
+        };
+        self.detections = detections.and_then(detections_json);
+        self.moderation = moderation.map(moderation_json);
+        if let Some(embedding) = embedding {
+            self.embed(embedding);
+        }
+        self.aesthetic = aesthetic.map(aesthetic_json);
+        self.ocr = ocr.map(ocr_json);
+    }
+
+    /// The embedding section: the packed vector with its
+    /// model, length, encoding and normalization, or why
+    /// there is none.
+    fn embed(&mut self, embedding: &EmbeddingMeta) {
+        match embedding {
+            EmbeddingMeta::Report(report) => {
+                self.embedding = Some(EmbeddingJson::Packed(pack_embedding(&report.vector)));
+                self.embedding_model = Some(report.model.clone());
+                self.embedding_dim = Some(report.vector.len());
+                self.embedding_encoding = Some("f16le-base64");
+                self.embedding_normalized = Some(true);
+            }
+            EmbeddingMeta::Unavailable(reason) => {
+                self.embedding = Some(EmbeddingJson::Absent);
+                self.embedding_reason = Some(*reason);
+            }
+        }
+    }
+
+    /// The records of the operations that report what they
+    /// did: video, pdf, studio, inpaint, segments and
+    /// objects_crop. A sealed request gets none of them (see
+    /// [`meta_response`]).
+    fn record_operations(&mut self, processed: &crate::engine::ProcessedImage) {
+        self.video = processed.video.as_ref().map(|v| VideoJson {
+            width: v.width,
+            height: v.height,
+            frame_timestamp: MetaNum::seconds(v.frame_seconds),
+            duration: v.duration_seconds.and_then(MetaNum::seconds),
+        });
+        self.pdf = processed.pdf.as_ref().map(|pdf| PdfJson {
+            pages: pdf.pages,
+            page: pdf.page,
+            page_width: MetaNum::points(pdf.page_width),
+            page_height: MetaNum::points(pdf.page_height),
+        });
+        self.studio = processed.studio.as_ref().map(studio_json);
+        self.inpaint = processed.inpaint.as_ref().map(|record| InpaintJson {
+            regions: record.regions.clone(),
+        });
+        self.segments = processed.segments.as_ref().and_then(segments_json);
+        self.objects_crop = processed.objects_crop.as_ref().and_then(objects_crop_json);
+    }
+
+    /// The placeholder fields, when the request asked for
+    /// them: the dominant color, the data URI, the palette
+    /// and the thumbhash.
+    fn describe_placeholder(&mut self, processed: &crate::engine::ProcessedImage) {
+        let Some(placeholder) = &processed.placeholder else {
+            return;
+        };
+        self.dominant_color = Some(placeholder.dominant_color.clone());
+        self.placeholder = Some(placeholder.data_uri.clone());
+        self.palette = Some(placeholder.palette.clone());
+        self.thumbhash = Some(placeholder.thumbhash.clone());
+    }
+}
+
+/// The detections section: each box, with the detector that
+/// produced it.
+///
+/// A non-finite score has no JSON representation (issue
+/// #352): the whole section is dropped rather than print a
+/// malformed value. The meta helper rejects non-finite boxes
+/// before this point, so this is the serializer's own guard:
+/// the number constructor refuses and the collect propagates
+/// the refusal.
+fn detections_json(pairs: &[(String, crate::ai::Detection)]) -> Option<Vec<DetectionJson>> {
+    pairs
+        .iter()
+        .map(|(detector, d)| {
+            Some(DetectionJson {
+                label: d.label.clone(),
+                score: MetaNum::display(d.score)?,
+                x: d.x,
+                y: d.y,
+                w: d.w,
+                h: d.h,
+                detector: detector.clone(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
 }
 
 /// The caching header of an answer to a meta request.
@@ -1654,4 +1746,127 @@ pub(in crate::server) fn meta_cache_headers(mut response: Response) -> Response 
         HeaderValue::from_static("private, no-store"),
     );
     response
+}
+
+/// The meta document for a render: the annotation sections
+/// the request opts into, then the document itself. The
+/// sections' blocking tasks decode the render, so they share
+/// it (issue #736): it is not copied for them.
+pub(in crate::server) async fn meta_document(
+    state: &AppState,
+    processed: crate::engine::ProcessedImage,
+    sealed: bool,
+    accept: Option<&str>,
+) -> Response {
+    let processed = Arc::new(processed);
+    let frame = DocumentFrame::new(Arc::clone(&processed));
+    meta_document_from(state, &processed, frame, sealed, accept).await
+}
+
+/// [`meta_document`] on the frame its sections share: the
+/// render is decoded once for all of them (issue #676), by
+/// the first that needs pixels.
+pub(in crate::server) async fn meta_document_from(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    frame: impl FrameSource,
+    sealed: bool,
+    accept: Option<&str>,
+) -> Response {
+    // The annotation sections share one deadline, the
+    // same process budget the render ran under: a
+    // section that has not answered when it passes is
+    // left out (tags, detections) or reports itself
+    // unavailable with the "timed_out" reason
+    // (moderation, embedding, OCR), and the response
+    // goes out with the sections that made it. OCR also
+    // gets the deadline inside the run, so its per-line
+    // recognition stops gathering instead of only being
+    // cut off at the response.
+    let annotation_deadline = Instant::now() + state.process_timeout;
+    let annotation = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(annotation_deadline),
+        annotate_meta(state, &frame),
+    )
+    .await
+    .ok()
+    .flatten();
+    let detections = if wants_detections(accept) {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(annotation_deadline),
+            detect_meta(state, &frame),
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let moderation = if wants_moderation(accept) {
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                moderate_meta(state, &frame),
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(_) => ModerationMeta::Unavailable("timed_out"),
+            },
+        )
+    } else {
+        None
+    };
+    // The embedding run (issue #172) serves two
+    // fields: the embedding itself, when the client
+    // opted in, and the aesthetic score, whenever a
+    // head is configured. One run feeds both.
+    let want_embedding = wants_embeddings(accept);
+    let embedding_run = if want_embedding || state.providers.aesthetic.is_some() {
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                embed_meta(state, &frame),
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(_) => EmbeddingMeta::Unavailable("timed_out"),
+            },
+        )
+    } else {
+        None
+    };
+    let aesthetic = compose_aesthetic(state, embedding_run.as_ref());
+    let ocr = if wants_ocr(accept) {
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                ocr_meta(state, &frame, annotation_deadline),
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(_) => OcrMeta::Unavailable("timed_out"),
+            },
+        )
+    } else {
+        None
+    };
+    // The sections are done with the pixels.
+    drop(frame);
+    meta_response(
+        processed,
+        sealed,
+        annotation.as_ref(),
+        detections.as_deref(),
+        moderation.as_ref(),
+        if want_embedding {
+            embedding_run.as_ref()
+        } else {
+            None
+        },
+        aesthetic.as_ref(),
+        ocr.as_ref(),
+    )
 }

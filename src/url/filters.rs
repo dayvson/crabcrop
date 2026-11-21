@@ -9,20 +9,27 @@
 //!
 //! A row takes one of four shapes:
 //!
-//! - `"grayscale" => Grayscale;` takes no arguments.
-//! - `"blur"(sigma: BLUR_SIGMA) => Blur(sigma);` takes a
-//!   comma-separated list, one kind per argument. The kind
-//!   reads the argument and writes it back canonically; the
-//!   names bind the variant's fields, which the right-hand
-//!   side both builds and matches.
-//! - `"curve"(custom read_curve) => Curve(channel, points)
+//! - `"grayscale" => Plain(PlainFilter::Grayscale);` takes
+//!   no arguments.
+//! - `"blur"(sigma: BLUR_SIGMA) => Plain(PlainFilter::Blur(sigma));`
+//!   takes a comma-separated list, one kind per argument.
+//!   The kind reads the argument and writes it back
+//!   canonically; the names bind the variant's fields, which
+//!   the right-hand side both builds and matches.
+//! - `"curve"(custom read_curve) => Plain(PlainFilter::Curve(channel, points))
 //!   spelled curve_args(*channel, points);` has a
 //!   sub-grammar of its own: the function reads the whole
 //!   argument list, and the expression after `spelled`
 //!   writes it.
-//! - `shorthand "trim" => Trim(DEFAULT_TRIM_TOLERANCE);` is
-//!   another spelling of a filter that a full row writes:
-//!   it is read, never written.
+//! - `shorthand "trim" => Plain(PlainFilter::Trim(DEFAULT_TRIM_TOLERANCE));`
+//!   is another spelling of a filter that a full row
+//!   writes: it is read, never written.
+//!
+//! The right-hand side is the [`Filter`] the row builds
+//! (issue #741): `Plain(...)` around the [`PlainFilter`] for
+//! a filter `crate::filters` applies from the image alone,
+//! and the variant itself for one the engine applies
+//! (`"removebg" => RemoveBg;`).
 //!
 //! One name may have several rows, told apart by argument
 //! count (`trim`, `trim(20)`, `trim(20,5,0,5,0)`). A bad
@@ -38,10 +45,10 @@ use std::str::FromStr;
 use super::{
     Anchor, BlendMode, CurveChannel, Filter, FlipDirection, FormatSpec, ImageFormat,
     MAX_BLUR_SIGMA, MAX_DIMENSION, MAX_EXPOSURE, MAX_GAMMA, MAX_TEXT_EXTENT, MAX_TEXT_GLYPHS,
-    MaskShape, ParseError, Quality, QualityValue, StudioMode, StudioSpec, anchor_text, encode_arg,
-    format_angle, format_kernel_value, format_text, hex3, parse_angle, parse_class_name,
-    parse_format_spec, parse_hex6, parse_kernel_value, parse_quality, parse_studio,
-    parse_text_color, percent_decode, quality_value_text,
+    MaskShape, ParseError, PlainFilter, Quality, QualityValue, StudioMode, StudioSpec, anchor_text,
+    decode_arg, encode_arg, format_angle, format_kernel_value, format_text, hex3, parse_angle,
+    parse_class_name, parse_format_spec, parse_hex6, parse_kernel_value, parse_quality,
+    parse_studio, parse_text_color, positive_zero, quality_value_text,
 };
 
 /// How one argument is read from the URL and written in the
@@ -62,7 +69,11 @@ trait Kind {
 /// the field's own type keeps each filter's spellings
 /// exact: an unsigned argument refuses a minus sign, `-0`
 /// included, and a float bound refuses NaN and the
-/// infinities.
+/// infinities. A float is the decimal rounded to the
+/// nearest `f32`, and the bounds apply to that value, so
+/// `blur(512.00001)` is `blur(512)`; a negative zero reads
+/// as zero (see [`Stored`]). `spec/url-signing.md` states
+/// these spellings for every implementation (issue #712).
 struct Number<T> {
     min: T,
     max: T,
@@ -89,11 +100,36 @@ impl<T> Number<T> {
     }
 }
 
-impl<T: FromStr + PartialOrd + Display> Kind for Number<T> {
+/// The value a parsed number is stored as: the number
+/// itself, except that a float's negative zero is zero
+/// (issue #712). `-0`, `0`, and a negative decimal too
+/// small for an `f32` then read as one value, spell one
+/// canonical way, and share one cache key. The engine
+/// renders the two zeros alike, so the URLs that spelled
+/// `-0` serve the same bytes as before.
+trait Stored: Sized {
+    fn stored(self) -> Self {
+        self
+    }
+}
+
+impl Stored for u8 {}
+impl Stored for u16 {}
+impl Stored for u32 {}
+impl Stored for u64 {}
+impl Stored for i32 {}
+
+impl Stored for f32 {
+    fn stored(self) -> Self {
+        positive_zero(self)
+    }
+}
+
+impl<T: FromStr + PartialOrd + Display + Stored> Kind for Number<T> {
     type Value = T;
 
     fn read(&self, text: &str) -> Option<T> {
-        let value: T = text.parse().ok()?;
+        let value = text.parse::<T>().ok()?.stored();
         let above_min = if self.open {
             value > self.min
         } else {
@@ -171,7 +207,7 @@ impl Kind for ClassName {
     type Value = String;
 
     fn read(&self, text: &str) -> Option<String> {
-        parse_class_name(&percent_decode(text)?)
+        parse_class_name(&decode_arg(text)?)
     }
 
     fn spell(&self, value: &String) -> String {
@@ -398,6 +434,18 @@ macro_rules! filter_specs {
             $($rest)*);
     };
 
+    // No arguments, in the variant that carries the filter
+    // (`Plain(PlainFilter::Grayscale)`).
+    (@rows [$($read:tt)*] [$($spell:tt)*] [$($error:tt)*] [$($spec:tt)*]
+        $name:literal => $variant:ident $fields:tt; $($rest:tt)*) => {
+        filter_specs!(@rows
+            [$($read)* ($name, None, _) => Some(Filter::$variant $fields),]
+            [$($spell)* Filter::$variant $fields => String::from($name),]
+            [$($error)*]
+            [$($spec)* tests::Spec { name: $name, args: Some(&[]), shorthand: false },]
+            $($rest)*);
+    };
+
     // One kind per argument.
     (@rows [$($read:tt)*] [$($spell:tt)*] [$($error:tt)*] [$($spec:tt)*]
         $name:literal ($($arg:ident: $kind:ident),+) => $variant:ident $fields:tt;
@@ -424,68 +472,70 @@ macro_rules! filter_specs {
 // Grouped as docs/filters.md lists them.
 filter_specs! {
     // Pixel filters.
-    "grayscale" => Grayscale;
-    "invert" => Invert;
-    "blur"(sigma: BLUR_SIGMA) => Blur(sigma);
-    "brighten"(amount: CHANNEL_OFFSET) => Brighten(amount);
-    "contrast"(amount: PERCENT) => Contrast(amount);
-    "gamma"(divisor: GAMMA) => Gamma(divisor);
-    "exposure"(stops: EXPOSURE_STOPS) => Exposure(stops);
+    "grayscale" => Plain(PlainFilter::Grayscale);
+    "invert" => Plain(PlainFilter::Invert);
+    "blur"(sigma: BLUR_SIGMA) => Plain(PlainFilter::Blur(sigma));
+    "brighten"(amount: CHANNEL_OFFSET) => Plain(PlainFilter::Brighten(amount));
+    "contrast"(amount: PERCENT) => Plain(PlainFilter::Contrast(amount));
+    "gamma"(divisor: GAMMA) => Plain(PlainFilter::Gamma(divisor));
+    "exposure"(stops: EXPOSURE_STOPS) => Plain(PlainFilter::Exposure(stops));
     "highlights_shadows"(highlights: PERCENT, shadows: PERCENT)
-        => HighlightsShadows(highlights, shadows);
-    "huerotate"(degrees: HUE_DEGREES) => HueRotate(degrees);
-    "sharpen"(amount: SHARPEN_AMOUNT) => Sharpen(amount);
-    "saturation"(factor: SATURATION_FACTOR) => Saturation(factor);
-    "vibrance"(amount: PERCENT) => Vibrance(amount);
+        => Plain(PlainFilter::HighlightsShadows(highlights, shadows));
+    "huerotate"(degrees: HUE_DEGREES) => Plain(PlainFilter::HueRotate(degrees));
+    "sharpen"(amount: SHARPEN_AMOUNT) => Plain(PlainFilter::Sharpen(amount));
+    "saturation"(factor: SATURATION_FACTOR) => Plain(PlainFilter::Saturation(factor));
+    "vibrance"(amount: PERCENT) => Plain(PlainFilter::Vibrance(amount));
     "rgb"(red: CHANNEL_OFFSET, green: CHANNEL_OFFSET, blue: CHANNEL_OFFSET)
-        => Rgb(red, green, blue);
+        => Plain(PlainFilter::Rgb(red, green, blue));
     "curve"(custom read_curve) else InvalidCurve
-        => Curve(channel, points) spelled curve_args(*channel, points);
+        => Plain(PlainFilter::Curve(channel, points)) spelled curve_args(*channel, points);
     "convolution"(custom read_convolution) else InvalidConvolution
-        => Convolution(values, normalize) spelled convolution_args(values, *normalize);
-    "noise"(amount: NOISE_PERCENT) else InvalidNoise => Noise(amount);
-    "equalize" => Equalize;
-    "enhance" => Enhance;
-    "rotate"(degrees: ROTATE_ANGLE) => Rotate(degrees);
-    shorthand "trim" => Trim(DEFAULT_TRIM_TOLERANCE);
-    "trim"(tolerance: TRIM_TOLERANCE) => Trim(tolerance);
+        => Plain(PlainFilter::Convolution(values, normalize))
+        spelled convolution_args(values, *normalize);
+    "noise"(amount: NOISE_PERCENT) else InvalidNoise => Plain(PlainFilter::Noise(amount));
+    "equalize" => Plain(PlainFilter::Equalize);
+    "enhance" => Plain(PlainFilter::Enhance);
+    "rotate"(degrees: ROTATE_ANGLE) => Plain(PlainFilter::Rotate(degrees));
+    shorthand "trim" => Plain(PlainFilter::Trim(DEFAULT_TRIM_TOLERANCE));
+    "trim"(tolerance: TRIM_TOLERANCE) => Plain(PlainFilter::Trim(tolerance));
     "trim"(
         tolerance: TRIM_TOLERANCE,
         left: TRIM_PIXELS,
         top: TRIM_PIXELS,
         right: TRIM_PIXELS,
         bottom: TRIM_PIXELS
-    ) => TrimSides(tolerance, [left, top, right, bottom]);
-    "sepia" => Sepia;
-    "duotone"(shadows: COLOR, highlights: COLOR) => Duotone(shadows, highlights);
-    "monochrome"(color: COLOR) => Monochrome(color);
-    "pixelate"(block: PIXELATE_BLOCK) => Pixelate(block);
-    "flip"(direction: FLIP_DIRECTIONS) => Flip(direction);
+    ) => Plain(PlainFilter::TrimSides(tolerance, [left, top, right, bottom]));
+    "sepia" => Plain(PlainFilter::Sepia);
+    "duotone"(shadows: COLOR, highlights: COLOR)
+        => Plain(PlainFilter::Duotone(shadows, highlights));
+    "monochrome"(color: COLOR) => Plain(PlainFilter::Monochrome(color));
+    "pixelate"(block: PIXELATE_BLOCK) => Plain(PlainFilter::Pixelate(block));
+    "flip"(direction: FLIP_DIRECTIONS) => Plain(PlainFilter::Flip(direction));
     "blur_region"(x: REGION_ORIGIN, y: REGION_ORIGIN, w: REGION_EXTENT, h: REGION_EXTENT)
         => BlurRegion { x, y, w, h };
     "pixelate_region"(x: REGION_ORIGIN, y: REGION_ORIGIN, w: REGION_EXTENT, h: REGION_EXTENT)
         => PixelateRegion { x, y, w, h };
     "remove_region"(x: REGION_ORIGIN, y: REGION_ORIGIN, w: REGION_EXTENT, h: REGION_EXTENT)
         => RemoveRegion { x, y, w, h };
-    shorthand "radius"(radius: CORNER_RADIUS) => Radius([radius; 4]);
+    shorthand "radius"(radius: CORNER_RADIUS) => Plain(PlainFilter::Radius([radius; 4]));
     "radius"(
         top_left: CORNER_RADIUS,
         top_right: CORNER_RADIUS,
         bottom_right: CORNER_RADIUS,
         bottom_left: CORNER_RADIUS
-    ) => Radius([top_left, top_right, bottom_right, bottom_left]);
-    "border"(width: BORDER_WIDTH, color: COLOR) => Border(width, color);
-    "mask"(shape: MASK_SHAPES) => Mask(shape);
+    ) => Plain(PlainFilter::Radius([top_left, top_right, bottom_right, bottom_left]));
+    "border"(width: BORDER_WIDTH, color: COLOR) => Plain(PlainFilter::Border(width, color));
+    "mask"(shape: MASK_SHAPES) => Plain(PlainFilter::Mask(shape));
 
     // Encoding and request directives.
-    "format"(custom |p| parse_format_spec(p).map(Filter::Format))
-        => Format(spec) spelled format_spec_args(spec);
-    "quality"(custom |p| parse_quality(p).map(Filter::Quality))
-        => Quality(quality) spelled quality_args(quality);
-    "palette"(colors: PALETTE_COLORS) => Palette(colors);
-    "max_bytes"(budget: BYTE_BUDGET) => MaxBytes(budget);
-    "fill"(color: COLOR) => Fill(color);
-    "no_upscale" => NoUpscale;
+    "format"(custom |p| parse_format_spec(p).map(PlainFilter::Format).map(Filter::Plain))
+        => Plain(PlainFilter::Format(spec)) spelled format_spec_args(spec);
+    "quality"(custom |p| parse_quality(p).map(PlainFilter::Quality).map(Filter::Plain))
+        => Plain(PlainFilter::Quality(quality)) spelled quality_args(quality);
+    "palette"(colors: PALETTE_COLORS) => Plain(PlainFilter::Palette(colors));
+    "max_bytes"(budget: BYTE_BUDGET) => Plain(PlainFilter::MaxBytes(budget));
+    "fill"(color: COLOR) => Plain(PlainFilter::Fill(color));
+    "no_upscale" => Plain(PlainFilter::NoUpscale);
     "dpr"(factor: DPR_FACTOR) => Dpr(factor);
 
     // Compositing.
@@ -501,7 +551,7 @@ filter_specs! {
     "removebg" => RemoveBg;
     "studio"(custom |p| parse_studio(p).map(Filter::Studio))
         => Studio(spec) spelled studio_args(spec);
-    "keep_profile" => KeepProfile;
+    "keep_profile" => Plain(PlainFilter::KeepProfile);
     "blurfaces" => BlurFaces;
     "pixelatefaces" => PixelateFaces;
     "blurclass"(class: CLASS_NAME) => BlurClass(class);
@@ -549,7 +599,7 @@ fn read_curve(p: &str) -> Option<Filter> {
         }
         points.push((x, y));
     }
-    Some(Filter::Curve(channel, points))
+    Some(Filter::Plain(PlainFilter::Curve(channel, points)))
 }
 
 fn curve_args(channel: CurveChannel, points: &[(u8, u8)]) -> String {
@@ -577,7 +627,7 @@ fn read_convolution(p: &str) -> Option<Filter> {
         .iter()
         .map(|v| parse_kernel_value(v).ok())
         .collect::<Option<Vec<f64>>>()?;
-    Some(Filter::Convolution(values, normalize))
+    Some(Filter::Plain(PlainFilter::Convolution(values, normalize)))
 }
 
 fn convolution_args(values: &[f64], normalize: bool) -> String {
@@ -602,7 +652,7 @@ fn read_watermark(p: &str) -> Option<Filter> {
     let alpha = OPACITY.read(alpha)?;
     let y = OFFSET.read(y)?;
     let x = OFFSET.read(x)?;
-    let url = percent_decode(url)?;
+    let url = decode_arg(url)?;
     if url.is_empty() {
         return None;
     }
@@ -630,7 +680,7 @@ fn read_overlay(p: &str) -> Option<Filter> {
     let alpha = OPACITY.read(alpha)?;
     let y = OFFSET.read(y)?;
     let x = OFFSET.read(x)?;
-    let url = percent_decode(url)?;
+    let url = decode_arg(url)?;
     if url.is_empty() {
         return None;
     }
@@ -671,7 +721,7 @@ fn read_text(p: &str) -> Option<Filter> {
     let anchor = Anchor::parse(anchor)?;
     let color = parse_text_color(color)?;
     let size = TEXT_SIZE.read(size)?;
-    let text = percent_decode(text)?;
+    let text = decode_arg(text)?;
     let glyphs = text.chars().count();
     if glyphs == 0 || glyphs > MAX_TEXT_GLYPHS || glyphs as u64 * size as u64 > MAX_TEXT_EXTENT {
         return None;
@@ -771,5 +821,7 @@ fn format_spec_args(spec: &FormatSpec) -> String {
     out
 }
 
+#[cfg(test)]
+mod split_proofs;
 #[cfg(test)]
 mod tests;

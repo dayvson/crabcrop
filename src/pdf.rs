@@ -43,8 +43,10 @@
 //! The raster clamp bounds the surface the renderer draws,
 //! not the images a page draws on it: Poppler decodes an
 //! embedded image at its full declared size before scaling
-//! it onto the page. On Linux both tools run under a 3 GiB
-//! address-space cap (`RENDERER_MAX_ADDRESS_SPACE`), which
+//! it onto the page. On Linux both tools run under an
+//! address-space cap, 3 GiB unless
+//! `CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB` says otherwise
+//! (`DEFAULT_RENDERER_ADDRESS_SPACE`, issue #738), which
 //! bounds every decode and surface a document can ask for:
 //! an image whose decode needs more fails in the renderer,
 //! which leaves that image out of the page, and a page whose
@@ -129,18 +131,27 @@ const MIN_RENDER_DPI: f64 = 1.0;
 /// headroom for chatty builds.
 const PROBE_REPORT_CAP: usize = 1024 * 1024;
 
-/// The PDF tools' address-space cap on Linux, 3 GiB, the
-/// frame extractor's. With Poppler 24.02, a 64 megapixel
-/// page (the raster budget) that nests five transparency
-/// groups under a soft mask peaked at 2.8 GB, a page drawing
-/// a 14000x14000 RGB JPEG 2000 image at 3.1 GB, and a 64
-/// megapixel page drawing a 12000x12000 JPEG at 1.1 GB; all
-/// three render the same bytes as without the cap. Work past
-/// the cap fails in the tool: an image whose decode needs
-/// more is left out of the page, and a page whose surfaces
-/// need more fails to render. A decode that fails near the
-/// cap can take several seconds to get there.
-const RENDERER_MAX_ADDRESS_SPACE: u64 = 3 << 30;
+/// The PDF tools' address-space cap on Linux when
+/// `CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB` is unset,
+/// 3 GiB, the frame extractor's. With Poppler 24.02, a 64
+/// megapixel page (the raster budget) that nests five
+/// transparency groups under a soft mask peaked at 2.8 GB, a
+/// page drawing a 14000x14000 RGB JPEG 2000 image at 3.1 GB,
+/// and a 64 megapixel page drawing a 12000x12000 JPEG at
+/// 1.1 GB; all three render the same bytes as without the
+/// cap. Work past the cap fails in the tool: an image whose
+/// decode needs more is left out of the page, and a page
+/// whose surfaces need more fails to render. A decode that
+/// fails near the cap can take several seconds to get there.
+pub const DEFAULT_RENDERER_ADDRESS_SPACE: u64 = 3 << 30;
+
+/// The least the cap may be set to, 256 MiB (issue #738):
+/// what the tools need to start, with room for other builds
+/// and for hosts with many fonts. With Poppler 24.02 and
+/// glibc 2.39, the boot check's document ran in 34 MiB
+/// through the probe and in 38 MiB through the renderer, and
+/// a letter page of Helvetica text rendered in 47 MiB.
+pub const MIN_RENDERER_ADDRESS_SPACE: u64 = 256 << 20;
 
 /// The two markers that open every JPEG 2000 codestream:
 /// SOC (start of codestream) and SIZ (image and tile size),
@@ -159,6 +170,32 @@ const JPX_BYTES_PER_SAMPLE: u64 = 4;
 /// in the document's size. A real document's images have one
 /// to four components each, so it never comes near.
 const JPX_SCAN_COMPONENTS: usize = 1 << 20;
+
+/// The document the boot check renders (issue #715): one
+/// blank page, 8 points square, which renders to a 16x16
+/// PNG at the fixed scale. Its cross-reference offsets are
+/// exact, so no renderer has to repair it.
+const SELF_TEST_PDF: &[u8] = b"%PDF-1.4\n\
+    1 0 obj\n\
+    << /Type /Catalog /Pages 2 0 R >>\n\
+    endobj\n\
+    2 0 obj\n\
+    << /Type /Pages /Kids [3 0 R] /Count 1 >>\n\
+    endobj\n\
+    3 0 obj\n\
+    << /Type /Page /Parent 2 0 R /MediaBox [0 0 8 8] /Resources << >> >>\n\
+    endobj\n\
+    xref\n\
+    0 4\n\
+    0000000000 65535 f \n\
+    0000000009 00000 n \n\
+    0000000058 00000 n \n\
+    0000000115 00000 n \n\
+    trailer\n\
+    << /Size 4 /Root 1 0 R >>\n\
+    startxref\n\
+    199\n\
+    %%EOF\n";
 
 /// Whether bytes can be a PDF at all: the format's
 /// header, `%PDF-`, appears within the first 1024 bytes
@@ -255,6 +292,10 @@ pub struct PdfRenderer {
     program: PathBuf,
     probe_program: PathBuf,
     timeout: Duration,
+    /// Both tools' address-space cap, in bytes:
+    /// [`DEFAULT_RENDERER_ADDRESS_SPACE`] unless
+    /// [`Self::with_address_space`] set another.
+    max_address_space: u64,
 }
 
 impl PdfRenderer {
@@ -278,7 +319,50 @@ impl PdfRenderer {
             program,
             probe_program,
             timeout,
+            max_address_space: DEFAULT_RENDERER_ADDRESS_SPACE,
         })
+    }
+
+    /// The renderer with every run of both tools capped at
+    /// `bytes` of address space, as
+    /// `CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB` sets it
+    /// (issue #738), and the JPEG 2000 pre-check held to the
+    /// same cap. The configuration holds it between
+    /// [`MIN_RENDERER_ADDRESS_SPACE`] and its own ceiling.
+    pub fn with_address_space(self, bytes: u64) -> Self {
+        Self {
+            max_address_space: bytes,
+            ..self
+        }
+    }
+
+    /// The boot check (issue #715): render the page of a
+    /// one-page test document as a `page:` request renders
+    /// one, the probe and then the renderer, and decode the
+    /// PNG. Two programs that exist and run can still fail
+    /// every page: Poppler's `pdftoppm`, for one, takes the
+    /// renderer's arguments but writes its PNG to a file, so
+    /// it prints nothing, and every `page:` request would
+    /// answer `502`. Such a pair fails here instead, at boot.
+    pub fn self_test(&self) -> Result<(), PdfError> {
+        let failed = |why: String| {
+            PdfError::Failed(format!(
+                "a one-page test document did not render: {why}. The renderer must take the \
+                 arguments pdftocairo takes and write the page to standard output as one PNG"
+            ))
+        };
+        let page = self
+            .render_page(SELF_TEST_PDF, 1)
+            .map_err(|e| failed(e.to_string()))?;
+        if page.pages != 1 {
+            return Err(failed(format!(
+                "the probe counted {} pages in it",
+                page.pages
+            )));
+        }
+        image::load_from_memory_with_format(&page.png, image::ImageFormat::Png)
+            .map_err(|e| failed(format!("the PNG the renderer wrote does not decode: {e}")))?;
+        Ok(())
     }
 
     /// Probe the source for the selected page: page
@@ -381,10 +465,10 @@ impl PdfRenderer {
         // One deadline for the scan, the probe and the
         // render together (issue #362).
         let deadline = Instant::now() + self.timeout;
-        if let Some(image) = oversized_jpx(pdf) {
+        if let Some(image) = oversized_jpx(pdf, self.max_address_space) {
             return Err(PdfError::NotPdf(format!(
                 "the document embeds a {}x{} JPEG 2000 image with {} {}, whose decode needs \
-                 about {} bytes, past the renderer's {RENDERER_MAX_ADDRESS_SPACE} byte cap",
+                 about {} bytes, past the renderer's {} byte cap",
                 image.width,
                 image.height,
                 image.components,
@@ -394,6 +478,7 @@ impl PdfRenderer {
                     "components"
                 },
                 image.decode_bytes(),
+                self.max_address_space,
             )));
         }
         let probe = self.probe_until(pdf, page, deadline)?;
@@ -508,7 +593,7 @@ impl PdfRenderer {
             max_stderr: PROBE_REPORT_CAP,
             deadline,
             cpu_limit: tool_cpu_limit(self.timeout),
-            max_address_space: RENDERER_MAX_ADDRESS_SPACE,
+            max_address_space: self.max_address_space,
         })
         .map_err(|e| {
             PdfError::Failed(match e {
@@ -705,10 +790,10 @@ impl JpxSize {
 }
 
 /// The first JPEG 2000 image the document stores as is
-/// whose decode cannot fit the renderer's address-space cap
-/// (see [`JpxSize::decode_bytes`]), or `None`. Such an
-/// image could only fail in the renderer, after it had
-/// taken all of the cap. A `JPXDecode` stream holds the
+/// whose decode cannot fit the renderer's address-space cap,
+/// `cap` bytes (see [`JpxSize::decode_bytes`]), or `None`.
+/// Such an image could only fail in the renderer, after it
+/// had taken all of the cap. A `JPXDecode` stream holds the
 /// codestream itself, so its SOC and SIZ markers sit in the
 /// document's bytes, and the SIZ segment declares the size
 /// the renderer's decoder allocates for. The scan reads
@@ -719,7 +804,7 @@ impl JpxSize {
 /// [`JPX_SCAN_COMPONENTS`] component entries in all and
 /// stops there. A codestream it does not read is bounded by
 /// the cap instead.
-fn oversized_jpx(pdf: &[u8]) -> Option<JpxSize> {
+fn oversized_jpx(pdf: &[u8], cap: u64) -> Option<JpxSize> {
     let mut components_left = JPX_SCAN_COMPONENTS;
     let mut at = 0;
     while let Some(found) = pdf[at..].iter().position(|&b| b == JPX_SOC_SIZ[0]) {
@@ -727,7 +812,7 @@ fn oversized_jpx(pdf: &[u8]) -> Option<JpxSize> {
         if pdf[start..].starts_with(&JPX_SOC_SIZ) {
             let size = parse_jpx_siz(&pdf[start + JPX_SOC_SIZ.len()..], &mut components_left);
             if let Some(size) = size
-                && size.decode_bytes() > RENDERER_MAX_ADDRESS_SPACE
+                && size.decode_bytes() > cap
             {
                 return Some(size);
             }
@@ -806,6 +891,11 @@ fn not_pdf() -> PdfError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JPEG 2000 scan against the renderer's default cap.
+    fn oversized(pdf: &[u8]) -> Option<JpxSize> {
+        oversized_jpx(pdf, DEFAULT_RENDERER_ADDRESS_SPACE)
+    }
 
     /// A whole-document probe report, recorded from the
     /// reference probe on a real two-page document.
@@ -1721,8 +1811,8 @@ exit 0\n";
         // four more for each of the largest component's: an
         // RGB image takes 16 bytes a pixel, so 16384x12288 fits
         // the 3 GiB cap exactly; a gray one takes 8.
-        assert_eq!(RENDERER_MAX_ADDRESS_SPACE, 3 << 30);
-        let at = |bytes: Vec<u8>| oversized_jpx(&bytes);
+        assert_eq!(DEFAULT_RENDERER_ADDRESS_SPACE, 3 << 30);
+        let at = |bytes: Vec<u8>| oversized(&bytes);
         assert_eq!(at(jpx_siz(16384, 12288, 0, 0, RGB)), None);
         assert!(at(jpx_siz(16384, 12289, 0, 0, RGB)).is_some());
         assert_eq!(at(jpx_siz(16384, 24576, 0, 0, &[(1, 1)])), None);
@@ -1758,7 +1848,7 @@ exit 0\n";
         document.extend_from_slice(&jpx_siz(64, 64, 0, 0, RGB));
         document.extend_from_slice(b" more ");
         document.extend_from_slice(&jpx_siz(24000, 24000, 0, 0, &[(1, 1)]));
-        assert_eq!(oversized_jpx(&document).map(|s| s.width), Some(24000));
+        assert_eq!(oversized(&document).map(|s| s.width), Some(24000));
     }
 
     /// A document of `bytes` that packs well-formed SIZ
@@ -1798,7 +1888,7 @@ exit 0\n";
         let first = parse_jpx_siz(&packed[13..], &mut unbounded).expect("well formed");
         assert_eq!((first.width, first.components), (1, 0x3F3F));
         let started = Instant::now();
-        assert_eq!(oversized_jpx(&packed), None);
+        assert_eq!(oversized(&packed), None);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the scan took {:?}",
@@ -1807,7 +1897,7 @@ exit 0\n";
         // An image before them is still found.
         let mut before = jpx_siz(16000, 16000, 0, 0, RGB);
         before.extend_from_slice(&packed);
-        assert!(oversized_jpx(&before).is_some());
+        assert!(oversized(&before).is_some());
     }
 
     #[test]
@@ -1816,20 +1906,20 @@ exit 0\n";
         // The length must match the component count.
         let mut wrong_length = big.clone();
         wrong_length[5] += 1;
-        assert_eq!(oversized_jpx(&wrong_length), None);
+        assert_eq!(oversized(&wrong_length), None);
         // No components, or a zero subsampling.
-        assert_eq!(oversized_jpx(&jpx_siz(16000, 16000, 0, 0, &[])), None);
+        assert_eq!(oversized(&jpx_siz(16000, 16000, 0, 0, &[])), None);
         assert_eq!(
-            oversized_jpx(&jpx_siz(16000, 16000, 0, 0, &[(1, 1), (0, 1)])),
+            oversized(&jpx_siz(16000, 16000, 0, 0, &[(1, 1), (0, 1)])),
             None
         );
         // An empty image (no extent past its offset).
-        assert_eq!(oversized_jpx(&jpx_siz(16000, 16000, 16000, 0, RGB)), None);
+        assert_eq!(oversized(&jpx_siz(16000, 16000, 16000, 0, RGB)), None);
         // Cut short anywhere.
         for end in 0..big.len() {
-            assert_eq!(oversized_jpx(&big[..end]), None, "cut at {end}");
+            assert_eq!(oversized(&big[..end]), None, "cut at {end}");
         }
-        assert!(oversized_jpx(&big).is_some());
+        assert!(oversized(&big).is_some());
     }
 
     /// The JPEG 2000 file (a JP2 box sequence around its
@@ -2010,6 +2100,35 @@ exit 0\n";
         assert!(marker.exists());
     }
 
+    #[test]
+    fn the_jpeg_2000_check_holds_images_to_the_configured_cap() {
+        // Issue #738: with the cap set, the check reads each
+        // image against that cap. An 8192x8192 RGB image takes
+        // 16 bytes a pixel to decode, 1 GiB: it fits the default
+        // cap, so the tools render the page, and is refused
+        // under a 1023 MiB one before either runs, with the cap
+        // in force named.
+        let dir = temp_dir("jpx-configured");
+        let marker = dir.join("ran");
+        let document = third_page_image_pdf(&jpx_siz(8192, 8192, 0, 0, RGB), 8192, 8192);
+        let capped = marking_renderer(&dir, &marker, 3).with_address_space(1023 << 20);
+        let err = capped.render_page(&document, 1).unwrap_err();
+        assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+        assert!(
+            err.to_string().ends_with(&format!(
+                "needs about {} bytes, past the renderer's {} byte cap",
+                1u64 << 30,
+                1023u64 << 20
+            )),
+            "{err}"
+        );
+        assert!(!marker.exists(), "no tool may run");
+        marking_renderer(&dir, &marker, 3)
+            .render_page(&document, 1)
+            .unwrap();
+        assert!(marker.exists());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn the_pdf_tools_run_under_the_renderer_address_space_cap() {
@@ -2041,7 +2160,7 @@ exit 0\n";
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         renderer.render_page(b"%PDF- fake", 1).unwrap();
         let recorded = std::fs::read_to_string(&record).unwrap();
-        let cap = RENDERER_MAX_ADDRESS_SPACE.to_string();
+        let cap = DEFAULT_RENDERER_ADDRESS_SPACE.to_string();
         assert_eq!(cap, (3u64 << 30).to_string());
         let expected: Vec<&str> = [cap.as_str(), "1000"].repeat(2);
         assert_eq!(
@@ -2161,5 +2280,121 @@ exit 0\n";
         assert_eq!((img.width(), img.height()), (400, 400));
         let p = img.get_pixel(200, 200);
         assert_eq!((p[0], p[1], p[2]), (255, 255, 255), "the image was drawn");
+    }
+
+    #[test]
+    fn the_self_test_document_needs_no_repair() {
+        // Issue #715: the boot renders this document, so its
+        // cross-reference table and `startxref` must point at
+        // what they name, as a renderer reads them.
+        let text = std::str::from_utf8(SELF_TEST_PDF).unwrap();
+        let xref = text.find("\nxref\n").unwrap() + 1;
+        let startxref: usize = text
+            .rsplit("startxref\n")
+            .next()
+            .and_then(|tail| tail.lines().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert_eq!(startxref, xref);
+        let lines: Vec<&str> = text[xref..].lines().collect();
+        assert_eq!(&lines[..3], ["xref", "0 4", "0000000000 65535 f "]);
+        for (n, entry) in lines[3..6].iter().enumerate() {
+            let offset: usize = entry[..10].parse().unwrap();
+            assert!(
+                text[offset..].starts_with(&format!("{} 0 obj\n", n + 1)),
+                "entry {}: {entry:?}",
+                n + 1
+            );
+        }
+        assert!(text.ends_with("startxref\n199\n%%EOF\n"));
+    }
+
+    /// The probe's report on the self-test document, in the
+    /// per-page form the reference probe prints.
+    const INFO_SELF_TEST: &str = "#!/bin/sh\n\
+cat > /dev/null\n\
+printf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  8 x 8 pts'\n\
+exit 0\n";
+
+    #[test]
+    fn the_self_test_passes_a_pair_that_renders_its_page() {
+        let dir = temp_dir("self-test-ok");
+        let png = dir.join("page.png");
+        image::RgbImage::new(16, 16).save(&png).unwrap();
+        write_tool(&dir, "pdfinfo", INFO_SELF_TEST);
+        let render = format!("#!/bin/sh\ncat > /dev/null\ncat '{}'\n", png.display());
+        let program = write_tool(&dir, "pdftocairo", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        renderer.self_test().unwrap();
+    }
+
+    #[test]
+    fn the_self_test_refuses_a_pair_that_renders_no_page() {
+        // Issue #715: a pair that runs could still fail every
+        // page, and each `page:` request answered `502`. The
+        // boot check fails it instead, naming why.
+        let silent = "#!/bin/sh\ncat > /dev/null\nexit 0\n";
+        let two_pages = INFO_SELF_TEST.replace("Pages:           1", "Pages:           2");
+        let cases = [
+            (
+                INFO_SELF_TEST,
+                silent,
+                "the PDF renderer produced no output",
+            ),
+            (
+                INFO_SELF_TEST,
+                "#!/bin/sh\ncat > /dev/null\nprintf 'P6 16 16 255 '\n",
+                "the PDF renderer's output is not a PNG",
+            ),
+            (
+                INFO_SELF_TEST,
+                RENDER_OK,
+                "the PNG the renderer wrote does not decode",
+            ),
+            (
+                INFO_SELF_TEST,
+                "#!/bin/sh\ncat > /dev/null\necho 'Syntax Error: no page' >&2\nexit 1\n",
+                "PDF renderer exited with",
+            ),
+            (
+                "#!/bin/sh\ncat > /dev/null\nexit 1\n",
+                RENDER_OK,
+                "not a PDF the probe can read",
+            ),
+            (
+                two_pages.as_str(),
+                RENDER_OK,
+                "the probe counted 2 pages in it",
+            ),
+        ];
+        for (n, (info, render, why)) in cases.into_iter().enumerate() {
+            let (_tools, program) = fake_pair(&format!("self-test-refused-{n}"), info, render);
+            let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+            let err = renderer.self_test().unwrap_err();
+            assert!(matches!(err, PdfError::Failed(_)), "{why}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.starts_with("a one-page test document did not render: "),
+                "{text}"
+            );
+            assert!(text.contains(why), "{why}: {text}");
+            assert!(
+                text.ends_with("write the page to standard output as one PNG"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The boot check with the real Poppler when it is on
+    /// PATH: the reference pair passes it.
+    #[test]
+    fn real_tools_pass_the_self_test() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(30)).unwrap();
+        renderer.self_test().unwrap();
+        let page = renderer.render_page(SELF_TEST_PDF, 1).unwrap();
+        assert_eq!(png_size(&page.png), (16, 16));
     }
 }

@@ -1,6 +1,6 @@
 # @crabcrop/url
 
-Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript, on Node or in the browser. No dependencies: Node signs and seals with `node:crypto`, and browser bundles get a built-in TypeScript implementation of the same functions (see [Browsers and bundlers](#browsers-and-bundlers)). The signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite and the server crate's differential tests run as well.
+Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript, on Node or in the browser. No dependencies: Node signs and seals with `node:crypto`, and browser bundles get a built-in TypeScript implementation of the same functions (see [Browsers and bundlers](#browsers-and-bundlers)). The signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite, the Python SDK's suite and the server crate's differential tests run as well.
 
 ## Usage
 
@@ -46,9 +46,14 @@ const ok = verifyUrlSignature("your-secret", url);
 
 // Purge signatures for the server's /purge and /purge-group endpoints
 // are domain-separated under a derived subkey; the helpers sign the
-// right strings so callers never assemble them by hand.
+// right strings so callers never assemble them by hand. Pass an
+// expiry (unix seconds) for a purge URL that stops working then;
+// its path is /purge/<signature>/exp:<expiry>/<path> (or
+// /purge-group/<signature>/exp:<expiry>/<group>).
 const purge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg");
 const group = purgeGroupSignature("your-secret", "thumb");
+const expiringPurge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg", 1893456000);
+const expiringGroup = purgeGroupSignature("your-secret", "thumb", 1893456000);
 
 // Upload signatures for the server's PUT /upload/<signature>/<name>
 // endpoint live in a third domain, under their own derived subkey.
@@ -73,7 +78,7 @@ const remainder = unseal("your-secret", seal("your-secret", "300x200/https://exa
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.
 
-`explainUrl(url)` parses a URL back into its signature, its explained segments and its source, and lists every error. It reads at most 64 KiB (65,536 bytes of UTF-8), which bounds the time one call takes. A longer input gets a single error and no signature, so `verifyUrlSignature` returns null for it.
+`explainUrl(url)` parses a URL back into its signature, its explained segments and its source, and lists every error. Its verdict is the server's: it reads each number as the server's types read it (a decimal as the 32-bit float the server reads, or the 64-bit one for a `convolution` value or a `frame:` selector, its range applied to the rounded value), and it reports what the server refuses before and after the parse: a remainder that begins with `crabcrop`, `purge`, `purge-group` or `upload`, more than 100 operations, and more than 16 distinct watermark and overlay URLs. It cannot see preset definitions or the server's default operations, so it counts each `preset:` reference as one operation. It reads at most 64 KiB (65,536 bytes of UTF-8), which bounds the time one call takes. A longer input gets a single error and no signature, so `verifyUrlSignature` returns null for it.
 
 The builders throw on operations or a source that can never verify: `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded). Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
 

@@ -12,7 +12,7 @@
  * surface is pinned to the same verdict corpora (audit PL-10,
  * P-3).
  */
-import { MAX_DIMENSION } from "./limits.js";
+import { isReservedRemainder, MAX_DIMENSION } from "./limits.js";
 export const FILTER_DESCRIPTIONS = {
     grayscale: "convert to grayscale",
     invert: "invert the colors",
@@ -231,12 +231,17 @@ export function trimLikeServer(text) {
  * A detection class name as the server's parse_class_name
  * takes it, already trimmed: 1 to 64 UTF-8 bytes (bytes, not
  * UTF-16 code units, as on the server) of letters, digits,
- * space, `_`, `.`, `-`, `/`.
+ * space, `_`, `.`, `-`, `/`. A letter or digit is what Rust's
+ * `char::is_alphanumeric` calls one: the Unicode Alphabetic
+ * property, or a number category. Alphabetic holds more than
+ * the letter categories: the vowel signs of Indic scripts
+ * (`हिंदी`), combining marks such as U+0345, and circled
+ * letters such as `Ⓐ` (issue #712).
  */
 export function isClassName(name) {
     return (name.length >= 1 &&
         new TextEncoder().encode(name).length <= 64 &&
-        /^[\p{L}\p{N} _.\-/]+$/u.test(name));
+        /^[\p{Alphabetic}\p{N} _.\-/]+$/u.test(name));
 }
 /**
  * The key a class name folds to when the objects crop drops
@@ -262,35 +267,164 @@ const NO_ARG_FILTERS = new Set([
 ]);
 const FORMAT_NAMES = new Set(IMAGE_FORMATS);
 const ANCHOR_NAMES = new Set(TEXT_ANCHORS);
+// Numbers (issue #712). The server reads every numeric
+// argument with its Rust type's `FromStr`, and the explainer
+// reads each one the same way, so the two give one verdict on
+// every spelling. spec/url-signing.md (Argument spellings)
+// states the rules for every implementation.
+/**
+ * Whether `s` is an integer in `min..=max` as Rust's unsigned
+ * `FromStr` reads one: an optional `+`, then ASCII digits,
+ * leading zeros allowed. A `-` is refused, even in `-0`.
+ */
+function isUintIn(s, min, max) {
+    return s !== null && /^\+?\d+$/.test(s) && integerIn(s, min, max);
+}
+/**
+ * Whether `s` is an integer in `min..=max` as Rust's signed
+ * `FromStr` reads one: an optional `+` or `-`, then ASCII
+ * digits. `-0` is 0.
+ */
 function isIntIn(s, min, max) {
-    // Rust's integer from_str syntax: an optional sign (the
-    // unsigned parsers accept '+' too), then digits.
-    return /^[+-]?\d+$/.test(s) && BigInt(s) >= BigInt(min) && BigInt(s) <= BigInt(max);
+    return s !== null && /^[+-]?\d+$/.test(s) && integerIn(s, min, max);
 }
-// The fraction digits can only follow a literal dot, so a run
-// of digits has one way to match and a long run costs linear
-// time. The older `\d+\.?\d*` could split one run at any point
-// and took quadratic time when the match failed (issue #594).
-// Both accept the same strings.
-const RUST_FLOAT = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
-function isFloat(s) {
-    // Rust's f32::from_str syntax (AP-23): plain decimal with
-    // an optional exponent; no hex, no surrounding whitespace,
-    // both of which Number() would otherwise accept. The
-    // inf/nan spellings Rust also parses are non-finite, and
-    // every caller rejects non-finite values, so the verdicts
-    // agree without them.
-    return RUST_FLOAT.test(s) && Number.isFinite(Number(s));
+function integerIn(s, min, max) {
+    // Past 20 significant digits a value is outside every
+    // integer type the grammar reads, and BigInt need not read
+    // a digit run as long as the URL.
+    if (s.replace(/^[+-]?0*/, "").length > 20)
+        return false;
+    const value = BigInt(s);
+    return value >= BigInt(min) && value <= BigInt(max);
 }
-const KERNEL_VALUE = /^-?\d+(\.\d+)?$/;
+/**
+ * Rust's float syntax: an optional sign, digits with an
+ * optional fraction (`2`, `2.`, `.5`), and an optional
+ * exponent. Each part matches one way, so a long run of
+ * digits costs linear time, matched or not (issue #594).
+ */
+const DECIMAL = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?)(\d+))?$/;
+/**
+ * The most significant digits {@link readDecimal} keeps. Every
+ * midpoint between two 64-bit floats has at most 767
+ * significant digits, so a decimal cut to this many, with one
+ * nonzero digit appended when any cut digit is nonzero, rounds
+ * to the float the whole decimal rounds to.
+ */
+const KEPT_DIGITS = 1000;
+/** The precision and range of the two binary float formats. */
+const BINARY = {
+    32: { mantissa: 24, minExponent: -126, maxExponent: 127, overflow: 39, underflow: -46 },
+    64: { mantissa: 53, minExponent: -1022, maxExponent: 1023, overflow: 309, underflow: -325 },
+};
+/** The largest finite 32-bit float, Rust's `f32::MAX`. */
+const F32_MAX = (2 - 2 ** -23) * 2 ** 127;
+/**
+ * The float a decimal argument reads as on the server (issue
+ * #712): Rust's `f32` or `f64` `FromStr`, which takes an
+ * optional sign, digits with an optional fraction (`2`, `2.`,
+ * `.5`), and an optional exponent (`e` or `E`, an optional
+ * sign, digits), and rounds the decimal to the nearest float of
+ * `bits` bits, a tie to the even one. Past the float's range the
+ * value is an infinity, and below half its smallest step it is
+ * zero, signed as the decimal is. Returns null for any other
+ * text, Rust's `inf` and `NaN` spellings included: no range the
+ * grammar checks admits them.
+ *
+ * The rounding is exact, in BigInt arithmetic. Rounding to a
+ * double first and then to 32 bits (`Math.fround(Number(s))`)
+ * rounds twice, and gets a decimal near the midpoint between
+ * two 32-bit floats wrong.
+ */
+export function readDecimal(text, bits) {
+    const match = DECIMAL.exec(text);
+    if (match === null)
+        return null;
+    const [, sign, whole, fraction = "", expSign = "", expDigits = "0"] = match;
+    if (whole === "" && fraction === "")
+        return null;
+    const negative = sign === "-";
+    const zero = negative ? -0 : 0;
+    const infinity = negative ? -Infinity : Infinity;
+    const format = BINARY[bits];
+    // value = digits * 10^e10. The exponent stays a safe integer:
+    // past nine digits it only has to stay past both pre-screens.
+    let digits = (whole + fraction).replace(/^0+/, "");
+    const expTrimmed = expDigits.replace(/^0+/, "");
+    const magnitude = expTrimmed.length > 9 ? 1e9 : Number(expTrimmed || "0");
+    let e10 = (expSign === "-" ? -magnitude : magnitude) - fraction.length;
+    let end = digits.length;
+    while (end > 0 && digits.charCodeAt(end - 1) === 48)
+        end--;
+    e10 += digits.length - end;
+    digits = digits.slice(0, end);
+    if (digits === "")
+        return zero;
+    const n = digits.length;
+    if (n - 1 + e10 >= format.overflow)
+        return infinity;
+    if (n + e10 <= format.underflow)
+        return zero;
+    if (n > KEPT_DIGITS) {
+        const sticky = /[1-9]/.test(digits.slice(KEPT_DIGITS));
+        e10 += n - KEPT_DIGITS - (sticky ? 1 : 0);
+        digits = digits.slice(0, KEPT_DIGITS) + (sticky ? "1" : "");
+    }
+    const d = BigInt(digits);
+    const num = e10 >= 0 ? d * 10n ** BigInt(e10) : d;
+    const den = e10 >= 0 ? 1n : 10n ** BigInt(-e10);
+    // e = floor(log2(num / den)), from the bit lengths.
+    let e = num.toString(2).length - den.toString(2).length;
+    if (e >= 0 ? num < den << BigInt(e) : num << BigInt(-e) < den)
+        e -= 1;
+    let q = Math.max(e, format.minExponent) - (format.mantissa - 1);
+    const top = q >= 0 ? num : num << BigInt(-q);
+    const bottom = q >= 0 ? den << BigInt(q) : den;
+    let mantissa = top / bottom;
+    const twice = 2n * (top - mantissa * bottom);
+    if (twice > bottom || (twice === bottom && (mantissa & 1n) === 1n))
+        mantissa += 1n;
+    if (mantissa === 1n << BigInt(format.mantissa)) {
+        mantissa >>= 1n;
+        q += 1;
+    }
+    if (q > format.maxExponent - (format.mantissa - 1))
+        return infinity;
+    const value = Number(mantissa) * 2 ** q;
+    return negative ? -value : value;
+}
+/**
+ * Whether `s` is a decimal whose 32-bit float is in
+ * `min..=max`, or above `min` with `above`: the bounds apply to
+ * the rounded value, as the server applies them, so
+ * `blur(512.00001)` is `blur(512)`.
+ */
+function f32In(s, min, max, above = false) {
+    if (s === null)
+        return false;
+    const value = readDecimal(s, 32);
+    return value !== null && (above ? value > min : value >= min) && value <= max;
+}
+/**
+ * The strict decimal of the `rotate` angle, the `convolution`
+ * kernel and the `frame:` selector (url.rs parse_angle): an
+ * optional minus where the value may be negative, digits, an
+ * optional fraction; no `+`, no exponent, no leading or
+ * trailing dot.
+ */
+const STRICT_DECIMAL = /^-?\d+(\.\d+)?$/;
 function isKernelValue(s) {
-    // The server's kernel-value grammar (url.rs
-    // parse_kernel_value): the rotate angle's strict decimal
-    // form, no exponent and no leading dot, bounded to 1024
-    // in absolute value.
-    return KERNEL_VALUE.test(s) && Math.abs(Number(s)) <= 1024;
+    // url.rs parse_kernel_value: a strict decimal, read as an
+    // f64, at most 1024 in absolute value.
+    if (!STRICT_DECIMAL.test(s))
+        return false;
+    const value = readDecimal(s, 64);
+    return value !== null && Math.abs(value) <= 1024;
 }
 function percentDecodable(s) {
+    // The server's escapes (url.rs decode_arg): `%` and two hex
+    // digits, decoding to UTF-8. `decodeURIComponent` refuses
+    // the rest, `%+1` included, as the server does (issue #712).
     try {
         return decodeURIComponent(s);
     }
@@ -316,58 +450,45 @@ function validateFilter(name, args) {
                 return null;
             const parts = args.split(",");
             if (parts.length === 1)
-                return isIntIn(parts[0], 0, 255) ? null : bad;
+                return isUintIn(parts[0], 0, 255) ? null : bad;
             return parts.length === 5 &&
-                isIntIn(parts[0], 0, 255) &&
-                parts.slice(1).every((p) => isIntIn(p, 0, 4294967295))
+                isUintIn(parts[0], 0, 255) &&
+                parts.slice(1).every((p) => isUintIn(p, 0, 4294967295))
                 ? null
                 : bad;
         }
         case "blur":
-            // The server's blur bound (url.rs MAX_BLUR_SIGMA):
-            // positive and at most 512.
-            return args !== null && isFloat(args) && Number(args) > 0 && Number(args) <= 512
-                ? null
-                : bad;
+            // The server's blur bound (url.rs MAX_BLUR_SIGMA): a
+            // normal f32, so at least 2^-126 (a subnormal sigma
+            // panics the image crate's Gaussian setup), and at most
+            // 512.
+            return f32In(args, 2 ** -126, 512) ? null : bad;
         case "sharpen":
-            return args !== null && isFloat(args) && Number(args) > 0 ? null : bad;
+            return f32In(args, 0, F32_MAX, true) ? null : bad;
         case "brighten":
-            return args !== null && isIntIn(args, -255, 255) ? null : bad;
+            return isIntIn(args, -255, 255) ? null : bad;
         case "huerotate":
-            return args !== null && isIntIn(args, -2147483648, 2147483647) ? null : bad;
+            return isIntIn(args, -2147483648, 2147483647) ? null : bad;
         case "contrast":
-            return args !== null && isFloat(args) && Number(args) >= -100 && Number(args) <= 100
-                ? null
-                : bad;
+            return f32In(args, -100, 100) ? null : bad;
         case "gamma":
-            return args !== null && isFloat(args) && Number(args) > 0 && Number(args) <= 10
-                ? null
-                : bad;
+            return f32In(args, 0, 10, true) ? null : bad;
         case "exposure":
-            return args !== null && isFloat(args) && Number(args) >= -10 && Number(args) <= 10
-                ? null
-                : bad;
+            return f32In(args, -10, 10) ? null : bad;
         case "highlights_shadows": {
             if (args === null)
                 return bad;
             const parts = args.split(",");
-            return parts.length === 2 &&
-                parts.every((p) => isFloat(p) && Number(p) >= -100 && Number(p) <= 100)
-                ? null
-                : bad;
+            return parts.length === 2 && parts.every((p) => f32In(p, -100, 100)) ? null : bad;
         }
         case "vibrance":
-            return args !== null && isFloat(args) && Number(args) >= -100 && Number(args) <= 100
-                ? null
-                : bad;
+            return f32In(args, -100, 100) ? null : bad;
         case "saturation":
-            return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 255
-                ? null
-                : bad;
+            return f32In(args, 0, 255) ? null : bad;
         case "quality": {
             if (args === null)
                 return bad;
-            if (args === "auto" || isIntIn(args, 1, 100))
+            if (args === "auto" || isUintIn(args, 1, 100))
                 return null;
             // Per-format list (issue #319): at most one bare
             // fallback, at most one entry per format, no video
@@ -377,7 +498,7 @@ function validateFilter(name, args) {
             for (const part of args.split(",")) {
                 const colon = part.indexOf(":");
                 if (colon === -1) {
-                    if (fallbackSeen || !(part === "auto" || isIntIn(part, 1, 100)))
+                    if (fallbackSeen || !(part === "auto" || isUintIn(part, 1, 100)))
                         return bad;
                     fallbackSeen = true;
                 }
@@ -390,14 +511,14 @@ function validateFilter(name, args) {
                     if (seen.has(canonical))
                         return bad;
                     seen.add(canonical);
-                    if (!(value === "auto" || isIntIn(value, 1, 100)))
+                    if (!(value === "auto" || isUintIn(value, 1, 100)))
                         return bad;
                 }
             }
             return seen.size + (fallbackSeen ? 1 : 0) > 0 ? null : bad;
         }
         case "palette":
-            return args !== null && isIntIn(args, 2, 256) ? null : bad;
+            return isUintIn(args, 2, 256) ? null : bad;
         case "format": {
             if (args === null)
                 return bad;
@@ -426,9 +547,12 @@ function validateFilter(name, args) {
                     return bad;
                 }
                 if (name === "webp") {
-                    if (/^method:[0-6]$/.test(option))
+                    // Each value is a u8 on the server (url.rs
+                    // parse_format_spec), so `method:+6` and `sns:050`
+                    // are spellings of 6 and 50.
+                    if (key === "method" && isUintIn(option.slice(7), 0, 6))
                         continue;
-                    if (/^sns:\d+$/.test(option) && isIntIn(option.slice(4), 0, 100))
+                    if (key === "sns" && isUintIn(option.slice(4), 0, 100))
                         continue;
                     return bad;
                 }
@@ -451,7 +575,7 @@ function validateFilter(name, args) {
             const coords = parts.slice(1);
             if (coords.length < 4 || coords.length > 32 || coords.length % 2 !== 0)
                 return bad;
-            if (!coords.every((p) => isIntIn(p, 0, 255)))
+            if (!coords.every((p) => isUintIn(p, 0, 255)))
                 return bad;
             for (let i = 2; i < coords.length; i += 2) {
                 if (Number(coords[i]) <= Number(coords[i - 2]))
@@ -471,13 +595,12 @@ function validateFilter(name, args) {
             return parts.slice(0, -1).every((p) => isKernelValue(p)) ? null : bad;
         }
         case "noise":
-            return args !== null && isIntIn(args, 0, 100) ? null : bad;
+            return isUintIn(args, 0, 100) ? null : bad;
         case "facepad":
-            return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 3
-                ? null
-                : bad;
+            return f32In(args, 0, 3) ? null : bad;
         case "upscale":
-            return args !== null && /^[+-]?\d+$/.test(args) && isOneOf(UPSCALE_FACTORS, Number(args))
+            // A u32, then one of the factors.
+            return isUintIn(args, 0, 4294967295) && isOneOf(UPSCALE_FACTORS, Number(args))
                 ? null
                 : bad;
         case "studio": {
@@ -508,7 +631,7 @@ function validateFilter(name, args) {
                     // The pad parses as a Rust u8 (an optional `+`,
                     // then digits; no minus sign, not even `-0`) and
                     // is bounded to 40.
-                    if (!/^\+?\d+$/.test(value) || BigInt(value) > 40n)
+                    if (!isUintIn(value, 0, 40))
                         return bad;
                 }
                 else if (mode === "product" && key === "bg") {
@@ -525,12 +648,16 @@ function validateFilter(name, args) {
             }
             return null;
         }
-        case "dpr":
-            return args !== null && isFloat(args) && isOneOf(DPR_FACTORS, Number(args))
-                ? null
-                : bad;
+        case "dpr": {
+            // An f32, then one of the factors: `dpr(1.50000001)`
+            // rounds to 1.5.
+            const factor = args === null ? null : readDecimal(args, 32);
+            return factor !== null && isOneOf(DPR_FACTORS, factor) ? null : bad;
+        }
         case "rotate":
-            return args !== null && /^-?\d+(\.\d+)?$/.test(args) && Math.abs(Number(args)) <= 36000
+            // url.rs parse_angle: a strict decimal, read as an f32,
+            // at most 100 turns either way.
+            return args !== null && STRICT_DECIMAL.test(args) && f32In(args, -36000, 36000)
                 ? null
                 : bad;
         case "fill":
@@ -540,7 +667,7 @@ function validateFilter(name, args) {
                 return bad;
             const parts = args.split(",");
             return (parts.length === 1 || parts.length === 4) &&
-                parts.every((p) => isIntIn(p, 0, MAX_DIMENSION))
+                parts.every((p) => isUintIn(p, 0, MAX_DIMENSION))
                 ? null
                 : bad;
         }
@@ -549,7 +676,7 @@ function validateFilter(name, args) {
                 return bad;
             const parts = args.split(",");
             return parts.length === 2 &&
-                isIntIn(parts[0], 0, MAX_DIMENSION) &&
+                isUintIn(parts[0], 0, MAX_DIMENSION) &&
                 /^[0-9a-fA-F]{6}$/.test(parts[1])
                 ? null
                 : bad;
@@ -565,7 +692,7 @@ function validateFilter(name, args) {
         case "monochrome":
             return args !== null && /^[0-9a-fA-F]{6}$/.test(args) ? null : bad;
         case "pixelate":
-            return args !== null && isIntIn(args, 1, MAX_DIMENSION) ? null : bad;
+            return isUintIn(args, 1, MAX_DIMENSION) ? null : bad;
         case "flip":
             return isOneOf(FLIP_AXES, args) ? null : bad;
         case "overlay": {
@@ -580,14 +707,14 @@ function validateFilter(name, args) {
                 return bad;
             let rest = fields;
             if (fields.length >= 6) {
-                if (!isIntIn(fields[fields.length - 1], 1, 400))
+                if (!isUintIn(fields[fields.length - 1], 1, 400))
                     return bad;
                 rest = fields.slice(0, -1);
             }
             const blend = rest[rest.length - 1];
             if (!isOneOf(BLEND_MODES, blend))
                 return bad;
-            if (!isIntIn(rest[rest.length - 2], 0, 100))
+            if (!isUintIn(rest[rest.length - 2], 0, 100))
                 return bad;
             if (!isIntIn(rest[rest.length - 3], -2147483648, 2147483647))
                 return bad;
@@ -621,19 +748,15 @@ function validateFilter(name, args) {
                 return bad;
             const parts = args.split(",");
             return parts.length === 4 &&
-                parts.every((p) => isIntIn(p, 0, MAX_DIMENSION)) &&
-                Number(parts[2]) >= 1 &&
-                Number(parts[3]) >= 1
+                isUintIn(parts[0], 0, MAX_DIMENSION) &&
+                isUintIn(parts[1], 0, MAX_DIMENSION) &&
+                isUintIn(parts[2], 1, MAX_DIMENSION) &&
+                isUintIn(parts[3], 1, MAX_DIMENSION)
                 ? null
                 : bad;
         }
         case "max_bytes":
-            return args !== null &&
-                /^[+-]?\d+$/.test(args) &&
-                BigInt(args) >= 1n &&
-                BigInt(args) <= 18446744073709551615n
-                ? null
-                : bad;
+            return isUintIn(args, 1, 18446744073709551615n) ? null : bad;
         case "text": {
             if (args === null)
                 return bad;
@@ -646,7 +769,7 @@ function validateFilter(name, args) {
             const text = percentDecodable(parts.slice(0, -3).join(","));
             return ANCHOR_NAMES.has(anchor) &&
                 /^[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(color) &&
-                isIntIn(size, 1, 1000) &&
+                isUintIn(size, 1, 1000) &&
                 text !== null &&
                 text !== "" &&
                 textLabelFits(text, Number(size))
@@ -663,7 +786,7 @@ function validateFilter(name, args) {
             const y = parts[parts.length - 2];
             const x = parts[parts.length - 3];
             const url = percentDecodable(parts.slice(0, -3).join(","));
-            return isIntIn(alpha, 0, 100) &&
+            return isUintIn(alpha, 0, 100) &&
                 isIntIn(y, -2147483648, 2147483647) &&
                 isIntIn(x, -2147483648, 2147483647) &&
                 url !== null &&
@@ -675,14 +798,16 @@ function validateFilter(name, args) {
             return `unknown filter: ${name}`;
     }
 }
-function explainFilters(rest) {
-    // The server splits the list on the ':' separators that
-    // sit outside parentheses (url.rs split_filter_chain):
-    // an argument list may itself contain ':' (the studio
-    // filter's named arguments are `key:value`), so a naive
-    // split would cut those filters apart. Unbalanced
-    // parentheses leave the tail in one part, which then
-    // fails its own parse, as on the server.
+/**
+ * The filters of a `filters:` segment's list. The server splits
+ * the list on the ':' separators that sit outside parentheses
+ * (url.rs split_filter_chain): an argument list may itself
+ * contain ':' (the studio filter's named arguments are
+ * `key:value`), so a naive split would cut those filters apart.
+ * Unbalanced parentheses leave the tail in one part, which then
+ * fails its own parse, as on the server.
+ */
+function filterChain(rest) {
     const parts = [];
     let depth = 0;
     let start = 0;
@@ -700,8 +825,11 @@ function explainFilters(rest) {
         }
     }
     parts.push(rest.slice(start));
+    return parts;
+}
+function explainFilters(rest) {
     const blurbs = [];
-    for (const part of parts) {
+    for (const part of filterChain(rest)) {
         const match = part.match(/^([a-z_0-9]+)(?:\((.*)\))?$/);
         if (!match) {
             return { error: `malformed filter: ${part}` };
@@ -719,6 +847,80 @@ function explainFilters(rest) {
         blurbs.push(args !== null ? `${name}(${args}): ${blurb}` : `${name}: ${blurb}`);
     }
     return { detail: blurbs.join("; ") };
+}
+/** The most operations one request runs (url.rs MAX_OPERATIONS). */
+export const MAX_OPERATIONS = 100;
+/**
+ * The most distinct watermark and overlay URLs one request
+ * names (url.rs MAX_WATERMARK_URLS, issue #613).
+ */
+export const MAX_WATERMARK_URLS = 16;
+/**
+ * The decoded image URL a valid `watermark(...)` or
+ * `overlay(...)` filter composites, or null for any other
+ * filter. Both split from the right, as validateFilter reads
+ * them.
+ */
+function compositedUrl(filter) {
+    const match = filter.match(/^(watermark|overlay)\((.*)\)$/);
+    if (!match)
+        return null;
+    const fields = match[2].split(",");
+    const numeric = match[1] === "watermark" ? 3 : fields.length >= 6 ? 5 : 4;
+    return percentDecodable(fields.slice(0, -numeric).join(","));
+}
+/**
+ * The caps the server applies once a request parses (url.rs
+ * check_operation_count and check_watermark_count, issues #469
+ * and #613): at most {@link MAX_OPERATIONS} operations, each
+ * filter in a `filters:` segment counting once, and at most
+ * {@link MAX_WATERMARK_URLS} distinct watermark and overlay
+ * URLs, compared as decoded. A preset reference counts as one
+ * operation: its definition holds at least one, and the
+ * explainer sees neither the definition nor the server's
+ * default operations, so both counts are lower bounds, and a
+ * cap they pass is one the server refuses too.
+ */
+function capErrors(segments) {
+    let operations = 0;
+    let presets = false;
+    const urls = new Set();
+    for (const { raw, kind } of segments) {
+        if (kind === "expiry" || kind === "maxage")
+            continue;
+        presets ||= kind === "preset";
+        if (kind === "operation" && raw.startsWith("filters:")) {
+            for (const filter of filterChain(raw.slice(8))) {
+                operations += 1;
+                const url = compositedUrl(filter);
+                if (url !== null)
+                    urls.add(url);
+            }
+        }
+        else {
+            operations += 1;
+        }
+    }
+    const errors = [];
+    const atLeast = presets ? "at least " : "";
+    if (operations > MAX_OPERATIONS) {
+        errors.push(`the request has ${atLeast}${operations} operations, over the ${MAX_OPERATIONS} operation limit: the server answers 400 (unsupported_operation)`);
+    }
+    else if (urls.size > MAX_WATERMARK_URLS) {
+        errors.push(`the request names ${urls.size} distinct watermark and overlay URLs, over the ${MAX_WATERMARK_URLS} URL limit: the server answers 400 (unsupported_operation)`);
+    }
+    return errors;
+}
+/**
+ * `<left>x<top>:<right>x<bottom>` as url.rs parse_rect_points
+ * reads it (crop-rect and focal): four u32s, with the right
+ * edge past the left and the bottom past the top.
+ */
+function isRectPoints(rest) {
+    const m = rest.match(/^(\+?\d+)x(\+?\d+):(\+?\d+)x(\+?\d+)$/);
+    if (!m || !m.slice(1).every((n) => isUintIn(n, 0, 4294967295)))
+        return false;
+    return BigInt(m[3]) > BigInt(m[1]) && BigInt(m[4]) > BigInt(m[2]);
 }
 const ALIGN_NAMES = new Set(CROP_ALIGNS);
 const U64_MAX = 18446744073709551615n;
@@ -746,11 +948,11 @@ function parseObjectsAlign(align) {
         if (!tail.startsWith(":"))
             return null;
         const text = tail.slice(1);
-        if (!isFloat(text))
+        // An f32 above 0 and at most 100, the bound applied to
+        // the rounded value, as on the server.
+        if (!f32In(text, 0, 100, true))
             return null;
         scale = Number(text);
-        if (!(scale > 0) || scale > 100)
-            return null;
     }
     const parts = list.split(",");
     const classes = [];
@@ -844,9 +1046,14 @@ function explainSegment(seg, nowSeconds) {
         const rest = seg.slice(6);
         // The server's frame grammar (url.rs parse_frame): the
         // poster keyword, or a strict decimal (no sign, no
-        // exponent, no leading dot) as seconds up to 86400 or,
-        // with a % suffix, as a percent up to 100.
-        const decimal = (text, max) => /^\d+(\.\d+)?$/.test(text) && Number(text) <= max;
+        // exponent, no leading dot) read as an f64, as seconds up
+        // to 86400 or, with a % suffix, as a percent up to 100.
+        const decimal = (text, max) => {
+            if (!/^\d+(\.\d+)?$/.test(text))
+                return false;
+            const value = readDecimal(text, 64);
+            return value !== null && value <= max;
+        };
         if (rest === "poster") {
             return { kind: "operation", title: "Frame", detail: "render the video source's poster frame" };
         }
@@ -889,11 +1096,7 @@ function explainSegment(seg, nowSeconds) {
     }
     if (seg.startsWith("crop-rect:")) {
         const rest = seg.slice(10);
-        const m = rest.match(/^([+-]?\d+)x([+-]?\d+):([+-]?\d+)x([+-]?\d+)$/);
-        if (!m ||
-            m.slice(1).some((n) => BigInt(n) < 0n || BigInt(n) > 4294967295n) ||
-            BigInt(m[3]) <= BigInt(m[1]) ||
-            BigInt(m[4]) <= BigInt(m[2])) {
+        if (!isRectPoints(rest)) {
             return {
                 kind: "operation",
                 title: "Crop rectangle",
@@ -904,11 +1107,7 @@ function explainSegment(seg, nowSeconds) {
     }
     if (seg.startsWith("focal:")) {
         const rest = seg.slice(6);
-        const m = rest.match(/^([+-]?\d+)x([+-]?\d+):([+-]?\d+)x([+-]?\d+)$/);
-        if (!m ||
-            m.slice(1).some((n) => BigInt(n) < 0n || BigInt(n) > 4294967295n) ||
-            BigInt(m[3]) <= BigInt(m[1]) ||
-            BigInt(m[4]) <= BigInt(m[2])) {
+        if (!isRectPoints(rest)) {
             return {
                 kind: "operation",
                 title: "Focal rectangle",
@@ -923,15 +1122,12 @@ function explainSegment(seg, nowSeconds) {
         const point = colon === -1 ? rest : rest.slice(0, colon);
         const zoomText = colon === -1 ? null : rest.slice(colon + 1);
         const xy = point.split("x");
+        // Each number an f32, the bounds applied to the rounded
+        // value (url.rs parse_focal_point).
         const ok = xy.length === 2 &&
-            isFloat(xy[0]) &&
-            isFloat(xy[1]) &&
-            Number(xy[0]) >= 0 &&
-            Number(xy[0]) <= 1 &&
-            Number(xy[1]) >= 0 &&
-            Number(xy[1]) <= 1 &&
-            (zoomText === null ||
-                (isFloat(zoomText) && Number(zoomText) > 0 && Number(zoomText) <= 100));
+            f32In(xy[0], 0, 1) &&
+            f32In(xy[1], 0, 1) &&
+            (zoomText === null || f32In(zoomText, 0, 100, true));
         if (!ok) {
             return {
                 kind: "operation",
@@ -1153,6 +1349,17 @@ export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
         signature = { kind: "invalid", value: signatureRaw, detail: "not `unsafe` and not lowercase hex: the server rejects it as malformed (400)" };
         errors.push("malformed signature segment");
     }
+    // Remainders the server refuses before it reads an
+    // operation, whatever the signature (server/admission.rs
+    // resolve_request): the segment key derivation owns, and
+    // the endpoints' own segments.
+    const head = remainder.split("/", 1)[0];
+    if (isReservedRemainder(remainder)) {
+        errors.push("the remainder begins with the reserved segment crabcrop, which key derivation owns: the server answers 400 (reserved_segment)");
+    }
+    else if (head === "purge" || head === "purge-group" || head === "upload") {
+        errors.push("an image URL may not begin with a purge or upload segment: the server answers 400 (reserved_segment)");
+    }
     const segments = [];
     let rest = remainder;
     let source = "";
@@ -1188,6 +1395,10 @@ export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
     }
     if (!source && rest) {
         source = rest;
+    }
+    // The caps apply to a request that parses, as on the server.
+    if (errors.length === 0) {
+        errors.push(...capErrors(segments));
     }
     return { signature, segments, source, remainder, errors };
 }

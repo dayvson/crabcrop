@@ -40,6 +40,14 @@ these rules:
              through jobs that do, and no `if:` on the way can run it after
              a failure. So a registry takes a version only once its release
              is published, the order every publish job keeps (issue #711).
+  fuzz       Every libFuzzer run (`cargo fuzz run`) passes -rss_limit_mb, so
+             an input that makes the process grow without bound is a
+             reported failure of that input, not a runner that dies with
+             nothing to show (issue #710).
+  cache      The release workflow restores no cache (actions/cache,
+             Swatinem/rust-cache, or a setup action's `cache` input): an
+             entry holds whatever the run that saved it built, and a release
+             builds what it publishes from its checkout alone (issue #710).
 
 The files are read with a small YAML reader for the part of YAML that
 workflows use: block mappings and sequences, literal block scalars,
@@ -337,6 +345,11 @@ PIPE_INTO_SHELL = [
 PIP_INSTALL = re.compile(r"\bpip3?(?:\.exe)?[\"']?\s+install\b")
 BUILD_RUN = re.compile(r"\bpython(?:3(?:\.\d+)?)?\s+-m\s+build\b")
 PYTHON_PACKAGE_WORK = re.compile(r"\bpip3?(?:\.exe)?[\"']?\s+(?:install|wheel|download)\b|\bpython(?:3(?:\.\d+)?)?\s+-m\s+build\b|\bsetup\.py\b")
+FUZZ_RUN = re.compile(r"\bcargo\s+(?:\+\S+\s+)?fuzz\s+run\b")
+# Actions that restore a cache into the job, and the setup actions that
+# do it through their `cache` input.
+CACHE_ACTIONS = {"actions/cache", "actions/cache/restore", "Swatinem/rust-cache"}
+CACHING_SETUP_ACTIONS = {"actions/setup-node", "actions/setup-python", "actions/setup-go", "actions/setup-java"}
 CHECKSUM = re.compile(r"\bsha256sum\b[^\n]*\s(?:-c|--check)\b|\bshasum\b[^\n]*-a\s*256\b[^\n]*\s(?:-c|--check)\b")
 RUNS_A_SCRIPT = re.compile(r"(?:^|[;&|(]\s*|\b(?:then|do|else)\s+)(?:sudo\s+)?(?:(?:ba|da|z)?sh\s+(?!-c\b)\S|\./\S)", re.M)
 # `|| true`, `|| :` or `|| echo ...` after a check lets a failed check
@@ -407,10 +420,16 @@ def pip_problems(command):
 
 
 def run_problems(script):
-    """The pipe, installer and pip rules for one run script."""
+    """The pipe, installer, pip and fuzz rules for one run script."""
     problems = []
     lines = shell_lines(script)
     for line in lines:
+        # -rss_limit_mb=0 turns the limit off.
+        if FUZZ_RUN.search(line) and not re.search(r"(?:^|\s)-rss_limit_mb=[1-9]\d*(?=\s|$)", line):
+            problems.append(
+                "runs a fuzz target without -rss_limit_mb, so an input that grows the process "
+                f"without bound is never reported as a failure: {line.strip()}"
+            )
         if "install_dist" in line:
             problems.append(
                 "runs dist's matrix.install_dist command, which pipes the cargo-dist installer into sh; "
@@ -662,6 +681,7 @@ def check_workflow(text, name):
     if not isinstance(workflow, dict):
         return [f"{name}: not a YAML mapping"]
     problems = []
+    release = workflow_stem(name) == "release"
     workflow_env = mapping(workflow.get("env"))
     for key in workflow_env:
         if key == "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL":
@@ -685,6 +705,11 @@ def check_workflow(text, name):
                 uses.startswith("./") or SHA_PIN.fullmatch(uses) or DOCKER_PIN.fullmatch(uses)
             ):
                 problems.append(f"{at}: uses {uses}, which is not pinned to a full commit SHA")
+            if release and restores_a_cache(step):
+                problems.append(
+                    f"{at}: restores a cache in the release workflow; a release builds what it publishes "
+                    "from its checkout alone"
+                )
             step_env = mapping(step.get("env"))
             env = {**job_env, **step_env}
             if "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL" in step_env:
@@ -705,6 +730,23 @@ def check_workflow(text, name):
     problems += gate_problems(workflow, name)
     problems += order_problems(workflow, name)
     return problems
+
+
+def workflow_stem(name):
+    """The workflow a file holds: `rust` for .github/workflows/rust.yml and
+    for its mirror docs/rust-workflow.yml."""
+    stem = Path(name).name.rsplit(".", 1)[0]
+    return stem[: -len("-workflow")] if stem.endswith("-workflow") else stem
+
+
+def restores_a_cache(step):
+    """Whether a step restores a cache into its job."""
+    uses = step.get("uses")
+    if not isinstance(uses, str):
+        return False
+    action = uses.split("@", 1)[0]
+    with_ = mapping(step.get("with"))
+    return action in CACHE_ACTIONS or (action in CACHING_SETUP_ACTIONS and bool(str(with_.get("cache", "")).strip()))
 
 
 def default_files(root):
@@ -738,8 +780,9 @@ def main(argv=None):
             print(f"  {problem}", file=sys.stderr)
         return 1
     print(f"{len(files)} workflow files: actions pinned, no download piped into a shell, installers checked "
-          "against pinned hashes, hashed pip installs, dav1d from a checked tarball, and every publishing job "
-          "behind the release approval and after the GitHub Release")
+          "against pinned hashes, hashed pip installs, dav1d from a checked tarball, every publishing job "
+          "behind the release approval and after the GitHub Release, every fuzz run under a memory limit, "
+          "and no cache in the release")
     return 0
 
 

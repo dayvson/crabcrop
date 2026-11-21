@@ -787,6 +787,7 @@ class ReleaseLayout(unittest.TestCase):
     def test_every_dav1d_build_uses_the_script(self):
         for path, job in (
             ("release-workflow.yml", "build-local-artifacts"),
+            ("rust-workflow.yml", "build"),
             ("rust-workflow.yml", "macos"),
             ("fuzz-workflow.yml", "fuzz"),
             ("fuzz-workflow.yml", "tests"),
@@ -801,6 +802,196 @@ class ReleaseLayout(unittest.TestCase):
                 self.assertLess(built, cargo, f"{path} {job} builds before it builds dav1d")
         checked = self.step_index("build-local-artifacts", "Check that dav1d is linked statically")
         self.assertGreater(checked, self.step_index("build-local-artifacts", "Build artifacts"))
+
+
+class Fuzz(unittest.TestCase):
+    """Issue #710: every libFuzzer run under a memory limit."""
+
+    def test_a_run_without_the_limit_fails(self):
+        for command in (
+            'cargo +nightly fuzz run "$TARGET" "$corpus" -- -max_total_time=900 -timeout=600',
+            "cargo fuzz run decode",
+            "cargo +nightly-2026-01-01 fuzz run op_chain -- -rss_limit_mb=0",
+        ):
+            with self.subTest(command=command):
+                (problem,) = step_problems(f"- run: |\n    {command}\n")
+                self.assertIn("without -rss_limit_mb", problem)
+
+    def test_the_limit_on_a_continued_line_passes(self):
+        step = """\
+            - run: |
+                cargo +nightly fuzz run "$TARGET" "$corpus" "fuzz/corpus/$TARGET" -- \\
+                  -max_total_time=900 \\
+                  -rss_limit_mb=2048 \\
+                  -timeout=600 > "$log" 2>&1 || status=$?
+            """
+        self.assertEqual(step_problems(step), [])
+
+    def test_other_cargo_fuzz_commands_pass(self):
+        for command in ('cargo +nightly fuzz build "$TARGET"', "cargo +nightly install cargo-fuzz --version 0.13.2 --locked"):
+            with self.subTest(command=command):
+                self.assertEqual(step_problems(f"- run: {command}\n"), [])
+
+
+class ReleaseCache(unittest.TestCase):
+    """Issue #710: the release builds from its checkout alone."""
+
+    STEPS = {
+        "actions/cache": f"- uses: actions/cache@{SHA}\n  with:\n    path: target\n    key: k\n",
+        "actions/cache/restore": f"- uses: actions/cache/restore@{SHA}\n  with:\n    path: target\n    key: k\n",
+        "Swatinem/rust-cache": f"- uses: Swatinem/rust-cache@{SHA}\n",
+        "setup-node cache": f"- uses: actions/setup-node@{SHA}\n  with:\n    node-version: 22\n    cache: npm\n",
+    }
+
+    def test_a_cache_in_the_release_workflow_fails(self):
+        for name in ("docs/release-workflow.yml", ".github/workflows/release.yml"):
+            for label, step in self.STEPS.items():
+                with self.subTest(name=name, step=label):
+                    (problem,) = cw.check_workflow(step_workflow(step), name)
+                    self.assertIn("restores a cache in the release workflow", problem)
+
+    def test_other_workflows_and_plain_setup_steps_pass(self):
+        for label, step in self.STEPS.items():
+            with self.subTest(step=label):
+                self.assertEqual(cw.check_workflow(step_workflow(step), "docs/rust-workflow.yml"), [])
+        plain = f"- uses: actions/setup-node@{SHA}\n  with:\n    node-version: 22\n"
+        self.assertEqual(cw.check_workflow(step_workflow(plain), "docs/release-workflow.yml"), [])
+        save = f"- uses: actions/cache/save@{SHA}\n  with:\n    path: target\n    key: k\n"
+        self.assertEqual(cw.check_workflow(step_workflow(save), "docs/release-workflow.yml"), [])
+
+
+def mirror(name):
+    return cw.load((ROOT / "docs" / f"{name}-workflow.yml").read_text(encoding="utf-8"))
+
+
+def steps_named(job, name):
+    return [step for step in job["steps"] if step.get("name") == name]
+
+
+class Timeouts(unittest.TestCase):
+    """Issues #543 and #710: no job holds a runner for six hours."""
+
+    # Their jobs set no timeout yet: release.yml is mostly what
+    # cargo-dist generates, and changelog.yml's one job reads a diff.
+    NOT_YET = {"release", "changelog"}
+
+    def test_every_job_of_the_landed_workflows_sets_a_timeout(self):
+        for path in sorted((ROOT / "docs").glob("*-workflow.yml")):
+            stem = cw.workflow_stem(path.name)
+            if stem in self.NOT_YET:
+                continue
+            for job_name, job in mirror(stem)["jobs"].items():
+                with self.subTest(workflow=stem, job=job_name):
+                    if "uses" not in job:
+                        self.assertRegex(str(job.get("timeout-minutes", "")), r"^[1-9]\d*$")
+
+
+class FuzzLayout(unittest.TestCase):
+    """The nightly fuzz workflow as docs/fuzz-workflow.yml lands it (issue #710)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = mirror("fuzz")
+        cls.jobs = cls.workflow["jobs"]
+
+    def test_no_failing_input_is_printed_or_uploaded(self):
+        for job in self.jobs.values():
+            for step in job["steps"]:
+                self.assertNotIn("upload-artifact", str(step.get("uses", "")))
+        (run,) = [step["run"] for step in self.jobs["fuzz"]["steps"] if "fuzz run" in str(step.get("run", ""))]
+        command = next(line for line in cw.shell_lines(run) if "fuzz run" in line)
+        self.assertRegex(command, r'> "\$log" 2>&1 \|\| status=\$\?$')
+        lines = [line.strip() for line in cw.shell_lines(run) if line.strip()]
+        self.assertEqual(lines[-2:], ['python3 scripts/fuzz_report.py "$log" "fuzz/artifacts/$TARGET"', 'exit "$status"'])
+
+    def test_the_matrix_fuzzes_every_target(self):
+        manifest = (ROOT / "fuzz" / "Cargo.toml").read_text(encoding="utf-8")
+        targets = re.findall(r'^\[\[bin\]\]\nname = "([^"]+)"', manifest, re.M)
+        self.assertIn("render", targets)
+        self.assertEqual(sorted(self.jobs["fuzz"]["strategy"]["matrix"]["target"]), sorted(targets))
+
+    def test_the_schedule_and_the_tests_job_stay(self):
+        self.assertTrue(self.workflow["on"]["schedule"])
+        runs = {step.get("name"): step for step in self.jobs["tests"]["steps"]}
+        smoke = runs["Fuzz smoke with the AVIF decoder"]["run"]
+        self.assertIn("--test smoke", smoke)
+        self.assertNotIn("--no-default-features", smoke)
+        self.assertEqual(runs["Workspace tests with 10000 cases per property"]["env"]["PROPTEST_CASES"], "10000")
+
+
+class RustLayout(unittest.TestCase):
+    """rust.yml as docs/rust-workflow.yml lands it (issue #710)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = mirror("rust")
+        cls.jobs = cls.workflow["jobs"]
+
+    def test_the_linux_avif_tests_link_the_release_dav1d(self):
+        runs = [str(step.get("run", "")) for step in self.jobs["build"]["steps"]]
+        built = next(at for at, run in enumerate(runs) if run.startswith("bash scripts/build_dav1d.sh"))
+        avif = next(at for at, run in enumerate(runs) if "--features avif-decode" in run)
+        self.assertLess(built, avif)
+        self.assertFalse([run for run in runs if "libdav1d" in run])
+
+    def test_only_a_push_to_main_saves_the_cargo_cache(self):
+        caches = [
+            step
+            for job in self.jobs.values()
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("Swatinem/rust-cache@")
+        ]
+        self.assertEqual(len(caches), 4)
+        for step in caches:
+            self.assertTrue(step["with"]["prefix-key"].startswith("rust-ci-"))
+            self.assertEqual(step["with"]["save-if"], "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
+
+    def test_a_scheduled_run_audits_and_does_nothing_else(self):
+        self.assertTrue(self.workflow["on"]["schedule"])
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                expected = "==" if name == "scheduled-audit" else "!="
+                self.assertEqual(job["if"], f"github.event_name {expected} 'schedule'")
+        audit = self.jobs["scheduled-audit"]
+        self.assertEqual(audit["permissions"], {"contents": "read", "issues": "write"})
+        self.assertTrue(str(audit["steps"][-1]["uses"]).startswith("rustsec/audit-check@"))
+
+    def test_the_semver_check_installs_a_checked_binary(self):
+        steps = self.jobs["semver"]["steps"]
+        (install,) = steps_named(self.jobs["semver"], "Install cargo-semver-checks")
+        script = "\n".join(cw.shell_lines(install["run"]))
+        self.assertRegex(script, r'echo "[0-9a-f]{64}  \$archive" \| sha256sum -c -')
+        self.assertLess(script.index("sha256sum -c"), script.index("tar -xzf"))
+        self.assertEqual(steps[-1]["run"], "cargo semver-checks --package crabcrop-url")
+        self.assertEqual(steps[-1]["if"], "steps.changed.outputs.changed == 'true'")
+
+
+class AiModelsLayout(unittest.TestCase):
+    """ai-models.yml as docs/ai-models-workflow.yml lands it (issue #710)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = mirror("ai-models")
+
+    def test_every_change_the_real_model_tests_compile_starts_it(self):
+        for event in ("pull_request", "push"):
+            paths = self.workflow["on"][event]["paths"]
+            for path in ("src/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "tests/fixtures/portrait.jpg", "tests/functional/corpus/dog.jpg"):
+                with self.subTest(event=event, path=path):
+                    self.assertIn(path, paths)
+
+    def test_every_model_variable_a_test_reads_is_set_and_required(self):
+        (step,) = steps_named(self.workflow["jobs"]["ai-models"], "Run the real-model AI tests")
+        env = step["env"]
+        self.assertEqual(env["CRABCROP_TEST_REQUIRE_MODELS"], "1")
+        read = set()
+        for source in (ROOT / "src").rglob("*.rs"):
+            text = source.read_text(encoding="utf-8")
+            read |= set(re.findall(r'env_or_skip\("(CRABCROP_TEST_[A-Z0-9_]+)"\)', text))
+            for names in re.findall(r"clip_vars\(\[([^\]]*)\]\)", text):
+                read |= set(re.findall(r'"(CRABCROP_TEST_[A-Z0-9_]+)"', names))
+        self.assertIn("CRABCROP_TEST_DETECT_MODEL", read)
+        self.assertEqual(sorted(read - set(env)), [])
 
 
 class Repository(unittest.TestCase):

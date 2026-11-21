@@ -59,3 +59,7 @@ path = "fuzz_targets/source_meta.rs"
 [[bin]]
 name = "op_chain"
 path = "fuzz_targets/op_chain.rs"
+
+[[bin]]
+name = "render"
+path = "fuzz_targets/render.rs"

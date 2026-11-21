@@ -69,14 +69,27 @@ const MAGIC: &[u8; 8] = b"crabsvg\x01";
 /// refuses a mismatch instead.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The worker's address-space cap. A legitimate render
-/// needs at most a few hundred megabytes: the 4096 px
-/// raster, a filter's intermediate rasters, the 256 MiB
-/// decode budget for embedded images, and the tree. The
-/// cap leaves room for that and the binary's own mappings,
-/// and turns the arc path's multi-gigabyte allocation into
-/// a failed allocation in the child.
-pub(crate) const WORKER_MAX_ADDRESS_SPACE: u64 = 4 << 30;
+/// The worker's address-space cap when
+/// `CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB` is unset. A
+/// legitimate render needs at most a few hundred megabytes:
+/// the 4096 px raster, a filter's intermediate rasters, the
+/// 256 MiB decode budget for embedded images, and the tree.
+/// The cap leaves room for that and the binary's own
+/// mappings, and turns the arc path's multi-gigabyte
+/// allocation into a failed allocation in the child. An AVIF
+/// decode runs under the same cap.
+pub const DEFAULT_WORKER_ADDRESS_SPACE: u64 = 4 << 30;
+
+/// The least the cap may be set to, 512 MiB (issue #738):
+/// what the worker needs to start, with room for other
+/// builds. A release build without AVIF decoding rendered a
+/// 200x100 SVG of two shapes in 135 MiB and a line of text
+/// in 141 MiB, most of it the binary's own mappings and the
+/// 64 MiB the malloc settings below pad the heap with. A
+/// debug build, three times the size, needed 226 MiB for the
+/// text and 176 MiB to decode a 1200x800 AVIF, the same
+/// whether dav1d saw 4 cores or 64.
+pub const MIN_WORKER_ADDRESS_SPACE: u64 = 512 << 20;
 
 /// The wall clock for isolated work whose caller has no
 /// deadline of its own (upload validation): the server's
@@ -247,6 +260,11 @@ fn work_name(job: u8) -> &'static str {
 pub struct WorkerCommand {
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    /// The address-space cap the worker is told to set
+    /// itself, in bytes: [`DEFAULT_WORKER_ADDRESS_SPACE`], or
+    /// what `CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB` says
+    /// (issue #738).
+    pub max_address_space: u64,
 }
 
 impl WorkerCommand {
@@ -269,6 +287,7 @@ impl WorkerCommand {
         Ok(Self {
             program,
             args: vec![WORKER_ARG.into()],
+            max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
         })
     }
 }
@@ -530,7 +549,7 @@ fn spawn(command: &WorkerCommand, timeout: Duration, job: u8) -> Result<Worker, 
     let cpu_limit = crate::toolrun::cpu_limit_for(timeout, 1);
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
-        .arg(WORKER_MAX_ADDRESS_SPACE.to_string())
+        .arg(command.max_address_space.to_string())
         .arg(cpu_limit.as_secs().max(1).to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -817,7 +836,7 @@ pub fn worker_main() -> i32 {
             .and_then(|arg| arg.parse().ok())
             .unwrap_or(default)
     };
-    let max_address_space = limit(WORKER_MAX_ADDRESS_SPACE);
+    let max_address_space = limit(DEFAULT_WORKER_ADDRESS_SPACE);
     let cpu_secs = limit(crate::toolrun::cpu_limit_for(WORKER_TIMEOUT, 1).as_secs());
     crate::toolrun::limit_self(Duration::from_secs(cpu_secs), max_address_space);
     // Should the host run short of memory anyway, the
@@ -1258,6 +1277,7 @@ mod tests {
         WorkerCommand {
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), script.into()],
+            max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
         }
     }
 
@@ -1368,6 +1388,7 @@ mod tests {
         let missing = WorkerCommand {
             program: PathBuf::from("/nonexistent/crabcrop"),
             args: Vec::new(),
+            max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
         };
         let result = run(
             &missing,
@@ -1485,7 +1506,7 @@ mod tests {
         assert!(
             settings
                 .iter()
-                .all(|&(_, value)| value < WORKER_MAX_ADDRESS_SPACE / 8)
+                .all(|&(_, value)| value < DEFAULT_WORKER_ADDRESS_SPACE / 8)
         );
     }
 
@@ -1799,6 +1820,7 @@ mod tests {
         let missing = WorkerCommand {
             program: PathBuf::from("/nonexistent/crabcrop"),
             args: Vec::new(),
+            max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
         };
         let result = run_avif(&missing, b"", 1, 1, Instant::now() + Duration::from_secs(5));
         assert!(

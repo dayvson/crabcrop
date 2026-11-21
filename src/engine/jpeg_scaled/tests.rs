@@ -1079,7 +1079,9 @@ fn a_proportional_side_and_the_cap_come_from_the_declared_size() {
                 flip_horizontal: false,
                 flip_vertical: false,
             }),
-            Operation::Filters(vec![crate::url::Filter::NoUpscale]),
+            Operation::Filters(vec![crate::url::Filter::Plain(
+                crate::url::PlainFilter::NoUpscale,
+            )]),
         ];
         ops.extend(ops_of("filters:grayscale"));
         ops
@@ -1467,6 +1469,345 @@ fn a_truncated_file_gets_the_full_size_path_s_answer() {
     }
 }
 
+/// The seed of the decode target's corpus (fuzz/corpus/decode)
+/// named `name`.
+fn fuzz_seed(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz/corpus/decode")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+fn a_damaged_progressive_file_gets_one_answer_at_every_size() {
+    // Issue #713: one of the progressive files a differential
+    // run found libjpeg-turbo reading without a warning where
+    // zune-jpeg stops, at the end of its first scan. It
+    // rendered at the sizes that took the scaled decode and
+    // failed at full size. The scaled decode now leaves it to
+    // the full-size path, so every size gets zune-jpeg's
+    // answer: the error.
+    let bytes = fuzz_seed("jpeg-progressive-damaged-scan");
+    let look = glance(&bytes).unwrap();
+    assert!(look.progressive);
+    for denominator in DENOMINATORS {
+        let scaled = ScaledDecode {
+            denominator,
+            stored: look.size,
+            orientation: None,
+        };
+        assert!(decode(&bytes, &scaled).is_some(), "1/{denominator}");
+    }
+    assert_eq!(first_scan::marker_in_first_scan(&bytes), Some(false));
+    let full = answer(at_full_size(|| render(&bytes, "97x0")));
+    assert!(
+        full.as_ref()
+            .is_err_and(|e| e.starts_with("Decode(") && e.contains("Marker missing")),
+        "{full:?}"
+    );
+    for remainder in ["12x8", "16x0", "32x0", "49x0", "97x0", "crop:20x20", "0x0"] {
+        assert_eq!(plan_for(&bytes, remainder), None, "{remainder}");
+        assert_eq!(answer(render(&bytes, remainder)), full, "{remainder}");
+    }
+}
+
+/// The data of a progressive file's first scan: from the end
+/// of its header to the marker that ends it.
+fn first_scan_data(bytes: &[u8]) -> std::ops::Range<usize> {
+    let start = header_segments(bytes).last().unwrap().2;
+    let end = (start..bytes.len() - 1)
+        .find(|&at| bytes[at] == 0xFF && bytes[at + 1] != 0x00)
+        .expect("a marker after the first scan");
+    start..end
+}
+
+/// Whether zune-jpeg refuses `bytes` because its reader did
+/// not come to the marker that ends the first scan.
+fn zune_misses_the_marker(bytes: &[u8]) -> bool {
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
+        zune_core::bytestream::ZCursor::new(bytes),
+        zune_jpeg_options(),
+    );
+    decoder
+        .decode()
+        .is_err_and(|e| format!("{e:?}").contains("Marker missing where expected"))
+}
+
+#[test]
+fn the_first_scan_is_read_as_zune_jpeg_reads_it() {
+    // Issue #713. zune-jpeg refuses a progressive file whose
+    // first scan its reader is done with before it comes to
+    // the marker that ends the scan, and the scaled decode
+    // leaves those to the full-size path (see `first_scan`).
+    // The files here are damaged where that turns: bytes
+    // added at the end of the first scan's data, which a
+    // reader that fills four bytes at a time may or may not
+    // come past, and each bit of the scan's data flipped in
+    // turn, which makes codes read shorter or longer. Wherever
+    // the reading follows the scan, it gives zune-jpeg's own
+    // answer; and a request gets one answer at every size,
+    // the scaled decode's or the full-size path's.
+    let (mut comes, mut misses, mut unread, mut rendered) = (0, 0, 0, 0);
+    for (width, height) in [(16, 16), (40, 24), (61, 37)] {
+        let img = picture(width, height);
+        let remainder = format!("{}x0", width / 3);
+        for subsamp in [
+            turbojpeg::Subsamp::None,
+            turbojpeg::Subsamp::Sub2x1,
+            turbojpeg::Subsamp::Sub2x2,
+            turbojpeg::Subsamp::Sub1x2,
+            turbojpeg::Subsamp::Sub4x1,
+        ] {
+            let bytes = jpeg_with(&img, |c| {
+                c.set_subsamp(subsamp).unwrap();
+                c.set_progressive(true).unwrap();
+            });
+            let kind = format!("{width}x{height} {subsamp:?}");
+            assert_eq!(
+                first_scan::marker_in_first_scan(&bytes),
+                Some(true),
+                "{kind}"
+            );
+            assert!(plan_for(&bytes, &remainder).is_some(), "{kind}");
+            let data = first_scan_data(&bytes);
+            let mut damaged = Vec::new();
+            for extra in 1..=9 {
+                for fill in [&[0x00][..], &[0x5A], &[0xFF, 0x00]] {
+                    let mut longer = bytes[..data.end].to_vec();
+                    for _ in 0..extra {
+                        longer.extend_from_slice(fill);
+                    }
+                    longer.extend_from_slice(&bytes[data.end..]);
+                    damaged.push((format!("{kind}, {extra} x {fill:02X?} added"), longer));
+                }
+            }
+            for at in data.clone() {
+                for bit in 0..8 {
+                    let mut flipped = bytes.clone();
+                    flipped[at] ^= 1 << bit;
+                    damaged.push((format!("{kind}, byte {at} bit {bit} flipped"), flipped));
+                }
+            }
+            for (n, (what, file)) in damaged.iter().enumerate() {
+                match first_scan::marker_in_first_scan(file) {
+                    Some(reached) => {
+                        assert_eq!(reached, !zune_misses_the_marker(file), "{what}");
+                        if reached {
+                            comes += 1;
+                        } else {
+                            misses += 1;
+                        }
+                    }
+                    None => unread += 1,
+                }
+                // Each added run, and every seventh flip:
+                // rendered on both paths.
+                if n < 27 || n % 7 == 0 {
+                    assert_survives(what, file, &remainder);
+                    rendered += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        comes > 2000 && misses > 150 && unread * 4 < comes + misses && rendered > 600,
+        "{comes} come to the marker, {misses} miss it, {unread} unread, {rendered} rendered"
+    );
+}
+
+/// Entropy-coded bits, the first in the highest bit of each
+/// byte, with a zero stuffed after each 0xFF.
+#[derive(Default)]
+struct BitWriter {
+    out: Vec<u8>,
+    held: u32,
+    count: u32,
+}
+
+impl BitWriter {
+    fn put(&mut self, value: u32, length: u32) {
+        for bit in (0..length).rev() {
+            self.held = self.held << 1 | (value >> bit & 1);
+            self.count += 1;
+            if self.count == 8 {
+                self.out.push(self.held as u8);
+                if self.held == 0xFF {
+                    self.out.push(0x00);
+                }
+                (self.held, self.count) = (0, 0);
+            }
+        }
+    }
+
+    /// The bytes, the last one padded with ones.
+    fn finish(mut self) -> Vec<u8> {
+        while self.count != 0 {
+            self.put(1, 1);
+        }
+        self.out
+    }
+}
+
+/// A progressive JPEG of DC scans only, `width` by `height`,
+/// with luma sampled `luma` (chroma at 1x1), and the DC table
+/// of the JPEG standard (Annex K.3). Its scans carry the
+/// components `scans` names in turn (1 is luma, 2 and 3
+/// chroma): a scan of one component walks that component's
+/// own blocks, and one of more walks the frame's MCUs. The DC
+/// values vary from block to block, so each code is 2 to 9
+/// bits with up to 11 more after it.
+fn dc_only_progressive(width: u16, height: u16, luma: (u8, u8), scans: &[&[u8]]) -> Vec<u8> {
+    const BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+    // The code, and its length, of each size of difference.
+    let mut codes = [(0u32, 0u32); 12];
+    let (mut code, mut size) = (0u32, 0usize);
+    for (length, count) in (1..=16u32).zip(BITS) {
+        for _ in 0..count {
+            codes[size] = (code, length);
+            code += 1;
+            size += 1;
+        }
+        code <<= 1;
+    }
+    let sampling = [luma, (1, 1), (1, 1)];
+    let (h_max, v_max) = (u32::from(luma.0), u32::from(luma.1));
+    let (w, h) = (u32::from(width), u32::from(height));
+    let mut out = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+    out.extend_from_slice(&[1; 64]);
+    out.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x11, 8]);
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.push(3);
+    for (id, (across, down)) in (1u8..).zip(sampling) {
+        out.extend_from_slice(&[id, across << 4 | down, 0]);
+    }
+    out.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x1F, 0x00]);
+    out.extend_from_slice(&BITS);
+    out.extend(0..12u8);
+    for scan in scans {
+        out.extend_from_slice(&[0xFF, 0xDA, 0, 6 + 2 * scan.len() as u8, scan.len() as u8]);
+        for id in *scan {
+            out.extend_from_slice(&[*id, 0x00]);
+        }
+        out.extend_from_slice(&[0, 0, 0]);
+        let mut blocks = Vec::new();
+        if let [id] = scan {
+            let (across, down) = sampling[usize::from(id - 1)];
+            for row in 0..(h * u32::from(down)).div_ceil(8 * v_max) {
+                for col in 0..(w * u32::from(across)).div_ceil(8 * h_max) {
+                    blocks.push((*id, row, col));
+                }
+            }
+        } else {
+            for mcu_row in 0..h.div_ceil(8 * v_max) {
+                for mcu_col in 0..w.div_ceil(8 * h_max) {
+                    for id in *scan {
+                        let (across, down) = sampling[usize::from(id - 1)];
+                        let (across, down) = (u32::from(across), u32::from(down));
+                        for v in 0..down {
+                            for u in 0..across {
+                                blocks.push((*id, mcu_row * down + v, mcu_col * across + u));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut bits = BitWriter::default();
+        let mut previous = [0i32; 3];
+        for (id, row, col) in blocks {
+            let hash = (u32::from(id) * 7919 + row * 104_729 + col * 1_299_709)
+                .wrapping_mul(2_654_435_761);
+            let value = (hash >> 16) as i32 % 2001 - 1000;
+            let diff = value - previous[usize::from(id - 1)];
+            previous[usize::from(id - 1)] = value;
+            let size = 32 - diff.unsigned_abs().leading_zeros();
+            let (code, length) = codes[size as usize];
+            bits.put(code, length);
+            if size > 0 {
+                let extra = if diff >= 0 { diff } else { diff - 1 };
+                bits.put(extra as u32 & ((1 << size) - 1), size);
+            }
+        }
+        out.extend(bits.finish());
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+#[test]
+fn a_first_scan_of_one_or_two_components_is_read_as_zune_jpeg_reads_it() {
+    // Issue #713. libjpeg-turbo writes a progressive file's
+    // first scan with all three components; mozjpeg, which
+    // writes many of the progressive JPEGs served on the web,
+    // gives each component a DC scan of its own by default, so
+    // its first scan is luma alone, which walks the luma
+    // blocks' own grid instead of the frame's MCUs. Such files
+    // are written here in every chroma layout, at sizes off
+    // the block grid: one DC scan per component, two
+    // components interleaved and the third alone, and a chroma
+    // component first. Each is read to its marker, decodes,
+    // and takes the scaled decode; damaged after its first
+    // scan's data or in a bit of it, the reading gives
+    // zune-jpeg's own answer wherever it follows the scan.
+    let (mut comes, mut misses, mut unread) = (0, 0, 0);
+    let plans: [&[&[u8]]; 3] = [&[&[1], &[2], &[3]], &[&[1, 2], &[3]], &[&[2], &[1], &[3]]];
+    for luma in [(1, 1), (2, 1), (2, 2), (1, 2), (4, 1)] {
+        for (width, height) in [(16, 16), (40, 24), (61, 37), (97, 61)] {
+            for scans in plans {
+                let bytes = dc_only_progressive(width, height, luma, scans);
+                let kind = format!("{width}x{height}, luma {luma:?}, scans {scans:?}");
+                assert_eq!(
+                    first_scan::marker_in_first_scan(&bytes),
+                    Some(true),
+                    "{kind}"
+                );
+                assert!(decode_image(&bytes).is_ok(), "{kind}");
+                assert!(
+                    plan_for(&bytes, &format!("{}x0", width / 3)).is_some(),
+                    "{kind}"
+                );
+                let data = first_scan_data(&bytes);
+                let mut damaged = Vec::new();
+                for extra in 1..=9 {
+                    for fill in [&[0x00][..], &[0x5A], &[0xFF, 0x00]] {
+                        let mut longer = bytes[..data.end].to_vec();
+                        for _ in 0..extra {
+                            longer.extend_from_slice(fill);
+                        }
+                        longer.extend_from_slice(&bytes[data.end..]);
+                        damaged.push((format!("{kind}, {extra} x {fill:02X?} added"), longer));
+                    }
+                }
+                for at in data.clone() {
+                    for bit in 0..8 {
+                        let mut flipped = bytes.clone();
+                        flipped[at] ^= 1 << bit;
+                        damaged.push((format!("{kind}, byte {at} bit {bit} flipped"), flipped));
+                    }
+                }
+                for (what, file) in &damaged {
+                    match first_scan::marker_in_first_scan(file) {
+                        Some(reached) => {
+                            assert_eq!(reached, !zune_misses_the_marker(file), "{what}");
+                            if reached {
+                                comes += 1;
+                            } else {
+                                misses += 1;
+                            }
+                        }
+                        None => unread += 1,
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        comes > 2000 && misses > 150 && unread * 4 < comes + misses,
+        "{comes} come to the marker, {misses} miss it, {unread} unread"
+    );
+}
+
 #[test]
 fn a_file_that_declares_another_size_than_it_carries_is_answered_as_before() {
     let img = picture(120, 80);
@@ -1487,7 +1828,25 @@ fn a_file_that_declares_another_size_than_it_carries_is_answered_as_before() {
         ] {
             let what = format!("{kind} declaring {width}x{height}");
             let lying = declaring(&bytes, width, height);
-            assert!(plan_for(&lying, "1x1").is_some(), "{what}");
+            // A progressive file that declares fewer blocks
+            // (16 by 16 pixels each, in 4:2:0) than it holds
+            // leaves its reader short of the marker that ends
+            // its first scan, and zune-jpeg refuses it: it is
+            // not planned (issue #713), and every size gets
+            // that refusal.
+            let fewer = width.div_ceil(16) * height.div_ceil(16) < 8 * 5;
+            if kind == "progressive" && fewer {
+                assert_eq!(plan_for(&lying, "1x1"), None, "{what}");
+                let refused = answer(at_full_size(|| render(&lying, "1x1")));
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|e| e.contains("Marker missing")),
+                    "{what}: {refused:?}"
+                );
+            } else {
+                assert!(plan_for(&lying, "1x1").is_some(), "{what}");
+            }
             assert_survives(&what, &lying, "1x1");
         }
     }
@@ -1910,12 +2269,20 @@ fn a_file_that_leaves_its_huffman_tables_out_is_refused_as_before() {
         }
     }
     // A progressive file gets no tables filled in: one that
-    // leaves them out is refused by libjpeg-turbo too, and the
+    // leaves them out is refused by libjpeg-turbo too. The
+    // reading of its first scan (issue #713) finds no table
+    // to read it with, so it is not planned at all, and the
     // full-size path answers.
     let progressive = progressive_jpeg(&picture(120, 80));
     let bare = without_segments(&progressive, |m, _| m == 0xC4);
     assert!(read(&bare).is_err());
-    assert_refused_and_answered_as_before("a progressive file with no tables", &bare, "40x0");
+    assert_eq!(first_scan::marker_in_first_scan(&bare), None);
+    assert_eq!(plan_for(&bare, "40x0"), None);
+    assert_eq!(
+        answer(render(&bare, "40x0")),
+        answer(at_full_size(|| render(&bare, "40x0"))),
+        "a progressive file with no tables"
+    );
     // A sequential file whose first scan holds one component
     // has other scans behind it, which the header does not
     // show: full size.
@@ -2239,10 +2606,21 @@ fn the_fuzz_seeds_are_the_shapes_they_are_named_for() {
             .filter(|d| decode_at(bytes, *d).is_some())
             .count()
     };
-    // Decoded at every scale: baseline and progressive.
-    for name in ["jpeg-small", "jpeg-blue", "jpeg-progressive"] {
+    // Decoded at every scale: baseline and progressive, the
+    // last with a DC scan per component, as mozjpeg writes
+    // them, so its first scan holds luma alone (issue #713).
+    for name in [
+        "jpeg-small",
+        "jpeg-blue",
+        "jpeg-progressive",
+        "jpeg-progressive-scan-per-component",
+    ] {
         assert_eq!(frames(&seed(name)), 3, "{name}");
     }
+    assert_eq!(
+        seed("jpeg-progressive-scan-per-component"),
+        dc_only_progressive(61, 37, (2, 2), &[&[1], &[2], &[3]])
+    );
     assert!(
         turbojpeg::read_header(&seed("jpeg-progressive"))
             .unwrap()
@@ -2281,6 +2659,16 @@ fn the_fuzz_seeds_are_the_shapes_they_are_named_for() {
         assert!(eligible(&bytes).is_some(), "{name}");
         assert_eq!(frames(&bytes), 0, "{name}");
     }
+    // A progressive file whose first scan zune-jpeg reads
+    // short of its marker, and libjpeg-turbo reads without a
+    // warning (issue #713): turned away before the decode, as
+    // the full-size decode refuses it.
+    let damaged = seed("jpeg-progressive-damaged-scan");
+    assert!(glance(&damaged).unwrap().progressive);
+    assert_eq!(first_scan::marker_in_first_scan(&damaged), Some(false));
+    assert_eq!(eligible(&damaged), None);
+    assert_eq!(frames(&damaged), 0);
+    assert!(decode_image(&damaged).is_err());
     // The two written by hand are the files these tests write.
     assert_eq!(seed("jpeg-scans-past-the-limit"), flat_progressive(191));
     assert_eq!(

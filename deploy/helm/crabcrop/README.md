@@ -38,7 +38,7 @@ helm install crabcrop deploy/helm/crabcrop \
 - The disk result tier on its own persistent volume (8GiB budget on a 10Gi claim), so renders survive pod restarts.
 - Both credentials wired from the Secret above: the signing secret, and the metrics token through `metricsToken.existingSecret`, so `/metrics` is never answerable without its bearer token.
 - The production environment: a 512 MB memory result tier sized against the memory limit, the slow lane at one permit (long-running renders, such as animated encodes, never starve stills), the 30-second processing limit stated, and private-address sources refused.
-- Health probes are part of the chart itself: liveness and readiness both read `/health`, and every install gets them. `/health` answers `503` once the request log has stalled, its queue full for 5 seconds because nothing reads the pod's standard output, so the liveness probe restarts a replica that can serve no image (see [The request log](../../../docs/deployment.md#the-request-log)).
+- Health probes are part of the chart itself: startup, liveness and readiness all read `/health`, and every install gets them (the startup probe gives boot 5 minutes; see [AI variant](#ai-variant)). `/health` answers `503` once the request log has stalled, its queue full for 5 seconds because nothing reads the pod's standard output, so the liveness probe restarts a replica that can serve no image (see [The request log](../../../docs/deployment.md#the-request-log)).
 
 Serving traffic takes the usual extra step: enable the Ingress (`ingress.enabled`, with your host and TLS) or front the Service your own way.
 
@@ -56,11 +56,11 @@ helm upgrade crabcrop deploy/helm/crabcrop \
   --set resultBucket.credentialsSecret=crabcrop-aws
 ```
 
-`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with environment-provided AWS credentials only, because the server reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` once at startup and does not fetch credentials from a pod IAM role or any other part of the AWS credential chain. `resultBucket.credentialsSecret` names the Secret that holds them, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with the keys in `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`, read once at startup, or, with none set, with the pod's role through EKS Pod Identity: its agent sets `AWS_CONTAINER_CREDENTIALS_FULL_URI` and the token file, and the server asks it for credentials before its first request and again 15 minutes before they expire. IAM roles for service accounts (IRSA, a web identity token) and the node's instance role are not used: give such a deployment keys. `resultBucket.credentialsSecret` names the Secret that holds the keys, under those key names; add an `AWS_SESSION_TOKEN` key for temporary credentials, which then expire until a restart. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
 
 ## Secrets
 
-The server treats six variables as secrets. Read each from a Secret you manage, through the value below. A value in `env` or `ai.env` lands in the Deployment as plain text, and anyone who can read the Deployment or its Pods can read it (the built-in `view` role can, though it cannot read Secrets).
+The server treats six variables as secrets. Read each from a Secret you manage, through the value below. A value in `env` or `ai.env` would land in the Deployment as plain text, where anyone who can read the Deployment or its Pods can read it (the built-in `view` role can, though it cannot read Secrets), so the chart refuses to render one (see below).
 
 | Variable | Value that reads it from a Secret |
 |---|---|
@@ -84,7 +84,7 @@ extraEnv:
         key: secret-access-key
 ```
 
-This release still renders a secret given in `env`, in `ai.env`, or as an `extraEnv` entry's `value`. It warns in the install notes and in a comment in the rendered Deployment, naming the value to set instead. Set `refusePlainSecrets: true` to fail the render instead. A later release will refuse these by default. To migrate, put each key in a Secret and set the value the warning names. Then remove the key from `env`, `ai.env` or `extraEnv`: an entry left there comes after the Secret's and wins. Move `AWS_ACCESS_KEY_ID` and `CRABCROP_GCS_ACCESS_KEY` with their secret keys the same way.
+A secret given in `env`, in `ai.env`, or as an `extraEnv` entry's `value` fails the render, with an error that names each such variable and the value to read it from instead (`refusePlainSecrets: true`, the default). To migrate, put each key in a Secret and set the value the error names. Then remove the key from `env`, `ai.env` or `extraEnv`: an entry left there comes after the Secret's and wins. Move `AWS_ACCESS_KEY_ID` and `CRABCROP_GCS_ACCESS_KEY` with their secret keys the same way. `refusePlainSecrets: false` renders such a value instead, with a warning in the install notes and in a comment in the rendered Deployment.
 
 ## Evaluation install
 
@@ -98,11 +98,11 @@ helm install crabcrop deploy/helm/crabcrop \
 Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. For a quick trial only, `--set secret=<value>` lets the chart create the Secret itself; do not use that route for anything real. To run your own build instead:
 
 ```bash
-docker build -t your-registry/crabcrop:0.13.1 .
-docker push your-registry/crabcrop:0.13.1
+docker build -t your-registry/crabcrop:0.14.0 .
+docker push your-registry/crabcrop:0.14.0
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
-  --set image.tag=0.13.1 \
+  --set image.tag=0.14.0 \
   --set existingSecret=crabcrop-secret
 ```
 
@@ -133,7 +133,7 @@ ai:
     CRABCROP_REMOVEBG_MODEL: /models/removebg.onnx
 ```
 
-`ai.enabled` switches the image to the Dockerfile.ai variant and mounts the models claim at `/models`. Which features load is decided by which model env vars you set (removebg, face, upscale, detection, CLIP tagging; see [docs/ai-features.md](../../../docs/ai-features.md)). Models are preloaded and validated at boot, so a bad path fails the pod at startup. Model files are deployment artifacts: the chart never carries them.
+`ai.enabled` switches the image to the Dockerfile.ai variant and mounts the models claim at `/models`. Which features load is decided by which model env vars you set (removebg, face, upscale, detection, CLIP tagging; see [docs/ai-features.md](../../../docs/ai-features.md)). Models are preloaded and validated at boot, so a bad path fails the pod at startup. The server answers nothing until they have loaded, so the pod's startup probe gives boot 5 minutes, 150 tries 2 seconds apart, before the kubelet restarts it; for a model set that takes longer, raise `startupProbe.failureThreshold` (`startupProbe.periodSeconds` sets the period). Model files are deployment artifacts: the chart never carries them.
 
 ## Other settings
 
@@ -148,7 +148,7 @@ env:
 
 Keep secrets out of this map: see [Secrets](#secrets).
 
-The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer token, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). [docs/configuration.md](../../../docs/configuration.md) lists every variable. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer token, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), `startupProbe` (how long boot may take before a restart: `periodSeconds` 2 and `failureThreshold` 150, 5 minutes, which the liveness and readiness probes wait for; see [AI variant](#ai-variant) and [Booting](../../../docs/deployment.md#booting-and-the-probes-that-wait-for-it)), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). [docs/configuration.md](../../../docs/configuration.md) lists every variable. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Security context
 
@@ -158,7 +158,7 @@ The server writes only to `/tmp` and to the volumes it mounts, such as the `resu
 
 `resources` requests 100m of CPU and 128Mi of memory by default and sets no limits: no limit suits every workload, so set them for yours. `values-production.yaml` sets both. Without a CPU limit the server sizes its stills lane and its default source buffer budget from the node's cores, so on a large node set a limit, or `CRABCROP_SOURCE_BUFFER_MAX_MB` in `env`. If you set only limits, Kubernetes no longer sets the requests equal to them; set requests too. The HPA's CPU target is a share of the CPU request, so set requests that fit your load before you turn on `autoscaling.enabled` (`values-production.yaml` requests 500m).
 
-`networkPolicy.enabled: true` adds a NetworkPolicy for the pods. It allows ingress to the HTTP port, from the peers in `networkPolicy.ingressFrom` or from anywhere when that is empty. It allows egress to DNS and to public IPv4 addresses, but not to the private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, the cloud metadata address) or `100.64.0.0/10`. That covers what `CRABCROP_BLOCK_PRIVATE_SOURCES` does not: hosts in `CRABCROP_ALLOWED_SOURCES` skip the address check, and code running in the pod is not bound by it. A source, a bucket or an S3-compatible endpoint on a private address needs its own rule in `networkPolicy.extraEgress`, and so does any IPv6 destination. The policy needs a network plugin that enforces NetworkPolicy.
+`networkPolicy.enabled: true` adds a NetworkPolicy for the pods. It allows ingress to the HTTP port, from the peers in `networkPolicy.ingressFrom` or from anywhere when that is empty. It allows egress to DNS and to public IPv4 addresses, but not to the private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, the cloud metadata address) or `100.64.0.0/10`. That covers what `CRABCROP_BLOCK_PRIVATE_SOURCES` does not: hosts in `CRABCROP_ALLOWED_SOURCES` skip the address check (unless `CRABCROP_CHECK_ALLOWED_SOURCES` is on), and code running in the pod is not bound by it. A source, a bucket or an S3-compatible endpoint on a private address needs its own rule in `networkPolicy.extraEgress`, and so does any IPv6 destination. The policy needs a network plugin that enforces NetworkPolicy.
 
 ```yaml
 networkPolicy:

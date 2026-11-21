@@ -1163,7 +1163,11 @@ def parity_cases():
          "target": "300x200/https://example.com/photo.jpg"},
         {"id": "sig-purge-preset", "kind": "purge_sig", "secret": S,
          "target": "preset:thumb/https://example.com/photo.jpg"},
+        {"id": "sig-purge-exp", "kind": "purge_sig", "secret": S,
+         "target": "300x200/https://example.com/photo.jpg", "expires": 1893456000},
         {"id": "sig-group", "kind": "group_sig", "secret": S, "group": "thumb"},
+        {"id": "sig-group-exp", "kind": "group_sig", "secret": S, "group": "thumb",
+         "expires": 1893456000},
         {"id": "sig-upload", "kind": "upload_sig", "secret": S, "name": "heroes/photo.jpg"},
         {"id": "sig-upload-exp", "kind": "upload_sig", "secret": S,
          "name": "heroes/photo.jpg", "expires": 1893456000},
@@ -1181,6 +1185,17 @@ def parity_cases():
                           "remainder": v["remainder"], "nonce": v["nonce"],
                           "key_id": v.get("key_id"),
                           "expect": v["token"]})
+        elif "purge_signature" in v:
+            # Purge and purge-group signatures, plain and
+            # expiring.
+            case = {"id": f"vec-purge-{i}", "secret": v["secret"],
+                    "expires": v.get("expires"),
+                    "expect": v["purge_signature"]}
+            if v["endpoint"] == "purge":
+                case.update(kind="purge_sig", target=v["target"])
+            else:
+                case.update(kind="group_sig", group=v["target"])
+            cases.append(case)
         else:
             cases.append({"id": f"vec-{i}", "kind": "sign", "secret": v["secret"],
                           "remainder": v["remainder"],

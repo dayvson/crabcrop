@@ -17,7 +17,8 @@ must agree on:
   keys on) or the stable error code of its rejection.
 - `builder_cases`: a TypeScript builder call, the segment it
   must produce (or that it must throw), and the canonical form
-  the server's parser gives that segment.
+  the server's parser gives that segment. The Python SDK runs
+  them too, each call under its Python name.
 
 The tables below encode the grammar as documented in
 docs/url-grammar.md and docs/filters.md; the differential tests
@@ -218,6 +219,11 @@ FOCALPOINT = [
     ("focalpoint:0x0:100", None, None),
     ("focalpoint:1x1", "focalpoint:1x1:1", None),
     ("focalpoint:0.75x0.40:2.50", "focalpoint:0.75x0.4:2.5", None),
+    # Issue #712: each number is an f32, a negative zero is
+    # zero, and the bounds apply to the rounded value.
+    ("focalpoint:-0x-0", "focalpoint:0x0:1", None),
+    ("focalpoint:1.00000001x0.5:100.000001", "focalpoint:1x0.5:100", None),
+    ("focalpoint:1.0000001x0.5", None, "invalid_focal_point"),
     ("focalpoint:1.5x0.4", None, "invalid_focal_point"),
     ("focalpoint:0.75x-0.1", None, "invalid_focal_point"),
     ("focalpoint:0.75x0.4:0", None, "invalid_focal_point"),
@@ -345,6 +351,12 @@ filter_cases([
     ("blur(0)", None, "invalid_filters"),
     ("blur(-1)", None, "invalid_filters"),
     ("blur(512.5)", None, "invalid_filters"),
+    # Issue #712: the decimal rounds to the nearest f32 first,
+    # so a spelling past 512 that rounds to it is blur(512).
+    ("blur(512.00001)", "blur(512)", None),
+    ("blur(512.0001)", None, "invalid_filters"),
+    ("blur(2.)", "blur(2)", None),
+    ("blur(1e-40)", None, "invalid_filters"),
     ("blur(abc)", None, "invalid_filters"),
     ("blur()", None, "invalid_filters"),
     ("blur( 2)", None, "invalid_filters"),
@@ -364,6 +376,10 @@ filter_cases([
     ("contrast(0.5)", None, None),
     ("contrast(100.1)", None, "invalid_filters"),
     ("contrast(nan)", None, "invalid_filters"),
+    # Issue #712: a negative zero, written or rounded to, is
+    # zero, one canonical spelling and one cache key.
+    ("contrast(-0)", "contrast(0)", None),
+    ("contrast(-1e-50)", "contrast(0)", None),
     ("gamma(2.2)", None, None),
     ("gamma(1e1)", "gamma(10)", None),
     ("gamma(10)", None, None),
@@ -376,9 +392,11 @@ filter_cases([
     ("exposure(10)", None, None),
     ("exposure(10.5)", None, "invalid_filters"),
     ("exposure(nan)", None, "invalid_filters"),
+    ("exposure(-0)", "exposure(0)", None),
     ("highlights_shadows(30,-20)", None, None),
     ("highlights_shadows(0,0)", None, None),
     ("highlights_shadows(+30,20)", "highlights_shadows(30,20)", None),
+    ("highlights_shadows(-0,-0)", "highlights_shadows(0,0)", None),
     ("highlights_shadows(101,0)", None, "invalid_filters"),
     ("highlights_shadows(30)", None, "invalid_filters"),
     ("highlights_shadows(1,2,3)", None, "invalid_filters"),
@@ -386,6 +404,7 @@ filter_cases([
     ("vibrance(-100)", None, None),
     ("vibrance(101)", None, "invalid_filters"),
     ("vibrance(nan)", None, "invalid_filters"),
+    ("vibrance(-0)", "vibrance(0)", None),
     ("huerotate(90)", None, None),
     ("huerotate(-90)", None, None),
     ("huerotate(+90)", "huerotate(90)", None),
@@ -399,6 +418,9 @@ filter_cases([
     ("saturation(0.5)", None, None),
     ("saturation(256)", None, "invalid_filters"),
     ("saturation(-1)", None, "invalid_filters"),
+    ("saturation(-0)", "saturation(0)", None),
+    ("saturation(-1e-50)", "saturation(0)", None),
+    ("saturation(255.000001)", "saturation(255)", None),
     ("rgb(255,-255,0)", None, None),
     ("rgb(+1,2,3)", "rgb(1,2,3)", None),
     ("rgb(256,0,0)", None, "invalid_filters"),
@@ -455,6 +477,10 @@ filter_cases([
     ("format(webp,method:6)", None, None),
     ("format(webp,sns:50,method:0)", "format(webp,method:0,sns:50)", None),
     ("format(webp,method:0,sns:0)", None, None),
+    # Issue #712: each value is a u8, so a `+` or leading
+    # zeros spell the same value.
+    ("format(webp,method:+6,sns:050)", "format(webp,method:6,sns:50)", None),
+    ("format(webp,method:-0)", None, "invalid_filters"),
     ("format(mov)", None, "invalid_filters"),
     ("format(avif,subsampling:420)", None, "invalid_filters"),
     ("format(jpeg,interlace)", None, "invalid_filters"),
@@ -498,6 +524,7 @@ filter_cases([
     ("noise(256)", None, "invalid_noise"),
     ("noise(-1)", None, "invalid_noise"),
     ("noise(1.5)", None, "invalid_noise"),
+    ("noise(-0)", None, "invalid_noise"),
 ])
 
 filter_cases([
@@ -553,6 +580,7 @@ filter_cases([
     ("facepad(3)", None, None),
     ("facepad(3.1)", None, "invalid_filters"),
     ("facepad(-1)", None, "invalid_filters"),
+    ("facepad(-0)", "facepad(0)", None),
     ("upscale(2)", None, None),
     ("upscale(4)", None, None),
     ("upscale(3)", None, "invalid_filters"),
@@ -567,6 +595,9 @@ filter_cases([
     ("dpr(7)", None, "invalid_filters"),
     ("dpr(2.5)", None, "invalid_filters"),
     ("dpr(0)", None, "invalid_filters"),
+    ("dpr(+2)", "dpr(2)", None),
+    ("dpr(1.50000001)", "dpr(1.5)", None),
+    ("dpr(1.5000001)", None, "invalid_filters"),
 ])
 
 filter_cases([
@@ -579,6 +610,12 @@ filter_cases([
     ("text(Hello,12,ff8800,middle)", None, "invalid_filters"),
     ("text(,12,ff8800,center)", None, "invalid_filters"),
     ("text(Hello,12,ff880,center)", None, "invalid_filters"),
+    # Issue #712: an escape is `%` and two hex digits, and a
+    # color is hex digits only, though Rust's integer parser
+    # reads a `+` in both.
+    ("text(%01Hi,12,ff8800,center)", "text(%01Hi,12,ff8800ff,center)", None),
+    ("text(%+1Hi,12,ff8800,center)", None, "invalid_filters"),
+    ("text(Hello,12,+f8800,center)", None, "invalid_filters"),
     # The label caps (issue #606): at most 1000 characters,
     # and characters times size at most 100000. Characters
     # count, not bytes: 1000 two-byte characters fit.
@@ -598,6 +635,7 @@ filter_cases([
     ("trim(20,5)", None, "invalid_filters"),
     ("trim(20,5,0,5,-1)", None, "invalid_filters"),
     ("trim(-1)", None, "invalid_filters"),
+    ("trim(-0)", None, "invalid_filters"),
     ("watermark(https%3A%2F%2Fx%2Fwm.png,0,0,80)", None, None),
     ("watermark(a.png,-5,10,100)", None, None),
     ("watermark(a.png,0,0,101)", None, "invalid_filters"),
@@ -612,6 +650,8 @@ filter_cases([
     ("rotate(1e2)", None, "invalid_filters"),
     ("rotate(.5)", None, "invalid_filters"),
     ("rotate(abc)", None, "invalid_filters"),
+    ("rotate(-0)", "rotate(0)", None),
+    ("rotate(36000.001)", "rotate(36000)", None),
     ("overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)", None, None),
     ("overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,screen,25)", None, None),
     ("overlay(a%2Cb.png,0,0,80,normal,25)", None, None),
@@ -890,6 +930,9 @@ builder("filter.highlightsShadows", [30, -20], "highlights_shadows(30,-20)")
 builder("filter.vibrance", [40], "vibrance(40)")
 builder("filter.hueRotate", [-90], "huerotate(-90)")
 builder("filter.saturation", [0], "saturation(0)")
+# Issue #712: a negative zero spells as zero, the form the
+# server keys on.
+builder("filter.saturation", [-0.0], "saturation(0)")
 builder("filter.rgb", [1, 2, 3], "rgb(1,2,3)")
 builder("filter.curve", ["rgb", [[0, 0], [255, 255]]], "curve(rgb,0,0,255,255)")
 builder("filter.curve", ["rgb", [[0, 0]]], "curve(rgb,0,0)",
@@ -963,6 +1006,12 @@ builder("filter.blurClass", ["\uFEFFperson\uFEFF"],
         throws=True, code="invalid_filters")
 builder("filter.blurClass", ["\u0085person\u0085"], "blurclass(person)")
 builder("filter.pixelateClass", ["traffic light"], "pixelateclass(traffic%20light)")
+# Issue #712: a class name is what Rust's is_alphanumeric takes,
+# the Alphabetic property included: Devanagari vowel signs, a
+# circled letter.
+builder("filter.blurClass", ["\u0939\u093f\u0902\u0926\u0940"],
+        "blurclass(%E0%A4%B9%E0%A4%BF%E0%A4%82%E0%A4%A6%E0%A5%80)")
+builder("ops.cropObjects", [100, 100, ["\u24b6"]], "crop:100x100:objects(%E2%92%B6):1")
 builder("filter.recolorClass", ["person", "FF0000"], "recolorclass(person,ff0000)")
 builder("filter.blurRegion", [1, 2, 30, 40], "blur_region(1,2,30,40)")
 builder("filter.removeRegion", [0, 0, 5, 5], "remove_region(0,0,5,5)")
@@ -976,9 +1025,9 @@ def render():
             "surface must agree on, and TypeScript builder calls with the "
             "segments they must produce. Generated by "
             "spec/generate_operation_vectors.py; do not edit by hand. "
-            "Consumed by the server crate's tests, the TypeScript SDK "
-            "tests, and the playground tests. The hand-written audit "
-            "corpus lives in spec/explain-verdicts.json."
+            "Consumed by the server crate's tests, the TypeScript and "
+            "Python SDK tests, and the playground tests. The hand-written "
+            "audit corpus lives in spec/explain-verdicts.json."
         ),
         "version": 1,
         "signature": "a" * 64,

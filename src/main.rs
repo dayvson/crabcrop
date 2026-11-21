@@ -23,8 +23,8 @@
 // importing them at the crate root lets every `crate::`
 // path in this file and in `config.rs` resolve to them.
 use crabcrop::{
-    ai, cache, cli, engine, frames, loader, observe, pdf, provenance, quality, s3store, server,
-    sigv4, storage, text, upload, url, video,
+    ai, cache, cli, credentials, engine, frames, loader, observe, pdf, provenance, quality,
+    s3store, server, sigv4, storage, svg, text, upload, url, video,
 };
 
 /// Print one boot line on standard output, as `println!` does,
@@ -36,7 +36,29 @@ macro_rules! boot_line {
     };
 }
 
+/// Write one line on standard error without `eprintln!`'s
+/// panic: the library's `stderr_line!` (issue #738), defined
+/// here as well, before `mod config`, so that the binary's
+/// tests keep the lines in their captured output.
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {
+        $crate::print_stderr_line(format_args!($($arg)*))
+    };
+}
+
 mod config;
+
+/// What the binary's [`stderr_line!`] writes with: the
+/// library's `observe::print_stderr_line`, which drops a line
+/// standard error does not take. In the tests, `eprintln!`
+/// keeps the lines in the test's captured output, as the
+/// library's own tests do.
+fn print_stderr_line(line: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    eprintln!("{line}");
+    #[cfg(not(test))]
+    crabcrop::observe::print_stderr_line(line);
+}
 
 /// What [`boot_line!`] prints with. `println!` panics when a write
 /// to standard output fails, and the boot lines are written before
@@ -98,7 +120,7 @@ fn main() {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("crabcrop: cannot start the async runtime: {e}");
+            stderr_line!("crabcrop: cannot start the async runtime: {e}");
             std::process::exit(1);
         }
     };
@@ -131,7 +153,7 @@ fn not_dumpable() {
     if let Err(e) =
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
     {
-        eprintln!("crabcrop: cannot mark the process non-dumpable: {e}");
+        stderr_line!("crabcrop: cannot mark the process non-dumpable: {e}");
     }
 }
 
@@ -221,27 +243,37 @@ async fn start() -> Option<std::time::Instant> {
     raise_malloc_thresholds();
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
-    match crabcrop::svg::WorkerCommand::current_binary() {
-        Ok(worker) => crabcrop::svg::isolate_in_child(worker),
+    let worker = match crabcrop::svg::WorkerCommand::current_binary() {
+        Ok(worker) => worker,
         Err(e) => {
-            eprintln!("crabcrop: cannot locate this binary to start SVG workers: {e}");
+            stderr_line!("crabcrop: cannot locate this binary to start SVG workers: {e}");
             std::process::exit(1);
         }
-    }
-    match run().await {
+    };
+    match run(worker).await {
         Ok(deadline) => Some(deadline),
         Err(e) => {
-            eprintln!("crabcrop: {e}");
+            stderr_line!("crabcrop: {e}");
             std::process::exit(1);
         }
     }
 }
 
 /// Boot from the process environment, then serve until a
-/// signal stops the server. Returns the deadline by which
-/// the runtime must stop.
-async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
+/// signal stops the server, its SVG work in workers started
+/// from `worker`. Returns the deadline by which the runtime
+/// must stop.
+async fn run(
+    worker: crabcrop::svg::WorkerCommand,
+) -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let config = Config::from_env(|name| env::var(name).ok())?;
+    // The workers take their address-space cap from the
+    // configuration (issue #738), before anything is built
+    // that could render an SVG.
+    crabcrop::svg::isolate_in_child(crabcrop::svg::WorkerCommand {
+        max_address_space: config.svg_worker_address_space,
+        ..worker
+    });
     // The result stores open, and then the listener binds,
     // before the AI preload: a taken port or an unwritable
     // directory is a cheap failure and should not wait for
@@ -249,9 +281,10 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // early, serve late).
     let stores = open_stores(&config)?;
     // The listen address is `CRABCROP_BIND` (issue #592),
-    // every IPv4 interface by default.
+    // every IPv4 interface by default; an IPv6 address takes
+    // IPv4 connections too (issue #715).
     let address = std::net::SocketAddr::new(config.bind, config.port);
-    let listener = tokio::net::TcpListener::bind(address)
+    let listener = crate::server::bind_listener(address)
         .await
         .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     // The port the listener holds, which the listening line
@@ -263,7 +296,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // warning when unsigned URLs may fetch from any host.
     boot_line!("{}", config.posture_line());
     if let Some(warning) = config.posture_warning() {
-        eprintln!("warning: {warning}");
+        stderr_line!("warning: {warning}");
     }
     boot_line!(
         "source fetch: cap {} MB, timeout {}s, buffer budget {} MB",
@@ -273,6 +306,19 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     );
     boot_line!("{}", config.connections_line());
     boot_line!("configuration fingerprint: {}", state.config_fingerprint);
+    // Credentials from the container endpoint (issue #709) are
+    // fetched before the first AWS request, the tombstone read
+    // below, and refreshed in the background from then on. The
+    // static keys need nothing here.
+    if let Some(creds) = &config.sources.aws_creds
+        && let Some(line) = creds.start().await
+    {
+        if line.starts_with("warning: ") {
+            stderr_line!("{line}");
+        } else {
+            boot_line!("{line}");
+        }
+    }
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461). A slow or hanging
     // store holds the first request, and the listening line,
@@ -280,6 +326,36 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     crate::server::start_purge_tombstones(&state).await;
     let background = state.background.clone();
     let disk = state.store.clone();
+    // The disk tier's boot scan has had this long, the binding
+    // and the steps above included (issue #708). One that has
+    // ended serves its entries from the first request; one
+    // that has not goes on in the background, and its watch
+    // logs it from the listening line on.
+    let scanning = match (&disk, &config.result_storage) {
+        (Some(store), Some(storage)) => {
+            let store = store.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                store.wait_scan(store.boot_deadline(), crate::storage::ScanPhase::ended)
+            })
+            .await?;
+            match &report.phase {
+                crate::storage::ScanPhase::Done => {
+                    boot_line!("{}", disk_scan_done(&storage.dir, storage.max_mb, &report));
+                    None
+                }
+                crate::storage::ScanPhase::Failed(e) => {
+                    stderr_line!("{}", disk_scan_failed(&storage.dir, e));
+                    None
+                }
+                crate::storage::ScanPhase::Stopped => None,
+                _ => {
+                    stderr_line!("warning: {}", disk_scan_running(&storage.dir, &report));
+                    Some((storage.dir.clone(), storage.max_mb))
+                }
+            }
+        }
+        _ => None,
+    };
     // From the listening line on, every line on standard
     // output goes through the request log (issue #642), so
     // the shutdown's lines come after the request lines
@@ -287,6 +363,9 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let log = state.request_log.clone();
     let signalled = shutdown_signal();
     boot_line!("crabcrop listening on port {port}");
+    if let (Some(store), Some((dir, max_mb))) = (&disk, scanning) {
+        watch_disk_scan(store.clone(), log.clone(), dir, max_mb);
+    }
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
     // listener closes, idle connections close, and requests
     // in flight finish; then the background work they and
@@ -302,11 +381,15 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // and idle time and caps how many are open.
     let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     let stop = tokio_util::sync::CancellationToken::new();
+    // The requests in flight, which a drain that ends before
+    // they do counts as cut off (issue #715).
+    let in_flight = crate::server::RequestsInFlight::default();
     let mut serve = std::pin::pin!(crate::server::serve_connections(
         listener,
         app(state),
         config.connections,
-        stop.clone()
+        stop.clone(),
+        in_flight.clone()
     ));
     tokio::select! {
         () = &mut serve => {
@@ -324,10 +407,17 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         "shutdown: draining requests and background work for up to {}s",
         shutdown_grace.as_secs()
     ));
-    let drain = async {
-        if tokio::time::timeout_at(deadline, serve).await.is_err() {
-            eprintln!("shutdown: requests still in flight at the deadline are cut off");
+    // A boot scan still running stops at its next file (issue
+    // #708): the next boot scans the directory again.
+    if let Some(purges) = disk.as_ref().and_then(|disk| disk.stop_scan()) {
+        for line in disk_scan_stopped(purges) {
+            stderr_line!("{line}");
         }
+    }
+    let drain = async {
+        // The requests still in flight at the deadline are
+        // counted below, with the rest of what is cut off.
+        let _ = tokio::time::timeout_at(deadline, serve).await;
         let left = background.drain(deadline).await;
         let disk_left = match &disk {
             Some(disk) => disk.settle(deadline).await,
@@ -340,13 +430,20 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let ((left, disk_left), when, stop_by) = tokio::select! {
         left = drain => (left, "at the deadline", deadline.into_std()),
         () = signalled_again => {
-            eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
+            stderr_line!("shutdown: a second signal ends the drain; what is still running is cut off");
             let disk_left = disk.as_ref().map(|disk| disk.backlog()).unwrap_or_default();
             ((background.running(), disk_left), "at the second signal", std::time::Instant::now())
         }
     };
+    // The requests still in flight: their handler runs, or
+    // their response is still being sent. The runtime stops
+    // them with the rest by `stop_by`.
+    let requests = in_flight.count();
+    if requests > 0 {
+        stderr_line!("shutdown: {requests} requests still in flight {when} are cut off");
+    }
     if left.writes > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} background writes still running {when} are dropped",
             left.writes
         );
@@ -354,7 +451,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     if left.renders > 0 {
         // A render whose client had gone, cut off before it
         // was stored: the next request for it renders it.
-        eprintln!(
+        stderr_line!(
             "shutdown: {} renders whose client left, still running {when}, are dropped unstored",
             left.renders
         );
@@ -362,19 +459,19 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     // Disk work left undone (issue #572), and what each kind
     // costs after a restart.
     if disk_left.deletions > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} purged disk entries are not deleted yet; the next boot indexes them again, so send those purges again, by URL for an entry a group purge removed before it had caught up with the group",
             disk_left.deletions
         );
     }
     if disk_left.behind > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} disk entries have not caught up with cache groups learned since they were written; after a restart a purge of those groups does not reach them",
             disk_left.behind
         );
     }
     if disk_left.owed > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: {} bucket copies may lack a cache group whose write was skipped; a restart forgets this",
             disk_left.owed
         );
@@ -398,7 +495,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let limit = crate::observe::SHUTDOWN_WAIT;
     let unwritten = log.finish(Some("shutdown: done"), limit).await;
     if unwritten > 0 {
-        eprintln!(
+        stderr_line!(
             "shutdown: standard output did not take the log within {}s; the last {unwritten} log lines are not written",
             limit.as_secs()
         );
@@ -439,6 +536,9 @@ struct Stores {
 /// the listener, as boot always has, and before
 /// [`build_state`] loads any model: a store that does not
 /// open is a cheap failure, reported ahead of a taken port.
+/// The disk tier's boot scan goes on in the background (issue
+/// #708); `run` waits for it before it serves, up to the
+/// store's boot deadline.
 fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // The entry MAC key for the persistent tiers (issue
     // #190): derived from the current signing secret, so
@@ -446,24 +546,44 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // and a secret rotation invalidates the old entries
     // rather than serving content authenticated under a
     // retired key.
-    let entry_key = crate::url::entry_key(&config.keyring.current);
+    // Each store keeps its own copy, zeroed when it is
+    // dropped, and this one is zeroed when boot is done with it.
+    let entry_key = zeroize::Zeroizing::new(crate::url::entry_key(&config.keyring.current));
     // Disk result storage, bounded by its own budget.
-    // Opening indexes whatever a previous run left behind.
     let disk = match &config.result_storage {
+        // A budget of 0 is no disk tier (issue #708): the
+        // directory is not created, probed or read.
+        Some(storage) if storage.max_bytes == 0 => {
+            boot_line!("{}", disk_tier_off(&storage.dir));
+            None
+        }
         Some(storage) => {
-            let store = crate::storage::DiskStore::open(
+            // The store checks its directory and indexes what
+            // a previous run left behind on a thread of its own
+            // (issue #708). The check is waited for here, before
+            // the listener binds, so a directory that cannot be
+            // written is a cheap failure, as it always was; one
+            // that does not answer holds the boot for
+            // `BOOT_SCAN_WAIT` at most.
+            let store = crate::storage::DiskStore::start(
                 std::path::Path::new(&storage.dir),
                 storage.max_bytes,
-                entry_key.clone(),
-            )
-            .map_err(|e| ConfigError::build(Some("CRABCROP_RESULT_STORAGE_DIR"), e))?;
-            let (entries, bytes) = store.stats();
-            boot_line!(
-                "result storage at {}: {entries} entries, {bytes} bytes, budget {} MB",
-                storage.dir,
-                storage.max_mb
+                entry_key.to_vec(),
             );
-            Some(Arc::new(store))
+            let checked = store.wait_scan(store.boot_deadline(), |phase| {
+                *phase != crate::storage::ScanPhase::Checking
+            });
+            if let crate::storage::ScanPhase::Failed(e) = &checked.phase {
+                return Err(ConfigError::build(
+                    Some("CRABCROP_RESULT_STORAGE_DIR"),
+                    e.clone(),
+                ));
+            }
+            boot_line!(
+                "{}",
+                disk_scan_started(&storage.dir, storage.max_mb, &checked.phase)
+            );
+            Some(store)
         }
         None => None,
     };
@@ -478,7 +598,7 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
                 config.sources.s3_endpoint.clone(),
                 config.sources.s3_region.clone(),
                 config.sources.aws_creds.clone(),
-                entry_key,
+                entry_key.to_vec(),
             )
             .map_err(|e| {
                 ConfigError::build(
@@ -495,6 +615,121 @@ fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
         None => None,
     };
     Ok(Stores { disk, shared })
+}
+
+/// How often a boot scan that outlasts the boot logs that it
+/// is still running (issue #708).
+const SCAN_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The boot line for a disk tier with a budget of 0 (issue
+/// #708).
+fn disk_tier_off(dir: &str) -> String {
+    format!("result storage: off, CRABCROP_RESULT_STORAGE_MAX_MB is 0, so {dir} is not used")
+}
+
+/// The boot line for a disk tier once its directory answered,
+/// or the boot stopped waiting for it: its budget, and what its
+/// boot scan does (issue #708).
+fn disk_scan_started(dir: &str, max_mb: usize, phase: &crate::storage::ScanPhase) -> String {
+    let doing = match phase {
+        crate::storage::ScanPhase::Checking => "waiting for the directory to answer",
+        _ => "scanning the entries a previous run left",
+    };
+    format!("result storage at {dir}: budget {max_mb} MB, {doing}")
+}
+
+/// The line for a boot scan that ended: what it indexed, how
+/// long it took to read how many files, and how many it
+/// deleted, could not delete and skipped (issue #708).
+fn disk_scan_done(dir: &str, max_mb: usize, report: &crate::storage::ScanReport) -> String {
+    let undeleted = match report.undeleted {
+        0 => String::new(),
+        n => format!(", could not delete {n}"),
+    };
+    format!(
+        "result storage at {dir}: {} entries, {} bytes, budget {max_mb} MB; the boot scan read {} files in {:.1}s, deleted {}{undeleted} and skipped {}",
+        report.entries,
+        report.bytes,
+        report.files,
+        report.elapsed.as_secs_f64(),
+        report.deleted,
+        report.skipped()
+    )
+}
+
+/// The line for a directory check that failed once the boot
+/// had gone on without it (issue #708).
+fn disk_scan_failed(dir: &str, error: &str) -> String {
+    format!("result storage at {dir}: {error}; the disk tier stays off until a restart")
+}
+
+/// The line for a boot scan still running (issue #708), at the
+/// boot's deadline and every [`SCAN_PROGRESS_EVERY`] after.
+fn disk_scan_running(dir: &str, report: &crate::storage::ScanReport) -> String {
+    let secs = report.elapsed.as_secs();
+    match report.phase {
+        crate::storage::ScanPhase::Checking => format!(
+            "result storage at {dir}: the directory has not answered after {secs}s; until it does, the disk tier serves and stores nothing"
+        ),
+        _ => format!(
+            "result storage at {dir}: the boot scan is still running after {secs}s, {} files read; until it ends, an entry it has not indexed is a miss",
+            report.files
+        ),
+    }
+}
+
+/// The shutdown's lines for a boot scan it stopped, which held
+/// `purges` purges sent while it ran (issue #708).
+fn disk_scan_stopped(purges: usize) -> Vec<String> {
+    let mut lines = vec![
+        "shutdown: the disk tier's boot scan had not ended and stops; the next boot scans the directory again".to_string(),
+    ];
+    if purges > 0 {
+        lines.push(format!(
+            "shutdown: {purges} purges sent while the boot scan ran have not reached the disk entries it had not indexed; with a shared tier their tombstones stay in force, and without one, send them again after the restart"
+        ));
+    }
+    lines
+}
+
+/// Log a boot scan that outlasted the boot (issue #708): every
+/// [`SCAN_PROGRESS_EVERY`] that it still runs, on stderr, and
+/// what it indexed, through the request log, once it ends. A
+/// thread of its own waits for it, so a scan stuck in the kernel
+/// keeps no runtime worker.
+fn watch_disk_scan(
+    store: Arc<crate::storage::DiskStore>,
+    log: RequestLog,
+    dir: String,
+    max_mb: usize,
+) {
+    let watch = move || {
+        loop {
+            let report = store.wait_scan(
+                std::time::Instant::now() + SCAN_PROGRESS_EVERY,
+                crate::storage::ScanPhase::ended,
+            );
+            match &report.phase {
+                crate::storage::ScanPhase::Done => {
+                    log.line(&disk_scan_done(&dir, max_mb, &report));
+                    return;
+                }
+                crate::storage::ScanPhase::Failed(e) => {
+                    stderr_line!("{}", disk_scan_failed(&dir, e));
+                    return;
+                }
+                // The shutdown logs it.
+                crate::storage::ScanPhase::Stopped => return,
+                _ => stderr_line!("{}", disk_scan_running(&dir, &report)),
+            }
+        }
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("crabcrop-scan-watch".to_string())
+        .spawn(watch)
+    {
+        stderr_line!("result storage: cannot watch the boot scan: {e}");
+    }
 }
 
 /// Build the server state from a validated configuration
@@ -545,6 +780,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if !config.explain_enabled {
         boot_line!("explain: off");
     }
+    if config.purge_require_expiry {
+        boot_line!("purges: expiring URLs only");
+    }
     // The request log (issue #642): a queue and its writer
     // thread, or with `CRABCROP_LOG_SYNC` a line written
     // where it is logged.
@@ -580,7 +818,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         metrics_token: config
             .metrics_token
             .as_ref()
-            .map(|token| token.expose().to_string()),
+            .map(|token| zeroize::Zeroizing::new(token.expose().to_string())),
         cache: Arc::new(Cache::new(config.cache_bytes)),
         providers: Arc::new(Providers {
             removebg: ai.removebg,
@@ -618,6 +856,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         width_step: config.width_step,
         client_hints: config.client_hints,
         explain_enabled: config.explain_enabled,
+        purge_require_expiry: config.purge_require_expiry,
         preserve_metadata: config.preserve_metadata,
         brand_color: config.brand_color,
         presets: config.presets.clone(),
@@ -816,15 +1055,46 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// output too large for its pick to be verified, now
 /// encoded once at the first pick instead of at the quality
 /// the search ended on).
-const RENDERING_VERSION: u32 = 7;
+///
+/// 8: the first release after 0.13.1, which changes output
+/// for existing URLs (an aspect crop of a source that is not
+/// 8-bit RGBA, which keeps the source's layout and depth
+/// where it was cut to 8-bit RGBA: an opaque source's crop
+/// has no alpha channel, so its PNG and JPEG XL bytes
+/// change, a gray source's crop stays gray, and a
+/// 16-bit or float source's crop is resized at its own
+/// depth; the redaction filters, `blur_region`,
+/// `pixelate_region`, `blurfaces`, `pixelatefaces`,
+/// `blurclass`, `pixelateclass` and `recolorclass`, which
+/// keep the image's layout and depth in the same way, a
+/// gray image recolored becoming RGB; a watermark or overlay
+/// that lands off the canvas, which leaves the base in its
+/// own layout; `quality(auto)` JPEG output with a `fill`,
+/// whose quality is picked and scored against the image
+/// flattened over the fill; `sharpen` past 255, which
+/// sharpens as 255 does; `huerotate` past -359 to 359, which
+/// turns by its remainder modulo 360; `blur_region` and
+/// `blurclass` boxes of more than 240 px on their shorter
+/// side, which blur at an eighth of it where the sigma
+/// stopped at 30; video output of a smart crop, whose frames
+/// are all cut from the window the first frame decided;
+/// class redaction with a segmentation model and more than
+/// 64 detections in a request, which redacts the detections
+/// past the 64th by their boxes; and a progressive JPEG
+/// source with restart intervals, or with a damaged first
+/// scan the full-size decoder refuses, whose first operation
+/// is a resize to a third of its size or less, which
+/// decodes at full size again, #713).
+const RENDERING_VERSION: u32 = 8;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
 /// metadata policy, the quality tuning knobs, the AVIF
-/// tile count, the width-hint step, the AI behavior
-/// thresholds, and the file-based inputs whose contents
-/// change results (the AI models, the CLIP set, the
-/// overlay font, the video and PDF tools, the detector
+/// tile count, the width-hint step, the tools'
+/// address-space caps that are not at their defaults, the
+/// AI behavior thresholds, and the file-based inputs whose
+/// contents change results (the AI models, the CLIP set,
+/// the overlay font, the video and PDF tools, the detector
 /// declarations and the models they name), plus the brand
 /// color, whose value shapes studio composites. A file
 /// input is identified by a digest of its contents, never
@@ -832,7 +1102,7 @@ const RENDERING_VERSION: u32 = 7;
 /// place at the same path must start a fresh epoch, and
 /// the same contents under a new path must not. The
 /// fingerprint is embedded in every cache key (see
-/// `cache_key_for` in `server.rs`), so a restart under
+/// `cache_key_for` in `server/request.rs`), so a restart under
 /// changed settings starts a fresh cache epoch instead of
 /// serving the old settings' renders from the persistent
 /// tiers. Settings that are already visible in the key
@@ -884,6 +1154,34 @@ fn config_fingerprint(
     }
     part("jxl_speed", &format!("{jxl_speed:?}"));
     part("width_step", &width_step.to_string());
+    // The tools' address-space caps (issue #738), each only
+    // when it is not its default, so a configuration that
+    // leaves them alone keeps the fingerprint it had. What a
+    // tool returns can depend on its cap, not only whether it
+    // fails: the PDF renderer leaves out of the page an image
+    // it cannot decode under the cap.
+    for (name, default) in [
+        (
+            "CRABCROP_VIDEO_ENCODER_ADDRESS_SPACE_MAX_MB",
+            crate::video::DEFAULT_ENCODER_ADDRESS_SPACE,
+        ),
+        (
+            "CRABCROP_VIDEO_DECODER_ADDRESS_SPACE_MAX_MB",
+            crate::frames::DEFAULT_DECODER_ADDRESS_SPACE,
+        ),
+        (
+            "CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB",
+            crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE,
+        ),
+        (
+            "CRABCROP_SVG_WORKER_ADDRESS_SPACE_MAX_MB",
+            crate::svg::DEFAULT_WORKER_ADDRESS_SPACE,
+        ),
+    ] {
+        if let Some(cap) = changed_cap(&get, name, default) {
+            part(name, &cap);
+        }
+    }
     // The AI behavior thresholds, at their effective
     // values (the builders' defaults when unset): both
     // gate what detection and tagging report, and
@@ -983,6 +1281,20 @@ fn config_fingerprint(
     }
     let digest = hasher.finalize();
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A tool's address-space cap for the fingerprint (issue
+/// #738): its value in megabytes when it is set to anything
+/// but `default` (in bytes), `None` when it is unset or the
+/// default. A value that does not parse contributes its raw
+/// text: boot fails on it later, in the configuration.
+fn changed_cap(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> Option<String> {
+    let value = get(name)?;
+    match value.parse::<u64>() {
+        Ok(mb) if mb == default >> 20 => None,
+        Ok(mb) => Some(mb.to_string()),
+        Err(_) => Some(value),
+    }
 }
 
 /// The fingerprint identity of one file-based input: the
@@ -1102,15 +1414,25 @@ fn build_ai_providers(config: &AiConfig) -> Result<AiProviders, ConfigError> {
         None => None,
     };
     let segment = build_segment(ort_dylib, config.segment.as_ref())?;
-    let (tagger, tag_threshold, embeddings) = match build_tagger(ort_dylib, config.clip.as_ref())? {
+    let clip = build_clip(ort_dylib, config.clip.as_ref(), config.moderation.as_ref())?;
+    let (tagger, tag_threshold, embeddings, clip_moderation) = match clip {
         Some(setup) => (
-            Some(setup.provider),
+            Some(setup.tagger),
             setup.threshold,
             Some(setup.embeddings),
+            setup.moderation,
         ),
-        None => (None, 0.05, None),
+        None => (None, 0.05, None, None),
     };
-    let moderation = build_moderation(ort_dylib, config.moderation.as_ref())?;
+    let moderation = match &config.moderation {
+        Some(ModerationConfig::Model { model, labels }) => {
+            Some(build_moderation(ort_dylib, model, labels.as_deref())?)
+        }
+        // Built with the tags, over the same load of the CLIP
+        // models (issue #736).
+        Some(ModerationConfig::ClipPrompts { .. }) => clip_moderation,
+        None => None,
+    };
     let aesthetic = build_aesthetic(config.aesthetic_head.as_deref())?;
     let ocr = build_ocr(ort_dylib, config.ocr.as_ref())?;
     let detect = build_detector(ort_dylib, config.detect.as_ref())?;
@@ -1193,11 +1515,16 @@ fn build_video_encoder(
                     Some("CRABCROP_VIDEO_ENCODER"),
                     format!("cannot use CRABCROP_VIDEO_ENCODER ({path}): {e}"),
                 )
-            })?;
+            })?
+            .with_address_space(config.encoder_address_space);
             boot_line!(
-                "video encoder: {path} (timeout {}s, output cap {} MB)",
+                "video encoder: {path} (timeout {}s, output cap {} MB{})",
                 config.timeout_secs,
-                config.max_mb
+                config.max_mb,
+                address_space_note(
+                    config.encoder_address_space,
+                    crate::video::DEFAULT_ENCODER_ADDRESS_SPACE
+                )
             );
             Ok(Some(Arc::new(encoder)))
         }
@@ -1225,11 +1552,31 @@ fn build_video_decoder(
                     Some("CRABCROP_VIDEO_DECODER"),
                     format!("cannot use CRABCROP_VIDEO_DECODER ({path}): {e}"),
                 )
-            })?;
-            boot_line!("video decoder: {path} (timeout {}s)", config.timeout_secs);
+            })?
+            .with_address_space(config.decoder_address_space);
+            boot_line!(
+                "video decoder: {path} (timeout {}s{})",
+                config.timeout_secs,
+                address_space_note(
+                    config.decoder_address_space,
+                    crate::frames::DEFAULT_DECODER_ADDRESS_SPACE
+                )
+            );
             Ok(Some(Arc::new(extractor)))
         }
         None => Ok(None),
+    }
+}
+
+/// What a tool's boot line says of its address-space cap
+/// (issue #738): nothing at the default, so a server that
+/// sets no cap prints the line it always has, and the cap in
+/// megabytes otherwise.
+fn address_space_note(cap: u64, default: u64) -> String {
+    if cap == default {
+        String::new()
+    } else {
+        format!(", address space {} MB", cap >> 20)
     }
 }
 
@@ -1258,7 +1605,7 @@ fn build_provenance_signer(
     let (line, warning) = provenance_boot_lines(&signer.name, signer.alg(), &config.cert);
     boot_line!("{line}");
     if let Some(warning) = warning {
-        eprintln!("warning: {warning}");
+        stderr_line!("warning: {warning}");
     }
     Ok(Some(Arc::new(signer)))
 }
@@ -1303,23 +1650,51 @@ fn provenance_boot_lines(
 /// counterpart of the frame extractor. Same boot rule:
 /// a set path that is not a usable renderer, or one
 /// whose `pdfinfo` sibling is missing, is fatal here,
-/// not on the first `page:` request.
+/// not on the first `page:` request. So is a pair that
+/// runs but cannot render a page (issue #715): the boot
+/// renders a one-page document through both programs, as
+/// the C2PA identity signs one image. It renders under the
+/// configured address-space cap, so a cap the pair cannot
+/// work in stops the boot too, and the error names the
+/// cap's variable when it is not the default (issue #738).
 fn build_pdf_renderer(
     config: &PdfConfig,
 ) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, ConfigError> {
     match &config.renderer {
         Some(path) => {
-            let renderer = crate::pdf::PdfRenderer::new(
-                std::path::PathBuf::from(path),
-                std::time::Duration::from_secs(config.timeout_secs),
-            )
-            .map_err(|e| {
+            let unusable = |e: crate::pdf::PdfError| {
                 ConfigError::build(
                     Some("CRABCROP_PDF_RENDERER"),
                     format!("cannot use CRABCROP_PDF_RENDERER ({path}): {e}"),
                 )
+            };
+            let renderer = crate::pdf::PdfRenderer::new(
+                std::path::PathBuf::from(path),
+                std::time::Duration::from_secs(config.timeout_secs),
+            )
+            .map_err(unusable)?
+            .with_address_space(config.renderer_address_space);
+            let cap_mb = config.renderer_address_space >> 20;
+            renderer.self_test().map_err(|e| {
+                if config.renderer_address_space == crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE {
+                    return unusable(e);
+                }
+                ConfigError::build(
+                    Some("CRABCROP_PDF_RENDERER"),
+                    format!(
+                        "cannot use CRABCROP_PDF_RENDERER ({path}) under the {cap_mb} MB \
+                         address-space cap CRABCROP_PDF_RENDERER_ADDRESS_SPACE_MAX_MB sets: {e}"
+                    ),
+                )
             })?;
-            boot_line!("PDF renderer: {path} (timeout {}s)", config.timeout_secs);
+            boot_line!(
+                "PDF renderer: {path} (timeout {}s{})",
+                config.timeout_secs,
+                address_space_note(
+                    config.renderer_address_space,
+                    crate::pdf::DEFAULT_RENDERER_ADDRESS_SPACE
+                )
+            );
             Ok(Some(Arc::new(renderer)))
         }
         None => Ok(None),
@@ -1492,128 +1867,165 @@ fn build_declared_detectors(
     Ok(DeclaredDetectors { boxes, focal })
 }
 
-/// A loaded tag provider plus the threshold its meta
-/// annotations compose with, and the embedding
-/// provider built from the same tagger (issue #172).
-struct TaggerSetup {
-    provider: Arc<dyn crate::ai::TagProvider>,
+/// The CLIP models' users, built over one load of the models
+/// (issue #736): the tag provider with the threshold its meta
+/// annotations compose with, the embedding provider built from
+/// the same tagger (issue #172), and the moderation review
+/// signals when moderation runs on CLIP prompts (issue #171).
+struct ClipSetup {
+    tagger: Arc<dyn crate::ai::TagProvider>,
     threshold: f32,
     embeddings: Arc<dyn crate::ai::EmbeddingProvider>,
+    moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
 }
 
-/// Build the CLIP tag provider, when the CLIP set is
-/// configured: preloaded like every other model, with a
-/// broken configuration failing startup.
-fn build_tagger(
+/// One label set a load of the CLIP models gives back: the set
+/// as a tag provider, and how many labels it holds.
+type ClipLabelSet = (Arc<dyn crate::ai::TagProvider>, usize);
+
+/// Build the CLIP users, when the CLIP set is configured:
+/// preloaded like every other model, with a broken
+/// configuration failing startup. With moderation on CLIP
+/// prompts, the prompts load with the tags, over the same
+/// image model (issue #736): one vision session and one
+/// embedding memo, so a meta request that asks for tags and
+/// moderation embeds its image once. The fallback used to load
+/// the CLIP models a second time.
+fn build_clip(
     ort_dylib: Option<&str>,
     config: Option<&ClipConfig>,
-) -> Result<Option<TaggerSetup>, ConfigError> {
+    moderation: Option<&ModerationConfig>,
+) -> Result<Option<ClipSetup>, ConfigError> {
+    build_clip_from(config, moderation, |config, label_sets| {
+        let sets = crate::ai::OnnxClipProvider::load_sets(
+            ort_dylib,
+            &config.image_model,
+            &config.text_model,
+            &config.tokenizer,
+            label_sets,
+        )?;
+        Ok(sets
+            .into_iter()
+            .map(|set| {
+                let labels = set.label_count();
+                (Arc::new(set) as Arc<dyn crate::ai::TagProvider>, labels)
+            })
+            .collect())
+    })
+}
+
+/// [`build_clip`] with the load named: `load` loads the CLIP
+/// models once for the label sets it is handed and gives back
+/// one set for each, in order. Boot hands it the ONNX load; the
+/// tests count its calls.
+fn build_clip_from(
+    config: Option<&ClipConfig>,
+    moderation: Option<&ModerationConfig>,
+    load: impl FnOnce(&ClipConfig, Vec<Vec<String>>) -> Result<Vec<ClipLabelSet>, crate::ai::AiError>,
+) -> Result<Option<ClipSetup>, ConfigError> {
     let Some(config) = config else {
         return Ok(None);
     };
-    let provider = crate::ai::OnnxClipProvider::load(
-        ort_dylib,
-        &config.image_model,
-        &config.text_model,
-        &config.tokenizer,
-        &config.labels,
-    )
-    .map_err(|e| {
+    let tagging = |e: crate::ai::AiError| {
         ConfigError::build(
             Some("CRABCROP_CLIP_IMAGE_MODEL"),
             format!("cannot load the CLIP tagging models: {e}"),
         )
-    })?;
+    };
+    let mut label_sets = vec![crate::ai::read_labels(&config.labels).map_err(tagging)?];
+    let prompts = match moderation {
+        Some(ModerationConfig::ClipPrompts { labels }) => Some(labels),
+        _ => None,
+    };
+    if let Some(prompts) = prompts {
+        label_sets.push(crate::ai::read_labels(prompts).map_err(|e| {
+            ConfigError::build(
+                Some("CRABCROP_MODERATION_LABELS"),
+                format!("cannot load the CLIP moderation fallback: {e}"),
+            )
+        })?);
+    }
+    let mut sets = load(config, label_sets).map_err(tagging)?.into_iter();
+    let mut next_set = || {
+        sets.next().ok_or_else(|| {
+            tagging(crate::ai::AiError::Load(
+                "the load gave back fewer label sets than it was handed".to_string(),
+            ))
+        })
+    };
+    let (tagger, labels) = next_set()?;
     boot_line!(
-        "CLIP tagging loaded ({} labels, threshold {})",
-        provider.label_count(),
+        "CLIP tagging loaded ({labels} labels, threshold {})",
         config.threshold
     );
-    // The threshold is presentation, applied where
-    // the meta annotation is composed (issue #152),
-    // so it travels with the provider to the server
-    // state rather than living inside the provider.
-    let provider = Arc::new(provider);
     // The embedding provider wraps the same
     // tagger (issue #172): the vector the tag
     // scores are computed from, surfaced with the
     // image model's identity.
     let embeddings = Arc::new(crate::ai::ClipEmbeddingProvider::new(
-        provider.clone(),
+        tagger.clone(),
         config.image_model.clone(),
     ));
-    Ok(Some(TaggerSetup {
-        provider,
+    let moderation = match prompts {
+        Some(_) => {
+            let (prompts, count) = next_set()?;
+            boot_line!(
+                "moderation review signals loaded from {} ({count} prompt labels)",
+                config.image_model
+            );
+            let provider: Arc<dyn crate::ai::ModerationProvider> = Arc::new(
+                crate::ai::ClipModerationProvider::new(prompts, config.image_model.clone()),
+            );
+            Some(provider)
+        }
+        None => None,
+    };
+    Ok(Some(ClipSetup {
+        tagger,
+        // The threshold is presentation, applied where the
+        // meta annotation is composed (issue #152), so it
+        // travels with the provider to the server state rather
+        // than living inside the provider.
         threshold: config.threshold,
         embeddings,
+        moderation,
     }))
 }
 
-/// Build the moderation provider, when configured (issue
-/// #171): a verdict classifier from
-/// `CRABCROP_MODERATION_MODEL`, or the CLIP zero-shot
-/// fallback when only a labels file is set. Preloaded like
-/// every other provider, with a broken configuration
-/// failing startup.
+/// Build the moderation verdict classifier (issue #171) from
+/// `CRABCROP_MODERATION_MODEL`, preloaded like every other
+/// provider, with a broken configuration failing startup. The
+/// CLIP zero-shot fallback, for a labels file without a model,
+/// is built with the tagger: [`build_clip`].
 fn build_moderation(
     ort_dylib: Option<&str>,
-    config: Option<&ModerationConfig>,
-) -> Result<Option<Arc<dyn crate::ai::ModerationProvider>>, ConfigError> {
-    match config {
-        None => Ok(None),
-        Some(ModerationConfig::Model { model, labels }) => {
-            // With a model, the labels file names its output
-            // categories; the provider checks the count
-            // against its probe at load.
-            let labels = match labels {
-                Some(path) => Some(crate::ai::read_labels(path).map_err(|e| {
-                    ConfigError::build(
-                        Some("CRABCROP_MODERATION_LABELS"),
-                        format!("cannot read the moderation labels: {e}"),
-                    )
-                })?),
-                None => None,
-            };
-            let provider = crate::ai::OnnxModerationProvider::load(ort_dylib, model, labels)
-                .map_err(|e| {
-                    ConfigError::build(
-                        Some("CRABCROP_MODERATION_MODEL"),
-                        format!("cannot load the moderation model: {e}"),
-                    )
-                })?;
-            boot_line!(
-                "moderation verdicts loaded from {model} ({} categories)",
-                provider.labels().len()
-            );
-            Ok(Some(Arc::new(provider)))
-        }
-        Some(ModerationConfig::ClipPrompts { labels, clip }) => {
-            // The same CLIP model files load again with the
-            // moderation labels, so the two label sets stay
-            // independent.
-            let tagger = crate::ai::OnnxClipProvider::load(
-                ort_dylib,
-                &clip.image_model,
-                &clip.text_model,
-                &clip.tokenizer,
-                labels,
+    model: &str,
+    labels: Option<&str>,
+) -> Result<Arc<dyn crate::ai::ModerationProvider>, ConfigError> {
+    // With a model, the labels file names its output
+    // categories; the provider checks the count
+    // against its probe at load.
+    let labels = match labels {
+        Some(path) => Some(crate::ai::read_labels(path).map_err(|e| {
+            ConfigError::build(
+                Some("CRABCROP_MODERATION_LABELS"),
+                format!("cannot read the moderation labels: {e}"),
             )
-            .map_err(|e| {
-                ConfigError::build(
-                    Some("CRABCROP_MODERATION_LABELS"),
-                    format!("cannot load the CLIP moderation fallback: {e}"),
-                )
-            })?;
-            boot_line!(
-                "moderation review signals loaded from {} ({} prompt labels)",
-                clip.image_model,
-                tagger.label_count()
-            );
-            let provider =
-                crate::ai::ClipModerationProvider::new(Arc::new(tagger), clip.image_model.clone());
-            Ok(Some(Arc::new(provider)))
-        }
-    }
+        })?),
+        None => None,
+    };
+    let provider =
+        crate::ai::OnnxModerationProvider::load(ort_dylib, model, labels).map_err(|e| {
+            ConfigError::build(
+                Some("CRABCROP_MODERATION_MODEL"),
+                format!("cannot load the moderation model: {e}"),
+            )
+        })?;
+    boot_line!(
+        "moderation verdicts loaded from {model} ({} categories)",
+        provider.labels().len()
+    );
+    Ok(Arc::new(provider))
 }
 
 /// Build the aesthetic head, when configured (issue #172):
@@ -1682,6 +2094,19 @@ fn build_ocr(
 #[allow(dead_code)]
 #[path = "test_support/scratch.rs"]
 mod test_support;
+
+// So does the writer of fake tools' scripts: the PDF
+// renderer's boot check runs them (issue #715).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "test_support/script.rs"]
+mod test_script;
+
+// And so does the writer of head saves: the aesthetic
+// head's boot error is checked on one (issue #760).
+#[cfg(test)]
+#[path = "test_support/head_archive.rs"]
+mod test_head_archive;
 
 #[cfg(test)]
 #[path = "main/tests.rs"]

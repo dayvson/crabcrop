@@ -53,6 +53,23 @@ fn keyring_verifies_across_a_rotation_window() {
 }
 
 #[test]
+fn keyring_zeroes_its_keys() {
+    // What dropping a ring runs: both keys are wiped, and the
+    // key IDs, which URLs carry in the clear, are kept.
+    let mut ring = Keyring {
+        current_id: "k-new".to_string(),
+        current: b"new-secret-value".to_vec(),
+        previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+    };
+    zeroize::Zeroize::zeroize(&mut ring);
+    assert!(ring.current.is_empty());
+    let (previous_id, previous) = ring.previous.as_ref().unwrap();
+    assert!(previous.is_empty());
+    assert_eq!(previous_id, "k-old");
+    assert_eq!(ring.current_id, "k-new");
+}
+
+#[test]
 fn keyring_purge_verification_keeps_domain_separation() {
     let ring = Keyring {
         current_id: "k-new".to_string(),
@@ -538,6 +555,132 @@ fn expiring_upload_signatures_verify_over_the_full_remainder() {
 }
 
 #[test]
+fn purge_remainders_split_an_optional_expiry() {
+    // The plain forms are the target path or the group name
+    // alone, a source's slashes included.
+    for plain in [
+        "300x200/https://example.com/a.jpg",
+        "thumb",
+        "s1.AAECAw/photo.jpg",
+        "expedition/https://example.com/a.jpg",
+        "300x200/exp:1893456000/https://example.com/a.jpg",
+        "",
+    ] {
+        assert_eq!(split_purge_remainder(plain).unwrap(), (None, plain));
+    }
+    // The expiring form leads with the exp: segment, and
+    // only that one segment is the purge's expiry: an exp:
+    // after it is the image's, part of the target.
+    assert_eq!(
+        split_purge_remainder("exp:1893456000/300x200/https://example.com/a.jpg").unwrap(),
+        (Some(1893456000), "300x200/https://example.com/a.jpg")
+    );
+    assert_eq!(
+        split_purge_remainder("exp:1893456000/thumb").unwrap(),
+        (Some(1893456000), "thumb")
+    );
+    assert_eq!(
+        split_purge_remainder("exp:5/exp:1893456000/300x200/a.jpg").unwrap(),
+        (Some(5), "exp:1893456000/300x200/a.jpg")
+    );
+    assert_eq!(
+        split_purge_remainder("exp:007/s1.AAECAw/photo.jpg").unwrap(),
+        (Some(7), "s1.AAECAw/photo.jpg")
+    );
+    assert_eq!(split_purge_remainder("exp:5/").unwrap(), (Some(5), ""));
+    // A leading segment that opens with exp: but does not
+    // parse, or that nothing follows, is the grammar error
+    // the image and upload grammars answer, whatever comes
+    // after it.
+    let long = format!("exp:{}/thumb", "9".repeat(10_000));
+    for bad in [
+        "exp:soon/300x200/https://example.com/a.jpg",
+        "exp:/thumb",
+        "exp:-5/thumb",
+        "exp:+5/thumb",
+        "exp:5.0/thumb",
+        "exp: 5/thumb",
+        "exp:\u{0661}\u{0662}/thumb",
+        "exp:18446744073709551616/thumb",
+        long.as_str(),
+        "exp:1893456000",
+        "exp:",
+    ] {
+        let err = split_purge_remainder(bad).unwrap_err();
+        assert_eq!(err.code(), "invalid_expiry", "{bad}");
+    }
+    assert_eq!(
+        split_purge_remainder("exp:18446744073709551615/thumb").unwrap(),
+        (Some(u64::MAX), "thumb")
+    );
+}
+
+#[test]
+fn expiring_purge_signatures_verify_over_the_full_remainder() {
+    let secret = b"test-secret";
+    let exp = 1893456000u64;
+    for (target, sig, verify_here, verify_there) in [
+        (
+            "300x200/https://example.com/a.jpg",
+            purge_signature_with_expiry(secret, "300x200/https://example.com/a.jpg", exp),
+            verify_purge as fn(&[u8], &Signature, &str) -> bool,
+            verify_purge_group as fn(&[u8], &Signature, &str) -> bool,
+        ),
+        (
+            "thumb",
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            verify_purge_group,
+            verify_purge,
+        ),
+    ] {
+        let sig = Signature::Hmac(sig);
+        let remainder = format!("exp:{exp}/{target}");
+        // Verification runs over the remainder exactly as
+        // presented, the expiry segment included.
+        assert!(verify_here(secret, &sig, &remainder), "{target}");
+        // Another expiry, another target, the stripped
+        // target and the other endpoint all fail.
+        assert!(
+            !verify_here(secret, &sig, &format!("exp:{}/{target}", exp + 1)),
+            "{target}"
+        );
+        assert!(
+            !verify_here(secret, &sig, &format!("exp:{exp}/{target}x")),
+            "{target}"
+        );
+        assert!(!verify_here(secret, &sig, target), "{target}");
+        assert!(!verify_there(secret, &sig, &remainder), "{target}");
+    }
+    // A plain purge signature over a target that opens with
+    // an image URL's exp: segment is the same bytes as the
+    // expiring form of the rest: the server cannot tell the
+    // two apart, which is why it reads that segment as the
+    // purge's expiry.
+    assert_eq!(
+        purge_signature(secret, "exp:1893456000/300x200/https://example.com/a.jpg"),
+        purge_signature_with_expiry(secret, "300x200/https://example.com/a.jpg", exp)
+    );
+}
+
+#[test]
+fn a_sealed_purge_target_under_the_key_id_exp_carries_no_expiry() {
+    // `exp` is a valid key ID, and a token sealed under it
+    // opens with `exp:s1.`. That segment is the token, the
+    // target's first segment, never the purge's expiry,
+    // whose seconds are digits: with or without an expiry
+    // in front, the token stays whole.
+    for sealed in ["exp:s1.AAECAw/photo.jpg", "exp:s1.AAECAw"] {
+        assert_eq!(split_purge_remainder(sealed).unwrap(), (None, sealed));
+        let expiring = format!("exp:5/{sealed}");
+        assert_eq!(split_purge_remainder(&expiring).unwrap(), (Some(5), sealed));
+    }
+    // An upload name has no token, so there the segment is
+    // the malformed expiry it always was.
+    let err = split_upload_remainder("exp:s1.AAECAw/photo.jpg").unwrap_err();
+    assert_eq!(err.code(), "invalid_expiry");
+}
+
+#[test]
 fn sealed_segment_splitting() {
     assert_eq!(split_sealed_segment("s1.AAECAw"), Some((None, "s1.AAECAw")));
     assert_eq!(
@@ -907,9 +1050,9 @@ fn parses_filters() {
     assert_eq!(
         ops,
         vec![Operation::Filters(vec![
-            Filter::Grayscale,
-            Filter::Quality(Quality::Value(80)),
-            Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
+            Filter::Plain(PlainFilter::Grayscale),
+            Filter::Plain(PlainFilter::Quality(Quality::Value(80))),
+            Filter::Plain(PlainFilter::Format(FormatSpec::plain(ImageFormat::WebP))),
         ])]
     );
 }
@@ -922,9 +1065,9 @@ fn parses_shape_filters() {
     assert_eq!(
         ops,
         vec![Operation::Filters(vec![
-            Filter::Radius([12, 12, 12, 12]),
-            Filter::Border(2, [0, 255, 0]),
-            Filter::Mask(MaskShape::Ellipse),
+            Filter::Plain(PlainFilter::Radius([12, 12, 12, 12])),
+            Filter::Plain(PlainFilter::Border(2, [0, 255, 0])),
+            Filter::Plain(PlainFilter::Mask(MaskShape::Ellipse)),
         ])]
     );
     let (ops, _) =
@@ -932,8 +1075,8 @@ fn parses_shape_filters() {
     assert_eq!(
         ops,
         vec![Operation::Filters(vec![
-            Filter::Radius([1, 2, 3, 4]),
-            Filter::Mask(MaskShape::Circle),
+            Filter::Plain(PlainFilter::Radius([1, 2, 3, 4])),
+            Filter::Plain(PlainFilter::Mask(MaskShape::Circle)),
         ])]
     );
 }
@@ -947,11 +1090,11 @@ fn parses_finishing_filters() {
     assert_eq!(
         ops,
         vec![Operation::Filters(vec![
-            Filter::Sepia,
-            Filter::Duotone([0, 0, 0], [255, 255, 255]),
-            Filter::Monochrome([255, 128, 0]),
-            Filter::Pixelate(8),
-            Filter::Flip(FlipDirection::Horizontal),
+            Filter::Plain(PlainFilter::Sepia),
+            Filter::Plain(PlainFilter::Duotone([0, 0, 0], [255, 255, 255])),
+            Filter::Plain(PlainFilter::Monochrome([255, 128, 0])),
+            Filter::Plain(PlainFilter::Pixelate(8)),
+            Filter::Plain(PlainFilter::Flip(FlipDirection::Horizontal)),
         ])]
     );
 }
@@ -1059,19 +1202,34 @@ fn numeric_filter_bounds_accept_the_endpoints() {
 #[test]
 fn parses_gamma_filter() {
     let (ops, _) = parse_operations("filters:gamma(2.2)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Gamma(2.2)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Gamma(
+            2.2
+        ))])]
+    );
 }
 
 #[test]
 fn parses_exposure_filter() {
     let (ops, _) = parse_operations("filters:exposure(1.5)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Exposure(1.5)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Exposure(1.5)
+        )])]
+    );
     // Zero stops is the identity and parses, like
     // contrast at 0; the endpoints of the stops range
     // parse too (one step past them is pinned in
     // rejects_bad_filters).
     let (ops, _) = parse_operations("filters:exposure(-2)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Exposure(-2.0)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Exposure(-2.0)
+        )])]
+    );
     assert!(parse_operations("filters:exposure(0)/example.com/img.jpg").is_ok());
 }
 
@@ -1081,8 +1239,8 @@ fn parses_highlights_shadows_filter() {
         parse_operations("filters:highlights_shadows(30,-20)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::HighlightsShadows(
-            30.0, -20.0
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::HighlightsShadows(30.0, -20.0)
         )])]
     );
     // Both at 0 are the identity and parse, like
@@ -1090,8 +1248,8 @@ fn parses_highlights_shadows_filter() {
     let (ops, _) = parse_operations("filters:highlights_shadows(0,0)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::HighlightsShadows(
-            0.0, 0.0
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::HighlightsShadows(0.0, 0.0)
         )])]
     );
 }
@@ -1099,27 +1257,52 @@ fn parses_highlights_shadows_filter() {
 #[test]
 fn parses_vibrance_filter() {
     let (ops, _) = parse_operations("filters:vibrance(40)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Vibrance(40.0)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Vibrance(40.0)
+        )])]
+    );
     // Zero is the identity and parses, like contrast
     // at 0.
     let (ops, _) = parse_operations("filters:vibrance(0)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Vibrance(0.0)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Vibrance(0.0)
+        )])]
+    );
 }
 
 #[test]
 fn parses_enhance_filter() {
     let (ops, _) = parse_operations("filters:enhance/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Enhance])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Enhance
+        )])]
+    );
     // Empty parentheses spell the same filter, like
     // every no-argument filter.
     let (ops, _) = parse_operations("filters:enhance()/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Enhance])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Enhance
+        )])]
+    );
 }
 
 #[test]
 fn parses_palette_filter() {
     let (ops, _) = parse_operations("filters:palette(64)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Palette(64)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Palette(64)
+        )])]
+    );
     // The endpoints of the color budget parse.
     assert!(parse_operations("filters:palette(2)/example.com/img.jpg").is_ok());
     assert!(parse_operations("filters:palette(256)/example.com/img.jpg").is_ok());
@@ -1146,7 +1329,9 @@ fn parses_border_filter() {
     let (ops, _) = parse_operations("filters:border(0,FF0000)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Border(0, [255, 0, 0])])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Border(0, [255, 0, 0])
+        )])]
     );
     assert!(parse_operations("filters:border(16383,FF0000)/example.com/img.jpg").is_ok());
 }
@@ -1240,8 +1425,14 @@ fn parses_curve_filter() {
     assert_eq!(
         ops,
         vec![Operation::Filters(vec![
-            Filter::Curve(CurveChannel::Rgb, vec![(0, 0), (255, 255)]),
-            Filter::Curve(CurveChannel::R, vec![(0, 64), (255, 255)]),
+            Filter::Plain(PlainFilter::Curve(
+                CurveChannel::Rgb,
+                vec![(0, 0), (255, 255)]
+            )),
+            Filter::Plain(PlainFilter::Curve(
+                CurveChannel::R,
+                vec![(0, 64), (255, 255)]
+            )),
         ])]
     );
     // The point-count endpoints: 2 and 16 points parse.
@@ -1313,9 +1504,8 @@ fn parses_convolution_filter() {
             .unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Convolution(
-            vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
-            false,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Convolution(vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0], false,)
         )])]
     );
     // Decimal values (a gaussian kernel) and the flag.
@@ -1325,11 +1515,13 @@ fn parses_convolution_filter() {
     .unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Convolution(
-            vec![
-                0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625
-            ],
-            true,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Convolution(
+                vec![
+                    0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625
+                ],
+                true,
+            )
         )])]
     );
     // A 5x5 kernel parses: 25 values plus the flag.
@@ -1412,7 +1604,12 @@ fn rejects_bad_convolutions() {
 #[test]
 fn parses_noise_filter() {
     let (ops, _) = parse_operations("filters:noise(40)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Noise(40)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Noise(
+            40
+        ))])]
+    );
     // The ends of the range parse: 0 (a no-op) and 100
     // (full scale).
     assert!(parse_operations("filters:noise(0)/example.com/img.jpg").is_ok());
@@ -1580,9 +1777,9 @@ fn parses_jxl_format() {
     let (ops, _) = parse_operations("filters:format(jxl)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-            ImageFormat::Jxl
-        ))])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec::plain(ImageFormat::Jxl))
+        )])]
     );
     // `removebg` parses, and takes no parameters.
     let (ops, _) = parse_operations("filters:removebg/example.com/img.png").unwrap();
@@ -1602,7 +1799,9 @@ fn parses_auto_quality() {
     let (ops, _) = parse_operations("filters:quality(auto)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Quality(Quality::Auto)])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Quality(Quality::Auto)
+        )])]
     );
 }
 
@@ -1613,47 +1812,53 @@ fn parses_format_options() {
             .unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec {
-            format: ImageFormat::Jpeg,
-            options: FormatOptions {
-                jpeg_progressive: true,
-                jpeg_subsampling: Some(Subsampling::S444),
-                ..FormatOptions::default()
-            },
-        })])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec {
+                format: ImageFormat::Jpeg,
+                options: FormatOptions {
+                    jpeg_progressive: true,
+                    jpeg_subsampling: Some(Subsampling::S444),
+                    ..FormatOptions::default()
+                },
+            })
+        )])]
     );
     let (ops, _) = parse_operations("filters:format(png,interlace)/example.com/i.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec {
-            format: ImageFormat::Png,
-            options: FormatOptions {
-                png_interlace: true,
-                ..FormatOptions::default()
-            },
-        })])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec {
+                format: ImageFormat::Png,
+                options: FormatOptions {
+                    png_interlace: true,
+                    ..FormatOptions::default()
+                },
+            })
+        )])]
     );
     let (ops, _) =
         parse_operations("filters:format(webp,method:6,sns:20)/example.com/i.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec {
-            format: ImageFormat::WebP,
-            options: FormatOptions {
-                webp_method: Some(6),
-                webp_sns: Some(20),
-                ..FormatOptions::default()
-            },
-        })])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec {
+                format: ImageFormat::WebP,
+                options: FormatOptions {
+                    webp_method: Some(6),
+                    webp_sns: Some(20),
+                    ..FormatOptions::default()
+                },
+            })
+        )])]
     );
     // A bare format is the plain spec every pre-options
     // URL already means.
     let (ops, _) = parse_operations("filters:format(webp)/example.com/i.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-            ImageFormat::WebP
-        ))])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec::plain(ImageFormat::WebP))
+        )])]
     );
 }
 
@@ -1727,11 +1932,11 @@ fn parses_per_format_quality() {
     let (ops, _) = parse_operations("filters:quality(jpeg:80,webp:75)/example.com/i.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Quality(
-            Quality::PerFormat(vec![
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Quality(Quality::PerFormat(vec![
                 (Some(ImageFormat::Jpeg), QualityValue::Value(80)),
                 (Some(ImageFormat::WebP), QualityValue::Value(75)),
-            ],)
+            ],))
         )])]
     );
     // Fallback plus entries, with an auto entry.
@@ -1739,19 +1944,19 @@ fn parses_per_format_quality() {
         parse_operations("filters:quality(70,jpeg:auto,avif:60)/example.com/i.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Quality(
-            Quality::PerFormat(vec![
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Quality(Quality::PerFormat(vec![
                 (None, QualityValue::Value(70)),
                 (Some(ImageFormat::Jpeg), QualityValue::Auto),
                 (Some(ImageFormat::Avif), QualityValue::Value(60)),
-            ],)
+            ],))
         )])]
     );
     // A single named entry is a list of one.
     let (ops, _) = parse_operations("filters:quality(webp:75)/example.com/i.jpg").unwrap();
     assert!(matches!(
         ops[0],
-        Operation::Filters(ref f) if matches!(f[0], Filter::Quality(Quality::PerFormat(_)))
+        Operation::Filters(ref f) if matches!(f[0], Filter::Plain(PlainFilter::Quality(Quality::PerFormat(_))))
     ));
 }
 
@@ -2076,9 +2281,9 @@ fn parses_avif_format() {
     let (ops, _) = parse_operations("filters:format(avif)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-            ImageFormat::Avif
-        ))])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec::plain(ImageFormat::Avif))
+        )])]
     );
 }
 
@@ -2089,9 +2294,9 @@ fn parses_video_formats() {
             parse_operations(&format!("filters:format({spelling})/example.com/img.gif")).unwrap();
         assert_eq!(
             ops,
-            vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-                format
-            ))])]
+            vec![Operation::Filters(vec![Filter::Plain(
+                PlainFilter::Format(FormatSpec::plain(format))
+            )])]
         );
         assert!(format.is_video());
         // The canonical form spells them back unchanged.
@@ -2313,7 +2518,12 @@ fn rejects_bad_focal_point() {
 #[test]
 fn parses_no_upscale() {
     let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::NoUpscale
+        )])]
+    );
 }
 
 #[test]
@@ -2409,9 +2619,19 @@ fn distinct_watermark_urls_are_capped() {
 #[test]
 fn parses_trim() {
     let (ops, _) = parse_operations("filters:trim/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Trim(10)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Trim(
+            10
+        ))])]
+    );
     let (ops, _) = parse_operations("filters:trim(0)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Trim(0)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Trim(
+            0
+        ))])]
+    );
     assert!(parse_operations("filters:trim(256)/example.com/img.jpg").is_err());
     assert!(parse_operations("filters:trim(-1)/example.com/img.jpg").is_err());
 }
@@ -2421,9 +2641,8 @@ fn parses_trim_with_per_side_amounts() {
     let (ops, _) = parse_operations("filters:trim(20,5,0,5,0)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::TrimSides(
-            20,
-            [5, 0, 5, 0]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::TrimSides(20, [5, 0, 5, 0])
         )])]
     );
     // The largest side the grammar takes.
@@ -2462,9 +2681,9 @@ fn parses_gif_format() {
     let (ops, _) = parse_operations("filters:format(gif)/example.com/img.jpg").unwrap();
     assert_eq!(
         ops,
-        vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
-            ImageFormat::Gif
-        ))])]
+        vec![Operation::Filters(vec![Filter::Plain(
+            PlainFilter::Format(FormatSpec::plain(ImageFormat::Gif))
+        )])]
     );
 }
 
@@ -3645,18 +3864,30 @@ fn preset_names_stay_linear_on_long_distinct_lists() {
 #[test]
 fn parses_filter_batch_two() {
     let cases: Vec<(&str, Filter)> = vec![
-        ("sharpen(1.5)", Filter::Sharpen(1.5)),
-        ("saturation(0)", Filter::Saturation(0.0)),
-        ("saturation(2.5)", Filter::Saturation(2.5)),
-        ("rgb(255,-255,0)", Filter::Rgb(255, -255, 0)),
-        ("equalize", Filter::Equalize),
-        ("rotate(90)", Filter::Rotate(90.0)),
-        ("rotate(-90)", Filter::Rotate(-90.0)),
-        ("rotate(45)", Filter::Rotate(45.0)),
-        ("rotate(45.5)", Filter::Rotate(45.5)),
-        ("rotate(-30.25)", Filter::Rotate(-30.25)),
-        ("fill(ff8800)", Filter::Fill([255, 136, 0])),
-        ("max_bytes(5000)", Filter::MaxBytes(5000)),
+        ("sharpen(1.5)", Filter::Plain(PlainFilter::Sharpen(1.5))),
+        ("saturation(0)", Filter::Plain(PlainFilter::Saturation(0.0))),
+        (
+            "saturation(2.5)",
+            Filter::Plain(PlainFilter::Saturation(2.5)),
+        ),
+        (
+            "rgb(255,-255,0)",
+            Filter::Plain(PlainFilter::Rgb(255, -255, 0)),
+        ),
+        ("equalize", Filter::Plain(PlainFilter::Equalize)),
+        ("rotate(90)", Filter::Plain(PlainFilter::Rotate(90.0))),
+        ("rotate(-90)", Filter::Plain(PlainFilter::Rotate(-90.0))),
+        ("rotate(45)", Filter::Plain(PlainFilter::Rotate(45.0))),
+        ("rotate(45.5)", Filter::Plain(PlainFilter::Rotate(45.5))),
+        ("rotate(-30.25)", Filter::Plain(PlainFilter::Rotate(-30.25))),
+        (
+            "fill(ff8800)",
+            Filter::Plain(PlainFilter::Fill([255, 136, 0])),
+        ),
+        (
+            "max_bytes(5000)",
+            Filter::Plain(PlainFilter::MaxBytes(5000)),
+        ),
     ];
     for (seg, want) in cases {
         let path = format!("filters:{seg}/example.com/img.jpg");
@@ -3776,15 +4007,19 @@ fn operation_count_counts_each_filter_and_every_other_operation_once() {
     assert_eq!(operation_count(&[]), 0);
     assert!(check_operation_count(&[]).is_ok());
     // Exactly at the cap passes, either way it is spelled.
-    let one_segment = vec![Operation::Filters(vec![Filter::Invert; MAX_OPERATIONS])];
+    let one_segment = vec![Operation::Filters(vec![
+        Filter::Plain(PlainFilter::Invert);
+        MAX_OPERATIONS
+    ])];
     assert!(check_operation_count(&one_segment).is_ok());
-    let segments = vec![Operation::Filters(vec![Filter::Invert]); MAX_OPERATIONS];
+    let segments =
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Invert)]); MAX_OPERATIONS];
     assert!(check_operation_count(&segments).is_ok());
     // One more fails with the count in the message and the
     // engine's code, so the HTTP answer did not change when
     // the check moved to parse time.
     let mut over = segments.clone();
-    over.push(Operation::Filters(vec![Filter::Invert]));
+    over.push(Operation::Filters(vec![Filter::Plain(PlainFilter::Invert)]));
     let err = check_operation_count(&over).unwrap_err();
     assert_eq!(err, ParseError::TooManyOperations(MAX_OPERATIONS + 1));
     assert_eq!(err.code(), "unsupported_operation");
@@ -3917,11 +4152,11 @@ fn parses_new_filters() {
     assert_eq!(
         ops,
         vec![Operation::Filters(vec![
-            Filter::Invert,
-            Filter::Blur(2.5),
-            Filter::Brighten(10),
-            Filter::Contrast(1.2),
-            Filter::HueRotate(90),
+            Filter::Plain(PlainFilter::Invert),
+            Filter::Plain(PlainFilter::Blur(2.5)),
+            Filter::Plain(PlainFilter::Brighten(10)),
+            Filter::Plain(PlainFilter::Contrast(1.2)),
+            Filter::Plain(PlainFilter::HueRotate(90)),
         ])]
     );
 }
@@ -3960,9 +4195,19 @@ fn rejects_bad_new_filter_params() {
 fn blur_sigma_cap_boundary() {
     // The cap itself, and a small normal sigma, are accepted.
     let (ops, _) = parse_operations("filters:blur(512)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Blur(512.0)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Blur(
+            512.0
+        ))])]
+    );
     let (ops, _) = parse_operations("filters:blur(0.001)/example.com/img.jpg").unwrap();
-    assert_eq!(ops, vec![Operation::Filters(vec![Filter::Blur(0.001)])]);
+    assert_eq!(
+        ops,
+        vec![Operation::Filters(vec![Filter::Plain(PlainFilter::Blur(
+            0.001
+        ))])]
+    );
     // Just over the cap is invalid_filters, like any other
     // out-of-range filter parameter.
     assert_eq!(
@@ -4357,7 +4602,7 @@ fn the_canonical_form_is_the_segment_wise_form() {
     // Shapes the parser never yields: empty filter lists
     // alone, first, last, and between operations.
     let size = || Operation::Size(parse_size("300x200").unwrap());
-    let gray = || Operation::Filters(vec![Filter::Grayscale]);
+    let gray = || Operation::Filters(vec![Filter::Plain(PlainFilter::Grayscale)]);
     let empty = || Operation::Filters(Vec::new());
     for ops in [
         vec![],
@@ -4375,5 +4620,217 @@ fn the_canonical_form_is_the_segment_wise_form() {
                 "{ops:?} {source:?}"
             );
         }
+    }
+}
+
+/// The canonical form of a remainder, or the code it fails
+/// with.
+fn canonical_or_code(remainder: &str) -> Result<String, &'static str> {
+    parse_operations_with_expiry(remainder)
+        .map(|(ops, source, _, _)| canonical_form(&ops, source))
+        .map_err(|e| e.code())
+}
+
+/// Numbers read as their Rust types read them (issue #712),
+/// and every spelling of one value has one canonical form,
+/// and so one cache key. A float is the decimal rounded to the
+/// nearest `f32`, its bounds checked on the rounded value; a
+/// negative zero is zero.
+#[test]
+fn numbers_read_as_their_types_and_spell_one_way() {
+    let src = "https://example.com/a.jpg";
+    for (spelling, canonical) in [
+        // A sign, an exponent, a bare point, leading zeros.
+        ("filters:blur(+2)", "filters:blur(2)"),
+        ("filters:blur(2e0)", "filters:blur(2)"),
+        ("filters:blur(2.)", "filters:blur(2)"),
+        ("filters:blur(+.5e1)", "filters:blur(5)"),
+        ("filters:brighten(+040)", "filters:brighten(40)"),
+        ("filters:brighten(-0)", "filters:brighten(0)"),
+        (
+            "filters:format(webp,method:+6,sns:050)",
+            "filters:format(webp,method:6,sns:50)",
+        ),
+        ("filters:dpr(+2)", "filters:dpr(2)"),
+        ("filters:dpr(2e0)", "filters:dpr(2)"),
+        // Rounding to f32 comes before the bounds.
+        ("filters:blur(512.00001)", "filters:blur(512)"),
+        ("filters:dpr(1.50000001)", "filters:dpr(1.5)"),
+        ("filters:saturation(255.000001)", "filters:saturation(255)"),
+        ("filters:rotate(36000.001)", "filters:rotate(36000)"),
+        (
+            "focalpoint:1.00000001x0.5:100.000001",
+            "focalpoint:1x0.5:100",
+        ),
+        // A negative zero, written or rounded to, is zero.
+        ("filters:contrast(-0)", "filters:contrast(0)"),
+        ("filters:contrast(-1e-50)", "filters:contrast(0)"),
+        ("filters:exposure(-0.0)", "filters:exposure(0)"),
+        ("filters:saturation(-0)", "filters:saturation(0)"),
+        ("filters:saturation(-1e-50)", "filters:saturation(0)"),
+        ("filters:vibrance(-0)", "filters:vibrance(0)"),
+        (
+            "filters:highlights_shadows(-0,-0e5)",
+            "filters:highlights_shadows(0,0)",
+        ),
+        ("filters:facepad(-0)", "filters:facepad(0)"),
+        ("focalpoint:-0x-0", "focalpoint:0x0:1"),
+        ("filters:rotate(-0)", "filters:rotate(0)"),
+    ] {
+        let remainder = format!("{spelling}/{src}");
+        assert_eq!(
+            canonical_or_code(&remainder),
+            Ok(format!("{canonical}/{src}")),
+            "{spelling}"
+        );
+        // The canonical form is its own: one key for both.
+        assert_eq!(
+            canonical_key_form(&remainder),
+            canonical_key_form(&format!("{canonical}/{src}")),
+            "{spelling}"
+        );
+    }
+    for (spelling, code) in [
+        // Unsigned arguments refuse a minus sign, `-0` too.
+        ("filters:trim(-0)", "invalid_filters"),
+        ("filters:noise(-0)", "invalid_noise"),
+        ("filters:curve(rgb,-0,0,255,255)", "invalid_curve"),
+        ("filters:watermark(a.png,0,0,-0)", "invalid_filters"),
+        ("crop-rect:-0x0:10x10", "invalid_crop_rect"),
+        // Past the bounds once rounded: below the smallest
+        // normal f32, zero, infinity.
+        ("filters:blur(512.0001)", "invalid_filters"),
+        ("filters:blur(1e-40)", "invalid_filters"),
+        ("filters:blur(1e-46)", "invalid_filters"),
+        ("filters:gamma(1e-46)", "invalid_filters"),
+        ("filters:sharpen(1e-46)", "invalid_filters"),
+        ("filters:sharpen(1e39)", "invalid_filters"),
+        ("filters:sharpen(3.4028236e38)", "invalid_filters"),
+        ("filters:gamma(-0)", "invalid_filters"),
+        ("filters:dpr(-0)", "invalid_filters"),
+        ("filters:contrast(inf)", "invalid_filters"),
+        ("filters:contrast(NaN)", "invalid_filters"),
+    ] {
+        assert_eq!(
+            canonical_or_code(&format!("{spelling}/{src}")),
+            Err(code),
+            "{spelling}"
+        );
+    }
+    // The smallest normal f32, in its shortest spelling, and
+    // the largest finite one, both inside their bounds.
+    assert!(canonical_or_code(&format!("filters:blur(1.1754944e-38)/{src}")).is_ok());
+    assert!(canonical_or_code(&format!("filters:sharpen(3.4028235e38)/{src}")).is_ok());
+}
+
+/// A percent escape in a filter argument is `%` and two ASCII
+/// hex digits, and a text color is hex digits only (issue
+/// #712): Rust's integer parser also reads a `+` there, so
+/// `%+1` decoded to U+0001 and `+fffff` read as a color. A
+/// root path keeps its own reading, unchanged.
+#[test]
+fn escapes_and_colors_take_hex_digits_only() {
+    let src = "https://example.com/a.jpg";
+    for (accepted, canonical) in [
+        (
+            "filters:text(%01Hi,12,ffffff,center)",
+            "filters:text(%01Hi,12,ffffffff,center)",
+        ),
+        (
+            "filters:text(%e2%9c%93,12,FFFFFF,center)",
+            "filters:text(%E2%9C%93,12,ffffffff,center)",
+        ),
+        (
+            "filters:text(Hi,12,0fffff,center)",
+            "filters:text(Hi,12,0fffffff,center)",
+        ),
+        ("filters:blurclass(%09person)", "filters:blurclass(person)"),
+        (
+            "crop:10x10:objects(%09person)",
+            "crop:10x10:objects(person):1",
+        ),
+    ] {
+        assert_eq!(
+            canonical_or_code(&format!("{accepted}/{src}")),
+            Ok(format!("{canonical}/{src}")),
+            "{accepted}"
+        );
+    }
+    for refused in [
+        "filters:text(%+1Hi,12,ffffff,center)",
+        "filters:text(%+AHi,12,ffffff,center)",
+        "filters:text(Hi%+,12,ffffff,center)",
+        "filters:text(Hi,12,+fffff,center)",
+        "filters:text(Hi,12,+fffffff,center)",
+        "filters:text(Hi,12,-fffff,center)",
+        "filters:blurclass(%+9person)",
+        "filters:recolorclass(%+9person,ff0000)",
+        "filters:watermark(%+1a.png,0,0,50)",
+        "filters:overlay(%+1a.png,0,0,50,normal)",
+    ] {
+        assert_eq!(
+            canonical_or_code(&format!("{refused}/{src}")),
+            Err("invalid_filters"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        canonical_or_code(&format!("crop:10x10:objects(%+9person)/{src}")),
+        Err("invalid_crop")
+    );
+    // A root path's escapes are read for the climb check only,
+    // and a path that expanded before still does, as written.
+    let map = root_map();
+    let (expanded, _) = expand_source_root("root:photos/a%+1b.jpg", &map).unwrap();
+    assert_eq!(expanded, "https://cdn.example.com/photos/a%+1b.jpg");
+    assert!(expand_source_root("root:photos/a%zzb.jpg", &map).is_err());
+}
+
+/// An upload's `exp:` takes the image grammar's digits
+/// (issue #712): `u64::from_str` alone also read a leading
+/// `+`. Leading zeros stay digits.
+#[test]
+fn upload_expiries_take_ascii_digits() {
+    assert_eq!(
+        split_upload_remainder("exp:09999999999/cat.jpg").unwrap(),
+        (Some(9_999_999_999), "cat.jpg")
+    );
+    for bad in ["exp:+9999999999/cat.jpg", "exp:+0/cat.jpg", "exp:+/cat.jpg"] {
+        assert_eq!(
+            split_upload_remainder(bad).unwrap_err().code(),
+            "invalid_expiry",
+            "{bad}"
+        );
+    }
+    // The image grammar reads the same digits the same way.
+    for (ts, ok) in [("09999999999", true), ("+9999999999", false), ("", false)] {
+        let remainder = format!("exp:{ts}/300x200/a.jpg");
+        assert_eq!(parse_operations(&remainder).is_ok(), ok, "{remainder}");
+    }
+}
+
+/// The cache entry key is the HMAC of its label under the
+/// secret (issue #190), derived by the server itself since the
+/// client crate no longer exports it (issue #712). The value is
+/// pinned: a different key would turn every stored entry into a
+/// miss. Its label is reserved, so no signer computes it.
+#[test]
+fn the_entry_key_is_the_hmac_of_its_label() {
+    assert_eq!(
+        hex::encode(entry_key(b"test-secret")),
+        "682ca9e96a91d206ee5cbd2e587972bb3a7f40ba4226a8f28e541884075652e8"
+    );
+    assert!(crabcrop_url::is_reserved_remainder(ENTRY_KEY_LABEL));
+    assert!(crabcrop_url::sign(b"test-secret", ENTRY_KEY_LABEL).is_err());
+    let secret = b"test-secret";
+    let entry = entry_key(secret);
+    for other in [
+        purge_key(secret),
+        purge_group_key(secret),
+        upload_key(secret),
+        crabcrop_url::seal_key(secret),
+        secret.to_vec(),
+    ] {
+        assert_ne!(entry, other);
     }
 }

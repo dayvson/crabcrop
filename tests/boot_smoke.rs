@@ -252,6 +252,52 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
     assert!(!stderr.contains("proxy"), "{stderr}");
 }
 
+#[test]
+#[cfg(unix)]
+fn crabcrop_bind_on_the_ipv6_any_address_takes_ipv4_too_or_fails_cleanly() {
+    // Issue #715: `CRABCROP_BIND=::` listens on every IPv6
+    // address and, with IPV6_V6ONLY off, on IPv4 too,
+    // whatever the host's default. On a host without IPv6
+    // the boot stops with an error that says what to set
+    // instead, and nothing panics.
+    if std::net::TcpListener::bind("[::]:0").is_err() {
+        let stderr = refused_boot(&[("CRABCROP_BIND", "::")]);
+        assert!(
+            stderr.contains("crabcrop: cannot listen on [::]:0: "),
+            "{stderr}"
+        );
+        assert!(
+            stderr.trim_end().ends_with(
+                "; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+            ),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        return;
+    }
+    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "::")]);
+    assert!(
+        printed
+            .iter()
+            .any(|l| l.starts_with("connections: bind ::, ")),
+        "{printed:#?}"
+    );
+    // IPv4, to the IPv6 listener.
+    assert!(status_line(port, "/health", "").contains("200"));
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        let mut stream = TcpStream::connect(("::1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: [::1]\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+    }
+}
+
 /// Boot with a minimal environment plus `env` and expect
 /// the boot to fail: the exit code is 1, nothing listens,
 /// and the result is what the server wrote to stderr. A
@@ -322,13 +368,14 @@ fn placeholder_secrets_from_the_docs_stop_the_boot() {
 }
 
 #[test]
-fn a_short_metrics_token_warns_at_boot_and_still_serves() {
+fn a_short_metrics_token_stops_the_boot_without_quoting_it() {
     // Issue #588: a metrics token only had to be non-empty.
-    // Under 16 bytes it warns for this release; a later one
-    // refuses it. The warning never quotes the token.
-    let stderr = boot_stderr(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]);
+    // From 0.12.0 a token under 16 bytes booted with a
+    // warning; it now stops the boot (issue #632), with an
+    // error that names the length and never the token.
+    let stderr = refused_boot(&[("CRABCROP_METRICS_TOKEN", "fifteen-bytes!!")]);
     assert!(
-        stderr.contains("warning: CRABCROP_METRICS_TOKEN is 15 bytes"),
+        stderr.starts_with("crabcrop: CRABCROP_METRICS_TOKEN must be at least 16 bytes, got 15"),
         "{stderr}"
     );
     assert!(!stderr.contains("fifteen-bytes!!"), "{stderr}");
@@ -373,6 +420,67 @@ fn boot_output(env: &[(&str, &str)]) -> (Vec<String>, String) {
 }
 
 #[test]
+fn a_disk_budget_of_zero_boots_without_the_tier_whatever_the_directory() {
+    // Issue #708: docs/configuration.md said a budget of 0
+    // disables storage even with a directory set, but boot
+    // created and probed the directory anyway, so an
+    // unwritable one stopped the boot. With a budget of 0 there
+    // is no disk tier: the boot says so, serves, and leaves the
+    // directory alone. /proc is not writable even for root.
+    let workdir = common::scratch_dir("boot-disk-off");
+    let missing = workdir.join("never-made");
+    for dir in [std::path::Path::new("/proc/self"), missing.as_path()] {
+        let dir = dir.display().to_string();
+        let (printed, stderr) = boot_output(&[
+            ("CRABCROP_RESULT_STORAGE_DIR", dir.as_str()),
+            ("CRABCROP_RESULT_STORAGE_MAX_MB", "0"),
+        ]);
+        assert!(
+            printed.contains(&format!(
+                "result storage: off, CRABCROP_RESULT_STORAGE_MAX_MB is 0, so {dir} is not used"
+            )),
+            "{printed:?}"
+        );
+        assert!(
+            !printed
+                .iter()
+                .any(|line| line.starts_with("result storage at")),
+            "{printed:?}"
+        );
+        assert!(!stderr.contains("result storage"), "{stderr}");
+    }
+    assert!(!missing.exists());
+    // With a budget, the unwritable directory still stops the
+    // boot.
+    let stderr = refused_boot(&[("CRABCROP_RESULT_STORAGE_DIR", "/proc/self")]);
+    assert!(
+        stderr.contains("the result storage directory /proc/self is not writable"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_disk_tier_boot_prints_its_scan_and_what_it_indexed() {
+    // Issue #708: the boot scan runs on a thread of its own;
+    // the boot says when it starts and, on a healthy disk,
+    // what it indexed before the server listens.
+    let workdir = common::scratch_dir("boot-disk-scan");
+    let dir = workdir.join("cache").display().to_string();
+    let (printed, _) = boot_output(&[("CRABCROP_RESULT_STORAGE_DIR", dir.as_str())]);
+    let started =
+        format!("result storage at {dir}: budget 512 MB, scanning the entries a previous run left");
+    let done = printed
+        .iter()
+        .position(|line| line.starts_with(&format!("result storage at {dir}: 0 entries, 0 bytes, budget 512 MB; the boot scan read 0 files in ")))
+        .unwrap_or_else(|| panic!("no scan line: {printed:?}"));
+    let begun = printed
+        .iter()
+        .position(|line| *line == started)
+        .unwrap_or_else(|| panic!("no start line: {printed:?}"));
+    assert!(begun < done, "{printed:?}");
+}
+
+#[test]
 fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
     // Issue #590: boot named no part of the request and
     // source posture. One line now names the request mode,
@@ -407,7 +515,8 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
                     "images.example.com, cdn.example.com",
                 ),
             ],
-            "request mode: unsafe; source allowlist: 2 hosts; private-address check: on",
+            "request mode: unsafe; source allowlist: 2 hosts; \
+             private-address check: on, allowlisted hosts exempt",
             None,
         ),
         (
@@ -427,7 +536,26 @@ fn boot_prints_the_request_mode_and_warns_when_anyone_can_fetch_any_host() {
                 presets_file,
                 ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
             ],
-            "request mode: presets-only; source allowlist: 1 host; private-address check: on",
+            "request mode: presets-only; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
+            None,
+        ),
+        (
+            vec![
+                unsafe_on,
+                only_presets,
+                presets_file,
+                ("CRABCROP_ALLOWED_SOURCES", "images.example.com"),
+                ("CRABCROP_CHECK_ALLOWED_SOURCES", "1"),
+            ],
+            "request mode: presets-only; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts included",
+            None,
+        ),
+        (
+            vec![unsafe_on, ("CRABCROP_ALLOWED_SOURCES", "192.0.2.10")],
+            "request mode: unsafe; source allowlist: 1 host; \
+             private-address check: on, allowlisted hosts exempt",
             None,
         ),
         (
@@ -503,6 +631,83 @@ fn explain_off_answers_404_while_images_still_render() {
     let stderr = refused_boot(&[("CRABCROP_EXPLAIN", "of")]);
     assert!(
         stderr.starts_with("crabcrop: invalid CRABCROP_EXPLAIN"),
+        "{stderr}"
+    );
+}
+
+/// One HTTP/1.0 POST with no body on `port`: the
+/// response's status line and its body.
+fn post(port: u16, path: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    let status = response.lines().next().unwrap_or("").to_string();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn purge_require_expiry_refuses_plain_purges_and_boot_says_so() {
+    // With `CRABCROP_PURGE_REQUIRE_EXPIRY=1` a purge URL
+    // with no expiry answers 403, boot says so, and the
+    // expiring form still purges. Unset, both purge.
+    let secret = "boot-smoke-secret-0123456789";
+    let target = "100x50/https://example.com/a.jpg";
+    let plain = format!(
+        "/purge/{}/{target}",
+        crabcrop_url::purge_signature(secret.as_bytes(), target)
+    );
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let expiring = format!(
+        "/purge/{}/exp:{exp}/{target}",
+        crabcrop_url::purge_signature_with_expiry(secret.as_bytes(), target, exp)
+    );
+    for (value, plain_status, says_so) in [(None, "200", false), (Some("1"), "403", true)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
+        command.env_clear().env("CRABCROP_SECRET", secret);
+        if let Some(value) = value {
+            command.env("CRABCROP_PURGE_REQUIRE_EXPIRY", value);
+        }
+        let (_server, port, _, printed) = common::serve_printing(&mut command);
+        let (status, body) = post(port, &plain);
+        assert!(
+            status.contains(plain_status),
+            "{value:?}: {status:?} {body:?}"
+        );
+        assert_eq!(
+            body.starts_with("expiry required"),
+            says_so,
+            "{value:?}: {body:?}"
+        );
+        let (status, body) = post(port, &expiring);
+        assert!(status.contains("200"), "{value:?}: {status:?} {body:?}");
+        assert_eq!(
+            printed.iter().any(|l| l == "purges: expiring URLs only"),
+            says_so,
+            "{value:?}: {printed:#?}"
+        );
+    }
+    // A typo stops the boot and names the variable, rather
+    // than leaving plain purge URLs working.
+    let stderr = refused_boot(&[("CRABCROP_PURGE_REQUIRE_EXPIRY", "required")]);
+    assert!(
+        stderr.starts_with("crabcrop: invalid CRABCROP_PURGE_REQUIRE_EXPIRY"),
         "{stderr}"
     );
 }
@@ -1104,36 +1309,20 @@ fn sigterm_stops_waiting_for_a_stalled_shared_write_at_the_grace() {
 
 #[test]
 #[cfg(unix)]
-fn sigterm_cuts_off_a_hung_request_at_the_grace() {
+fn sigterm_cuts_off_hung_requests_at_the_grace_and_counts_them() {
     // Issue #463: the connection drain had no deadline, so
     // one request stuck on a slow origin held the shutdown
     // until the platform killed the process. Now the grace
-    // bounds it too.
-    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let origin_addr = origin.local_addr().unwrap();
-    let (fetched_tx, fetched) = std::sync::mpsc::channel();
-    // An origin that accepts the fetch and never answers.
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in origin.incoming() {
-            let Ok(stream) = stream else { return };
-            let _ = fetched_tx.send(());
-            held.push(stream);
-        }
-    });
+    // bounds it too. Issue #715: the line that says requests
+    // were cut off says how many.
     let grace = Duration::from_secs(2);
     let (mut server, port, lines) = serving_unsafe_urls(&[
         ("CRABCROP_SOURCE_TIMEOUT_SECS", "600"),
         ("CRABCROP_SHUTDOWN_GRACE_SECS", &grace.as_secs().to_string()),
     ]);
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let request = format!(
-        "GET /unsafe/40x30/http://{origin_addr}/img/hang.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).unwrap();
-    fetched
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the server fetches the source");
+    let _streams = hung_requests(port, 2);
+    // A request that has finished is not among them.
+    assert!(status_line(port, "/health", "").contains("200"));
     let signalled = Instant::now();
     terminate(&server);
     wait_for_line(&lines, "shutdown: draining");
@@ -1146,14 +1335,78 @@ fn sigterm_cuts_off_a_hung_request_at_the_grace() {
         "exited after {took:?}"
     );
     assert!(
-        stderr.contains("shutdown: requests still in flight at the deadline are cut off"),
+        stderr.contains("shutdown: 2 requests still in flight at the deadline are cut off"),
         "{stderr}"
     );
-    // The request's miss belongs to the request: it is not
-    // reported again as background work left behind.
+    // The requests' misses belong to the requests: they are
+    // not reported again as background work left behind.
     assert!(!stderr.contains("background writes"), "{stderr}");
     assert!(!stderr.contains("renders whose client left"), "{stderr}");
     wait_for_line(&lines, "shutdown: done");
+}
+
+/// `count` requests on the server at `port`, each for a
+/// source of its own at an origin that accepts the fetch and
+/// never answers: they hang until the server cuts them off.
+/// Returns once the server has fetched every source, with
+/// the clients' streams, which keep the requests open.
+#[cfg(unix)]
+fn hung_requests(port: u16, count: usize) -> Vec<TcpStream> {
+    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let (fetched_tx, fetched) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in origin.incoming() {
+            let Ok(stream) = stream else { return };
+            let _ = fetched_tx.send(());
+            held.push(stream);
+        }
+    });
+    // A source each, so that the requests are fetches of
+    // their own and not one shared render.
+    let streams: Vec<TcpStream> = (0..count)
+        .map(|n| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let request = format!(
+                "GET /unsafe/40x30/http://{origin_addr}/img/hang-{n}.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            stream
+        })
+        .collect();
+    for _ in &streams {
+        fetched
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the server fetches each source");
+    }
+    streams
+}
+
+#[test]
+#[cfg(unix)]
+fn a_second_signal_counts_the_requests_it_cuts_off() {
+    // Issue #715: a second signal ends the drain at once, and
+    // the requests still in flight are cut off then. Its line
+    // counts them as the deadline's does; nothing used to.
+    let (mut server, port, lines) = serving_unsafe_urls(&[
+        ("CRABCROP_SOURCE_TIMEOUT_SECS", "600"),
+        ("CRABCROP_SHUTDOWN_GRACE_SECS", "120"),
+    ]);
+    let _streams = hung_requests(port, 1);
+    terminate(&server);
+    wait_for_line(&lines, "shutdown: draining");
+    let signalled = Instant::now();
+    signal(&server, rustix::process::Signal::INT);
+    let (status, stderr) = exit_of(&mut server, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(took < Duration::from_secs(5), "exited {took:?} after it");
+    assert!(
+        stderr.contains("shutdown: 1 requests still in flight at the second signal are cut off"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("at the deadline"), "{stderr}");
 }
 
 #[test]
@@ -1424,6 +1677,26 @@ fn serving(env: &[(&str, &str)]) -> (ServerGuard, u16, Vec<String>) {
     (server, port, printed)
 }
 
+/// Bind `port` on `ip` without listening, so that a
+/// connection there is refused for as long as the socket is
+/// held, or `None` when something already holds the port on
+/// that address. The kernel picks a server's port for the
+/// address the server binds, and the same number can be in
+/// use on another loopback address, by another test's server
+/// or origin: a test that expects a refusal there holds the
+/// port first.
+#[cfg(target_os = "linux")]
+fn hold_unlistened(ip: std::net::Ipv4Addr, port: u16) -> Option<rustix::fd::OwnedFd> {
+    let socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::STREAM,
+        None,
+    )
+    .ok()?;
+    rustix::net::bind(&socket, &std::net::SocketAddrV4::new(ip, port)).ok()?;
+    Some(socket)
+}
+
 #[test]
 fn a_connection_that_never_finishes_its_request_head_is_closed_at_the_header_timeout() {
     // Issue #607: the server never set a timer on its
@@ -1582,7 +1855,17 @@ fn crabcrop_bind_listens_on_the_named_address_only() {
         TcpStream::connect(("127.0.0.2", port)).is_ok(),
         "by default the server listens on every IPv4 interface"
     );
-    let (_server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+    // The kernel picks the port for 127.0.0.1 only, so it can
+    // be in use on 127.0.0.2 already, by the health verb
+    // test's server: hold it there, bound but not listening,
+    // so a connection is refused for certain.
+    let (_server, port, printed, _held) = (0..8)
+        .find_map(|_| {
+            let (server, port, printed) = serving(&[("CRABCROP_BIND", "127.0.0.1")]);
+            hold_unlistened(std::net::Ipv4Addr::new(127, 0, 0, 2), port)
+                .map(|held| (server, port, printed, held))
+        })
+        .expect("in 8 tries, a server port that nothing holds on 127.0.0.2");
     assert!(status_line(port, "/health", "").contains("200"));
     let refused = TcpStream::connect(("127.0.0.2", port)).map(|_| ());
     assert_eq!(
@@ -1655,7 +1938,18 @@ fn the_health_verb_probes_the_address_crabcrop_bind_names() {
     // failed on a healthy server. The verb reads
     // CRABCROP_BIND as the server does and probes that
     // address. 127.0.0.2 is a loopback address on Linux.
-    let (_server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+    // The check without the setting needs nothing to listen
+    // on 127.0.0.1 at the server's port. The kernel picks the
+    // port for 127.0.0.2 only, so another test's server or
+    // origin can listen on 127.0.0.1 at the same number: the
+    // test holds the port there, bound but not listening, and
+    // starts another server when something else holds it.
+    let (_server, port, _held) = (0..8)
+        .find_map(|_| {
+            let (server, port, _) = serving(&[("CRABCROP_BIND", "127.0.0.2")]);
+            hold_unlistened(std::net::Ipv4Addr::LOCALHOST, port).map(|held| (server, port, held))
+        })
+        .expect("in 8 tries, a server port that nothing holds on 127.0.0.1");
     let health = |vars: &[(&str, &str)]| {
         Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .arg("health")

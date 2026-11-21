@@ -48,6 +48,42 @@ const MAX_DEPTH: usize = 32;
 /// hundred (issue #609).
 const MAX_BUILT: usize = 1 << 16;
 
+// The opcodes the machine reads, by their names in
+// CPython's pickle module. `PickleMachine::run` refuses
+// every other byte.
+const PROTO: u8 = 0x80;
+const STOP: u8 = b'.';
+const BINUNICODE: u8 = b'X';
+const SHORT_BINUNICODE: u8 = 0x8c;
+const SHORT_BINSTRING: u8 = b'U';
+const BININT1: u8 = b'K';
+const BININT2: u8 = b'M';
+const BININT: u8 = b'J';
+const LONG: u8 = b'L';
+const LONG1: u8 = 0x8a;
+const LONG4: u8 = 0x8b;
+const BINFLOAT: u8 = b'G';
+const NONE: u8 = b'N';
+const NEWTRUE: u8 = 0x88;
+const NEWFALSE: u8 = 0x89;
+const MARK: u8 = b'(';
+const EMPTY_TUPLE: u8 = b')';
+const TUPLE: u8 = b't';
+const TUPLE1: u8 = 0x85;
+const TUPLE2: u8 = 0x86;
+const TUPLE3: u8 = 0x87;
+const EMPTY_DICT: u8 = b'}';
+const SETITEM: u8 = b's';
+const SETITEMS: u8 = b'u';
+const BUILD: u8 = b'b';
+const BINPUT: u8 = b'q';
+const LONG_BINPUT: u8 = b'r';
+const BINGET: u8 = b'h';
+const LONG_BINGET: u8 = b'j';
+const GLOBAL: u8 = b'c';
+const REDUCE: u8 = b'R';
+const BINPERSID: u8 = b'Q';
+
 /// A restricted pickle interpreter, sized for the
 /// state dicts `torch.save` writes for a linear head:
 /// an ordered dict of tensor rebuilds over float
@@ -61,10 +97,23 @@ const MAX_BUILT: usize = 1 << 16;
 /// objects and never touches the filesystem. What it
 /// builds is bounded too: every value counts against
 /// `MAX_BUILT`, and no value nests past `MAX_DEPTH`.
+///
+/// An open MARK fences the stack, as in CPython's
+/// unpickler (`Modules/_pickle.c`, where `load_mark` sets
+/// the fence of the `Pdata` stack, `marker` lowers it to
+/// the MARK before when an opcode closes one, and
+/// `Pdata_pop`, `Pdata_poptuple`, `load_build`,
+/// `do_setitems` and the memo puts refuse to reach below
+/// it). No opcode here pops or reads a value from below
+/// the latest open MARK (see `fenced`), so no MARK stands
+/// past the top of the stack, and TUPLE and SETITEMS
+/// always find theirs within it (issue #760).
 struct PickleMachine<'a> {
     bytes: &'a [u8],
     at: usize,
     stack: Vec<PickleValue>,
+    /// The stack length each open MARK recorded, the
+    /// latest last.
     marks: Vec<usize>,
     memo: Vec<Option<PickleValue>>,
     /// The running count against `MAX_BUILT`.
@@ -72,236 +121,295 @@ struct PickleMachine<'a> {
 }
 
 impl<'a> PickleMachine<'a> {
+    /// Read opcodes until STOP. MARK and the opcodes that
+    /// push a fixed value run here; every other opcode
+    /// runs in the handler for its family below.
     fn run(mut self) -> Result<PickleValue, String> {
         loop {
             let op = self.byte().ok_or("the pickle ends without a STOP")?;
             match op {
-                // PROTO: the version byte is advisory;
-                // the opcode allowlist below is the
-                // real gate.
-                0x80 => {
-                    self.byte().ok_or("the pickle ends inside PROTO")?;
-                }
-                // GLOBAL: 'c' module '\n' name '\n'
-                b'c' => {
-                    let module = self.line()?;
-                    let name = self.line()?;
-                    self.push(PickleValue::Global(module, name))?;
-                }
-                // BINUNICODE / SHORT_BINUNICODE /
-                // SHORT_BINSTRING: length-prefixed
-                // strings (the state dict's keys and the
-                // storage arguments).
-                b'X' => {
-                    let len = self.u32()? as usize;
-                    let raw = self.take(len)?;
-                    let s = String::from_utf8(raw.to_vec())
-                        .map_err(|_| "a pickle string is not valid UTF-8".to_string())?;
-                    self.push(PickleValue::Str(s))?;
-                }
-                0x8c => {
-                    let len = self.byte().ok_or("the pickle ends inside a short string")? as usize;
-                    let raw = self.take(len)?;
-                    let s = String::from_utf8(raw.to_vec())
-                        .map_err(|_| "a pickle string is not valid UTF-8".to_string())?;
-                    self.push(PickleValue::Str(s))?;
-                }
-                b'U' => {
-                    let len = self.byte().ok_or("the pickle ends inside a short string")? as usize;
-                    let raw = self.take(len)?;
-                    self.push(PickleValue::Str(String::from_utf8_lossy(raw).into_owned()))?;
-                }
-                // Integers: BININT1, BININT2, BININT,
-                // LONG (a decimal line), LONG1/LONG4
-                // (little-endian two's complement).
-                b'K' => {
-                    let v = self.byte().ok_or("the pickle ends inside BININT1")?;
-                    self.push(PickleValue::Int(v as i64))?;
-                }
-                b'M' => {
-                    let v = self.u16()?;
-                    self.push(PickleValue::Int(v as i64))?;
-                }
-                b'J' => {
-                    let v = self.u32()? as i32;
-                    self.push(PickleValue::Int(v as i64))?;
-                }
-                b'L' => {
-                    let raw = self.line()?;
-                    let digits = raw.strip_suffix('L').unwrap_or(&raw);
-                    let v: i64 = digits
-                        .parse()
-                        .map_err(|_| format!("a pickle LONG is not a number: {raw:?}"))?;
-                    self.push(PickleValue::Int(v))?;
-                }
-                0x8a | 0x8b => {
-                    let len = if op == 0x8a {
-                        self.byte().ok_or("the pickle ends inside LONG1")? as usize
-                    } else {
-                        self.u32()? as usize
-                    };
-                    if len > 8 {
-                        return Err("a pickle long is too large for a head file".to_string());
-                    }
-                    let raw = self.take(len)?;
-                    let mut v: i64 = 0;
-                    for (i, b) in raw.iter().enumerate() {
-                        v |= (*b as i64) << (8 * i);
-                    }
-                    if len > 0 && len < 8 && raw[len - 1] & 0x80 != 0 {
-                        v -= 1i64 << (8 * len);
-                    }
-                    self.push(PickleValue::Int(v))?;
-                }
-                // BINFLOAT: big-endian f64.
-                b'G' => {
-                    let raw = self.take(8)?;
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(raw);
-                    self.push(PickleValue::Float(f64::from_be_bytes(buf)))?;
-                }
-                b'N' => self.push(PickleValue::None)?,
-                0x88 => self.push(PickleValue::Bool(false))?,
-                0x89 => self.push(PickleValue::Bool(true))?,
-                b')' => self.push(PickleValue::Tuple(Vec::new()))?,
-                b'(' => self.marks.push(self.stack.len()),
-                b't' => {
-                    let from = self.mark()?;
-                    let items: Vec<PickleValue> = self.stack.drain(from..).collect();
-                    self.push_tuple(items)?;
-                }
-                0x85..=0x87 => {
-                    let n = (op - 0x84) as usize;
-                    if self.stack.len() < n {
-                        return Err("the pickle's stack underflows at a tuple".to_string());
-                    }
-                    let items: Vec<PickleValue> =
-                        self.stack.drain(self.stack.len() - n..).collect();
-                    self.push_tuple(items)?;
-                }
-                // BINPERSID: torch's persistent id for a
-                // storage, a tuple of (the word
-                // "storage", the storage class, the
-                // archive key, the location, the element
-                // count). Only the key is used.
-                b'Q' => {
-                    let value = self.pop()?;
-                    let PickleValue::Tuple(parts) = &value else {
-                        return Err("a pickle persistent id is not a tuple".to_string());
-                    };
-                    let [
-                        PickleValue::Str(kind),
-                        PickleValue::Global(_, class),
-                        PickleValue::Str(key),
-                        ..,
-                    ] = parts.as_slice()
-                    else {
-                        return Err("a pickle persistent id does not name a storage".to_string());
-                    };
-                    if kind.as_str() != "storage" || !class.contains("Storage") {
-                        return Err(format!(
-                            "a pickle persistent id names {kind} {class}, not a storage"
-                        ));
-                    }
-                    self.push(PickleValue::Storage(key.clone()))?;
-                }
-                // REDUCE: call an allowlisted global.
-                b'R' => {
-                    let args = self.pop()?;
-                    let callable = self.pop()?;
-                    let PickleValue::Global(module, name) = callable else {
-                        return Err("a pickle REDUCE target is not a global".to_string());
-                    };
-                    let PickleValue::Tuple(args) = args else {
-                        return Err("a pickle REDUCE argument is not a tuple".to_string());
-                    };
-                    let value = reduce(&module, &name, args)?;
-                    self.push(value)?;
-                }
-                b'}' => self.push(PickleValue::Map(Vec::new()))?,
-                // SETITEM: value, then key, onto the map
-                // below them.
-                b's' => {
-                    let value = self.pop()?;
-                    let key = self.pop()?;
-                    let PickleValue::Str(key) = key else {
-                        return Err("a pickle dict key is not a string".to_string());
-                    };
-                    check_nesting(&value)?;
-                    let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
-                        return Err("a pickle SETITEM has no dict under it".to_string());
-                    };
-                    set_map_entry(pairs, key, value);
-                }
-                // SETITEMS: key/value pairs since the
-                // mark, onto the map below it.
-                b'u' => {
-                    let from = self.mark()?;
-                    let items: Vec<PickleValue> = self.stack.drain(from..).collect();
-                    if !items.len().is_multiple_of(2) {
-                        return Err("a pickle SETITEMS holds an odd item count".to_string());
-                    }
-                    for value in items.iter().skip(1).step_by(2) {
-                        check_nesting(value)?;
-                    }
-                    let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
-                        return Err("a pickle SETITEMS has no dict under it".to_string());
-                    };
-                    let mut iter = items.into_iter();
-                    while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
-                        let PickleValue::Str(key) = k else {
-                            return Err("a pickle dict key is not a string".to_string());
-                        };
-                        set_map_entry(pairs, key, v);
-                    }
-                }
-                // BUILD: the state (a metadata dict in
-                // torch saves) is validated as data and
-                // discarded; the built object stays.
-                b'b' => {
-                    let state = self.pop()?;
-                    if !matches!(state, PickleValue::Map(_) | PickleValue::None) {
-                        return Err("a pickle BUILD state is not a dict".to_string());
-                    }
-                    if self.stack.is_empty() {
-                        return Err("a pickle BUILD has no object under it".to_string());
-                    }
-                }
-                // BINPUT / LONG_BINPUT: memoize the
-                // stack top.
-                b'q' => {
-                    let at = self.byte().ok_or("the pickle ends inside BINPUT")? as usize;
-                    self.put_memo(at)?;
-                }
-                b'r' => {
-                    let at = self.u32()? as usize;
-                    self.put_memo(at)?;
-                }
-                // BINGET / LONG_BINGET.
-                b'h' => {
-                    let at = self.byte().ok_or("the pickle ends inside BINGET")? as usize;
-                    self.get_memo(at)?;
-                }
-                b'j' => {
-                    let at = self.u32()? as usize;
-                    self.get_memo(at)?;
-                }
-                b'.' => {
-                    if self.stack.len() != 1 {
-                        return Err(format!(
-                            "the pickle ends with {} values on the stack, not one",
-                            self.stack.len()
-                        ));
-                    }
-                    return Ok(self.stack.pop().unwrap());
-                }
-                _ => {
-                    return Err(format!(
-                        "unsupported pickle opcode 0x{op:02x}: not a head state dict shape this loader reads"
-                    ));
-                }
+                PROTO => self.proto()?,
+                STOP => return self.stop(),
+                BINUNICODE | SHORT_BINUNICODE | SHORT_BINSTRING => self.string(op)?,
+                BININT1 | BININT2 | BININT | LONG | LONG1 | LONG4 => self.integer(op)?,
+                BINFLOAT => self.float()?,
+                NONE => self.push(PickleValue::None)?,
+                NEWTRUE => self.push(PickleValue::Bool(true))?,
+                NEWFALSE => self.push(PickleValue::Bool(false))?,
+                MARK => self.marks.push(self.stack.len()),
+                EMPTY_TUPLE => self.push(PickleValue::Tuple(Vec::new()))?,
+                TUPLE | TUPLE1 | TUPLE2 | TUPLE3 => self.tuple(op)?,
+                EMPTY_DICT => self.push(PickleValue::Map(Vec::new()))?,
+                SETITEM => self.set_item()?,
+                SETITEMS => self.set_items()?,
+                BUILD => self.build()?,
+                BINPUT | LONG_BINPUT | BINGET | LONG_BINGET => self.memo(op)?,
+                GLOBAL => self.global()?,
+                REDUCE => self.call()?,
+                BINPERSID => self.persistent_id()?,
+                _ => return Err(unsupported(op)),
             }
         }
+    }
+
+    /// PROTO: the version byte is advisory; the opcode
+    /// allowlist in `run` is the real gate.
+    fn proto(&mut self) -> Result<(), String> {
+        self.byte().ok_or("the pickle ends inside PROTO")?;
+        Ok(())
+    }
+
+    /// STOP: the one value left on the stack is the
+    /// pickle's. CPython pops it like any other value, so
+    /// it refuses one below an open MARK.
+    fn stop(mut self) -> Result<PickleValue, String> {
+        self.fenced("STOP", 1)?;
+        if self.stack.len() != 1 {
+            return Err(format!(
+                "the pickle ends with {} values on the stack, not one",
+                self.stack.len()
+            ));
+        }
+        Ok(self.stack.pop().unwrap())
+    }
+
+    /// Strings: BINUNICODE and SHORT_BINUNICODE (UTF-8
+    /// behind a four-byte and a one-byte length) and
+    /// SHORT_BINSTRING (bytes behind a one-byte length,
+    /// read lossily). They are the state dict's keys and
+    /// the storage arguments.
+    fn string(&mut self, op: u8) -> Result<(), String> {
+        let len = match op {
+            BINUNICODE => self.u32()? as usize,
+            SHORT_BINUNICODE | SHORT_BINSTRING => {
+                self.byte().ok_or("the pickle ends inside a short string")? as usize
+            }
+            _ => return Err(unsupported(op)),
+        };
+        let raw = self.take(len)?;
+        let s = if op == SHORT_BINSTRING {
+            String::from_utf8_lossy(raw).into_owned()
+        } else {
+            String::from_utf8(raw.to_vec())
+                .map_err(|_| "a pickle string is not valid UTF-8".to_string())?
+        };
+        self.push(PickleValue::Str(s))
+    }
+
+    /// Integers: BININT1, BININT2 and BININT, LONG (a
+    /// decimal line), and LONG1 and LONG4 (little-endian
+    /// two's complement behind a one-byte and a four-byte
+    /// length).
+    fn integer(&mut self, op: u8) -> Result<(), String> {
+        let v = match op {
+            BININT1 => self.byte().ok_or("the pickle ends inside BININT1")? as i64,
+            BININT2 => self.u16()? as i64,
+            BININT => self.u32()? as i32 as i64,
+            LONG => {
+                let raw = self.line()?;
+                let digits = raw.strip_suffix('L').unwrap_or(&raw);
+                digits
+                    .parse::<i64>()
+                    .map_err(|_| format!("a pickle LONG is not a number: {raw:?}"))?
+            }
+            LONG1 => {
+                let len = self.byte().ok_or("the pickle ends inside LONG1")? as usize;
+                self.long(len)?
+            }
+            LONG4 => {
+                let len = self.u32()? as usize;
+                self.long(len)?
+            }
+            _ => return Err(unsupported(op)),
+        };
+        self.push(PickleValue::Int(v))
+    }
+
+    /// The body of a LONG1 or LONG4: `len` bytes of
+    /// little-endian two's complement, at most the eight
+    /// an `i64` holds.
+    fn long(&mut self, len: usize) -> Result<i64, String> {
+        if len > 8 {
+            return Err("a pickle long is too large for a head file".to_string());
+        }
+        let raw = self.take(len)?;
+        let mut v: i64 = 0;
+        for (i, b) in raw.iter().enumerate() {
+            v |= (*b as i64) << (8 * i);
+        }
+        if len > 0 && len < 8 && raw[len - 1] & 0x80 != 0 {
+            v -= 1i64 << (8 * len);
+        }
+        Ok(v)
+    }
+
+    /// BINFLOAT: a big-endian f64.
+    fn float(&mut self) -> Result<(), String> {
+        let raw = self.take(8)?;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(raw);
+        self.push(PickleValue::Float(f64::from_be_bytes(buf)))
+    }
+
+    /// TUPLE folds the values since the mark into a tuple,
+    /// TUPLE1 to TUPLE3 the top one to three. TUPLE closes
+    /// its MARK and takes only what stands above it; CPython
+    /// refuses TUPLE1 to TUPLE3 a value below an open MARK.
+    fn tuple(&mut self, op: u8) -> Result<(), String> {
+        let from = match op {
+            TUPLE => self.mark()?,
+            TUPLE1..=TUPLE3 => {
+                let n = usize::from(op - TUPLE1) + 1;
+                self.fenced(["TUPLE1", "TUPLE2", "TUPLE3"][n - 1], n)?;
+                self.stack
+                    .len()
+                    .checked_sub(n)
+                    .ok_or("the pickle's stack underflows at a tuple")?
+            }
+            _ => return Err(unsupported(op)),
+        };
+        let items: Vec<PickleValue> = self.stack.drain(from..).collect();
+        self.push_tuple(items)
+    }
+
+    /// SETITEM: value, then key, onto the map below them.
+    /// CPython refuses it unless all three stand above the
+    /// latest open MARK.
+    fn set_item(&mut self) -> Result<(), String> {
+        self.fenced("SETITEM", 3)?;
+        let value = self.pop()?;
+        let key = self.pop()?;
+        let PickleValue::Str(key) = key else {
+            return Err("a pickle dict key is not a string".to_string());
+        };
+        check_nesting(&value)?;
+        let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
+            return Err("a pickle SETITEM has no dict under it".to_string());
+        };
+        set_map_entry(pairs, key, value);
+        Ok(())
+    }
+
+    /// SETITEMS: key/value pairs since the mark, onto the
+    /// map below it. CPython reads the map below a MARK on
+    /// purpose: it sits under the MARK that SETITEMS
+    /// closes. It must still stand above the MARK open
+    /// before that one, or CPython refuses it.
+    fn set_items(&mut self) -> Result<(), String> {
+        let from = self.mark()?;
+        // The pairs since the MARK, and the map under them.
+        self.fenced("SETITEMS", self.stack.len() - from + 1)?;
+        let items: Vec<PickleValue> = self.stack.drain(from..).collect();
+        if !items.len().is_multiple_of(2) {
+            return Err("a pickle SETITEMS holds an odd item count".to_string());
+        }
+        for value in items.iter().skip(1).step_by(2) {
+            check_nesting(value)?;
+        }
+        let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
+            return Err("a pickle SETITEMS has no dict under it".to_string());
+        };
+        let mut iter = items.into_iter();
+        while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+            let PickleValue::Str(key) = k else {
+                return Err("a pickle dict key is not a string".to_string());
+            };
+            set_map_entry(pairs, key, v);
+        }
+        Ok(())
+    }
+
+    /// BUILD: the state (a metadata dict in torch saves)
+    /// is validated as data and discarded; the built
+    /// object stays. CPython refuses it unless both stand
+    /// above the latest open MARK.
+    fn build(&mut self) -> Result<(), String> {
+        self.fenced("BUILD", 2)?;
+        let state = self.pop()?;
+        if !matches!(state, PickleValue::Map(_) | PickleValue::None) {
+            return Err("a pickle BUILD state is not a dict".to_string());
+        }
+        if self.stack.is_empty() {
+            return Err("a pickle BUILD has no object under it".to_string());
+        }
+        Ok(())
+    }
+
+    /// The memo: BINPUT and LONG_BINPUT store the stack
+    /// top under a one-byte or a four-byte index, BINGET
+    /// and LONG_BINGET push what an index holds.
+    fn memo(&mut self, op: u8) -> Result<(), String> {
+        match op {
+            BINPUT => {
+                let at = self.byte().ok_or("the pickle ends inside BINPUT")? as usize;
+                self.put_memo("BINPUT", at)
+            }
+            LONG_BINPUT => {
+                let at = self.u32()? as usize;
+                self.put_memo("LONG_BINPUT", at)
+            }
+            BINGET => {
+                let at = self.byte().ok_or("the pickle ends inside BINGET")? as usize;
+                self.get_memo(at)
+            }
+            LONG_BINGET => {
+                let at = self.u32()? as usize;
+                self.get_memo(at)
+            }
+            _ => Err(unsupported(op)),
+        }
+    }
+
+    /// GLOBAL: 'c' module '\n' name '\n'.
+    fn global(&mut self) -> Result<(), String> {
+        let module = self.line()?;
+        let name = self.line()?;
+        self.push(PickleValue::Global(module, name))
+    }
+
+    /// REDUCE: call an allowlisted global (see `reduce`)
+    /// with an argument tuple. CPython pops both, so it
+    /// refuses either below an open MARK.
+    fn call(&mut self) -> Result<(), String> {
+        self.fenced("REDUCE", 2)?;
+        let args = self.pop()?;
+        let callable = self.pop()?;
+        let PickleValue::Global(module, name) = callable else {
+            return Err("a pickle REDUCE target is not a global".to_string());
+        };
+        let PickleValue::Tuple(args) = args else {
+            return Err("a pickle REDUCE argument is not a tuple".to_string());
+        };
+        let value = reduce(&module, &name, args)?;
+        self.push(value)
+    }
+
+    /// BINPERSID: torch's persistent id for a storage, a
+    /// tuple of (the word "storage", the storage class,
+    /// the archive key, the location, the element count).
+    /// Only the key is used. CPython pops the id, so it
+    /// refuses one below an open MARK.
+    fn persistent_id(&mut self) -> Result<(), String> {
+        self.fenced("BINPERSID", 1)?;
+        let value = self.pop()?;
+        let PickleValue::Tuple(parts) = &value else {
+            return Err("a pickle persistent id is not a tuple".to_string());
+        };
+        let [
+            PickleValue::Str(kind),
+            PickleValue::Global(_, class),
+            PickleValue::Str(key),
+            ..,
+        ] = parts.as_slice()
+        else {
+            return Err("a pickle persistent id does not name a storage".to_string());
+        };
+        if kind.as_str() != "storage" || !class.contains("Storage") {
+            return Err(format!(
+                "a pickle persistent id names {kind} {class}, not a storage"
+            ));
+        }
+        self.push(PickleValue::Storage(key.clone()))
     }
 
     fn byte(&mut self) -> Option<u8> {
@@ -349,10 +457,29 @@ impl<'a> PickleMachine<'a> {
             .ok_or_else(|| "the pickle's stack underflows".to_string())
     }
 
+    /// Close the latest open MARK, for TUPLE and SETITEMS:
+    /// the stack length it recorded. No opcode since has
+    /// popped below it, so it is within the stack.
     fn mark(&mut self) -> Result<usize, String> {
         self.marks
             .pop()
             .ok_or_else(|| "the pickle has a tuple or items opcode with no mark".to_string())
+    }
+
+    /// Refuse `name`, an opcode about to pop or read the
+    /// top `n` values of the stack, when one of them stands
+    /// below the latest open MARK, as CPython refuses it
+    /// ("unexpected MARK found"). Each opcode checks before
+    /// it takes or looks at a value, as in CPython. A MARK
+    /// at the bottom of the stack fences nothing: there, a
+    /// stack shorter than `n` is the opcode's own
+    /// underflow, which it reports in its own words.
+    fn fenced(&self, name: &str, n: usize) -> Result<(), String> {
+        let fence = self.marks.last().copied().unwrap_or(0);
+        if fence > 0 && self.stack.len() < fence + n {
+            return Err(fence_error(name));
+        }
+        Ok(())
     }
 
     /// Push a value built from the file's bytes. It
@@ -376,9 +503,13 @@ impl<'a> PickleMachine<'a> {
         Ok(())
     }
 
-    /// A memo copy counts at the size of the tree it
-    /// copies, before the copy is made.
-    fn put_memo(&mut self, at: usize) -> Result<(), String> {
+    /// Store the stack top in the memo, for `name`. A memo
+    /// copy counts at the size of the tree it copies, before
+    /// the copy is made. CPython refuses to store a top that
+    /// stands below an open MARK; it checks once it has read
+    /// the index, as this does.
+    fn put_memo(&mut self, name: &str, at: usize) -> Result<(), String> {
+        self.fenced(name, 1)?;
         if at > 4096 {
             return Err("a pickle memo index is implausibly large".to_string());
         }
@@ -456,6 +587,18 @@ fn nesting_error() -> String {
     format!(
         "the pickle nests tuples or dicts more than {MAX_DEPTH} levels deep: a head state dict nests a few"
     )
+}
+
+/// The refusal of an opcode that would pop or read a
+/// value from below an open MARK (see
+/// `PickleMachine::fenced`).
+fn fence_error(name: &str) -> String {
+    format!("a pickle {name} uses a value from below an open MARK")
+}
+
+/// The refusal of a byte outside the opcode allowlist.
+fn unsupported(op: u8) -> String {
+    format!("unsupported pickle opcode 0x{op:02x}: not a head state dict shape this loader reads")
 }
 
 /// The REDUCE allowlist: build an ordered dict, or
@@ -538,3 +681,9 @@ pub(super) fn unpickle(bytes: &[u8]) -> Result<PickleValue, String> {
 
 #[cfg(test)]
 mod tests;
+
+// The opcode handlers, pinned against a frozen copy of the
+// single loop they replaced (issue #741), apart from the
+// two changes issue #760 made after it.
+#[cfg(test)]
+mod handler_proofs;

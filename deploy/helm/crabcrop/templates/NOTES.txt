@@ -36,8 +36,8 @@ remove it from env, ai.env or extraEnv (an entry there wins):
 Move AWS_ACCESS_KEY_ID and CRABCROP_GCS_ACCESS_KEY with their
 secret keys. An extraEnv entry with valueFrom.secretKeyRef
 works too.
-This release only warns. A later release will refuse them;
-set refusePlainSecrets=true to refuse them now.
+They render because refusePlainSecrets is false; at its
+default, true, the render fails instead.
 {{- end }}
 {{- if and .Values.ai.enabled (not .Values.ai.models.existingClaim) }}
 

@@ -17,7 +17,8 @@
 //! - `file://...`, local files under a configured root. A path
 //!   with a `..` segment is refused before the filesystem is
 //!   touched, and the rest are canonicalized per request so a
-//!   symlink cannot lead out of the root either.
+//!   symlink cannot lead out of the root either. Only a regular
+//!   file is read: the open cannot wait on a FIFO (issue #708).
 //!
 //! Bucket sources are gated by a bucket allowlist rather than the
 //! host policy: the endpoint is operator configuration, not
@@ -57,6 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, Url, header, redirect};
 
+use crate::credentials::AwsCredentials;
 use crate::sigv4::{self, Credentials};
 
 /// Default cap on response bodies: 10 MiB, the default of
@@ -592,13 +594,18 @@ impl Drop for BodyCharge<'_> {
 pub struct SourcePolicy {
     /// Host suffixes an URL's host must match (exactly, or as a
     /// subdomain). Empty means no allowlist. A listed host is
-    /// exempt from the private-address check: the allowlist is
-    /// how an operator vouches for a loopback or internal
-    /// source.
+    /// exempt from the private-address check, unless
+    /// `check_allowlisted` is set: the allowlist is how an
+    /// operator vouches for a loopback or internal source.
     pub allowed_suffixes: Vec<String>,
     /// Refuse hosts resolving to non-public addresses, except
     /// allowlisted hosts.
     pub block_private: bool,
+    /// Apply the private-address check, and the pinning that
+    /// comes with it, to allowlisted hosts too
+    /// (`CRABCROP_CHECK_ALLOWED_SOURCES`): the allowlist then
+    /// only narrows what may be fetched.
+    pub check_allowlisted: bool,
 }
 
 impl SourcePolicy {
@@ -613,19 +620,35 @@ impl SourcePolicy {
         Self {
             allowed_suffixes,
             block_private,
+            check_allowlisted: false,
         }
+    }
+
+    /// This policy with the private-address check applied to
+    /// allowlisted hosts too, or not (the default).
+    pub fn with_allowlisted_checked(mut self, check: bool) -> Self {
+        self.check_allowlisted = check;
+        self
+    }
+
+    /// Whether the private-address check, and the pinning
+    /// that comes with it, applies to a host that is or is not
+    /// `allowlisted`.
+    pub fn checks(&self, allowlisted: bool) -> bool {
+        self.block_private && (!allowlisted || self.check_allowlisted)
     }
 
     /// Whether fetches under this policy pin hostnames to
     /// their validated addresses (see `check_policy`): the
-    /// private-address check is on and no allowlist is set.
-    /// With an allowlist, every host the loader fetches is
-    /// listed, and listed hosts skip the check and the pin.
-    /// A pinned fetch connects directly, never through a
-    /// proxy the environment configures, which boot warns
-    /// about (issue #471).
+    /// private-address check is on, and either no allowlist
+    /// is set or it applies to listed hosts too. With an
+    /// allowlist and the exemption, every host the loader
+    /// fetches is listed, and listed hosts skip the check and
+    /// the pin. A pinned fetch connects directly, never
+    /// through a proxy the environment configures, which boot
+    /// warns about (issue #471).
     pub fn pins_hostnames(&self) -> bool {
-        self.block_private && self.allowed_suffixes.is_empty()
+        self.block_private && (self.allowed_suffixes.is_empty() || self.check_allowlisted)
     }
 }
 
@@ -680,6 +703,11 @@ pub struct Loader {
     /// [`HostLookups`]); shared by loader clones and by the
     /// HTTP clients' resolver.
     lookups: HostLookups,
+    /// Tests only: the private-address check takes loopback
+    /// addresses for public ones (see
+    /// [`Loader::with_loopback_public`]).
+    #[cfg(test)]
+    loopback_public: bool,
 }
 
 /// How many source host lookups run at once, per loader. A
@@ -1129,8 +1157,12 @@ pub struct SourceConfig {
     pub s3_endpoint: Option<String>,
     /// AWS region for endpoint derivation and signing.
     pub s3_region: String,
-    /// Ambient AWS credentials, when configured.
-    pub aws_creds: Option<Credentials>,
+    /// The AWS signing credentials, when configured: the
+    /// static keys from the environment, or the container
+    /// credentials endpoint's, refreshed (issue #709). The
+    /// upload and shared result stores sign with the same
+    /// source.
+    pub aws_creds: Option<AwsCredentials>,
     /// Base URL of the GCS XML API (or a fake, in tests).
     pub gcs_endpoint: String,
     /// Credential scope region for GCS signing.
@@ -1237,6 +1269,8 @@ impl Loader {
             source_budget: SourceBudget::unlimited(),
             read_ahead_pool: read_ahead_pool(tokio::sync::Semaphore::MAX_PERMITS, max_bytes),
             lookups,
+            #[cfg(test)]
+            loopback_public: false,
         })
     }
 
@@ -1268,6 +1302,18 @@ impl Loader {
         self.lookups = HostLookups::new(std::sync::Arc::new(lookup), slots, per_origin, wait);
         self.client = source_client(self.timeout, &self.lookups).expect("source client");
         self.pinned_clients.lock().unwrap().clear();
+        self
+    }
+
+    /// Take loopback addresses for public ones in the
+    /// private-address check, so a test can fetch, through the
+    /// pin the check returns, from a listener on this machine:
+    /// a name the stand-in resolver (see
+    /// [`Loader::with_host_lookup`]) maps to loopback passes the
+    /// check and is pinned to that address.
+    #[cfg(test)]
+    pub(crate) fn with_loopback_public(mut self) -> Self {
+        self.loopback_public = true;
         self
     }
 
@@ -1703,13 +1749,16 @@ impl Loader {
                 };
                 (
                     url,
-                    self.sources.aws_creds.as_ref(),
+                    self.sources
+                        .aws_creds
+                        .as_ref()
+                        .and_then(AwsCredentials::current),
                     self.sources.s3_region.as_str(),
                 )
             }
             StoreKind::Gcs => (
                 format!("{}/{bucket}/{encoded_key}", self.sources.gcs_endpoint),
-                self.sources.gcs_creds.as_ref(),
+                self.sources.gcs_creds.clone().map(std::sync::Arc::new),
                 self.sources.gcs_region.as_str(),
             ),
         };
@@ -1735,7 +1784,7 @@ impl Loader {
                 sign_headers.push(("x-amz-security-token", token.as_str()));
             }
             let authorization = sigv4::authorization(
-                creds,
+                &creds,
                 &sigv4::SignRequest {
                     method: "GET",
                     path: url.path(),
@@ -1773,7 +1822,27 @@ impl Loader {
     /// directory, or nothing there would tell the caller what
     /// exists outside it (issue #325). Only opening and reading
     /// a canonical path inside the root keep their own failure.
+    ///
+    /// The checks resolve the path; on Unix the file is then
+    /// opened from the root one component at a time, following
+    /// no symlink (see [`open_inside`]), so a directory on the
+    /// path that is replaced by a symlink after the checks cannot
+    /// take the open out of the root. Such a component answers
+    /// the same `NotFound`.
     async fn load_file(&self, url: &str, mode: BodyMode<'_>) -> Result<LoadBody, LoadError> {
+        self.load_file_checked(url, mode, || {}).await
+    }
+
+    /// [`Loader::load_file`], running `after_check` once the
+    /// containment checks have passed and before the file is
+    /// opened: the moment a change to the tree would have to
+    /// land to redirect the open.
+    async fn load_file_checked(
+        &self,
+        url: &str,
+        mode: BodyMode<'_>,
+        after_check: impl FnOnce(),
+    ) -> Result<LoadBody, LoadError> {
         use tokio::io::AsyncReadExt;
         let Some(root) = &self.sources.file_root else {
             return Err(LoadError::Forbidden(
@@ -1824,14 +1893,24 @@ impl Loader {
         {
             return Err(LoadError::NotFound);
         }
-        let mut file = tokio::fs::File::open(&canonical)
+        after_check();
+        // Opened the way the disk tier opens its entries (issue
+        // #708), on a blocking thread: a plain open of a FIFO
+        // waits in open(2) for a writer that may never come, so
+        // the open does not wait, and what it opened must be a
+        // regular file. Anything else at a path inside the root
+        // (a FIFO, a socket, a device, a directory) is the
+        // read failure a directory always answered.
+        let root = root.clone();
+        let (file, meta) = tokio::task::spawn_blocking(move || open_inside(&root, &canonical))
             .await
-            .map_err(map_file_error)?;
+            .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))??;
+        let mut file = tokio::fs::File::from_std(file);
         if matches!(mode, BodyMode::Probe(_)) {
             // A probe of a file needs only its head; the
             // total is the file's own size. The size cap
             // keeps the full load's too-large answer.
-            let total = file.metadata().await.map_err(map_file_error)?.len();
+            let total = meta.len();
             if total > self.max_bytes {
                 return Err(LoadError::TooLarge {
                     limit: self.max_bytes,
@@ -1858,7 +1937,7 @@ impl Loader {
         // under the read charges the rest as it arrives.
         let mut part = match mode {
             BodyMode::Full(Some(charged)) => {
-                let total = file.metadata().await.map_err(map_file_error)?.len();
+                let total = meta.len();
                 if total > self.max_bytes {
                     return Err(LoadError::TooLarge {
                         limit: self.max_bytes,
@@ -1969,15 +2048,16 @@ impl Loader {
         // loopback or internal source, so the private-address
         // check (and the connection pinning that comes with
         // it) applies to every host the operator has not
-        // listed.
-        if self.policy.block_private && !allowlisted {
+        // listed, and to listed hosts too only when the
+        // operator asks for it.
+        if self.policy.checks(allowlisted) {
             // IPv6 literals arrive bracketed from the URL parser.
             let bare = host.trim_start_matches('[').trim_end_matches(']');
             if let Ok(ip) = bare.parse::<IpAddr>() {
                 // A literal is judged from the URL text alone,
                 // which tells the caller nothing it did not
                 // send: a policy refusal.
-                if is_non_public(&ip) {
+                if self.refuses(&ip) {
                     return Err(LoadError::Forbidden(format!(
                         "host {host} is a non-public address"
                     )));
@@ -1985,7 +2065,7 @@ impl Loader {
                 return Ok(None);
             }
             let ips = self.lookups.resolve(host, origin).await?;
-            if let Some(ip) = ips.iter().find(|ip| is_non_public(ip)) {
+            if let Some(ip) = ips.iter().find(|ip| self.refuses(ip)) {
                 // The same failure as a name that does not
                 // resolve (see `LoadError::Network`); the
                 // address goes to the server log only.
@@ -2012,6 +2092,18 @@ impl Loader {
             }));
         }
         Ok(None)
+    }
+
+    /// Whether the private-address check refuses `ip`: whether
+    /// it is non-public (see [`is_non_public`]). Only a test
+    /// build can have the check take loopback for public (see
+    /// `Loader::with_loopback_public`).
+    fn refuses(&self, ip: &IpAddr) -> bool {
+        #[cfg(test)]
+        if self.loopback_public && ip.is_loopback() {
+            return false;
+        }
+        is_non_public(ip)
     }
 }
 
@@ -2194,16 +2286,13 @@ fn is_valid_bucket_name(bucket: &str) -> bool {
     }
     // Not an IPv4 address spelling: four numeric labels.
     let labels: Vec<&str> = bucket.split('.').collect();
-    if labels.len() == 4
+    let ipv4_spelling = labels.len() == 4
         && labels.iter().all(|label| {
             !label.is_empty()
                 && label.bytes().all(|b| b.is_ascii_digit())
                 && label.parse::<u32>().is_ok_and(|n| n <= 255)
-        })
-    {
-        return false;
-    }
-    true
+        });
+    !ipv4_spelling
 }
 
 /// Decode `%XX` escapes in a URL path. A literal `+` stays a
@@ -2253,6 +2342,85 @@ fn map_file_error(e: std::io::Error) -> LoadError {
         LoadError::NotFound
     } else {
         LoadError::Network(format!("cannot read file source: {e}"))
+    }
+}
+
+/// Open the `file://` source at `canonical`, the canonical
+/// path [`Loader::load_file`] resolved under the file root
+/// `root`: relative to the root's descriptor, one component at
+/// a time, as an upload writes (see `write_inside` in
+/// `upload.rs`). Each directory opens only if it is still a
+/// directory and not a symlink (`O_DIRECTORY | O_NOFOLLOW`),
+/// and the file opens as [`crate::storage::open_regular_at`]
+/// opens one: without waiting for a FIFO's writer or following
+/// a symlink, and only if it is a regular file. The checks
+/// found no symlink on the canonical path, so a component that
+/// is missing now, no longer a directory, or a symlink was
+/// changed after them: it is refused with the one
+/// [`LoadError::NotFound`] (issue #325), and nothing past it
+/// is opened. Any other failure keeps the read failure that
+/// [`map_file_error`] gives.
+///
+/// Where the system has `O_PATH`, as Linux does, the
+/// directories open with it, which asks of each the search
+/// permission the lookup by path asked and nothing more.
+/// Elsewhere they open for reading, which a directory that
+/// can be searched but not read refuses.
+#[cfg(unix)]
+fn open_inside(
+    root: &std::path::Path,
+    canonical: &std::path::Path,
+) -> Result<(std::fs::File, std::fs::Metadata), LoadError> {
+    use rustix::fs::{Mode, OFlags};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let directory = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let beneath = canonical
+        .strip_prefix(root)
+        .map_err(|_| LoadError::NotFound)?;
+    let mut components = beneath.components();
+    let Some(file) = components.next_back() else {
+        // The root itself: a directory, which the regular-file
+        // check refuses with the read failure.
+        return crate::storage::open_regular(root).map_err(map_file_error);
+    };
+    let mut at = rustix::fs::open(root, directory, Mode::empty()).map_err(refused)?;
+    for component in components {
+        at = rustix::fs::openat(&at, component.as_os_str(), directory, Mode::empty())
+            .map_err(refused)?;
+    }
+    crate::storage::open_regular_at(&at, file.as_os_str()).map_err(|e| {
+        match rustix::io::Errno::from_io_error(&e) {
+            Some(errno) => refused(errno),
+            None => map_file_error(e),
+        }
+    })
+}
+
+/// Elsewhere the file opens by its canonical path, which a
+/// directory replaced after the checks can still redirect. The
+/// releases build only for Linux and macOS (see
+/// `dist-workspace.toml`), where the Unix `open_inside` opens it
+/// a component at a time.
+#[cfg(not(unix))]
+fn open_inside(
+    _root: &std::path::Path,
+    canonical: &std::path::Path,
+) -> Result<(std::fs::File, std::fs::Metadata), LoadError> {
+    crate::storage::open_regular(canonical).map_err(map_file_error)
+}
+
+/// The answer for a component of a `file://` path that did not
+/// open (see [`open_inside`]): one that is missing, not a
+/// directory, or a symlink answers as a missing file, and any
+/// other failure is the read failure.
+#[cfg(unix)]
+fn refused(e: rustix::io::Errno) -> LoadError {
+    use rustix::io::Errno;
+    match e {
+        Errno::NOENT | Errno::NOTDIR | Errno::LOOP => LoadError::NotFound,
+        e => map_file_error(e.into()),
     }
 }
 
@@ -2387,6 +2555,74 @@ mod tests {
         assert_eq!(loader.pinned_clients.lock().unwrap().len(), 1);
         loader.pinned_client(&pin(9102)).unwrap();
         assert_eq!(loader.pinned_clients.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_name_is_fetched_through_the_pin_the_policy_check_returned() {
+        // The tests above build their pin by hand. Here the
+        // private-address check makes it: the stand-in resolver
+        // maps the name to the loopback address a local listener
+        // answers on, which this loader takes for a public one,
+        // and answers any later lookup of the name with a
+        // documentation address nothing answers on. The fetch
+        // must reach the listener, with the name in its Host
+        // header, on the client pinned to the address the check
+        // validated, and never look the name up again: a fetch
+        // that did would go to the other address and fail.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heard = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            socket.write_all(&ok_image_response()).await.unwrap();
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let lookups = std::sync::Arc::clone(&asked);
+        // The private-address check on, as a server has it by
+        // default: the loader's own default policy checks nothing.
+        let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(5))
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec![], true))
+            .with_host_lookup(
+                move |host| {
+                    let mut lookups = lookups.lock().unwrap();
+                    lookups.push(host.to_string());
+                    Ok(vec![if lookups.len() == 1 {
+                        IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    } else {
+                        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
+                    }])
+                },
+                4,
+                Duration::from_secs(1),
+            )
+            .with_loopback_public();
+        let body = loader
+            .load(&format!("http://pinned.test:{port}/img.jpg"))
+            .await;
+        assert_eq!(body, Ok(b"\xff\xd8\xff\xd9".to_vec()));
+        let head = heard.await.unwrap();
+        let host = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("host")
+                .then(|| value.trim().to_string())
+        });
+        assert_eq!(host, Some(format!("pinned.test:{port}")), "{head}");
+        assert_eq!(*asked.lock().unwrap(), ["pinned.test"]);
+        let pin = (
+            "pinned.test".to_string(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        );
+        assert!(loader.pinned_clients.lock().unwrap().contains_key(&pin));
     }
 
     #[test]
@@ -3103,7 +3339,7 @@ mod tests {
         let (base, captured) = spawn_capturing_server().await;
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             allowed_buckets: vec!["photos".to_string()],
             ..Default::default()
         });
@@ -3196,7 +3432,7 @@ mod tests {
         // check, before any request is signed (audit R2-05).
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             allowed_buckets: vec!["photos".to_string()],
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             gcs_creds: Some(test_creds()),
             ..Default::default()
         });
@@ -3470,6 +3706,206 @@ mod tests {
         for url in ["file:///sub", "file:///sub/", "file:///"] {
             let err = loader.load(url).await.unwrap_err();
             assert!(matches!(err, LoadError::Network(_)), "{url}: {err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Make a FIFO at `path`.
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {}: {status}", path.display());
+    }
+
+    /// Await `load`, failing the test if it has not answered
+    /// within 3 seconds, before the test loader's 5 second
+    /// timeout (issue #708). A load stuck opening the FIFO at
+    /// `fifo` for reading waits for a writer, and its blocking
+    /// thread stays stuck past any timeout, so one is then let
+    /// in, until the load ends, and the test fails naming the
+    /// wait instead of hanging, the runtime's drop included.
+    #[cfg(unix)]
+    async fn answers_promptly<T>(fifo: &std::path::Path, load: impl Future<Output = T>) -> T {
+        let mut load = std::pin::pin!(load);
+        if let Ok(answer) = tokio::time::timeout(Duration::from_secs(3), &mut load).await {
+            return answer;
+        }
+        let fifo = fifo.to_path_buf();
+        let release = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                // With a reader waiting in open(2), this opens and
+                // lets it go; closing it is the end of file the
+                // reader then sees. With none it fails at once.
+                use rustix::fs::{Mode, OFlags};
+                drop(rustix::fs::open(
+                    &fifo,
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let _ = load.await;
+        let _ = release.join();
+        panic!("a file source load waited for a writer on a FIFO");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_under_the_root_answers_at_once_as_a_file_that_cannot_be_read() {
+        // Issue #708: a file source was opened with a plain open,
+        // which waits in open(2) until a FIFO has a writer, so a
+        // FIFO under the root held its request, and a thread of
+        // the blocking pool, until one came. The open does not
+        // wait now, and what it opened must be a regular file:
+        // anything else answers at once with the read failure a
+        // directory under the root gets, through a symlink inside
+        // the root too.
+        let (base, root) = make_file_tree();
+        make_fifo(&root.join("pipe.jpg"));
+        std::os::unix::fs::symlink(root.join("pipe.jpg"), root.join("piped.jpg")).unwrap();
+        let fifo = root.join("pipe.jpg");
+        let loader = file_loader(&root, 1024);
+        for url in ["file:///pipe.jpg", "file:///piped.jpg"] {
+            let full = answers_promptly(&fifo, loader.load(url)).await;
+            assert!(
+                matches!(full, Err(LoadError::Network(_))),
+                "{url}: {full:?}"
+            );
+            let probe = answers_promptly(
+                &fifo,
+                loader.load_probe(url, MediaAdmission::default(), &|_: &[u8]| true),
+            )
+            .await;
+            assert!(
+                matches!(probe, Err(LoadError::Network(_))),
+                "probe {url}: {probe:?}"
+            );
+        }
+        let dir = loader.load("file:///sub").await;
+        assert!(matches!(dir, Err(LoadError::Network(_))), "{dir:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_that_resolves_inside_the_root_still_loads() {
+        // Issue #708: the open refuses to follow a symlink, but it
+        // opens the canonical path, which names none, so a link
+        // that resolves inside the root still reads its target,
+        // whether it names the file or a directory on the way.
+        let (base, root) = make_file_tree();
+        std::os::unix::fs::symlink(root.join("pic.jpg"), root.join("alias.jpg")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("subdir")).unwrap();
+        std::os::unix::fs::symlink("pic.jpg", root.join("relative.jpg")).unwrap();
+        let loader = file_loader(&root, 1024);
+        for (url, body) in [
+            ("file:///alias.jpg", &b"rootpic"[..]),
+            ("file:///relative.jpg", b"rootpic"),
+            ("file:///subdir/inner.jpg", b"inner"),
+        ] {
+            assert_eq!(loader.load(url).await.unwrap(), body, "{url}");
+            let probe = loader
+                .load_probe(url, MediaAdmission::default(), &|_: &[u8]| true)
+                .await
+                .unwrap();
+            assert_eq!(probe.head, body, "probe {url}");
+            assert_eq!(probe.total_bytes, Some(body.len() as u64), "probe {url}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What a load answered, as text a failed assertion can show.
+    #[cfg(unix)]
+    fn answered(answer: &Result<LoadBody, LoadError>) -> String {
+        match answer {
+            Ok(LoadBody::Full(body)) => format!("read {:?}", String::from_utf8_lossy(body)),
+            Ok(LoadBody::Probe(probe)) => {
+                format!("probed {:?}", String::from_utf8_lossy(&probe.head))
+            }
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_component_swapped_for_a_symlink_after_the_checks_is_not_followed() {
+        // The checks resolve the path inside the root. Before the
+        // open, a directory on it is moved away and a symlink to
+        // a directory outside the root, holding a file of the
+        // same name, takes its place. Opened by its canonical
+        // path, the file outside was read. The open walks the
+        // path from the root without following a symlink now, so
+        // the load answers as a missing file, as a path that
+        // leads out of the root does (issue #325), and reads
+        // nothing outside it. The same for a directory deeper on
+        // the path, and for the file itself swapped for a symlink
+        // to a file outside, in a full load and a probe.
+        let (base, root) = make_file_tree();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("deeper")).unwrap();
+        std::fs::write(outside.join("inner.jpg"), b"outside").unwrap();
+        std::fs::write(outside.join("deeper/inner.jpg"), b"outside").unwrap();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("sub/deeper/inner.jpg"), b"deeper").unwrap();
+        let loader = file_loader(&root, 1024);
+        let settled = |_: &[u8]| true;
+        // The URL, the path under the root swapped, and the
+        // symlink's target outside the root.
+        let swaps = [
+            ("file:///sub/inner.jpg", "sub", outside.clone()),
+            ("file:///sub/deeper/inner.jpg", "sub", outside.clone()),
+            (
+                "file:///sub/deeper/inner.jpg",
+                "sub/deeper",
+                outside.join("deeper"),
+            ),
+            (
+                "file:///sub/inner.jpg",
+                "sub/inner.jpg",
+                outside.join("inner.jpg"),
+            ),
+        ];
+        for (url, swapped, target) in &swaps {
+            for full in [true, false] {
+                let at = root.join(swapped);
+                let moved = base.join("moved-away");
+                let swap = || {
+                    std::fs::rename(&at, &moved).unwrap();
+                    std::os::unix::fs::symlink(target, &at).unwrap();
+                };
+                let mode = if full {
+                    BodyMode::Full(None)
+                } else {
+                    BodyMode::Probe(&settled)
+                };
+                let answer = loader.load_file_checked(url, mode, swap).await;
+                assert!(
+                    matches!(answer, Err(LoadError::NotFound)),
+                    "{url} with {swapped} swapped (full load: {full}): {}",
+                    answered(&answer)
+                );
+                std::fs::remove_file(&at).unwrap();
+                std::fs::rename(&moved, &at).unwrap();
+            }
+        }
+        // With nothing swapped, the same loads read the files
+        // inside the root.
+        for (url, body) in [
+            ("file:///sub/inner.jpg", &b"inner"[..]),
+            ("file:///sub/deeper/inner.jpg", b"deeper"),
+        ] {
+            let answer = loader
+                .load_file_checked(url, BodyMode::Full(None), || {})
+                .await;
+            assert!(
+                matches!(&answer, Ok(LoadBody::Full(read)) if read == body),
+                "{url}: {}",
+                answered(&answer)
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4191,6 +4627,67 @@ mod tests {
         assert_eq!(looked_up.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn allowlisted_hosts_can_be_held_to_the_private_address_check() {
+        // With the exemption (the default), a listed name that
+        // resolves inward passes the check unpinned. With the
+        // check kept for listed hosts, it fails like any other
+        // inward name, a listed inward literal is refused, and
+        // a listed public name is pinned to its checked address.
+        let listed = || {
+            SourcePolicy::new(
+                vec![
+                    "internal.test".to_string(),
+                    "mixed.test".to_string(),
+                    "10.0.0.8".to_string(),
+                    "public.test".to_string(),
+                ],
+                true,
+            )
+        };
+        let lookup = |host: &str| match host {
+            "public.test" => Ok(vec!["93.184.216.34".parse().unwrap()]),
+            other => inward_lookup(other),
+        };
+        let exempt = Loader::with_defaults()
+            .unwrap()
+            .with_policy(listed())
+            .with_host_lookup(lookup, LOOKUP_SLOTS, LOOKUP_WAIT);
+        let checked = Loader::with_defaults()
+            .unwrap()
+            .with_policy(listed().with_allowlisted_checked(true))
+            .with_host_lookup(lookup, LOOKUP_SLOTS, LOOKUP_WAIT);
+        for host in ["internal.test", "mixed.test", "10.0.0.8", "public.test"] {
+            let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
+            assert!(
+                matches!(exempt.check_policy(&url, host).await, Ok(None)),
+                "{host}"
+            );
+        }
+        for host in ["internal.test", "mixed.test"] {
+            let url = Url::parse(&format!("http://{host}/x.png")).unwrap();
+            let err = checked.check_policy(&url, host).await.unwrap_err();
+            assert!(matches!(err, LoadError::Network(_)), "{host}: {err:?}");
+        }
+        let url = Url::parse("http://10.0.0.8/x.png").unwrap();
+        let err = checked.check_policy(&url, "10.0.0.8").await.unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+        let url = Url::parse("http://public.test/x.png").unwrap();
+        let pinned = checked
+            .check_policy(&url, "public.test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.addr, "93.184.216.34:80".parse().unwrap());
+        // The allowlist still decides what may be fetched.
+        let url = Url::parse("http://elsewhere.test/x.png").unwrap();
+        let err = checked
+            .check_policy(&url, "elsewhere.test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+    }
+
     #[test]
     fn bucket_keys_and_percent_decoding_parse() {
         assert_eq!(
@@ -4253,7 +4750,7 @@ mod tests {
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
             allowed_buckets: vec!["*".to_string()],
-            aws_creds: Some(test_creds()),
+            aws_creds: Some(test_creds().into()),
             ..Default::default()
         });
         for url in [

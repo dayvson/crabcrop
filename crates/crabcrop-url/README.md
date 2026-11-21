@@ -2,7 +2,7 @@
 
 Build, sign, seal, and verify [crabcrop](https://github.com/dayvson/crabcrop) URLs from Rust.
 
-crabcrop is an on-demand image optimization service: a URL names an image and the operations to apply to it, and a signature (or a sealed token) proves the URL was minted by someone holding the secret. This crate is the client half of that scheme, and it is the same code the server verifies with, so client and server cannot drift. The scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md), and the crate runs the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json) as part of its test suite.
+crabcrop is an on-demand image optimization service: a URL names an image and the operations to apply to it, and a signature (or a sealed token) proves the URL was minted by someone holding the secret. This crate is the client half of that scheme, and it is the same code the server verifies with, so client and server cannot drift. The scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md), and the crate runs the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json) as part of its test suite, from a copy it ships, so `cargo test` passes on the published package too.
 
 The same scheme is implemented for other languages, byte for byte against the same test vectors: [`@crabcrop/url`](https://www.npmjs.com/package/@crabcrop/url) for TypeScript and [`crabcrop-url`](https://pypi.org/project/crabcrop-url/) for Python.
 
@@ -46,7 +46,7 @@ use crabcrop_url::build_url_with_key_id;
 
 let url = build_url_with_key_id(
     "https://images.example.com",
-    Some((b"your-new-secret", "k2026")),
+    (b"your-new-secret", "k2026"),
     "300x200",
     "https://example.com/photo.jpg",
     None,
@@ -86,21 +86,20 @@ https://images.example.com/s1.<token>/hero.jpg
 The trailing name is cosmetic: the server never parses or authenticates it, and it is excluded from the token and the cache key, so the sealed and plain forms of one render are one cache entry and one purge target.
 
 ```rust
-use crabcrop_url::build_sealed_url;
+use crabcrop_url::SealedUrl;
 
-let url = build_sealed_url(
+let url = SealedUrl::new(
     "https://images.example.com",
-    Some(b"your-secret"),
     "crop:1200x630:smart/filters:format(webp)",
     "https://origin.internal/photo.jpg",
-    Some(1893456000),
-    Some("hero.jpg"),
-    None,
 )
+.expires(1893456000)
+.name("hero.jpg")
+.build(b"your-secret")
 .unwrap();
 ```
 
-Tokens are AES-256-GCM under a subkey derived from the secret (see below), with a fresh random nonce per mint. Key IDs work for sealed URLs exactly as for signed ones: pass `Some("k2026")` as the last argument and the segment becomes `k2026:s1.<token>`. There is no `unsafe` spelling of a token; sealing without a secret is an error.
+`SealedUrl::new` takes the base, the operations, and the source; `expires`, `name`, and `key_id` add the parts a URL may have, and `build` seals under the secret. Tokens are AES-256-GCM under a subkey derived from the secret (see below), with a fresh random nonce per mint. Key IDs work for sealed URLs exactly as for signed ones: `.key_id("k2026")` makes the segment `k2026:s1.<token>`. There is no `unsafe` spelling of a token: `build` takes the secret itself, not an option. The positional `build_sealed_url` of earlier releases still works and is deprecated.
 
 The primitives are public for servers and tests that open tokens directly:
 
@@ -130,18 +129,30 @@ assert!(verify(b"your-secret", &signature, "300x200/https://example.com/photo.jp
 
 `sign`, and every builder, refuses a remainder that begins with the reserved segment `crabcrop` (`is_reserved_remainder`) with `BuildError::ReservedRemainder`: the derived subkeys below are the HMAC of labels such as `crabcrop/purge-key` under the secret, so a signature over one of them would be that subkey. No image URL may begin with that segment, and the server refuses one whatever its signature. See [Reserved remainders](https://github.com/dayvson/crabcrop/blob/main/spec/url-signing.md#reserved-remainders).
 
-Builders always emit the canonical lowercase hex tag, and the server accepts only that spelling: an uppercase tag is well-formed hex but not a valid signature segment there, so hand-assembled URLs should reuse builder output rather than re-casing a tag.
+Builders always emit the canonical lowercase hex tag, and the server accepts only that spelling: an uppercase tag is well-formed hex but not a valid signature segment there. `verify` takes the same stance, so it answers what the server answers: it accepts the bare 64-character lowercase tag and nothing else, neither another case nor a `<key-id>:` prefix (split the prefix off first). Hand-assembled URLs should reuse builder output rather than re-casing a tag.
 
 ## Purge signatures
 
 Cache purge endpoints take their own signatures, domain-separated under a derived subkey, so a signature minted for an image URL does not verify at a purge endpoint (or the other way around). The helpers sign the right strings, so callers never assemble them by hand.
 
 ```rust
-use crabcrop_url::{purge_group_signature, purge_signature};
+use crabcrop_url::{
+    purge_group_signature, purge_group_signature_with_expiry, purge_signature,
+    purge_signature_with_expiry,
+};
 
 let purge = purge_signature(b"your-secret", "300x200/https://example.com/photo.jpg");
 let group = purge_group_signature(b"your-secret", "thumb");
 ```
+
+A plain purge signature authorizes its purge until the secret rotates. The expiring form signs an `exp:<unix-seconds>` segment along with the target, and the server refuses the purge from that second on; its path is `/purge/<signature>/exp:<unix-seconds>/<path>` (or `/purge-group/<signature>/exp:<unix-seconds>/<group>`), and `purge_signed_string` gives what follows the signature segment.
+
+```rust
+let purge = purge_signature_with_expiry(b"your-secret", "300x200/https://example.com/photo.jpg", 1893456000);
+let group = purge_group_signature_with_expiry(b"your-secret", "thumb", 1893456000);
+```
+
+The server reads a leading `exp:` segment of a purge path as the purge's own expiry. A target copied from an image URL that opens with the image's `exp:` segment is therefore refused from that second on; the image's expiry is not part of its cache key, so drop it from the target and the purge evicts the same entries.
 
 ## Upload signatures
 
@@ -159,13 +170,21 @@ For delegated upload tokens (handing a client a one-shot right to upload), alway
 let expiring = upload_signature_with_expiry(b"your-secret", "photo.jpg", 1893456000);
 ```
 
+## Clearing keys from memory
+
+The `zeroize` feature, off by default, clears key material when it is dropped: the subkeys the crate derives for its own purge, upload and seal operations, and, through the `zeroize` features of `hmac`, `sha2` and `aes-gcm`, the state those crates keep from a key. It adds the [`zeroize`](https://crates.io/crates/zeroize) crate as a dependency. A subkey that `purge_key`, `purge_group_key`, `upload_key` or `seal_key` returns is the caller's to clear, for example by holding it in `zeroize::Zeroizing`.
+
+```sh
+cargo add crabcrop-url --features zeroize
+```
+
 ## Unsigned mode
 
 A `None` secret produces the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. Sealed URLs are the exception: they require a secret, as described above.
 
 ## Errors
 
-Builders fail loudly at build time rather than minting a URL that would be refused at fetch time. Failures are typed: `BuildError` for signed URL construction (a character that cannot travel in a URL path, an out-of-range srcset width, an invalid key ID) and `SealError` for sealing and opening (remainder too long, invalid key ID, no secret, and the uniform `OpenFailed`).
+Builders fail loudly at build time rather than minting a URL that would be refused at fetch time. Failures are typed: `BuildError` for signed URL construction (a character that cannot travel in a URL path, an out-of-range srcset width, an invalid key ID, a reserved remainder) and `SealError` for sealing and opening (remainder too long, invalid key ID, a refused character, a reserved remainder, no secret for the deprecated `build_sealed_url`, a random number generator that could not draw a nonce, an encryption failure, and the uniform `OpenFailed`, which only opening returns). Both enums are `#[non_exhaustive]`: a later release may add a variant, so a `match` on one needs a wildcard arm.
 
 The refused characters are `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded), so a URL signed over them answers 403 from a page. Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error message names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
 

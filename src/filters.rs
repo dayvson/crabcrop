@@ -3,14 +3,17 @@
 //! [`apply_filters_filled`] runs pixel filters in URL order and collects
 //! encoding directives. `Format`, `Quality`, `Fill`, and
 //! `MaxBytes` do not touch pixels; they are recorded for the
-//! encoder.
+//! encoder. It takes [`PlainFilter`]s, the filters that need
+//! nothing but the image (issue #741); the engine applies
+//! the rest of [`crate::url::Filter`] itself, many of them
+//! through the functions here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::DynamicImage;
 
 use crate::url::{
-    CurveChannel, Filter, FormatOptions, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA,
+    CurveChannel, FormatOptions, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA, PlainFilter,
     Quality,
 };
 
@@ -241,6 +244,29 @@ enum Pixels<'a> {
 }
 
 impl<'a> RgbaPart<'a> {
+    /// The part of an image of `size` whose RGBA pixels are
+    /// `pixels`, with its top-left corner at `origin` in the
+    /// whole image: a part made without the whole image, as a
+    /// scaled overlay's is.
+    pub fn copied(pixels: image::RgbaImage, origin: (u32, u32), size: (u32, u32)) -> Self {
+        Self::shared(std::sync::Arc::new(pixels), origin, size)
+    }
+
+    /// [`RgbaPart::copied`], for pixels other parts hold too: an
+    /// animated render draws one scaled overlay part on every
+    /// frame.
+    pub fn shared(
+        pixels: std::sync::Arc<image::RgbaImage>,
+        origin: (u32, u32),
+        size: (u32, u32),
+    ) -> Self {
+        RgbaPart {
+            pixels: Pixels::Copied(pixels),
+            origin,
+            size,
+        }
+    }
+
     /// The part `rect` of `image`: all of it read in place
     /// when it is RGBA, otherwise a copy of `rect` alone.
     pub fn of(image: &'a DynamicImage, rect: Rect) -> Self {
@@ -282,8 +308,55 @@ impl From<DynamicImage> for WatermarkImage {
     }
 }
 
-/// The sigma a `Filter::Blur` applies with. The parser caps
-/// sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,
+/// The most `sharpen` strength that changes the picture
+/// (issue #713). The filter adds `a` times each sample's
+/// difference from the mean of its four neighbors, a whole
+/// number of levels for 8-bit samples, so from `a` = 255 on
+/// every sample that differs from that mean by a level or
+/// more is already driven to 0 or 255 and every other keeps
+/// its value: the picture stops changing. Measured on four
+/// corpus images (a portrait, two photographs and a
+/// gradient), every whole amount from 255 to 16,449 renders
+/// the same pixels as 255. Past that the products leave the
+/// range `f32` holds exactly and flat areas turn to noise: at
+/// 20,000 up to 1% of the pixels move, at 100,000 from 5 to
+/// 27% of a photograph's and every pixel of the gradient, at
+/// 1e8 every channel is 0 or 255, and at 3e38 the kernel
+/// overflows and the image comes out black. A fractional
+/// amount over 255 moved up to 11% of the pixels by a level
+/// of rounding. The URL still takes any positive amount, so
+/// every URL that answered keeps answering; a larger one
+/// sharpens as 255 does.
+pub(crate) const MAX_SHARPEN_AMOUNT: f32 = 255.0;
+
+/// The strength a `PlainFilter::Sharpen` works at: the
+/// amount the URL names, held to [`MAX_SHARPEN_AMOUNT`]. A
+/// NaN or an infinite amount, which the parser never hands
+/// over, takes the bound too, past which nothing changes.
+fn sharpen_amount(amount: f32) -> f32 {
+    if amount.is_finite() {
+        amount.min(MAX_SHARPEN_AMOUNT)
+    } else {
+        MAX_SHARPEN_AMOUNT
+    }
+}
+
+/// The angle a `PlainFilter::HueRotate` turns the hue by:
+/// the degrees the URL names, reduced modulo 360 in integer
+/// arithmetic before they become a float (issue #713). The
+/// remainder keeps the sign, so every angle from -359 to 359
+/// turns as it always did, and any other integer turns as the
+/// angle it reduces to: `huerotate(450)` is `huerotate(90)`.
+/// Converted unreduced, a large angle kept its rounding error
+/// into the sine and cosine, so equivalent angles rendered
+/// apart by a level here and there, and 2147483647 did not
+/// render as 127.
+fn hue_degrees(degrees: i32) -> i32 {
+    degrees % 360
+}
+
+/// The sigma a `PlainFilter::Blur` applies with. The parser
+/// caps sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,
 /// but a filter built any other way must not reach the image
 /// crate's Gaussian setup with a sigma that panics it (a
 /// subnormal trips an `is_normal` assert) or sizes a kernel
@@ -303,7 +376,7 @@ fn blur_sigma(sigma: f32) -> f32 {
 /// Returns the transformed image plus the encoding directives.
 /// Later directives win when a filter repeats.
 #[cfg(test)]
-pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, EncodeOptions) {
+pub fn apply_filters(img: DynamicImage, filters: &[PlainFilter]) -> (DynamicImage, EncodeOptions) {
     apply_filters_filled(img, filters, None)
 }
 
@@ -312,7 +385,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
 /// turned image leaves uncovered (issue #144).
 pub fn apply_filters_filled(
     img: DynamicImage,
-    filters: &[Filter],
+    filters: &[PlainFilter],
     fill: Option<[u8; 3]>,
 ) -> (DynamicImage, EncodeOptions) {
     match apply_filters_within(img, filters, fill, None) {
@@ -324,10 +397,13 @@ pub fn apply_filters_filled(
 /// [`apply_filters_filled`] under the request's processing
 /// deadline (`None` for none), which a blur checks before
 /// each row (issue #614). Past the deadline it stops and
-/// answers [`DeadlinePassed`]; the image is dropped.
+/// answers [`DeadlinePassed`]; the image is dropped. Every
+/// arm of its match applies a filter or records a
+/// directive: a filter the engine applies itself is not a
+/// [`PlainFilter`], so none reaches it (issue #741).
 pub fn apply_filters_within(
     img: DynamicImage,
-    filters: &[Filter],
+    filters: &[PlainFilter],
     fill: Option<[u8; 3]>,
     deadline: Option<std::time::Instant>,
 ) -> Result<(DynamicImage, EncodeOptions), DeadlinePassed> {
@@ -335,7 +411,7 @@ pub fn apply_filters_within(
     let mut options = EncodeOptions::default();
     for filter in filters {
         match filter {
-            Filter::Grayscale => {
+            PlainFilter::Grayscale => {
                 img = map_rgb_lanes(img, |r, g, b| {
                     for i in 0..LANES {
                         let y = round_lane(luma_of(r[i], g[i], b[i]));
@@ -345,36 +421,36 @@ pub fn apply_filters_within(
                     }
                 });
             }
-            Filter::Invert => img.invert(),
-            Filter::Blur(sigma) => img = blur_fast_within(&img, blur_sigma(*sigma), deadline)?,
-            Filter::Brighten(amount) => img = brighten_fast(img, *amount),
-            Filter::Contrast(amount) => {
+            PlainFilter::Invert => img.invert(),
+            PlainFilter::Blur(sigma) => img = blur_fast_within(&img, blur_sigma(*sigma), deadline)?,
+            PlainFilter::Brighten(amount) => img = brighten_fast(img, *amount),
+            PlainFilter::Contrast(amount) => {
                 img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
             }
-            Filter::Gamma(gamma) => {
+            PlainFilter::Gamma(gamma) => {
                 img = gamma_correct(img, *gamma);
             }
-            Filter::Exposure(stops) => {
+            PlainFilter::Exposure(stops) => {
                 img = exposure_correct(img, *stops);
             }
-            Filter::HighlightsShadows(highlights, shadows) => {
+            PlainFilter::HighlightsShadows(highlights, shadows) => {
                 img = highlights_shadows(&img, *highlights, *shadows);
             }
-            Filter::HueRotate(degrees) => img = huerotate_fast(img, *degrees),
-            Filter::Sharpen(amount) => {
+            PlainFilter::HueRotate(degrees) => img = huerotate_fast(img, hue_degrees(*degrees)),
+            PlainFilter::Sharpen(amount) => {
                 // Unsharp mask as a 3x3 convolution: the center is
                 // boosted, the cross neighbors subtracted.
-                let a = *amount;
+                let a = sharpen_amount(*amount);
                 let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
                 img = map_rgb_image(img, |rgb| filter3x3_rgb(&rgb, &kernel));
             }
-            Filter::Saturation(amount) => {
+            PlainFilter::Saturation(amount) => {
                 img = map_rgb_image(img, |rgb| saturate(rgb, *amount));
             }
-            Filter::Vibrance(amount) => {
+            PlainFilter::Vibrance(amount) => {
                 img = map_rgb_image(img, |rgb| vibrance(rgb, *amount));
             }
-            Filter::Rgb(r, g, b) => {
+            PlainFilter::Rgb(r, g, b) => {
                 img = map_rgb(img, |pr, pg, pb| {
                     [
                         (pr as i32 + r).clamp(0, 255) as u8,
@@ -383,22 +459,22 @@ pub fn apply_filters_within(
                     ]
                 });
             }
-            Filter::Curve(channel, points) => {
+            PlainFilter::Curve(channel, points) => {
                 img = tone_curve(&img, *channel, points);
             }
-            Filter::Convolution(values, normalize) => {
+            PlainFilter::Convolution(values, normalize) => {
                 img = convolve(&img, values, *normalize);
             }
-            Filter::Noise(amount) => {
+            PlainFilter::Noise(amount) => {
                 img = add_noise(&img, *amount);
             }
-            Filter::Equalize => {
+            PlainFilter::Equalize => {
                 img = map_rgb_image(img, equalize);
             }
-            Filter::Enhance => {
+            PlainFilter::Enhance => {
                 img = map_rgb_image(img, auto_levels);
             }
-            Filter::Rotate(degrees) => {
+            PlainFilter::Rotate(degrees) => {
                 let normalized = fold_degrees(*degrees);
                 img = if normalized == 90.0 {
                     rotate90_fast(&img)
@@ -412,70 +488,28 @@ pub fn apply_filters_within(
                     rotate_arbitrary(img, normalized, fill)
                 };
             }
-            Filter::Trim(tolerance) => img = trim(img, *tolerance),
-            Filter::TrimSides(tolerance, sides) => img = trim_sides(img, *tolerance, *sides),
-            // Watermarks are applied by the engine, which owns
-            // the resolved images; one reaching this function is
-            // unresolved by construction and leaves pixels alone.
-            // (The engine never routes them here.)
-            // Region redaction runs in the engine, which
-            // validates the rectangle against the image size
-            // in effect at that point. (Same routing.)
-            Filter::BlurRegion { .. } | Filter::PixelateRegion { .. } => {}
-            // Region removal runs in the engine, which owns
-            // the inpainting provider. (Same routing as the
-            // other region filters.)
-            Filter::RemoveRegion { .. } => {}
-            Filter::Watermark { .. } => {}
-            // Overlays are applied by the engine, which owns
-            // the resolved images. (Same routing as above.)
-            Filter::Overlay { .. } => {}
-            // Background removal is applied by the engine, which
-            // owns the mask provider. (Same routing as above.)
-            Filter::RemoveBg => {}
-            // Studio mode is applied by the engine, which owns
-            // the mask provider and the brand color. (Same
-            // routing as above.)
-            Filter::Studio(_) => {}
-            // Upscaling is applied by the engine, which owns the
-            // upscale provider. (Same routing.)
-            Filter::Upscale(_) => {}
-            // Text is drawn by the engine, which owns the
-            // configured font renderer. (Same routing.)
-            Filter::Text { .. } => {}
-            // Face operations run in the engine, which owns the
-            // face provider and the shared detection memo. Face
-            // padding is a directive the face crop reads from
-            // the request as a whole. (Same routing.)
-            Filter::BlurFaces | Filter::PixelateFaces | Filter::FacePad(_) => {}
-            // Class operations are engine-routed (they need
-            // the detection provider), like the face filters
-            // above.
-            Filter::BlurClass(_) | Filter::PixelateClass(_) | Filter::RecolorClass(..) => {}
-            // DPR scales size targets in the engine, which
-            // resolves it against the request as a whole (with
-            // the client-hint fallback). (Same routing.)
-            Filter::Dpr(_) => {}
-            Filter::Sepia => img = sepia(img),
-            Filter::Duotone(shadow, highlight) => img = duotone(img, *shadow, *highlight),
-            Filter::Monochrome(color) => img = monochrome(img, *color),
-            Filter::Pixelate(block) => img = pixelate(&img, *block),
-            Filter::Flip(direction) => {
+            PlainFilter::Trim(tolerance) => img = trim(img, *tolerance),
+            PlainFilter::TrimSides(tolerance, sides) => img = trim_sides(img, *tolerance, *sides),
+            PlainFilter::Sepia => img = sepia(img),
+            PlainFilter::Duotone(shadow, highlight) => img = duotone(img, *shadow, *highlight),
+            PlainFilter::Monochrome(color) => img = monochrome(img, *color),
+            PlainFilter::Pixelate(block) => img = pixelate(&img, *block),
+            PlainFilter::Flip(direction) => {
                 img = match direction {
                     crate::url::FlipDirection::Horizontal => fliph_fast(&img),
                     crate::url::FlipDirection::Vertical => flipv_fast(&img),
                 }
             }
-            Filter::Radius(radii) => img = rounded_corners(&img, *radii),
-            Filter::Border(width, color) => img = draw_border(&img, *width, *color),
-            Filter::Mask(shape) => img = mask_shape(&img, *shape),
-            Filter::Fill(color) => options.fill = Some(*color),
-            Filter::MaxBytes(n) => options.max_bytes = Some(*n),
-            Filter::KeepProfile => options.keep_profile = true,
-            Filter::Quality(q) => options.quality = Some(q.clone()),
-            Filter::Palette(n) => options.palette = Some(*n),
-            Filter::NoUpscale => options.no_upscale = true,
-            Filter::Format(spec) => {
+            PlainFilter::Radius(radii) => img = rounded_corners(&img, *radii),
+            PlainFilter::Border(width, color) => img = draw_border(&img, *width, *color),
+            PlainFilter::Mask(shape) => img = mask_shape(&img, *shape),
+            PlainFilter::Fill(color) => options.fill = Some(*color),
+            PlainFilter::MaxBytes(n) => options.max_bytes = Some(*n),
+            PlainFilter::KeepProfile => options.keep_profile = true,
+            PlainFilter::Quality(q) => options.quality = Some(q.clone()),
+            PlainFilter::Palette(n) => options.palette = Some(*n),
+            PlainFilter::NoUpscale => options.no_upscale = true,
+            PlainFilter::Format(spec) => {
                 options.format = Some(spec.format);
                 options.format_options = spec.options;
             }
@@ -2489,6 +2523,64 @@ pub fn monochrome(img: DynamicImage, color: [u8; 3]) -> DynamicImage {
     })
 }
 
+/// `$body` run on the pixel buffer of `$img` as `$buf`,
+/// whatever layout `$img` has, and that buffer handed back as
+/// the same layout: how the redactions work at the image's
+/// own depth (issue #713). `DynamicImage` is non-exhaustive,
+/// but image 0.25 has no other layout: a later one would be
+/// worked on as RGBA8.
+macro_rules! in_layout {
+    ($img:expr, |$buf:ident| $body:expr) => {
+        match $img {
+            DynamicImage::ImageLuma8(mut $buf) => {
+                $body;
+                DynamicImage::ImageLuma8($buf)
+            }
+            DynamicImage::ImageLumaA8(mut $buf) => {
+                $body;
+                DynamicImage::ImageLumaA8($buf)
+            }
+            DynamicImage::ImageRgb8(mut $buf) => {
+                $body;
+                DynamicImage::ImageRgb8($buf)
+            }
+            DynamicImage::ImageRgba8(mut $buf) => {
+                $body;
+                DynamicImage::ImageRgba8($buf)
+            }
+            DynamicImage::ImageLuma16(mut $buf) => {
+                $body;
+                DynamicImage::ImageLuma16($buf)
+            }
+            DynamicImage::ImageLumaA16(mut $buf) => {
+                $body;
+                DynamicImage::ImageLumaA16($buf)
+            }
+            DynamicImage::ImageRgb16(mut $buf) => {
+                $body;
+                DynamicImage::ImageRgb16($buf)
+            }
+            DynamicImage::ImageRgba16(mut $buf) => {
+                $body;
+                DynamicImage::ImageRgba16($buf)
+            }
+            DynamicImage::ImageRgb32F(mut $buf) => {
+                $body;
+                DynamicImage::ImageRgb32F($buf)
+            }
+            DynamicImage::ImageRgba32F(mut $buf) => {
+                $body;
+                DynamicImage::ImageRgba32F($buf)
+            }
+            other => {
+                let mut $buf = other.into_rgba8();
+                $body;
+                DynamicImage::ImageRgba8($buf)
+            }
+        }
+    };
+}
+
 /// Mosaic the image into `block`-pixel squares anchored at
 /// the top-left, each painted with the average of its pixels
 /// (alpha included when the image carries it). A block of 1
@@ -2500,79 +2592,202 @@ pub fn pixelate(img: &DynamicImage, block: u32) -> DynamicImage {
     }
     if img.color().has_alpha() {
         let mut rgba = img.to_rgba8();
-        average_blocks(
-            &mut rgba,
-            block,
-            |p| [p[0], p[1], p[2], p[3]],
-            |p, v| {
-                p[0] = v[0];
-                p[1] = v[1];
-                p[2] = v[2];
-                p[3] = v[3];
-            },
-        );
+        average_blocks(&mut rgba, block);
         DynamicImage::ImageRgba8(rgba)
     } else {
         let mut rgb = img.to_rgb8();
-        average_blocks(
-            &mut rgb,
-            block,
-            |p| [p[0], p[1], p[2], 0],
-            |p, v| {
-                p[0] = v[0];
-                p[1] = v[1];
-                p[2] = v[2];
-            },
-        );
+        average_blocks(&mut rgb, block);
         DynamicImage::ImageRgb8(rgb)
     }
 }
 
-/// Shared block averaging for `pixelate`, over either pixel
-/// buffer: `get` reads the channels that take part (the
-/// fourth is an alpha slot, 0 for RGB), `set` writes the
-/// averaged pixel back.
-fn average_blocks<P: image::Pixel>(
-    img: &mut image::ImageBuffer<P, Vec<P::Subpixel>>,
-    block: u32,
-    get: impl Fn(&P) -> [u8; 4],
-    set: impl Fn(&mut P, [u8; 4]),
-) {
+/// [`pixelate`] in the image's own layout, gray, 16-bit and
+/// float included, for the region and class redactions
+/// (issue #713). The plain filter keeps the 8-bit layouts it
+/// always wrote; an 8-bit image averages to the same values
+/// either way.
+fn pixelate_in_layout(img: &DynamicImage, block: u32) -> DynamicImage {
+    if block <= 1 {
+        return img.clone();
+    }
+    in_layout!(img.clone(), |buf| average_blocks(&mut buf, block))
+}
+
+/// Shared block averaging for `pixelate`, over any pixel
+/// buffer: every channel of each block, alpha included,
+/// takes the block's mean, rounded as
+/// [`RedactSample::block_mean`] rounds it.
+fn average_blocks<P>(img: &mut image::ImageBuffer<P, Vec<P::Subpixel>>, block: u32)
+where
+    P: image::Pixel,
+    P::Subpixel: RedactSample,
+{
     let (w, h) = (img.width(), img.height());
+    let channels = usize::from(P::CHANNEL_COUNT);
     for by in (0..h).step_by(block as usize) {
         for bx in (0..w).step_by(block as usize) {
             let (bw, bh) = (block.min(w - bx), block.min(h - by));
-            let mut sums = [0u64; 4];
+            let mut sums = [<P::Subpixel as RedactSample>::Sum::default(); 4];
             for y in by..by + bh {
                 for x in bx..bx + bw {
-                    let v = get(&img.get_pixel(x, y).clone());
-                    for c in 0..4 {
-                        sums[c] += v[c] as u64;
+                    for (sum, v) in sums.iter_mut().zip(img.get_pixel(x, y).channels()) {
+                        *sum += v.widen();
                     }
                 }
             }
-            let n = (bw * bh) as f32;
-            let avg = [
-                (sums[0] as f32 / n).round() as u8,
-                (sums[1] as f32 / n).round() as u8,
-                (sums[2] as f32 / n).round() as u8,
-                (sums[3] as f32 / n).round() as u8,
-            ];
+            let mut avg = *img.get_pixel(bx, by);
+            for (v, sum) in avg.channels_mut().iter_mut().zip(sums).take(channels) {
+                *v = RedactSample::block_mean(sum, bw * bh);
+            }
             for y in by..by + bh {
                 for x in bx..bx + bw {
-                    set(img.get_pixel_mut(x, y), avg);
+                    img.put_pixel(x, y, avg);
                 }
             }
         }
     }
 }
 
+/// A sample the redactions average, blend and paint in, at
+/// its own depth (issue #713): `u8`, `u16` or `f32`. The
+/// `u8` arithmetic is the redactions' as it always was, so an
+/// 8-bit image redacts to the values it always did.
+trait RedactSample: image::Primitive + 'static {
+    /// A running sum of samples.
+    type Sum: Copy + Default + std::ops::AddAssign;
+    fn widen(self) -> Self::Sum;
+    /// The mean of `n` samples that add up to `sum`, as
+    /// [`pixelate`] rounds it: for `u8`, the sum over `n` in
+    /// `f32`, rounded half away from zero.
+    fn block_mean(sum: Self::Sum, n: u32) -> Self;
+    /// The mean of `n` samples that add up to `sum`, as the
+    /// face mosaic rounds it: for the integer depths, to the
+    /// nearest level, half up.
+    fn cell_mean(sum: Self::Sum, n: u64) -> Self;
+    /// `self` taken `m` / 255 of the way to `to`, as a soft
+    /// mask blends: for the integer depths, truncated.
+    fn toward(self, to: Self, m: u32) -> Self;
+    /// An 8-bit level (a paint color's channel) at this
+    /// depth.
+    fn from_level(v: u8) -> Self;
+}
+
+impl RedactSample for u8 {
+    type Sum = u64;
+    fn widen(self) -> u64 {
+        u64::from(self)
+    }
+    fn block_mean(sum: u64, n: u32) -> u8 {
+        (sum as f32 / n as f32).round() as u8
+    }
+    fn cell_mean(sum: u64, n: u64) -> u8 {
+        ((sum + n / 2) / n) as u8
+    }
+    fn toward(self, to: u8, m: u32) -> u8 {
+        ((u32::from(self) * (255 - m) + u32::from(to) * m) / 255) as u8
+    }
+    fn from_level(v: u8) -> u8 {
+        v
+    }
+}
+
+impl RedactSample for u16 {
+    type Sum = u64;
+    fn widen(self) -> u64 {
+        u64::from(self)
+    }
+    fn block_mean(sum: u64, n: u32) -> u16 {
+        (sum as f64 / f64::from(n)).round() as u16
+    }
+    fn cell_mean(sum: u64, n: u64) -> u16 {
+        ((sum + n / 2) / n) as u16
+    }
+    fn toward(self, to: u16, m: u32) -> u16 {
+        let m = u64::from(m);
+        ((u64::from(self) * (255 - m) + u64::from(to) * m) / 255) as u16
+    }
+    fn from_level(v: u8) -> u16 {
+        u16::from(v) * 257
+    }
+}
+
+impl RedactSample for f32 {
+    type Sum = f64;
+    fn widen(self) -> f64 {
+        f64::from(self)
+    }
+    fn block_mean(sum: f64, n: u32) -> f32 {
+        (sum / f64::from(n)) as f32
+    }
+    fn cell_mean(sum: f64, n: u64) -> f32 {
+        (sum / n as f64) as f32
+    }
+    fn toward(self, to: f32, m: u32) -> f32 {
+        let m = m as f32 / 255.0;
+        self * (1.0 - m) + to * m
+    }
+    fn from_level(v: u8) -> f32 {
+        f32::from(v) / 255.0
+    }
+}
+
+/// `img` in the layout of `like`, converted the way the image
+/// crate converts between layouts; `img` itself, moved, when
+/// it already has that layout. A redaction works on a copy of
+/// the region in the image's layout and writes back into it,
+/// so the two only differ for a step that changed the
+/// layout.
+fn into_layout_of(img: DynamicImage, like: &DynamicImage) -> DynamicImage {
+    match like {
+        DynamicImage::ImageLuma8(_) => DynamicImage::ImageLuma8(img.into_luma8()),
+        DynamicImage::ImageLumaA8(_) => DynamicImage::ImageLumaA8(img.into_luma_alpha8()),
+        DynamicImage::ImageRgb8(_) => DynamicImage::ImageRgb8(img.into_rgb8()),
+        DynamicImage::ImageRgba8(_) => DynamicImage::ImageRgba8(img.into_rgba8()),
+        DynamicImage::ImageLuma16(_) => DynamicImage::ImageLuma16(img.into_luma16()),
+        DynamicImage::ImageLumaA16(_) => DynamicImage::ImageLumaA16(img.into_luma_alpha16()),
+        DynamicImage::ImageRgb16(_) => DynamicImage::ImageRgb16(img.into_rgb16()),
+        DynamicImage::ImageRgba16(_) => DynamicImage::ImageRgba16(img.into_rgba16()),
+        DynamicImage::ImageRgb32F(_) => DynamicImage::ImageRgb32F(img.into_rgb32f()),
+        DynamicImage::ImageRgba32F(_) => DynamicImage::ImageRgba32F(img.into_rgba32f()),
+        _ => DynamicImage::ImageRgba8(img.into_rgba8()),
+    }
+}
+
+/// [`put_redacted`] on a `DynamicImage` of any layout: `done`
+/// is brought into `base`'s layout first (see
+/// [`into_layout_of`]), so the rest of `base` keeps its
+/// layout, its depth and every sample it had.
+fn put_redacted_in(base: &mut DynamicImage, done: DynamicImage, x: u32, y: u32) {
+    let done = into_layout_of(done, base);
+    match (base, done) {
+        (DynamicImage::ImageLuma8(b), DynamicImage::ImageLuma8(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageLumaA8(b), DynamicImage::ImageLumaA8(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageRgb8(b), DynamicImage::ImageRgb8(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageRgba8(b), DynamicImage::ImageRgba8(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageLuma16(b), DynamicImage::ImageLuma16(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageLumaA16(b), DynamicImage::ImageLumaA16(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageRgb16(b), DynamicImage::ImageRgb16(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageRgba16(b), DynamicImage::ImageRgba16(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageRgb32F(b), DynamicImage::ImageRgb32F(d)) => put_redacted(b, d, x, y),
+        (DynamicImage::ImageRgba32F(b), DynamicImage::ImageRgba32F(d)) => put_redacted(b, d, x, y),
+        // `DynamicImage` is non-exhaustive, but image 0.25 has
+        // no other layout: a later one redacts as RGBA8.
+        (base, done) => {
+            let mut rgba = base.to_rgba8();
+            put_redacted(&mut rgba, done.into_rgba8(), x, y);
+            *base = DynamicImage::ImageRgba8(rgba);
+        }
+    }
+}
+
 /// Apply `f` to the rectangle (x, y, w, h) of `img` and write
-/// the result into an RGBA copy in place of the rectangle's
-/// pixels (see [`put_redacted`]); pixels outside the
-/// rectangle are untouched. The caller guarantees the
-/// rectangle is in bounds. An error from `f` is returned as
-/// is.
+/// the result into a copy of `img` in place of the
+/// rectangle's pixels (see [`put_redacted`]); pixels outside
+/// the rectangle are untouched. The copy keeps `img`'s layout
+/// and depth (issue #713): an 8-bit RGB image stays RGB, a
+/// 16-bit or float one keeps its samples, and only an image
+/// with alpha has alpha. The caller guarantees the rectangle
+/// is in bounds. An error from `f` is returned as is.
 fn apply_to_region<E>(
     img: &DynamicImage,
     x: u32,
@@ -2581,10 +2796,11 @@ fn apply_to_region<E>(
     h: u32,
     f: impl Fn(&DynamicImage) -> Result<DynamicImage, E>,
 ) -> Result<DynamicImage, E> {
-    let mut base = img.to_rgba8();
     let region = img.crop_imm(x, y, w, h);
-    put_redacted(&mut base, f(&region)?.to_rgba8(), x, y);
-    Ok(DynamicImage::ImageRgba8(base))
+    let done = f(&region)?;
+    let mut base = img.clone();
+    put_redacted_in(&mut base, done, x, y);
+    Ok(base)
 }
 
 /// Write the redacted pixels `done` over the rectangle of
@@ -2596,23 +2812,34 @@ fn apply_to_region<E>(
 /// the stored RGB, so a face stored at alpha 0 would be
 /// detected and then served intact.
 ///
-/// A rectangle of uniform alpha keeps that alpha exactly: it
-/// carries no detail to redact, and the blur's fixed-point
-/// kernel sums to slightly under one from a sigma of about
-/// 18, which would leave an opaque rectangle's alpha just
-/// under 255 (253 at sigma 30). Like `overlay`, it clips to
-/// `base`, so an empty or out-of-frame rectangle is a no-op.
-fn put_redacted(base: &mut image::RgbaImage, mut done: image::RgbaImage, x: u32, y: u32) {
+/// In a layout with alpha, a rectangle of uniform alpha
+/// keeps that alpha exactly: it carries no detail to redact,
+/// and the blur's fixed-point kernel sums to slightly under
+/// one from a sigma of about 18, which would leave an opaque
+/// rectangle's alpha just under 255 (253 at sigma 30). Like
+/// `overlay`, it clips to `base`, so an empty or out-of-frame
+/// rectangle is a no-op. Any layout and depth works; the two
+/// buffers share one.
+fn put_redacted<P: image::Pixel>(
+    base: &mut image::ImageBuffer<P, Vec<P::Subpixel>>,
+    mut done: image::ImageBuffer<P, Vec<P::Subpixel>>,
+    x: u32,
+    y: u32,
+) {
     let w = done.width().min(base.width().saturating_sub(x));
     let h = done.height().min(base.height().saturating_sub(y));
     if w == 0 || h == 0 {
         return;
     }
-    let alpha = base.get_pixel(x, y)[3];
-    let uniform = (y..y + h).all(|py| (x..x + w).all(|px| base.get_pixel(px, py)[3] == alpha));
-    if uniform {
-        for p in done.pixels_mut() {
-            p[3] = alpha;
+    if P::HAS_ALPHA {
+        let last = usize::from(P::CHANNEL_COUNT) - 1;
+        let alpha = base.get_pixel(x, y).channels()[last];
+        let uniform = (y..y + h)
+            .all(|py| (x..x + w).all(|px| base.get_pixel(px, py).channels()[last] == alpha));
+        if uniform {
+            for p in done.pixels_mut() {
+                p.channels_mut()[last] = alpha;
+            }
         }
     }
     image::imageops::replace(base, &done, x as i64, y as i64);
@@ -2620,9 +2847,16 @@ fn put_redacted(base: &mut image::RgbaImage, mut done: image::RgbaImage, x: u32,
 
 /// Gaussian-blur one rectangle of `img` (explicit region
 /// redaction: plates, screens, documents). The sigma scales
-/// with the region, min(w, h) / 8 clamped to [1, 30], so a
-/// tall thin region blurs to its own scale. The blur checks
-/// `deadline` before each row (issue #614).
+/// with the region, min(w, h) / 8 and at least 1, so a tall
+/// thin region blurs to its own scale and a large one blurs
+/// as strongly, for its size, as a small one: a sign or a
+/// document that fills a large region is not left legible by
+/// a fixed ceiling (issue #713). The face blur has no ceiling
+/// either, at a sixth of each face's shorter side. The blur's
+/// work grows with the sigma, so it checks
+/// `deadline` before each row (issue #614): a region too
+/// large to blur before the processing limit answers 504
+/// there, as a face of that size does.
 pub fn blur_region(
     img: &DynamicImage,
     x: u32,
@@ -2631,19 +2865,28 @@ pub fn blur_region(
     h: u32,
     deadline: Option<std::time::Instant>,
 ) -> Result<DynamicImage, DeadlinePassed> {
-    let sigma = (w.min(h) as f32 / 8.0).clamp(1.0, 30.0);
+    let sigma = region_blur_sigma(w, h);
     apply_to_region(img, x, y, w, h, |region| {
         blur_fast_within(region, sigma, deadline)
     })
 }
 
+/// The sigma [`blur_region`] blurs a `w` by `h` region at: an
+/// eighth of its shorter side, at least 1. It used to stop at
+/// 30, where a region 240 px or more on its shorter side got
+/// no more blur than that (issue #713).
+pub(crate) fn region_blur_sigma(w: u32, h: u32) -> f32 {
+    (w.min(h) as f32 / 8.0).max(1.0)
+}
+
 /// Pixelate one rectangle of `img`, with the block size
 /// derived from the region: min(w, h) / 10, at least 2 px,
-/// using the same block averaging as the `pixelate` filter.
+/// using the same block averaging as the `pixelate` filter,
+/// at the image's own depth.
 pub fn pixelate_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> DynamicImage {
     let block = (w.min(h) / 10).max(2);
     let Ok(out) = apply_to_region(img, x, y, w, h, |region| {
-        Ok::<_, std::convert::Infallible>(pixelate(region, block))
+        Ok::<_, std::convert::Infallible>(pixelate_in_layout(region, block))
     });
     out
 }
@@ -2833,45 +3076,56 @@ pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> Dynam
 }
 
 /// Paint `img` as a grid of cells, each with the average of its
-/// pixels (alpha included). The grid has `side / cell` cells
+/// pixels (alpha included), in `img`'s own layout and depth
+/// (issue #713). The grid has `side / cell` cells
 /// along each axis (at least one), spread evenly, so every cell
 /// is at least `cell` px on a side, or the whole axis when the
 /// image is shorter: unlike `pixelate`'s anchored blocks, no
 /// thin strip at the right or bottom edge keeps its detail.
 fn mosaic(img: &DynamicImage, cell: u32) -> DynamicImage {
-    let mut rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    in_layout!(img.clone(), |buf| mosaic_cells(&mut buf, cell))
+}
+
+/// The cells of [`mosaic`] painted over one buffer.
+fn mosaic_cells<P>(img: &mut image::ImageBuffer<P, Vec<P::Subpixel>>, cell: u32)
+where
+    P: image::Pixel,
+    P::Subpixel: RedactSample,
+{
+    let (w, h) = img.dimensions();
     let cell = cell.max(1);
     let (nx, ny) = ((w / cell).max(1), (h / cell).max(1));
     // u64: with small cells on a long side, i * side passes
     // u32::MAX.
     let edge = |i: u32, side: u32, n: u32| (i as u64 * side as u64 / n as u64) as u32;
+    let channels = usize::from(P::CHANNEL_COUNT);
     for j in 0..ny {
         let (y0, y1) = (edge(j, h, ny), edge(j + 1, h, ny));
         for i in 0..nx {
             let (x0, x1) = (edge(i, w, nx), edge(i + 1, w, nx));
-            let mut sums = [0u64; 4];
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let p = rgba.get_pixel(x, y);
-                    for c in 0..4 {
-                        sums[c] += p[c] as u64;
-                    }
-                }
-            }
             let n = (x1 - x0) as u64 * (y1 - y0) as u64;
             if n == 0 {
                 continue;
             }
-            let avg = image::Rgba(sums.map(|s| ((s + n / 2) / n) as u8));
+            let mut sums = [<P::Subpixel as RedactSample>::Sum::default(); 4];
             for y in y0..y1 {
                 for x in x0..x1 {
-                    rgba.put_pixel(x, y, avg);
+                    for (sum, v) in sums.iter_mut().zip(img.get_pixel(x, y).channels()) {
+                        *sum += v.widen();
+                    }
+                }
+            }
+            let mut avg = *img.get_pixel(x0, y0);
+            for (v, sum) in avg.channels_mut().iter_mut().zip(sums).take(channels) {
+                *v = RedactSample::cell_mean(sum, n);
+            }
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    img.put_pixel(x, y, avg);
                 }
             }
         }
     }
-    DynamicImage::ImageRgba8(rgba)
 }
 
 /// Blur every detection's box in `img`, through the
@@ -2939,11 +3193,12 @@ fn clamped_box(img: &DynamicImage, det: &crate::ai::Detection) -> Option<(u32, u
 /// pixel by a soft mask at the box's own resolution (issue
 /// #175): strength 255 takes the pixel from `over`, 0
 /// keeps `base`, and the values between antialias the
-/// silhouette's edge. All four channels blend, so the
+/// silhouette's edge. All channels blend, so the
 /// result matches what the unmasked region operation
 /// would have produced inside the shape. The mask is
 /// resized to the box when an export answered at another
-/// resolution.
+/// resolution. The blend runs in `base`'s layout and depth
+/// (issue #713).
 fn blend_masked(
     base: &DynamicImage,
     over: &DynamicImage,
@@ -2960,8 +3215,56 @@ fn blend_masked(
         fitted = image::imageops::resize(mask, w, h, image::imageops::FilterType::Triangle);
         &fitted
     };
-    let mut out = base.to_rgba8();
-    let over = over.to_rgba8();
+    let converted;
+    let over = if over.color() == base.color() {
+        over
+    } else {
+        converted = into_layout_of(over.clone(), base);
+        &converted
+    };
+    macro_rules! blend {
+        ($($variant:ident),*) => {
+            match (base.clone(), over) {
+                $((DynamicImage::$variant(mut out), DynamicImage::$variant(over)) => {
+                    blend_masked_in(&mut out, over, mask, (x, y, w, h));
+                    DynamicImage::$variant(out)
+                })*
+                // `into_layout_of` brought `over` into `base`'s
+                // layout; a later layout blends as RGBA8.
+                (base, over) => {
+                    let mut out = base.into_rgba8();
+                    blend_masked_in(&mut out, &over.to_rgba8(), mask, (x, y, w, h));
+                    DynamicImage::ImageRgba8(out)
+                }
+            }
+        };
+    }
+    blend!(
+        ImageLuma8,
+        ImageLumaA8,
+        ImageRgb8,
+        ImageRgba8,
+        ImageLuma16,
+        ImageLumaA16,
+        ImageRgb16,
+        ImageRgba16,
+        ImageRgb32F,
+        ImageRgba32F
+    )
+}
+
+/// [`blend_masked`] on one buffer: `out` holds the base and
+/// takes `over`'s pixels in the (x, y, w, h) box, by the
+/// mask's strength.
+fn blend_masked_in<P>(
+    out: &mut image::ImageBuffer<P, Vec<P::Subpixel>>,
+    over: &image::ImageBuffer<P, Vec<P::Subpixel>>,
+    mask: &image::GrayImage,
+    (x, y, w, h): (u32, u32, u32, u32),
+) where
+    P: image::Pixel,
+    P::Subpixel: RedactSample,
+{
     for ly in 0..h {
         for lx in 0..w {
             let m = mask.get_pixel(lx, ly)[0] as u32;
@@ -2969,18 +3272,17 @@ fn blend_masked(
                 continue;
             }
             let (gx, gy) = (x + lx, y + ly);
+            let src = *over.get_pixel(gx, gy);
             let dst = out.get_pixel_mut(gx, gy);
             if m == 255 {
-                *dst = *over.get_pixel(gx, gy);
+                *dst = src;
             } else {
-                let src = over.get_pixel(gx, gy);
-                for c in 0..4 {
-                    dst[c] = ((dst[c] as u32 * (255 - m) + src[c] as u32 * m) / 255) as u8;
+                for (d, s) in dst.channels_mut().iter_mut().zip(src.channels()) {
+                    *d = d.toward(*s, m);
                 }
             }
         }
     }
-    DynamicImage::ImageRgba8(out)
 }
 
 /// Blur every detection's silhouette in `img` (issue
@@ -3038,7 +3340,8 @@ pub struct MaskedDetection {
 /// Recolor every detection's box in `img`: the object's
 /// pixels take `color`, their alpha untouched (the paint
 /// is a tint of the object, not a cutout). Without a
-/// segment provider this is the rectangle form.
+/// segment provider this is the rectangle form. A gray image
+/// is painted in color (see [`paint_box`]).
 pub fn recolor_detections(
     img: &DynamicImage,
     detections: &[crate::ai::Detection],
@@ -3049,7 +3352,7 @@ pub fn recolor_detections(
         let Some((x, y, w, h)) = clamped_box(&out, det) else {
             continue;
         };
-        out = paint_box(&out, x, y, w, h, None, color);
+        out = paint_box(out, x, y, w, h, None, color);
     }
     out
 }
@@ -3067,15 +3370,19 @@ pub fn recolor_detections_masked(
         let Some((x, y, w, h)) = clamped_box(&out, &item.detection) else {
             continue;
         };
-        out = paint_box(&out, x, y, w, h, Some(&item.mask), color);
+        out = paint_box(out, x, y, w, h, Some(&item.mask), color);
     }
     out
 }
 
 /// Paint `color` over one box of `img`, optionally through
 /// a soft mask at the box's resolution; alpha is preserved.
+/// The paint keeps `img`'s depth and its alpha or lack of
+/// one (issue #713). A gray image cannot hold the color, so
+/// its paint widens it to color at its own depth: gray to
+/// RGB, gray with alpha to RGBA.
 fn paint_box(
-    img: &DynamicImage,
+    img: DynamicImage,
     x: u32,
     y: u32,
     w: u32,
@@ -3091,7 +3398,29 @@ fn paint_box(
         }
         other => other,
     };
-    let mut out = img.to_rgba8();
+    let img = match img {
+        DynamicImage::ImageLuma8(_) => DynamicImage::ImageRgb8(img.into_rgb8()),
+        DynamicImage::ImageLumaA8(_) => DynamicImage::ImageRgba8(img.into_rgba8()),
+        DynamicImage::ImageLuma16(_) => DynamicImage::ImageRgb16(img.into_rgb16()),
+        DynamicImage::ImageLumaA16(_) => DynamicImage::ImageRgba16(img.into_rgba16()),
+        other => other,
+    };
+    in_layout!(img, |buf| paint_box_in(&mut buf, (x, y, w, h), mask, color))
+}
+
+/// [`paint_box`] on one buffer of a color layout: the first
+/// three channels take `color`, at the buffer's depth, by the
+/// mask's strength; a fourth, alpha, is left alone.
+fn paint_box_in<P>(
+    out: &mut image::ImageBuffer<P, Vec<P::Subpixel>>,
+    (x, y, w, h): (u32, u32, u32, u32),
+    mask: Option<&image::GrayImage>,
+    color: [u8; 3],
+) where
+    P: image::Pixel,
+    P::Subpixel: RedactSample,
+{
+    let paint = color.map(<P::Subpixel as RedactSample>::from_level);
     for ly in 0..h {
         for lx in 0..w {
             let m = mask.map_or(255, |mk| mk.get_pixel(lx, ly)[0] as u32);
@@ -3099,33 +3428,25 @@ fn paint_box(
                 continue;
             }
             let px = out.get_pixel_mut(x + lx, y + ly);
-            if m == 255 {
-                px[0] = color[0];
-                px[1] = color[1];
-                px[2] = color[2];
-            } else {
-                for c in 0..3 {
-                    px[c] = ((px[c] as u32 * (255 - m) + color[c] as u32 * m) / 255) as u8;
-                }
+            for (v, c) in px.channels_mut().iter_mut().zip(paint) {
+                *v = if m == 255 { c } else { v.toward(c, m) };
             }
         }
     }
-    DynamicImage::ImageRgba8(out)
 }
 
 /// Apply `redact` to each face region of `img` and write the
 /// results back in place of the face pixels (see
-/// [`put_redacted`]). Face boxes are clamped to the image;
-/// empty or fully out-of-frame boxes are skipped.
+/// [`put_redacted`]), in `img`'s own layout and depth (issue
+/// #713). Face boxes are clamped to the image; empty or
+/// fully out-of-frame boxes are skipped, and with nothing to
+/// redact the image comes back as it was.
 fn redact_faces<E>(
     img: &DynamicImage,
     faces: &[crate::ai::FaceBox],
     redact: impl Fn(&DynamicImage, &crate::ai::FaceBox) -> Result<DynamicImage, E>,
 ) -> Result<DynamicImage, E> {
-    if faces.is_empty() {
-        return Ok(img.clone());
-    }
-    let mut base = img.to_rgba8();
+    let mut base = img.clone();
     for face in faces {
         let x = face.x.min(img.width());
         let y = face.y.min(img.height());
@@ -3135,9 +3456,9 @@ fn redact_faces<E>(
             continue;
         }
         let region = img.crop_imm(x, y, w, h);
-        put_redacted(&mut base, redact(&region, face)?.to_rgba8(), x, y);
+        put_redacted_in(&mut base, redact(&region, face)?, x, y);
     }
-    Ok(DynamicImage::ImageRgba8(base))
+    Ok(base)
 }
 
 /// Crop away the uniform border: keep the bounding box of
@@ -3169,14 +3490,18 @@ fn trim_sides(img: DynamicImage, tolerance: u8, sides: [u32; 4]) -> DynamicImage
 /// does. The engine unions these boxes across the frames of
 /// an animation, so every frame takes one cut (issue #465).
 pub(crate) fn trim_box(img: &DynamicImage, tolerance: u8) -> Option<(u32, u32, u32, u32)> {
-    let converted;
-    let rgba = match img.as_rgba8() {
-        Some(rgba) => rgba,
-        None => {
-            converted = img.to_rgba8();
-            &converted
-        }
-    };
+    match img.as_rgba8() {
+        Some(rgba) => trim_box_rgba(rgba, tolerance),
+        None => trim_box_rgba(&img.to_rgba8(), tolerance),
+    }
+}
+
+/// [`trim_box`] of an RGBA8 buffer, read where it is: the
+/// animated paths survey their frames this way (issue #713).
+pub(crate) fn trim_box_rgba(
+    rgba: &image::RgbaImage,
+    tolerance: u8,
+) -> Option<(u32, u32, u32, u32)> {
     if rgba.width() == 0 || rgba.height() == 0 {
         return None;
     }

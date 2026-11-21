@@ -755,12 +755,122 @@ fn parse_studio(p: &str) -> Option<StudioSpec> {
     Some(spec)
 }
 
-/// One filter from a `filters:...` segment.
+/// One filter from a `filters:...` segment, as the engine
+/// routes it (issue #741). A [`PlainFilter`] needs nothing
+/// but the image it is given, and `crate::filters` applies
+/// it. Every other variant needs something only the engine
+/// holds: the images the server fetched, a model, the font,
+/// the bounds of the image in effect, or the request as a
+/// whole. The engine applies those itself. The engine's
+/// match names every variant, and the match in
+/// `crate::filters` every plain one, so a new filter does
+/// not compile until one side applies it.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
 /// for the tests and the pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
+    /// A filter `crate::filters` applies from the image
+    /// alone.
+    Plain(PlainFilter),
+    /// Overlay another image at (x, y) with an opacity (0-100).
+    /// The URL is the percent-decoded watermark location; the
+    /// server fetches it before the engine runs. Negative
+    /// coordinates anchor from the right/bottom edges.
+    Watermark {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+    },
+    /// Composite another image over the result with a blend
+    /// mode, at (x, y) with an opacity (0-100), optionally
+    /// scaled to `width` percent of the base image's width.
+    /// The URL is the percent-decoded overlay location; the
+    /// server fetches it before the engine runs, through the
+    /// same prefetch as watermarks. Negative coordinates
+    /// anchor from the right/bottom edges.
+    Overlay {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+        blend: BlendMode,
+        width: Option<u32>,
+    },
+    /// Remove the background with the server's segmentation
+    /// model, keeping the subject over transparency. The model
+    /// is operator-configured; the engine applies its mask.
+    RemoveBg,
+    /// Studio mode (issues #197 and #198): one filter
+    /// naming an outcome, expanded deterministically in the
+    /// engine and reported in meta. `product` composites
+    /// the subject the segmentation model finds onto a
+    /// backdrop with a synthesized contact shadow, scaled
+    /// and centered to a pad margin; `scene` keeps the
+    /// photograph's scene, reframing it on the detected
+    /// subject and applying a per-image light and color
+    /// correction.
+    Studio(StudioSpec),
+    /// Blur every detected face (privacy redaction), backed by
+    /// the server's face model.
+    BlurFaces,
+    /// Pixelate every detected face (privacy redaction),
+    /// backed by the server's face model.
+    PixelateFaces,
+    /// Blur every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    BlurClass(String),
+    /// Pixelate every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    PixelateClass(String),
+    /// Recolor every detected object of the named class to
+    /// the given RGB color (issue #175), backed by the
+    /// server's detection model. With a segment provider
+    /// configured the paint follows the object's
+    /// silhouette; without one it fills the box.
+    RecolorClass(String, [u8; 3]),
+    /// Padding for `crop:*:face`, as a fraction of the face
+    /// size added on every side. A request-wide directive,
+    /// like `no_upscale`.
+    FacePad(f32),
+    /// AI super-resolution by the given factor (2 or 4),
+    /// backed by the server's upscale model.
+    Upscale(u32),
+    /// Device-pixel-ratio directive: scale size and crop
+    /// targets by the factor (1, 1.5, 2, or 3) before the
+    /// no-upscale cap sees them.
+    Dpr(f32),
+    /// Rendered text overlaid at one of the nine grid anchors.
+    /// The text is the percent-decoded label; color is RGBA.
+    Text {
+        text: String,
+        size: u32,
+        color: [u8; 4],
+        anchor: Anchor,
+    },
+    /// Gaussian-blur the rectangle (x, y, w, h), in the
+    /// pixels of the image at the point the filter runs.
+    /// Redaction of plates, screens, documents.
+    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Pixelate the rectangle (x, y, w, h), same coordinate
+    /// convention as `BlurRegion`.
+    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Erase the rectangle (x, y, w, h) and inpaint it from
+    /// the surrounding pixels, same coordinate convention
+    /// and bounds discipline as `BlurRegion`. Backed by the
+    /// server's inpainting model (issue #176).
+    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
+}
+
+/// A filter that needs nothing but the image it is given
+/// (issue #741): a pixel filter, which `crate::filters`
+/// applies in URL order, or an encoding directive, which it
+/// records for the encoder. [`Filter::Plain`] carries it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlainFilter {
     /// Desaturate the image.
     Grayscale,
     /// Invert every channel.
@@ -866,87 +976,9 @@ pub enum Filter {
     /// counts, clamped by the engine so at least one pixel
     /// survives on each axis.
     TrimSides(u8, [u32; 4]),
-    /// Overlay another image at (x, y) with an opacity (0-100).
-    /// The URL is the percent-decoded watermark location; the
-    /// server fetches it before the engine runs. Negative
-    /// coordinates anchor from the right/bottom edges.
-    Watermark {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-    },
-    /// Composite another image over the result with a blend
-    /// mode, at (x, y) with an opacity (0-100), optionally
-    /// scaled to `width` percent of the base image's width.
-    /// The URL is the percent-decoded overlay location; the
-    /// server fetches it before the engine runs, through the
-    /// same prefetch as watermarks. Negative coordinates
-    /// anchor from the right/bottom edges.
-    Overlay {
-        url: String,
-        x: i32,
-        y: i32,
-        alpha: u8,
-        blend: BlendMode,
-        width: Option<u32>,
-    },
-    /// Remove the background with the server's segmentation
-    /// model, keeping the subject over transparency. The model
-    /// is operator-configured; the engine applies its mask.
-    RemoveBg,
-    /// Studio mode (issues #197 and #198): one filter
-    /// naming an outcome, expanded deterministically in the
-    /// engine and reported in meta. `product` composites
-    /// the subject the segmentation model finds onto a
-    /// backdrop with a synthesized contact shadow, scaled
-    /// and centered to a pad margin; `scene` keeps the
-    /// photograph's scene, reframing it on the detected
-    /// subject and applying a per-image light and color
-    /// correction.
-    Studio(StudioSpec),
     /// Keep the source ICC profile instead of converting
     /// to sRGB (`filters:keep_profile`).
     KeepProfile,
-    /// Blur every detected face (privacy redaction), backed by
-    /// the server's face model.
-    BlurFaces,
-    /// Pixelate every detected face (privacy redaction),
-    /// backed by the server's face model.
-    PixelateFaces,
-    /// Blur every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    BlurClass(String),
-    /// Pixelate every detected object of the named class
-    /// (privacy redaction), backed by the server's
-    /// detection model.
-    PixelateClass(String),
-    /// Recolor every detected object of the named class to
-    /// the given RGB color (issue #175), backed by the
-    /// server's detection model. With a segment provider
-    /// configured the paint follows the object's
-    /// silhouette; without one it fills the box.
-    RecolorClass(String, [u8; 3]),
-    /// Padding for `crop:*:face`, as a fraction of the face
-    /// size added on every side. A request-wide directive,
-    /// like `no_upscale`.
-    FacePad(f32),
-    /// AI super-resolution by the given factor (2 or 4),
-    /// backed by the server's upscale model.
-    Upscale(u32),
-    /// Device-pixel-ratio directive: scale size and crop
-    /// targets by the factor (1, 1.5, 2, or 3) before the
-    /// no-upscale cap sees them.
-    Dpr(f32),
-    /// Rendered text overlaid at one of the nine grid anchors.
-    /// The text is the percent-decoded label; color is RGBA.
-    Text {
-        text: String,
-        size: u32,
-        color: [u8; 4],
-        anchor: Anchor,
-    },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Rounded corners: radii in pixels, CSS order (top-left,
@@ -972,18 +1004,6 @@ pub enum Filter {
     Pixelate(u32),
     /// Mirror the image, horizontally or vertically.
     Flip(FlipDirection),
-    /// Gaussian-blur the rectangle (x, y, w, h), in the
-    /// pixels of the image at the point the filter runs.
-    /// Redaction of plates, screens, documents.
-    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Pixelate the rectangle (x, y, w, h), same coordinate
-    /// convention as `BlurRegion`.
-    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
-    /// Erase the rectangle (x, y, w, h) and inpaint it from
-    /// the surrounding pixels, same coordinate convention
-    /// and bounds discipline as `BlurRegion`. Backed by the
-    /// server's inpainting model (issue #176).
-    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -1620,6 +1640,9 @@ fn parse_focal_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
 /// factor no larger than [`MAX_FOCAL_ZOOM`]. The zoom is
 /// optional on input and always spelled in the canonical
 /// form, the way bare `trim` canonicalizes to `trim(10)`.
+/// Each number is a decimal rounded to the nearest `f32`,
+/// as the filter arguments are, and a negative zero is
+/// zero (issue #712).
 fn parse_focal_point(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFocalPoint(seg.to_string());
     let (point, zoom_text) = match rest.split_once(':') {
@@ -1627,8 +1650,8 @@ fn parse_focal_point(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         None => (rest, None),
     };
     let (x_text, y_text) = point.split_once('x').ok_or_else(invalid)?;
-    let x: f32 = x_text.parse().map_err(|_| invalid())?;
-    let y: f32 = y_text.parse().map_err(|_| invalid())?;
+    let x = positive_zero(x_text.parse().map_err(|_| invalid())?);
+    let y = positive_zero(y_text.parse().map_err(|_| invalid())?);
     if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
         return Err(invalid());
     }
@@ -1701,7 +1724,7 @@ fn parse_crop_align(s: &str) -> Option<Align> {
     };
     let mut classes: Vec<String> = Vec::new();
     for raw in list.split(',') {
-        let name = parse_class_name(&percent_decode(raw)?)?;
+        let name = parse_class_name(&decode_arg(raw)?)?;
         if classes.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
             continue;
         }
@@ -1920,6 +1943,15 @@ fn parse_class_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// A parsed float with its negative zero made zero (issue
+/// #712). Rust's `Display` spells `-0.0` as `-0`, so without
+/// this `saturation(-0)` (or `saturation(-1e-50)`, which
+/// rounds to it) kept a canonical spelling, and a cache key,
+/// apart from `saturation(0)`, though the two render alike.
+fn positive_zero(value: f32) -> f32 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
 /// Parse a `rotate` angle (issue #144): an optional minus,
 /// digits, and an optional fraction, with no exponent and no
 /// leading dot, so every implementation of the grammar reads
@@ -2068,6 +2100,18 @@ pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseErro
 /// lifetime).
 pub type ParsedRemainder<'a> = (Vec<Operation>, &'a str, Option<u64>, Option<u32>);
 
+/// The unix seconds after `exp:`, in image remainders and
+/// upload remainders alike: one or more ASCII digits, leading
+/// zeros allowed, no sign, within a `u64`. `seg` is the whole
+/// segment, which the error carries.
+fn parse_expiry(ts: &str, seg: &str) -> Result<u64, ParseError> {
+    let invalid = || ParseError::InvalidExpiry(seg.to_string());
+    if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    ts.parse::<u64>().map_err(|_| invalid())
+}
+
 /// Parse the operation segments off the front of the remainder,
 /// also extracting the request's metadata segments: an
 /// `exp:<unix-seconds>` expiry and a `maxage:<seconds>` cache
@@ -2086,13 +2130,7 @@ pub fn parse_operations_with_expiry(input: &str) -> Result<ParsedRemainder<'_>, 
             None => (rest, ""),
         };
         if let Some(ts) = seg.strip_prefix("exp:") {
-            if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(ParseError::InvalidExpiry(seg.to_string()));
-            }
-            expiry = Some(
-                ts.parse::<u64>()
-                    .map_err(|_| ParseError::InvalidExpiry(seg.to_string()))?,
-            );
+            expiry = Some(parse_expiry(ts, seg)?);
             rest = remaining;
             continue;
         }
@@ -2341,16 +2379,16 @@ pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec
         matches!(
             op,
             Operation::Filters(filters)
-                if filters.iter().any(|f| matches!(f, Filter::MaxBytes(_)))
+                if filters.iter().any(|f| matches!(f, Filter::Plain(PlainFilter::MaxBytes(_))))
         )
     });
     let keep_default_filter = |f: &Filter| -> bool {
         match f {
-            Filter::Format(_) => directives.explicit_format.is_none(),
-            Filter::Quality(_) => !directives.quality_directive,
-            Filter::Fill(_) => directives.fill.is_none(),
+            Filter::Plain(PlainFilter::Format(_)) => directives.explicit_format.is_none(),
+            Filter::Plain(PlainFilter::Quality(_)) => !directives.quality_directive,
+            Filter::Plain(PlainFilter::Fill(_)) => directives.fill.is_none(),
             Filter::Dpr(_) => directives.dpr.is_none(),
-            Filter::MaxBytes(_) => !url_has_max_bytes,
+            Filter::Plain(PlainFilter::MaxBytes(_)) => !url_has_max_bytes,
             _ => true,
         }
     };
@@ -2558,6 +2596,14 @@ pub struct RootRef {
     pub path: String,
 }
 
+impl RootRef {
+    /// The reference as the URL wrote it, `root:<name>/<path>`:
+    /// the source [`expand_source_root`] read it from.
+    pub fn written(&self) -> String {
+        format!("root:{}/{}", self.name, self.path)
+    }
+}
+
 /// Expand a `root:<name>/<path>` short source against the
 /// server's named source roots (issue #248), returning the
 /// expanded source and the reference as written. A source
@@ -2638,7 +2684,7 @@ pub fn expand_source_root_in_remainder(
 fn normalize_root_path(path: &str) -> Option<String> {
     let mut out: Vec<&str> = Vec::new();
     for seg in path.split('/') {
-        let decoded = percent_decode(seg)?;
+        let decoded = decode_path_segment(seg)?;
         if decoded.contains('/') || decoded.contains('\\') {
             return None;
         }
@@ -2657,9 +2703,12 @@ fn normalize_root_path(path: &str) -> Option<String> {
 }
 
 /// The `text(...)` color field: `rrggbb` (opaque) or
-/// `rrggbbaa`, as RGBA bytes.
+/// `rrggbbaa`, as RGBA bytes, every character an ASCII hex
+/// digit. Rust's integer parser also reads a leading `+`,
+/// which made `+fffff` a color (issue #712); the digit test
+/// refuses it.
 fn parse_text_color(s: &str) -> Option<[u8; 4]> {
-    if !matches!(s.len(), 6 | 8) {
+    if !matches!(s.len(), 6 | 8) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let v = u32::from_str_radix(s, 16).ok()?;
@@ -2812,25 +2861,25 @@ impl RequestDirectives {
             if let Operation::Filters(filters) = op {
                 for f in filters {
                     match f {
-                        Filter::Format(spec) => {
+                        Filter::Plain(PlainFilter::Format(spec)) => {
                             d.explicit_format = Some(spec.format);
                             d.format_options = spec.options;
                         }
-                        Filter::NoUpscale => d.no_upscale = true,
-                        Filter::Fill(color) => d.fill = Some(*color),
+                        Filter::Plain(PlainFilter::NoUpscale) => d.no_upscale = true,
+                        Filter::Plain(PlainFilter::Fill(color)) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
                         Filter::Studio(_) => d.studio = true,
                         Filter::RemoveRegion { .. } => d.remove_region = true,
-                        Filter::Radius(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Radius(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("radius")
                         }
-                        Filter::Mask(_) if d.shape_filter.is_none() => {
+                        Filter::Plain(PlainFilter::Mask(_)) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("mask")
                         }
                         Filter::Upscale(_) => d.upscale = true,
                         Filter::Dpr(factor) => d.dpr = Some(*factor),
-                        Filter::KeepProfile => d.keep_profile = true,
-                        Filter::Quality(_) => d.quality_directive = true,
+                        Filter::Plain(PlainFilter::KeepProfile) => d.keep_profile = true,
+                        Filter::Plain(PlainFilter::Quality(_)) => d.quality_directive = true,
                         Filter::Text { .. } => d.text = true,
                         Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
                         Filter::BlurClass(name)
@@ -2890,16 +2939,45 @@ impl RequestDirectives {
     }
 }
 
-/// Decode `%XX` escapes; other characters pass through. A
-/// malformed escape or non-UTF-8 result is an error.
-fn percent_decode(s: &str) -> Option<String> {
+/// Decode the `%XX` escapes of a filter argument (a class
+/// name, a watermark or overlay URL, a text label), the
+/// inverse of [`encode_arg`]; other characters pass through.
+/// An escape is `%` and two ASCII hex digits in either case,
+/// as RFC 3986 spells it, so `%+1` is malformed (issue #712):
+/// Rust's integer parser reads `+1` as hex, and the escape
+/// used to decode to U+0001. A malformed escape or a result
+/// that is not UTF-8 is an error.
+fn decode_arg(s: &str) -> Option<String> {
+    decode_escapes(s, |pair| {
+        let digit = |b: u8| char::from(b).to_digit(16);
+        Some((digit(pair[0])? * 16 + digit(pair[1])?) as u8)
+    })
+}
+
+/// Decode the `%XX` escapes of a `root:` source path segment
+/// for the climb check in [`normalize_root_path`]. A root
+/// path is source text that the expansion keeps as written,
+/// not an argument of the grammar, so it keeps the reading it
+/// has always had: the two characters after `%` are read by
+/// Rust's integer parser, which also takes `+` and one digit.
+/// [`decode_arg`] refuses that spelling in arguments; here a
+/// path that resolves today keeps resolving (issue #712).
+fn decode_path_segment(s: &str) -> Option<String> {
+    decode_escapes(s, |pair| {
+        u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()
+    })
+}
+
+/// The decoding loop of [`decode_arg`] and
+/// [`decode_path_segment`]: `byte` reads the two bytes after
+/// each `%`, and the result must be UTF-8.
+fn decode_escapes(s: &str, byte: impl Fn(&[u8]) -> Option<u8>) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hex = s.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
+            out.push(byte(bytes.get(i + 1..i + 3)?)?);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -2917,7 +2995,7 @@ fn hex3(c: [u8; 3]) -> String {
 /// or overlay URL, a class name, a text label) for the
 /// canonical form: everything outside the unreserved set
 /// is encoded, so the encoding is deterministic and
-/// `percent_decode` restores the exact string.
+/// [`decode_arg`] restores the exact string.
 fn encode_arg(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for &b in text.as_bytes() {
@@ -3186,10 +3264,23 @@ pub fn purge_key(secret: &[u8]) -> Vec<u8> {
 /// an entry planted in the disk cache or the shared
 /// bucket by anyone without the secret fails verification
 /// and reads as a miss. The key is server-internal: it
-/// signs stored entries, never URLs.
+/// signs stored entries, never URLs, so the server derives
+/// it itself rather than through the client crate (issue
+/// #712). It is the HMAC of [`ENTRY_KEY_LABEL`] under the
+/// secret, the crate's derivation for every subkey; the
+/// label begins with [`crabcrop_url::RESERVED_SEGMENT`], so
+/// no signer ever computes it as a signature. Changing it
+/// would turn every stored entry into a miss.
 pub fn entry_key(secret: &[u8]) -> Vec<u8> {
-    crabcrop_url::entry_key(secret)
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(ENTRY_KEY_LABEL.as_bytes());
+    mac.finalize().into_bytes().to_vec()
 }
+
+/// The label [`entry_key`] is derived from.
+pub const ENTRY_KEY_LABEL: &str = "crabcrop/entry-key";
 
 /// The purge signature for a target path: HMAC-SHA256 of
 /// the path alone, under the derived purge key. Delegates
@@ -3199,6 +3290,15 @@ pub fn entry_key(secret: &[u8]) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
     crabcrop_url::purge_signature(secret, target)
+}
+
+/// The expiring purge signature for a target path: HMAC of
+/// `exp:<expires>/<target>` under the derived purge key.
+/// Delegates to the crate helper; this mints, for operators
+/// and tests.
+#[allow(dead_code)]
+pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) -> String {
+    crabcrop_url::purge_signature_with_expiry(secret, target, expires)
 }
 
 /// Derive the purge-group signing key from the server
@@ -3219,6 +3319,57 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     crabcrop_url::purge_group_signature(secret, group)
 }
 
+/// The expiring purge-group signature for a cache group:
+/// HMAC of `exp:<expires>/<group>` under the derived
+/// purge-group key. Delegates to the crate helper.
+#[allow(dead_code)]
+pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u64) -> String {
+    crabcrop_url::purge_group_signature_with_expiry(secret, group, expires)
+}
+
+/// Split a purge or purge-group request remainder (what
+/// follows the signature segment) into its optional expiry
+/// and the target: the purge path, or the group name. The
+/// expiring form leads with an `exp:<unix-seconds>` segment,
+/// the upload endpoint's spelling (see
+/// [`split_upload_remainder`]), and only a leading segment
+/// is the purge's expiry.
+///
+/// An image remainder may carry `exp:` among its operations,
+/// so a plain purge minted over such a remainder can open
+/// with `exp:<n>/`. Its signature covers the same bytes as
+/// the expiring form of the rest, so it verifies either way,
+/// and it is read the one way every purge URL is: that
+/// segment is the purge's expiry. The purge evicts what it
+/// evicted before, because an image's `exp:` is not part of
+/// its cache key ([`canonical_key_form`] drops it), so the
+/// rest of the path names the same entries; from that
+/// second on it is refused as expired instead. A group
+/// name never begins with `exp:` (groups are preset names,
+/// `[A-Za-z0-9_-]`, and a name with a `/` was refused), so
+/// for the purge-group endpoint the spelling was free.
+///
+/// A sealed target signed under the key ID `exp` opens with
+/// `exp:s1.` ([`split_sealed_segment`]): that segment is the
+/// token, which the purge unseals, and never an expiry,
+/// whose seconds are digits. It stays in the target, so the
+/// plain purge URL of such a sealed URL evicts what it
+/// always did.
+///
+/// As for uploads, any other leading segment that starts
+/// with `exp:` but does not parse, or that nothing follows,
+/// is a grammar error (`invalid_expiry`), never part of the
+/// target. The signature covers the remainder exactly as
+/// presented, expiry included, so verification runs on the
+/// unsplit string.
+pub fn split_purge_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let first = rest.split_once('/').map_or(rest, |(first, _)| first);
+    if split_sealed_segment(first).is_some() {
+        return Ok((None, rest));
+    }
+    split_leading_expiry(rest)
+}
+
 /// Verify a purge signature. Purges are the server's only
 /// destructive operation, so they never honor `unsafe`
 /// (review Q3): an HMAC under the purge subkey is always
@@ -3227,7 +3378,11 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
 pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => crabcrop_url::verify(&purge_key(secret), hex_digest, target),
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(purge_key(secret)),
+            hex_digest,
+            target,
+        ),
     }
 }
 
@@ -3238,9 +3393,11 @@ pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool 
 pub fn verify_purge_group(secret: &[u8], signature: &Signature, group: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => {
-            crabcrop_url::verify(&purge_group_key(secret), hex_digest, group)
-        }
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(purge_group_key(secret)),
+            hex_digest,
+            group,
+        ),
     }
 }
 
@@ -3282,15 +3439,25 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
 /// unambiguous here because an upload name can never
 /// contain a `:` (see `crate::upload::validate_upload_name`).
 /// A leading segment that starts with `exp:` but does not
-/// parse is a grammar error, not a name. The signature
-/// covers the remainder exactly as presented, expiry
-/// included, so verification runs on the unsplit string
-/// before this is called.
+/// parse is a grammar error, not a name, and it parses as
+/// the image grammar parses it: ASCII digits only, so
+/// `exp:+9999999999` is refused here too (issue #712). The
+/// signature covers the remainder exactly as presented,
+/// expiry included, so verification runs on the unsplit
+/// string before this is called.
 pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
-    let Some((first, name)) = rest.split_once('/') else {
-        // No slash: the remainder is one segment. It is a
-        // name, unless it spells an expiry with no name
-        // after it, which is malformed.
+    split_leading_expiry(rest)
+}
+
+/// Split an optional leading `exp:<unix-seconds>` segment
+/// off a remainder, the expiring spelling the upload, purge
+/// and purge-group endpoints share. A remainder that does
+/// not open with `exp:` comes back whole.
+fn split_leading_expiry(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let Some((first, tail)) = rest.split_once('/') else {
+        // No slash: the remainder is one segment. It is
+        // what the endpoint names, unless it spells an
+        // expiry with nothing after it, which is malformed.
         if rest.starts_with("exp:") {
             return Err(ParseError::InvalidExpiry(rest.to_string()));
         }
@@ -3299,10 +3466,7 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
     let Some(ts) = first.strip_prefix("exp:") else {
         return Ok((None, rest));
     };
-    let exp: u64 = ts
-        .parse()
-        .map_err(|_| ParseError::InvalidExpiry(first.to_string()))?;
-    Ok((Some(exp), name))
+    Ok((Some(parse_expiry(ts, first)?), tail))
 }
 
 /// Verify an upload signature. Like purges, uploads are
@@ -3312,7 +3476,11 @@ pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseEr
 pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
     match signature {
         Signature::Unsafe => false,
-        Signature::Hmac(hex_digest) => crabcrop_url::verify(&upload_key(secret), hex_digest, name),
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(
+            &zeroize::Zeroizing::new(upload_key(secret)),
+            hex_digest,
+            name,
+        ),
     }
 }
 
@@ -3328,8 +3496,9 @@ pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
 /// from any other forgery attempt.
 ///
 /// Its `Debug` prints the key IDs and redacts the keys
-/// (issue #455). It is not `PartialEq`: nothing compares
-/// rings, and a derived comparison of key bytes would not be
+/// (issue #455), and the keys are zeroed when it is dropped.
+/// It is not `PartialEq`: nothing compares rings, and a
+/// derived comparison of key bytes would not be
 /// constant-time.
 #[derive(Clone)]
 pub struct Keyring {
@@ -3337,6 +3506,23 @@ pub struct Keyring {
     pub current: Vec<u8>,
     pub previous: Option<(String, Vec<u8>)>,
 }
+
+impl zeroize::Zeroize for Keyring {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.current);
+        if let Some((_, previous)) = &mut self.previous {
+            zeroize::Zeroize::zeroize(previous);
+        }
+    }
+}
+
+impl Drop for Keyring {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Keyring {}
 
 impl std::fmt::Debug for Keyring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

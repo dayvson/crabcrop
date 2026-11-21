@@ -2,8 +2,12 @@
 
 use std::path::Path;
 
+mod head_archive;
+pub(crate) use head_archive::head_archive;
 mod scratch;
 pub(crate) use scratch::{ScratchDir, scratch_dir};
+mod script;
+pub(crate) use script::write_script;
 
 /// A small deterministic generator (xorshift64*) for the
 /// tests that take random steps: a seed gives the same steps
@@ -32,47 +36,42 @@ impl Rng {
     pub(crate) fn pick<'a, T>(&mut self, of: &'a [T]) -> &'a T {
         &of[self.below(of.len())]
     }
+
+    /// `len` random bytes.
+    pub(crate) fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.step() as u8).collect()
+    }
 }
 
-/// Write `body` to `path` as an executable script, for the
-/// tests that stand a fake tool in for FFmpeg, pdftocairo
-/// or pdfinfo.
-///
-/// The bytes are written by a `/bin/sh` child, never
-/// through a descriptor of the test process (issue #523).
-/// `cargo test` runs tests on many threads, and many of
-/// them spawn tools. A child forked while this process
-/// holds the script open for writing keeps a copy of that
-/// descriptor until its exec, and Linux refuses to execute
-/// a file that any process holds open for writing: the
-/// test's own spawn then fails with ETXTBSY ("Text file
-/// busy"). Closing the file before the spawn does not
-/// help, since the copy outlives the close. Writing under
-/// a temporary name and renaming it into place does not
-/// help either: the copy refers to the file, not to its
-/// name, and the rename keeps the file. A writer in its
-/// own process holds no descriptor that a fork of this one
-/// could copy, and it has exited, its descriptors closed,
-/// before this returns.
-#[cfg(unix)]
-pub(crate) fn write_script(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    let status = std::process::Command::new("/bin/sh")
-        .args(["-c", "printf '%s' \"$2\" > \"$1\"", "write_script"])
-        .arg(path)
-        .arg(body)
-        .stdin(std::process::Stdio::null())
-        .status()
-        .expect("spawn /bin/sh to write a test script");
-    assert!(status.success(), "writing {}: {status}", path.display());
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// Elsewhere the scripts cannot run, and there is no fork
-/// to race: a plain write keeps the tests compiling.
-#[cfg(not(unix))]
-pub(crate) fn write_script(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
+/// The lengths a CRC-32 from crc32fast is compared with the
+/// table loops it replaced at (issue #737): every length to
+/// past 1 KiB, across the sizes where the crate changes method
+/// below that (16 bytes, its 128-byte fold, the 256 bytes of its
+/// AVX2 loop); the 1.5 KiB where its Arm path splits into three
+/// streams, which moves with the data's alignment; the 2 KiB of
+/// its AVX-512 loop; a byte either side of 4 KiB, 64 KiB and
+/// 1 MiB, and of the limits on the chunks crabcrop injects (the
+/// caps on an embedded profile and on an XMP packet, and the
+/// largest `iTXt` a plain packet makes, 22 bytes of header past
+/// its cap); and megabytes, the size of an IDAT.
+pub(crate) fn crc_lengths() -> Vec<usize> {
+    let mut lengths: Vec<usize> = (0..=1100).chain(1530..=1560).collect();
+    let edges = [
+        2048,
+        4096,
+        65_536,
+        1 << 20,
+        crate::color::MAX_EMBED_ICC_BYTES,
+        crate::color::MAX_XMP_BYTES,
+        crate::color::MAX_XMP_BYTES + b"XML:com.adobe.xmp\0".len() + 4,
+    ];
+    for edge in edges {
+        lengths.extend([edge - 1, edge, edge + 1]);
+    }
+    lengths.extend([3 << 20, (4 << 20) + 13]);
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths
 }
 
 #[cfg(all(test, unix))]

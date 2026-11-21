@@ -60,9 +60,10 @@ for (const v of vectors) {
     continue;
   }
   if (v.signature === undefined) {
-    // Sealed entries carry a token, not a signature; the
-    // playground does not seal (issue #255 lives in the
-    // SDKs and the CLI).
+    // Sealed entries carry a token, and purge entries a
+    // purge signature, not an image signature: the
+    // playground neither seals (issue #255 lives in the
+    // SDKs and the CLI) nor mints purge signatures.
     continue;
   }
   test(`sign vector: ${v.description}`, async () => {

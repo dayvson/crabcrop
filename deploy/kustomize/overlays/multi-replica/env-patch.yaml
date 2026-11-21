@@ -3,8 +3,9 @@
 # is the multi-replica example: uncomment and set your
 # bucket (plus CRABCROP_S3_REGION and the AWS credentials:
 # the server reads AWS_ACCESS_KEY_ID and
-# AWS_SECRET_ACCESS_KEY at startup and does not pick up
-# platform-injected role credentials) so every replica
+# AWS_SECRET_ACCESS_KEY at startup, or, with none, the
+# pod's EKS Pod Identity role; IRSA web identity tokens are
+# not used) so every replica
 # reads and writes one cache. Read the keys from a Secret,
 # as below: a value: line puts them in the Deployment as
 # plain text. Create it with

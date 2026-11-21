@@ -67,7 +67,7 @@ impl Neighbors for f32 {
     }
 }
 
-impl<T: FromStr + PartialOrd + Neighbors> Samples for Number<T> {
+impl<T: FromStr + PartialOrd + Neighbors + Stored> Samples for Number<T> {
     fn accepted(&self) -> Vec<String> {
         let mut out = vec![self.spell(&self.max)];
         if self.open {
@@ -144,7 +144,7 @@ impl Samples for Angle {
 
 /// Spellings for the rows with a sub-grammar of their own,
 /// which no kind can generate: (name, accepted, refused).
-const CUSTOM_SAMPLES: &[(&str, &[&str], &[&str])] = &[
+pub(super) const CUSTOM_SAMPLES: &[(&str, &[&str], &[&str])] = &[
     (
         "curve",
         &[
@@ -256,9 +256,9 @@ fn parse_one(text: &str) -> Result<Filter, ParseError> {
 /// was written, and only its spelling sorts it.
 fn sorted(filter: Filter) -> Filter {
     match filter {
-        Filter::Quality(Quality::PerFormat(mut entries)) => {
+        Filter::Plain(PlainFilter::Quality(Quality::PerFormat(mut entries))) => {
             entries.sort_by_key(|(format, _)| format.map(format_text));
-            Filter::Quality(Quality::PerFormat(entries))
+            Filter::Plain(PlainFilter::Quality(Quality::PerFormat(entries)))
         }
         other => other,
     }

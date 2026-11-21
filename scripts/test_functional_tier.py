@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Tests for the tier choice in .github/workflows/functional.yml.
+"""Tests for the tier choice in the functional workflow.
 
 A pull request gets the full functional tier when its diff touches a path
 the "Decide the tier" step lists, and the smoke tier otherwise. Each case
 runs that step's own shell script, read from the workflow, with git stubbed
 to print the case's diff, and reads the tier it writes to GITHUB_OUTPUT.
+The workflow is read from docs/functional-workflow.yml, the mirror that
+lands as .github/workflows/functional.yml (scripts/test_all.sh fails while
+the two differ), so a change is tested before it lands.
 Run directly: python3 scripts/test_functional_tier.py
 """
+import fnmatch
 import os
 import re
 import subprocess
@@ -14,7 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/functional.yml"
+WORKFLOW = Path(__file__).resolve().parent.parent / "docs/functional-workflow.yml"
 
 
 def tier_step_script(text):
@@ -117,6 +121,18 @@ class FunctionalTier(unittest.TestCase):
         self.assertEqual(choose_tier(["README.md"], event="push"), "full")
         self.assertEqual(choose_tier([], event="workflow_dispatch", input_tier="smoke"), "smoke")
         self.assertEqual(choose_tier(["src/server.rs"], event="workflow_dispatch", input_tier="smoke"), "smoke")
+
+    def test_every_listed_path_can_match(self):
+        # Issue #710: an arm after `src/*` listed `src/url/*`, which
+        # could never be reached, since `src/*` matches it first. Each
+        # pattern, with its stars spelled out, must reach its own arm.
+        arms = re.findall(r"^\s*([^\s()]+)\) tier=full ;;$", SCRIPT, re.M)
+        patterns = [pattern for arm in arms for pattern in arm.split("|")]
+        self.assertIn("src/*", patterns)
+        for at, pattern in enumerate(patterns):
+            example = pattern.replace("*", "x")
+            earlier = [p for p in patterns[:at] if fnmatch.fnmatchcase(example, p)]
+            self.assertEqual(earlier, [], f"{pattern} can never match: {earlier} matches {example} first")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,9 @@
 //!   URLs.
 //! - **Purge and upload signatures**: the same HMAC under
 //!   domain-separated derived subkeys, so a signature
-//!   minted for one endpoint verifies at no other.
+//!   minted for one endpoint verifies at no other. Each
+//!   has an expiring form, with an `exp:` segment inside
+//!   the signed text.
 //!
 //! Each subkey is the HMAC of a fixed label under the
 //! secret, and every label begins with the segment
@@ -29,6 +31,12 @@
 //! segment, so every signer here refuses such a remainder
 //! ([`is_reserved_remainder`]): a signature over a label
 //! would be that label's subkey.
+//!
+//! With the `zeroize` feature, off by default, the subkeys the
+//! crate derives for its own signing and sealing are overwritten
+//! with zeros when it drops them, and so is the state `hmac`,
+//! `sha2` and `aes-gcm` keep from a key. A subkey returned to the
+//! caller ([`purge_key`] and the like) is the caller's to clear.
 //!
 //! ```
 //! let url = crabcrop_url::build_url(
@@ -81,10 +89,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// The first remainder segment reserved for key derivation.
 /// Every derived subkey ([`purge_key`], [`purge_group_key`],
-/// [`upload_key`], [`seal_key`], [`entry_key`]) is the HMAC
-/// of a label such as `crabcrop/purge-key` under the secret,
-/// which is the image signature of that label. No image URL
-/// may begin with this segment (the server refuses one with
+/// [`upload_key`], [`seal_key`], and the key the server
+/// authenticates its stored cache entries with, which it
+/// derives from `crabcrop/entry-key` itself) is the HMAC of a
+/// label such as `crabcrop/purge-key` under the secret, which
+/// is the image signature of that label. No image URL may
+/// begin with this segment (the server refuses one with
 /// `400 reserved_segment`), and every signer and builder
 /// refuses a remainder that does, so no image signature is
 /// ever a subkey.
@@ -112,6 +122,36 @@ fn derive_subkey(secret: &[u8], label: &str) -> Vec<u8> {
     debug_assert!(is_reserved_remainder(label));
     hmac_sha256(secret, label.as_bytes()).to_vec()
 }
+
+/// A subkey this crate derives for its own signing or sealing,
+/// and drops when that is done. With the `zeroize` feature, its
+/// bytes are overwritten with zeros when it is dropped, before
+/// its buffer is freed; without the feature the buffer is freed
+/// as it is. A subkey returned to the caller ([`purge_key`] and
+/// the like) is the caller's to clear.
+struct Subkey(Vec<u8>);
+
+impl Subkey {
+    fn derive(secret: &[u8], label: &str) -> Self {
+        Subkey(derive_subkey(secret, label))
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Drop for Subkey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// The label [`purge_key`] is derived from.
+const PURGE_KEY_LABEL: &str = "crabcrop/purge-key";
+/// The label [`purge_group_key`] is derived from.
+const PURGE_GROUP_KEY_LABEL: &str = "crabcrop/purge-group-key";
+/// The label [`upload_key`] is derived from.
+const UPLOAD_KEY_LABEL: &str = "crabcrop/upload-key";
+/// The label [`seal_key`] is derived from.
+const SEAL_KEY_LABEL: &str = "crabcrop/seal-key";
 
 /// A signature under a derived subkey: the lowercase hex
 /// HMAC-SHA256 of `message`. The message space is the
@@ -167,14 +207,27 @@ pub fn sign_with_key_id(
     Ok(format!("{key_id}:{}", sign(secret, remainder)?))
 }
 
-/// Verify a presented signature segment against a remainder,
-/// in constant time. A segment that is not a 64-character hex
-/// SHA-256 tag fails without panicking. This is the raw check
-/// the server runs under the secret and under each subkey, so
-/// it does not refuse reserved remainders: the server refuses
-/// an image remainder that begins with [`RESERVED_SEGMENT`]
-/// before it verifies anything.
+/// Verify a presented signature tag against a remainder, in
+/// constant time. The tag is the bare hex, without a
+/// `<key-id>:` prefix, in its one canonical spelling: 64
+/// lowercase hex characters, as [`sign`] writes it and as the
+/// server's parser takes it. Anything else, an uppercase tag
+/// included, fails without panicking, so this answers what
+/// the server answers. This is the raw check the server runs
+/// under the secret and under each subkey, so it does not
+/// refuse reserved remainders: the server refuses an image
+/// remainder that begins with [`RESERVED_SEGMENT`] before it
+/// verifies anything.
 pub fn verify(secret: &[u8], signature_hex: &str, remainder: &str) -> bool {
+    // The spelling check reads only the presented tag, never
+    // the expected one, so it leaks nothing about the secret.
+    if signature_hex.len() != 64
+        || !signature_hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return false;
+    }
     let Ok(expected) = hex::decode(signature_hex) else {
         return false;
     };
@@ -191,8 +244,10 @@ pub const MAX_DIMENSION: u32 = 16383;
 
 /// Why a builder refused to produce a URL. Typed, with the
 /// offending value attached, so callers can react to the
-/// failure instead of parsing a message.
+/// failure instead of parsing a message. A later release may
+/// add a variant, so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BuildError {
     /// The named input ("operations" or "source") contains
     /// a character that cannot travel unchanged in a URL
@@ -280,15 +335,54 @@ fn write_invalid_character(
 /// purge endpoint. That holds because [`sign`] never signs
 /// the label itself (see [`RESERVED_SEGMENT`]).
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/purge-key")
+    derive_subkey(secret, PURGE_KEY_LABEL)
 }
 
 /// The purge signature for a target path (the request
 /// remainder without its signature): HMAC-SHA256 of the
 /// path under the purge subkey. This is the signature
-/// segment for `POST /purge/<signature>/<path>`.
+/// segment for `POST /purge/<signature>/<path>`. It
+/// authorizes the purge until the secret rotates; see
+/// [`purge_signature_with_expiry`] for one that stops
+/// working at a given second.
+///
+/// The server reads a leading `exp:<unix-seconds>` segment
+/// of a purge path as the purge's own expiry, so a target
+/// that opens with an image URL's `exp:` segment signs the
+/// same bytes as the expiring form of the rest, and is
+/// refused once that second is reached. An image's `exp:`
+/// is not part of its cache key: drop it from the target
+/// and the purge evicts the same entries.
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
-    sign_under_subkey(&purge_key(secret), target)
+    sign_under_subkey(&Subkey::derive(secret, PURGE_KEY_LABEL).0, target)
+}
+
+/// The signed string a purge or purge-group signature
+/// covers: the target path or group name alone, or, for the
+/// expiring form, an `exp:<unix-seconds>` segment in front
+/// of it. It is also exactly what follows the signature
+/// segment in the request path, so a URL assembled from it
+/// carries the bytes its signature covers.
+pub fn purge_signed_string(target: &str, expires: Option<u64>) -> String {
+    match expires {
+        Some(exp) => format!("exp:{exp}/{target}"),
+        None => target.to_string(),
+    }
+}
+
+/// The expiring purge signature for a target path:
+/// HMAC-SHA256 of `exp:<expires>/<target>` under the purge
+/// subkey. The request path is
+/// `POST /purge/<signature>/exp:<expires>/<target>`; the
+/// expiry sits inside the signed string, so it can neither
+/// be stripped nor extended without the secret, and the
+/// server refuses the purge once the expiry second is
+/// reached, the comparison image and upload URLs use.
+pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) -> String {
+    sign_under_subkey(
+        &purge_key(secret),
+        &purge_signed_string(target, Some(expires)),
+    )
 }
 
 /// The purge-group subkey: the raw bytes of the
@@ -300,28 +394,32 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
 /// can never be transplanted to `/purge-group`, whatever
 /// target string it was minted over (audit R2-14).
 pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/purge-group-key")
+    derive_subkey(secret, PURGE_GROUP_KEY_LABEL)
 }
 
 /// The purge-group signature for a cache group: HMAC-SHA256
 /// of the group name under the purge-group subkey. This is
 /// the signature segment for
 /// `POST /purge-group/<signature>/<group>`; the helper
-/// exists so nobody has to know the signed string.
+/// exists so nobody has to know the signed string. It
+/// authorizes the purge until the secret rotates; see
+/// [`purge_group_signature_with_expiry`] for one that stops
+/// working at a given second.
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
-    sign_under_subkey(&purge_group_key(secret), group)
+    sign_under_subkey(&Subkey::derive(secret, PURGE_GROUP_KEY_LABEL).0, group)
 }
 
-/// The cache entry subkey: the raw bytes of the
-/// HMAC-SHA256 of the domain label `crabcrop/entry-key`
-/// under the secret. Persistent cache entries are MACed
-/// under this derived key (issue #190), so a forged entry
-/// planted in the disk cache or the shared bucket fails
-/// verification and reads as a miss. The key never
-/// leaves the server: no client signature is ever
-/// computed with it.
-pub fn entry_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/entry-key")
+/// The expiring purge-group signature for a cache group:
+/// HMAC-SHA256 of `exp:<expires>/<group>` under the
+/// purge-group subkey. The request path is
+/// `POST /purge-group/<signature>/exp:<expires>/<group>`,
+/// and the server refuses the purge once the expiry second
+/// is reached, as for [`purge_signature_with_expiry`].
+pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u64) -> String {
+    sign_under_subkey(
+        &purge_group_key(secret),
+        &purge_signed_string(group, Some(expires)),
+    )
 }
 
 /// The upload subkey: the raw bytes of the HMAC-SHA256 of
@@ -331,14 +429,14 @@ pub fn entry_key(secret: &[u8]) -> Vec<u8> {
 /// for an image URL (or a purge) does not verify at the
 /// upload endpoint (issue #168).
 pub fn upload_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/upload-key")
+    derive_subkey(secret, UPLOAD_KEY_LABEL)
 }
 
 /// The upload signature for an object name: HMAC-SHA256 of
 /// the name under the upload subkey. This is the signature
 /// segment for `PUT /upload/<signature>/<name>`.
 pub fn upload_signature(secret: &[u8], name: &str) -> String {
-    sign_under_subkey(&upload_key(secret), name)
+    sign_under_subkey(&Subkey::derive(secret, UPLOAD_KEY_LABEL).0, name)
 }
 
 /// The seal subkey: the raw bytes of the HMAC-SHA256 of
@@ -351,7 +449,7 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
 /// this same derivation, and the rotation window for
 /// signatures is the rotation window for tokens.
 pub fn seal_key(secret: &[u8]) -> Vec<u8> {
-    derive_subkey(secret, "crabcrop/seal-key")
+    derive_subkey(secret, SEAL_KEY_LABEL)
 }
 
 /// The version marker that opens a sealed token segment:
@@ -378,8 +476,11 @@ pub const MAX_SEALED_REMAINDER: usize = 2048;
 /// stay well under it (see [`MAX_SEALED_REMAINDER`]).
 pub const MAX_SEALED_SEGMENT: usize = 4096;
 
-/// Why sealing or opening a sealed token failed.
+/// Why sealing or opening a sealed token failed. A later
+/// release may add a variant, so a `match` needs a wildcard
+/// arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SealError {
     /// The remainder is longer than
     /// [`MAX_SEALED_REMAINDER`] bytes. Carries its length.
@@ -392,21 +493,31 @@ pub enum SealError {
     /// path (the set is at [`validate_url_text`]), so the
     /// remainder it would seal could never be served.
     InvalidCharacter { what: &'static str, character: char },
-    /// Sealing was asked for without a secret. There is no
+    /// Sealing was asked for without a secret, which only the
+    /// deprecated [`build_sealed_url`] can do. There is no
     /// `unsafe` spelling of a token, the mirror image of how
     /// purge and upload signatures treat a null secret.
     NoSecret,
-    /// [`build_sealed_url`] assembled a remainder that begins
+    /// A sealed builder assembled a remainder that begins
     /// with [`RESERVED_SEGMENT`], which no image URL may
     /// carry: the server refuses a token whose remainder
     /// does. Carries the remainder.
     ReservedRemainder(String),
+    /// The operating system's random number generator could
+    /// not draw the nonce [`seal`] needs. Carries its error,
+    /// as text. Nothing was sealed; a retry may succeed.
+    RandomnessFailed(String),
+    /// AES-256-GCM refused to encrypt the remainder. The
+    /// cipher refuses only a message far past
+    /// [`MAX_SEALED_REMAINDER`], so this marks a bug, not an
+    /// input to correct.
+    EncryptFailed,
     /// The token did not open under the given secret. Every
     /// open failure (malformed body, wrong key, tampered
     /// bytes, unknown version) is this one value, on
     /// purpose: openers must never learn which stage failed,
     /// and servers answer all of them with one uniform
-    /// refusal.
+    /// refusal. Sealing never fails with it.
     OpenFailed,
 }
 
@@ -429,6 +540,12 @@ impl std::fmt::Display for SealError {
                 write!(f, "sealing requires a secret: there is no unsafe token")
             }
             SealError::ReservedRemainder(_) => write_reserved_remainder(f),
+            SealError::RandomnessFailed(cause) => write!(
+                f,
+                "the operating system's random number generator failed, so no nonce \
+                 could be drawn: {cause}"
+            ),
+            SealError::EncryptFailed => write!(f, "AES-256-GCM refused to encrypt the remainder"),
             SealError::OpenFailed => write!(f, "the token did not open under this secret"),
         }
     }
@@ -436,12 +553,13 @@ impl std::fmt::Display for SealError {
 
 impl std::error::Error for SealError {}
 
+/// The cipher a token seals and opens under: AES-256-GCM keyed
+/// with the seal subkey, which is dropped once the cipher holds
+/// it.
 fn seal_cipher(secret: &[u8]) -> aes_gcm::Aes256Gcm {
     use aes_gcm::KeyInit as _;
-    let key = seal_key(secret);
-    let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::try_from(key.as_slice())
-        .expect("an HMAC-SHA256 tag is 32 bytes");
-    aes_gcm::Aes256Gcm::new(&key)
+    let key = Subkey::derive(secret, SEAL_KEY_LABEL);
+    aes_gcm::Aes256Gcm::new_from_slice(&key.0).expect("an HMAC-SHA256 tag is 32 bytes")
 }
 
 /// The nonce array for a 12-byte nonce, the one length
@@ -470,7 +588,7 @@ fn seal_with_fixed_nonce(
                 aad: SEAL_AAD,
             },
         )
-        .map_err(|_| SealError::OpenFailed)?;
+        .map_err(|_| SealError::EncryptFailed)?;
     let mut body = Vec::with_capacity(12 + sealed.len());
     body.extend_from_slice(nonce);
     body.extend_from_slice(&sealed);
@@ -488,7 +606,7 @@ fn seal_with_fixed_nonce(
 /// [`seal_with_key_id`].
 pub fn seal(secret: &[u8], remainder: &str) -> Result<String, SealError> {
     let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).map_err(|_| SealError::OpenFailed)?;
+    getrandom::fill(&mut nonce).map_err(|e| SealError::RandomnessFailed(e.to_string()))?;
     seal_with_fixed_nonce(secret, &nonce, remainder)
 }
 
@@ -573,11 +691,12 @@ pub fn open_token(secret: &[u8], token: &str) -> Result<String, SealError> {
 
 /// Open a full token segment, with or without a
 /// `<key-id>:` prefix, under one secret. The key ID is
-/// routing metadata and is not consulted here: this
-/// function's question is whether this secret opens the
-/// token, the same stance [`verify`] takes toward keyed
-/// signatures. Servers route by key ID through their
-/// keyring instead.
+/// routing metadata and is not consulted here, beyond being
+/// well formed: this function's question is whether this
+/// secret opens the token. Servers route by key ID through
+/// their keyring instead. [`verify`] is not the same: it
+/// takes the bare hex tag, and a keyed signature segment
+/// fails it until the `<key-id>:` prefix is split off.
 pub fn unseal(secret: &[u8], segment: &str) -> Result<String, SealError> {
     let token = match segment.split_once(':') {
         Some((id, rest)) => {
@@ -591,19 +710,129 @@ pub fn unseal(secret: &[u8], segment: &str) -> Result<String, SealError> {
     open_token(secret, token)
 }
 
-/// Assemble a sealed crabcrop URL:
+/// A sealed crabcrop URL to build:
 /// `{base}/[<key-id>:]s1.<token>/{friendly-name}`.
+///
+/// [`SealedUrl::new`] takes what every sealed URL has (the
+/// base, the operations, and the source), the setters add
+/// what some have (an expiry, a friendly name, a key ID),
+/// and [`SealedUrl::build`] seals under a secret, which it
+/// requires: there is no `unsafe` spelling of a token.
 ///
 /// The remainder is assembled exactly as [`build_url`]
 /// assembles it (expiry segment, operations, source) and
 /// then sealed whole, pre-expansion, so the sealed and
 /// plain forms of one render are one cache entry and one
-/// purge target on the server. `name` is the cosmetic
-/// friendly name: the server never parses, validates, or
-/// authenticates it, and it is excluded from the token and
-/// the cache key; pass `None` (or an empty name) to end
-/// the URL at the token. A `None` secret is an error:
-/// there is no `unsafe` spelling of a token.
+/// purge target on the server.
+///
+/// ```
+/// use crabcrop_url::{SealedUrl, unseal};
+///
+/// let url = SealedUrl::new(
+///     "https://images.example.com",
+///     "crop:1200x630:smart/filters:format(webp)",
+///     "https://origin.internal/photo.jpg",
+/// )
+/// .expires(1893456000)
+/// .name("hero.jpg")
+/// .key_id("k2026")
+/// .build(b"your-secret")
+/// .unwrap();
+/// let path = url.strip_prefix("https://images.example.com/").unwrap();
+/// let (segment, name) = path.split_once('/').unwrap();
+/// assert!(segment.starts_with("k2026:s1."));
+/// assert_eq!(name, "hero.jpg");
+/// assert_eq!(
+///     unseal(b"your-secret", segment).unwrap(),
+///     "exp:1893456000/crop:1200x630:smart/filters:format(webp)/https://origin.internal/photo.jpg"
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedUrl<'a> {
+    base: &'a str,
+    operations: &'a str,
+    source: &'a str,
+    expires: Option<u64>,
+    name: Option<&'a str>,
+    key_id: Option<&'a str>,
+}
+
+impl<'a> SealedUrl<'a> {
+    /// A sealed URL for `operations` (verbatim, as for
+    /// [`build_url`]) on `source`, served from `base`, with no
+    /// expiry, no friendly name, and no key ID.
+    #[must_use]
+    pub fn new(base: &'a str, operations: &'a str, source: &'a str) -> Self {
+        SealedUrl {
+            base,
+            operations,
+            source,
+            expires: None,
+            name: None,
+            key_id: None,
+        }
+    }
+
+    /// Expire the URL at this unix second: an `exp:` segment
+    /// leads the sealed remainder.
+    #[must_use = "a setter returns the changed URL and leaves this one as it was"]
+    pub fn expires(self, unix_seconds: u64) -> Self {
+        SealedUrl {
+            expires: Some(unix_seconds),
+            ..self
+        }
+    }
+
+    /// The cosmetic friendly name after the token. The server
+    /// never parses, validates, or authenticates it, and it is
+    /// excluded from the token and the cache key. Without one,
+    /// or with an empty one, the URL ends at the token.
+    #[must_use = "a setter returns the changed URL and leaves this one as it was"]
+    pub fn name(self, name: &'a str) -> Self {
+        SealedUrl {
+            name: Some(name),
+            ..self
+        }
+    }
+
+    /// Stamp the token segment with a key ID, as
+    /// [`seal_with_key_id`] does: the server opens it under the
+    /// named key only.
+    #[must_use = "a setter returns the changed URL and leaves this one as it was"]
+    pub fn key_id(self, key_id: &'a str) -> Self {
+        SealedUrl {
+            key_id: Some(key_id),
+            ..self
+        }
+    }
+
+    /// Seal the remainder under `secret` and assemble the URL.
+    /// It fails with the input that can never be served (a
+    /// refused character, a reserved remainder, a remainder over
+    /// [`MAX_SEALED_REMAINDER`], an invalid key ID), or when no
+    /// nonce can be drawn.
+    pub fn build(&self, secret: &[u8]) -> Result<String, SealError> {
+        let remainder = assemble_remainder(self.operations, self.source, self.expires)?;
+        let base = self.base.trim_end_matches('/');
+        let segment = match self.key_id {
+            Some(id) => seal_with_key_id(secret, id, &remainder)?,
+            None => seal(secret, &remainder)?,
+        };
+        match self.name {
+            Some(name) if !name.is_empty() => Ok(format!("{base}/{segment}/{name}")),
+            _ => Ok(format!("{base}/{segment}")),
+        }
+    }
+}
+
+/// Assemble a sealed crabcrop URL from positional arguments:
+/// [`SealedUrl`] with `expires`, `name`, and `key_id` set when
+/// they are `Some`. A `None` secret fails with
+/// [`SealError::NoSecret`], after the inputs are checked.
+#[deprecated(
+    since = "0.14.0",
+    note = "use `SealedUrl::new(base, operations, source)`, its setters, and `build(secret)`"
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sealed_url(
     base: &str,
@@ -614,25 +843,22 @@ pub fn build_sealed_url(
     name: Option<&str>,
     key_id: Option<&str>,
 ) -> Result<String, SealError> {
-    let remainder = assemble_remainder(operations, source, expires).map_err(|e| match e {
-        BuildError::InvalidCharacter { what, character } => {
-            SealError::InvalidCharacter { what, character }
-        }
-        BuildError::ReservedRemainder(remainder) => SealError::ReservedRemainder(remainder),
-        _ => SealError::OpenFailed,
-    })?;
     let Some(secret) = secret else {
+        // The input checks answer first, as they always did.
+        assemble_remainder(operations, source, expires)?;
         return Err(SealError::NoSecret);
     };
-    let base = base.trim_end_matches('/');
-    let segment = match key_id {
-        Some(id) => seal_with_key_id(secret, id, &remainder)?,
-        None => seal(secret, &remainder)?,
-    };
-    match name {
-        Some(name) if !name.is_empty() => Ok(format!("{base}/{segment}/{name}")),
-        _ => Ok(format!("{base}/{segment}")),
+    let mut url = SealedUrl::new(base, operations, source);
+    if let Some(expires) = expires {
+        url = url.expires(expires);
     }
+    if let Some(name) = name {
+        url = url.name(name);
+    }
+    if let Some(key_id) = key_id {
+        url = url.key_id(key_id);
+    }
+    url.build(secret)
 }
 
 /// The signed string an upload signature covers: the name
@@ -661,7 +887,7 @@ pub fn upload_signed_string(name: &str, expires: Option<u64>) -> String {
 /// rotates.
 pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
     sign_under_subkey(
-        &upload_key(secret),
+        &Subkey::derive(secret, UPLOAD_KEY_LABEL).0,
         &upload_signed_string(name, Some(expires)),
     )
 }
@@ -675,16 +901,52 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
 /// #472). Builders fail loudly at build time instead of
 /// minting a URL that 403s at fetch time.
 pub fn validate_url_text(text: &str, what: &'static str) -> Result<(), BuildError> {
-    if let Some(c) = text.chars().find(|c| {
+    match refused_character(text) {
+        Some(character) => Err(BuildError::InvalidCharacter { what, character }),
+        None => Ok(()),
+    }
+}
+
+/// The first character of `text` that [`validate_url_text`]
+/// refuses.
+fn refused_character(text: &str) -> Option<char> {
+    text.chars().find(|c| {
         matches!(c, '?' | '#')
             || !c.is_ascii()
             || c.is_ascii_control()
             || *c == ' '
             || BROWSER_REWRITTEN.contains(c)
-    }) {
-        return Err(BuildError::InvalidCharacter { what, character: c });
+    })
+}
+
+/// Why [`assemble_remainder`] refused its inputs: the two
+/// refusals every builder shares, plain or sealed, which each
+/// builder reports in its own error type.
+enum RemainderError {
+    InvalidCharacter { what: &'static str, character: char },
+    Reserved(String),
+}
+
+impl From<RemainderError> for BuildError {
+    fn from(e: RemainderError) -> Self {
+        match e {
+            RemainderError::InvalidCharacter { what, character } => {
+                BuildError::InvalidCharacter { what, character }
+            }
+            RemainderError::Reserved(remainder) => BuildError::ReservedRemainder(remainder),
+        }
     }
-    Ok(())
+}
+
+impl From<RemainderError> for SealError {
+    fn from(e: RemainderError) -> Self {
+        match e {
+            RemainderError::InvalidCharacter { what, character } => {
+                SealError::InvalidCharacter { what, character }
+            }
+            RemainderError::Reserved(remainder) => SealError::ReservedRemainder(remainder),
+        }
+    }
 }
 
 /// The remainder every builder signs or seals: the expiry
@@ -698,9 +960,12 @@ fn assemble_remainder(
     operations: &str,
     source: &str,
     expires: Option<u64>,
-) -> Result<String, BuildError> {
-    validate_url_text(operations, "operations")?;
-    validate_url_text(source, "source")?;
+) -> Result<String, RemainderError> {
+    for (text, what) in [(operations, "operations"), (source, "source")] {
+        if let Some(character) = refused_character(text) {
+            return Err(RemainderError::InvalidCharacter { what, character });
+        }
+    }
     let mut remainder = String::new();
     if let Some(exp) = expires {
         remainder.push_str(&format!("exp:{exp}/"));
@@ -710,7 +975,9 @@ fn assemble_remainder(
         remainder.push('/');
     }
     remainder.push_str(source);
-    refuse_reserved(&remainder)?;
+    if is_reserved_remainder(&remainder) {
+        return Err(RemainderError::Reserved(remainder));
+    }
     Ok(remainder)
 }
 
@@ -741,22 +1008,20 @@ pub fn build_url(
 }
 
 /// [`build_url`] with a key ID stamped on the signature
-/// segment, via [`sign_with_key_id`]. With `secret` None the
-/// URL would be `unsafe` and a key ID is meaningless there,
-/// so it is rejected rather than silently dropped.
+/// segment, via [`sign_with_key_id`]. `secret` is the secret
+/// and the ID of the key it is: a keyed URL is always signed,
+/// since an `unsafe` URL has no key to name.
 pub fn build_url_with_key_id(
     base: &str,
-    secret: Option<(&[u8], &str)>,
+    secret: (&[u8], &str),
     operations: &str,
     source: &str,
     expires: Option<u64>,
 ) -> Result<String, BuildError> {
+    let (secret, key_id) = secret;
     let remainder = assemble_remainder(operations, source, expires)?;
     let base = base.trim_end_matches('/');
-    let segment = match secret {
-        Some((secret, key_id)) => sign_with_key_id(secret, key_id, &remainder)?,
-        None => return Err(BuildError::InvalidKeyId(String::new())),
-    };
+    let segment = sign_with_key_id(secret, key_id, &remainder)?;
     Ok(format!("{base}/{segment}/{remainder}"))
 }
 
@@ -787,13 +1052,46 @@ pub fn build_srcset(
 mod tests {
     use super::*;
 
+    /// The cross-language vectors, `spec/test-vectors.json` in
+    /// the crabcrop repository. The package carries its own
+    /// copy, so its tests build from the published crate,
+    /// which ships no `spec/` directory (issue #712);
+    /// [`vendored_vectors_are_the_spec_file`] holds the copy to
+    /// the spec's file in the repository.
+    const VECTORS: &str = include_str!("../tests/test-vectors.json");
+
+    /// The cache entry subkey's label, which the server
+    /// derives its entry key from: a signer refuses it like
+    /// every other label.
+    const ENTRY_KEY_LABEL: &str = "crabcrop/entry-key";
+
+    /// In the repository, the vendored vectors are the spec's
+    /// file byte for byte. A published package has no spec to
+    /// compare with, and its copy is the one the release
+    /// tested. Refresh the copy with
+    /// `cp spec/test-vectors.json crates/crabcrop-url/tests/`.
+    #[test]
+    fn vendored_vectors_are_the_spec_file() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !repo.join("spec/url-signing.md").is_file() {
+            return;
+        }
+        let spec = std::fs::read_to_string(repo.join("spec/test-vectors.json"))
+            .expect("the repository's spec/test-vectors.json");
+        assert!(
+            spec == VECTORS,
+            "crates/crabcrop-url/tests/test-vectors.json differs from spec/test-vectors.json: \
+             cp spec/test-vectors.json crates/crabcrop-url/tests/"
+        );
+    }
+
     /// The canonical cross-language vectors from
     /// `spec/test-vectors.json`, verified here against this
     /// crate (and, through the server crate's delegation,
     /// against the server's verification path).
     #[test]
     fn canonical_test_vectors() {
-        let text = include_str!("../../../spec/test-vectors.json");
+        let text = VECTORS;
         let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         let signed: Vec<&serde_json::Value> = vectors
             .iter()
@@ -811,6 +1109,42 @@ mod tests {
             );
             assert!(verify(secret.as_bytes(), signature, remainder));
             assert!(!verify(secret.as_bytes(), signature, "tampered"));
+            // One canonical spelling, as the server's parser
+            // takes it (issue #712): the uppercase spelling of
+            // the same tag is well-formed hex, and it fails.
+            let upper = signature.to_uppercase();
+            assert_ne!(upper, signature);
+            assert!(!verify(secret.as_bytes(), &upper, remainder), "{remainder}");
+        }
+    }
+
+    /// `verify` takes the canonical tag and nothing else: 64
+    /// lowercase hex characters, the bare tag with no key ID
+    /// (issue #712). Mixed case, a key-ID prefix, a short or
+    /// long tag, and non-hex all fail, without panicking.
+    #[test]
+    fn verify_takes_only_the_canonical_tag() {
+        let secret = b"verify-spelling-secret";
+        let remainder = "300x200/https://example.com/a.jpg";
+        let tag = sign(secret, remainder).unwrap();
+        assert!(verify(secret, &tag, remainder));
+        let first_letter = tag.find(|c: char| c.is_ascii_lowercase()).unwrap();
+        let mut mixed = tag.clone();
+        mixed.replace_range(
+            first_letter..=first_letter,
+            &tag[first_letter..=first_letter].to_uppercase(),
+        );
+        for bad in [
+            mixed,
+            tag.to_uppercase(),
+            format!("k2:{tag}"),
+            tag[..62].to_string(),
+            format!("{tag}00"),
+            format!("{}zz", &tag[..62]),
+            String::new(),
+            "é".repeat(32),
+        ] {
+            assert!(!verify(secret, &bad, remainder), "{bad}");
         }
     }
 
@@ -821,7 +1155,7 @@ mod tests {
     /// token must open back to its remainder.
     #[test]
     fn sealed_test_vectors() {
-        let text = include_str!("../../../spec/test-vectors.json");
+        let text = VECTORS;
         let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         let sealed: Vec<&serde_json::Value> = vectors
             .iter()
@@ -845,6 +1179,62 @@ mod tests {
         }
     }
 
+    /// The purge vectors from `spec/test-vectors.json`: each
+    /// endpoint's helper, plain or expiring, reproduces the
+    /// signature, `purge_signed_string` the signed string,
+    /// which is also what follows the signature segment in
+    /// the request path, and the expiring form is the plain
+    /// signature over that string under the endpoint's own
+    /// subkey.
+    #[test]
+    fn purge_test_vectors() {
+        type Plain = fn(&[u8], &str) -> String;
+        type Expiring = fn(&[u8], &str, u64) -> String;
+        type Subkey = fn(&[u8]) -> Vec<u8>;
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(VECTORS).unwrap();
+        let purges: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v.get("purge_signature").is_some())
+            .collect();
+        assert!(purges.len() >= 6, "the spec carries purge vectors");
+        let mut expiring = 0;
+        for v in purges {
+            let description = v["description"].as_str().unwrap();
+            let secret = v["secret"].as_str().unwrap().as_bytes();
+            let target = v["target"].as_str().unwrap();
+            let expires = v.get("expires").map(|e| e.as_u64().unwrap());
+            let signed = v["signed"].as_str().unwrap();
+            let expected = v["purge_signature"].as_str().unwrap();
+            let (plain, with_expiry, subkey): (Plain, Expiring, Subkey) =
+                match v["endpoint"].as_str().unwrap() {
+                    "purge" => (purge_signature, purge_signature_with_expiry, purge_key),
+                    "purge-group" => (
+                        purge_group_signature,
+                        purge_group_signature_with_expiry,
+                        purge_group_key,
+                    ),
+                    other => panic!("{description}: unknown endpoint {other}"),
+                };
+            assert_eq!(
+                purge_signed_string(target, expires),
+                signed,
+                "{description}"
+            );
+            let minted = match expires {
+                Some(exp) => {
+                    expiring += 1;
+                    with_expiry(secret, target, exp)
+                }
+                None => plain(secret, target),
+            };
+            assert_eq!(minted, expected, "{description}");
+            assert_eq!(plain(secret, signed), expected, "{description}");
+            assert!(verify(&subkey(secret), expected, signed), "{description}");
+            assert!(!verify(secret, expected, signed), "{description}");
+        }
+        assert!(expiring >= 3, "the spec carries expiring purge vectors");
+    }
+
     /// The refusal vectors from `spec/test-vectors.json`
     /// (issue #472): every builder refuses each input with
     /// the typed error naming the input and the character,
@@ -853,7 +1243,7 @@ mod tests {
     /// message.
     #[test]
     fn refusal_test_vectors() {
-        let text = include_str!("../../../spec/test-vectors.json");
+        let text = VECTORS;
         let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         let refusals: Vec<&serde_json::Value> = vectors
             .iter()
@@ -896,12 +1286,21 @@ mod tests {
                 }
             }
             assert!(matches!(
-                build_url_with_key_id(base, Some((b"s3cr3t", "k2")), operations, source, None),
+                build_url_with_key_id(base, (b"s3cr3t", "k2"), operations, source, None),
                 Err(BuildError::InvalidCharacter { character: c, .. }) if c == character
             ));
             assert!(
                 matches!(
-                    build_sealed_url(base, Some(b"s3cr3t"), operations, source, None, None, None),
+                    SealedUrl::new(base, operations, source).build(b"s3cr3t"),
+                    Err(SealError::InvalidCharacter { character: c, .. }) if c == character
+                ),
+                "{description}"
+            );
+            #[allow(deprecated)]
+            let shim = build_sealed_url(base, None, operations, source, None, None, None);
+            assert!(
+                matches!(
+                    shim,
                     Err(SealError::InvalidCharacter { character: c, .. }) if c == character
                 ),
                 "{description}"
@@ -922,7 +1321,7 @@ mod tests {
     /// the one message every implementation spells alike.
     #[test]
     fn reserved_test_vectors() {
-        let text = include_str!("../../../spec/test-vectors.json");
+        let text = VECTORS;
         let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         let reserved: Vec<&serde_json::Value> = vectors
             .iter()
@@ -963,32 +1362,21 @@ mod tests {
                 );
             }
             assert_eq!(
-                build_url_with_key_id(base, Some((secret, "k2")), operations, source, None),
+                build_url_with_key_id(base, (secret, "k2"), operations, source, None),
                 Err(refused.clone()),
                 "{description}"
             );
             let sealed = SealError::ReservedRemainder(remainder.to_string());
             assert_eq!(sealed.to_string(), refused.to_string());
-            for secret in [Some(secret), None] {
-                assert_eq!(
-                    build_sealed_url(base, secret, operations, source, None, None, None),
-                    Err(sealed.clone()),
-                    "{description}"
-                );
+            let url = SealedUrl::new(base, operations, source);
+            for url in [url, url.key_id("k2"), url.name("a.jpg")] {
+                assert_eq!(url.build(secret), Err(sealed.clone()), "{description}");
             }
-            assert_eq!(
-                build_sealed_url(
-                    base,
-                    Some(secret),
-                    operations,
-                    source,
-                    None,
-                    None,
-                    Some("k2")
-                ),
-                Err(sealed.clone()),
-                "{description}"
-            );
+            for secret in [Some(secret), None] {
+                #[allow(deprecated)]
+                let shim = build_sealed_url(base, secret, operations, source, None, None, None);
+                assert_eq!(shim, Err(sealed.clone()), "{description}");
+            }
             // The sealing primitive encrypts under the seal
             // subkey and computes no HMAC under the secret, so
             // it is not where the reserved segment is policed;
@@ -1013,7 +1401,9 @@ mod tests {
             ("crabcrop/purge-group-key", purge_group_key),
             ("crabcrop/upload-key", upload_key),
             ("crabcrop/seal-key", seal_key),
-            ("crabcrop/entry-key", entry_key),
+            (ENTRY_KEY_LABEL, |secret| {
+                derive_subkey(secret, ENTRY_KEY_LABEL)
+            }),
         ];
         for (label, subkey) in subkeys {
             // The derivation is unchanged: the HMAC of the
@@ -1025,8 +1415,8 @@ mod tests {
             assert_eq!(build_url(base, Some(secret), "", label, None), refused);
             let (head, tail) = label.split_once('/').unwrap();
             assert_eq!(build_url(base, Some(secret), head, tail, None), refused);
-            assert!(build_url_with_key_id(base, Some((secret, "k")), "", label, None).is_err());
-            assert!(build_sealed_url(base, Some(secret), "", label, None, None, None).is_err());
+            assert!(build_url_with_key_id(base, (secret, "k"), "", label, None).is_err());
+            assert!(SealedUrl::new(base, "", label).build(secret).is_err());
             // What does sign is never a subkey.
             for remainder in [
                 format!("exp:1/{label}"),
@@ -1261,34 +1651,20 @@ mod tests {
         assert_eq!(key.len(), 32);
         assert_ne!(key, purge_key(secret));
         assert_ne!(key, purge_group_key(secret));
-        assert_ne!(key, entry_key(secret));
+        assert_ne!(key, derive_subkey(secret, ENTRY_KEY_LABEL));
         assert_ne!(key, upload_key(secret));
         assert_ne!(key, secret.to_vec());
         assert_eq!(key, seal_key(secret));
-        // No secret, no token.
-        assert_eq!(
-            build_sealed_url(
-                "https://img.example.com",
-                None,
-                "300x200",
-                "https://example.com/a.jpg",
-                None,
-                None,
-                None,
-            ),
-            Err(SealError::NoSecret)
-        );
         // The assembled URL: token in the signature slot,
         // the friendly name after it, nothing else.
-        let url = build_sealed_url(
+        let url = SealedUrl::new(
             "https://img.example.com/",
-            Some(secret),
             "300x200",
             "https://example.com/photo.jpg",
-            Some(1893456000),
-            Some("photo.jpg"),
-            None,
         )
+        .expires(1893456000)
+        .name("photo.jpg")
+        .build(secret)
         .unwrap();
         let path = url.strip_prefix("https://img.example.com/").unwrap();
         let (segment, name) = path.split_once('/').unwrap();
@@ -1297,40 +1673,152 @@ mod tests {
             unseal(secret, segment).unwrap(),
             "exp:1893456000/300x200/https://example.com/photo.jpg"
         );
-        // No name: the URL ends at the token.
-        let bare = build_sealed_url(
-            "https://img.example.com",
-            Some(secret),
-            "300x200",
-            "https://example.com/photo.jpg",
-            None,
-            None,
-            Some("k2"),
-        )
-        .unwrap();
-        let segment = bare.strip_prefix("https://img.example.com/").unwrap();
-        assert!(segment.starts_with("k2:s1."), "{segment}");
-        assert_eq!(
-            unseal(secret, segment).unwrap(),
-            "300x200/https://example.com/photo.jpg"
-        );
-        // Unbuildable remainders refuse at build time, like
-        // the plain builders (audit P-4).
-        assert!(matches!(
-            build_sealed_url(
+        // No name, or an empty one: the URL ends at the token.
+        for url in [
+            SealedUrl::new(
                 "https://img.example.com",
-                Some(secret),
                 "300x200",
-                "https://example.com/a.jpg?w=1",
-                None,
-                None,
-                None,
+                "https://example.com/photo.jpg",
             ),
+            SealedUrl::new(
+                "https://img.example.com",
+                "300x200",
+                "https://example.com/photo.jpg",
+            )
+            .name(""),
+        ] {
+            let bare = url.key_id("k2").build(secret).unwrap();
+            let segment = bare.strip_prefix("https://img.example.com/").unwrap();
+            assert!(segment.starts_with("k2:s1."), "{segment}");
+            assert_eq!(
+                unseal(secret, segment).unwrap(),
+                "300x200/https://example.com/photo.jpg"
+            );
+        }
+        // Unbuildable remainders refuse at build time, like
+        // the plain builders (audit P-4), and so does a bad
+        // key ID.
+        let unbuildable = SealedUrl::new(
+            "https://img.example.com",
+            "300x200",
+            "https://example.com/a.jpg?w=1",
+        );
+        assert_eq!(
+            unbuildable.build(secret),
             Err(SealError::InvalidCharacter {
                 what: "source",
                 character: '?'
             })
-        ));
+        );
+        let url = SealedUrl::new("https://img.example.com", "300x200", "a.jpg");
+        assert_eq!(
+            url.key_id("has space").build(secret),
+            Err(SealError::InvalidKeyId("has space".to_string()))
+        );
+        // The sealing cap applies to the assembled remainder.
+        let long = "a".repeat(MAX_SEALED_REMAINDER);
+        let at_cap = SealedUrl::new("https://img.example.com", "", &long)
+            .build(secret)
+            .unwrap();
+        assert_eq!(unseal(secret, &unseal_shape(&at_cap)).unwrap(), long);
+        assert_eq!(
+            SealedUrl::new("https://img.example.com", "x", &long).build(secret),
+            Err(SealError::RemainderTooLong(MAX_SEALED_REMAINDER + 2))
+        );
+    }
+
+    /// The segment after the base of a sealed URL with no
+    /// friendly name: the token itself.
+    fn unseal_shape(url: &str) -> String {
+        url.strip_prefix("https://img.example.com/")
+            .unwrap()
+            .to_string()
+    }
+
+    /// The deprecated positional builder (issue #712) answers
+    /// what [`SealedUrl`] answers for the same inputs, and a
+    /// `None` secret is [`SealError::NoSecret`] once the inputs
+    /// pass their checks.
+    #[test]
+    #[allow(deprecated)]
+    fn the_positional_sealed_builder_is_the_struct_builder() {
+        let base = "https://img.example.com";
+        let secret = b"shim-secret";
+        assert_eq!(
+            build_sealed_url(base, None, "300x200", "a.jpg", None, None, None),
+            Err(SealError::NoSecret)
+        );
+        assert_eq!(
+            build_sealed_url(base, None, "300x200", "a.jpg?", None, None, None),
+            Err(SealError::InvalidCharacter {
+                what: "source",
+                character: '?'
+            })
+        );
+        let url = build_sealed_url(
+            base,
+            Some(secret),
+            "300x200",
+            "a.jpg",
+            Some(7),
+            Some("n.jpg"),
+            Some("k1"),
+        )
+        .unwrap();
+        let (segment, name) = unseal_shape(&url)
+            .split_once('/')
+            .map(|(s, n)| (s.to_string(), n.to_string()))
+            .unwrap();
+        assert_eq!(name, "n.jpg");
+        assert!(segment.starts_with("k1:s1."), "{segment}");
+        assert_eq!(unseal(secret, &segment).unwrap(), "exp:7/300x200/a.jpg");
+        // Tokens carry a fresh nonce, so compare the shape and
+        // the payload, not the bytes.
+        let built = SealedUrl::new(base, "300x200", "a.jpg")
+            .expires(7)
+            .name("n.jpg")
+            .key_id("k1")
+            .build(secret)
+            .unwrap();
+        let (built_segment, built_name) = unseal_shape(&built)
+            .split_once('/')
+            .map(|(s, n)| (s.to_string(), n.to_string()))
+            .unwrap();
+        assert_eq!(built_name, name);
+        assert_eq!(
+            unseal(secret, &built_segment).unwrap(),
+            unseal(secret, &segment).unwrap()
+        );
+    }
+
+    /// Sealing fails with its own errors, never with
+    /// [`SealError::OpenFailed`], which belongs to opening
+    /// (issue #712), and each one says what happened.
+    #[test]
+    fn seal_failures_are_not_open_failures() {
+        let messages = [
+            (
+                SealError::RandomnessFailed("no entropy source".to_string()),
+                "the operating system's random number generator failed, so no nonce could be \
+                 drawn: no entropy source",
+            ),
+            (
+                SealError::EncryptFailed,
+                "AES-256-GCM refused to encrypt the remainder",
+            ),
+            (
+                SealError::OpenFailed,
+                "the token did not open under this secret",
+            ),
+        ];
+        for (error, message) in messages {
+            assert_eq!(error.to_string(), message);
+        }
+        assert_ne!(SealError::EncryptFailed, SealError::OpenFailed);
+        assert_ne!(
+            SealError::RandomnessFailed(String::new()),
+            SealError::OpenFailed
+        );
     }
 
     #[test]
@@ -1367,22 +1855,78 @@ mod tests {
     }
 
     #[test]
-    fn derived_subkeys_are_domain_separated() {
-        // The entry MAC key is a derivation beside purge,
-        // purge-group, and upload: same secret, four
-        // unrelated keys, none of them the secret itself.
+    fn expiring_purge_signatures_cover_the_expiry() {
+        // Pinned literals, computed with Python's hmac module
+        // and with OpenSSL: the expiring form signs
+        // `exp:<expires>/` and the target under each
+        // endpoint's own subkey.
         let secret = b"test-secret";
-        let entry = entry_key(secret);
-        assert_eq!(entry.len(), 32);
-        assert_ne!(entry, purge_key(secret));
-        assert_ne!(entry, purge_group_key(secret));
-        assert_ne!(entry, upload_key(secret));
-        assert_ne!(purge_group_key(secret), upload_key(secret));
-        assert_ne!(entry, secret.to_vec());
-        // And it is deterministic: two derivations agree,
-        // so every replica holding the secret verifies
-        // the entries any other wrote.
-        assert_eq!(entry, entry_key(secret));
+        let target = "300x200/https://example.com/a.jpg";
+        let exp = 1893456000;
+        assert_eq!(purge_signed_string(target, None), target);
+        assert_eq!(
+            purge_signed_string("thumb", Some(exp)),
+            "exp:1893456000/thumb"
+        );
+        assert_eq!(
+            purge_signature_with_expiry(secret, target, exp),
+            "fb745f8bc540df658be4c4c954b49054e871bd7c6836be43edb74a34a01aacb0"
+        );
+        assert_eq!(
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            "fd5eb666f654c3046374cd6f569a23f9a0254be1f1761ee16255c217a2b40a3f"
+        );
+        // Bound to the expiry, the target and the endpoint,
+        // and never the plain signature.
+        assert_ne!(
+            purge_signature_with_expiry(secret, target, exp),
+            purge_signature_with_expiry(secret, target, exp + 1)
+        );
+        assert_ne!(
+            purge_signature_with_expiry(secret, target, exp),
+            purge_signature(secret, target)
+        );
+        assert_ne!(
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            purge_group_signature(secret, "thumb")
+        );
+        assert_ne!(
+            purge_group_signature_with_expiry(secret, "thumb", exp),
+            purge_signature_with_expiry(secret, "thumb", exp)
+        );
+        // A plain target that opens with an image URL's exp:
+        // segment signs the same bytes as the expiring form
+        // of the rest, which is why the server reads that
+        // segment as the purge's own expiry.
+        assert_eq!(
+            purge_signature(secret, &format!("exp:{exp}/{target}")),
+            purge_signature_with_expiry(secret, target, exp)
+        );
+    }
+
+    #[test]
+    fn derived_subkeys_are_domain_separated() {
+        // Purge, purge-group, and upload: same secret, three
+        // unrelated keys, none of them the secret itself. The
+        // server's entry key is a fourth, which its own tests
+        // check beside these.
+        let secret = b"test-secret";
+        let keys = [
+            purge_key(secret),
+            purge_group_key(secret),
+            upload_key(secret),
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(key.len(), 32);
+            assert_ne!(*key, secret.to_vec());
+            for other in &keys[i + 1..] {
+                assert_ne!(key, other);
+            }
+        }
+        // And each is deterministic: two derivations agree,
+        // so every replica holding the secret verifies what
+        // any other signed.
+        assert_eq!(keys[0], purge_key(secret));
     }
 
     #[test]
@@ -1617,7 +2161,7 @@ mod tests {
     fn build_url_with_key_id_places_the_segment() {
         let url = build_url_with_key_id(
             "https://img.example.com/",
-            Some((b"test-secret", "k2")),
+            (b"test-secret", "k2"),
             "300x200",
             "example.com/i.jpg",
             None,
@@ -1628,15 +2172,16 @@ mod tests {
             url,
             format!("https://img.example.com/{segment}/300x200/example.com/i.jpg")
         );
-        assert!(
+        // A bad key ID is the one refusal of its own.
+        assert_eq!(
             build_url_with_key_id(
                 "https://img.example.com",
-                None,
+                (b"test-secret", "bad id"),
                 "300x200",
                 "example.com/i.jpg",
                 None,
-            )
-            .is_err()
+            ),
+            Err(BuildError::InvalidKeyId("bad id".to_string()))
         );
     }
 }

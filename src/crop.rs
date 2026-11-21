@@ -68,7 +68,8 @@ pub struct CropTrace {
 /// The engine resizes every crop to its target, and it
 /// resamples the window straight from the frame instead of
 /// from a copy of it (issue #654); [`Uncut::into_image`] is
-/// the plain cut.
+/// the plain cut. Either way the crop keeps the frame's
+/// layout (issue #713).
 #[derive(Debug)]
 pub(crate) struct Uncut {
     pub(crate) img: DynamicImage,
@@ -81,12 +82,12 @@ impl Uncut {
         Uncut { img, window: None }
     }
 
-    /// Cut the window. A cut is RGBA8 whatever the frame's
-    /// own layout, as a crop's always was; a frame no cut
-    /// runs on comes back untouched.
+    /// Cut the window, in the frame's own layout (see
+    /// [`cut`]); a frame no cut runs on comes back
+    /// untouched.
     pub(crate) fn into_image(self) -> DynamicImage {
         match self.window {
-            Some(window) => DynamicImage::ImageRgba8(cut_rgba(&self.img, window)),
+            Some(window) => cut(&self.img, window),
             None => self.img,
         }
     }
@@ -104,45 +105,39 @@ pub(crate) fn clamp_window(
     (x, y, w.min(width - x), h.min(height - y))
 }
 
-/// The `window` of `img` as RGBA8: byte for byte
-/// `image::imageops::crop_imm(img, ..).to_image()`, which
-/// reads a `DynamicImage` one pixel at a time through its
-/// RGBA view. The two layouts nearly every source decodes to
-/// are copied by rows instead: RGB8 gains an opaque alpha,
-/// RGBA8 is copied as it is. Every other layout takes the
-/// crate's path.
-pub(crate) fn cut_rgba(img: &DynamicImage, (x, y, w, h): (u32, u32, u32, u32)) -> image::RgbaImage {
-    let (x, y, w, h) = clamp_window((x, y, w, h), (img.width(), img.height()));
-    let (left, columns) = (x as usize, w as usize);
-    let rows = (y as usize)..(y as usize + h as usize);
+/// The `window` of `img`, in `img`'s own layout: byte for
+/// byte `DynamicImage::crop_imm`, which copies a pixel at a
+/// time. The two layouts nearly every source decodes to,
+/// RGB8 and RGBA8, are copied by rows instead, into a new
+/// buffer tagged sRGB as their cut always was; every other
+/// layout takes the crate's path.
+///
+/// A crop used to cut every layout to RGBA8 (issue #713):
+/// an opaque frame gained an alpha channel, so a PNG or a
+/// JPEG XL of an opaque source carried one, and a 16-bit or
+/// float frame came out with 8 bits. The window is now the
+/// frame's pixels as they are, so an 8-bit RGB frame stays
+/// RGB, an 8-bit RGBA frame keeps the bytes its cut always
+/// had, and a gray, 16-bit or float frame keeps its layout.
+pub(crate) fn cut(img: &DynamicImage, window: (u32, u32, u32, u32)) -> DynamicImage {
+    let (x, y, w, h) = clamp_window(window, (img.width(), img.height()));
+    let rows = |raw: &[u8], channels: usize| {
+        let stride = img.width() as usize * channels;
+        let (left, columns) = (x as usize * channels, w as usize * channels);
+        let mut out = Vec::with_capacity(columns * h as usize);
+        for line in raw[y as usize * stride..(y + h) as usize * stride].chunks_exact(stride) {
+            out.extend_from_slice(&line[left..left + columns]);
+        }
+        out
+    };
     match img {
-        DynamicImage::ImageRgb8(src) if w > 0 && h > 0 => {
-            let stride = src.width() as usize * 3;
-            let lines = src.as_raw()[rows.start * stride..rows.end * stride].chunks_exact(stride);
-            let mut out = vec![0u8; columns * h as usize * 4];
-            for (dst, line) in out.chunks_exact_mut(columns * 4).zip(lines) {
-                let line = &line[left * 3..(left + columns) * 3];
-                for (d, s) in dst
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(line.as_chunks::<3>().0)
-                {
-                    *d = [s[0], s[1], s[2], 255];
-                }
-            }
-            image::RgbaImage::from_raw(w, h, out).expect("cut size")
-        }
-        DynamicImage::ImageRgba8(src) if w > 0 && h > 0 => {
-            let stride = src.width() as usize * 4;
-            let lines = src.as_raw()[rows.start * stride..rows.end * stride].chunks_exact(stride);
-            let mut out = Vec::with_capacity(columns * h as usize * 4);
-            for line in lines {
-                out.extend_from_slice(&line[left * 4..(left + columns) * 4]);
-            }
-            image::RgbaImage::from_raw(w, h, out).expect("cut size")
-        }
-        _ => image::imageops::crop_imm(img, x, y, w, h).to_image(),
+        DynamicImage::ImageRgb8(src) if w > 0 && h > 0 => DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(w, h, rows(src.as_raw(), 3)).expect("cut size"),
+        ),
+        DynamicImage::ImageRgba8(src) if w > 0 && h > 0 => DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(w, h, rows(src.as_raw(), 4)).expect("cut size"),
+        ),
+        _ => img.crop_imm(x, y, w, h),
     }
 }
 

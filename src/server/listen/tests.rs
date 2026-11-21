@@ -22,7 +22,8 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ConnectionLimits, Frames, Running, Sending, Watch, serve_connection, serve_connections,
+    ClientKey, ConnectionLimits, Frames, RequestsInFlight, Running, Sending, Watch, bind_listener,
+    serve_connection, serve_connections,
 };
 use crate::test_support::Rng;
 
@@ -44,8 +45,15 @@ async fn start(
         header_timeout,
         idle_timeout,
         max_connections: 64,
+        per_client: None,
     };
-    let served = tokio::spawn(serve_connections(listener, router, limits, stop.clone()));
+    let served = tokio::spawn(serve_connections(
+        listener,
+        router,
+        limits,
+        stop.clone(),
+        RequestsInFlight::default(),
+    ));
     (addr, stop, served)
 }
 
@@ -463,6 +471,102 @@ async fn stopping_closes_idle_connections_and_waits_for_requests_in_flight() {
     assert!(TcpStream::connect(addr).await.is_err());
 }
 
+#[test]
+fn a_request_counts_in_flight_until_its_body_is_sent_or_it_is_dropped() {
+    // Issue #715: a shutdown that stops waiting at its
+    // deadline says how many requests it cut off. One count
+    // spans every connection of the loop, and a request
+    // counts from its head until its response body is sent,
+    // or until its handler or its body is dropped unfinished.
+    let in_flight = RequestsInFlight::default();
+    let limits = ConnectionLimits {
+        header_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+        max_connections: 2,
+        per_client: None,
+    };
+    let one = Arc::new(Watch::new(limits, in_flight.clone()));
+    let two = Arc::new(Watch::new(limits, in_flight.clone()));
+    assert_eq!(in_flight.count(), 0);
+    let answered = one.request(Version::HTTP_11);
+    let dropped = two.request(Version::HTTP_11);
+    let multiplexed = two.request(Version::HTTP_2);
+    assert_eq!(in_flight.count(), 3);
+    // Answered, the request counts while its body is sent.
+    let sending = answered.answered();
+    assert_eq!(in_flight.count(), 3);
+    drop(sending);
+    assert_eq!(in_flight.count(), 2);
+    // A handler dropped unanswered: its client left.
+    drop(dropped);
+    assert_eq!(in_flight.count(), 1);
+    drop(multiplexed.answered());
+    assert_eq!(in_flight.count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_ipv6_listener_takes_ipv4_too_or_says_the_host_has_no_ipv6() {
+    // Issue #715: `CRABCROP_BIND=::` listens with
+    // IPV6_V6ONLY off, so it takes IPv4 connections too
+    // whatever the host's default. A host without IPv6
+    // cannot make the socket, and the error says what to
+    // set instead; that is the half this test runs there.
+    let listener = match bind_listener("[::]:0".parse().unwrap()).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            assert!(
+                std::net::TcpListener::bind("[::]:0").is_err(),
+                "the host binds [::], but this bind failed: {e}"
+            );
+            assert!(
+                e.to_string().ends_with(
+                    "; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+                ),
+                "{e}"
+            );
+            eprintln!("skipping the dual-stack half: this host has no IPv6");
+            return;
+        }
+    };
+    assert!(!rustix::net::sockopt::ipv6_v6only(&listener).unwrap());
+    let port = listener.local_addr().unwrap().port();
+    let ipv4 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (_, peer) = listener.accept().await.unwrap();
+    assert_eq!(peer.ip().to_canonical(), ipv4.local_addr().unwrap().ip());
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        let ipv6 = TcpStream::connect(("::1", port)).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.ip(), ipv6.local_addr().unwrap().ip());
+    }
+    // An IPv4 address binds as it always has.
+    let ipv4_only = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    assert!(ipv4_only.local_addr().unwrap().is_ipv4());
+}
+
+#[cfg(unix)]
+#[test]
+fn only_a_host_without_ipv6_is_told_to_bind_ipv4() {
+    // Issue #715: the hint is for the one failure that means
+    // the host has no IPv6. A socket refused for another
+    // reason, such as a full file table, keeps its own
+    // message, which a hint about IPv6 would only mislead.
+    let errno = |e: rustix::io::Errno| std::io::Error::from_raw_os_error(e.raw_os_error());
+    let no_ipv6 = super::with_no_ipv6_hint(errno(rustix::io::Errno::AFNOSUPPORT));
+    let plain = errno(rustix::io::Errno::AFNOSUPPORT).to_string();
+    assert_eq!(
+        no_ipv6.to_string(),
+        format!(
+            "{plain}; this host has no IPv6: set CRABCROP_BIND to an IPv4 address, such as 0.0.0.0"
+        )
+    );
+    for other in [rustix::io::Errno::MFILE, rustix::io::Errno::NOBUFS] {
+        let e = super::with_no_ipv6_hint(errno(other));
+        assert_eq!(e.raw_os_error(), Some(other.raw_os_error()), "{e}");
+        assert!(!e.to_string().contains("IPv6"), "{e}");
+    }
+}
+
 /// The whole request head the keep-alive tests send.
 const GET_ROOT: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
@@ -472,6 +576,99 @@ async fn one_request(stream: &mut TcpStream) {
     let (head, body) = read_response(stream).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(body, "ok");
+}
+
+/// Connect to `addr` from the local address `from`, or
+/// `None` when this host cannot bind it.
+async fn connect_from(from: std::net::IpAddr, addr: SocketAddr) -> Option<TcpStream> {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(SocketAddr::new(from, 0)).ok()?;
+    Some(socket.connect(addr).await.unwrap())
+}
+
+#[tokio::test]
+async fn a_client_past_its_share_is_closed_and_other_clients_are_served() {
+    // With a share of 2, a client's third connection is
+    // closed unanswered while its first two stay open and
+    // keep being served; once it closes one, it may open
+    // another. Off by default (`start` passes none).
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let limits = ConnectionLimits {
+        header_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+        max_connections: 64,
+        per_client: Some(2),
+    };
+    tokio::spawn(serve_connections(
+        listener,
+        router(),
+        limits,
+        stop.clone(),
+        RequestsInFlight::default(),
+    ));
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    one_request(&mut first).await;
+    one_request(&mut second).await;
+    let mut third = TcpStream::connect(addr).await.unwrap();
+    let _ = third.write_all(GET_ROOT).await;
+    assert!(
+        closed_within(&mut third, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "the third connection was not closed"
+    );
+    one_request(&mut first).await;
+    one_request(&mut second).await;
+    // Another client is not held to the first one's share.
+    // All of 127/8 is the loopback on Linux; elsewhere only
+    // 127.0.0.1 may be configured, and this part is skipped.
+    let other = std::net::IpAddr::from([127, 0, 0, 2]);
+    if let Some(mut other) = connect_from(other, addr).await {
+        one_request(&mut other).await;
+    }
+    drop(first);
+    // The server sees the close once it reads the socket:
+    // retry until the freed place is taken.
+    let mut fourth = None;
+    for _ in 0..50 {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut answer = [0u8; 12];
+        if stream.write_all(GET_ROOT).await.is_ok() && stream.read_exact(&mut answer).await.is_ok()
+        {
+            assert_eq!(&answer, b"HTTP/1.1 200");
+            fourth = Some(stream);
+            break;
+        }
+        sleep(ms(20)).await;
+    }
+    assert!(fourth.is_some(), "the freed place was never given out");
+    stop.cancel();
+}
+
+#[test]
+fn a_client_is_an_ipv4_address_or_an_ipv6_slash_64() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    let mapped = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 7).to_ipv6_mapped());
+    assert_eq!(ClientKey::of(v4), ClientKey::of(mapped));
+    assert_ne!(
+        ClientKey::of(v4),
+        ClientKey::of(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)))
+    );
+    let host: Ipv6Addr = "2001:db8:1:2::1".parse().unwrap();
+    let same_net: Ipv6Addr = "2001:db8:1:2:ffff:ffff:ffff:fffe".parse().unwrap();
+    let next_net: Ipv6Addr = "2001:db8:1:3::1".parse().unwrap();
+    assert_eq!(
+        ClientKey::of(IpAddr::V6(host)),
+        ClientKey::of(IpAddr::V6(same_net))
+    );
+    assert_ne!(
+        ClientKey::of(IpAddr::V6(host)),
+        ClientKey::of(IpAddr::V6(next_net))
+    );
 }
 
 #[tokio::test]
@@ -702,6 +899,7 @@ async fn a_keep_alive_request_polls_its_connection_once() {
         header_timeout: Duration::from_secs(30),
         idle_timeout: Duration::from_secs(30),
         max_connections: 1,
+        per_client: None,
     };
     let slot = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
     let polls = Arc::new(AtomicUsize::new(0));
@@ -713,6 +911,7 @@ async fn a_keep_alive_request_polls_its_connection_once() {
             limits,
             CancellationToken::new(),
             slot,
+            RequestsInFlight::default(),
         )),
         polls: Arc::clone(&polls),
     });
@@ -841,11 +1040,15 @@ struct Driven {
 
 impl Driven {
     fn new(header_timeout: Duration, idle_timeout: Duration) -> Self {
-        let watch = Arc::new(Watch::new(ConnectionLimits {
-            header_timeout,
-            idle_timeout,
-            max_connections: 1,
-        }));
+        let watch = Arc::new(Watch::new(
+            ConnectionLimits {
+                header_timeout,
+                idle_timeout,
+                max_connections: 1,
+                per_client: None,
+            },
+            RequestsInFlight::default(),
+        ));
         let closed = Arc::new(Mutex::new(None));
         let (watching, closing) = (Arc::clone(&watch), Arc::clone(&closed));
         tokio::spawn(async move {
