@@ -94,7 +94,7 @@ jobs:
         with:
           path: ${{ env.AI_ASSETS }}
           # Bump the trailing version when any pin below changes.
-          key: ai-assets-v2-ort1.31.0-u2netp309c84-yunet8f238-yoloabc0dd-clip583fd1-bus-c02019-mod971a21-lama7df918-samenc51e08-samdec2542b8-ocrdet090f04-ocrrec6f3272-dictb5f2bf-aesb32c7b14c-aesl142cd4e6
+          key: ai-assets-v3-ort1.31.0-nuget7e35fd-u2netp309c84-yunet8f238-yoloabc0dd-clip583fd1-bus-c02019-mod971a21-lama7df918-samenc51e08-samdec2542b8-ocrdet090f04-ocrrec6f3272-dictb5f2bf-aesb32c7b14c-aesl142cd4e6
 
       - name: Download the pinned assets
         run: |
@@ -107,8 +107,11 @@ jobs:
             fi
           }
           # ONNX Runtime 1.31.0 and u2netp + YuNet: the same URLs
-          # and pins as Dockerfile.ai.
-          fetch onnxruntime.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz
+          # and pins as Dockerfile.ai. ONNX Runtime comes from its
+          # NuGet package (issue #733): its linux-x64 library is
+          # byte for byte the one the GitHub release tarball
+          # carried, so the library's pin below is unchanged.
+          fetch onnxruntime.nupkg https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.31.0/microsoft.ml.onnxruntime.1.31.0.nupkg
           fetch u2netp.onnx https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx
           fetch yunet.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
           # YOLOv8n: the exact export the tests were built against.
@@ -155,8 +158,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -s "$AI_ASSETS/libonnxruntime.so" ]; then
-            tar -xzf "$AI_ASSETS/onnxruntime.tgz" -C "$AI_ASSETS"
-            cp "$AI_ASSETS/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0" "$AI_ASSETS/libonnxruntime.so"
+            unzip -p "$AI_ASSETS/onnxruntime.nupkg" runtimes/linux-x64/native/libonnxruntime.so > "$AI_ASSETS/libonnxruntime.so"
           fi
 
       - name: Verify asset checksums
@@ -164,7 +166,7 @@ jobs:
           set -euo pipefail
           cd "$AI_ASSETS"
           sha256sum -c - <<'EOF'
-          cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57  onnxruntime.tgz
+          7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b  onnxruntime.nupkg
           469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e  libonnxruntime.so
           309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  u2netp.onnx
           8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  yunet.onnx
