@@ -6,7 +6,7 @@ use image::imageops::FilterType;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, collect_outputs};
+use super::session::{build_session, collect_outputs, lock_model};
 use super::{AiError, FocalProvider};
 
 /// Focal point backed by a declared heatmap model (issue
@@ -81,7 +81,7 @@ impl OnnxFocalProvider {
             input.into_boxed_slice(),
         ))
         .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.session, "the focal model's session");
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;

@@ -20,6 +20,12 @@ not where the list says (a pin count that changed, a field gone) stops
 the bump before anything is written. The dav1d pin in
 scripts/build_dav1d.sh is dav1d's own version, not a release site, so
 the bump leaves it; check_versions.py reads it against the docs.
+
+A pin of the release's commit (version_sites.RELEASE_COMMITS: the
+benchmark harness's CRABCROP_COMMIT) is emptied when the bump moves the
+version of its file, since the commit the new tag will name does not
+exist yet; benchmark/setup.sh then builds the commit the tag names, and
+refuses to run until the tag exists (issue #711).
 """
 import argparse
 import re
@@ -39,6 +45,10 @@ def main(argv=None):
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
         raise SystemExit("usage: bump_version.py X.Y.Z [--date YYYY-MM-DD] [--dry-run]")
     version = args.version
+    # The commit pins that hold a commit now, which the bump empties
+    # when it moves their file; one already empty is not reported.
+    commit_rows, _ = version_sites.check_commits()
+    pinned = [site for values, site in commit_rows if values and any(values)]
     changed, problems = version_sites.bump(version)
     try:
         changelog = assemble_changelog.plan(version_sites.ROOT, version, args.date)
@@ -55,6 +65,13 @@ def main(argv=None):
         else:
             (version_sites.ROOT / rel).write_text(text, encoding="utf-8")
             print(f"updated {rel}")
+    for site in pinned:
+        text = changed.get(site.path)
+        if text is not None and not any(text[start:end] for start, end in site.locate(text)):
+            print(
+                f"{'would empty' if args.dry_run else 'emptied'} {site.what} in {site.path}: "
+                "pin the tag's commit there once it exists"
+            )
     for line in assemble_changelog.apply(version_sites.ROOT, changelog, args.dry_run):
         print(line)
     if args.dry_run:

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crabcrop::svg::{WORKER_ARG, WorkerCommand, prepare, screen};
+use crabcrop::svg::{DEFAULT_WORKER_ADDRESS_SPACE, WORKER_ARG, WorkerCommand, prepare, screen};
 
 // Not every shared item is used here.
 #[allow(dead_code)]
@@ -384,6 +384,7 @@ fn the_worker_renders_what_the_process_renders() {
     let worker = WorkerCommand {
         program: PathBuf::from(env!("CARGO_BIN_EXE_crabcrop")),
         args: vec![WORKER_ARG.into()],
+        max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
     };
     for document in ordinary_documents() {
         let screened = screen(document.as_bytes()).unwrap();

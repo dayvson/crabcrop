@@ -205,6 +205,16 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
 
     assert.equal(await client.call("purge_result", { path: remainder }), "purged 1");
     assert.equal(await client.call("purge_result", { path: remainder }), "purged 0");
+
+    // An expiring purge URL purges before its second and is
+    // refused from it, by the server, with nothing evicted.
+    await (await fetch(url)).arrayBuffer();
+    const now = Math.floor(Date.now() / 1000);
+    assert.equal(
+      await client.call("purge_result", { path: remainder, expires: now - 1 }),
+      "purge failed: HTTP 403: signature expired",
+    );
+    assert.equal(await client.call("purge_result", { path: remainder, expires: now + 3600 }), "purged 1");
   } finally {
     mcp.kill();
     fixtureServer.kill();
@@ -549,6 +559,58 @@ test("purge_result POSTs only to /purge/ under CRABCROP_BASE, whatever the base 
     }
   } finally {
     for (const client of clients) client.child.kill();
+    recorder.close();
+  }
+});
+
+test("purge_result sends an expiring purge URL with expires, and drops an image's own exp:", { timeout: 60000 }, async () => {
+  const { createServer } = await import("node:http");
+  const hits = [];
+  const recorder = createServer((req, res) => {
+    hits.push(`${req.method} ${req.url}`);
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("purged 1");
+  });
+  await new Promise((resolve) => recorder.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${recorder.address().port}`;
+  const secret = "mcp-test-secret-0123456";
+  const client = await startMcp({ ...process.env, CRABCROP_BASE: origin, CRABCROP_SECRET: secret });
+  // The purge signature, computed here from the spec: the
+  // HMAC of the signed string under the secret's purge
+  // subkey.
+  const purgeKey = createHmac("sha256", secret).update("crabcrop/purge-key").digest();
+  const sig = (signed) => createHmac("sha256", purgeKey).update(signed).digest("hex");
+  const path = "300x200/https://example.com/a.jpg";
+  const exp = 1893456000;
+  try {
+    const list = await client.request("tools/list", {});
+    const purge = list.tools.find((tool) => tool.name === "purge_result");
+    assert.equal(purge.inputSchema.properties.expires.type, "number");
+    // The expiry follows the signature segment, inside the
+    // signed string.
+    assert.equal(await client.call("purge_result", { path, expires: exp }), "purged 1");
+    // An image URL's own exp: in front of the path is not
+    // the purge's expiry: it is dropped, with or without an
+    // expiry of the purge's own.
+    assert.equal(await client.call("purge_result", { path: `exp:5/${path}`, expires: exp }), "purged 1");
+    assert.equal(await client.call("purge_result", { path: `exp:5/exp:6/${path}` }), "purged 1");
+    // What the server would not read as an expiry stays.
+    assert.equal(await client.call("purge_result", { path: `exp:soon/${path}` }), "purged 1");
+    assert.deepEqual(hits, [
+      `POST /purge/${sig(`exp:${exp}/${path}`)}/exp:${exp}/${path}`,
+      `POST /purge/${sig(`exp:${exp}/${path}`)}/exp:${exp}/${path}`,
+      `POST /purge/${sig(path)}/${path}`,
+      `POST /purge/${sig(`exp:soon/${path}`)}/exp:soon/${path}`,
+    ]);
+    // An expiry the server cannot read is refused before any
+    // request.
+    for (const expires of [1.5, -1, "1893456000"]) {
+      const out = await client.call("purge_result", { path, expires });
+      assert.match(out, /^error: (expires must be|argument expires must be a number)/, String(expires));
+    }
+    assert.equal(hits.length, 4);
+  } finally {
+    client.child.kill();
     recorder.close();
   }
 });

@@ -537,11 +537,9 @@ fn concurrent_face_detections_share_the_memo_safely() {
 
 #[test]
 fn without_a_memo_every_face_detection_runs_the_model() {
-    // A provider whose session lock is poisoned leaves its
-    // memo out, so that every detection reaches the lock and
-    // fails there as it always did. Without a memo nothing
-    // is looked up and nothing is remembered: a frame the
-    // memo knows runs the model again.
+    // Without a memo nothing is looked up and nothing is
+    // remembered: a frame the memo knows runs the model
+    // again.
     let memo = DetectionMemo::new();
     let runs = std::cell::Cell::new(0);
     let img = DynamicImage::ImageRgb8(noise_rgb(120, 90, 65));
@@ -551,14 +549,52 @@ fn without_a_memo_every_face_detection_runs_the_model() {
     assert_eq!(runs.get(), 2, "a detection without the memo did not run");
     // The model's failure goes out, although the memo could
     // have answered.
-    let failed = detect_faces(None, &img, |_input| Err(AiError::LockPoisoned));
-    assert_eq!(failed, Err(AiError::LockPoisoned));
+    let failure = AiError::Inference("inference failed: boom".to_string());
+    let failed = detect_faces(None, &img, |_input| Err(failure.clone()));
+    assert_eq!(failed, Err(failure));
     // And a frame detected without the memo is not in it.
     let other = DynamicImage::ImageRgb8(noise_rgb(120, 90, 66));
     detect_faces(None, &other, fake_yunet(&runs)).unwrap();
     assert_eq!(runs.get(), 3);
     detect_faces(Some(&memo), &other, fake_yunet(&runs)).unwrap();
     assert_eq!(runs.get(), 4);
+}
+
+/// Issue #715 with the real model: a request that
+/// panicked while it held the session's lock poisoned it,
+/// and the provider then left its memo out and failed
+/// every detection at the lock. Now a frame the memo
+/// knows is answered from it, and the next frame that
+/// runs the model takes the session back and gets the
+/// boxes a healthy session gives.
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_FACE_MODEL=...
+/// cargo test -- --ignored face_detection_takes_back_a_session_a_panic_poisoned
+#[test]
+#[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+fn face_detection_takes_back_a_session_a_panic_poisoned() {
+    let (Some(dylib), Some(model)) = (
+        crate::ai::env_or_skip("CRABCROP_TEST_ORT_DYLIB"),
+        crate::ai::env_or_skip("CRABCROP_TEST_FACE_MODEL"),
+    ) else {
+        return;
+    };
+    let portrait =
+        image::load_from_memory(include_bytes!("../../../tests/fixtures/portrait.jpg")).unwrap();
+    let flipped = portrait.fliph();
+    let healthy = OnnxFaceProvider::load(Some(&dylib), &model).unwrap();
+    let want = healthy.detect(&flipped).unwrap();
+    assert!(!want.is_empty(), "the flipped portrait has a face");
+    let provider = OnnxFaceProvider::load(Some(&dylib), &model).unwrap();
+    let remembered = provider.detect(&portrait).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _session = provider.session.lock().unwrap();
+        panic!("a panic while the session is held");
+    }));
+    assert!(panicked.is_err());
+    assert!(provider.session.is_poisoned());
+    assert_eq!(provider.detect(&portrait).unwrap(), remembered);
+    assert_eq!(provider.detect(&flipped).unwrap(), want);
+    assert!(!provider.session.is_poisoned());
 }
 
 /// The memo with the real model: a repeat gets the boxes

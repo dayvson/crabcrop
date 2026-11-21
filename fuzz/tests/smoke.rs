@@ -6,14 +6,15 @@
 //! targets. Bounded and fast, so it belongs on the local
 //! checklist (scripts/test_all.sh); the open-ended fuzzing
 //! itself runs under cargo-fuzz on a nightly toolchain, every
-//! night in .github/workflows/fuzz.yml (see fuzz/README.md).
+//! night in .github/workflows/fuzz.yml once the owner enables
+//! that workflow (see fuzz/README.md, issue #710).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crabcrop_fuzz::ChainOutcome;
 use crabcrop_fuzz::engine::EngineError;
-use crabcrop_fuzz::url::{self, Align, Filter, Operation};
+use crabcrop_fuzz::url::{self, Align, Filter, Operation, PlainFilter};
 
 fn corpus_inputs() -> Vec<String> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/parse_request");
@@ -76,32 +77,32 @@ fn op_families(op: &Operation, out: &mut BTreeSet<&'static str>) {
 
 fn filter_family(filter: &Filter) -> &'static str {
     match filter {
-        Filter::Grayscale => "grayscale",
-        Filter::Invert => "invert",
-        Filter::Blur(_) => "blur",
-        Filter::Brighten(_) => "brighten",
-        Filter::Contrast(_) => "contrast",
-        Filter::Gamma(_) => "gamma",
-        Filter::Exposure(_) => "exposure",
-        Filter::HighlightsShadows(..) => "highlights_shadows",
-        Filter::Vibrance(_) => "vibrance",
-        Filter::HueRotate(_) => "huerotate",
-        Filter::Sharpen(_) => "sharpen",
-        Filter::Saturation(_) => "saturation",
-        Filter::Rgb(..) => "rgb",
-        Filter::Curve(..) => "curve",
-        Filter::Convolution(..) => "convolution",
-        Filter::Noise(_) => "noise",
-        Filter::Equalize => "equalize",
-        Filter::Enhance => "enhance",
-        Filter::Rotate(_) => "rotate",
-        Filter::Trim(_) => "trim",
-        Filter::TrimSides(..) => "trim(sides)",
+        Filter::Plain(PlainFilter::Grayscale) => "grayscale",
+        Filter::Plain(PlainFilter::Invert) => "invert",
+        Filter::Plain(PlainFilter::Blur(_)) => "blur",
+        Filter::Plain(PlainFilter::Brighten(_)) => "brighten",
+        Filter::Plain(PlainFilter::Contrast(_)) => "contrast",
+        Filter::Plain(PlainFilter::Gamma(_)) => "gamma",
+        Filter::Plain(PlainFilter::Exposure(_)) => "exposure",
+        Filter::Plain(PlainFilter::HighlightsShadows(..)) => "highlights_shadows",
+        Filter::Plain(PlainFilter::Vibrance(_)) => "vibrance",
+        Filter::Plain(PlainFilter::HueRotate(_)) => "huerotate",
+        Filter::Plain(PlainFilter::Sharpen(_)) => "sharpen",
+        Filter::Plain(PlainFilter::Saturation(_)) => "saturation",
+        Filter::Plain(PlainFilter::Rgb(..)) => "rgb",
+        Filter::Plain(PlainFilter::Curve(..)) => "curve",
+        Filter::Plain(PlainFilter::Convolution(..)) => "convolution",
+        Filter::Plain(PlainFilter::Noise(_)) => "noise",
+        Filter::Plain(PlainFilter::Equalize) => "equalize",
+        Filter::Plain(PlainFilter::Enhance) => "enhance",
+        Filter::Plain(PlainFilter::Rotate(_)) => "rotate",
+        Filter::Plain(PlainFilter::Trim(_)) => "trim",
+        Filter::Plain(PlainFilter::TrimSides(..)) => "trim(sides)",
         Filter::Watermark { .. } => "watermark",
         Filter::Overlay { .. } => "overlay",
         Filter::RemoveBg => "removebg",
         Filter::Studio(_) => "studio",
-        Filter::KeepProfile => "keep_profile",
+        Filter::Plain(PlainFilter::KeepProfile) => "keep_profile",
         Filter::BlurFaces => "blurfaces",
         Filter::PixelateFaces => "pixelatefaces",
         Filter::BlurClass(_) => "blurclass",
@@ -111,23 +112,23 @@ fn filter_family(filter: &Filter) -> &'static str {
         Filter::Upscale(_) => "upscale",
         Filter::Dpr(_) => "dpr",
         Filter::Text { .. } => "text",
-        Filter::Fill(_) => "fill",
-        Filter::Radius(_) => "radius",
-        Filter::Border(..) => "border",
-        Filter::Mask(_) => "mask",
-        Filter::Sepia => "sepia",
-        Filter::Duotone(..) => "duotone",
-        Filter::Monochrome(_) => "monochrome",
-        Filter::Pixelate(_) => "pixelate",
-        Filter::Flip(_) => "flip",
+        Filter::Plain(PlainFilter::Fill(_)) => "fill",
+        Filter::Plain(PlainFilter::Radius(_)) => "radius",
+        Filter::Plain(PlainFilter::Border(..)) => "border",
+        Filter::Plain(PlainFilter::Mask(_)) => "mask",
+        Filter::Plain(PlainFilter::Sepia) => "sepia",
+        Filter::Plain(PlainFilter::Duotone(..)) => "duotone",
+        Filter::Plain(PlainFilter::Monochrome(_)) => "monochrome",
+        Filter::Plain(PlainFilter::Pixelate(_)) => "pixelate",
+        Filter::Plain(PlainFilter::Flip(_)) => "flip",
         Filter::BlurRegion { .. } => "blur_region",
         Filter::PixelateRegion { .. } => "pixelate_region",
         Filter::RemoveRegion { .. } => "remove_region",
-        Filter::MaxBytes(_) => "max_bytes",
-        Filter::Quality(_) => "quality",
-        Filter::Palette(_) => "palette",
-        Filter::Format(_) => "format",
-        Filter::NoUpscale => "no_upscale",
+        Filter::Plain(PlainFilter::MaxBytes(_)) => "max_bytes",
+        Filter::Plain(PlainFilter::Quality(_)) => "quality",
+        Filter::Plain(PlainFilter::Palette(_)) => "palette",
+        Filter::Plain(PlainFilter::Format(_)) => "format",
+        Filter::Plain(PlainFilter::NoUpscale) => "no_upscale",
     }
 }
 
@@ -855,5 +856,219 @@ fn seal_truncations_and_mutations_satisfy_the_invariants() {
             }
             bytes[i] = original;
         }
+    }
+}
+
+/// The parse_request seeds of the sealed spelling (issue
+/// #710): the file, its key ID, and the remainder its token
+/// seals. Each is `/<token>/photo.jpg`, the token minted by
+/// `sample_token` or `sample_keyed_token`, so it can be made
+/// again.
+const SEALED_SEEDS: [(&str, Option<&str>, &str); 2] = [
+    (
+        "seed-69",
+        None,
+        "300x200/filters:quality(80):format(webp)/example.com/img.jpg",
+    ),
+    (
+        "seed-70",
+        Some(crabcrop_fuzz::SEAL_KEY_ID),
+        "fit-in:640x480/filters:dpr(2)/root:photos/cat.jpg",
+    ),
+];
+
+#[test]
+fn the_sealed_seeds_are_minted_by_the_harness_secret() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/parse_request");
+    for (file, key_id, remainder) in SEALED_SEEDS {
+        let token = match key_id {
+            None => crabcrop_fuzz::sample_token(remainder),
+            Some(_) => crabcrop_fuzz::sample_keyed_token(remainder),
+        };
+        let expected = format!("/{token}/photo.jpg");
+        let found = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+        assert_eq!(
+            found, expected,
+            "corpus/parse_request/{file} should hold {expected}"
+        );
+    }
+}
+
+#[test]
+fn parse_request_seeds_hold_sealed_requests_that_open() {
+    // A sealed request opens under the harness keyring to the
+    // remainder it carries, which the server then takes as a
+    // verified plain one: the corpus holds a bare token and a
+    // keyed one, so the parser target fuzzes both opens and
+    // what follows them from its first input.
+    let mut opened = BTreeSet::new();
+    for input in corpus_inputs() {
+        let first = input
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("");
+        if !url::looks_sealed(first) {
+            continue;
+        }
+        let Some(remainder) = crabcrop_fuzz::open_sealed(first) else {
+            continue;
+        };
+        assert!(
+            url::parse_request(&format!("/unsafe/{remainder}")).is_ok(),
+            "{input} opens to {remainder:?}, which does not parse"
+        );
+        opened.insert(url::split_sealed_segment(first).is_some_and(|(kid, _)| kid.is_some()));
+        crabcrop_fuzz::check(&input);
+    }
+    assert_eq!(
+        opened,
+        BTreeSet::from([false, true]),
+        "the corpus needs a bare and a keyed sealed request that open"
+    );
+}
+
+#[test]
+fn parse_request_seeds_reach_the_server_entry_points() {
+    // Issue #710: what the server does with a remainder after
+    // the parser (the upload split, the default operations,
+    // the operation and watermark caps, the explain forecast)
+    // had no seed of its own. Each of these is one.
+    let outcomes: Vec<crabcrop_fuzz::RemainderOutcome> = corpus_inputs()
+        .iter()
+        .filter_map(|input| url::parse_signature(input).ok())
+        .map(|(_, _, rest)| crabcrop_fuzz::check_remainder(rest))
+        .collect();
+    let any = |test: &dyn Fn(&crabcrop_fuzz::RemainderOutcome) -> bool| outcomes.iter().any(test);
+    assert!(
+        any(&|o| o.upload_expiry),
+        "no seed splits as an expiring upload"
+    );
+    // format, quality, fill, dpr and max_bytes: every
+    // singleton directive the defaults carry.
+    assert!(
+        any(&|o| o.defaults_dropped == 5),
+        "no seed drops every singleton default"
+    );
+    assert!(
+        any(&|o| o.operations == url::MAX_OPERATIONS),
+        "no seed sits on the operation cap, the defaults merged in"
+    );
+    assert!(
+        any(&|o| o.operations == url::MAX_OPERATIONS + 1),
+        "no seed is one operation past the cap, the defaults merged in"
+    );
+    assert!(
+        any(&|o| o.watermarks == url::MAX_WATERMARK_URLS),
+        "no seed names as many watermark URLs as a request may"
+    );
+    assert!(
+        any(&|o| o.watermarks == url::MAX_WATERMARK_URLS + 1),
+        "no seed names one watermark URL past the cap"
+    );
+    let largest = url::DPR_FACTORS
+        .iter()
+        .copied()
+        .reduce(f32::max)
+        .map(f64::from);
+    assert!(
+        any(&|o| o.hinted_dpr.is_some() && o.hinted_dpr < largest),
+        "no seed's forecast steps the largest DPR hint down"
+    );
+}
+
+/// The render corpus (issue #710).
+fn render_seeds() -> Vec<Vec<u8>> {
+    byte_corpus_inputs("render")
+}
+
+#[test]
+fn render_seeds_satisfy_the_invariants() {
+    // The JPEG seeds and the animated WebP seeds all render,
+    // except the grayscale and the truncated JPEG, which the
+    // scaled decode stands down for: they render or refuse at
+    // full size, as before it.
+    let outcomes: Vec<crabcrop_fuzz::RenderOutcome> = render_seeds()
+        .iter()
+        .map(|seed| crabcrop_fuzz::check_render(seed))
+        .collect();
+    let rendered = |animated: bool| {
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, crabcrop_fuzz::RenderOutcome::Rendered { animated: a, .. } if *a == animated))
+            .count()
+    };
+    assert!(rendered(false) >= 5, "{outcomes:?}");
+    assert!(rendered(true) >= 5, "{outcomes:?}");
+}
+
+#[test]
+fn the_render_corpus_reaches_the_scaled_jpeg_decode() {
+    // Issue #710: a render whose first resize shrinks a JPEG
+    // far enough decodes it at reduced scale, and that frame's
+    // pixels are not the full-size decode's. The same JPEG
+    // resized to the same size after a `0x0` step, which keeps
+    // the full size and so turns the scaled decode down, gives
+    // other bytes: each seed the scaled decode takes shows the
+    // render target reached it.
+    let render = |seed: &[u8], path: &str| {
+        let (_, _, request) = url::parse_request(path).expect("the request parses");
+        crabcrop_fuzz::engine::Engine
+            .process(seed, &request.operations)
+            .expect("the seed renders")
+            .bytes
+    };
+    let mut scaled = 0;
+    for seed in render_seeds() {
+        if crabcrop_fuzz::engine::decode_jpeg_scaled(&seed, 2).is_none() {
+            continue;
+        }
+        let crabcrop_fuzz::RenderOutcome::Rendered { width, .. } =
+            crabcrop_fuzz::check_render(&seed)
+        else {
+            panic!("a JPEG the scaled decode takes did not render");
+        };
+        let direct = render(&seed, &format!("/unsafe/{width}x0/example.com/source"));
+        let full = render(&seed, &format!("/unsafe/0x0/{width}x0/example.com/source"));
+        if direct != full {
+            scaled += 1;
+        }
+    }
+    assert!(
+        scaled >= 4,
+        "{scaled} JPEG seeds rendered through the scaled decode"
+    );
+}
+
+#[test]
+fn render_truncations_and_mutations_satisfy_the_invariants() {
+    // Every truncation of the smallest JPEG the scaled decode
+    // takes and of the smallest animated WebP lands in a header,
+    // a scan or a chunk; each byte of the JPEG in turn also
+    // becomes a zero, a fill byte or a letter, as in the decode
+    // sweeps above. The WebP's single-byte mutations are left to
+    // the fuzzer, as the decode target's are.
+    let seeds = render_seeds();
+    let jpeg = seeds
+        .iter()
+        .filter(|s| crabcrop_fuzz::engine::decode_jpeg_scaled(s, 2).is_some())
+        .min_by_key(|s| s.len())
+        .expect("a JPEG seed the scaled decode takes");
+    let webp = seeds
+        .iter()
+        .filter(|s| s.starts_with(b"RIFF"))
+        .min_by_key(|s| s.len())
+        .expect("an animated WebP seed");
+    for seed in [jpeg, webp] {
+        for end in 0..=seed.len() {
+            crabcrop_fuzz::check_render(&seed[..end]);
+        }
+    }
+    let mut bytes = jpeg.clone();
+    for (i, replacement) in (0..bytes.len()).zip([0x00u8, 0xff, b'A'].into_iter().cycle()) {
+        let original = bytes[i];
+        bytes[i] = replacement;
+        crabcrop_fuzz::check_render(&bytes);
+        bytes[i] = original;
     }
 }

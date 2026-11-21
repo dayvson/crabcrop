@@ -22,14 +22,31 @@ both SDKs must all pass.
   `main.rs` is the binary, reading configuration and booting the
   server. The operation parser and canonical forms in `url.rs`
   (a filter is one row of the table in `url/filters.rs`, which
-  generates both its parser and its canonical spelling),
-  pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
-  state in `engine/state.rs`), HTTP and caching in `server.rs`
-  (request coalescing in `server/process.rs`, metadata responses in
-  `server/meta.rs`), source fetching policy in `loader.rs`, AI
-  features in `ai/` (provider traits in `ai/mod.rs`, one file per
-  provider family, all re-exported from `crate::ai`) and
-  `studio.rs`. A large module keeps its unit tests in
+  generates both its parser and its canonical spelling, and one
+  variant: of `PlainFilter` when `filters.rs` applies it from the
+  image alone, of `Filter` when the engine applies it itself),
+  pipeline in `engine.rs` (the `Engine` and its stages, with a file
+  per part under `engine/`: decoding in `decode.rs`, the resource
+  limits in `limits.rs`, the operation chain in `chain.rs`, animated
+  sources in `animated.rs`, sizing in `resize.rs`, compositing in
+  `overlay.rs`, detections in `detect.rs`, the focal form in
+  `focal.rs`, encoders in `encode.rs`, pipeline state in
+  `state.rs`, the reduced-scale JPEG decode in `jpeg_scaled.rs`,
+  the `overlay(...,width)` scale in `overlay_scale.rs`, animated
+  WebP frames through libwebp in `webp_anim.rs`), HTTP and caching
+  in `server.rs` (the state and the router, with a file per part
+  under `server/`: admission in `admission.rs`, the image route in
+  `request.rs`, flights in `flight.rs`, the cache tiers in
+  `tiers.rs`, the miss path in `miss.rs`, responses in
+  `response.rs`, the `/explain`, purge, upload and system endpoints
+  in `explain.rs`, `purge.rs`, `upload.rs` and `system.rs`, request
+  coalescing in `process.rs`, metadata responses in `meta.rs`, the
+  accept loop and its connection bounds in `listen.rs`, the work
+  handlers leave running and the shutdown drain in
+  `background.rs`), source fetching policy in
+  `loader.rs`, AI features in `ai/` (provider traits in
+  `ai/mod.rs`, one file per provider family, all re-exported from
+  `crate::ai`) and `studio.rs`. A large module keeps its unit tests in
   `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
   `server.rs`, `engine.rs`, `url.rs`, `filters.rs`, `frames.rs`
   and the files under `ai/` do; a second test module (the
@@ -44,14 +61,22 @@ both SDKs must all pass.
   server's parser is `src/url.rs`.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
-- `fuzz/`: cargo-fuzz targets for the URL parser, the token
-  opener, image decode (AVIF through dav1d included), metadata,
-  and operation chains through the engine, built on the server
-  library and `crabcrop-url` (the opener's home). The smoke runs
-  in `scripts/test_all.sh`; `.github/workflows/fuzz.yml` fuzzes
-  every target nightly.
-- `tests/functional/`: the HTTP functional suite, tiered; the local tier
-  runs without network or model files.
+- `fuzz/`: cargo-fuzz targets for the URL parser (and what the
+  server does with a remainder after it: sealed tokens, the
+  default operations, the operation and watermark caps, the
+  explain forecast), the token opener, image decode (AVIF
+  through dav1d included), metadata, operation chains through
+  the engine, and source renders (the scaled JPEG decode and the
+  animated WebP walk), built on the server library and
+  `crabcrop-url` (the opener's home). The smoke runs in
+  `scripts/test_all.sh`. `.github/workflows/fuzz.yml` fuzzes
+  every target nightly once the workflow is enabled, which is
+  the owner's switch: it has been disabled since before its
+  first scheduled run, so until then no open-ended fuzzing runs
+  anywhere (issue #710).
+- `tests/functional/`: the HTTP functional suite, tiered: the smoke and
+  full tiers run without network or model files, and the local tier holds
+  the AI cases, which need the models.
 
 ## Build and test
 
@@ -65,20 +90,27 @@ both SDKs must all pass.
   the first CI run fails on style alone.
 - The real-model AI tests are `#[ignore]`d in the normal gate: they need
   model files and an ONNX Runtime library, which are deployment artifacts,
-  never repo content. `.github/workflows/ai-models.yml` downloads the
-  pinned artifacts and runs them (`cargo test -- --ignored`) on pull
-  requests and main pushes that touch `src/ai/`, `src/tokenizer.rs`,
-  `tests/fixtures/portrait.jpg`, its hash-locked Python requirements
-  (`scripts/requirements/ai-fixtures.txt`) or the workflow itself, on
-  every release tag before anything publishes, weekly, and by hand. When
-  you cannot run them locally, that pull-request run is where an AI
-  change is verified.
-  A change outside those paths can still break them (the real-model tests
-  in `src/main.rs` and `src/engine.rs`, an `ort` bump in `Cargo.lock`)
-  without starting it: run the workflow by hand on the branch
-  (`gh workflow run ai-models.yml --ref <branch>`).
-- The AI functional groups (`tests/functional`, tier `local`) run in no CI
-  workflow: only a local run with the models verifies them.
+  never repo content. A test that reads its `CRABCROP_TEST_*` variables
+  through `crate::ai::env_or_skip` skips when one is unset, so a local run
+  tests the models it has. `.github/workflows/ai-models.yml` downloads the
+  pinned artifacts and runs every ignored test (`cargo test -- --ignored`),
+  the ones in `src/main.rs` and `src/engine.rs` included, with every
+  variable set and `CRABCROP_TEST_REQUIRE_MODELS=1`, which turns such a
+  skip into a failure. It
+  runs on pull requests and main pushes that touch anything under `src/`,
+  the manifests, `Cargo.lock` (an `ort` bump), `rust-toolchain.toml`, the
+  fixture photos the tests embed, its hash-locked Python requirements
+  (`scripts/requirements/ai-fixtures.txt`) or the workflow itself; on
+  every release tag before anything publishes; weekly; and by hand
+  (`gh workflow run ai-models.yml --ref <branch>`). When you cannot run
+  them locally, that pull-request run is where an AI change is verified.
+- The AI functional groups (`tests/functional/cases_ai.json`, tier
+  `local`) run in no CI workflow: they boot the server with the full model
+  set (`CRABCROP_FUNC_MODELS_DIR`), which the ai-models workflow does not
+  download, so only a local run with the models verifies them over HTTP.
+  `.github/workflows/functional.yml` runs the other tiers: smoke or full
+  on a pull request (its diff decides), and full on every push to main,
+  on release tags and nightly.
 
 ## Invariants
 
@@ -99,9 +131,11 @@ both SDKs must all pass.
   in CI fails. `scripts/check_locks.py` fails CI when the two lockfiles
   disagree on a package both carry, or when either locks a decoder at
   two versions: one decoder version is what ships, pre-checks and
-  fuzzes. A Dependabot cargo pull request moves the root lockfile only,
-  so one that moves a package both carry fails that check until the
-  refresh is pushed to its branch.
+  fuzzes. It also fails on a second reqwest (issue #742): c2pa's async
+  HTTP stack, which crabcrop never calls, compiled reqwest 0.12 beside
+  crabcrop's 0.13. A Dependabot cargo pull request moves the
+  root lockfile only, so one that moves a package both carry fails that
+  check until the refresh is pushed to its branch.
 - `THIRD-PARTY-NOTICES.md`, which every artifact ships, is generated
   from `Cargo.lock` for the release build (`scripts/check_notices.py
   --write`, with the cargo-about version the script pins; RELEASING.md,

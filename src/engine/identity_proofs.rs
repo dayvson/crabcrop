@@ -248,6 +248,134 @@ fn a_refused_resample_never_hands_on_a_premultiplied_frame() {
     assert_eq!(cases, 2 * 5 * 2);
 }
 
+/// RGBA8 frames, the layout of an animation's frames, under
+/// each alpha plane a frame can carry: the mixed plane of
+/// [`frames_at`]; opaque; a GIF frame's, whose pixels are
+/// opaque or transparent black; and transparent over colors.
+fn rgba8_planes(w: u32, h: u32) -> Vec<(String, DynamicImage)> {
+    let mut frames = Vec::new();
+    for (kind, content) in [("smooth", smooth as Content), ("harsh", harsh)] {
+        let mixed = mixed_alpha(content);
+        for plane in ["mixed", "opaque", "gif", "clear"] {
+            let alpha = |x: u32, y: u32| match plane {
+                "mixed" => mixed(x, y),
+                "opaque" => 255,
+                "gif" if (x / 5 + y / 3).is_multiple_of(3) => 0,
+                "gif" => 255,
+                _ => 0,
+            };
+            let img = image::RgbaImage::from_fn(w, h, |x, y| match alpha(x, y) {
+                0 if plane == "gif" => image::Rgba([0, 0, 0, 0]),
+                a => image::Rgba([content(x, y, 0), content(x, y, 1), content(x, y, 2), a]),
+            });
+            frames.push((
+                format!("{kind} rgba8 {plane} {w}x{h}"),
+                DynamicImage::ImageRgba8(img),
+            ));
+        }
+    }
+    frames
+}
+
+#[test]
+fn the_lent_resize_matches_the_owned_resize_and_puts_the_frame_back() {
+    // Issue #737: the trim survey resizes frames it borrows. An
+    // RGBA8 frame is premultiplied where it sits and the rows
+    // that changed are written back; every other layout is
+    // read as it is. Every layout, RGBA8 under every alpha
+    // plane a frame carries, at the sizes the owned resize is
+    // proven at: the owned resize's bytes, and the frame as it
+    // came.
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (3, 2), (9, 17), (64, 48), (101, 53)] {
+        let mut frames = frames_at(w, h);
+        frames.extend(rgba8_planes(w, h));
+        for (name, img) in frames {
+            for (tw, th) in [
+                (w.div_ceil(2), h.div_ceil(2)),
+                (w.div_ceil(3), h),
+                (w, h.div_ceil(3)),
+                (w * 2, h * 2),
+                (w + 1, h + 3),
+                (1, 1),
+                (40, 27),
+                (33, 77),
+                (w, h),
+            ] {
+                let mut lent = img.clone();
+                let resized = resize_lanczos3_lent(&mut lent, tw, th);
+                let owned = resize_lanczos3_owned(img.clone(), tw, th);
+                assert!(same(&resized, &owned), "{name} to {tw}x{th}");
+                assert!(same(&lent, &img), "{name} to {tw}x{th}: the frame changed");
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 5 * (20 + 8) * 9);
+}
+
+#[test]
+fn the_rows_a_premultiply_changes_are_the_rows_copied_out() {
+    // Issue #737: the lent resize copies out the rows holding
+    // a pixel neither opaque nor black, and no other. Every
+    // row the backend's premultiply changes is among them, and
+    // an opaque frame or a GIF frame copies none.
+    for (w, h) in [(1, 1), (9, 17), (64, 48)] {
+        for (name, img) in rgba8_planes(w, h) {
+            let frame = img.to_rgba8();
+            let changing = ChangingRows::of(&frame);
+            let mut premultiplied = frame.clone();
+            fast_image_resize::MulDiv::new()
+                .multiply_alpha_inplace(&mut premultiplied)
+                .unwrap();
+            let stride = w as usize * 4;
+            let before: Vec<&[u8]> = frame.as_raw().chunks(stride).collect();
+            let after: Vec<&[u8]> = premultiplied.as_raw().chunks(stride).collect();
+            for (y, (was, is)) in before.iter().zip(&after).enumerate() {
+                if was != is {
+                    assert!(
+                        changing.rows.contains(&y),
+                        "{name}: row {y} changed uncopied"
+                    );
+                }
+            }
+            let copied: Vec<&[u8]> = changing.rows.iter().map(|&y| before[y]).collect();
+            assert_eq!(changing.bytes, copied.concat(), "{name}");
+            if name.contains("opaque") || name.contains("gif") {
+                assert!(changing.rows.is_empty(), "{name}");
+            }
+        }
+    }
+    // A black pixel is kept at any alpha; one with a color under
+    // partial alpha is not, and its row alone is copied.
+    let mut frame = image::RgbaImage::from_pixel(5, 4, image::Rgba([10, 20, 30, 255]));
+    frame.put_pixel(2, 1, image::Rgba([0, 0, 0, 7]));
+    frame.put_pixel(3, 2, image::Rgba([9, 0, 0, 200]));
+    let changing = ChangingRows::of(&frame);
+    assert_eq!(changing.rows, [2]);
+    assert_eq!(changing.bytes, frame.as_raw()[2 * 20..3 * 20]);
+}
+
+#[test]
+fn a_refused_lent_resize_puts_the_frame_back() {
+    // Issue #737: no input makes the backend refuse, so the
+    // refusal is forced. The lent frame was premultiplied where
+    // it sits; it comes back as it came, and the resize is the
+    // plain one of that frame.
+    for (w, h) in [(9, 17), (64, 48)] {
+        for (name, img) in rgba8_planes(w, h) {
+            let plain = resize_lanczos3(&img, w * 2, h + 3);
+            let mut lent = img.clone();
+            let refused = {
+                let _refusal = RefusedConvolve::new();
+                resize_lanczos3_lent(&mut lent, w * 2, h + 3)
+            };
+            assert!(same(&lent, &img), "{name}: the frame changed");
+            assert!(same(&refused, &plain), "{name}");
+        }
+    }
+}
+
 /// The cut every aspect crop made before issue #713: the
 /// image crate's, one pixel at a time through the frame's
 /// RGBA view, so every layout came out RGBA8.
@@ -1208,4 +1336,191 @@ fn placing_falls_back_to_the_blend_wherever_a_row_copy_is_not_it() {
         }
     }
     assert_eq!(cases, 60);
+}
+
+/// The part of an overlay scaled to `target` px wide as it was
+/// read: the whole overlay through the image crate's resize,
+/// then the part cut from it.
+fn scaled_part_as_it_was(ov: &DynamicImage, target: u32, (x, y, w, h): Window) -> image::RgbaImage {
+    ov.resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
+        .crop_imm(x, y, w, h)
+        .into_rgba8()
+}
+
+/// Widths to scale an overlay `w` px wide to: to one pixel,
+/// down, to its own width, just past it, and up.
+fn overlay_widths(w: u32) -> Vec<u32> {
+    let mut widths = vec![
+        1,
+        2,
+        3,
+        w.div_ceil(2),
+        w.saturating_sub(1),
+        w,
+        w + 1,
+        w * 2,
+        w * 3 + 1,
+        64,
+    ];
+    widths.retain(|&t| t >= 1);
+    widths.sort_unstable();
+    widths.dedup();
+    widths
+}
+
+/// Parts of a scaled overlay of `(w, h)` to read: all of it,
+/// its edges, its middle and its last pixel.
+fn overlay_parts((w, h): (u32, u32)) -> Vec<Window> {
+    let mut parts = vec![
+        (0, 0, w, h),
+        (0, 0, w, 1),
+        (0, h - 1, w, 1),
+        (0, 0, 1, h),
+        (w - 1, 0, 1, h),
+        (w / 3, h / 3, (w / 3).max(1), (h / 3).max(1)),
+        (w - 1, h - 1, 1, 1),
+    ];
+    parts.sort_unstable();
+    parts.dedup();
+    parts
+}
+
+#[test]
+fn an_overlay_scaled_where_it_lands_matches_the_whole_scale() {
+    // `overlay(...,width)` scales only the part of the overlay
+    // that lands, a row at a time: in every layout, up and
+    // down, every part matches the same part of the whole
+    // scale the image crate gave, and so does the size.
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (1, 9), (9, 1), (7, 5), (23, 17), (40, 3)] {
+        for (name, ov) in frames_at(w, h) {
+            for target in overlay_widths(w) {
+                let whole = ov.resize(target, u32::MAX, image::imageops::FilterType::Lanczos3);
+                let size = overlay_scale::scaled_size((w, h), target);
+                assert_eq!(size, (whole.width(), whole.height()), "{name} to {target}");
+                for part in overlay_parts(size) {
+                    let ours =
+                        overlay_scale::scaled_part(&ov, size, part, || Ok::<(), ()>(())).unwrap();
+                    assert_eq!(
+                        ours.as_raw(),
+                        scaled_part_as_it_was(&ov, target, part).as_raw(),
+                        "{name} to {target}, part {part:?}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert!(cases > 4000, "{cases}");
+}
+
+#[test]
+fn an_overlay_s_scaled_size_is_the_crate_s() {
+    // The scaled size decides where the overlay lands before
+    // anything is scaled, so it must be the size the crate's
+    // resize gives, across shapes and widths: tall, wide and
+    // square overlays, to widths below, at and above their
+    // own, where the rounding of the height changes.
+    let mut cases = 0;
+    for w in (1..=61).step_by(4) {
+        for h in [1, 2, 3, 7, 10, 33, 64, 99] {
+            let ov = DynamicImage::ImageLuma8(image::GrayImage::new(w, h));
+            for target in [1, 2, 3, 5, 8, 13, w, w + 1, 2 * w + 1, 97] {
+                let scaled = ov.resize(target, u32::MAX, image::imageops::FilterType::Nearest);
+                let crate_size = (scaled.width(), scaled.height());
+                assert_eq!(
+                    overlay_scale::scaled_size((w, h), target),
+                    crate_size,
+                    "{w}x{h} to {target}"
+                );
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 16 * 8 * 10);
+}
+
+/// `blend_overlay` as it was: the whole overlay scaled, then
+/// the part that lands read from it (the pixel budget aside,
+/// which these sizes never reach).
+#[allow(clippy::too_many_arguments)]
+fn blend_overlay_as_it_was(
+    ctx: &ProcessContext<'_>,
+    base: &DynamicImage,
+    ov: &crate::filters::WatermarkImage,
+    x: i32,
+    y: i32,
+    alpha: u8,
+    mode: crate::url::BlendMode,
+    width_pct: Option<u32>,
+) -> DynamicImage {
+    let target = width_pct.map(|pct| ((base.width() as u64 * pct as u64) / 100).max(1) as u32);
+    if !lands_on((base.width(), base.height()), (x, y)) {
+        return base.clone();
+    }
+    let scaled = target.map(|target| {
+        ov.image()
+            .resize(target, u32::MAX, image::imageops::FilterType::Lanczos3)
+    });
+    let top_size = match &scaled {
+        Some(scaled) => (scaled.width(), scaled.height()),
+        None => (ov.image().width(), ov.image().height()),
+    };
+    let Some(part) = landing((base.width(), base.height()), top_size, (x, y)) else {
+        return base.clone();
+    };
+    let top = match &scaled {
+        Some(scaled) => crate::filters::RgbaPart::of(scaled, part.0),
+        None => ov.rgba_part(part.0),
+    };
+    composite(
+        base,
+        &top,
+        (x, y),
+        alpha,
+        || ctx.check_deadline(),
+        |b, o| blend_channel(mode, b, o),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_scaled_overlay_blends_as_it_did() {
+    // The whole filter, against the code it replaced: every
+    // overlay layout on two bases, placed inside, across an
+    // edge, anchored from the far edges and off the canvas,
+    // scaled down, to the base's width and up, in two blend
+    // modes. Every byte matches.
+    use crate::url::BlendMode;
+    let ctx = ProcessContext::default();
+    let bases = [
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(37, 23, |x, y| {
+            image::Rgb([smooth(x, y, 0), smooth(x, y, 1), smooth(x, y, 2)])
+        })),
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(16, 41, |x, y| {
+            image::Rgba([
+                harsh(x, y, 0),
+                harsh(x, y, 1),
+                harsh(x, y, 2),
+                smooth(y, x, 3),
+            ])
+        })),
+    ];
+    let mut cases = 0;
+    for base in &bases {
+        for (name, ov) in frames_at(11, 7) {
+            let ov = crate::filters::WatermarkImage::new(ov);
+            for (x, y) in [(0, 0), (5, 3), (-1, -1), (-4, 2), (30, 20), (40, 50)] {
+                for pct in [None, Some(1), Some(30), Some(100), Some(150), Some(400)] {
+                    for mode in [BlendMode::Normal, BlendMode::Overlay] {
+                        let ours = blend_overlay(&ctx, base, &ov, x, y, 70, mode, pct).unwrap();
+                        let theirs = blend_overlay_as_it_was(&ctx, base, &ov, x, y, 70, mode, pct);
+                        assert!(same(&ours, &theirs), "{name} at {x},{y}, {pct:?}, {mode:?}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 2 * 20 * 6 * 6 * 2);
 }

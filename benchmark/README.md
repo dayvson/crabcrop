@@ -3,7 +3,7 @@
 A reproducible comparison of three self-hosted image servers on the
 same host, the same origin, and the same operations:
 
-- crabcrop 0.13.1 (release build from the `v0.13.1` tag)
+- crabcrop 0.14.0 (release build from the `v0.14.0` tag)
 - Thumbor 7.8.0 (pip, venv)
 - imgproxy 4.0.24 (official source build, see the version notes)
 
@@ -30,7 +30,18 @@ and prepares `benchmark/.work/` with the three servers. It installs
 system packages with apt (libvips and build tools), installs a Go
 toolchain under `~/.local`, builds imgproxy from its release tag,
 creates the Thumbor venv, and builds crabcrop in release mode from
-the `v0.13.1` tag in a detached worktree.
+the `v0.14.0` tag in a detached worktree.
+
+The crabcrop pin is settled before anything is installed, and
+`bash benchmark/setup.sh --check` settles it alone. The commit
+built is the one the tag names, and `CRABCROP_COMMIT` must equal
+it when set; without the tag in the clone, only a pinned commit
+whose `Cargo.toml` carries `CRABCROP_VERSION` is built. A release
+bump (`scripts/bump_version.py`) moves the version and the tag
+and empties the commit, which it cannot know, so between the bump
+and the tag the script refuses to run instead of building the
+previous release under the new tag's name. The refresh that
+publishes new results pins the commit again: `--check` prints it.
 
 `bench.py` then starts a local origin server for the fixtures,
 starts each service in turn, measures it alone, stops it, and
@@ -180,9 +191,11 @@ tier that the budget configures. Results are written up in
 
 ## Version notes
 
-- crabcrop 0.13.1, tag `v0.13.1`, commit
-  06af7c7e7656c6877d8e3c6b2d74e9ab1ff1ca61. Built with
-  `cargo build --release --locked` from the tag.
+- crabcrop 0.14.0, tag `v0.14.0`, commit
+  `CRABCROP_COMMIT` in setup.sh, which must be the commit the tag
+  names. Built with `cargo build --release --locked` from that
+  commit. Each write-up in `results/` records the commit it
+  measured.
 - Thumbor 7.8.0, pip package `thumbor==7.8.0`, Python venv.
 - imgproxy 4.0.24, tag `v4.0.24`, commit
   4735a54944a53a3d572c166b38649c841862520c, built from the

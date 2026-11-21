@@ -6,7 +6,8 @@
 //! one smart crop window; class redaction holds its
 //! segmentation decodes to a cap and checks the deadline
 //! between them; and the frame copies the animated paths no
-//! longer make change nothing they render.
+//! longer make change nothing they render, the trim survey's
+//! after a resize (issue #737) among them.
 
 use super::*;
 use std::io::Cursor;
@@ -636,13 +637,13 @@ fn a_trim_nothing_runs_before_surveys_the_frames_where_they_are() {
     // settled: the same window as a chain whose first step
     // changes no pixel (a fill), and the same render.
     let gif = bordered_frames_gif();
-    let decoded = decode_gif_frames(&gif, None).unwrap();
+    let mut decoded = decode_gif_frames(&gif, None).unwrap();
     let ctx = ProcessContext::default();
-    let window_of = |remainder: &str, key: (usize, usize)| {
+    let mut window_of = |remainder: &str, key: (usize, usize)| {
         let ops = ops_of(remainder);
         let directives = crate::url::RequestDirectives::analyze(&ops);
         let mut share = FrameShare::default();
-        survey_trims(&decoded, &ops, None, 1.0, &ctx, &directives, &mut share).unwrap();
+        survey_trims(&mut decoded, &ops, None, 1.0, &ctx, &directives, &mut share).unwrap();
         share.trims.get(key, (40, 30)).expect("a settled window")
     };
     let first = window_of("filters:trim(10)", (0, 0));
@@ -652,4 +653,119 @@ fn a_trim_nothing_runs_before_surveys_the_frames_where_they_are() {
         render(&gif, "filters:trim(10)").bytes,
         render(&gif, "filters:fill(000000):trim(10)").bytes
     );
+}
+
+/// Three 40x30 frames laid out like [`bordered_frames_gif`]'s,
+/// their content and border under partial alpha, at offsets
+/// and delays of their own: frames whose pixels a premultiply
+/// changes, as an animated WebP with alpha can have.
+fn translucent_frames() -> Frames {
+    let frame = |(left, top): (u32, u32), delay: u32| {
+        let buffer = image::RgbaImage::from_fn(40, 30, |x, y| {
+            let inside = (left..left + 12).contains(&x) && (top..top + 8).contains(&y);
+            if inside {
+                image::Rgba([(x * 6) as u8, 40, (y * 8) as u8, (60 + x * 4) as u8])
+            } else {
+                image::Rgba([250, 245, 240, 128])
+            }
+        });
+        let delay = image::Delay::from_numer_denom_ms(delay, 1);
+        image::Frame::from_parts(buffer, left, top, delay)
+    };
+    Frames {
+        first: frame((4, 5), 70),
+        rest: vec![frame((15, 9), 80), frame((9, 18), 90)],
+    }
+}
+
+/// Every frame's pixels, position and delay.
+fn frame_parts(frames: &Frames) -> Vec<(image::RgbaImage, u32, u32, image::Delay)> {
+    frames
+        .iter()
+        .map(|f| (f.buffer().clone(), f.left(), f.top(), f.delay()))
+        .collect()
+}
+
+#[test]
+fn a_trim_after_a_resize_is_lent_the_frames_and_puts_them_back() {
+    // Issue #737: a trim after other steps copied every frame
+    // to run those steps on, once per trim. When the first
+    // step resizes the whole frame, each frame is lent to it
+    // and put back instead, and none is copied. The windows
+    // are the ones a copy settles, which a chain that starts
+    // with a fill (no pixel changes, and still a copy) shows,
+    // and so is the render; the frames come back as they
+    // were, positions and delays too. GIF frames, whose resize
+    // copies no row, and frames under partial alpha, whose
+    // resize writes rows back.
+    let gif = bordered_frames_gif();
+    let ctx = ProcessContext::default();
+    // Each chain with the copies its survey takes: none, but
+    // for a resize to the frames' own size, which hands on
+    // the frame itself and so runs on a copy of it.
+    let chains = [
+        ("20x15/filters:trim(10)", 0),
+        ("80x0/filters:trim(10)", 0),
+        ("fit-in:30x30/filters:trim(10)", 0),
+        ("20x15/filters:grayscale():trim(10)", 0),
+        ("20x15/filters:trim(10)/filters:trim(5)", 0),
+        ("40x30/filters:trim(10)", 3),
+    ];
+    // The windows a survey settles, and the frames it copied.
+    let settle = |frames: &mut Frames, remainder: &str| {
+        let ops = ops_of(remainder);
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        let mut share = FrameShare::default();
+        LENT_FRAME_COPIES.set(0);
+        survey_trims(frames, &ops, None, 1.0, &ctx, &directives, &mut share).unwrap();
+        let windows: Vec<_> = share
+            .trims
+            .entries
+            .iter()
+            .map(|e| (e.dims, e.found))
+            .collect();
+        (windows, LENT_FRAME_COPIES.get())
+    };
+    let decoded = || decode_gif_frames(&gif, None).unwrap();
+    // The window of the first chain on the GIF: the three
+    // frames' boxes at 20x15, joined.
+    assert_eq!(
+        settle(&mut decoded(), chains[0].0).0,
+        [((20, 15), Some((1, 2, 13, 12)))]
+    );
+    for (source, make) in [
+        ("gif", &decoded as &dyn Fn() -> Frames),
+        ("translucent", &translucent_frames),
+    ] {
+        let mut frames = make();
+        let parts = frame_parts(&frames);
+        for (lent, copies) in chains {
+            let copied = format!("filters:fill(000000)/{lent}");
+            let (windows, lent_copies) = settle(&mut frames, lent);
+            let (twin, twin_copies) = settle(&mut frames, &copied);
+            assert!(!windows.is_empty(), "{source} {lent}");
+            assert_eq!(windows, twin, "{source} {lent}");
+            assert_eq!(lent_copies, copies, "{source} {lent}: frames copied");
+            assert_eq!(twin_copies, 3 * windows.len(), "{source} {copied}");
+            assert!(
+                frame_parts(&frames) == parts,
+                "{source} {lent}: a frame changed"
+            );
+            let rendered = |remainder: &str| {
+                let ops = ops_of(remainder);
+                let directives = crate::url::RequestDirectives::analyze(&ops);
+                let (frames, _) =
+                    render_frames(make(), &ops, &ctx, &directives, FrameShare::default()).unwrap();
+                frame_parts(&frames)
+            };
+            assert!(rendered(lent) == rendered(&copied), "{source} {lent}");
+            if source == "gif" {
+                assert_eq!(
+                    render(&gif, lent).bytes,
+                    render(&gif, &copied).bytes,
+                    "{lent}"
+                );
+            }
+        }
+    }
 }

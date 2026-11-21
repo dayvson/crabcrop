@@ -6,7 +6,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::memo::DetectionMemo;
-use super::session::{build_session, fir_resize, rgb8_view};
+use super::session::{build_session, fir_resize, lock_model, rgb8_view};
 use super::{AiError, FaceBox, FaceProvider};
 
 /// Face detection backed by YuNet (the 2023mar ONNX export):
@@ -68,18 +68,14 @@ const FACE_NMS_THRESHOLD: f32 = 0.3;
 
 impl FaceProvider for OnnxFaceProvider {
     fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, AiError> {
-        // A provider whose session a panic has poisoned
-        // answers no frame, as before: the memo is left out,
-        // so a remembered frame fails at the lock like any
-        // other.
-        let memo = (!self.session.is_poisoned()).then_some(&self.memo);
+        let memo = Some(&self.memo);
         detect_faces(memo, img, |input| {
             let tensor = ort::value::Tensor::from_array((
                 [1, 3, FACE_INPUT as usize, FACE_INPUT as usize],
                 input.into_boxed_slice(),
             ))
             .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let mut session = lock_model(&self.session, "the face detection model's session");
             let outputs = session
                 .run(ort::inputs![self.input_name.as_str() => tensor])
                 .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;

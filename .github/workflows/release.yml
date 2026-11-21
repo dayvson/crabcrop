@@ -515,11 +515,13 @@ jobs:
   # reviewer approves this job's `release` environment: host (the
   # GitHub Release and the installer), build-images (GHCR) and the
   # registry jobs all wait for it. It waits in turn for every build
-  # and the AI gate, so the reviewer can inspect this run's
-  # artifacts first: the artifacts-* files host will publish, and
-  # pypi-dist. The registry jobs name the environment too, for its
-  # secrets, so they ask for a second approval once host has
-  # published (RELEASING.md). Pull request runs skip it.
+  # (the crates' included) and the AI gate, so the reviewer can
+  # inspect this run's artifacts first: the artifacts-* files host
+  # will publish, and pypi-dist. The registry jobs name the
+  # environment too, for its secrets, so they ask for a second
+  # approval once host has published, and publish-mcp-registry a
+  # third once publish-mcp is done (RELEASING.md). Pull request
+  # runs skip it.
   release-gate:
     name: Release approval (the GitHub Release, the images and the packages)
     needs:
@@ -527,8 +529,9 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
       - build-pypi
+      - package-crates
       - ai-models
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.build-pypi.result == 'success' && needs.ai-models.result == 'success' }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.build-pypi.result == 'success' && needs.package-crates.result == 'success' && needs.ai-models.result == 'success' }}
     runs-on: ubuntu-22.04
     environment: release
     permissions: {}
@@ -579,6 +582,39 @@ jobs:
           name: pypi-dist
           path: sdks/python/dist/
           if-no-files-found: error
+
+  # The two crates (issue #711), packaged and built from their
+  # packaged sources, as cargo publish would, in a job with no
+  # secrets: crabcrop-url, and crabcrop, the server crate. cargo
+  # packages them together and builds crabcrop against the
+  # packaged crabcrop-url, so this needs nothing published. The
+  # release approval waits for this job, so a crate that does not
+  # build from its package stops the release before anything is
+  # public, and publish-crate then publishes without building
+  # (--no-verify): no build script or procedural macro of the
+  # server's dependencies runs in a job that holds the crates.io
+  # token. The build compiles the C libraries the tree vendors,
+  # and rav1e's assembly needs nasm. Like ai-models, it runs on
+  # tag pushes only.
+  package-crates:
+    name: Package and build the crates (crabcrop-url and crabcrop)
+    needs: preflight
+    if: ${{ !github.event.pull_request }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install nasm (rav1e SIMD build)
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Package and build both crates
+        run: cargo package -p crabcrop-url -p crabcrop --locked
 
   # The release gate (issue #414): the real-model AI tests,
   # run from ai-models.yml in parallel with the builds. The
@@ -659,13 +695,26 @@ jobs:
           push: true
           tags: ${{ env.AI_TAGS }}
 
+  # Both crates, under the one registry approval (issue #711):
+  # crabcrop-url, then crabcrop, the server crate that
+  # `cargo install --locked crabcrop` builds, which takes
+  # crabcrop-url from crates.io. package-crates built both from
+  # their packages before the approval, so this job builds
+  # nothing (--no-verify). The script checks that both carry the
+  # tag's version before it publishes either, publishes crabcrop
+  # once the crates.io index lists crabcrop-url, so that its
+  # packaged Cargo.lock names that version, and skips a version
+  # crates.io already has, so re-running the failed job finishes
+  # what an earlier attempt started.
   publish-crate:
-    name: Publish crabcrop-url to crates.io
+    name: Publish crabcrop-url and crabcrop to crates.io
     needs:
       - plan
       - host
+      - package-crates
     if: ${{ !github.event.pull_request }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     environment: release
     permissions:
       contents: read
@@ -678,8 +727,9 @@ jobs:
         with:
           toolchain: stable
       - name: cargo publish
-        run: cargo publish -p crabcrop-url --locked
+        run: python3 scripts/publish_crates.py --tag "$RELEASE_TAG" --no-verify crabcrop-url crabcrop
         env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-npm:
@@ -765,6 +815,55 @@ jobs:
           npm publish --access public --tag "$NPM_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # The MCP registry entry, sdks/mcp/server.json (issue #711),
+  # published with the registry's own publisher once publish-mcp
+  # has put @crabcrop/mcp on npm: the registry checks the npm
+  # package's mcpName before it lists a version. The publisher
+  # is pinned by version and SHA-256 below; a registry upgrade
+  # can refuse an old one ("invalid audience"), so move the pin
+  # deliberately, both values together. The script skips a
+  # prerelease, which the registry would mark as the latest
+  # version, and a version already listed, and logs in with
+  # GitHub OIDC (id-token: write) when the entry's namespace is
+  # this repository owner's. Otherwise the registry needs a
+  # token of an Owner of the namespace's organization,
+  # MCP_GITHUB_TOKEN, a secret to keep in this environment
+  # (RELEASING.md, Repository settings). Naming the environment
+  # makes the job wait for its own approval, since it starts
+  # once publish-mcp is done (RELEASING.md).
+  publish-mcp-registry:
+    name: Publish the MCP registry entry
+    needs:
+      - plan
+      - host
+      - publish-mcp
+    if: ${{ !github.event.pull_request }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MCP_PUBLISHER_URL: "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.9/mcp-publisher_linux_amd64.tar.gz"
+      MCP_PUBLISHER_SHA256: "4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install mcp-publisher (pinned by version and checksum)
+        run: |
+          archive="$RUNNER_TEMP/mcp-publisher.tar.gz"
+          curl --proto '=https' --tlsv1.2 -LsSf "$MCP_PUBLISHER_URL" -o "$archive"
+          echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/mcp-publisher"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/mcp-publisher" mcp-publisher
+      - name: Publish server.json
+        run: python3 scripts/publish_mcp_registry.py --tag "$RELEASE_TAG" --publisher "$RUNNER_TEMP/mcp-publisher/mcp-publisher"
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          MCP_GITHUB_TOKEN: ${{ secrets.MCP_GITHUB_TOKEN }}
 
   # Uploads the files build-pypi made, and builds nothing (issue
   # #598): the PyPI token reaches only the upload step.

@@ -80,7 +80,7 @@ fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (common::ServerGuard, u
             .env("CRABCROP_UPLOAD_DIR", upload_dir)
             .env("CRABCROP_ALLOW_UNSAFE", "1")
             .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-            .env("CRABCROP_METRICS_TOKEN", "budget-token")
+            .env("CRABCROP_METRICS_TOKEN", "source-budget-metrics-token")
             .env("CRABCROP_SOURCE_BUFFER_MAX_MB", budget_mb.to_string())
             .env("CRABCROP_META_MODE", "1"),
     );
@@ -197,7 +197,11 @@ fn wait_for_requests(origin: &Origin, n: usize) {
 }
 
 fn metrics(port: u16) -> String {
-    let (status, _, body) = get(port, "/metrics", "Authorization: Bearer budget-token\r\n");
+    let (status, _, body) = get(
+        port,
+        "/metrics",
+        "Authorization: Bearer source-budget-metrics-token\r\n",
+    );
     assert_eq!(status, 200);
     String::from_utf8(body).unwrap()
 }

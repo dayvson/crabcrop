@@ -18,6 +18,7 @@ from crabcrop_url import (  # noqa: E402
     purge_key,
     purge_group_signature,
     purge_signature,
+    seal,
     seal_url,
     seal_with_nonce,
     sign,
@@ -37,6 +38,7 @@ SIGNED_VECTORS = [v for v in VECTORS if "signature" in v]
 SEALED_VECTORS = [v for v in VECTORS if v.get("sealed")]
 REFUSAL_VECTORS = [v for v in VECTORS if "refuses" in v]
 RESERVED_VECTORS = [v for v in VECTORS if v.get("reserved")]
+PURGE_VECTORS = [v for v in VECTORS if "purge_signature" in v]
 RESERVED_MESSAGE = (
     'remainder begins with the reserved segment "crabcrop": '
     "it is kept for key derivation, and no image URL may begin with it"
@@ -87,6 +89,7 @@ class TestVectors(unittest.TestCase):
             ]
             if what == "source":
                 calls.append(lambda: build_srcset(base, "s3cr3t", v["source"], [320]))
+                calls.append(lambda: build_srcset(base, "s3cr3t", v["source"], [320], key_id="k2"))
             for call in calls:
                 with self.subTest(description=v["description"]):
                     with self.assertRaises(ValueError) as caught:
@@ -187,6 +190,47 @@ class TestPurgeSignatures(unittest.TestCase):
             purge_group_signature("test-secret", "thumb"),
             purge_signature("test-secret", "thumb"),
         )
+
+    def test_purge_vectors(self):
+        # Each endpoint's helper, plain or expiring, reproduces
+        # the spec's signature, and the expiring form is the
+        # plain signature over the signed string, which is
+        # also what follows the signature segment in the path.
+        self.assertGreaterEqual(len(PURGE_VECTORS), 6)
+        self.assertGreaterEqual(len([v for v in PURGE_VECTORS if "expires" in v]), 3)
+        helpers = {"purge": purge_signature, "purge-group": purge_group_signature}
+        for v in PURGE_VECTORS:
+            with self.subTest(description=v["description"]):
+                helper = helpers[v["endpoint"]]
+                self.assertEqual(
+                    helper(v["secret"], v["target"], v.get("expires")),
+                    v["purge_signature"],
+                )
+                self.assertEqual(helper(v["secret"], v["signed"]), v["purge_signature"])
+
+    def test_expiring_form_covers_the_expiry(self):
+        target = "300x200/https://example.com/a.jpg"
+        self.assertNotEqual(
+            purge_signature("test-secret", target, 1893456000),
+            purge_signature("test-secret", target, 1893456001),
+        )
+        self.assertNotEqual(
+            purge_signature("test-secret", target, 1893456000),
+            purge_signature("test-secret", target),
+        )
+        self.assertNotEqual(
+            purge_group_signature("test-secret", "thumb", 1893456000),
+            purge_signature("test-secret", "thumb", 1893456000),
+        )
+        # An expiry the server's grammar cannot read is
+        # refused at mint time, for both endpoints.
+        for bad in (1.5, -1, True, "1893456000", 2**64):
+            with self.subTest(expires=bad):
+                with self.assertRaises(ValueError):
+                    purge_signature("test-secret", target, bad)
+                with self.assertRaises(ValueError):
+                    purge_group_signature("test-secret", "thumb", bad)
+        self.assertRegex(purge_group_signature("test-secret", "thumb", 0), "^[0-9a-f]{64}$")
 
 
 class TestUploadSignatures(unittest.TestCase):
@@ -367,6 +411,12 @@ class TestSealedVectors(unittest.TestCase):
                 self.assertEqual(unseal(v["secret"], v["token"]), v["remainder"])
                 with self.assertRaises(SealError):
                     unseal("wrong-secret", v["token"])
+                # `seal`, the TypeScript and Rust name (issue #716),
+                # draws a fresh nonce, so its token opens back to the
+                # vector's remainder rather than matching the token.
+                fresh = seal(v["secret"], v["remainder"], v.get("key_id"))
+                self.assertEqual(unseal(v["secret"], fresh), v["remainder"])
+                self.assertEqual(fresh.split(":", 1)[0] if ":" in fresh else None, v.get("key_id"))
 
     def test_round_trip_and_builders(self):
         remainder = "300x200/https://example.com/photo.jpg"

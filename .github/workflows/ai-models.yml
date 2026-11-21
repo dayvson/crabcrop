@@ -9,11 +9,18 @@ name: AI models (real inference)
 # ignored AI tests for real.
 #
 # When it runs (issue #414): on pull requests and main pushes
-# that touch the AI code (src/ai/, src/tokenizer.rs), the
-# fixture photo the real-model tests read, or this workflow;
+# that touch anything the real-model tests compile or read;
 # from release.yml on every release tag, where publishing waits
 # for it to pass; weekly, so drift in the pinned downloads shows
-# up between changes; and by hand.
+# up between changes; and by hand. "Anything they compile" is
+# all of src/, as a pattern rather than a module list, with the
+# manifests, the lockfile and the toolchain: the providers live
+# in src/ai/, but the filters, the studio, the meta responses,
+# the engine and the boot code in src/main.rs call them and
+# hold real-model tests of their own, and an `ort` bump moves
+# only Cargo.lock (issue #710; #633 changed that code outside
+# the old list and merged with no real-model run). The fixtures
+# are the photos the tests embed.
 #
 # The live workflow is .github/workflows/ai-models.yml and
 # docs/ai-models-workflow.yml is its mirror: the automation
@@ -29,17 +36,23 @@ on:
     - cron: "17 5 * * 1"
   pull_request:
     paths:
-      - src/ai/**
-      - src/tokenizer.rs
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
       - tests/fixtures/portrait.jpg
+      - tests/functional/corpus/dog.jpg
       - scripts/requirements/ai-fixtures.txt
       - .github/workflows/ai-models.yml
   push:
     branches: [ "main" ]
     paths:
-      - src/ai/**
-      - src/tokenizer.rs
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
       - tests/fixtures/portrait.jpg
+      - tests/functional/corpus/dog.jpg
       - scripts/requirements/ai-fixtures.txt
       - .github/workflows/ai-models.yml
 
@@ -312,8 +325,17 @@ jobs:
       - name: Install nasm (rav1e SIMD build)
         run: sudo apt-get install -y -qq nasm
 
+      # Every ignored test runs, the engine's and the boot
+      # code's real-model tests with the src/ai/ ones (issue
+      # #710). A real-model test skips when its variable is
+      # unset, so a local run tests the models it has; here
+      # every model is provisioned, and
+      # CRABCROP_TEST_REQUIRE_MODELS turns such a skip into a
+      # failure, so a variable that goes missing from the list
+      # below cannot leave its test quietly unrun.
       - name: Run the real-model AI tests
         env:
+          CRABCROP_TEST_REQUIRE_MODELS: "1"
           CRABCROP_TEST_ORT_DYLIB: ${{ env.AI_ASSETS }}/libonnxruntime.so
           CRABCROP_TEST_FACE_MODEL: ${{ env.AI_ASSETS }}/yunet.onnx
           CRABCROP_TEST_REMOVEBG_MODEL: ${{ env.AI_ASSETS }}/u2netp.onnx

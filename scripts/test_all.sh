@@ -55,10 +55,11 @@ for mirror in docs/*-workflow.yml; do
   fi
 done
 
-step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs, dav1d from a checked tarball, publishing behind the release approval)"
+step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs, dav1d from a checked tarball, publishing behind the release approval, fuzz runs under a memory limit that publish no failing input)"
 python3 scripts/check_workflows.py
 python3 scripts/test_check_workflows.py
 python3 scripts/test_build_dav1d.py
+python3 scripts/test_fuzz_report.py
 
 step "Functional tier (a pull request's diff picks smoke or full)"
 python3 scripts/test_functional_tier.py
@@ -115,9 +116,11 @@ step "Rendering version (a corpus re-baseline since the last release tag raises 
 python3 scripts/check_rendering_version.py ${GITHUB_ACTIONS:+--strict}
 python3 scripts/test_check_rendering_version.py
 
-step "Release scripts (the preflight checks, and creating or updating the GitHub Release)"
+step "Release scripts (the preflight checks, creating or updating the GitHub Release, and publishing the crates and the MCP registry entry)"
 python3 scripts/test_release_preflight.py
 python3 scripts/test_publish_github_release.py
+python3 scripts/test_publish_crates.py
+python3 scripts/test_publish_mcp_registry.py
 
 step "Docs sync (env vars, error codes, filters and the CHANGELOG heading match the code, and the changelog fragments assemble)"
 python3 scripts/check_docs.py
@@ -140,7 +143,9 @@ step "TypeScript SDK"
 (cd sdks/typescript && npm ci --no-audit --no-fund && npm run build && npm test)
 
 step "Python SDK"
-(cd sdks/python && python3 -m unittest discover -s tests)
+# The differential tests run the TypeScript SDK on the Node above;
+# with CRABCROP_DIFF_REQUIRE_NODE they fail, not skip, without it.
+(cd sdks/python && CRABCROP_DIFF_REQUIRE_NODE=1 python3 -m unittest discover -s tests)
 
 step "MCP server"
 (cd sdks/mcp && npm ci --no-audit --no-fund && npm test)
@@ -200,9 +205,12 @@ for url in "http://127.0.0.1:8909/src00.jpg" "http://127.0.0.1:3321/health"; do
 done
 (cd playground && npm run test:integration)
 
-step "Fuzz smoke (parser invariants, corpus + mutations)"
+step "Fuzz smoke (every target's invariants over its corpus, truncations and mutations)"
 # Without the fuzz crate's default avif-decode feature, so the
-# smoke needs no dav1d; the nightly fuzz workflow runs it with.
+# smoke needs no dav1d. The nightly fuzz workflow runs it with
+# the feature, and fuzzes each target, once the owner enables
+# that workflow; until then this smoke is the only fuzzing that
+# runs (issue #710).
 cargo test --locked --manifest-path fuzz/Cargo.toml --no-default-features --lib --test smoke
 
 step "All suites passed"

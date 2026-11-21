@@ -14,7 +14,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crabcrop::engine::decode_image;
-use crabcrop::svg::{WORKER_ARG, WorkerCommand, decode_avif_in};
+use crabcrop::svg::{DEFAULT_WORKER_ADDRESS_SPACE, WORKER_ARG, WorkerCommand, decode_avif_in};
 use image::{ImageEncoder, RgbImage, RgbaImage};
 
 // Not every shared item is used here.
@@ -90,6 +90,7 @@ fn the_worker_decodes_what_the_process_decodes() {
     let worker = WorkerCommand {
         program: PathBuf::from(env!("CARGO_BIN_EXE_crabcrop")),
         args: vec![WORKER_ARG.into()],
+        max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
     };
     let mut checked = 0;
     let mut refused = Vec::new();
@@ -264,6 +265,7 @@ fn worker_decode_latency() {
     let worker = WorkerCommand {
         program: PathBuf::from(env!("CARGO_BIN_EXE_crabcrop")),
         args: vec![WORKER_ARG.into()],
+        max_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
     };
     for (label, avif) in [
         ("small 20x12", rgb_avif(20, 12)),

@@ -45,6 +45,9 @@ pub use ocr::{OCR_MAX_LINES, OnnxOcrProvider, read_ocr_dict};
 pub use sam::{
     MaskGeometry, OnnxSegmentProvider, mask_geometry, segment_box_coords, segment_preprocess,
 };
+pub(crate) use session::lock_recoveries;
+#[cfg(test)]
+pub(crate) use session::recover_a_poisoned_lock;
 pub use upscale::OnnxUpscaleProvider;
 
 /// How an AI operation failed, typed so callers can map the
@@ -61,10 +64,6 @@ pub enum AiError {
     /// input tensor, executing the session, a transient ORT
     /// error.
     Inference(String),
-    /// A provider's session lock was poisoned: an earlier
-    /// inference panicked while holding it, so the session's
-    /// state can no longer be trusted.
-    LockPoisoned,
     /// The model ran but its output is not what the provider
     /// contract requires: no outputs, an unreadable tensor,
     /// an unexpected shape, an embedding of the wrong size.
@@ -76,7 +75,6 @@ impl std::fmt::Display for AiError {
         match self {
             AiError::Load(cause) => write!(f, "{cause}"),
             AiError::Inference(cause) => write!(f, "{cause}"),
-            AiError::LockPoisoned => write!(f, "a model session lock was poisoned"),
             AiError::BadOutput(cause) => write!(f, "{cause}"),
         }
     }
@@ -366,18 +364,41 @@ pub trait OcrProvider: Send + Sync + std::fmt::Debug {
 /// tests take their model paths from. An unset variable means
 /// that model is not provisioned in this environment, so the
 /// caller early-returns and the test skips instead of
-/// panicking: provisioning is a deliberate choice, and the
-/// ai-models workflow sets only some of the variables. A set
+/// panicking: a local run provisions the models it has. A set
 /// variable is used as given: a non-UTF-8 value panics, and
 /// a missing or invalid file it points at fails the test.
+///
+/// Where every model is provisioned, a skip would hide a
+/// variable that went missing, and with it a test that never
+/// ran. There [`REQUIRE_MODELS`] is set (the ai-models
+/// workflow sets it, issue #710), and an unset variable fails
+/// the test instead.
 ///
 /// Not `cfg(test)`: the binary's own tests (`src/main.rs`, a
 /// separate crate from this library) call it too.
 #[doc(hidden)]
 pub fn env_or_skip(name: &str) -> Option<String> {
-    match std::env::var(name) {
+    provisioned(name, |var| std::env::var(var))
+}
+
+/// Set to anything but the empty string, this turns the skip
+/// of [`env_or_skip`] into a failure.
+const REQUIRE_MODELS: &str = "CRABCROP_TEST_REQUIRE_MODELS";
+
+/// [`env_or_skip`] over any lookup, so its rule is tested
+/// without changing the process environment.
+fn provisioned(
+    name: &str,
+    lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Option<String> {
+    match lookup(name) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => {
+            let required = lookup(REQUIRE_MODELS).is_ok_and(|value| !value.is_empty());
+            assert!(
+                !required,
+                "{name} is not set, and {REQUIRE_MODELS} says every real-model test runs here"
+            );
             eprintln!("skipping: {name} is not set");
             None
         }

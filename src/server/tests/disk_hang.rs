@@ -19,7 +19,7 @@ pub(super) fn disk_only_state(dir: &std::path::Path, memory: usize) -> AppState 
     state.shared_store = None;
     state.cache = Arc::new(Cache::new(memory));
     state.presets = preset_test_map();
-    state.metrics_token = Some(TEST_METRICS_TOKEN.to_string());
+    state.metrics_token = Some(TEST_METRICS_TOKEN.to_string().into());
     state
 }
 

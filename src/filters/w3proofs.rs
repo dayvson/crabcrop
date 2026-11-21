@@ -435,7 +435,7 @@ fn rotate90_fast_matches_crate_around_the_size_gate() {
 fn rotate_90_filter_takes_the_block_turn_and_matches_the_crate() {
     let turn = |img: &DynamicImage, degrees: f32| {
         let before = ROT90_BLOCK_TURNS.with(|turns| turns.get());
-        let (out, _) = apply_filters(img.clone(), &[Filter::Rotate(degrees)]);
+        let (out, _) = apply_filters(img.clone(), &[PlainFilter::Rotate(degrees)]);
         (out, ROT90_BLOCK_TURNS.with(|turns| turns.get()) - before)
     };
     let (mut past_gate, mut under_gate) = (0, 0);

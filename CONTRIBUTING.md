@@ -81,7 +81,10 @@ A unit test that stands a script in for an external tool (FFmpeg,
 pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
 `std::fs::write`. A script written through the test process's own file
 descriptor can fail to start with "Text file busy" when another test thread
-spawns a child at the same moment (issue #523).
+spawns a child at the same moment (issue #523). The binary's unit tests cannot
+see the library's test modules, so they include the function's file,
+`src/test_support/script.rs`, with `#[path]`, and call it as
+`crate::test_script::write_script`.
 
 A test that writes files makes them in a directory of its own from
 `crate::test_support::scratch_dir(tag)`: it starts empty under
@@ -125,6 +128,36 @@ CI enforces formatting and lints. Run both before pushing:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## The toolchain
+
+`rust-toolchain.toml` pins the Rust release every build in the repository
+uses: CI, the release, and a `cargo` you run here, for which rustup installs
+it on first use. It is the stable release CI ran when it was set, so a new
+stable release cannot change a lint result on its own: a Clippy lint that
+1.99 added once failed a release commit's lint step (d926f96, issue #710).
+The minimum Rust versions in the manifests (`rust-version`, checked by the
+`msrv` job in `rust.yml`) are floors, separate from this pin, and move only
+when the code needs a newer Rust. The nightly fuzzing uses its own nightly
+toolchain (`cargo +nightly fuzz`).
+
+Moving to a newer stable release is a pull request of its own:
+
+1. Set `channel` in `rust-toolchain.toml` to the new version (`1.100.0`,
+   say, never `stable`).
+2. Run `cargo fmt --all -- --check` and
+   `cargo clippy --locked --workspace --all-targets -- -D warnings` with it,
+   and fix what the new lints find in the same pull request, so main never
+   carries a toolchain its lint step fails on.
+3. Run the tests (`cargo test --locked --workspace`, and
+   `scripts/test_all.sh`). The render corpus must pass unchanged: a new
+   compiler is no reason to re-baseline it.
+4. Check `rust.yml`'s `semver` job: cargo-semver-checks reads the
+   toolchain's rustdoc output, and a newer toolchain can need a newer
+   release of it, pinned there with its checksum.
+
+The ai-models workflow runs for a change to the pin, like any change to
+what the real-model tests compile.
 
 ## The URL grammar is a shared contract
 
@@ -170,8 +203,9 @@ merges first (issue #539).
 
 - **Name** the file `changelog.d/<issue>.<section>.md`, for example
   `changelog.d/521.changed.md`. The section is one of `added`, `changed`,
-  `deprecated`, `removed`, `fixed` or `security`. A short slug after the
-  number, in lowercase words joined by hyphens, is always allowed:
+  `deprecated`, `removed`, `fixed` or `security` (or `summary`, for the
+  release's summary below). A short slug after the number, in lowercase
+  words joined by hyphens, is always allowed:
   `changelog.d/521-chained-resize.changed.md`. Use one when the plain name is
   taken (a second entry for the same issue and section), and also when
   another pull request for the same issue may add an entry to that section
@@ -189,6 +223,8 @@ merges first (issue #539).
   which would start a second entry or a heading: rewrap it instead. A blank
   line, a second bullet or a heading is refused, since an entry is one
   paragraph and a second entry is a second fragment.
+- **Open with what changed**: one sentence that says it, then the detail.
+  Someone deciding whether to upgrade reads the first sentences.
 - **Preview** `## [Unreleased]` as the release will write it. Each section
   lists the entries already written under `## [Unreleased]` first, as they
   are, then the fragments in issue order:
@@ -196,6 +232,22 @@ merges first (issue #539).
   ```bash
   python3 scripts/assemble_changelog.py --check
   ```
+
+  It also warns about each fragment whose first sentence runs past 160
+  characters. The warning does not fail anything: shorten the sentence, or
+  leave it as it is.
+
+Each release's section opens with a summary of two to five lines, written
+when the release is cut (RELEASING.md step 1). It is a fragment too,
+`changelog.d/<issue>.summary.md`, named after an issue its lines name. Each
+line opens with `- ` (a wrapped line joins the one above it) and points at
+the entry it summarizes by that entry's issue, as the entries name theirs,
+`(issue #521)`: a line that names no issue is refused. The release writes
+the lines as a list above the section's first heading: those written there
+by hand under `## [Unreleased]` first, then the summary fragments in issue
+order, each with its lines in the order you gave them, so one fragment sets
+the whole order. A line about an entry that names no issue goes under
+`## [Unreleased]` by hand, above the first heading.
 
 A pull request that raises `RENDERING_VERSION` also says that the release
 starts a new cache epoch (RELEASING.md step 4), in an entry that opens with

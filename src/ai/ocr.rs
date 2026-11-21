@@ -6,7 +6,7 @@ use image::imageops::FilterType;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, collect_outputs, fir_resize, rgb8_view};
+use super::session::{build_session, collect_outputs, fir_resize, lock_model, rgb8_view};
 use super::{AiError, OcrLine, OcrProvider, OcrReport};
 
 /// The detection stage's side limit: the image is scaled
@@ -663,7 +663,7 @@ impl OnnxOcrProvider {
             input.into_boxed_slice(),
         ))
         .map_err(|e| AiError::Inference(format!("cannot build the detection tensor: {e}")))?;
-        let mut session = self.detect.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.detect, "the OCR detection model's session");
         let outputs = session
             .run(ort::inputs![self.detect_input.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("detection failed: {e}")))?;
@@ -688,7 +688,7 @@ impl OnnxOcrProvider {
         let (input, shape) = ocr_rec_preprocess(crop);
         let tensor = ort::value::Tensor::from_array((shape, input.into_boxed_slice()))
             .map_err(|e| AiError::Inference(format!("cannot build the recognition tensor: {e}")))?;
-        let mut session = self.recognize.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.recognize, "the OCR recognition model's session");
         let outputs = session
             .run(ort::inputs![self.recognize_input.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("recognition failed: {e}")))?;

@@ -117,11 +117,19 @@ if ($GROUP === 'vectors') {
     $signed = 0;
     $refused = 0;
     $reserved = 0;
+    $purges = 0;
     $reserved_message = 'remainder begins with the reserved segment "crabcrop": '
         . 'it is kept for key derivation, and no image URL may begin with it';
     foreach ($vectors as $vector) {
         if (!empty($vector['sealed'])) {
             continue; // Sealing is out of scope for a URL builder.
+        }
+        if (isset($vector['purge_signature'])) {
+            // Purge signatures too: the plugin builds image URLs
+            // and mints none. They are counted, so a spec without
+            // them shows here.
+            $purges++;
+            continue;
         }
         if (!empty($vector['reserved'])) {
             // A remainder under the reserved segment: every derived
@@ -193,6 +201,7 @@ if ($GROUP === 'vectors') {
     check($signed >= 20, "signature vectors covered ($signed)");
     check($refused >= 17, "refusal vectors covered ($refused)");
     check($reserved >= 9, "reserved vectors covered ($reserved)");
+    check($purges >= 6, "purge vectors recognized and skipped ($purges)");
     // A key label's signature would be its subkey: refused, and a
     // source that only names a label further in still signs.
     foreach (array('crabcrop/purge-key', 'crabcrop/upload-key', 'crabcrop/seal-key') as $label) {
@@ -390,6 +399,27 @@ if ($GROUP === 'config_constants') {
     eq(true, $config['disable_sizes'], 'constant supplies disable sizes');
     eq('CRABCROP_WP_BASE_URL', crabcrop_wp_constant_for('base_url'), 'constant_for names the base URL constant');
     eq(null, crabcrop_wp_constant_for('key_id'), 'constant_for: key id has no settings field');
+
+    // With the secret set by its constant, the page holds neither
+    // the constant's secret nor the stored one, and the disabled
+    // field, which the browser does not submit, keeps the stored
+    // secret on save.
+    ob_start();
+    crabcrop_wp_settings_page();
+    $page = ob_get_clean();
+    check(strpos($page, 'option-secret') === false, 'settings page: a constant set, the stored secret is not in the page');
+    check(strpos($page, 'const-secret') === false, "settings page: the constant's secret is not in the page");
+    check(
+        preg_match('/name="crabcrop_settings\[secret\]"\s+value=""[^>]*disabled="disabled"/', $page) === 1,
+        'settings page: a constant set, the secret field is empty and disabled'
+    );
+    check(strpos($page, 'A secret is stored') === false, 'settings page: a constant set, no claim of a stored secret');
+    check(strpos($page, 'crabcrop_settings[clear_secret]') === false, 'settings page: a constant set, nothing to remove');
+    eq(
+        'option-secret',
+        crabcrop_wp_sanitize_settings(array('base_url' => 'https://options.example.com'))['secret'],
+        'sanitize: a constant set, saving keeps the stored secret'
+    );
 }
 
 if ($GROUP === 'rewrite') {
@@ -603,6 +633,90 @@ if ($GROUP === 'settings') {
         array('a' => 'b'),
         crabcrop_wp_parse_size_map('a=b', 'presets'),
         'parse: tight spacing works'
+    );
+
+    // The stored secret: never written into the page, kept when
+    // the field comes back empty or absent (a field a constant
+    // disables is not submitted), replaced by a new value, and
+    // removed only when asked.
+    set_options(array(
+        'base_url' => 'https://images.example.com',
+        'mode' => 'signed',
+        'secret' => 'stored-s3cret-value',
+        'size_map' => array('thumbnail' => 'crop:150x150:smart'),
+    ));
+    ob_start();
+    crabcrop_wp_settings_page();
+    $page = ob_get_clean();
+    check(strpos($page, 'stored-s3cret-value') === false, 'settings page: the stored secret is not in the page');
+    check(strpos($page, 'A secret is stored') !== false, 'settings page: says a secret is stored');
+    check(
+        preg_match('/name="crabcrop_settings\[secret\]"\s+value=""/', $page) === 1,
+        'settings page: the secret field starts empty'
+    );
+    check(strpos($page, 'crabcrop_settings[clear_secret]') !== false, 'settings page: offers to remove the stored secret');
+    $form = array(
+        'base_url' => 'https://images.example.com',
+        'mode' => 'signed',
+        'size_map_text' => 'thumbnail = crop:150x150:smart',
+    );
+    eq(
+        'stored-s3cret-value',
+        crabcrop_wp_sanitize_settings($form + array('secret' => ''))['secret'],
+        'sanitize: an empty secret field keeps the stored secret'
+    );
+    eq(
+        'stored-s3cret-value',
+        crabcrop_wp_sanitize_settings($form)['secret'],
+        'sanitize: a missing secret field keeps the stored secret'
+    );
+    eq(
+        'new-s3cret',
+        crabcrop_wp_sanitize_settings($form + array('secret' => 'new-s3cret'))['secret'],
+        'sanitize: a new secret replaces the stored one'
+    );
+    eq(
+        '',
+        crabcrop_wp_sanitize_settings($form + array('secret' => '', 'clear_secret' => '1'))['secret'],
+        'sanitize: the remove checkbox clears the stored secret'
+    );
+    eq(
+        '',
+        crabcrop_wp_sanitize_settings($form + array('secret' => 'ignored', 'clear_secret' => '1'))['secret'],
+        'sanitize: removing wins over a value typed at the same time'
+    );
+    // With no secret stored, the page says nothing is stored.
+    set_options(array('base_url' => 'https://images.example.com', 'mode' => 'presets'));
+    ob_start();
+    crabcrop_wp_settings_page();
+    $page = ob_get_clean();
+    check(strpos($page, 'A secret is stored') === false, 'settings page: no stored secret, no claim of one');
+    check(strpos($page, 'crabcrop_settings[clear_secret]') === false, 'settings page: nothing to remove');
+
+    // WordPress sanitizes twice on the first save, the second time
+    // over the first pass's output: the second pass changes
+    // nothing, the size map and the secret included.
+    set_options(array());
+    $first = crabcrop_wp_sanitize_settings(array(
+        'base_url' => 'https://images.example.com',
+        'mode' => 'signed',
+        'secret' => 'first-s3cret',
+        'size_map_text' => "thumbnail = crop:150x150:smart\nmedium = preset:card",
+        'disable_sizes' => '1',
+    ));
+    eq($first, crabcrop_wp_sanitize_settings($first), 'sanitize: a second pass over its own output changes nothing');
+    eq(
+        array('thumbnail' => 'crop:150x150:smart', 'medium' => 'preset:card'),
+        crabcrop_wp_sanitize_settings($first)['size_map'],
+        'sanitize: the second pass keeps the size map'
+    );
+    eq(
+        array('thumbnail' => 'wp-thumb'),
+        crabcrop_wp_sanitize_settings(array(
+            'mode' => 'presets',
+            'size_map' => array('thumbnail' => 'wp-thumb', 'medium' => 'not a preset'),
+        ))['size_map'],
+        'sanitize: a parsed map is checked again, not trusted'
     );
 
     // Admin wiring: the actions register the setting and the page.

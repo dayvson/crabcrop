@@ -275,6 +275,78 @@ class Installer(unittest.TestCase):
                     """
                 self.assertEqual(step_problems(step, self.ENV), [])
 
+    def test_a_moving_url_fails_even_when_checked(self):
+        env = self.ENV.replace("download/v0.33.1/", "latest/download/")
+        step = """\
+            - run: |
+                curl -LsSf "$CARGO_DIST_INSTALLER_URL" -o i.sh
+                echo "$CARGO_DIST_INSTALLER_SHA256  i.sh" | shasum -a 256 -c -
+                sh i.sh
+            """
+        (problem,) = step_problems(step, env)
+        self.assertIn("from a releases/latest URL", problem)
+
+
+class Publisher(unittest.TestCase):
+    """Issue #711: the MCP registry's publisher, pinned like the cargo-dist installer."""
+
+    ENV = (
+        "env:\n"
+        '  MCP_PUBLISHER_URL: "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.9/mcp-publisher_linux_amd64.tar.gz"\n'
+        f'  MCP_PUBLISHER_SHA256: "{HASH}"\n'
+    )
+    INSTALL = """\
+        - name: Install mcp-publisher (pinned by version and checksum)
+          run: |
+            archive="$RUNNER_TEMP/mcp-publisher.tar.gz"
+            curl --proto '=https' --tlsv1.2 -LsSf "$MCP_PUBLISHER_URL" -o "$archive"
+            echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -
+            mkdir -p "$RUNNER_TEMP/mcp-publisher"
+            tar -xzf "$archive" -C "$RUNNER_TEMP/mcp-publisher" mcp-publisher
+        """
+
+    def test_the_release_jobs_install_step_passes(self):
+        self.assertEqual(step_problems(self.INSTALL, self.ENV), [])
+
+    def test_the_registry_guides_unpinned_install_fails(self):
+        # The registry's guide once fetched releases/latest and piped it
+        # into tar, with no check at all.
+        step = """\
+            - name: Install MCP Publisher
+              run: |
+                curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+            """
+        (problem,) = step_problems(step)
+        self.assertIn("fetches the mcp-publisher archive from a releases/latest URL", problem)
+
+    def test_an_unchecked_or_late_checked_archive_fails(self):
+        unchecked = self.INSTALL.replace('            echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -\n', "")
+        (problem,) = step_problems(unchecked, self.ENV)
+        self.assertIn("fetches the mcp-publisher archive but never checks its sha256", problem)
+        late = unchecked + '            echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -\n'
+        (problem,) = step_problems(late, self.ENV)
+        self.assertIn("unpacks the mcp-publisher archive before it checks its sha256", problem)
+        piped = """\
+            - run: |
+                curl -LsSf "$MCP_PUBLISHER_URL" | tar xz mcp-publisher
+                echo "$MCP_PUBLISHER_SHA256  mcp-publisher" | sha256sum -c -
+            """
+        (problem,) = step_problems(piped, self.ENV)
+        self.assertIn("unpacks the mcp-publisher archive before it checks its sha256", problem)
+
+    def test_a_check_against_no_pinned_hash_fails(self):
+        (problem,) = step_problems(self.INSTALL, self.ENV.replace(HASH, "${{ vars.PUBLISHER_SHA }}"))
+        self.assertIn("checks the mcp-publisher archive against no pinned sha256", problem)
+
+    def test_running_the_unpacked_publisher_is_no_fetch(self):
+        step = """\
+            - name: Publish server.json
+              run: |
+                python3 scripts/publish_mcp_registry.py --tag "$RELEASE_TAG" --publisher "$RUNNER_TEMP/mcp-publisher/mcp-publisher"
+                "$RUNNER_TEMP/mcp-publisher/mcp-publisher" publish sdks/mcp/server.json
+            """
+        self.assertEqual(step_problems(step, self.ENV), [])
+
 
 class Pip(unittest.TestCase):
     """Issue #598: every pip install is hashed, the build backend included."""
@@ -547,6 +619,79 @@ class Gate(unittest.TestCase):
         self.assertEqual(problems(text), [])
 
 
+def with_job(workflow, job):
+    """`workflow` with one more job, given as its YAML lines under `jobs:`."""
+    return workflow + textwrap.indent(textwrap.dedent(job).strip("\n"), "  ") + "\n"
+
+
+# A registry job in the release approval's environment that waits for
+# nothing else: the gate rule takes it, since it waits for an approval,
+# but it can publish before host has published the GitHub Release.
+UNORDERED = """\
+publish-mcp-registry:
+  needs:
+    - plan
+  runs-on: ubuntu-22.04
+  environment: release
+  permissions:
+    contents: read
+    id-token: write
+  steps:
+    - run: mcp-publisher publish
+"""
+
+
+class Order(unittest.TestCase):
+    """Issue #711: every publishing job runs after host, as the registry jobs do."""
+
+    def order(self, text):
+        return [p for p in problems(text) if "before host has published" in p or "no host job" in p]
+
+    def test_the_gated_layout_is_in_order(self):
+        self.assertEqual(problems(NEW_GATE), [])
+
+    def test_a_registry_job_that_skips_host_fails(self):
+        text = with_job(NEW_GATE, UNORDERED)
+        (problem,) = problems(text)
+        self.assertIn("job publish-mcp-registry publishes (id-token: write; names the `release` environment)", problem)
+        self.assertIn("before host has published the GitHub Release", problem)
+        for needs in ("    - release-gate\n", "    - plan\n    - release-gate\n"):
+            with self.subTest(needs=needs):
+                (problem,) = problems(with_job(NEW_GATE, UNORDERED.replace("    - plan\n", needs)))
+                self.assertIn("job publish-mcp-registry publishes", problem)
+
+    def test_a_job_after_a_registry_job_is_in_order(self):
+        # Needing publish-crate, which needs host, is waiting for host.
+        job = UNORDERED.replace("    - plan\n", "    - publish-crate\n").replace("  environment: release\n", "")
+        self.assertEqual(problems(with_job(NEW_GATE, job)), [])
+        self.assertEqual(problems(with_job(NEW_GATE, UNORDERED.replace("    - plan\n", "    - plan\n    - host\n"))), [])
+
+    def test_an_if_that_runs_after_a_failed_host_fails(self):
+        job = UNORDERED.replace("    - plan\n", "    - host\n").replace("  runs-on:", "  if: ${{ always() }}\n  runs-on:")
+        self.assertEqual(len(self.order(with_job(NEW_GATE, job))), 1)
+        job = job.replace("${{ always() }}", "${{ always() && needs.host.result == 'success' }}")
+        self.assertEqual(problems(with_job(NEW_GATE, job)), [])
+
+    def test_images_that_skip_host_fail(self):
+        text = NEW_GATE.replace("  build-images:\n    needs: host\n", "  build-images:\n    needs: release-gate\n")
+        (problem,) = problems(text)
+        self.assertIn("job build-images publishes (packages: write) but can run before host", problem)
+
+    def test_only_the_release_workflow_is_ordered(self):
+        # No release-gate job: the gate rule alone applies, as before.
+        self.assertEqual(self.order(with_job(OLD_GATE, UNORDERED)), [])
+        found = step_problems("- run: npm publish\n  env:\n    T: ${{ secrets.NPM_TOKEN }}\n")
+        self.assertEqual([p for p in found if "before host" in p], [])
+        self.assertTrue(found, "the gate rule still covers the job")
+
+    def test_an_approval_without_host_is_reported(self):
+        text = NEW_GATE.replace("  host:\n", "  publish-release:\n").replace("needs: host", "needs: publish-release")
+        text = text.replace("      - host\n", "      - publish-release\n")
+        found = self.order(text)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("has the release-gate approval job but no host job", found[0])
+
+
 class ReleaseLayout(unittest.TestCase):
     """The release workflow as docs/release-workflow.yml lands it."""
 
@@ -563,14 +708,60 @@ class ReleaseLayout(unittest.TestCase):
         gate = self.jobs["release-gate"]
         self.assertEqual(gate["environment"], "release")
         self.assertEqual(gate["permissions"], {})
-        for build in ("build-local-artifacts", "build-global-artifacts", "build-pypi", "ai-models"):
+        for build in ("build-local-artifacts", "build-global-artifacts", "build-pypi", "package-crates", "ai-models"):
             self.assertIn(build, gate["needs"])
+        for build in ("build-pypi", "package-crates", "ai-models"):
+            self.assertIn(f"needs.{build}.result == 'success'", cw.conjuncts(gate["if"]))
         self.assertIn("release-gate", self.jobs["host"]["needs"])
         self.assertIn("needs.release-gate.result == 'success'", cw.conjuncts(self.jobs["host"]["if"]))
         self.assertEqual(self.jobs["build-images"]["needs"], "host")
-        for job in ("publish-crate", "publish-npm", "publish-mcp", "publish-pypi"):
+        for job in ("publish-crate", "publish-npm", "publish-mcp", "publish-pypi", "publish-mcp-registry"):
             self.assertIn("host", self.jobs[job]["needs"])
             self.assertEqual(self.jobs[job]["environment"], "release")
+
+    def test_the_crate_job_publishes_crabcrop_url_then_crabcrop(self):
+        # Issue #711: the server crate goes up in the same job, after the
+        # crate it depends on, under the same approval.
+        job = self.jobs["publish-crate"]
+        publish = job["steps"][self.step_index("publish-crate", "cargo publish")]
+        self.assertEqual(publish["run"], 'python3 scripts/publish_crates.py --tag "$RELEASE_TAG" --no-verify crabcrop-url crabcrop')
+        self.assertEqual(publish["env"]["RELEASE_TAG"], "${{ needs.plan.outputs.tag }}")
+        self.assertEqual([step["name"] for step in job["steps"] if cw.secret_names(step)], ["cargo publish"])
+        self.assertIn("timeout-minutes", job)
+
+    def test_the_crates_build_without_secrets_and_publish_without_building(self):
+        # Issue #711, as build-pypi and publish-pypi do for PyPI (#598):
+        # the server crate's dependencies run build scripts and procedural
+        # macros, so they build in a job without the crates.io token, and
+        # the job with the token publishes what that one built from.
+        build = self.jobs["package-crates"]
+        self.assertEqual(cw.secret_names(build), [])
+        self.assertEqual(build["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", build)
+        package = build["steps"][self.step_index("package-crates", "Package and build both crates")]
+        self.assertEqual(package["run"], "cargo package -p crabcrop-url -p crabcrop --locked")
+        self.assertLess(self.step_index("package-crates", "Install nasm (rav1e SIMD build)"), self.step_index("package-crates", "Package and build both crates"))
+        self.assertIn("timeout-minutes", build)
+        publish = self.jobs["publish-crate"]
+        self.assertIn("package-crates", publish["needs"])
+        runs = [str(step.get("run", "")) for step in publish["steps"]]
+        self.assertEqual([run for run in runs if re.search(r"\bcargo (?:build|package|test)\b|\bnasm\b", run)], [])
+        self.assertTrue(all("--no-verify" in run for run in runs if "publish" in run), runs)
+
+    def test_the_mcp_registry_entry_publishes_after_its_npm_package(self):
+        # Issue #711: the registry checks the npm package's mcpName, so the
+        # entry goes up once publish-mcp has put the package on npm.
+        job = self.jobs["publish-mcp-registry"]
+        self.assertEqual(job["needs"], ["plan", "host", "publish-mcp"])
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertRegex(job["env"]["MCP_PUBLISHER_URL"], r"/releases/download/v\d+\.\d+\.\d+/mcp-publisher_linux_amd64\.tar\.gz$")
+        self.assertRegex(job["env"]["MCP_PUBLISHER_SHA256"], r"^[0-9a-f]{64}$")
+        install = job["steps"][self.step_index("publish-mcp-registry", "Install mcp-publisher (pinned by version and checksum)")]
+        publish = job["steps"][self.step_index("publish-mcp-registry", "Publish server.json")]
+        self.assertIn('--publisher "$RUNNER_TEMP/mcp-publisher/mcp-publisher"', publish["run"])
+        self.assertIn('-C "$RUNNER_TEMP/mcp-publisher" mcp-publisher', install["run"])
+        self.assertEqual([step["name"] for step in job["steps"] if cw.secret_names(step)], ["Publish server.json"])
+        self.assertIn("timeout-minutes", job)
 
     def test_pull_requests_skip_the_approval(self):
         self.assertIn("needs.plan.outputs.publishing == 'true'", cw.conjuncts(self.jobs["release-gate"]["if"]))
@@ -596,6 +787,7 @@ class ReleaseLayout(unittest.TestCase):
     def test_every_dav1d_build_uses_the_script(self):
         for path, job in (
             ("release-workflow.yml", "build-local-artifacts"),
+            ("rust-workflow.yml", "build"),
             ("rust-workflow.yml", "macos"),
             ("fuzz-workflow.yml", "fuzz"),
             ("fuzz-workflow.yml", "tests"),
@@ -610,6 +802,196 @@ class ReleaseLayout(unittest.TestCase):
                 self.assertLess(built, cargo, f"{path} {job} builds before it builds dav1d")
         checked = self.step_index("build-local-artifacts", "Check that dav1d is linked statically")
         self.assertGreater(checked, self.step_index("build-local-artifacts", "Build artifacts"))
+
+
+class Fuzz(unittest.TestCase):
+    """Issue #710: every libFuzzer run under a memory limit."""
+
+    def test_a_run_without_the_limit_fails(self):
+        for command in (
+            'cargo +nightly fuzz run "$TARGET" "$corpus" -- -max_total_time=900 -timeout=600',
+            "cargo fuzz run decode",
+            "cargo +nightly-2026-01-01 fuzz run op_chain -- -rss_limit_mb=0",
+        ):
+            with self.subTest(command=command):
+                (problem,) = step_problems(f"- run: |\n    {command}\n")
+                self.assertIn("without -rss_limit_mb", problem)
+
+    def test_the_limit_on_a_continued_line_passes(self):
+        step = """\
+            - run: |
+                cargo +nightly fuzz run "$TARGET" "$corpus" "fuzz/corpus/$TARGET" -- \\
+                  -max_total_time=900 \\
+                  -rss_limit_mb=2048 \\
+                  -timeout=600 > "$log" 2>&1 || status=$?
+            """
+        self.assertEqual(step_problems(step), [])
+
+    def test_other_cargo_fuzz_commands_pass(self):
+        for command in ('cargo +nightly fuzz build "$TARGET"', "cargo +nightly install cargo-fuzz --version 0.13.2 --locked"):
+            with self.subTest(command=command):
+                self.assertEqual(step_problems(f"- run: {command}\n"), [])
+
+
+class ReleaseCache(unittest.TestCase):
+    """Issue #710: the release builds from its checkout alone."""
+
+    STEPS = {
+        "actions/cache": f"- uses: actions/cache@{SHA}\n  with:\n    path: target\n    key: k\n",
+        "actions/cache/restore": f"- uses: actions/cache/restore@{SHA}\n  with:\n    path: target\n    key: k\n",
+        "Swatinem/rust-cache": f"- uses: Swatinem/rust-cache@{SHA}\n",
+        "setup-node cache": f"- uses: actions/setup-node@{SHA}\n  with:\n    node-version: 22\n    cache: npm\n",
+    }
+
+    def test_a_cache_in_the_release_workflow_fails(self):
+        for name in ("docs/release-workflow.yml", ".github/workflows/release.yml"):
+            for label, step in self.STEPS.items():
+                with self.subTest(name=name, step=label):
+                    (problem,) = cw.check_workflow(step_workflow(step), name)
+                    self.assertIn("restores a cache in the release workflow", problem)
+
+    def test_other_workflows_and_plain_setup_steps_pass(self):
+        for label, step in self.STEPS.items():
+            with self.subTest(step=label):
+                self.assertEqual(cw.check_workflow(step_workflow(step), "docs/rust-workflow.yml"), [])
+        plain = f"- uses: actions/setup-node@{SHA}\n  with:\n    node-version: 22\n"
+        self.assertEqual(cw.check_workflow(step_workflow(plain), "docs/release-workflow.yml"), [])
+        save = f"- uses: actions/cache/save@{SHA}\n  with:\n    path: target\n    key: k\n"
+        self.assertEqual(cw.check_workflow(step_workflow(save), "docs/release-workflow.yml"), [])
+
+
+def mirror(name):
+    return cw.load((ROOT / "docs" / f"{name}-workflow.yml").read_text(encoding="utf-8"))
+
+
+def steps_named(job, name):
+    return [step for step in job["steps"] if step.get("name") == name]
+
+
+class Timeouts(unittest.TestCase):
+    """Issues #543 and #710: no job holds a runner for six hours."""
+
+    # Their jobs set no timeout yet: release.yml is mostly what
+    # cargo-dist generates, and changelog.yml's one job reads a diff.
+    NOT_YET = {"release", "changelog"}
+
+    def test_every_job_of_the_landed_workflows_sets_a_timeout(self):
+        for path in sorted((ROOT / "docs").glob("*-workflow.yml")):
+            stem = cw.workflow_stem(path.name)
+            if stem in self.NOT_YET:
+                continue
+            for job_name, job in mirror(stem)["jobs"].items():
+                with self.subTest(workflow=stem, job=job_name):
+                    if "uses" not in job:
+                        self.assertRegex(str(job.get("timeout-minutes", "")), r"^[1-9]\d*$")
+
+
+class FuzzLayout(unittest.TestCase):
+    """The nightly fuzz workflow as docs/fuzz-workflow.yml lands it (issue #710)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = mirror("fuzz")
+        cls.jobs = cls.workflow["jobs"]
+
+    def test_no_failing_input_is_printed_or_uploaded(self):
+        for job in self.jobs.values():
+            for step in job["steps"]:
+                self.assertNotIn("upload-artifact", str(step.get("uses", "")))
+        (run,) = [step["run"] for step in self.jobs["fuzz"]["steps"] if "fuzz run" in str(step.get("run", ""))]
+        command = next(line for line in cw.shell_lines(run) if "fuzz run" in line)
+        self.assertRegex(command, r'> "\$log" 2>&1 \|\| status=\$\?$')
+        lines = [line.strip() for line in cw.shell_lines(run) if line.strip()]
+        self.assertEqual(lines[-2:], ['python3 scripts/fuzz_report.py "$log" "fuzz/artifacts/$TARGET"', 'exit "$status"'])
+
+    def test_the_matrix_fuzzes_every_target(self):
+        manifest = (ROOT / "fuzz" / "Cargo.toml").read_text(encoding="utf-8")
+        targets = re.findall(r'^\[\[bin\]\]\nname = "([^"]+)"', manifest, re.M)
+        self.assertIn("render", targets)
+        self.assertEqual(sorted(self.jobs["fuzz"]["strategy"]["matrix"]["target"]), sorted(targets))
+
+    def test_the_schedule_and_the_tests_job_stay(self):
+        self.assertTrue(self.workflow["on"]["schedule"])
+        runs = {step.get("name"): step for step in self.jobs["tests"]["steps"]}
+        smoke = runs["Fuzz smoke with the AVIF decoder"]["run"]
+        self.assertIn("--test smoke", smoke)
+        self.assertNotIn("--no-default-features", smoke)
+        self.assertEqual(runs["Workspace tests with 10000 cases per property"]["env"]["PROPTEST_CASES"], "10000")
+
+
+class RustLayout(unittest.TestCase):
+    """rust.yml as docs/rust-workflow.yml lands it (issue #710)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = mirror("rust")
+        cls.jobs = cls.workflow["jobs"]
+
+    def test_the_linux_avif_tests_link_the_release_dav1d(self):
+        runs = [str(step.get("run", "")) for step in self.jobs["build"]["steps"]]
+        built = next(at for at, run in enumerate(runs) if run.startswith("bash scripts/build_dav1d.sh"))
+        avif = next(at for at, run in enumerate(runs) if "--features avif-decode" in run)
+        self.assertLess(built, avif)
+        self.assertFalse([run for run in runs if "libdav1d" in run])
+
+    def test_only_a_push_to_main_saves_the_cargo_cache(self):
+        caches = [
+            step
+            for job in self.jobs.values()
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("Swatinem/rust-cache@")
+        ]
+        self.assertEqual(len(caches), 4)
+        for step in caches:
+            self.assertTrue(step["with"]["prefix-key"].startswith("rust-ci-"))
+            self.assertEqual(step["with"]["save-if"], "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
+
+    def test_a_scheduled_run_audits_and_does_nothing_else(self):
+        self.assertTrue(self.workflow["on"]["schedule"])
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                expected = "==" if name == "scheduled-audit" else "!="
+                self.assertEqual(job["if"], f"github.event_name {expected} 'schedule'")
+        audit = self.jobs["scheduled-audit"]
+        self.assertEqual(audit["permissions"], {"contents": "read", "issues": "write"})
+        self.assertTrue(str(audit["steps"][-1]["uses"]).startswith("rustsec/audit-check@"))
+
+    def test_the_semver_check_installs_a_checked_binary(self):
+        steps = self.jobs["semver"]["steps"]
+        (install,) = steps_named(self.jobs["semver"], "Install cargo-semver-checks")
+        script = "\n".join(cw.shell_lines(install["run"]))
+        self.assertRegex(script, r'echo "[0-9a-f]{64}  \$archive" \| sha256sum -c -')
+        self.assertLess(script.index("sha256sum -c"), script.index("tar -xzf"))
+        self.assertEqual(steps[-1]["run"], "cargo semver-checks --package crabcrop-url")
+        self.assertEqual(steps[-1]["if"], "steps.changed.outputs.changed == 'true'")
+
+
+class AiModelsLayout(unittest.TestCase):
+    """ai-models.yml as docs/ai-models-workflow.yml lands it (issue #710)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = mirror("ai-models")
+
+    def test_every_change_the_real_model_tests_compile_starts_it(self):
+        for event in ("pull_request", "push"):
+            paths = self.workflow["on"][event]["paths"]
+            for path in ("src/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "tests/fixtures/portrait.jpg", "tests/functional/corpus/dog.jpg"):
+                with self.subTest(event=event, path=path):
+                    self.assertIn(path, paths)
+
+    def test_every_model_variable_a_test_reads_is_set_and_required(self):
+        (step,) = steps_named(self.workflow["jobs"]["ai-models"], "Run the real-model AI tests")
+        env = step["env"]
+        self.assertEqual(env["CRABCROP_TEST_REQUIRE_MODELS"], "1")
+        read = set()
+        for source in (ROOT / "src").rglob("*.rs"):
+            text = source.read_text(encoding="utf-8")
+            read |= set(re.findall(r'env_or_skip\("(CRABCROP_TEST_[A-Z0-9_]+)"\)', text))
+            for names in re.findall(r"clip_vars\(\[([^\]]*)\]\)", text):
+                read |= set(re.findall(r'"(CRABCROP_TEST_[A-Z0-9_]+)"', names))
+        self.assertIn("CRABCROP_TEST_DETECT_MODEL", read)
+        self.assertEqual(sorted(read - set(env)), [])
 
 
 class Repository(unittest.TestCase):

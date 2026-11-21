@@ -1297,8 +1297,8 @@ mod tests {
             .process(
                 P3,
                 &[crate::url::Operation::Filters(vec![
-                    crate::url::Filter::Format(crate::url::FormatSpec::plain(
-                        crate::url::ImageFormat::Png,
+                    crate::url::Filter::Plain(crate::url::PlainFilter::Format(
+                        crate::url::FormatSpec::plain(crate::url::ImageFormat::Png),
                     )),
                 ])],
             )

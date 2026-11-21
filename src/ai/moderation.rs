@@ -6,7 +6,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::clip::{ChannelStats, crop224_preprocess, first_row};
-use super::session::{ModelOutput, build_session, collect_outputs, model_display_name};
+use super::session::{ModelOutput, build_session, collect_outputs, lock_model, model_display_name};
 use super::{AiError, ModerationProvider, ModerationScores, TagProvider, TagScore};
 
 /// Content moderation backed by a ViT classifier ONNX
@@ -62,7 +62,7 @@ impl OnnxModerationProvider {
         let tensor =
             ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+        let mut session = lock_model(&self.session, "the moderation model's session");
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;

@@ -12,8 +12,8 @@
 //! server will do.
 
 use crate::url::{
-    Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, ParseError, Quality,
-    Signature,
+    Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, ParseError, PlainFilter,
+    Quality, Signature,
 };
 
 const USAGE: &str = "\
@@ -37,7 +37,10 @@ CLI verbs (flags go after the verb; see Flags below):
                                       (--placeholders / --detections ask for those fields.)
                                       Needs meta mode on the server (CRABCROP_META_MODE=1).
   crabcrop purge <url-or-remainder>   Purge one URL's cached variants.
-  crabcrop purge-group <name>         Purge every cached entry in a preset group.
+                                      (--expires <unix-seconds> sends a purge URL
+                                      that stops working at that second.)
+  crabcrop purge-group <name>         Purge every cached entry in a preset group
+                                      (--expires as for purge).
   crabcrop upload <file> [<name>]     Upload an original to the server's upload store
                                       (name defaults to the file's basename); prints the
                                       source reference to use in transform URLs.
@@ -60,8 +63,8 @@ Flags (each value flag also takes the --flag=<value> spelling):
                                       Env CRABCROP_SECRET_KEY_ID.
   --placeholders                      meta only: include the placeholder fields.
   --detections                        meta only: include the detection boxes.
-  --expires <unix-seconds>            upload only: the minted upload token stops working
-                                      at that second.
+  --expires <unix-seconds>            upload, purge and purge-group only: the minted upload
+                                      token or purge URL stops working at that second.
   --help, -h                          Print this help and exit, in any position.";
 
 /// Every flag `parse_flags` accepts: the ones that take a
@@ -190,9 +193,10 @@ struct Config {
     /// verb accepts them.
     placeholders: bool,
     detections: bool,
-    /// Upload token expiry (issue #192): a unix-seconds
-    /// second at which the minted upload token stops
-    /// working. Only the `upload` verb accepts it.
+    /// The expiry of a minted upload token (issue #192) or
+    /// purge URL: a unix-seconds second at which it stops
+    /// working. Only the `upload`, `purge` and `purge-group`
+    /// verbs accept it.
     expires: Option<u64>,
 }
 
@@ -470,9 +474,9 @@ pub async fn exec(args: &[String]) -> Result<String, CliError> {
             "--placeholders and --detections only apply to the meta verb".to_string(),
         ));
     }
-    if verb != "upload" && config.expires.is_some() {
+    if !matches!(verb, "upload" | "purge" | "purge-group") && config.expires.is_some() {
         return Err(CliError::Usage(
-            "--expires only applies to the upload verb".to_string(),
+            "--expires only applies to the upload, purge and purge-group verbs".to_string(),
         ));
     }
     match verb {
@@ -808,22 +812,24 @@ fn hex3(c: [u8; 3]) -> String {
 
 pub(crate) fn describe_filter(filter: &Filter) -> String {
     match filter {
-        Filter::Grayscale => "grayscale: convert to grayscale".into(),
-        Filter::Invert => "invert: invert the colors".into(),
-        Filter::Blur(v) => format!("blur({v}): gaussian blur"),
-        Filter::Brighten(v) => format!("brighten({v}): adjust brightness"),
-        Filter::Contrast(v) => format!("contrast({v}): adjust contrast"),
-        Filter::Gamma(v) => format!("gamma({v}): apply gamma correction"),
-        Filter::Exposure(v) => format!("exposure({v}): adjust exposure in stops"),
-        Filter::HighlightsShadows(h, s) => {
+        Filter::Plain(PlainFilter::Grayscale) => "grayscale: convert to grayscale".into(),
+        Filter::Plain(PlainFilter::Invert) => "invert: invert the colors".into(),
+        Filter::Plain(PlainFilter::Blur(v)) => format!("blur({v}): gaussian blur"),
+        Filter::Plain(PlainFilter::Brighten(v)) => format!("brighten({v}): adjust brightness"),
+        Filter::Plain(PlainFilter::Contrast(v)) => format!("contrast({v}): adjust contrast"),
+        Filter::Plain(PlainFilter::Gamma(v)) => format!("gamma({v}): apply gamma correction"),
+        Filter::Plain(PlainFilter::Exposure(v)) => {
+            format!("exposure({v}): adjust exposure in stops")
+        }
+        Filter::Plain(PlainFilter::HighlightsShadows(h, s)) => {
             format!("highlights_shadows({h},{s}): adjust highlights and shadows")
         }
-        Filter::Vibrance(v) => format!("vibrance({v}): adjust vibrance"),
-        Filter::HueRotate(v) => format!("huerotate({v}): rotate the hue"),
-        Filter::Sharpen(v) => format!("sharpen({v}): sharpen"),
-        Filter::Saturation(v) => format!("saturation({v}): adjust saturation"),
-        Filter::Rgb(r, g, b) => format!("rgb({r},{g},{b}): shift the channels"),
-        Filter::Curve(channel, points) => {
+        Filter::Plain(PlainFilter::Vibrance(v)) => format!("vibrance({v}): adjust vibrance"),
+        Filter::Plain(PlainFilter::HueRotate(v)) => format!("huerotate({v}): rotate the hue"),
+        Filter::Plain(PlainFilter::Sharpen(v)) => format!("sharpen({v}): sharpen"),
+        Filter::Plain(PlainFilter::Saturation(v)) => format!("saturation({v}): adjust saturation"),
+        Filter::Plain(PlainFilter::Rgb(r, g, b)) => format!("rgb({r},{g},{b}): shift the channels"),
+        Filter::Plain(PlainFilter::Curve(channel, points)) => {
             let mut text = format!("curve({}", channel.name());
             for (x, y) in points {
                 text.push_str(&format!(",{x},{y}"));
@@ -831,7 +837,7 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
             text.push_str("): remap tones through the control points");
             text
         }
-        Filter::Convolution(values, normalize) => {
+        Filter::Plain(PlainFilter::Convolution(values, normalize)) => {
             let mut text = "convolution(".to_string();
             for (i, v) in values.iter().enumerate() {
                 if i > 0 {
@@ -843,12 +849,14 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
             text.push_str("): apply the kernel to the image");
             text
         }
-        Filter::Noise(v) => format!("noise({v}): add deterministic film grain"),
-        Filter::Equalize => "equalize: histogram equalization".into(),
-        Filter::Enhance => "enhance: gentle auto-levels".into(),
-        Filter::Rotate(v) => format!("rotate({v}): rotate by a multiple of 90 degrees"),
-        Filter::Trim(v) => format!("trim({v}): trim near-uniform borders"),
-        Filter::TrimSides(t, [l, tp, r, b]) => {
+        Filter::Plain(PlainFilter::Noise(v)) => format!("noise({v}): add deterministic film grain"),
+        Filter::Plain(PlainFilter::Equalize) => "equalize: histogram equalization".into(),
+        Filter::Plain(PlainFilter::Enhance) => "enhance: gentle auto-levels".into(),
+        Filter::Plain(PlainFilter::Rotate(v)) => {
+            format!("rotate({v}): rotate by a multiple of 90 degrees")
+        }
+        Filter::Plain(PlainFilter::Trim(v)) => format!("trim({v}): trim near-uniform borders"),
+        Filter::Plain(PlainFilter::TrimSides(t, [l, tp, r, b])) => {
             format!(
                 "trim({t},{l},{tp},{r},{b}): trim near-uniform borders, then remove pixels per side"
             )
@@ -888,7 +896,9 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
                 )
             }
         },
-        Filter::KeepProfile => "keep_profile: keep the source ICC profile".into(),
+        Filter::Plain(PlainFilter::KeepProfile) => {
+            "keep_profile: keep the source ICC profile".into()
+        }
         Filter::BlurFaces => "blurfaces: blur detected faces (AI)".into(),
         Filter::PixelateFaces => "pixelatefaces: pixelate detected faces (AI)".into(),
         Filter::BlurClass(name) => format!("blurclass({name}): blur detected {name} (AI)"),
@@ -905,26 +915,32 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::Upscale(v) => format!("upscale({v}): AI upscale"),
         Filter::Dpr(v) => format!("dpr({v}): device pixel ratio for the whole request"),
         Filter::Text { text, .. } => format!("text: draw the text {text:?}"),
-        Filter::Fill(c) => format!("fill({}): flatten transparency onto this color", hex3(*c)),
-        Filter::Radius(corners) => format!(
+        Filter::Plain(PlainFilter::Fill(c)) => {
+            format!("fill({}): flatten transparency onto this color", hex3(*c))
+        }
+        Filter::Plain(PlainFilter::Radius(corners)) => format!(
             "radius: round the corners ({}, {}, {}, {})",
             corners[0], corners[1], corners[2], corners[3]
         ),
-        Filter::Border(w, c) => format!("border({w}, {}): paint an inside border", hex3(*c)),
-        Filter::Mask(shape) => format!(
+        Filter::Plain(PlainFilter::Border(w, c)) => {
+            format!("border({w}, {}): paint an inside border", hex3(*c))
+        }
+        Filter::Plain(PlainFilter::Mask(shape)) => format!(
             "mask({}): clip to a shape, keeping alpha",
             match shape {
                 MaskShape::Circle => "circle",
                 MaskShape::Ellipse => "ellipse",
             }
         ),
-        Filter::Sepia => "sepia: sepia tone".into(),
-        Filter::Duotone(a, b) => {
+        Filter::Plain(PlainFilter::Sepia) => "sepia: sepia tone".into(),
+        Filter::Plain(PlainFilter::Duotone(a, b)) => {
             format!("duotone({}, {}): two-tone gradient map", hex3(*a), hex3(*b))
         }
-        Filter::Monochrome(c) => format!("monochrome({}): single-hue tint", hex3(*c)),
-        Filter::Pixelate(v) => format!("pixelate({v}): mosaic into blocks"),
-        Filter::Flip(d) => format!(
+        Filter::Plain(PlainFilter::Monochrome(c)) => {
+            format!("monochrome({}): single-hue tint", hex3(*c))
+        }
+        Filter::Plain(PlainFilter::Pixelate(v)) => format!("pixelate({v}): mosaic into blocks"),
+        Filter::Plain(PlainFilter::Flip(d)) => format!(
             "flip({}): mirror the image",
             match d {
                 FlipDirection::Horizontal => "h",
@@ -940,8 +956,10 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::RemoveRegion { x, y, w, h } => {
             format!("remove_region({x},{y},{w},{h}): erase one rectangle and inpaint it")
         }
-        Filter::MaxBytes(v) => format!("max_bytes({v}): cap the output size in bytes"),
-        Filter::Quality(q) => match q {
+        Filter::Plain(PlainFilter::MaxBytes(v)) => {
+            format!("max_bytes({v}): cap the output size in bytes")
+        }
+        Filter::Plain(PlainFilter::Quality(q)) => match q {
             Quality::Auto => "quality(auto): encode quality".into(),
             Quality::Value(v) => format!("quality({v}): encode quality"),
             Quality::PerFormat(entries) => {
@@ -959,10 +977,10 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
                 format!("quality({}): encode quality per format", parts.join(","))
             }
         },
-        Filter::Palette(n) => {
+        Filter::Plain(PlainFilter::Palette(n)) => {
             format!("palette({n}): write PNG as an indexed image with at most {n} colors")
         }
-        Filter::Format(spec) => {
+        Filter::Plain(PlainFilter::Format(spec)) => {
             let name = format_name(spec.format);
             let o = &spec.options;
             let mut notes: Vec<String> = Vec::new();
@@ -987,7 +1005,7 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
                 format!("format({name}): output as {name} with {}", notes.join(", "))
             }
         }
-        Filter::NoUpscale => "no_upscale: never enlarge past the source".into(),
+        Filter::Plain(PlainFilter::NoUpscale) => "no_upscale: never enlarge past the source".into(),
     }
 }
 
@@ -1155,29 +1173,58 @@ async fn meta(config: &Config, positional: &[String]) -> Result<String, CliError
     serde_json::to_string_pretty(&json).map_err(|e| CliError::Response(e.to_string()))
 }
 
+/// The purge target of an image URL's remainder: the
+/// remainder without the `exp:` segments it opens with. The
+/// server reads a purge path's leading `exp:` segment as the
+/// purge's own expiry, so an image URL whose expiry has
+/// passed would be refused as an expired purge; an image's
+/// `exp:` is not part of its cache key, so the rest names
+/// the same entries. A leading segment that does not parse
+/// as an expiry stays, for the server to refuse.
+fn purge_target(rest: &str) -> &str {
+    let mut target = rest;
+    while let Ok((Some(_), tail)) = crate::url::split_purge_remainder(target) {
+        target = tail;
+    }
+    target
+}
+
+/// Purge one URL's cached variants: sign the purge for the
+/// remainder of the URL or remainder given (see
+/// [`purge_target`]), and with `--expires` in the expiring
+/// form, `/purge/<signature>/exp:<unix-seconds>/<path>`.
 async fn purge(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let input = one_target(positional, "purge")?;
     let secret = require_secret(config)?;
     let (_, _, rest) = split_signed(&input, &config.base);
-    let sig = crate::url::purge_signature(secret, &rest);
+    let target = purge_target(&rest);
+    let sig = match config.expires {
+        Some(ts) => crate::url::purge_signature_with_expiry(secret, target, ts),
+        None => crate::url::purge_signature(secret, target),
+    };
     let segment = match &config.key_id {
         Some(kid) => format!("{kid}:{sig}"),
         None => sig,
     };
-    post_purge(config, &format!("{}/purge/{segment}/{rest}", config.base)).await
+    let tail = crabcrop_url::purge_signed_string(target, config.expires);
+    post_purge(config, &format!("{}/purge/{segment}/{tail}", config.base)).await
 }
 
 async fn purge_group(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let name = one_target(positional, "purge-group")?;
     let secret = require_secret(config)?;
-    let sig = crate::url::purge_group_signature(secret, &name);
+    let sig = match config.expires {
+        Some(ts) => crate::url::purge_group_signature_with_expiry(secret, &name, ts),
+        None => crate::url::purge_group_signature(secret, &name),
+    };
     let segment = match &config.key_id {
         Some(kid) => format!("{kid}:{sig}"),
         None => sig,
     };
+    let tail = crabcrop_url::purge_signed_string(&name, config.expires);
     post_purge(
         config,
-        &format!("{}/purge-group/{segment}/{name}", config.base),
+        &format!("{}/purge-group/{segment}/{tail}", config.base),
     )
     .await
 }
@@ -2268,13 +2315,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expires_applies_to_the_upload_verb_only() {
-        // --expires on any other verb is a usage error,
-        // like the meta-only flags, and a non-numeric
-        // value never parses.
-        assert!(
-            exec(&args(&[
-                "sign",
+    async fn expires_applies_to_the_upload_and_purge_verbs_only() {
+        // --expires on a verb that mints no upload token or
+        // purge URL is a usage error, like the meta-only
+        // flags, and a non-numeric value never parses.
+        for verb in ["sign", "seal", "explain", "meta"] {
+            let err = exec(&args(&[
+                verb,
                 "--secret",
                 "test-secret",
                 "--expires",
@@ -2282,13 +2329,154 @@ mod tests {
                 "300x200/https://example.com/a.jpg",
             ]))
             .await
-            .is_err()
-        );
+            .unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)), "{verb}: {err}");
+        }
         assert!(
             exec(&args(&["upload", "--expires", "soon", "whatever.png",]))
                 .await
                 .is_err()
         );
+        // The purge verbs take it: with nothing listening,
+        // they get as far as sending the purge. A value that
+        // is not a timestamp is refused before any request.
+        let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        for verb in ["purge", "purge-group"] {
+            let argv = [
+                verb,
+                "--secret",
+                "s",
+                "--base",
+                &base,
+                "--expires",
+                "1893456000",
+                "thumb",
+            ];
+            let err = exec(&args(&argv)).await.unwrap_err();
+            assert!(matches!(err, CliError::Request(_)), "{verb}: {err}");
+            let err = exec(&args(&[verb, "--secret", "s", "--expires=soon", "thumb"]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CliError::Invalid(_)), "{verb}: {err}");
+        }
+    }
+
+    /// One HTTP exchange on a loopback port that answers
+    /// `200 purged 0` and hands back the request line it
+    /// got.
+    async fn record_one_request() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, line) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let n = stream.read(&mut request).await.unwrap();
+            let text = String::from_utf8_lossy(&request[..n]).to_string();
+            let _ = sender.send(text.lines().next().unwrap_or("").to_string());
+            let reply =
+                "HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\npurged 0\n";
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        (base, line)
+    }
+
+    #[tokio::test]
+    async fn purge_verbs_send_the_expiring_form_with_expires() {
+        let secret = b"cli-purge-secret";
+        let exp = 1893456000u64;
+        let target = "300x200/https://example.com/a.jpg";
+        // With --expires, the path carries the exp: segment
+        // the signature covers, after the signature segment.
+        // An image URL's own exp: in front of the target is
+        // dropped first, with or without --expires.
+        for (input, expires, path) in [
+            (
+                target.to_string(),
+                Some(exp),
+                format!(
+                    "/purge/{}/exp:{exp}/{target}",
+                    crabcrop_url::purge_signature_with_expiry(secret, target, exp)
+                ),
+            ),
+            (
+                format!("exp:5/{target}"),
+                Some(exp),
+                format!(
+                    "/purge/{}/exp:{exp}/{target}",
+                    crabcrop_url::purge_signature_with_expiry(secret, target, exp)
+                ),
+            ),
+            (
+                format!("exp:5/{target}"),
+                None,
+                format!(
+                    "/purge/{}/{target}",
+                    crabcrop_url::purge_signature(secret, target)
+                ),
+            ),
+        ] {
+            let (base, line) = record_one_request().await;
+            let mut argv = vec!["purge", "--secret", "cli-purge-secret", "--base", &base];
+            let ts = expires.map(|e| e.to_string());
+            if let Some(ts) = &ts {
+                argv.extend(["--expires", ts]);
+            }
+            argv.push(&input);
+            assert_eq!(exec(&args(&argv)).await.unwrap(), "purged 0");
+            assert_eq!(
+                line.await.unwrap(),
+                format!("POST {path} HTTP/1.1"),
+                "{input}"
+            );
+        }
+        let (base, line) = record_one_request().await;
+        let argv = [
+            "purge-group",
+            "--secret",
+            "cli-purge-secret",
+            "--key-id",
+            "k2",
+            "--base",
+            &base,
+            "--expires",
+            "1893456000",
+            "thumb",
+        ];
+        assert_eq!(exec(&args(&argv)).await.unwrap(), "purged 0");
+        assert_eq!(
+            line.await.unwrap(),
+            format!(
+                "POST /purge-group/k2:{}/exp:{exp}/thumb HTTP/1.1",
+                crabcrop_url::purge_group_signature_with_expiry(secret, "thumb", exp)
+            )
+        );
+    }
+
+    #[test]
+    fn a_purge_target_drops_the_image_expiry_it_opens_with() {
+        // The server reads a purge path's leading exp: as the
+        // purge's own expiry; an image's exp: is not part of
+        // its cache key, so the CLI purges by the rest.
+        for (rest, target) in [
+            ("exp:1893456000/300x200/a.jpg", "300x200/a.jpg"),
+            ("exp:1/exp:2/300x200/a.jpg", "300x200/a.jpg"),
+            ("300x200/a.jpg", "300x200/a.jpg"),
+            ("300x200/exp:1/a.jpg", "300x200/exp:1/a.jpg"),
+            ("s1.AAECAw/photo.jpg", "s1.AAECAw/photo.jpg"),
+            // What does not parse as an expiry stays, for the
+            // server to refuse.
+            ("exp:soon/300x200/a.jpg", "exp:soon/300x200/a.jpg"),
+            ("exp:1893456000", "exp:1893456000"),
+            ("expedition/a.jpg", "expedition/a.jpg"),
+        ] {
+            assert_eq!(purge_target(rest), target, "{rest}");
+        }
     }
 
     #[tokio::test]
@@ -2433,22 +2621,28 @@ mod tests {
         // before the colon is a filter segment the parser
         // itself accepts (review CL-5).
         for filter in [
-            Filter::HueRotate(90),
-            Filter::Curve(crate::url::CurveChannel::Rgb, vec![(0, 0), (255, 255)]),
-            Filter::Convolution(vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0], false),
-            Filter::Convolution(
+            Filter::Plain(PlainFilter::HueRotate(90)),
+            Filter::Plain(PlainFilter::Curve(
+                crate::url::CurveChannel::Rgb,
+                vec![(0, 0), (255, 255)],
+            )),
+            Filter::Plain(PlainFilter::Convolution(
+                vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
+                false,
+            )),
+            Filter::Plain(PlainFilter::Convolution(
                 vec![
                     0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625,
                 ],
                 true,
-            ),
-            Filter::Noise(40),
-            Filter::Flip(FlipDirection::Horizontal),
-            Filter::Flip(FlipDirection::Vertical),
-            Filter::Quality(Quality::Value(80)),
-            Filter::Quality(Quality::Auto),
-            Filter::Mask(MaskShape::Circle),
-            Filter::Mask(MaskShape::Ellipse),
+            )),
+            Filter::Plain(PlainFilter::Noise(40)),
+            Filter::Plain(PlainFilter::Flip(FlipDirection::Horizontal)),
+            Filter::Plain(PlainFilter::Flip(FlipDirection::Vertical)),
+            Filter::Plain(PlainFilter::Quality(Quality::Value(80))),
+            Filter::Plain(PlainFilter::Quality(Quality::Auto)),
+            Filter::Plain(PlainFilter::Mask(MaskShape::Circle)),
+            Filter::Plain(PlainFilter::Mask(MaskShape::Ellipse)),
         ] {
             let described = describe_filter(&filter);
             let spelling = described.split(':').next().unwrap();
