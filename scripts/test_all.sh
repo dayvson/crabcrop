@@ -55,10 +55,11 @@ for mirror in docs/*-workflow.yml; do
   fi
 done
 
-step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs, dav1d from a checked tarball, publishing behind the release approval)"
+step "Workflows (actions pinned by SHA, no download piped into a shell, hashed pip installs, dav1d from a checked tarball, publishing behind the release approval, fuzz runs under a memory limit that publish no failing input)"
 python3 scripts/check_workflows.py
 python3 scripts/test_check_workflows.py
 python3 scripts/test_build_dav1d.py
+python3 scripts/test_fuzz_report.py
 
 step "Functional tier (a pull request's diff picks smoke or full)"
 python3 scripts/test_functional_tier.py
@@ -202,9 +203,12 @@ for url in "http://127.0.0.1:8909/src00.jpg" "http://127.0.0.1:3321/health"; do
 done
 (cd playground && npm run test:integration)
 
-step "Fuzz smoke (parser invariants, corpus + mutations)"
+step "Fuzz smoke (every target's invariants over its corpus, truncations and mutations)"
 # Without the fuzz crate's default avif-decode feature, so the
-# smoke needs no dav1d; the nightly fuzz workflow runs it with.
+# smoke needs no dav1d. The nightly fuzz workflow runs it with
+# the feature, and fuzzes each target, once the owner enables
+# that workflow; until then this smoke is the only fuzzing that
+# runs (issue #710).
 cargo test --locked --manifest-path fuzz/Cargo.toml --no-default-features --lib --test smoke
 
 step "All suites passed"

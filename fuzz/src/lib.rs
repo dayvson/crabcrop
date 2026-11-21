@@ -2,21 +2,24 @@
 //! of the server: the URL parser (issue #146), the
 //! sealed-token opener (issue #255), and the byte
 //! surfaces behind them (issue #387): image decode,
-//! source metadata extraction, and operation chains.
+//! source metadata extraction, operation chains, and
+//! source renders (issue #710).
 //!
 //! The harness depends on the server's library target
 //! (issue #417), so every check runs the server's own
 //! code: the parser in `crabcrop::url`, the decode
 //! dispatch and the render pipeline in `crabcrop::engine`,
 //! the metadata code in `crabcrop::color`, the filters in
-//! `crabcrop::filters`, and the SVG pipeline in
+//! `crabcrop::filters`, the explain forecast in
+//! `crabcrop::explain`, and the SVG pipeline in
 //! `crabcrop::svg`. The opener lives in `crabcrop-url`, a
 //! direct dependency. `check` drives the parser target,
 //! `check_seal` the opener target, and `check_decode`,
-//! `check_meta`, and `check_chain` the byte targets; all of
-//! them also run under the deterministic smoke test.
+//! `check_meta`, `check_chain`, and `check_render` the byte
+//! targets; all of them also run under the deterministic
+//! smoke test.
 
-pub use crabcrop::{color, engine, filters, svg, url};
+pub use crabcrop::{color, engine, explain, filters, svg, url};
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -96,8 +99,14 @@ fn check_round_trip(input: &str) {
 /// - Expansion, which counts a remainder before it builds
 ///   anything, agrees with splicing every reference and
 ///   parsing the result (see [`check_counted_expansion`]).
+/// - The path the server walks after the parser is total
+///   too: a sealed signature segment opens under the harness
+///   keyring, and a remainder goes through the upload split,
+///   the default operations, the operation and watermark
+///   caps and the explain forecast (see [`check_server_path`]).
 pub fn check(input: &str) {
     check_round_trip(input);
+    check_server_path(input);
     if let Ok((_, _, rest)) = url::parse_signature(input) {
         let key1 = url::canonical_key_form(rest);
         let key2 = url::canonical_key_form(&key1);
@@ -236,6 +245,223 @@ pub fn check_counted_expansion(rest: &str) {
     }
 }
 
+/// The key ID of the harness keyring's current key, which a
+/// keyed sealed seed names.
+pub const SEAL_KEY_ID: &str = "fuzzkey";
+
+/// The keyring a sealed request opens under (issue #710): the
+/// seal secret as the current key, under [`SEAL_KEY_ID`], and
+/// the second secret as the previous one, so a keyed open, an
+/// unkeyed open and the rotation window all run.
+pub fn keyring() -> &'static url::Keyring {
+    static RING: OnceLock<url::Keyring> = OnceLock::new();
+    RING.get_or_init(|| url::Keyring {
+        current_id: SEAL_KEY_ID.to_string(),
+        current: SEAL_SECRET.to_vec(),
+        previous: Some(("previous".to_string(), SEAL_OTHER.to_vec())),
+    })
+}
+
+/// The server-wide default operations [`check_remainder`]
+/// merges in: a stand-in for `CRABCROP_DEFAULT_OPS`, the way
+/// [`presets`] stands in for the preset file. It holds a size
+/// and each singleton directive a request's own drops from it
+/// (format, quality, fill, dpr, max_bytes), so every rule of
+/// `merge_default_ops` has a default to apply to.
+pub fn default_ops() -> &'static [Operation] {
+    static DEFAULTS: OnceLock<Vec<Operation>> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        url::parse_default_ops(
+            "fit-in:2000x2000/filters:format(webp):quality(80):fill(ffffff):dpr(1.5):max_bytes(900000):sharpen(0.5)",
+            presets(),
+        )
+        .expect("valid default operations")
+    })
+}
+
+/// The source facts the explain forecast walks over: a
+/// probed JPEG of a known size, and a source whose header
+/// gave no size.
+fn probes() -> [engine::SourceProbe; 2] {
+    [
+        engine::SourceProbe {
+            kind: "jpeg",
+            dimensions: Some((4000, 3000)),
+        },
+        engine::SourceProbe {
+            kind: "unknown",
+            dimensions: None,
+        },
+    ]
+}
+
+/// The path the server walks from a request path once the
+/// parser has read it (issue #710), the way its
+/// `authenticate` walks it: a sealed signature segment opens
+/// under [`keyring`], and the remainder it carries replaces
+/// the presented one, whatever followed the token (a friendly
+/// name), and goes where a verified plain remainder goes; a
+/// marker-shaped segment that is no token, or one past the
+/// segment cap, is refused before any open. A plain remainder
+/// then runs [`check_remainder`], and an opened one every
+/// check [`check`] holds a request to.
+pub fn check_server_path(input: &str) {
+    let path = input.strip_prefix('/').unwrap_or(input);
+    let first = path.split('/').next().unwrap_or("");
+    if url::looks_sealed(first) {
+        if let Some(remainder) = open_sealed(first) {
+            check(&format!("/unsafe/{remainder}"));
+        }
+        return;
+    }
+    if let Ok((_, _, rest)) = url::parse_signature(input) {
+        check_remainder(rest);
+    }
+}
+
+/// The remainder a sealed signature segment carries, opened
+/// under [`keyring`] as the server opens it: `None` for a
+/// segment that is no token, one past the segment cap, and a
+/// token no key of the ring opens.
+pub fn open_sealed(segment: &str) -> Option<String> {
+    let (key_id, token) = url::split_sealed_segment(segment)?;
+    if segment.len() > crabcrop_url::MAX_SEALED_SEGMENT {
+        return None;
+    }
+    keyring().open_sealed(key_id, token)
+}
+
+/// What [`check_remainder`] found, so the smoke can tell
+/// which of the server's steps a seed reaches.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RemainderOutcome {
+    /// The upload split found an `exp:` segment.
+    pub upload_expiry: bool,
+    /// The remainder parsed, its presets expanded.
+    pub parsed: bool,
+    /// How many of the default operations' filters the
+    /// request's own directives dropped from the merge.
+    pub defaults_dropped: usize,
+    /// The merged list's operation count.
+    pub operations: usize,
+    /// The distinct watermark and overlay URLs it names.
+    pub watermarks: usize,
+    /// For a list both caps admit, the DPR factor the
+    /// forecast over the probed size settled the largest hint
+    /// on, where the chain names no factor of its own.
+    pub hinted_dpr: Option<f64>,
+}
+
+/// What the server does with a verified remainder (issue
+/// #710). Each step is total over untrusted text, and:
+///
+/// - the upload route splits it into an expiry and an object
+///   name (`split_upload_remainder`): the name is the whole
+///   remainder, or what follows an `exp:` segment;
+/// - the image and explain routes expand its presets, parse
+///   it, and merge the default operations in
+///   (`merge_default_ops`): with no defaults the merge is the
+///   request itself, and the request's operations follow the
+///   defaults unchanged;
+/// - the operation and watermark caps refuse a merged list
+///   exactly when its count passes them, and name the count;
+/// - a list both caps admit gets the explain report, whose
+///   forecast walks the chain in the engine's arithmetic over
+///   each of [`probes`], with and without the defaults; with
+///   none, the largest DPR hint steps down where the chain
+///   passes the limits at it.
+pub fn check_remainder(rest: &str) -> RemainderOutcome {
+    let mut outcome = RemainderOutcome::default();
+    match url::split_upload_remainder(rest) {
+        Ok((None, name)) => assert_eq!(name, rest, "a plain upload name is the remainder"),
+        Ok((Some(_), name)) => {
+            let head = &rest[..rest.len() - name.len()];
+            assert!(
+                rest.ends_with(name) && head.starts_with("exp:") && head.ends_with('/'),
+                "{rest:?} split into an expiry and {name:?}"
+            );
+            outcome.upload_expiry = true;
+        }
+        Err(_) => {}
+    }
+    let Ok(expanded) = url::expand_presets(rest, presets(), false) else {
+        return outcome;
+    };
+    let Ok((ops, source, expiry, _)) = url::parse_operations_with_expiry(&expanded) else {
+        return outcome;
+    };
+    outcome.parsed = true;
+    assert_eq!(
+        url::merge_default_ops(&[], ops.clone()),
+        ops,
+        "merging no defaults changed {rest:?}"
+    );
+    let merged = url::merge_default_ops(default_ops(), ops.clone());
+    assert!(
+        merged.len() >= ops.len() && merged[merged.len() - ops.len()..] == ops[..],
+        "the defaults reordered or dropped the request's own operations for {rest:?}"
+    );
+    let count = url::operation_count(&merged);
+    outcome.operations = count;
+    outcome.defaults_dropped =
+        url::operation_count(default_ops()) + url::operation_count(&ops) - count;
+    match url::check_operation_count(&merged) {
+        Ok(()) => assert!(count <= url::MAX_OPERATIONS, "admitted {count} operations"),
+        Err(url::ParseError::TooManyOperations(refused)) => assert!(
+            refused == count && count > url::MAX_OPERATIONS,
+            "refused {refused} of {count} operations"
+        ),
+        Err(e) => panic!("the operation cap refused {rest:?} with {e:?}"),
+    }
+    let watermarks = url::RequestDirectives::analyze(&merged)
+        .watermark_urls
+        .len();
+    outcome.watermarks = watermarks;
+    match url::check_watermark_count(&merged) {
+        Ok(()) => assert!(watermarks <= url::MAX_WATERMARK_URLS),
+        Err(url::ParseError::TooManyWatermarks(refused)) => assert!(
+            refused == watermarks && watermarks > url::MAX_WATERMARK_URLS,
+            "refused {refused} of {watermarks} watermark URLs"
+        ),
+        Err(e) => panic!("the watermark cap refused {rest:?} with {e:?}"),
+    }
+    if count > url::MAX_OPERATIONS || watermarks > url::MAX_WATERMARK_URLS {
+        return outcome;
+    }
+    // The report on a server with these defaults, and on one
+    // with none: a default `dpr(...)` decides the factor, so
+    // only the second lets a DPR hint in, and steps it down.
+    let largest = url::DPR_FACTORS.iter().copied().reduce(f32::max);
+    let [known, unknown] = probes();
+    for chain in [&merged, &ops] {
+        for (probe, dpr_hint) in [(known, None), (known, largest), (unknown, None)] {
+            let report = explain::Report::new(explain::ReportInput {
+                signed: false,
+                key_id: None,
+                expiry,
+                now: 1_700_000_000,
+                source_url: source.to_string(),
+                source_root: None,
+                probe,
+                dpr_hint,
+                source_bytes: None,
+                ops: ops.clone(),
+                merged_ops: chain.clone(),
+                presets: Vec::new(),
+                canonical: url::canonical_form(chain, source),
+                cache_group: None,
+                image_path: format!("/unsafe/{rest}"),
+            });
+            let json = report.to_json();
+            let _ = report.to_html();
+            if json["forecast"]["dpr_from"].as_str() == Some("hint") {
+                outcome.hinted_dpr = json["forecast"]["dpr"].as_f64();
+            }
+        }
+    }
+    outcome
+}
+
 /// The harness secret for the seal invariants, and a distinct
 /// second secret the same token must never open under.
 const SEAL_SECRET: &[u8] = b"crabcrop-fuzz-seal-secret-000001";
@@ -291,6 +517,13 @@ pub fn check_seal(data: &[u8]) {
 /// reproduces.
 pub fn sample_token(remainder: &str) -> String {
     crabcrop_url::seal_with_nonce(SEAL_SECRET, None, &[0x5a; 12], remainder)
+        .expect("a remainder within the cap seals")
+}
+
+/// [`sample_token`] under the key ID of the harness keyring's
+/// current key, with a nonce of its own.
+pub fn sample_keyed_token(remainder: &str) -> String {
+    crabcrop_url::seal_with_nonce(SEAL_SECRET, Some(SEAL_KEY_ID), &[0x5b; 12], remainder)
         .expect("a remainder within the cap seals")
 }
 
@@ -358,6 +591,119 @@ fn check_scaled_decode(data: &[u8], full_decodes: bool) {
             (width.div_ceil(denominator), height.div_ceil(denominator)),
             "a {width}x{height} JPEG decoded at 1/{denominator}",
         );
+    }
+}
+
+/// The largest JPEG the render target renders, in pixels of
+/// the size its header declares. The scaled decode makes a
+/// frame of a quarter of them or fewer, but a file it stands
+/// down for decodes at full size, and the fuzzing build runs
+/// the resize over a hundred times slower than a debug build.
+pub const RENDER_MAX_PIXELS: u64 = 1 << 20;
+
+/// The largest animated WebP canvas the render target
+/// renders: every frame is decoded, resized and encoded
+/// again, up to the engine's frame cap, so the budget is a
+/// canvas's worth of work per frame.
+pub const RENDER_MAX_ANIMATED_PIXELS: u64 = 1 << 14;
+
+/// What [`check_render`] did with an input, so the smoke can
+/// tell a render from a refusal or a skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderOutcome {
+    /// Not a JPEG or an animated WebP, no size in its header,
+    /// or past the render budgets: nothing ran.
+    Skipped,
+    /// The engine refused the source.
+    Refused(engine::EngineError),
+    /// The engine rendered it at this size; `animated` when
+    /// the output is an animated WebP.
+    Rendered {
+        width: u32,
+        height: u32,
+        animated: bool,
+    },
+}
+
+/// Whether `bytes` are a WebP the image crate's decoder opens
+/// as an animation.
+fn is_animated_webp(bytes: &[u8]) -> bool {
+    image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+        .is_ok_and(|decoder| decoder.has_animation())
+}
+
+/// The render invariants for a source body (issue #710): the
+/// two in-process C decoders the performance work added, in
+/// the render path that the decode target's direct calls do
+/// not take. A JPEG whose first resize shrinks it far enough
+/// is decoded by libjpeg-turbo at a half, a quarter or an
+/// eighth of its size (`engine/jpeg_scaled.rs`: the plan, the
+/// decode, and the reduced frame the resize reads), and an
+/// animated WebP is walked frame by frame through libwebp
+/// (`engine/webp_anim.rs`), each frame resized, and encoded
+/// again.
+///
+/// The request is a plain resize to a third, a sixth or a
+/// twelfth of the declared width (the input's length picks
+/// which, so each scale is in reach), the height following.
+/// The render is total: the engine renders it or refuses it
+/// with an `EngineError`. A render reports the size the
+/// header declares, turned upright, as the source's size,
+/// and lands on the requested width and the height that
+/// keeps that size's aspect, within a pixel: the reduced
+/// frame stands for the whole image, so no size the request
+/// works out depends on which decode served it. Sources past
+/// [`RENDER_MAX_PIXELS`] (a JPEG) or
+/// [`RENDER_MAX_ANIMATED_PIXELS`] (an animation) skip it.
+pub fn check_render(data: &[u8]) -> RenderOutcome {
+    let budget = match image::guess_format(data) {
+        Ok(image::ImageFormat::Jpeg) => RENDER_MAX_PIXELS,
+        Ok(image::ImageFormat::WebP) if is_animated_webp(data) => RENDER_MAX_ANIMATED_PIXELS,
+        _ => return RenderOutcome::Skipped,
+    };
+    let declared = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    let Some((width, height)) = declared else {
+        return RenderOutcome::Skipped;
+    };
+    if u64::from(width) * u64::from(height) > budget {
+        return RenderOutcome::Skipped;
+    }
+    let shrink = [3, 6, 12][data.len() % 3];
+    let target = (width / shrink).max(1);
+    let request = format!("/unsafe/{target}x0/example.com/source");
+    let (_, _, parsed) = url::parse_request(&request).expect("the render request parses");
+    let out = match engine::Engine.process(data, &parsed.operations) {
+        Ok(out) => out,
+        Err(error) => return RenderOutcome::Refused(error),
+    };
+    let source = (out.source_width, out.source_height);
+    assert!(
+        source == (width, height) || source == (height, width),
+        "a {width}x{height} source rendered as one of {}x{}",
+        source.0,
+        source.1
+    );
+    assert_eq!(
+        out.width, target,
+        "a resize to {target} wide rendered {} wide",
+        out.width
+    );
+    let aspect = f64::from(target) * f64::from(source.1) / f64::from(source.0);
+    assert!(
+        (f64::from(out.height) - aspect).abs() <= 1.0,
+        "a {}x{} source resized to {target} wide rendered {} high, not {aspect:.1}",
+        source.0,
+        source.1,
+        out.height
+    );
+    assert!(!out.bytes.is_empty(), "the engine rendered an empty body");
+    RenderOutcome::Rendered {
+        width: out.width,
+        height: out.height,
+        animated: is_animated_webp(&out.bytes),
     }
 }
 

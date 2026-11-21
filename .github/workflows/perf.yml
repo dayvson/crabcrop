@@ -29,6 +29,12 @@ jobs:
   bench:
 
     runs-on: ubuntu-latest
+    # At least twice the longest recent run, 11.3 minutes
+    # (issue #710; rust.yml states the rule): a hung build or
+    # benchmark fails in half an hour instead of holding the
+    # runner for GitHub's six-hour default. The gate step
+    # below stays non-blocking, as the comment above says.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

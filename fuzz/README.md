@@ -5,9 +5,10 @@ names is untrusted bytes, so both are the server's attack
 surface. This package fuzzes the text entry points, the
 URL parser (issue #146) and the sealed-token opener
 (issue #255), and the byte surfaces behind them (issue
-#387): image decode, source metadata extraction, and
+#387): image decode, source metadata extraction,
 operation chains through the render pipeline (issue
-#476).
+#476), and source bodies rendered through it (issue
+#710).
 
 ## The targets
 
@@ -23,7 +24,19 @@ operation chains through the render pipeline (issue
   stand-in for operator configuration, like the source
   root map) is total, with and without the presets-only
   policy, and an expanded path that parses meets the same
-  fixed point.
+  fixed point;
+- the path the server walks after the parser is total
+  (`check_server_path`, issue #710): a sealed signature
+  segment (`s1.`, bare or keyed) opens under a harness
+  keyring to the remainder it carries, which then meets
+  every invariant above, and a remainder goes through the
+  upload route's expiry split, the default operations
+  (`default_ops`, a stand-in for `CRABCROP_DEFAULT_OPS`
+  holding each singleton directive), the operation and
+  watermark caps, which refuse exactly the lists past them,
+  and the explain report, whose forecast walks the chain
+  with and without the defaults and with and without a DPR
+  hint.
 
 `unseal` checks the sealed-token opener (`check_seal`) for
 every input:
@@ -94,6 +107,26 @@ request that parses:
   100-megapixel output budget, bounds a run's
   allocations. The render must also stay inside that
   bound, which checks the guard itself.
+
+`render` checks a source body rendered through the engine
+(`check_render`, issue #710): the render path of the two
+C decoders the performance work moved into the server
+process, which `decode` calls directly. A JPEG whose first
+resize shrinks it far enough is decoded by libjpeg-turbo at
+a half, a quarter or an eighth of its size
+(`engine/jpeg_scaled.rs`: the plan, the decode, and the
+reduced frame the resize reads), and an animated WebP is
+walked frame by frame through libwebp
+(`engine/webp_anim.rs`), resized, and encoded again. The
+request is a plain resize to a third, a sixth or a twelfth
+of the declared width (the input's length picks which), so
+each scale is in reach. The render is total, and one that
+succeeds reports the declared size, turned upright, as the
+source's size and lands on the requested width and the
+height that keeps that aspect, within a pixel: the reduced
+frame stands for the whole image. JPEGs past 2^20 declared
+pixels and animations past 2^14 canvas pixels skip it, for
+the same reason the chain budgets below exist.
 
 Blurs get a budget of their own, `CHAIN_MAX_BLUR_WORK`
 (2^24 pixels times kernel taps, summed over the chain).
@@ -174,8 +207,18 @@ cover every operation family the grammar has (each
 operation, crop alignment kind, and filter, plus `exp:`,
 `maxage:`, `preset:`, and `root:`); the family match is
 exhaustive, so a new operation or filter does not compile
-there until it has a family and a seed. On its own,
-without dav1d (as `scripts/test_all.sh` runs it):
+there until it has a family and a seed. It also checks that
+its seeds reach the server's steps after the parser: a bare
+and a keyed sealed request that open, an expiring upload
+remainder, a request that drops every singleton default,
+lists on and just past the operation and watermark caps,
+and a forecast that steps the DPR hint down. `render`
+checks that its JPEG seeds render through the scaled decode
+(the render of a `0x0` step first, which turns the scaled
+decode down, gives other bytes) and its animated WebP seeds
+render as animations, and sweeps truncations of both and
+single-byte mutations of the JPEG. On its own, without
+dav1d (as `scripts/test_all.sh` runs it):
 
 ```sh
 cargo test --manifest-path fuzz/Cargo.toml --no-default-features --lib --test smoke
@@ -187,15 +230,31 @@ seed decodes through dav1d.
 ## Real fuzzing (nightly)
 
 `.github/workflows/fuzz.yml` (mirrored at
-`docs/fuzz-workflow.yml`) runs every night and by hand:
-each of the five targets for 15 minutes with the default
-features (the release's static dav1d, built by
-`scripts/build_dav1d.sh`), the corpus
-each run grows cached for the next one, and any crashing
-input uploaded as the `fuzz-artifacts-<target>` artifact
-of the failed job. The same workflow runs the smoke with
-the AVIF decoder linked, and the workspace tests with
+`docs/fuzz-workflow.yml`) runs every night and by hand,
+once the workflow is enabled. Enabling it is the owner's
+switch (the repository's Actions settings, Fuzz, Enable
+workflow): it was disabled before its first scheduled run,
+and while it stays disabled none of what follows runs
+anywhere (issue #710). Each night it fuzzes each of the six
+targets for 15 minutes with the default features (the
+release's static dav1d, built by `scripts/build_dav1d.sh`)
+and the limits below, and caches the corpus each run grows
+for the next one. The same workflow runs the smoke with the
+AVIF decoder linked, and the workspace tests with
 `PROPTEST_CASES=10000` (issue #478).
+
+A failing input fails its target's job. The repository's
+logs and artifacts are public, and a failing input is a
+reproducer until its fix ships, so the job neither prints
+nor uploads it: the run's output goes to a file, and
+`scripts/fuzz_report.py` prints what cannot carry the input
+(libFuzzer's progress and statistics, the error and where it
+happened, the stack) and names each failing input by kind,
+SHA-256 and size. Reproduce it from there: run the target
+locally with the same limits until it fails at the same
+place in the stack (the corpus a night's run saves feeds
+the next night's, so a failure tends to recur there too),
+and the input's hash says when it is the same one.
 
 Locally, open-ended runs need a nightly toolchain,
 cargo-fuzz, and dav1d (see above):
@@ -206,8 +265,10 @@ cargo +nightly install cargo-fuzz --locked
 cargo +nightly fuzz run op_chain -- -max_total_time=300 -rss_limit_mb=2048 -malloc_limit_mb=512 -timeout=600
 ```
 
-The same for `parse_request`, `unseal`, `decode`, and
-`source_meta`. The limits are the workflow's: 2 GiB for
+The same for `parse_request`, `unseal`, `decode`,
+`source_meta`, and `render`. The limits are the workflow's
+(`scripts/check_workflows.py` fails a run without the
+first): 2 GiB for
 the process, and 512 MiB for any one allocation, twice the
 engine's 256 MiB decode budget (one decoded buffer may
 reach the budget, and a same-size copy or one capacity
@@ -217,10 +278,10 @@ generous on purpose: the sanitizer build is slow enough
 that a tight one reports bounded work as a hang.
 
 Crashes land in `fuzz/artifacts/`. A crash becomes its own
-fix issue with the minimized input
-(`cargo +nightly fuzz tmin <target> <input>`), and the
-input joins this corpus and the regression tests before
-the fix ships.
+fix issue, reported privately (SECURITY.md) when the input
+can hurt a running server, and the minimized input
+(`cargo +nightly fuzz tmin <target> <input>`) joins this
+corpus and the regression tests with its fix.
 
 ## The corpus
 
@@ -280,3 +341,23 @@ encoded (it reaches dav1d with the default features), and
 focal and focal-point crops, fit-in, pad, crop-rect, the
 debug view, DPR, and encodes to other formats, all small
 enough to render inside the harness budget.
+
+For the server's steps after the parser (issue #710),
+`corpus/parse_request/` also holds two sealed requests,
+`seed-69` bare and `seed-70` keyed: each is
+`/<token>/photo.jpg`, the token what `sample_token` or
+`sample_keyed_token` mints for the remainder the smoke
+names, so either can be made again. Next to them are an
+expiring upload remainder and one whose expiry does not
+parse, a request that names every singleton directive, 93
+and 94 filters (on the operation cap and one past it once
+the defaults merge in), 16 and 17 watermark URLs, and a
+size the largest DPR hint takes past the limits.
+`corpus/render/` holds JPEGs the scaled decode takes (a
+baseline photo, a progressive file, one stored on its side
+under EXIF orientation 6, one whose sides are no multiple of
+any scale), two it stands down for (a grayscale and a
+truncated file), and five small animated WebPs: a tiny
+canvas, blended frames with alpha, lossy and lossless frames
+side by side, a disposal to the background colour, and a
+file without the alpha flag.

@@ -129,6 +129,36 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## The toolchain
+
+`rust-toolchain.toml` pins the Rust release every build in the repository
+uses: CI, the release, and a `cargo` you run here, for which rustup installs
+it on first use. It is the stable release CI ran when it was set, so a new
+stable release cannot change a lint result on its own: a Clippy lint that
+1.99 added once failed a release commit's lint step (d926f96, issue #710).
+The minimum Rust versions in the manifests (`rust-version`, checked by the
+`msrv` job in `rust.yml`) are floors, separate from this pin, and move only
+when the code needs a newer Rust. The nightly fuzzing uses its own nightly
+toolchain (`cargo +nightly fuzz`).
+
+Moving to a newer stable release is a pull request of its own:
+
+1. Set `channel` in `rust-toolchain.toml` to the new version (`1.100.0`,
+   say, never `stable`).
+2. Run `cargo fmt --all -- --check` and
+   `cargo clippy --locked --workspace --all-targets -- -D warnings` with it,
+   and fix what the new lints find in the same pull request, so main never
+   carries a toolchain its lint step fails on.
+3. Run the tests (`cargo test --locked --workspace`, and
+   `scripts/test_all.sh`). The render corpus must pass unchanged: a new
+   compiler is no reason to re-baseline it.
+4. Check `rust.yml`'s `semver` job: cargo-semver-checks reads the
+   toolchain's rustdoc output, and a newer toolchain can need a newer
+   release of it, pinned there with its checksum.
+
+The ai-models workflow runs for a change to the pin, like any change to
+what the real-model tests compile.
+
 ## The URL grammar is a shared contract
 
 The URL grammar and signing scheme are specified in

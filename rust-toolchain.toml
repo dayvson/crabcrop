@@ -1,3 +1,6 @@
+# The Rust release every build here uses: the stable release CI ran when it
+# was set (rustc 1.99.1). A newer release moves it in a pull request of its
+# own, with the fixes its new lints ask for (CONTRIBUTING.md, The toolchain).
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
