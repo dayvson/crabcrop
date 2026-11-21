@@ -275,6 +275,78 @@ class Installer(unittest.TestCase):
                     """
                 self.assertEqual(step_problems(step, self.ENV), [])
 
+    def test_a_moving_url_fails_even_when_checked(self):
+        env = self.ENV.replace("download/v0.33.1/", "latest/download/")
+        step = """\
+            - run: |
+                curl -LsSf "$CARGO_DIST_INSTALLER_URL" -o i.sh
+                echo "$CARGO_DIST_INSTALLER_SHA256  i.sh" | shasum -a 256 -c -
+                sh i.sh
+            """
+        (problem,) = step_problems(step, env)
+        self.assertIn("from a releases/latest URL", problem)
+
+
+class Publisher(unittest.TestCase):
+    """Issue #711: the MCP registry's publisher, pinned like the cargo-dist installer."""
+
+    ENV = (
+        "env:\n"
+        '  MCP_PUBLISHER_URL: "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.9/mcp-publisher_linux_amd64.tar.gz"\n'
+        f'  MCP_PUBLISHER_SHA256: "{HASH}"\n'
+    )
+    INSTALL = """\
+        - name: Install mcp-publisher (pinned by version and checksum)
+          run: |
+            archive="$RUNNER_TEMP/mcp-publisher.tar.gz"
+            curl --proto '=https' --tlsv1.2 -LsSf "$MCP_PUBLISHER_URL" -o "$archive"
+            echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -
+            mkdir -p "$RUNNER_TEMP/mcp-publisher"
+            tar -xzf "$archive" -C "$RUNNER_TEMP/mcp-publisher" mcp-publisher
+        """
+
+    def test_the_release_jobs_install_step_passes(self):
+        self.assertEqual(step_problems(self.INSTALL, self.ENV), [])
+
+    def test_the_registry_guides_unpinned_install_fails(self):
+        # The registry's guide once fetched releases/latest and piped it
+        # into tar, with no check at all.
+        step = """\
+            - name: Install MCP Publisher
+              run: |
+                curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+            """
+        (problem,) = step_problems(step)
+        self.assertIn("fetches the mcp-publisher archive from a releases/latest URL", problem)
+
+    def test_an_unchecked_or_late_checked_archive_fails(self):
+        unchecked = self.INSTALL.replace('            echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -\n', "")
+        (problem,) = step_problems(unchecked, self.ENV)
+        self.assertIn("fetches the mcp-publisher archive but never checks its sha256", problem)
+        late = unchecked + '            echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum -c -\n'
+        (problem,) = step_problems(late, self.ENV)
+        self.assertIn("unpacks the mcp-publisher archive before it checks its sha256", problem)
+        piped = """\
+            - run: |
+                curl -LsSf "$MCP_PUBLISHER_URL" | tar xz mcp-publisher
+                echo "$MCP_PUBLISHER_SHA256  mcp-publisher" | sha256sum -c -
+            """
+        (problem,) = step_problems(piped, self.ENV)
+        self.assertIn("unpacks the mcp-publisher archive before it checks its sha256", problem)
+
+    def test_a_check_against_no_pinned_hash_fails(self):
+        (problem,) = step_problems(self.INSTALL, self.ENV.replace(HASH, "${{ vars.PUBLISHER_SHA }}"))
+        self.assertIn("checks the mcp-publisher archive against no pinned sha256", problem)
+
+    def test_running_the_unpacked_publisher_is_no_fetch(self):
+        step = """\
+            - name: Publish server.json
+              run: |
+                python3 scripts/publish_mcp_registry.py --tag "$RELEASE_TAG" --publisher "$RUNNER_TEMP/mcp-publisher/mcp-publisher"
+                "$RUNNER_TEMP/mcp-publisher/mcp-publisher" publish sdks/mcp/server.json
+            """
+        self.assertEqual(step_problems(step, self.ENV), [])
+
 
 class Pip(unittest.TestCase):
     """Issue #598: every pip install is hashed, the build backend included."""
@@ -547,6 +619,79 @@ class Gate(unittest.TestCase):
         self.assertEqual(problems(text), [])
 
 
+def with_job(workflow, job):
+    """`workflow` with one more job, given as its YAML lines under `jobs:`."""
+    return workflow + textwrap.indent(textwrap.dedent(job).strip("\n"), "  ") + "\n"
+
+
+# A registry job in the release approval's environment that waits for
+# nothing else: the gate rule takes it, since it waits for an approval,
+# but it can publish before host has published the GitHub Release.
+UNORDERED = """\
+publish-mcp-registry:
+  needs:
+    - plan
+  runs-on: ubuntu-22.04
+  environment: release
+  permissions:
+    contents: read
+    id-token: write
+  steps:
+    - run: mcp-publisher publish
+"""
+
+
+class Order(unittest.TestCase):
+    """Issue #711: every publishing job runs after host, as the registry jobs do."""
+
+    def order(self, text):
+        return [p for p in problems(text) if "before host has published" in p or "no host job" in p]
+
+    def test_the_gated_layout_is_in_order(self):
+        self.assertEqual(problems(NEW_GATE), [])
+
+    def test_a_registry_job_that_skips_host_fails(self):
+        text = with_job(NEW_GATE, UNORDERED)
+        (problem,) = problems(text)
+        self.assertIn("job publish-mcp-registry publishes (id-token: write; names the `release` environment)", problem)
+        self.assertIn("before host has published the GitHub Release", problem)
+        for needs in ("    - release-gate\n", "    - plan\n    - release-gate\n"):
+            with self.subTest(needs=needs):
+                (problem,) = problems(with_job(NEW_GATE, UNORDERED.replace("    - plan\n", needs)))
+                self.assertIn("job publish-mcp-registry publishes", problem)
+
+    def test_a_job_after_a_registry_job_is_in_order(self):
+        # Needing publish-crate, which needs host, is waiting for host.
+        job = UNORDERED.replace("    - plan\n", "    - publish-crate\n").replace("  environment: release\n", "")
+        self.assertEqual(problems(with_job(NEW_GATE, job)), [])
+        self.assertEqual(problems(with_job(NEW_GATE, UNORDERED.replace("    - plan\n", "    - plan\n    - host\n"))), [])
+
+    def test_an_if_that_runs_after_a_failed_host_fails(self):
+        job = UNORDERED.replace("    - plan\n", "    - host\n").replace("  runs-on:", "  if: ${{ always() }}\n  runs-on:")
+        self.assertEqual(len(self.order(with_job(NEW_GATE, job))), 1)
+        job = job.replace("${{ always() }}", "${{ always() && needs.host.result == 'success' }}")
+        self.assertEqual(problems(with_job(NEW_GATE, job)), [])
+
+    def test_images_that_skip_host_fail(self):
+        text = NEW_GATE.replace("  build-images:\n    needs: host\n", "  build-images:\n    needs: release-gate\n")
+        (problem,) = problems(text)
+        self.assertIn("job build-images publishes (packages: write) but can run before host", problem)
+
+    def test_only_the_release_workflow_is_ordered(self):
+        # No release-gate job: the gate rule alone applies, as before.
+        self.assertEqual(self.order(with_job(OLD_GATE, UNORDERED)), [])
+        found = step_problems("- run: npm publish\n  env:\n    T: ${{ secrets.NPM_TOKEN }}\n")
+        self.assertEqual([p for p in found if "before host" in p], [])
+        self.assertTrue(found, "the gate rule still covers the job")
+
+    def test_an_approval_without_host_is_reported(self):
+        text = NEW_GATE.replace("  host:\n", "  publish-release:\n").replace("needs: host", "needs: publish-release")
+        text = text.replace("      - host\n", "      - publish-release\n")
+        found = self.order(text)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("has the release-gate approval job but no host job", found[0])
+
+
 class ReleaseLayout(unittest.TestCase):
     """The release workflow as docs/release-workflow.yml lands it."""
 
@@ -563,14 +708,60 @@ class ReleaseLayout(unittest.TestCase):
         gate = self.jobs["release-gate"]
         self.assertEqual(gate["environment"], "release")
         self.assertEqual(gate["permissions"], {})
-        for build in ("build-local-artifacts", "build-global-artifacts", "build-pypi", "ai-models"):
+        for build in ("build-local-artifacts", "build-global-artifacts", "build-pypi", "package-crates", "ai-models"):
             self.assertIn(build, gate["needs"])
+        for build in ("build-pypi", "package-crates", "ai-models"):
+            self.assertIn(f"needs.{build}.result == 'success'", cw.conjuncts(gate["if"]))
         self.assertIn("release-gate", self.jobs["host"]["needs"])
         self.assertIn("needs.release-gate.result == 'success'", cw.conjuncts(self.jobs["host"]["if"]))
         self.assertEqual(self.jobs["build-images"]["needs"], "host")
-        for job in ("publish-crate", "publish-npm", "publish-mcp", "publish-pypi"):
+        for job in ("publish-crate", "publish-npm", "publish-mcp", "publish-pypi", "publish-mcp-registry"):
             self.assertIn("host", self.jobs[job]["needs"])
             self.assertEqual(self.jobs[job]["environment"], "release")
+
+    def test_the_crate_job_publishes_crabcrop_url_then_crabcrop(self):
+        # Issue #711: the server crate goes up in the same job, after the
+        # crate it depends on, under the same approval.
+        job = self.jobs["publish-crate"]
+        publish = job["steps"][self.step_index("publish-crate", "cargo publish")]
+        self.assertEqual(publish["run"], 'python3 scripts/publish_crates.py --tag "$RELEASE_TAG" --no-verify crabcrop-url crabcrop')
+        self.assertEqual(publish["env"]["RELEASE_TAG"], "${{ needs.plan.outputs.tag }}")
+        self.assertEqual([step["name"] for step in job["steps"] if cw.secret_names(step)], ["cargo publish"])
+        self.assertIn("timeout-minutes", job)
+
+    def test_the_crates_build_without_secrets_and_publish_without_building(self):
+        # Issue #711, as build-pypi and publish-pypi do for PyPI (#598):
+        # the server crate's dependencies run build scripts and procedural
+        # macros, so they build in a job without the crates.io token, and
+        # the job with the token publishes what that one built from.
+        build = self.jobs["package-crates"]
+        self.assertEqual(cw.secret_names(build), [])
+        self.assertEqual(build["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", build)
+        package = build["steps"][self.step_index("package-crates", "Package and build both crates")]
+        self.assertEqual(package["run"], "cargo package -p crabcrop-url -p crabcrop --locked")
+        self.assertLess(self.step_index("package-crates", "Install nasm (rav1e SIMD build)"), self.step_index("package-crates", "Package and build both crates"))
+        self.assertIn("timeout-minutes", build)
+        publish = self.jobs["publish-crate"]
+        self.assertIn("package-crates", publish["needs"])
+        runs = [str(step.get("run", "")) for step in publish["steps"]]
+        self.assertEqual([run for run in runs if re.search(r"\bcargo (?:build|package|test)\b|\bnasm\b", run)], [])
+        self.assertTrue(all("--no-verify" in run for run in runs if "publish" in run), runs)
+
+    def test_the_mcp_registry_entry_publishes_after_its_npm_package(self):
+        # Issue #711: the registry checks the npm package's mcpName, so the
+        # entry goes up once publish-mcp has put the package on npm.
+        job = self.jobs["publish-mcp-registry"]
+        self.assertEqual(job["needs"], ["plan", "host", "publish-mcp"])
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertRegex(job["env"]["MCP_PUBLISHER_URL"], r"/releases/download/v\d+\.\d+\.\d+/mcp-publisher_linux_amd64\.tar\.gz$")
+        self.assertRegex(job["env"]["MCP_PUBLISHER_SHA256"], r"^[0-9a-f]{64}$")
+        install = job["steps"][self.step_index("publish-mcp-registry", "Install mcp-publisher (pinned by version and checksum)")]
+        publish = job["steps"][self.step_index("publish-mcp-registry", "Publish server.json")]
+        self.assertIn('--publisher "$RUNNER_TEMP/mcp-publisher/mcp-publisher"', publish["run"])
+        self.assertIn('-C "$RUNNER_TEMP/mcp-publisher" mcp-publisher', install["run"])
+        self.assertEqual([step["name"] for step in job["steps"] if cw.secret_names(step)], ["Publish server.json"])
+        self.assertIn("timeout-minutes", job)
 
     def test_pull_requests_skip_the_approval(self):
         self.assertIn("needs.plan.outputs.publishing == 'true'", cw.conjuncts(self.jobs["release-gate"]["if"]))

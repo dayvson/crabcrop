@@ -36,7 +36,7 @@ A secret of at least 16 bytes is the only required configuration; the server wil
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases).
 
-**crates.io:** `cargo install crabcrop` builds the current release from source; the prerequisites are in [Deployment](docs/deployment.md).
+**crates.io:** `cargo install --locked crabcrop` builds the current release from source, with the dependency versions it was released with; the prerequisites are in [Deployment](docs/deployment.md).
 
 ## Quickstart
 

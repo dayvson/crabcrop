@@ -116,9 +116,11 @@ step "Rendering version (a corpus re-baseline since the last release tag raises 
 python3 scripts/check_rendering_version.py ${GITHUB_ACTIONS:+--strict}
 python3 scripts/test_check_rendering_version.py
 
-step "Release scripts (the preflight checks, and creating or updating the GitHub Release)"
+step "Release scripts (the preflight checks, creating or updating the GitHub Release, and publishing the crates and the MCP registry entry)"
 python3 scripts/test_release_preflight.py
 python3 scripts/test_publish_github_release.py
+python3 scripts/test_publish_crates.py
+python3 scripts/test_publish_mcp_registry.py
 
 step "Docs sync (env vars, error codes, filters and the CHANGELOG heading match the code, and the changelog fragments assemble)"
 python3 scripts/check_docs.py

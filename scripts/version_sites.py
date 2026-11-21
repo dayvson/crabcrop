@@ -15,9 +15,16 @@ what the bump writes. Each site also says how many pins its file carries:
 a file with another count (a third `tag:` line in the Helm values, a
 lockfile entry gone) is reported as a problem with that file, never a
 traceback.
+
+RELEASE_COMMITS lists the pins of the release's commit, which no bump can
+know: the bump empties them, and the check accepts nothing or a full
+commit SHA there, and where git can read that commit, only one whose
+Cargo.toml carries the release's version (issue #711).
 """
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -293,16 +300,35 @@ SITES = [
     # The benchmark harness pins the release it measures (issue #312):
     # setup.sh names the version and tag it builds, the two runners
     # default to that build's worktree, and the README's version notes
-    # record it. The commit line in setup.sh is not a site: a bump
-    # cannot know the new tag's commit, so the refresh that lands new
-    # results writes it. The dated files under benchmark/results/ are
-    # records of the release they measured, not pins; the version
-    # tools test exempts them as EXAMPLES.
+    # record it. The commit setup.sh pins is no version: RELEASE_COMMITS
+    # below lists it, and the bump empties it. The dated files under
+    # benchmark/results/ are records of the release they measured, not
+    # pins; the version tools test exempts them as EXAMPLES.
     pattern("benchmark/setup.sh", "CRABCROP_VERSION", r"^CRABCROP_VERSION=(.+)$", re.M),
     pattern("benchmark/setup.sh", "CRABCROP_TAG", r"^CRABCROP_TAG=v(.+)$", re.M),
     pattern("benchmark/bench.py", "default crabcrop build (worktree name)", r"crabcrop-v(\d+\.\d+\.\d+)"),
     pattern("benchmark/bench_cache.py", "default crabcrop build (worktree name)", r"crabcrop-v(\d+\.\d+\.\d+)"),
     Site("benchmark/README.md", "crabcrop version and tag (current release lines)", _benchmark_readme_pins, count=5),
+]
+
+# Pins of the release's commit, which no version names (issue #711).
+# A bump cannot know the commit the new tag will name: the release
+# commit comes after the bump, and the tag after that. So when the
+# bump moves the version sites of a pin's file, it empties the pin,
+# and the file's tool then takes the commit from the tag; the check
+# accepts a pin that is empty or a full commit SHA. benchmark/setup.sh
+# builds the commit its tag names, refuses a pin the tag disagrees
+# with, and without the tag builds only a pinned commit of the
+# version it names. The bump used to leave the previous release's
+# commit here, and setup.sh, which fell back to the pin when the new
+# tag was missing, built the previous release under the new tag's
+# name. The refresh that lands new results pins the commit again. Where
+# git can read the pinned commit, the check also wants its Cargo.toml at
+# the release's version: a release commit made with the bump from before
+# that change moved the version and kept the previous commit.
+COMMIT = re.compile(r"[0-9a-f]{40}")
+RELEASE_COMMITS = [
+    pattern("benchmark/setup.sh", "CRABCROP_COMMIT (the commit CRABCROP_TAG names)", r"^CRABCROP_COMMIT=(.*)$", re.M),
 ]
 
 
@@ -399,12 +425,70 @@ def check(root=ROOT):
     return version, rows, problems
 
 
+def commit_version(root, commit):
+    """The version Cargo.toml's [package] has at `commit`, or None when git
+    cannot read that commit at `root`: no repository there, or a clone
+    without it, such as a shallow checkout."""
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(Path(root).resolve().parent), "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{SITES[0].path}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        ((start, end),) = SITES[0].locate(done.stdout)
+    except (SiteError, ValueError):
+        return None
+    return done.stdout[start:end]
+
+
+def check_commits(root=ROOT, version=None):
+    """Read every release commit pin (RELEASE_COMMITS).
+
+    Returns (rows, problems) like check(): one (values, site) row per
+    pin, and one message per pin that is unreadable or holds neither
+    nothing nor a full lowercase commit SHA. Given the release
+    `version`, a pinned commit git can read must carry it too.
+    """
+    rows, problems = [], []
+    for site in RELEASE_COMMITS:
+        try:
+            text = _read(root, site.path)
+            values = [text[start:end] for start, end in site.locate(text)]
+        except SiteError as err:
+            rows.append((None, site))
+            problems.append(f"{site.path}: {err}")
+            continue
+        rows.append((values, site))
+        for value in values:
+            if value and not COMMIT.fullmatch(value):
+                problems.append(f"{site.path}: {site.what} is {value!r}, expected a full commit SHA or nothing")
+            elif value and version:
+                found = commit_version(root, value)
+                if found is not None and found != version:
+                    problems.append(
+                        f"{site.path}: {site.what} is {value}, a commit of {found}, not {version}; empty it, as a bump "
+                        f"does, or pin the commit v{version} names"
+                    )
+    return rows, problems
+
+
 def bump(version, root=ROOT):
-    """Move every site to `version`.
+    """Move every site to `version`, and empty the commit pins it outdates.
 
     Returns (changed, problems): the new text of each file the bump
-    changes, and one message per site that stops it. Nothing is written
-    here; with any problem, the caller writes nothing at all.
+    changes, and one message per site that stops it. A release commit
+    pin is emptied when the bump moves a version site of its file, and
+    kept when the bump leaves the file as it was (a bump to the version
+    the tree already carries). Nothing is written here; with any
+    problem, the caller writes nothing at all.
     """
     original, texts, problems = {}, {}, []
     for site in SITES:
@@ -421,5 +505,18 @@ def bump(version, root=ROOT):
             problems.append(f"{site.path}: {err}")
             continue
         texts[site.path] = text
+    for site in RELEASE_COMMITS:
+        try:
+            if site.path not in texts:
+                original[site.path] = texts[site.path] = _read(root, site.path)
+            text = texts[site.path]
+            spans = site.locate(text)
+        except SiteError as err:
+            problems.append(f"{site.path}: {err}")
+            continue
+        if text != original[site.path]:
+            for start, end in sorted(spans, reverse=True):
+                text = text[:start] + text[end:]
+            texts[site.path] = text
     changed = {path: text for path, text in texts.items() if text != original[path]}
     return changed, problems

@@ -11,10 +11,13 @@ these rules:
   pipe       No run step pipes a download into a shell (`| sh`, `| bash`),
              and none runs dist's generated `matrix.install_dist` command,
              which does (issue #597).
-  installer  A step that fetches cargo-dist-installer.sh, by name or through
-             an env value that names it, checks it against a pinned SHA-256
-             before it runs it, and a failed check stops the step
-             (issue #597).
+  installer  A step that fetches a download it then runs, by name or
+             through an env value that names it, checks it against a pinned
+             SHA-256 before it runs or unpacks it, a failed check stops the
+             step, and the URL names a version, not releases/latest. The
+             downloads are cargo-dist-installer.sh (issue #597) and the MCP
+             registry's publisher, an mcp-publisher_<os>_<arch> archive
+             (issue #711).
   pip        Every pip install reads a requirements file with
              --require-hashes and names no package on the command line, and
              `python -m build` runs with --no-isolation, so the build
@@ -30,6 +33,13 @@ these rules:
              of the `release` environment. It names the environment, or it
              needs a job that does and its `if:` cannot run it after that
              job failed or was rejected (issue #599).
+  order      In the release workflow, the one with the `release-gate`
+             approval job, every other job that the gate rule covers or that
+             names the `release` environment runs only after `host`, the job
+             that publishes the GitHub Release: it needs host, directly or
+             through jobs that do, and no `if:` on the way can run it after
+             a failure. So a registry takes a version only once its release
+             is published, the order every publish job keeps (issue #711).
   fuzz       Every libFuzzer run (`cargo fuzz run`) passes -rss_limit_mb, so
              an input that makes the process grow without bound is a
              reported failure of that input, not a runner that dies with
@@ -57,6 +67,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RELEASE_ENVIRONMENT = "release"
+# The release workflow's approval job, and the job that publishes the
+# GitHub Release once it is approved (cargo-dist's name for it).
+RELEASE_APPROVAL = "release-gate"
+RELEASE_HOST = "host"
 
 
 # ---------------------------------------------------------------- YAML
@@ -437,35 +451,61 @@ def run_problems(script):
     return problems
 
 
+# Downloads a workflow runs once fetched: the marker that names one in a
+# script or an env value, and how a problem names it. The publisher's
+# marker is its release archive's name (mcp-publisher_<os>_<arch>), so a
+# step that only runs the unpacked mcp-publisher binary is no fetch.
+INSTALLERS = (
+    ("cargo-dist-installer", "cargo-dist-installer.sh"),
+    ("mcp-publisher_", "the mcp-publisher archive"),
+)
+# An unpacking command, where a command starts (so not `.tar.gz` in a name).
+UNPACKS = re.compile(r"(?:^|[;&|(]\s*|\b(?:then|do|else)\s+)(?:sudo\s+)?(?:bsdtar|tar|unzip)\s", re.M)
+MOVING_URL = re.compile(r"/releases/latest/")
+
+
 def installer_problems(script, env):
-    """A step that fetches cargo-dist-installer.sh checks a pinned hash first."""
+    """A step that fetches an installer checks a pinned hash first."""
+    problems = []
+    for marker, what in INSTALLERS:
+        problems += fetch_problems(script, env, marker, what)
+    return problems
+
+
+def fetch_problems(script, env, marker, what):
+    """The installer rule for one download, named by `marker`."""
     lines = [line.strip() for line in shell_lines(script)]
     # The URL may live in the workflow, job or step env, as it does in
     # release.yml: `curl "$CARGO_DIST_INSTALLER_URL" -o dist.sh` fetches it too.
-    via_env = [name for name, value in env.items() if "cargo-dist-installer" in str(value)]
+    via_env = [name for name, value in env.items() if marker in str(value)]
     names = [rf"\$\{{?{re.escape(name)}\b|\benv\.{re.escape(name)}\b" for name in via_env]
-    if not any("cargo-dist-installer" in line or any(re.search(n, line) for n in names) for line in lines):
+    used = [name for name, pattern in zip(via_env, names) if any(re.search(pattern, line) for line in lines)]
+    if not used and not any(marker in line for line in lines):
         return []
+    sources = [line for line in lines if marker in line] + [str(env[name]) for name in used]
+    if any(MOVING_URL.search(source) for source in sources):
+        return [f"fetches {what} from a releases/latest URL, which moves with each release: name its version and pin its sha256"]
     # Compare positions in the whole script, not line numbers, so
     # `sh i.sh && echo "$H  i.sh" | shasum -a 256 -c -` runs before it checks.
     joined = "\n".join(lines)
     check = CHECKSUM.search(joined)
-    runs = RUNS_A_SCRIPT.search(joined)
     if check is None:
-        return ["fetches cargo-dist-installer.sh but never checks its sha256 (sha256sum -c or shasum -a 256 -c)"]
-    if runs is not None and runs.start() < check.start():
-        return ["runs cargo-dist-installer.sh before it checks its sha256"]
+        return [f"fetches {what} but never checks its sha256 (sha256sum -c or shasum -a 256 -c)"]
+    for pattern, verb in ((RUNS_A_SCRIPT, "runs"), (UNPACKS, "unpacks")):
+        use = pattern.search(joined)
+        if use is not None and use.start() < check.start():
+            return [f"{verb} {what} before it checks its sha256"]
     start = joined.rfind("\n", 0, check.start()) + 1
     end = joined.find("\n", check.start())
     line = joined[start : len(joined) if end < 0 else end]
     if SOFT_FAIL.search(line, check.start() - start):
-        return ["lets a failed sha256 check of cargo-dist-installer.sh pass (`|| true`); a failed check must stop the step"]
+        return [f"lets a failed sha256 check of {what} pass (`|| true`); a failed check must stop the step"]
     if HEX64.search(line):
         return []
     for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", line):
         if HEX64.fullmatch(str(env.get(name, ""))):
             return []
-    return ["checks cargo-dist-installer.sh against no pinned sha256 (a literal, or an env value of 64 hex digits)"]
+    return [f"checks {what} against no pinned sha256 (a literal, or an env value of 64 hex digits)"]
 
 
 def strings(value):
@@ -574,17 +614,60 @@ def gate_problems(workflow, name):
 
     problems = []
     for job_name, job in jobs.items():
-        job = mapping(job)
-        reasons = write_scopes(job, workflow)
-        secrets = secret_names(job)
-        if job.get("secrets") == "inherit":
-            secrets.append("every secret (secrets: inherit)")
-        reasons += [f"reads {secret}" for secret in secrets]
+        reasons = publish_reasons(mapping(job), workflow)
         if reasons and not is_gated(job_name):
             problems.append(
                 f"{name}: job {job_name} can write or read secrets ({'; '.join(reasons)}) but does not wait for "
                 f"the `{RELEASE_ENVIRONMENT}` environment's approval: name the environment, or need a job that "
                 "does with an `if:` that runs only after it succeeded"
+            )
+    return problems
+
+
+def publish_reasons(job, workflow):
+    """What makes a job one the gate rule covers: what it can write, and the secrets it reads."""
+    reasons = write_scopes(job, workflow)
+    secrets = secret_names(job)
+    if job.get("secrets") == "inherit":
+        secrets.append("every secret (secrets: inherit)")
+    return reasons + [f"reads {secret}" for secret in secrets]
+
+
+def runs_after(jobs, job_name, target, seen=()):
+    """Whether `job_name` runs only after `target` succeeded, through its needs."""
+    job = mapping(jobs.get(job_name))
+    for need in as_list(job.get("needs")):
+        if need not in jobs or need in seen or not waits_for(job, need):
+            continue
+        if need == target or runs_after(jobs, need, target, seen + (job_name,)):
+            return True
+    return False
+
+
+def order_problems(workflow, name):
+    """The order rule: in the release workflow, everything that publishes runs after host."""
+    jobs = mapping(workflow.get("jobs"))
+    if RELEASE_APPROVAL not in jobs:
+        return []
+    if RELEASE_HOST not in jobs:
+        return [
+            f"{name}: the workflow has the {RELEASE_APPROVAL} approval job but no {RELEASE_HOST} job, which "
+            "publishes the GitHub Release and which every publishing job runs after; if cargo-dist renamed it, "
+            "rename RELEASE_HOST in scripts/check_workflows.py"
+        ]
+    problems = []
+    for job_name, job in jobs.items():
+        job = mapping(job)
+        if job_name in (RELEASE_APPROVAL, RELEASE_HOST):
+            continue
+        publishes = publish_reasons(job, workflow)
+        if environment_name(job) == RELEASE_ENVIRONMENT:
+            publishes.append(f"names the `{RELEASE_ENVIRONMENT}` environment")
+        if publishes and not runs_after(jobs, job_name, RELEASE_HOST):
+            problems.append(
+                f"{name}: job {job_name} publishes ({'; '.join(publishes)}) but can run before {RELEASE_HOST} has "
+                f"published the GitHub Release: need {RELEASE_HOST}, or a job that runs after it, with an `if:` "
+                "that runs only after it succeeded"
             )
     return problems
 
@@ -645,6 +728,7 @@ def check_workflow(text, name):
                     "do that in a step or job without the secret"
                 )
     problems += gate_problems(workflow, name)
+    problems += order_problems(workflow, name)
     return problems
 
 
@@ -695,9 +779,10 @@ def main(argv=None):
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
-    print(f"{len(files)} workflow files: actions pinned, no download piped into a shell, hashed pip installs, "
-          "dav1d from a checked tarball, every publishing job behind the release approval, every fuzz run "
-          "under a memory limit, and no cache in the release")
+    print(f"{len(files)} workflow files: actions pinned, no download piped into a shell, installers checked "
+          "against pinned hashes, hashed pip installs, dav1d from a checked tarball, every publishing job "
+          "behind the release approval and after the GitHub Release, every fuzz run under a memory limit, "
+          "and no cache in the release")
     return 0
 
 
