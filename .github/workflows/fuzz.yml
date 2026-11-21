@@ -3,16 +3,28 @@
 # mirror: keep the two identical (scripts/test_all.sh fails
 # when they differ).
 #
+# It runs once the workflow is enabled, which is the owner's
+# switch (the repository's Actions settings, Fuzz, Enable
+# workflow): it was disabled before its first scheduled run,
+# and while it stays disabled nothing below runs anywhere
+# (issue #710).
+#
 # Every pull request runs the deterministic fuzz smoke
 # (scripts/test_all.sh). Open-ended, coverage-guided fuzzing
 # needs a nightly toolchain and minutes per target, so it
 # runs here, every night and by hand, never per pull
-# request: each of the five cargo-fuzz targets for 15
+# request: each of the six cargo-fuzz targets for 15
 # minutes, built with the fuzz crate's default features,
 # which include the dav1d AVIF decoder every shipped build
-# carries. A crash fails the target's job and uploads its
-# input; see "Real fuzzing" in fuzz/README.md for what
-# happens next.
+# carries, under a 2 GiB memory limit. A failing input fails
+# its target's job. This repository's logs and artifacts are
+# public and a failing input is a reproducer, so the job
+# prints where the run failed and names the input by its
+# SHA-256 and size, and neither prints nor uploads the input
+# itself; see "Real fuzzing" in fuzz/README.md for what
+# happens next. The tests job runs the fuzz smoke with the
+# AVIF decoder linked and the workspace tests with ten
+# thousand cases per property test.
 name: Fuzz
 
 on:
@@ -44,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_request, unseal, decode, source_meta, op_chain]
+        target: [parse_request, unseal, decode, source_meta, op_chain, render]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,6 +73,12 @@ jobs:
         run: |
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      # On its own, so a build failure prints in full: the run
+      # below sends its output to a file.
+      - name: Build the ${{ matrix.target }} target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +nightly fuzz build "$TARGET"
       # A cache key is written once, so each run attempt saves
       # under its own key (a re-run keeps what it found too)
       # and restores the newest key of any earlier run.
@@ -94,25 +112,33 @@ jobs:
           # max_bytes ladder at 500x500 took 29 s), and 600 s
           # leaves room for slower runners without reporting
           # slow-but-bounded work as a hang.
+          #
+          # The run's output goes to a file, not to this log:
+          # on a failure libFuzzer prints the input (in hex, as
+          # text and in base64, up to 256 bytes), cargo-fuzz
+          # prints its Debug form, and a harness assertion may
+          # quote it. scripts/fuzz_report.py prints the rest
+          # (progress, statistics, the error and its stack)
+          # and names each failing input by SHA-256 and size
+          # (issue #710).
+          log="$RUNNER_TEMP/fuzz-$TARGET.log"
+          status=0
           cargo +nightly fuzz run "$TARGET" "$corpus" "fuzz/corpus/$TARGET" -- \
             -max_total_time=900 \
             -rss_limit_mb=2048 \
             -malloc_limit_mb=512 \
             -timeout=600 \
-            -print_final_stats=1
+            -print_final_stats=1 > "$log" 2>&1 || status=$?
+          python3 scripts/fuzz_report.py "$log" "fuzz/artifacts/$TARGET"
+          exit "$status"
+      # The corpus holds no failing input: libFuzzer writes
+      # those to fuzz/artifacts, which nothing uploads.
       - name: Save the corpus
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/corpus/${{ matrix.target }}
           key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Upload crashing inputs
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}
-          if-no-files-found: ignore
 
   tests:
 
