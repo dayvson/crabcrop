@@ -156,14 +156,14 @@ pub(in crate::server) async fn run_flight(
 
 /// What makes two image requests for one key identical for
 /// a flight's shared response (issue #407): the same raw
-/// path (the sealing, the cache groups, and the cache
-/// lifetime all come from it) and the same header inputs as
-/// the miss path sees them: the negotiated format, not the
-/// raw Accept (on this path errors are plain text whatever it
-/// says), the quantized width, not the raw hint, and whether
-/// Save-Data applies, not the raw header, so browsers that
-/// phrase the same request differently still share one
-/// flight.
+/// path (the sealing, the cache groups, and the `maxage:`
+/// and `exp:` that set the cache lifetime all come from it)
+/// and the same header inputs as the miss path sees them:
+/// the negotiated format, not the raw Accept (on this path
+/// errors are plain text whatever it says), the quantized
+/// width, not the raw hint, and whether Save-Data applies,
+/// not the raw header, so browsers that phrase the same
+/// request differently still share one flight.
 struct FlightIdentity<'a> {
     path: &'a str,
     preferred: Option<ImageFormat>,
@@ -279,6 +279,7 @@ fn answer_hit(
         hit.quality,
         hit.bytes,
         work.max_age,
+        work.expires_at,
         state.client_hints,
     );
     attach_cache_headers(&mut response, cache_status, &work.groups, work.sealed);
@@ -287,7 +288,10 @@ fn answer_hit(
 }
 
 /// The answer to an image request from the response the
-/// flight it followed shared (issue #407).
+/// flight it followed shared (issue #407). Its headers are
+/// the leader's, the cache lifetime included: an expiry's
+/// seconds left were counted as the leader's render ended,
+/// which is when this answer is ready too.
 fn answer_shared(
     shared: &SharedFlight,
     if_none_match: Option<&str>,
