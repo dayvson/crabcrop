@@ -4,6 +4,22 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-22
+
+- Boot now refuses a `CRABCROP_METRICS_TOKEN` under 16 bytes, and the Helm chart a secret given as a plain value: fix both before upgrading (issue #632).
+
+### Added
+
+- The release workflow now publishes the `crabcrop` crate to crates.io, so `cargo install --locked crabcrop` installs every release (issue #711). It goes up after `crabcrop-url`, under the same approval. The crate was published by hand, when at all: 0.13.0 went up 71 minutes after `crabcrop-url`, and 0.9.6 never did. Both crates are packaged and built from their packages before the release approval, in a job with no secrets, so a crate that does not build stops the release before anything is public, and the job that holds the crates.io token builds nothing. The workflow also publishes the MCP server's registry entry, `io.github.crabcrop/crabcrop` (`sdks/mcp/server.json`), once `@crabcrop/mcp` is on npm, with the registry's own publisher pinned by version and SHA-256, so the MCP registry lists each release instead of only 0.1.0, which was submitted by hand. A prerelease is not listed there, as npm keeps one off `latest`. Both publishing jobs skip a version their registry already has, so re-running a failed job finishes the release instead of failing on what an earlier attempt published.
+
+### Changed
+
+- The Helm chart now refuses to render a secret given as a plain value, unless `refusePlainSecrets` is set to `false` (issue #632). Since 0.12.0 a secret variable (`CRABCROP_SECRET`, `CRABCROP_SECRET_PREVIOUS`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `CRABCROP_GCS_SECRET_KEY` or `CRABCROP_METRICS_TOKEN`) set in `env`, in `ai.env` or as an `extraEnv` entry's `value` rendered into the Deployment as plain text, with a warning in the install notes and a comment in the manifest, and `refusePlainSecrets: true` failed the render instead (issue #589). That is now the default, so `helm install`, `helm upgrade` and `helm template` fail with an error that names each such variable and the value that reads it from a Secret. To migrate, put each key in a Secret and set the value the error names, then remove the key from `env`, `ai.env` or `extraEnv`: an entry left there comes after the Secret's and wins. Move `AWS_ACCESS_KEY_ID` and `CRABCROP_GCS_ACCESS_KEY` with their secret keys the same way. `refusePlainSecrets: false` renders such a value as before, with the warning. An install with no secret in `env`, `ai.env` or an `extraEnv` value renders the same manifest as before.
+
+- A `CRABCROP_METRICS_TOKEN` under 16 bytes now stops the boot (issue #632). Since 0.12.0 such a token booted with a warning on stderr that a later release would refuse it (issue #588). The error names the variable and the length, never the token, as for a short `CRABCROP_SECRET`: `CRABCROP_METRICS_TOKEN must be at least 16 bytes, got 12`. A deployment that runs on a shorter token will not start after the upgrade: generate a new one, for example with `openssl rand -hex 32`, and give it to whatever scrapes `/metrics` along with the server. An unset or empty token still closes `/metrics` with `403`.
+
+- In the library, the filters that `crabcrop::filters` applies from the image alone have an enum of their own (issue #741). The 36 such variants of `crabcrop::url::Filter` move under `Filter::Plain(crabcrop::url::PlainFilter)`, and `crabcrop::filters::apply_filters_filled` and `apply_filters_within` take `&[PlainFilter]`, so a filter the engine applies itself can no longer reach that match and be skipped there. The URL grammar, `/explain`, the cache keys and every render are unchanged.
+
 ## [0.14.0] - 2026-11-18
 
 - This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #713). Aspect crops, the redaction filters, and watermarks and overlays placed off the canvas now keep the source's layout and depth.
