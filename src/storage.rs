@@ -4193,7 +4193,12 @@ mod tests {
         assert!(!no_room(&err), "probe error: {err}");
         let err =
             DiskStore::open(Path::new("/proc/self"), 1_000_000, test_entry_key()).unwrap_err();
-        assert!(err.contains("not writable"), "open error: {err}");
+        // /proc exists only on Linux. Elsewhere (macOS, whose
+        // root volume is read-only) creating the directory is
+        // what fails, before the probe runs.
+        if cfg!(target_os = "linux") {
+            assert!(err.contains("not writable"), "open error: {err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
