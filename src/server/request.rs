@@ -418,6 +418,7 @@ pub(in crate::server) async fn serve(
         groups: resolved.groups,
         cache_key,
         max_age: resolved.max_age,
+        expires_at: resolved.expiry.map(|expiry| expiry.at),
         sealed,
         progress: MissProgress::default(),
         disk_handoff: None,

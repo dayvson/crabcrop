@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod disk_hang;
 mod disk_scan;
 mod disk_stall;
+mod expiry_lifetime;
 mod explain_admission;
 mod meta_frame;
 mod request_log;
@@ -7190,6 +7191,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
         None,
+        None,
         true,
     );
     finalize_validators(&mut resp, &etag, None);
@@ -7201,6 +7203,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         ImageFormat::Png,
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
+        None,
         None,
         true,
     );
@@ -7217,6 +7220,7 @@ async fn validators_attach_the_etag_and_answer_304_on_a_match() {
         ImageFormat::Png,
         None,
         bytes::Bytes::from(vec![1, 2, 3]),
+        None,
         None,
         true,
     );
@@ -7238,6 +7242,7 @@ fn validators_skip_meta_and_error_responses() {
         None,
         bytes::Bytes::from(vec![1]),
         None,
+        None,
         true,
     );
     resp.headers_mut()
@@ -7250,6 +7255,7 @@ fn validators_skip_meta_and_error_responses() {
         ImageFormat::Png,
         None,
         bytes::Bytes::from(vec![1]),
+        None,
         None,
         true,
     );

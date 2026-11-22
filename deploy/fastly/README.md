@@ -48,13 +48,9 @@ Without an explicit `filters:format(...)`, crabcrop negotiates the output format
 
 ## 4. Expiring URLs: the edge does not read them
 
-`exp:` expiry lives inside the signed path, and Fastly never looks inside the URL. A response cached before expiry keeps being served until its TTL runs out or it is purged: with step 1 in place, that can be a year. What expiry still guarantees is that the origin refuses the URL, so nothing new gets rendered or re-cached after it passes.
+`exp:` expiry lives inside the signed path, and Fastly never looks inside the URL. It does not have to: crabcrop caps the `max-age` of an expiring URL's response at the seconds left before its `exp:` second, and with step 1 in place the origin's `max-age` is the TTL, so a cached copy goes stale when the URL expires. The edge then asks the origin again, the origin refuses the URL with `403` and `no-store`, and the boilerplate passes that answer without storing it.
 
-If expiry has to bite at the edge, pick one:
-
-- Cap the edge TTL for expiring paths with the `crabcrop-expiry-ttl-cap` snippet in `fastly-snippets.vcl` (type fetch): when the path carries an `exp:` segment and the origin's TTL exceeds the cap, the TTL is clamped. Set the cap no higher than the shortest signed lifetime you mint. The clamp replaces crabcrop's TTL for those paths only.
-- Purge the URL when it expires, from the same job that tracks the expiry (step 5; one URL purge from a generous budget).
-- Accept it, when expiry is about minting (no new renders) rather than access control. Most signed-URL deployments mean exactly that.
+No snippet is needed for expiring paths. A TTL cap on them, such as the `crabcrop-expiry-ttl-cap` snippet an earlier version of this recipe offered, only ever lowers the TTL, so it is safe to keep, but it is no longer needed: all it does now is shorten how long the edge keeps the URLs that have longer left. Where a copy must not be served after the expiry even as stale content, also purge the URL when it expires, from the same job that tracks the expiry (step 5; one URL purge from a generous budget).
 
 ## 5. Purge mapping
 
@@ -74,7 +70,7 @@ Two variant subtleties: a URL purge targets the cache key, so it invalidates eve
 
 ## 6. Shielding (optional)
 
-Shielding designates one Fastly POP as the shield for the host: edge POPs that miss ask the shield instead of the origin, so crabcrop sees one fill per object from the shield POP rather than one per edge POP, on top of its own two tiers. Pick a shield data center close to the origin (Origins, your host, Shielding). Two things to know before enabling it: inbound traffic to the shield is billed as regular traffic, and VCL executes twice, once at the edge POP and once at the shield, so the fetch snippets above apply at both tiers (they are written to be safe under that: the key bridge sets the same value from the same header, and the TTL cap only ever clamps down). Worth it when the origin is far from most viewers or renders are expensive (AI operations); unnecessary when viewers and origin share a region.
+Shielding designates one Fastly POP as the shield for the host: edge POPs that miss ask the shield instead of the origin, so crabcrop sees one fill per object from the shield POP rather than one per edge POP, on top of its own two tiers. Pick a shield data center close to the origin (Origins, your host, Shielding). Two things to know before enabling it: inbound traffic to the shield is billed as regular traffic, and VCL executes twice, once at the edge POP and once at the shield, so the fetch snippet above applies at both tiers (it is written to be safe under that: the key bridge sets the same value from the same header). Worth it when the origin is far from most viewers or renders are expensive (AI operations); unnecessary when viewers and origin share a region.
 
 ## Checklist
 

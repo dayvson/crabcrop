@@ -1,6 +1,6 @@
 # crabcrop Fastly snippets.
 #
-# Four regular VCL snippets for a Fastly CDN service in front of a
+# Three regular VCL snippets for a Fastly CDN service in front of a
 # crabcrop origin. Create each block below as its own snippet,
 # with the name and type noted above it. Regular snippets are
 # versioned service configuration; no custom VCL is needed, and
@@ -127,19 +127,3 @@ if (req.http.Accept) {
 # the full URL, query string and all). Drop it before the
 # lookup. The origin never reads one.
 set req.url = req.url.path;
-
-# ----------------------------------------------------------------
-# Snippet: crabcrop-expiry-ttl-cap
-# Type: fetch
-# Optional: only when signed expiry must bite at the edge
-# (README step 4).
-#
-# Cap the edge TTL of responses to URLs carrying an exp:
-# segment, so a cached copy cannot outlive the signed lifetime
-# by much. Set the cap no higher than the shortest lifetime you
-# mint. The pattern can also match an exp: segment inside a
-# source path; the cost of a false hit is a shorter TTL, never
-# a wrong object.
-if (req.url ~ "/exp:[0-9]" && beresp.ttl > 300s) {
-  set beresp.ttl = 300s;
-}
