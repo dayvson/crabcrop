@@ -20,6 +20,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - In the library, the filters that `crabcrop::filters` applies from the image alone have an enum of their own (issue #741). The 36 such variants of `crabcrop::url::Filter` move under `Filter::Plain(crabcrop::url::PlainFilter)`, and `crabcrop::filters::apply_filters_filled` and `apply_filters_within` take `&[PlainFilter]`, so a filter the engine applies itself can no longer reach that match and be skipped there. The URL grammar, `/explain`, the cache keys and every render are unchanged.
 
+### Security
+
+- The `url` crate moves from 2.5.8 to 2.5.9, which fixes RUSTSEC-2026-0592 (issue #775). In 2.5.8, `Url::origin` recursed once per `blob:` prefix of a URL, with no depth limit. crabcrop calls `Url::origin` in one place: the `Debug` output of the container credentials endpoint, which prints the scheme and host of a URL the operator configures. No request reaches that call. The fuzz lock moves with the root lock, and `form_urlencoded` moves from 1.2.2 to 1.2.3 with `url`.
+
 ## [0.14.0] - 2026-11-18
 
 - This release starts a new cache epoch: every render the server cached before the upgrade is made again once (issue #713). Aspect crops, the redaction filters, and watermarks and overlays placed off the canvas now keep the source's layout and depth.
