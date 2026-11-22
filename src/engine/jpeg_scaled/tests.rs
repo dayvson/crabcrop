@@ -1350,6 +1350,188 @@ fn a_source_past_the_decode_limits_is_refused_before_any_decode() {
     assert_eq!(scale_for(&declared, "100x0"), Some(8));
 }
 
+/// A progressive CMYK JPEG, as [`four_component_jpeg`] writes
+/// a CMYK one.
+fn progressive_cmyk_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let pixels: Vec<u8> = picture(width, height)
+        .pixels()
+        .flat_map(|p| [p[0], p[1], p[2], 255 - p[0] / 2])
+        .collect();
+    let mut compressor = turbojpeg::Compressor::new().unwrap();
+    compressor.set_quality(90).unwrap();
+    compressor.set_subsamp(turbojpeg::Subsamp::None).unwrap();
+    compressor
+        .set_colorspace(turbojpeg::Colorspace::CMYK)
+        .unwrap();
+    compressor.set_progressive(true).unwrap();
+    compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: pixels.as_slice(),
+            width: width as usize,
+            pitch: width as usize * 4,
+            height: height as usize,
+            format: turbojpeg::PixelFormat::CMYK,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_progressive_jpeg_is_charged_its_coefficients_before_any_decode() {
+    // A progressive file cannot be decoded a row at a time:
+    // either decoder keeps every component's coefficients, two
+    // bytes a sample, until the last scan, beside the frame.
+    // So the frame, at four bytes a pixel, and the coefficients
+    // are charged together against the 256 MiB decode budget,
+    // from the frame header, before anything decodes. At 4:2:0
+    // a 6200x6200 frame is 154 MB and its coefficients 116 MB:
+    // past the budget, though the frame alone is inside it.
+    let declared = declaring(&progressive_jpeg(&picture(64, 48)), 6200, 6200);
+    let refused = decode_image(&declared);
+    assert!(
+        matches!(&refused, Err(EngineError::Decode(why)) if why.contains("coefficients")),
+        "{:?}",
+        refused.map(|img| (img.width(), img.height()))
+    );
+    // A request that shrinks it far enough for a scaled decode
+    // is refused the same way: the scaled decode holds the same
+    // coefficients, and a file the full-size path refuses is
+    // not eligible for it.
+    let answered = answer(render(&declared, "100x0"));
+    assert_eq!(
+        answered,
+        answer(at_full_size(|| render(&declared, "100x0")))
+    );
+    assert!(
+        answered.as_ref().is_err_and(|e| e.contains("coefficients")),
+        "{answered:?}"
+    );
+    // A CMYK file keeps four components at full resolution and
+    // never takes the scaled decode: a 4800x4800 one holds a
+    // 92 MB frame and 184 MB of coefficients.
+    let cmyk = declaring(&progressive_cmyk_jpeg(64, 48), 4800, 4800);
+    let refused = decode_image(&cmyk);
+    assert!(
+        matches!(&refused, Err(EngineError::Decode(why)) if why.contains("coefficients")),
+        "{:?}",
+        refused.map(|img| (img.width(), img.height()))
+    );
+}
+
+/// The coefficients [`progressive_coefficient_bytes`] charges
+/// `bytes`, from zune-jpeg's reading of its header.
+fn coefficients(bytes: &[u8]) -> u64 {
+    let mut zune = zune_jpeg::JpegDecoder::new_with_options(
+        zune_core::bytestream::ZCursor::new(bytes),
+        zune_jpeg_options(),
+    );
+    zune.decode_headers().unwrap();
+    progressive_coefficient_bytes(bytes, &zune)
+}
+
+#[test]
+fn the_coefficients_charged_are_the_blocks_the_decoders_keep() {
+    // 100x60 is 13x8 blocks at full resolution, and 7 MCUs of
+    // 16 px across, 4 of 16 px down: each component keeps its
+    // blocks over the image padded out to whole MCUs, 64
+    // coefficients of two bytes a block. A baseline file keeps
+    // none.
+    let img = picture(100, 60);
+    let layouts = [
+        // Every component at full resolution.
+        (turbojpeg::Subsamp::None, 3 * 13 * 8),
+        // Luma at 2x1 in MCUs of 16x8, chroma at half width.
+        (turbojpeg::Subsamp::Sub2x1, 14 * 8 + 2 * 7 * 8),
+        (turbojpeg::Subsamp::Sub2x2, 14 * 8 + 2 * 7 * 4),
+        (turbojpeg::Subsamp::Sub1x2, 13 * 8 + 2 * 13 * 4),
+        // MCUs of 32x8: four across.
+        (turbojpeg::Subsamp::Sub4x1, 16 * 8 + 2 * 4 * 8),
+        (turbojpeg::Subsamp::Gray, 13 * 8),
+    ];
+    for (subsamp, blocks) in layouts {
+        let baseline = jpeg_with(&img, |c| c.set_subsamp(subsamp).unwrap());
+        let progressive = jpeg_with(&img, |c| {
+            c.set_subsamp(subsamp).unwrap();
+            c.set_progressive(true).unwrap();
+        });
+        assert_eq!(coefficients(&baseline), 0, "{subsamp:?} baseline");
+        assert_eq!(
+            coefficients(&progressive),
+            blocks * 128,
+            "{subsamp:?} progressive"
+        );
+    }
+    // CMYK keeps four components at full resolution.
+    assert_eq!(
+        coefficients(&progressive_cmyk_jpeg(100, 60)),
+        4 * 13 * 8 * 128
+    );
+    // The charge is the frame and the coefficients together:
+    // at 4:2:0, 6100x6100 holds 261 MB and fits the budget,
+    // and 6200x6200 holds 269 MB and does not.
+    let small = progressive_jpeg(&picture(64, 48));
+    for (side, fits) in [(6100, true), (6200, false)] {
+        let declared = declaring(&small, side, side);
+        let held = u64::from(side) * u64::from(side) * 4 + coefficients(&declared);
+        assert_eq!(held <= MAX_DECODE_ALLOC, fits, "{side}: {held}");
+    }
+}
+
+#[test]
+fn the_sampling_factors_are_read_from_the_frame_zune_jpeg_reads() {
+    let img = picture(100, 60);
+    let progressive = progressive_jpeg(&img);
+    // 4:2:0: luma at 2x2 and each chroma component at 1x1.
+    let exact = (14 * 8 + 2 * 7 * 4) * 128;
+    // Every component at 2x2.
+    let most = 3 * 14 * 8 * 128;
+    assert_eq!(coefficients(&progressive), exact);
+    // A segment that carries another JPEG, as an EXIF thumbnail
+    // does, is stepped over by its length, frame header and all.
+    let thumbnail = jpeg_with(&picture(30, 20), |c| {
+        c.set_subsamp(turbojpeg::Subsamp::None).unwrap();
+        c.set_progressive(true).unwrap();
+    });
+    let with_thumbnail = with_segment(
+        &progressive,
+        0xE1,
+        &[&b"Exif\0\0"[..], &thumbnail[..]].concat(),
+    );
+    assert_eq!(coefficients(&with_thumbnail), exact);
+    // zune-jpeg reads five bytes of an APP0 segment of length 6,
+    // which holds four: the byte after it is the segment's to
+    // zune-jpeg, and the walk steps over it too.
+    let app0 = [
+        &progressive[..2],
+        &[0xFF, 0xE0, 0, 6, b'J', b'F', b'I', b'F', 0][..],
+        &progressive[2..],
+    ]
+    .concat();
+    assert_eq!(coefficients(&app0), exact);
+    // A stray byte between two segments, which zune-jpeg passes
+    // over and the walk does not follow: every component is
+    // charged at the largest factors, the most the frame holds.
+    let (_, _, first_end) = header_segments(&progressive)[0];
+    let stray = [
+        &progressive[..first_end],
+        &[0u8][..],
+        &progressive[first_end..],
+    ]
+    .concat();
+    assert_eq!(coefficients(&stray), most);
+    // zune-jpeg decodes all three as the file itself.
+    let want = decode_image(&progressive).unwrap();
+    for (what, bytes) in [
+        ("app0", &app0),
+        ("stray", &stray),
+        ("thumbnail", &with_thumbnail),
+    ] {
+        assert!(
+            decode_image(bytes).unwrap().as_bytes() == want.as_bytes(),
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn a_passed_deadline_stops_the_request_before_a_second_decode() {
     let past = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));

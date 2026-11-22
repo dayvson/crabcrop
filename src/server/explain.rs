@@ -36,8 +36,9 @@ use super::miss::render_miss;
 /// The load asks this after every chunk, on the async
 /// runtime, so it never sizes a kind whose probe is heavy
 /// ([`crate::engine::probe_is_heavy`]): an SVG's size needs
-/// the whole document anyway, an AVIF's a decode, and a
-/// HEIC's a walk of its item graph. Those read on to the end
+/// the whole document anyway, an AVIF's a decode, a HEIC's a
+/// walk of its item graph, and a JPEG XL's the decoder's
+/// reading of its colour encoding. Those read on to the end
 /// of the body (or the head cap), and [`explain_probe`]
 /// sizes them once, off the runtime.
 pub(in crate::server) fn probe_settled(head: &[u8]) -> bool {
@@ -57,11 +58,12 @@ const PROBE_GATE_WAIT: std::time::Duration = PROCESS_GATE_WAIT;
 
 /// The explain report's source probe. A heavy probe (an
 /// SVG's parse in the worker, which may take the probe's
-/// whole 5 s, an AVIF's decode, or a HEIC's item graph
-/// walk) runs on a blocking thread under the probe gate,
-/// so the async runtime, and every route it serves, never
-/// waits on one; the permit moves into the job, so a probe
-/// whose request went away still counts until it ends.
+/// whole 5 s, an AVIF's decode, a HEIC's item graph walk, or
+/// a JPEG XL's header read through its colour encoding) runs
+/// on a blocking thread under the probe gate, so the async
+/// runtime, and every route it serves, never waits on one;
+/// the permit moves into the job, so a probe whose request
+/// went away still counts until it ends.
 /// Every other kind's probe reads headers alone and runs
 /// inline. `None` means the gate stayed full past its wait.
 async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine::SourceProbe> {
@@ -99,8 +101,8 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// of its guards ([`probe_explained`]), and the facts come
 /// from header probing (`crate::engine::probe_source`): no
 /// decode, no detection, no process, AI, or video gate (an
-/// SVG, AVIF, or HEIC probe takes the probe gate, see
-/// [`explain_probe`]), and nothing written to any cache
+/// SVG, AVIF, HEIC, or JPEG XL probe takes the probe gate,
+/// see [`explain_probe`]), and nothing written to any cache
 /// tier. A bad signature, an over-cap operation list, or
 /// an expired URL therefore costs zero source fetches.
 /// [`explain_report`] builds the report and

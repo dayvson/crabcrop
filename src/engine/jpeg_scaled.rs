@@ -38,7 +38,9 @@
 //! is decoded. A scaled decode holds a frame of a quarter of
 //! the pixels or fewer where the full one holds them all, and
 //! for a progressive file the same coefficients zune-jpeg
-//! holds; its scans are capped where zune-jpeg caps them
+//! holds, which both paths charge with the full frame, so a
+//! progressive file past the budget is refused at every size;
+//! its scans are capped where zune-jpeg caps them
 //! ([`MAX_SCANS`]).
 //!
 //! Two decoders reading one file is the hazard, and the answer
@@ -76,7 +78,8 @@ use image::DynamicImage;
 
 use super::{
     EngineError, ImageSize, MAX_DECODE_ALLOC, Operation, ProcessContext, SizeCap,
-    check_decoded_dimensions, exif_orientation, has_zero_side, resize_target, zune_jpeg_options,
+    check_decoded_dimensions, exif_orientation, has_zero_side, progressive_coefficient_bytes,
+    resize_target, zune_jpeg_options,
 };
 
 mod first_scan;
@@ -465,9 +468,11 @@ fn tiff_orientation(tiff: &[u8]) -> Option<u32> {
 /// such header.
 ///
 /// The declared size is held to the decode limits here, ahead
-/// of any decode: a file past them is not eligible, and the
-/// full-size path refuses it by the same two checks before it
-/// decodes anything.
+/// of any decode, and so is a progressive file's frame with the
+/// coefficients both decoders keep beside it
+/// ([`progressive_coefficient_bytes`]): a file past them is not
+/// eligible, and the full-size path refuses it by the same
+/// checks before it decodes anything.
 ///
 /// Last, a progressive file's first scan must be one
 /// zune-jpeg reads to the marker that ends it
@@ -492,7 +497,9 @@ fn eligible_size(bytes: &[u8], glance: &Glance) -> Option<(u32, u32)> {
     let (width, height) = (u32::try_from(width).ok()?, u32::try_from(height).ok()?);
     if (width, height) != glance.size
         || check_decoded_dimensions(width.into(), height.into()).is_err()
-        || u64::from(width) * u64::from(height) * 4 > MAX_DECODE_ALLOC
+        || (u64::from(width) * u64::from(height) * 4)
+            .saturating_add(progressive_coefficient_bytes(bytes, &zune))
+            > MAX_DECODE_ALLOC
     {
         return None;
     }

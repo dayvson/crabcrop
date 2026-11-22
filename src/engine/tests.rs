@@ -1888,6 +1888,54 @@ fn orientations_match_the_image_crate() {
     assert_eq!(checked, ORIENTATION_LAYOUTS * 4 * 10 + 8 + 3 * 2);
 }
 
+/// Orientations 5 and 7 turn the frame and then mirror the
+/// turned frame where it is, so the step holds two frames, as
+/// a plain turn does, where mirroring into a frame of its own
+/// held three. Every value writes the bytes it wrote when each
+/// step made a new frame, for every layout: at small sizes, and
+/// just past where the fast permutations start, which is past
+/// where they spread a frame over threads.
+#[test]
+fn every_orientation_writes_what_it_wrote_into_new_frames() {
+    fn into_new_frames(img: &DynamicImage, orientation: u32) -> DynamicImage {
+        use crate::filters::{
+            fliph_fast, flipv_fast, rotate90_fast, rotate180_fast, rotate270_fast,
+        };
+        match orientation {
+            2 => fliph_fast(img),
+            3 => rotate180_fast(img),
+            4 => flipv_fast(img),
+            5 => fliph_fast(&rotate90_fast(img)),
+            6 => rotate90_fast(img),
+            7 => fliph_fast(&rotate270_fast(img)),
+            8 => rotate270_fast(img),
+            _ => img.clone(),
+        }
+    }
+    let mut checked = 0;
+    for layout in 0..ORIENTATION_LAYOUTS {
+        let bytes = u32::from(orientation_frame(layout, 1, 1).color().bytes_per_pixel());
+        // Four million bytes and one row more, 1601 px wide.
+        let rows = 4_000_000 / (1601 * bytes) + 1;
+        for (w, h) in [(1, 1), (1, 9), (9, 1), (67, 45), (1601, rows)] {
+            let img = orientation_frame(layout, w, h);
+            for orientation in 0..=9 {
+                let want = into_new_frames(&img, orientation);
+                let got = apply_orientation(img.clone(), orientation);
+                let what = format!("orientation {orientation} of {:?} at {w}x{h}", img.color());
+                assert_eq!(
+                    (got.color(), got.width(), got.height()),
+                    (want.color(), want.width(), want.height()),
+                    "{what}"
+                );
+                assert!(got.as_bytes() == want.as_bytes(), "{what}");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, ORIENTATION_LAYOUTS * 5 * 10);
+}
+
 #[test]
 fn avif_format_encodes() {
     let engine = Engine;
@@ -8310,9 +8358,75 @@ fn an_animated_webp_past_the_kept_bytes_budget_is_refused_up_front() {
         "the refusal took {:?}",
         started.elapsed()
     );
-    // Three frames on a 4000x4000 canvas keep 192 MB, inside the
-    // budget, so the header charge admits them.
-    assert!(check_webp_frame_budget(&with_webp_canvas(animated_webp_bytes(), 4000, 4000)).is_ok());
+    // Three frames on a 3000x3000 canvas keep 108 MB, and their
+    // decode holds 180 MB with its two working canvases (see
+    // `an_animated_webp_is_charged_the_canvases_its_decode_holds`),
+    // inside the budget, so the header charge admits them.
+    assert!(check_webp_frame_budget(&with_webp_canvas(animated_webp_bytes(), 3000, 3000)).is_ok());
+}
+
+/// An animation of `count` lossless 4x4 frames, each its own
+/// colour, which [`with_webp_canvas`] can set on a larger canvas.
+fn small_animated_webp(count: u8) -> Vec<u8> {
+    let frames: Vec<_> = (0..count)
+        .map(|i| {
+            let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9 + i * 40, 255]));
+            let image = oxideav_webp::WebpImage::from_rgba8(4, 4, img.as_raw().clone()).unwrap();
+            oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(50)))
+        })
+        .collect();
+    let opts = oxideav_webp::EncodeOptions::default()
+        .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+    oxideav_webp::encode_animation(&frames, &opts).unwrap()
+}
+
+#[test]
+fn an_animated_webp_is_charged_the_canvases_its_decode_holds() {
+    // While a frame decodes, a decode holds two canvas-sized
+    // buffers beside the frames it has kept: the canvas the
+    // frames are composited onto and the frame being decoded
+    // (the image crate's iterator, which takes any file the
+    // libwebp walk declines, the buffer it copies the canvas
+    // into as well). One frame on an 8192x8192 canvas keeps
+    // 256 MiB, which the decoded-frames budget admits, but its
+    // decode holds three such buffers, so it is refused from
+    // its headers, before any frame decodes. A one-frame
+    // animation continues as a still, so this is what any
+    // request for it costs, whatever the output.
+    let one = with_webp_canvas(small_animated_webp(1), 8192, 8192);
+    let err = check_webp_frame_budget(&one).unwrap_err();
+    assert!(
+        err.to_string().contains("byte decode allocation limit"),
+        "{err}"
+    );
+    let started = std::time::Instant::now();
+    let got = decode_webp_frames(&one, None).unwrap_err();
+    assert_eq!(got.to_string(), err.to_string());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        started.elapsed()
+    );
+    // One frame may have three canvases' worth of the budget:
+    // 4096x5461 at four bytes a pixel is three times 85.3 MiB,
+    // and one more row passes 256 MiB.
+    assert!(check_webp_frame_budget(&with_webp_canvas(small_animated_webp(1), 4096, 5461)).is_ok());
+    assert!(
+        check_webp_frame_budget(&with_webp_canvas(small_animated_webp(1), 4096, 5462)).is_err()
+    );
+    // Two frames on a 4096x4096 canvas: the two kept and the
+    // two working buffers are four canvases of 64 MiB, the
+    // budget exactly. One more row passes it.
+    assert!(check_webp_frame_budget(&with_webp_canvas(small_animated_webp(2), 4096, 4096)).is_ok());
+    assert!(
+        check_webp_frame_budget(&with_webp_canvas(small_animated_webp(2), 4096, 4097)).is_err()
+    );
+    // Within the charge both frames still decode, at the
+    // canvas's size.
+    let frames =
+        decode_webp_frames(&with_webp_canvas(small_animated_webp(2), 64, 48), None).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.dimensions(), (64, 48));
 }
 
 /// A GIF with a `width` x `height` logical screen and `frames`

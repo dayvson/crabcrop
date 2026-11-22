@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Security
+
+- Three decode steps now hold, or are charged for, what they keep beside the decoded frame, and `/explain` sizes a JPEG XL source off the async runtime. An animated WebP is charged, from its VP8X canvas and ANMF headers before any frame decodes, two canvases beyond the frames it keeps, for the canvas its frames are composited onto and the frame being decoded. So one frame on a canvas past about 22.4 megapixels (4096x5461 is the largest at that width), or two frames past 16.8 (4096x4096), are now refused before they decode, where they decoded before; a render answers `502`, as for any source past the decode limits, and since a one-frame animation continues as a still, that is so whatever the output. The libwebp frame walk also frees each decoded frame before it copies the canvas out, and hands the last frame the canvas itself instead of a copy. A progressive JPEG is charged the coefficients its decode keeps until the last scan, two bytes a sample of each component, beside its frame at four bytes a pixel, from its frame header before either decoder starts, at every requested size, the reduced-scale decode included. So a progressive file past about 38 megapixels at 4:2:0, 33.5 at 4:2:2, 26.8 at 4:4:4 or 22.4 in CMYK is now refused with `502` where it decoded before; a baseline file is charged its frame alone, as before. EXIF orientations 5 and 7 now mirror the turned frame in place, so they hold two frames, as 6 and 8 do, instead of three, and write the same bytes. And `/explain` sizes a JPEG XL source as it sizes an SVG, AVIF or HEIC one: once, on a blocking thread under the probe gate, after reading the source up to the head cap (256 KB), so such a request can now answer `503` when the gate is full.
+
 ## [0.15.0] - 2026-11-22
 
 - Boot now refuses a `CRABCROP_METRICS_TOKEN` under 16 bytes, and the Helm chart a secret given as a plain value: fix both before upgrading (issue #632).

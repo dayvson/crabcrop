@@ -52,7 +52,11 @@
 //! one canvas, refused past the decode allocation budget, and
 //! one decoded frame no larger than it: a stream that codes
 //! another size than its frame is refused on its header, before
-//! libwebp decodes any of it.
+//! libwebp decodes any of it. The decoded frame is freed once
+//! it is on the canvas, before the canvas is copied out for the
+//! frame, and the last frame takes the canvas itself, so the
+//! walk holds at most one canvas more than the animation has
+//! frames, one fewer than the charge allows for.
 
 /// Why [`Animation::next_frame`] produced no frame.
 pub(super) enum Stop {
@@ -319,11 +323,20 @@ impl<'a> Animation<'a> {
             frame_has_alpha,
             self.previous,
         );
+        // The frame is on the canvas: its decoded pixels go before
+        // the canvas is copied out.
+        drop(pixels);
         self.previous = (frame.x, frame.y, frame.width, frame.height);
         self.dispose_next = frame.dispose;
         self.next = after;
         self.produced += 1;
-        let mut out = canvas.clone();
+        // Nothing composites onto the canvas after the last frame,
+        // so that frame takes the canvas itself.
+        let mut out = if self.produced == self.frames {
+            std::mem::take(canvas)
+        } else {
+            canvas.clone()
+        };
         if !self.has_alpha {
             // The image crate reads such a file as RGB and widens
             // it: the canvas's own alpha never shows.

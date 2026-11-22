@@ -537,16 +537,18 @@ pub(in crate::engine) fn check_gif_frame_budget(bytes: &[u8]) -> Result<(), Engi
 /// decoded-pixel total, charged against [`MAX_ANIMATED_PIXELS`]
 /// as the collector charges the frames it retains; the walk and
 /// the image crate's decoder each hold a canvas-sized working
-/// buffer and a per-frame copy of it, so the canvas is charged
-/// against [`MAX_DECODE_ALLOC`] at four bytes a pixel. The image
-/// crate's WebP decoder enforces only the per-axis dimension
-/// limit, not the allocation budget, so without this charge an
-/// over-budget canvas would be allocated before the collector
-/// could refuse it. The canvas and the frame count are read by
-/// [`webp_anim::header`], the way image-webp reads them, so the
-/// pixels charged here are the pixels it allocates. A container
-/// that does not parse this far states no canvas; the decoder
-/// then opens it and fails before it allocates a canvas.
+/// buffer and the frame they decode beside the frames they keep,
+/// so the canvas is charged against [`MAX_DECODE_ALLOC`] at four
+/// bytes a pixel, alone and as many times as there are frames
+/// and two more. The image crate's WebP decoder enforces only
+/// the per-axis dimension limit, not the allocation budget, so
+/// without this charge an over-budget canvas would be allocated
+/// before the collector could refuse it. The canvas and the
+/// frame count are read by [`webp_anim::header`], the way
+/// image-webp reads them, so the pixels charged here are the
+/// pixels it allocates. A container that does not parse this
+/// far states no canvas; the decoder then opens it and fails
+/// before it allocates a canvas.
 pub(in crate::engine) fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let Some(header) = webp_anim::header(bytes) else {
         return Ok(());
@@ -581,6 +583,26 @@ pub(in crate::engine) fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), Eng
     if total_pixels.saturating_mul(4) > MAX_DECODE_ALLOC {
         return Err(EngineError::Decode(format!(
             "WebP frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
+        )));
+    }
+    // While its last frame decodes, the image crate's iterator
+    // holds two canvas-sized buffers beyond the frames it hands
+    // back: its canvas and the frame it decodes, beside the
+    // buffer it copies the canvas into for that frame. The walk
+    // holds one fewer, since its last frame takes its canvas (see
+    // `webp_anim`). The decode is charged the iterator's, which
+    // takes any file the walk declines: two canvases more than
+    // the frames it keeps. A file with no frames allocates no
+    // canvas, and its decode refuses it.
+    let held = u64::from(header.frames)
+        .saturating_add(2)
+        .saturating_mul(canvas)
+        .saturating_mul(4);
+    if header.frames > 0 && held > MAX_DECODE_ALLOC {
+        return Err(EngineError::Decode(format!(
+            "WebP decode of {} frames on a {}x{} canvas would hold {held} bytes, past the \
+             {MAX_DECODE_ALLOC} byte decode allocation limit",
+            header.frames, header.width, header.height
         )));
     }
     Ok(())

@@ -45,7 +45,7 @@ pub use decode::{
 };
 pub(in crate::engine) use decode::{
     check_jxl_dimensions, decode_source_image, detect_format, ensure_jxl_decoder, is_heic, is_jxl,
-    zune_jpeg_options,
+    progressive_coefficient_bytes, zune_jpeg_options,
 };
 mod resize;
 #[cfg(test)]

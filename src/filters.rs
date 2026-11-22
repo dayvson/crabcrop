@@ -1833,6 +1833,37 @@ perm_fn!(rotate180_fast, rot180_px, false, rotate180);
 perm_fn!(fliph_fast, fliph_px, false, fliph);
 perm_fn!(flipv_fast, flipv_px, false, flipv);
 
+/// Mirror `img` left to right where it is: the pixels
+/// [`fliph_fast`] writes, with no second frame. Each row's
+/// pixels are reversed in place, in bands over threads for a
+/// large frame as [`fliph_px`] bands its copy. A layout the
+/// fast permutations do not take keeps the image crate's own
+/// in-place flip, which is exact for every layout.
+pub(crate) fn fliph_in_place(img: &mut DynamicImage) {
+    fn mirror_rows<const CH: usize>(raw: &mut [u8], width: usize) {
+        let px = raw.as_chunks_mut::<CH>().0;
+        let rows = px.len() / width.max(1);
+        let br = perm_band_rows(rows, px.len() * CH);
+        if br >= rows {
+            px.chunks_mut(width.max(1)).for_each(<[[u8; CH]]>::reverse);
+            return;
+        }
+        std::thread::scope(|s| {
+            for band in px.chunks_mut(br * width) {
+                s.spawn(move || band.chunks_mut(width).for_each(<[[u8; CH]]>::reverse));
+            }
+        });
+    }
+    let width = img.width() as usize;
+    match img {
+        DynamicImage::ImageLuma8(i) => mirror_rows::<1>(i, width),
+        DynamicImage::ImageLumaA8(i) => mirror_rows::<2>(i, width),
+        DynamicImage::ImageRgb8(i) => mirror_rows::<3>(i, width),
+        DynamicImage::ImageRgba8(i) => mirror_rows::<4>(i, width),
+        other => other.apply_orientation(image::metadata::Orientation::FlipHorizontal),
+    }
+}
+
 // ---------------- huerotate ----------------
 
 fn hue_matrix(value: i32) -> [f64; 9] {
