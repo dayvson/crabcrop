@@ -387,13 +387,16 @@ pub(in crate::server) async fn serve(
         &negotiated,
     );
     // The key fully determines the lookup: a stored response can
-    // be served without touching the loader or the engine. Meta
-    // requests bypass the cache in both directions: they must
-    // never be answered with image bytes, and their JSON is never
-    // stored as an image entry. Debug requests bypass it too:
-    // the diagnostic must never be served from, or stored into,
-    // any tier (its key differs from the plain URL's anyway, but
-    // the bypass is the rule, not the key's accident).
+    // be served with no fetch and no render, a disk or shared
+    // copy once the checks of the source policy that the source
+    // text decides admit it (issue #780, see `run_flight`), a
+    // memory copy as it is. Meta requests bypass the cache in
+    // both directions: they must never be answered with image
+    // bytes, and their JSON is never stored as an image entry.
+    // Debug requests bypass it too: the diagnostic must never
+    // be served from, or stored into, any tier (its key differs
+    // from the plain URL's anyway, but the bypass is the rule,
+    // not the key's accident).
     let bypass = negotiated.meta || negotiated.debug;
     if !bypass {
         record.cache_looked_up = true;

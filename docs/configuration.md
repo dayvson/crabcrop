@@ -99,6 +99,19 @@ Pinned fetches connect directly and never go through a proxy: a proxy resolves t
 
 Boot prints the request and source posture on one line, for example `request mode: signed; source allowlist: none; private-address check: on`. The mode is `signed`, `unsafe` (`CRABCROP_ALLOW_UNSAFE`), `presets-only` (with `CRABCROP_ONLY_PRESETS` too) or `signed presets-only` (`CRABCROP_ONLY_PRESETS` alone). The allowlist shows its host count, or `none`. The check reads `on` or `off`; with an allowlist set it reads `on, allowlisted hosts exempt` by default, or `on, allowlisted hosts included` with `CRABCROP_CHECK_ALLOWED_SOURCES`. When unsigned URLs are on and no allowlist is set, boot also prints a warning on stderr: in unsafe mode anyone can run any operations on images from any host the loader may fetch, and in presets-only mode anyone can render the presets on them (see [Presets](operations.md#presets)). The server still starts.
 
+### Changing the source policy
+
+A change to the source policy applies to the results the cache tiers already hold. The policy is not part of the configuration fingerprint (see [Caching](responses.md#caching)), so a change starts no new cache epoch. Instead, before the disk tier or the shared bucket answers a request, the server runs the checks that the request's source URL, and each watermark URL it names, decide on their own:
+
+- the host allowlist, `CRABCROP_ALLOWED_SOURCES`;
+- an IP address against the non-public address refusal (`CRABCROP_BLOCK_PRIVATE_SOURCES`, `CRABCROP_ALLOW_ANY_SOURCE` and `CRABCROP_CHECK_ALLOWED_SOURCES`);
+- the bucket allowlist, `CRABCROP_ALLOWED_BUCKETS`, and the bucket naming rules;
+- whether file sources are configured, by `CRABCROP_FILE_ROOT` (or `CRABCROP_UPLOAD_DIR` without it).
+
+Those two tiers may hold results that an earlier process or another replica stored under another policy. Memory holds only results this process stored, or read from those tiers, after its own policy admitted their sources, so a memory hit runs no check. A request the checks refuse reads neither tier: it gets the answer a render of its source gets, `403 source_forbidden`, whatever a tier holds for it. So dropping a host or a bucket from its list, turning `CRABCROP_CHECK_ALLOWED_SOURCES` on, or turning file sources off stops every stored render it covers from serving, on every replica that runs the new policy. The renders themselves stay in the tiers, and serve again if the policy admits their sources again. To remove them, purge them (see [Purge a cached result](endpoints.md#purge-a-cached-result)).
+
+The checks never look a host name up, so a hit costs no lookup. A result stored from a host name that now resolves to a non-public address therefore keeps serving from the tiers until it is purged: only a request that misses resolves the name, and it fails with `502 source_fetch_failed`, as a name that does not resolve does. The same holds for a listed host name that resolves to a non-public address when `CRABCROP_CHECK_ALLOWED_SOURCES` is turned on. Memory and the disk tier drop such a result when they evict it; the shared bucket keeps it until a lifecycle rule expires it (see [the cache tiers](deployment.md#the-cache-tiers-and-what-replicas-change)).
+
 ### AVIF tiles
 
 `CRABCROP_AVIF_TILES` sets how many tiles an AVIF is written in: `1`, `2`, `4`, `8` or `16`, and `4` when it is unset. Any other value stops the boot with an error that names the variable. A frame too small for that many tiles gets fewer: at the default speed and quality a tile takes at least 128x128 pixels, so a 256x256 frame has room for four and an 800x533 one for 26. Below quality 80 a tile takes at least 256x256 pixels, so an 800x533 frame has room for six, and eight or sixteen tiles write the same file as six.

@@ -182,7 +182,12 @@ pub struct AppState {
     /// exposition unauthenticated. Zeroed when the state is
     /// dropped.
     pub metrics_token: Option<zeroize::Zeroizing<String>>,
-    /// Processed-response cache, shared like the metrics.
+    /// Processed-response cache, shared like the metrics. It
+    /// is this server's own: a copy enters it only once this
+    /// server's `loader` policy has admitted the copy's
+    /// sources, so a memory hit runs none of the policy's
+    /// checks (issue #780). A state that loads under another
+    /// policy needs a cache of its own.
     pub cache: Arc<Cache>,
     /// The provider and renderer handles (see
     /// [`Providers`]): one `Arc`, shared with every

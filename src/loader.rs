@@ -1225,6 +1225,38 @@ enum StoreKind {
     Gcs,
 }
 
+/// The kind of source a URL names, by its scheme: what a load
+/// dispatches on, and the checks of its text with it.
+enum SourceKind<'a> {
+    /// An `s3://` or `gs://` URL: the store, the bucket and the
+    /// object key.
+    Object(StoreKind, &'a str, &'a str),
+    /// A `file://` URL.
+    File,
+    /// Anything else, which only an HTTP or HTTPS URL passes.
+    Http,
+}
+
+impl<'a> SourceKind<'a> {
+    /// The kind `url` names. A bucket URL is split into its
+    /// bucket and key here, and refused when it does not split
+    /// into a bucket the naming rules allow and a key.
+    fn of(url: &'a str) -> Result<Self, LoadError> {
+        if let Some(rest) = url.strip_prefix("s3://") {
+            let (bucket, key) = split_bucket_key(rest, "s3")?;
+            return Ok(SourceKind::Object(StoreKind::S3, bucket, key));
+        }
+        if let Some(rest) = url.strip_prefix("gs://") {
+            let (bucket, key) = split_bucket_key(rest, "gs")?;
+            return Ok(SourceKind::Object(StoreKind::Gcs, bucket, key));
+        }
+        if url.starts_with("file://") {
+            return Ok(SourceKind::File);
+        }
+        Ok(SourceKind::Http)
+    }
+}
+
 /// How much of a body a probe load reads at most: enough
 /// for a header probe to identify any source the pipeline
 /// reads, with room to spare for header-rich formats, and
@@ -1525,6 +1557,32 @@ impl Loader {
         }
     }
 
+    /// Run the checks of the source policy that the text of
+    /// `url` decides on its own (issue #780): the ones a load of
+    /// it runs before it touches the network or the filesystem,
+    /// in the same order, through the same functions, so a
+    /// refusal here is the error the load fails with. For an
+    /// HTTP or HTTPS URL, its scheme, credentials in it, the
+    /// host allowlist, and an IP literal against the
+    /// private-address check; for a bucket URL, the bucket
+    /// naming rules, dot segments, and the bucket allowlist; for
+    /// a file URL, whether file sources are configured, its
+    /// host, and a path that would leave the root. No host name
+    /// is resolved: a name the private-address check would
+    /// resolve passes, and only a load refuses one that resolves
+    /// to a non-public address.
+    pub(crate) fn check_source_text(&self, url: &str) -> Result<(), LoadError> {
+        match SourceKind::of(url)? {
+            SourceKind::Object(_, bucket, key) => self.check_object(bucket, key),
+            SourceKind::File => self.check_file_text(url).map(drop),
+            SourceKind::Http => {
+                let first = parse_source(url)?;
+                check_hop_scheme(&first, 0)?;
+                self.check_policy_text(&first).map(drop)
+            }
+        }
+    }
+
     /// Run one load under the loader's total timeout, which
     /// ends at `deadline`.
     async fn load_timed(
@@ -1548,22 +1606,13 @@ impl Loader {
         admission: MediaAdmission,
         mode: BodyMode<'_>,
     ) -> Result<LoadBody, LoadError> {
-        if let Some(rest) = url.strip_prefix("s3://") {
-            let (bucket, key) = split_bucket_key(rest, "s3")?;
-            return self
-                .load_object(StoreKind::S3, bucket, key, admission, mode)
-                .await;
+        match SourceKind::of(url)? {
+            SourceKind::Object(kind, bucket, key) => {
+                self.load_object(kind, bucket, key, admission, mode).await
+            }
+            SourceKind::File => self.load_file(url, mode).await,
+            SourceKind::Http => self.load_http(url, admission, mode).await,
         }
-        if let Some(rest) = url.strip_prefix("gs://") {
-            let (bucket, key) = split_bucket_key(rest, "gs")?;
-            return self
-                .load_object(StoreKind::Gcs, bucket, key, admission, mode)
-                .await;
-        }
-        if url.starts_with("file://") {
-            return self.load_file(url, mode).await;
-        }
-        self.load_http(url, admission, mode).await
     }
 
     async fn load_http(
@@ -1572,8 +1621,7 @@ impl Loader {
         admission: MediaAdmission,
         mode: BodyMode<'_>,
     ) -> Result<LoadBody, LoadError> {
-        let mut parsed =
-            Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
+        let mut parsed = parse_source(url)?;
         // Every lookup this fetch starts of another host, on
         // any redirect hop, counts against the host the caller
         // named (see `LOOKUP_SLOTS_PER_ORIGIN`). A URL with no
@@ -1582,16 +1630,7 @@ impl Loader {
         let origin = parsed.host_str().unwrap_or_default().to_owned();
         let mut hops = 0;
         loop {
-            if parsed.scheme() != "http" && parsed.scheme() != "https" {
-                let cause = format!("unsupported scheme: {}", parsed.scheme());
-                // The first hop is the caller's own text; a
-                // redirect elsewhere is the origin's answer.
-                return Err(if hops == 0 {
-                    LoadError::InvalidSource(cause)
-                } else {
-                    LoadError::Network(cause)
-                });
-            }
+            check_hop_scheme(&parsed, hops)?;
             let pin = self.check_policy(&parsed, &origin).await?;
             let client = match &pin {
                 Some(pin) => self.pinned_client(pin)?,
@@ -1801,16 +1840,10 @@ impl Loader {
         Ok(ProbeLoad { head, total_bytes })
     }
 
-    /// Fetch one object from S3 or GCS, signing with SigV4 when
-    /// credentials are configured for the store.
-    async fn load_object(
-        &self,
-        kind: StoreKind,
-        bucket: &str,
-        key: &str,
-        admission: MediaAdmission,
-        mode: BodyMode<'_>,
-    ) -> Result<LoadBody, LoadError> {
+    /// The checks of a bucket source that its text decides,
+    /// before anything is signed: no dot segment in the bucket
+    /// or the key, and a bucket the allowlist names.
+    fn check_object(&self, bucket: &str, key: &str) -> Result<(), LoadError> {
         // The request URL places the key after the bucket, and
         // URL parsing collapses dot segments, so a key carrying
         // them would move the request outside the allowlisted
@@ -1840,6 +1873,20 @@ impl Loader {
                 "bucket {bucket} is not an allowed source"
             )));
         }
+        Ok(())
+    }
+
+    /// Fetch one object from S3 or GCS, signing with SigV4 when
+    /// credentials are configured for the store.
+    async fn load_object(
+        &self,
+        kind: StoreKind,
+        bucket: &str,
+        key: &str,
+        admission: MediaAdmission,
+        mode: BodyMode<'_>,
+    ) -> Result<LoadBody, LoadError> {
+        self.check_object(bucket, key)?;
         let encoded_key = sigv4::encode_path(key);
         let (url_string, creds, region) = match kind {
             StoreKind::S3 => {
@@ -1936,24 +1983,19 @@ impl Loader {
         self.load_file_checked(url, mode, || {}).await
     }
 
-    /// [`Loader::load_file`], running `after_check` once the
-    /// containment checks have passed and before the file is
-    /// opened: the moment a change to the tree would have to
-    /// land to redirect the open.
-    async fn load_file_checked(
-        &self,
-        url: &str,
-        mode: BodyMode<'_>,
-        after_check: impl FnOnce(),
-    ) -> Result<LoadBody, LoadError> {
-        use tokio::io::AsyncReadExt;
+    /// The checks of a `file://` source that its text decides,
+    /// which [`Loader::load_file`] runs before it touches the
+    /// filesystem: file sources are configured, the URL parses
+    /// and names no host but this one, and its decoded path
+    /// holds no NUL and no component that would leave the root.
+    /// Returns the root and the decoded path.
+    fn check_file_text(&self, url: &str) -> Result<(&PathBuf, String), LoadError> {
         let Some(root) = &self.sources.file_root else {
             return Err(LoadError::Forbidden(
                 "file sources are not configured".to_string(),
             ));
         };
-        let parsed =
-            Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
+        let parsed = parse_source(url)?;
         match parsed.host_str() {
             None | Some("") | Some("localhost") => {}
             Some(host) => {
@@ -1968,10 +2010,25 @@ impl Loader {
                 "invalid file source path".to_string(),
             ));
         }
-        let relative = decoded.trim_start_matches('/');
-        if !file_source_path_stays_in_root(relative) {
+        if !file_source_path_stays_in_root(decoded.trim_start_matches('/')) {
             return Err(LoadError::NotFound);
         }
+        Ok((root, decoded))
+    }
+
+    /// [`Loader::load_file`], running `after_check` once the
+    /// containment checks have passed and before the file is
+    /// opened: the moment a change to the tree would have to
+    /// land to redirect the open.
+    async fn load_file_checked(
+        &self,
+        url: &str,
+        mode: BodyMode<'_>,
+        after_check: impl FnOnce(),
+    ) -> Result<LoadBody, LoadError> {
+        use tokio::io::AsyncReadExt;
+        let (root, decoded) = self.check_file_text(url)?;
+        let relative = decoded.trim_start_matches('/');
         // The path text itself is resolved, not a normal form
         // of it, so a trailing slash still asks for a
         // directory, as the filesystem reads it.
@@ -2142,6 +2199,43 @@ impl Loader {
         url: &Url,
         origin: &str,
     ) -> Result<Option<PinnedResolution>, LoadError> {
+        let Some(host) = self.check_policy_text(url)? else {
+            return Ok(None);
+        };
+        let ips = self.lookups.resolve(host, origin).await?;
+        if let Some(ip) = ips.iter().find(|ip| self.refuses(ip)) {
+            // The same failure as a name that does not
+            // resolve (see `LoadError::Network`); the
+            // address goes to the server log only.
+            return Err(LoadError::Network(format!(
+                "host {host} resolves to a non-public address ({ip})"
+            )));
+        }
+        // Hostnames get pinned to the first validated
+        // address for this connection. A lookup that
+        // returns no address fails like a name that does
+        // not resolve, rather than leaving the connection
+        // to resolve the name again, unchecked.
+        let Some(&first) = ips.first() else {
+            return Err(LoadError::Network(
+                "dns lookup failed: no addresses".to_string(),
+            ));
+        };
+        let port = url
+            .port()
+            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+        Ok(Some(PinnedResolution {
+            host: host.to_string(),
+            addr: std::net::SocketAddr::new(first, port),
+        }))
+    }
+
+    /// The part of [`Loader::check_policy`] that the text of
+    /// `url` decides, with no lookup: credentials in it, its
+    /// host, the allowlist, and an IP literal against the
+    /// private-address check. Returns the host name the check
+    /// still has to resolve, when it applies to a name.
+    fn check_policy_text<'u>(&self, url: &'u Url) -> Result<Option<&'u str>, LoadError> {
         // The loader never presents credentials to an origin
         // (audit L-2): a signed URL must not make the server
         // authenticate anywhere with author-chosen userinfo.
@@ -2170,46 +2264,21 @@ impl Loader {
         // it) applies to every host the operator has not
         // listed, and to listed hosts too only when the
         // operator asks for it.
-        if self.policy.checks(allowlisted) {
-            // IPv6 literals arrive bracketed from the URL parser.
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            if let Ok(ip) = bare.parse::<IpAddr>() {
-                // A literal is judged from the URL text alone,
-                // which tells the caller nothing it did not
-                // send: a policy refusal.
-                if self.refuses(&ip) {
-                    return Err(LoadError::Forbidden(format!(
-                        "host {host} is a non-public address"
-                    )));
-                }
-                return Ok(None);
-            }
-            let ips = self.lookups.resolve(host, origin).await?;
-            if let Some(ip) = ips.iter().find(|ip| self.refuses(ip)) {
-                // The same failure as a name that does not
-                // resolve (see `LoadError::Network`); the
-                // address goes to the server log only.
-                return Err(LoadError::Network(format!(
-                    "host {host} resolves to a non-public address ({ip})"
-                )));
-            }
-            // Hostnames get pinned to the first validated
-            // address for this connection. A lookup that
-            // returns no address fails like a name that does
-            // not resolve, rather than leaving the connection
-            // to resolve the name again, unchecked.
-            let Some(&first) = ips.first() else {
-                return Err(LoadError::Network(
-                    "dns lookup failed: no addresses".to_string(),
-                ));
-            };
-            let port = url
-                .port()
-                .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-            return Ok(Some(PinnedResolution {
-                host: host.to_string(),
-                addr: std::net::SocketAddr::new(first, port),
-            }));
+        if !self.policy.checks(allowlisted) {
+            return Ok(None);
+        }
+        // IPv6 literals arrive bracketed from the URL parser.
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let Ok(ip) = bare.parse::<IpAddr>() else {
+            return Ok(Some(host));
+        };
+        // A literal is judged from the URL text alone, which
+        // tells the caller nothing it did not send: a policy
+        // refusal.
+        if self.refuses(&ip) {
+            return Err(LoadError::Forbidden(format!(
+                "host {host} is a non-public address"
+            )));
         }
         Ok(None)
     }
@@ -2225,6 +2294,28 @@ impl Loader {
         }
         is_non_public(ip)
     }
+}
+
+/// The source URL `url` names, parsed: an invalid source when
+/// its text does not parse.
+fn parse_source(url: &str) -> Result<Url, LoadError> {
+    Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))
+}
+
+/// Refuse a hop of an HTTP or HTTPS fetch whose scheme the
+/// loader does not fetch; `hops` counts the redirects before it.
+fn check_hop_scheme(url: &Url, hops: usize) -> Result<(), LoadError> {
+    if url.scheme() == "http" || url.scheme() == "https" {
+        return Ok(());
+    }
+    let cause = format!("unsupported scheme: {}", url.scheme());
+    // The first hop is the caller's own text; a redirect
+    // elsewhere is the origin's answer.
+    Err(if hops == 0 {
+        LoadError::InvalidSource(cause)
+    } else {
+        LoadError::Network(cause)
+    })
 }
 
 /// Whether `host` equals `suffix` or is a subdomain of it. The dot
@@ -4806,6 +4897,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_text_checks_refuse_what_a_load_refuses_from_the_text_alone() {
+        // Issue #780: a stored result answers only a request
+        // whose sources pass the checks their text decides, so
+        // those checks refuse what a load refuses before it
+        // touches the network or the filesystem, with the error
+        // the load fails with, and they never look a name up.
+        let (base, root) = make_file_tree();
+        let looked_up = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&looked_up);
+        let loader = Loader::with_defaults()
+            .unwrap()
+            .with_policy(
+                SourcePolicy::new(
+                    vec!["listed.test".to_string(), "10.0.0.8".to_string()],
+                    true,
+                )
+                .with_allowlisted_checked(true),
+            )
+            .with_sources(SourceConfig {
+                allowed_buckets: vec!["bkt".to_string()],
+                file_root: Some(root),
+                ..Default::default()
+            })
+            .with_host_lookup(
+                move |host| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    inward_lookup(host)
+                },
+                LOOKUP_SLOTS,
+                LOOKUP_WAIT,
+            );
+        let no_files = Loader::with_defaults().unwrap();
+        for (loader, url) in [
+            (&loader, "http://elsewhere.test/x.png"),
+            (&loader, "http://10.0.0.8/x.png"),
+            (&loader, "http://user:pw@listed.test/x.png"),
+            (&loader, "ftp://listed.test/x.png"),
+            (&loader, "not a url"),
+            (&loader, "s3://other/x.png"),
+            (&loader, "gs://other/x.png"),
+            (&loader, "s3://bkt/a/../x.png"),
+            (&loader, "s3://Not_A_Bucket/x.png"),
+            (&loader, "s3://bkt"),
+            (&loader, "file://remote/pic.jpg"),
+            (&loader, "file:///pic%00.jpg"),
+            (&loader, "file:///sub/..%2fpic.jpg"),
+            (&no_files, "file:///pic.jpg"),
+        ] {
+            let refused = loader.check_source_text(url).unwrap_err();
+            assert_eq!(loader.load(url).await, Err(refused), "{url}");
+        }
+        assert_eq!(looked_up.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // What only a fetch can tell passes: a listed name the
+        // private-address check has to resolve, a listed bucket,
+        // and a path under the root, whether a file is there or
+        // not.
+        for url in [
+            "http://listed.test/x.png",
+            "s3://bkt/x.png",
+            "file:///pic.jpg",
+            "file:///nope.jpg",
+        ] {
+            assert_eq!(loader.check_source_text(url), Ok(()), "{url}");
+        }
+        assert_eq!(looked_up.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The load of the name looks it up, and it does not
+        // resolve.
+        let err = loader.load("http://listed.test/x.png").await.unwrap_err();
+        assert!(matches!(err, LoadError::Network(_)), "{err:?}");
+        assert_eq!(looked_up.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -542,7 +542,7 @@ pub(in crate::server) async fn lookup_tiers(
     cache_key: &str,
     groups: &[String],
 ) -> Option<(CachedImage, &'static str)> {
-    lookup_tiers_within(state, cache_key, groups, &mut DiskBudget::new()).await
+    lookup_tiers_within(state, cache_key, groups, &mut DiskBudget::new(), || true).await
 }
 
 /// A memory hit's group learn (audit R2-15, issues #350,
@@ -628,6 +628,17 @@ pub(in crate::server) fn memory_hit(
 /// before any slower tier, and every way back in is a
 /// promotion through this chain or a guarded write.
 ///
+/// A disk or shared copy may also have been stored by an
+/// earlier process or another replica, under a source policy
+/// that admitted what this server's policy now refuses
+/// (issue #780), so those two tiers are read only when
+/// `slower_tiers_admitted`, which runs once memory has
+/// missed, says the request's sources pass this server's
+/// policy. Memory needs no such check either: it holds only
+/// what this server stored after the policy admitted it, or
+/// promoted through this chain past that check, and the
+/// policy is fixed for the server's life.
+///
 /// The disk tier is waited for within `budget` (issue
 /// #572): a lookup that finds no disk slot, or whose read
 /// does not answer, before the budget runs out goes on to
@@ -641,11 +652,15 @@ pub(in crate::server) async fn lookup_tiers_within(
     cache_key: &str,
     groups: &[String],
     budget: &mut DiskBudget,
+    slower_tiers_admitted: impl FnOnce() -> bool,
 ) -> Option<(CachedImage, &'static str)> {
     let snapshot = state.purge_guard.snapshot();
     if let Some(hit) = state.cache.get(cache_key) {
         memory_hit(state, snapshot, cache_key, groups, &hit);
         return Some((hit, "crabcrop; hit"));
+    }
+    if !slower_tiers_admitted() {
+        return None;
     }
     if let Some(store) = &state.store
         && store.contains(cache_key)
