@@ -15,8 +15,13 @@
 //! by the next store. The byte budget evicts least recently
 //! used entries, with recency tracked in memory and re-seeded
 //! from file times by the boot scan. Each entry is charged its
-//! file and the record the in-memory index keeps for it, so
-//! the budget bounds the index's memory as well as the files.
+//! file in whole blocks of its volume, with an allowance for
+//! its inode (issue #777), and the record the in-memory index
+//! keeps for it, so the budget bounds what the volume holds and
+//! the index's memory. A volume that runs out of room first, as
+//! one of small renders runs out of inodes, lowers the budget
+//! to what the store held, and a boot on a full volume deletes
+//! the oldest entries until it can write.
 //!
 //! The index is the authority on an entry's cache groups
 //! (issue #572). A group learned on a hit goes into the index
@@ -363,18 +368,69 @@ const RECORD_OVERHEAD: usize = 2
 /// write that landed while it ran included.
 const SCAN_STAMPS: u64 = 1 << 62;
 
+/// What an entry's file costs its volume besides its blocks
+/// (issue #777): an inode, 256 bytes on ext4 and 512 on XFS,
+/// and the directory entry that names it.
+const FILE_OVERHEAD: usize = 512;
+
+/// The block size entries are charged in when the volume's own
+/// is not known (issue #777): 4 KiB, ext4's and XFS's.
+const FALLBACK_BLOCK: usize = 4096;
+
+/// The largest block size taken from the volume (issue #777).
+/// Local filesystems give files blocks of 64 KiB at most. NFS
+/// reports its transfer size instead, often 1 MiB, which no
+/// file takes on the server, so a larger size counts as
+/// [`FALLBACK_BLOCK`].
+const MAX_BLOCK: usize = 64 * 1024;
+
+/// The size of the blocks the volume that holds `dir` gives its
+/// files (issue #777): its `statvfs` fragment size, or
+/// [`FALLBACK_BLOCK`] when that is unknown or not a local
+/// filesystem's.
+#[cfg(unix)]
+fn volume_block(dir: &Path) -> usize {
+    rustix::fs::statvfs(dir)
+        .ok()
+        .and_then(|volume| usize::try_from(volume.f_frsize).ok())
+        .filter(|block| (1..=MAX_BLOCK).contains(block))
+        .unwrap_or(FALLBACK_BLOCK)
+}
+
+#[cfg(not(unix))]
+fn volume_block(_dir: &Path) -> usize {
+    FALLBACK_BLOCK
+}
+
 /// What one entry is charged against the store's budget: its
-/// file of `file_bytes`, plus the record the index keeps for
-/// it in memory (the key twice, as it keys both maps, the file
-/// stem, and each group name). Charging the file alone let
-/// entries with tiny bodies under long keys hold about twice
-/// the budget in index memory.
-fn entry_charge(key: &str, file_bytes: usize, groups: &[String]) -> usize {
+/// file of `file_bytes` in whole blocks of `block` bytes, and
+/// [`FILE_OVERHEAD`], which is what the volume gives it (issue
+/// #777), plus the record the index keeps for it in memory (the
+/// key twice, as it keys both maps, the file stem, and each
+/// group name). Charging the file alone let entries with tiny
+/// bodies under long keys hold about twice the budget in index
+/// memory, and charging its length let a store of small renders
+/// take several times the budget in blocks.
+fn entry_charge(key: &str, file_bytes: usize, groups: &[String], block: usize) -> usize {
     let groups: usize = groups
         .iter()
         .map(|group| group.len() + size_of::<String>() + ALLOCATION_OVERHEAD)
         .sum();
-    file_bytes + 2 * key.len() + STEM_LEN + groups + RECORD_OVERHEAD
+    file_bytes.next_multiple_of(block)
+        + FILE_OVERHEAD
+        + 2 * key.len()
+        + STEM_LEN
+        + groups
+        + RECORD_OVERHEAD
+}
+
+/// Whether a write failed for want of room on the volume, or
+/// under its quota (issue #777): `ENOSPC` or `EDQUOT`.
+fn no_room(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
 }
 
 #[derive(Debug, Default)]
@@ -404,6 +460,15 @@ struct Inner {
     clock: u64,
     /// The sum of the indexed entries' charges.
     total_bytes: usize,
+    /// What `total_bytes` is held to: the store's budget, until
+    /// a write finds the volume full (issue #777), which lowers
+    /// it for as long as the process runs (see
+    /// [`DiskStore::make_room`]).
+    budget: usize,
+    /// The block size of the directory's volume, read once when
+    /// the directory is checked (issue #777): every entry's file
+    /// is charged in whole blocks of it.
+    block: usize,
     /// Waits on one purge's deletions, by the first sequence
     /// number of its range: the range's end and the wait's
     /// count. Purge ranges never overlap.
@@ -625,13 +690,15 @@ struct DeletionCount {
 }
 
 impl Inner {
-    fn new() -> Self {
+    fn new(budget: usize) -> Self {
         Inner {
             deletions: KeyQueue {
                 track_ended: true,
                 ..KeyQueue::default()
             },
             clock: SCAN_STAMPS,
+            budget,
+            block: FALLBACK_BLOCK,
             scan: Some(ScanState::default()),
             ..Inner::default()
         }
@@ -702,6 +769,10 @@ pub struct DiskStore {
     last_job_done_ms: AtomicU64,
     /// Rate-limits the log lines for disk waits that ran out.
     stall_log: StallLog,
+    /// Rate-limits the log lines for entry writes that failed
+    /// (issue #777): a disk that refuses writes refuses every
+    /// one, and each printed a line.
+    write_log: StallLog,
     /// Rate-limits the log lines for background jobs that
     /// failed: a disk that refuses them fails each one again
     /// at every retry.
@@ -743,7 +814,9 @@ pub(crate) const SCAN_THREAD: &str = "crabcrop-disk-scan";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanPhase {
     /// Creating, probing and opening the directory. Nothing is
-    /// read or written yet.
+    /// written yet, and nothing is read unless the volume has no
+    /// room for the probe file (issue #777): the scan then reads
+    /// the entry files and deletes the oldest until it has.
     Checking,
     /// Reading the entry files. Writes land meanwhile.
     Scanning,
@@ -769,8 +842,9 @@ pub struct ScanReport {
     /// What those entries are charged against the budget.
     pub bytes: usize,
     /// The entry files it deleted: ones that do not verify,
-    /// cannot be entries, or no longer fit the budget, and
-    /// stale copies of keys written since the boot.
+    /// cannot be entries, or no longer fit the budget, stale
+    /// copies of keys written since the boot, and the oldest on a
+    /// volume that had no room for the probe file (issue #777).
     pub deleted: u64,
     /// The entry files it could not delete. Each also counts
     /// in the tier's errors and in
@@ -1068,16 +1142,20 @@ const PROBE_NAME: &str = ".crabcrop-write-probe";
 /// instead of being discovered per request, silently, on
 /// every put. The scratch name never matches the entry
 /// scan's stem pattern and is removed on success anyway.
-fn probe_writable(dir: &Path) -> Result<(), String> {
+fn probe_writable(dir: &Path) -> std::io::Result<()> {
     let probe = dir.join(PROBE_NAME);
-    std::fs::write(&probe, b"").map_err(|e| {
-        format!(
-            "the result storage directory {} is not writable: {e}",
-            dir.display()
-        )
-    })?;
+    std::fs::write(&probe, b"")?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
+}
+
+/// The check's message for a directory the probe could not
+/// write to.
+fn not_writable(dir: &Path, e: &std::io::Error) -> String {
+    format!(
+        "the result storage directory {} is not writable: {e}",
+        dir.display()
+    )
 }
 
 impl DiskStore {
@@ -1090,9 +1168,14 @@ impl DiskStore {
     /// instead, which does this on a thread of its own.
     pub fn open(dir: &Path, max_bytes: usize, entry_key: Vec<u8>) -> Result<Self, String> {
         let store = Self::unscanned(dir, max_bytes, entry_key);
-        let read = store.check_dir()?;
-        store.scan(read);
-        Ok(store)
+        let (read, full) = store.check_dir()?;
+        store.scan(read, full);
+        // A volume with no room for the probe file is checked
+        // again once the scan has made room (issue #777).
+        match store.scan_report().phase {
+            ScanPhase::Failed(e) => Err(e),
+            _ => Ok(store),
+        }
     }
 
     /// Start the store rooted at `dir` (issue #708): it is
@@ -1118,13 +1201,14 @@ impl DiskStore {
             dir: dir.to_path_buf(),
             max_bytes,
             entry_key: zeroize::Zeroizing::new(entry_key),
-            inner: Mutex::new(Inner::new()),
+            inner: Mutex::new(Inner::new(max_bytes)),
             errors: std::sync::atomic::AtomicU64::new(0),
             permits: Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
             drain_wake: tokio::sync::Notify::new(),
             progress: tokio::sync::watch::Sender::new(0),
             last_job_done_ms: AtomicU64::new(0),
             stall_log: StallLog::new("disk waits ran out"),
+            write_log: StallLog::new("cache entry writes failed"),
             job_log: StallLog::new("background disk jobs failed"),
             boot: BootScan {
                 started: std::time::Instant::now(),
@@ -1156,8 +1240,8 @@ impl DiskStore {
             .spawn(move || {
                 let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
                 match store.check_dir() {
-                    Ok(read) => {
-                        store.scan(read);
+                    Ok((read, full)) => {
+                        store.scan(read, full);
                         store.kick();
                     }
                     Err(e) => store.end_scan(ScanPhase::Failed(e)),
@@ -1171,26 +1255,42 @@ impl DiskStore {
     }
 
     /// Create, probe and open the directory, with the messages
-    /// a boot that fails on them gives. Once it answers, writes
-    /// may land.
-    fn check_dir(&self) -> Result<std::fs::ReadDir, String> {
+    /// a boot that fails on them gives, and read its volume's
+    /// block size. Once it answers, writes may land. A volume
+    /// with no room for the probe file (issue #777), out of
+    /// inodes or blocks or over its quota, has not answered yet:
+    /// `true` says so, and the scan makes room before it does
+    /// (see [`DiskStore::make_room_to_probe`]). A read-only or
+    /// otherwise unwritable directory fails at once.
+    fn check_dir(&self) -> Result<(std::fs::ReadDir, bool), String> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| format!("cannot create the result storage directory: {e}"))?;
-        self.held(OpKind::Write, &self.dir.join(PROBE_NAME))
-            .map_err(|e| {
-                format!(
-                    "the result storage directory {} is not writable: {e}",
-                    self.dir.display()
-                )
-            })?;
-        probe_writable(&self.dir)?;
+        let full = match self.probe() {
+            Ok(()) => false,
+            Err(e) if no_room(&e) => true,
+            Err(e) => return Err(not_writable(&self.dir, &e)),
+        };
         let read = std::fs::read_dir(&self.dir)
             .map_err(|e| format!("cannot read the result storage directory: {e}"))?;
-        if let Some(scan) = self.inner.lock().unwrap().scan.as_mut() {
-            scan.checked = true;
+        let block = volume_block(&self.dir);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.block = block;
+            if let Some(scan) = inner.scan.as_mut() {
+                scan.checked = !full;
+            }
         }
-        self.set_phase(ScanPhase::Scanning);
-        Ok(read)
+        if !full {
+            self.set_phase(ScanPhase::Scanning);
+        }
+        Ok((read, full))
+    }
+
+    /// The boot's writability probe (see [`probe_writable`]),
+    /// with the hook a write runs.
+    fn probe(&self) -> std::io::Result<()> {
+        self.held(OpKind::Write, &self.dir.join(PROBE_NAME))?;
+        probe_writable(&self.dir)
     }
 
     /// When the boot stops waiting for the directory check and
@@ -1295,22 +1395,74 @@ impl DiskStore {
 
     /// Count and log one write failure. The store stays
     /// best-effort (the write is dropped, the pipeline
-    /// continues), but never silently (issue #367).
-    fn note_error(&self, what: &str, e: &std::io::Error) {
+    /// continues), but never silently (issue #367). The log has
+    /// the first failure at once, then at most one line every
+    /// 10 seconds with a count (issue #777).
+    fn note_error(&self, what: &str) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        stderr_line!("result storage: {what}: {e}");
+        if let Some(line) = self.write_log.note(monotonic_ms(), what) {
+            stderr_line!("{line}");
+        }
     }
 
     /// Count and log one failed run of a background job. It
     /// is retried; the log has the first failure at once, then
     /// at most one line every 10 seconds with a count.
-    fn note_job_error(&self, what: &str, e: &std::io::Error) {
+    fn note_job_error(&self, what: &str) {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(line) = self.job_log.note(monotonic_ms(), &format!("{what}: {e}")) {
+        if let Some(line) = self.job_log.note(monotonic_ms(), what) {
             stderr_line!("{line}");
         }
+    }
+
+    /// What to log for the write of an entry charged `charge`
+    /// that failed with `e`, `what` saying which write it was.
+    /// One that found no room on the volume makes room first
+    /// (see [`DiskStore::make_room`]), and the line says what the
+    /// budget is now.
+    fn write_failed(&self, what: &str, e: &std::io::Error, charge: usize) -> String {
+        match no_room(e).then(|| self.make_room(charge)).flatten() {
+            Some(budget) => format!(
+                "{what}: {e}; the volume is full, so the budget is {budget} bytes until the next start"
+            ),
+            None => format!("{what}: {e}"),
+        }
+    }
+
+    /// Make room after a write of an entry charged `charge` found
+    /// no room on the volume (issue #777): the volume ran out of
+    /// blocks or inodes, or the quota it is under did, before the
+    /// budget filled, as a volume of small renders runs out of
+    /// inodes. The tier is full, then, whatever its budget says.
+    /// The budget drops to what the store held, less that charge,
+    /// since a write takes its room before it evicts, and stays
+    /// there for as long as the process runs. The least recently
+    /// used entries go until the rest fit it, so the next write
+    /// lands. A store that holds less than that charge cannot
+    /// make the room: the volume is full of something else, and
+    /// the budget stays, so the writes land again once it has
+    /// room. While the boot scan runs, the files it has not
+    /// indexed are not charged, so what the store holds says
+    /// nothing of the volume: the budget stays too, and the scan
+    /// trims what it indexes to it. Returns the budget it
+    /// lowered.
+    fn make_room(&self, charge: usize) -> Option<usize> {
+        let (budget, evicted) = {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            if inner.scan.is_some() || inner.total_bytes < charge {
+                return None;
+            }
+            inner.budget = inner.budget.min(inner.total_bytes - charge);
+            (inner.budget, evict_oldest(inner, 0))
+        };
+        for (key, stem) in evicted {
+            let _claim = FileClaim::inline(self, &key);
+            self.unlink(&self.file_for(&stem));
+        }
+        Some(budget)
     }
 
     /// Count and log a blocking task that died before it
@@ -1424,7 +1576,12 @@ impl DiskStore {
     /// key's claim, like every other deletion, and one it
     /// deletes by name only once no write can rename into it,
     /// so neither removes a file a write put in place.
-    fn scan(&self, read: std::fs::ReadDir) {
+    ///
+    /// On a volume that had no room for the probe file, `full`
+    /// (issue #777), the directory has not answered: nothing is
+    /// written while it reads, and before it indexes it deletes
+    /// the oldest entries until the probe finds room.
+    fn scan(&self, read: std::fs::ReadDir, full: bool) {
         let mut found: Vec<Scanned> = Vec::new();
         let mut overcharged: Vec<(String, String, Vec<String>)> = Vec::new();
         // A zero budget disables the store (reads and writes
@@ -1435,6 +1592,7 @@ impl DiskStore {
         } else {
             self.max_bytes
         };
+        let block = self.inner.lock().unwrap().block;
         for entry in read.flatten() {
             if self.boot.stop.load(Ordering::Relaxed) {
                 return self.end_scan(ScanPhase::Stopped);
@@ -1495,13 +1653,13 @@ impl DiskStore {
                     file_bytes,
                     mtime,
                 } => {
-                    let charge = entry_charge(&key, file_bytes, &groups);
+                    let charge = entry_charge(&key, file_bytes, &groups, block);
                     // `put` never stores an entry charged more
                     // than the whole budget. One here was
                     // stored under a larger budget or by a
-                    // build that charged the file alone, and
-                    // keeping it would leave no room for any
-                    // other entry.
+                    // build that charged the file alone, or its
+                    // length and not its blocks, and keeping it
+                    // would leave no room for any other entry.
                     if self.max_bytes > 0 && charge > self.max_bytes {
                         overcharged.push((key, stem, groups));
                         continue;
@@ -1519,6 +1677,9 @@ impl DiskStore {
             }
         }
         found.sort_by_key(|scanned| scanned.mtime);
+        if full && let Err(ended) = self.make_room_to_probe(&mut found, &mut overcharged) {
+            return self.end_scan(ended);
+        }
         let Some((unlink, entries, bytes)) = self.index_scanned(found, overcharged) else {
             return self.end_scan(ScanPhase::Stopped);
         };
@@ -1535,6 +1696,62 @@ impl DiskStore {
         );
         drop(state);
         self.boot.changed.notify_all();
+    }
+
+    /// Make room for the boot's probe file on a volume that had
+    /// none (issue #777), before the scan indexes what it found:
+    /// delete the files it found, those charged more than the
+    /// whole budget first, as they go anyway, then the oldest
+    /// entries, one at a time, until the probe finds room. Then
+    /// the directory has answered, and writes may land. Nothing
+    /// is written meanwhile, so each file goes under its key's
+    /// claim with no write to wait for. A volume still full once
+    /// none is left is full of something else: the check fails
+    /// with the probe's error, as for a directory the process may
+    /// not write, and so does a probe that fails another way.
+    /// `Err` holds how the scan ends instead.
+    fn make_room_to_probe(
+        &self,
+        found: &mut Vec<Scanned>,
+        overcharged: &mut Vec<(String, String, Vec<String>)>,
+    ) -> Result<(), ScanPhase> {
+        let mut oldest = 0;
+        loop {
+            let e = match self.probe() {
+                Ok(()) => break,
+                Err(e) if no_room(&e) => e,
+                Err(e) => return Err(ScanPhase::Failed(not_writable(&self.dir, &e))),
+            };
+            if self.boot.stop.load(Ordering::Relaxed) {
+                return Err(ScanPhase::Stopped);
+            }
+            let (key, stem, groups) = match (overcharged.pop(), found.get(oldest)) {
+                (Some(file), _) => file,
+                (None, Some(scanned)) => {
+                    oldest += 1;
+                    (
+                        scanned.key.clone(),
+                        scanned.stem.clone(),
+                        scanned.groups.clone(),
+                    )
+                }
+                (None, None) => return Err(ScanPhase::Failed(not_writable(&self.dir, &e))),
+            };
+            let claimed = claim_or_queue(&mut self.inner.lock().unwrap(), &key, &stem, &groups);
+            if let Some(stem) = claimed {
+                let _claim = FileClaim::inline(self, &key);
+                self.scan_unlink(
+                    &self.file_for(&stem),
+                    "the volume had no room for the probe file",
+                );
+            }
+        }
+        found.drain(..oldest);
+        if let Some(scan) = self.inner.lock().unwrap().scan.as_mut() {
+            scan.checked = true;
+        }
+        self.set_phase(ScanPhase::Scanning);
+        Ok(())
     }
 
     /// The scan's one step under the index lock (issue #708):
@@ -1599,15 +1816,16 @@ impl DiskStore {
             }
         }
         // A directory filled under a larger budget, or by a
-        // build that charged each entry its file alone, can
-        // hold more than the budget. The oldest entries are
-        // the ones `put` would evict first: delete them until
-        // the rest fit beside what was written since the store
-        // started, in one pass over the sorted list.
+        // build that charged each entry its file alone, or its
+        // length and not its blocks (issue #777), can hold more
+        // than the budget. The oldest entries are the ones
+        // `put` would evict first: delete them until the rest
+        // fit beside what was written since the store started,
+        // in one pass over the sorted list.
         let mut total: usize = kept.iter().map(|scanned| scanned.charge).sum();
         let mut over = 0;
         if self.max_bytes > 0 {
-            while inner.total_bytes + total > self.max_bytes && over < kept.len() {
+            while inner.total_bytes + total > inner.budget && over < kept.len() {
                 total -= kept[over].charge;
                 over += 1;
             }
@@ -2004,21 +2222,26 @@ impl DiskStore {
     /// claim on. The claim goes on every path.
     fn land_claimed(&self, key: &str, image: &CachedImage) -> Option<Landed> {
         let release = ReleaseWrite { store: self, key };
-        let entry = {
+        let (entry, block, budget) = {
             let inner = self.inner.lock().unwrap();
             match inner.claims.get(key) {
                 Some(Claim::Write {
                     groups,
                     doomed: false,
-                }) if self.max_bytes != 0 => CachedImage {
-                    groups: with_groups(&image.groups, groups),
-                    ..image.clone()
-                },
+                }) if self.max_bytes != 0 => (
+                    CachedImage {
+                        groups: with_groups(&image.groups, groups),
+                        ..image.clone()
+                    },
+                    inner.block,
+                    inner.budget,
+                ),
                 _ => return None,
             }
         };
         let data = serialize_entry(key, &entry, &self.entry_key);
-        if entry_charge(key, data.len(), &entry.groups) > self.max_bytes {
+        let charge = entry_charge(key, data.len(), &entry.groups, block);
+        if charge > budget {
             return None;
         }
         let stem = key_stem(key);
@@ -2027,49 +2250,48 @@ impl DiskStore {
             .held(OpKind::Write, &tmp)
             .and_then(|()| std::fs::write(&tmp, &data))
         {
-            self.note_error("cannot write a cache entry", &e);
             let _ = std::fs::remove_file(&tmp);
+            self.note_error(&self.write_failed("cannot write a cache entry", &e, charge));
             return None;
         }
         if let Err(e) = std::fs::rename(&tmp, self.file_for(&stem)) {
-            self.note_error("cannot move a cache entry into place", &e);
             let _ = std::fs::remove_file(&tmp);
+            let what = "cannot move a cache entry into place";
+            self.note_error(&self.write_failed(what, &e, charge));
             return None;
         }
         std::mem::forget(release);
-        let mut evicted: Vec<(String, String)> = Vec::new();
-        let landed = {
+        let (landed, evicted) = {
             let mut guard = self.inner.lock().unwrap();
             let inner = &mut *guard;
-            match inner.claims.remove(key) {
+            let claim = inner.claims.remove(key);
+            let groups = match claim {
                 Some(Claim::Write {
                     groups,
                     doomed: false,
-                }) => {
+                }) => Some(with_groups(&entry.groups, &groups)),
+                _ => None,
+            };
+            // The budget can have dropped since the charge was
+            // checked, when a write found the volume full (issue
+            // #777): an entry it no longer fits goes like a
+            // doomed one.
+            let charge = groups
+                .as_ref()
+                .map(|groups| entry_charge(key, data.len(), groups, inner.block))
+                .filter(|charge| *charge <= inner.budget);
+            match (groups, charge) {
+                (Some(groups), Some(charge)) => {
                     // The rename replaced the file a queued
                     // deletion was for.
                     if inner.deletions.remove(key) {
                         inner.wake_deletion_waits();
                         self.progress.send_modify(|n| *n += 1);
                     }
-                    let groups = with_groups(&entry.groups, &groups);
                     if groups.len() > entry.groups.len() {
                         inner.rewrites.push(key, &stem, &mut inner.next_seq);
                     }
-                    let charge = entry_charge(key, data.len(), &groups);
-                    // The least recently used entry is the first
-                    // in the order (issue #708).
-                    while inner.total_bytes + charge > self.max_bytes {
-                        let Some((_, oldest)) = inner.order.pop_first() else {
-                            break;
-                        };
-                        if let Some(record) = evict_entry(inner, &oldest)
-                            && let Some(stem) =
-                                claim_or_queue(inner, &oldest, &record.stem, &record.groups)
-                        {
-                            evicted.push((oldest, stem));
-                        }
-                    }
+                    let evicted = evict_oldest(inner, charge);
                     inner.next_id += 1;
                     let id = inner.next_id;
                     inner.total_bytes += charge;
@@ -2089,16 +2311,16 @@ impl DiskStore {
                             stamp,
                         },
                     );
-                    Some(Landed { id, groups })
+                    (Some(Landed { id, groups }), evicted)
                 }
                 _ => {
-                    // Doomed: the file just written goes again,
-                    // under the key's claim. The deletion the
-                    // purge queued for it stays, so a failed
-                    // unlink here is retried, and the purge's
-                    // waits hold until the file is gone.
+                    // Doomed, or past the budget: the file just
+                    // written goes again, under the key's claim.
+                    // The deletion a purge queued for it stays, so
+                    // a failed unlink here is retried, and the
+                    // purge's waits hold until the file is gone.
                     inner.claims.insert(key.to_string(), Claim::File);
-                    None
+                    (None, Vec::new())
                 }
             }
         };
@@ -2430,7 +2652,7 @@ impl DiskStore {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         // The claim's drop queues it again.
-                        self.note_job_error("cannot delete a purged cache entry", &e);
+                        self.note_job_error(&format!("cannot delete a purged cache entry: {e}"));
                         return;
                     }
                 }
@@ -2454,7 +2676,7 @@ impl DiskStore {
         let parsed = match self.held(OpKind::Read, path) {
             Ok(()) => data.and_then(|data| parse_entry(&data, &self.entry_key)),
             Err(e) => {
-                self.note_job_error("cannot read a cache entry to add its groups", &e);
+                self.note_job_error(&format!("cannot read a cache entry to add its groups: {e}"));
                 return false;
             }
         };
@@ -2464,10 +2686,10 @@ impl DiskStore {
             self.drop_copy(key, id, path);
             return true;
         };
-        let groups = {
+        let (groups, block, budget) = {
             let mut inner = self.inner.lock().unwrap();
             match inner.entries.get(key).filter(|record| record.id == id) {
-                Some(record) => record.groups.clone(),
+                Some(record) => (record.groups.clone(), inner.block, inner.budget),
                 None => {
                     inner.rewrites.finish(key, false);
                     return true;
@@ -2480,7 +2702,8 @@ impl DiskStore {
         }
         image.groups = with_groups(&image.groups, &groups);
         let data = serialize_entry(key, &image, &self.entry_key);
-        if entry_charge(key, data.len(), &image.groups) > self.max_bytes {
+        let charge = entry_charge(key, data.len(), &image.groups, block);
+        if charge > budget {
             self.drop_copy(key, id, path);
             return true;
         }
@@ -2490,8 +2713,9 @@ impl DiskStore {
             .and_then(|()| std::fs::write(&tmp, &data))
             .and_then(|()| std::fs::rename(&tmp, path))
         {
-            self.note_job_error("cannot add cache groups to a cache entry", &e);
             let _ = std::fs::remove_file(&tmp);
+            let what = "cannot add cache groups to a cache entry";
+            self.note_job_error(&self.write_failed(what, &e, charge));
             return false;
         }
         let mut guard = self.inner.lock().unwrap();
@@ -2499,7 +2723,7 @@ impl DiskStore {
         match inner.entries.get_mut(key).filter(|record| record.id == id) {
             Some(record) => {
                 record.file_bytes = data.len();
-                let charge = entry_charge(key, record.file_bytes, &record.groups);
+                let charge = entry_charge(key, record.file_bytes, &record.groups, inner.block);
                 inner.total_bytes = inner.total_bytes - record.charge + charge;
                 record.charge = charge;
                 let again = record.groups.iter().any(|g| !image.groups.contains(g));
@@ -2783,6 +3007,26 @@ fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     Some(record)
 }
 
+/// Evict the least recently used entries, the first in the
+/// order (issue #708), until `room` more bytes fit the budget,
+/// and return the key of each whose file the caller deletes
+/// under the claim taken for it, with its stem. Another's
+/// deletion is queued (see [`claim_or_queue`]).
+fn evict_oldest(inner: &mut Inner, room: usize) -> Vec<(String, String)> {
+    let mut evicted = Vec::new();
+    while inner.total_bytes + room > inner.budget {
+        let Some((_, oldest)) = inner.order.pop_first() else {
+            break;
+        };
+        if let Some(record) = evict_entry(inner, &oldest)
+            && let Some(stem) = claim_or_queue(inner, &oldest, &record.stem, &record.groups)
+        {
+            evicted.push((oldest, stem));
+        }
+    }
+    evicted
+}
+
 /// Claim the file at `stem` of a copy of `key` in `groups`,
 /// just evicted or never indexed, for an inline delete and
 /// return its stem, or, when another job holds it, queue the
@@ -2903,7 +3147,7 @@ fn learn_locked(inner: &mut Inner, key: &str, groups: &[String], bucket: Bucket<
         let grew = merged.len() > record.groups.len();
         if grew {
             record.groups = merged;
-            let charge = entry_charge(key, record.file_bytes, &record.groups);
+            let charge = entry_charge(key, record.file_bytes, &record.groups, inner.block);
             inner.total_bytes = inner.total_bytes - record.charge + charge;
             record.charge = charge;
             if matches!(bucket, Bucket::Skipped) {
@@ -3946,7 +4190,10 @@ mod tests {
             "the probe cleans up after itself"
         );
         let err = probe_writable(Path::new("/proc/self")).unwrap_err();
-        assert!(err.contains("not writable"), "probe error: {err}");
+        assert!(!no_room(&err), "probe error: {err}");
+        let err =
+            DiskStore::open(Path::new("/proc/self"), 1_000_000, test_entry_key()).unwrap_err();
+        assert!(err.contains("not writable"), "open error: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3965,6 +4212,12 @@ mod tests {
     /// The entry MAC key the test stores run under.
     fn test_entry_key() -> Vec<u8> {
         crate::url::entry_key(b"storage-test-secret")
+    }
+
+    /// What a store in `dir` charges an entry of `key` with no
+    /// groups whose file is `file` bytes long (issue #777).
+    fn charge_in(dir: &Path, key: &str, file: usize) -> usize {
+        entry_charge(key, file, &[], volume_block(dir))
     }
 
     fn image(bytes: &[u8]) -> CachedImage {
@@ -4268,7 +4521,7 @@ mod tests {
         let dir = temp_dir("evict");
         let payload = vec![7u8; 100];
         let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
-        let one = entry_charge("a", file, &[]);
+        let one = charge_in(&dir, "a", file);
         let budget = 2 * one + one / 2;
         let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
         store.put("a", &image(&payload));
@@ -4295,7 +4548,7 @@ mod tests {
         let dir = temp_dir("unlink-fails");
         let payload = vec![7u8; 100];
         let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
-        let one = entry_charge("a", file, &[]);
+        let one = charge_in(&dir, "a", file);
         let store = DiskStore::open(&dir, 2 * one + one / 2, test_entry_key()).unwrap();
         store.put("a", &image(&payload));
         store.put("b", &image(&payload));
@@ -4352,13 +4605,16 @@ mod tests {
     #[test]
     fn an_entry_whose_index_record_does_not_fit_the_budget_is_not_stored() {
         // The file fits the budget; the file and the index
-        // record the store keeps for it in memory do not.
+        // record the store keeps for it in memory do not. The
+        // budget also holds a small entry, which takes a block
+        // (issue #777).
         let dir = temp_dir("record-too-big");
         let key = "k".repeat(4096);
         let payload = [7u8; 70];
         let file = serialize_entry(&key, &image(&payload), &test_entry_key()).len();
-        let charge = entry_charge(&key, file, &[]);
-        let budget = file + 100;
+        let charge = charge_in(&dir, &key, file);
+        let small = serialize_entry("small", &image(b"1"), &test_entry_key()).len();
+        let budget = file.max(charge_in(&dir, "small", small)) + 100;
         assert!(charge > budget);
         let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
         store.put("small", &image(b"1"));
@@ -4385,9 +4641,12 @@ mod tests {
             .map(|i| format!("{i:02}/{}", "k".repeat(500)))
             .collect();
         let payload = [7u8; 100];
+        let file = serialize_entry(&keys[0], &image(&payload), &test_entry_key()).len();
+        let one = charge_in(&dir, &keys[0], file);
+        let budget = 3 * one + one / 2;
         // Charged more than the reopened budget on its own,
-        // though its file fits it.
-        let huge = "h".repeat(4096);
+        // though its file fits it: the index holds its key twice.
+        let huge = "h".repeat(budget / 2);
         {
             let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
             for key in &keys {
@@ -4408,11 +4667,8 @@ mod tests {
                 .set_modified(when)
                 .unwrap();
         }
-        let file = serialize_entry(&keys[0], &image(&payload), &test_entry_key()).len();
-        let one = entry_charge(&keys[0], file, &[]);
-        let budget = 3 * one + one / 2;
         let huge_file = serialize_entry(&huge, &image(&payload), &test_entry_key()).len();
-        assert!(huge_file <= budget && entry_charge(&huge, huge_file, &[]) > budget);
+        assert!(huge_file <= budget && charge_in(&dir, &huge, huge_file) > budget);
         let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
         let (entries, total) = store.stats();
         assert!(
@@ -4433,6 +4689,341 @@ mod tests {
         assert!(store.get(&huge).is_none());
         assert!(!dir.join(format!("{}.bin", key_stem(&huge))).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A test hook that answers writes as a volume with room for
+    /// `files` files does (issue #777): once the directory holds
+    /// that many, a new file, an entry's temporary file or the
+    /// boot's probe file, fails with `errno`.
+    #[cfg(unix)]
+    fn volume_of(dir: &Path, files: usize, errno: rustix::io::Errno) -> TestHold {
+        let dir = dir.to_path_buf();
+        Arc::new(move |kind, _| {
+            let held = std::fs::read_dir(&dir).map_or(0, Iterator::count);
+            if kind == OpKind::Write && held >= files {
+                return Err(std::io::Error::from_raw_os_error(errno.raw_os_error()));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_of_entries_smaller_than_a_block_is_charged_at_least_the_blocks_they_take() {
+        // Issue #777: each entry was charged its file's length
+        // and its index record, but the volume gives every file
+        // an inode and at least one block, so a store of small
+        // renders took several times its budget on disk: 1,168
+        // entries under a 1 MiB budget held 358,576 bytes in
+        // 4,832 KiB of blocks. Each file is now charged in whole
+        // blocks of its volume, with an allowance for its inode
+        // and its directory entry.
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = temp_dir("block-charge");
+        let budget = 1024 * 1024;
+        let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+        for i in 0..2_000 {
+            let key = format!("1x1/filters:format(png)/http://127.0.0.1/tiny/{i}.png");
+            store.put(&key, &image(&[7u8; 72]));
+        }
+        let (entries, charged) = store.stats();
+        assert!(charged <= budget, "{charged}");
+        let block = rustix::fs::statvfs(dir.path()).unwrap().f_frsize as usize;
+        let files: Vec<std::fs::Metadata> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap())
+            .collect();
+        assert_eq!(files.len(), entries);
+        assert!(files.iter().all(|file| file.len() < block as u64));
+        let whole: usize = files
+            .iter()
+            .map(|file| (file.len() as usize).next_multiple_of(block))
+            .sum();
+        let allocated: usize = files.iter().map(|file| file.blocks() as usize * 512).sum();
+        // An ext4 inode is 256 bytes.
+        let inodes = entries * 256;
+        assert!(
+            charged >= whole.max(allocated) + inodes,
+            "{entries} entries charged {charged} bytes take {allocated} bytes of blocks ({whole} in whole blocks of {block}) and {entries} inodes"
+        );
+        // A reopened store charges what it finds the same.
+        drop(store);
+        let reopened = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
+        assert_eq!(reopened.stats(), (entries, charged));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_finds_the_volume_full_evicts_and_the_next_write_lands() {
+        // Issue #777: a volume can run out of inodes or blocks
+        // before the budget fills. Every later write then failed
+        // with ENOSPC and nothing was evicted, since the budget
+        // was not full, so the tier stored nothing new. A write
+        // that finds the volume full now evicts the oldest
+        // entries and lowers the budget to what the tier held, so
+        // the next write lands, and so do the ones after it. A
+        // quota that runs out (EDQUOT) is the same.
+        use rustix::io::Errno;
+        for errno in [Errno::NOSPC, Errno::DQUOT] {
+            let dir = temp_dir("volume-full");
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.set_hold(Some(volume_of(&dir, 8, errno)));
+            let keys: Vec<String> = (0..30)
+                .map(|i| format!("{i:02}/http://127.0.0.1/a.png"))
+                .collect();
+            for key in &keys[..8] {
+                store.put(key, &image(&[7u8; 100]));
+                assert!(store.contains(key), "{errno:?}: {key}");
+            }
+            let held = store.stats().1;
+            // The volume holds 8 files: the ninth write fails and
+            // counts, and the oldest entry goes to make room.
+            store.put(&keys[8], &image(&[7u8; 100]));
+            assert!(!store.contains(&keys[8]), "{errno:?}");
+            assert_eq!(store.errors(), 1, "{errno:?}");
+            assert!(
+                !store.contains(&keys[0]),
+                "{errno:?}: the oldest entry stays"
+            );
+            assert!(!store.file_for(&key_stem(&keys[0])).exists(), "{errno:?}");
+            // Every later write lands, and the tier keeps under
+            // what it held, which leaves the volume room for the
+            // next one.
+            for key in &keys[9..] {
+                store.put(key, &image(&[7u8; 100]));
+                assert!(store.get(key).is_some(), "{errno:?}: {key}");
+                assert!(store.stats().1 < held, "{errno:?}: {key}");
+            }
+            assert_eq!(store.errors(), 1, "{errno:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_rewrite_that_finds_the_volume_full_makes_room_and_lands_on_its_retry() {
+        // Issue #777: the drain writes an entry's learned groups
+        // into a new file before the old one goes. On a full
+        // volume that failed at every retry. It now makes room
+        // the way a landing write does, so its retry lands.
+        let dir = temp_dir("rewrite-full");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        let keys: Vec<String> = (0..4)
+            .map(|i| format!("{i}/http://127.0.0.1/a.png"))
+            .collect();
+        for key in &keys {
+            store.put(key, &image(&[7u8; 100]));
+        }
+        store.set_hold(Some(volume_of(&dir, keys.len(), rustix::io::Errno::NOSPC)));
+        store.learn_groups(&keys[3], &groups(&["g"]), Bucket::Unknown);
+        assert!(store.run_one_job());
+        assert_eq!(store.errors(), 1);
+        assert!(!store.contains(&keys[0]), "the oldest entry stays");
+        assert!(store.run_one_job());
+        assert_eq!(file_groups(&store, &keys[3]), ["g"]);
+        assert_eq!(store.errors(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_on_a_volume_with_no_room_for_the_probe_deletes_the_oldest_entries_and_serves() {
+        // Issue #777: on a volume whose inodes ran out, the
+        // boot's probe could not create its file, and the boot
+        // stopped as for a directory it may not write. The volume
+        // persists, so every restart stopped the same way until
+        // the directory was emptied by hand. The boot now reads
+        // the entries, deletes the oldest until the probe file
+        // can be created, and serves the rest.
+        let dir = temp_dir("boot-full");
+        let old: Vec<String> = (0..6).map(|i| format!("old/{i}")).collect();
+        left_by_a_previous_run(&dir, &old, &[7u8; 100]);
+        let store = Arc::new(DiskStore::unscanned(&dir, 1_000_000, test_entry_key()));
+        store.set_hold(Some(volume_of(&dir, old.len(), rustix::io::Errno::NOSPC)));
+        store.begin_scan();
+        let report = scan_ended(&store);
+        assert_eq!(report.phase, ScanPhase::Done);
+        assert_eq!((report.files, report.entries, report.deleted), (6, 5, 1));
+        assert!(!store.file_for(&key_stem(&old[0])).exists());
+        assert_eq!(lru_order(&store), old[1..].to_vec());
+        for key in &old[1..] {
+            assert!(store.get(key).is_some(), "{key}");
+        }
+        // It writes: the first write takes the room the probe
+        // found, the next finds the volume full and makes room,
+        // and the one after it lands.
+        for key in ["new/1", "new/2", "new/3"] {
+            store.put(key, &image(b"fresh"));
+        }
+        assert!(store.get("new/1").is_some());
+        assert!(store.get("new/2").is_none());
+        assert!(store.get("new/3").is_some());
+        assert_eq!(store.errors(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_probe_refused_by_a_read_only_volume_or_a_permission_still_fails_the_check() {
+        // Issue #777: only a volume that is full is read for
+        // room. A read-only mount, or a directory the process may
+        // not write, fails the check at once, as before: nothing
+        // is read, deleted or written.
+        use rustix::io::Errno;
+        for errno in [Errno::ROFS, Errno::ACCESS] {
+            let dir = temp_dir("boot-refused");
+            let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
+            left_by_a_previous_run(&dir, &old, &[7u8; 100]);
+            let store = Arc::new(DiskStore::unscanned(&dir, 1_000_000, test_entry_key()));
+            store.set_hold(Some(Arc::new(move |kind, _| match kind {
+                OpKind::Write => Err(std::io::Error::from_raw_os_error(errno.raw_os_error())),
+                _ => Ok(()),
+            })));
+            store.begin_scan();
+            let report = scan_ended(&store);
+            match &report.phase {
+                ScanPhase::Failed(e) => assert!(e.contains("is not writable"), "{errno:?}: {e}"),
+                other => panic!("{errno:?}: {other:?}"),
+            }
+            assert_eq!((report.files, report.deleted), (0, 0), "{errno:?}");
+            for key in &old {
+                assert!(store.file_for(&key_stem(key)).exists(), "{errno:?}: {key}");
+            }
+            assert!(matches!(
+                store.begin_write("k", &[], Bucket::Unknown, true),
+                WritePlan::Off
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_on_a_volume_that_stays_full_fails_its_check_once_no_entry_is_left() {
+        // Issue #777: the boot deletes the oldest entries to make
+        // room for the probe file. When none is left and the
+        // probe still finds no room, the volume is full of
+        // something else, and the check fails with the probe's
+        // error, as for a directory the process may not write.
+        let dir = temp_dir("boot-stays-full");
+        let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
+        left_by_a_previous_run(&dir, &old, &[7u8; 100]);
+        let store = Arc::new(DiskStore::unscanned(&dir, 1_000_000, test_entry_key()));
+        store.set_hold(Some(volume_of(&dir, 0, rustix::io::Errno::NOSPC)));
+        store.begin_scan();
+        let report = scan_ended(&store);
+        match &report.phase {
+            ScanPhase::Failed(e) => assert!(
+                e.contains("is not writable") && e.contains("No space left on device"),
+                "{e}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(report.deleted, 3);
+        assert!(matches!(
+            store.begin_write("k", &[], Bucket::Unknown, true),
+            WritePlan::Off
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_finds_a_volume_full_of_other_files_leaves_the_budget() {
+        // Issue #777: a tier that holds less than the write needs
+        // cannot make room for it, so the volume is full of
+        // something else. The budget stays, nothing is evicted,
+        // and writes land again once the volume has room.
+        let dir = temp_dir("volume-full-elsewhere");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.set_hold(Some(volume_of(&dir, 0, rustix::io::Errno::NOSPC)));
+        store.put("a", &image(b"small"));
+        assert!(!store.contains("a"));
+        assert_eq!(store.errors(), 1);
+        assert_eq!(store.inner.lock().unwrap().budget, 1_000_000);
+        store.set_hold(None);
+        store.put("a", &image(b"small"));
+        assert!(store.get("a").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_in_flight_when_the_budget_drops_below_its_charge_lands_nothing() {
+        // Issue #777: a write's charge is checked against the
+        // budget before its file is written, and a write that
+        // finds the volume full meanwhile can lower the budget
+        // below it. It then goes like a doomed write: its file is
+        // deleted, and the budget holds.
+        let dir = temp_dir("budget-drops");
+        let store = Arc::new(DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap());
+        for key in ["a", "b", "c"] {
+            store.put(key, &image(b"small"));
+        }
+        let WritePlan::Claimed(claim) = store.begin_write("big", &[], Bucket::Unknown, true) else {
+            panic!("the key was not claimed");
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, release_rx) = (Mutex::new(held_tx), Mutex::new(release_rx));
+        let (big, full) = (key_stem("big"), key_stem("f"));
+        store.set_hold(Some(Arc::new(move |kind, path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if kind == OpKind::Write && name.starts_with(&big) {
+                let _ = held_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+            if kind == OpKind::Write && name.starts_with(&full) {
+                let errno = rustix::io::Errno::NOSPC.raw_os_error();
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            Ok(())
+        })));
+        let payload = vec![7u8; 4 * volume_block(&dir)];
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || store.land(claim, &image(&payload)))
+        };
+        held_rx.recv().unwrap();
+        // A small write finds the volume full: the budget drops
+        // to two small entries, far below the write in flight.
+        store.put("f", &image(b"small"));
+        let budget = store.inner.lock().unwrap().budget;
+        drop(release_tx);
+        assert!(
+            writer.join().unwrap().is_none(),
+            "it landed past the budget"
+        );
+        assert!(!store.contains("big"));
+        assert!(!store.file_for(&key_stem("big")).exists());
+        assert!(store.stats().1 <= budget);
+        assert_eq!(store.keys().len(), 2);
+    }
+
+    #[test]
+    fn failed_writes_are_logged_at_most_once_every_10_seconds_and_each_counts() {
+        // Issue #777: each write that failed printed its own line
+        // on stderr, so a disk that refused writes printed one for
+        // every render. The log now has the first at once, then
+        // at most one line every 10 seconds with a count of the
+        // rest, as for the background jobs; every failure still
+        // counts.
+        let dir = temp_dir("write-lines");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.set_hold(Some(Arc::new(|kind, _| match kind {
+            OpKind::Write => Err(std::io::Error::other("the disk refuses writes")),
+            _ => Ok(()),
+        })));
+        for i in 0..50 {
+            store.put(&format!("k{i}"), &image(b"x"));
+        }
+        assert_eq!(store.errors(), 50);
+        assert_eq!(store.write_log.since.load(Ordering::Relaxed), 49);
+        let next = store.write_log.note(
+            monotonic_ms() + STALL_LOG_EVERY_MS,
+            "cannot write a cache entry: x",
+        );
+        assert_eq!(
+            next.unwrap(),
+            "result storage: cannot write a cache entry: x; 49 more cache entry writes failed since the last line"
+        );
     }
 
     #[test]
@@ -5398,7 +5989,7 @@ mod tests {
         let dir = temp_dir("learn-charge");
         let payload = vec![7u8; 100];
         let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
-        let budget = 2 * entry_charge("a", file, &[]) + 200;
+        let budget = 2 * charge_in(&dir, "a", file) + 200;
         let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
         store.put("a", &image(&payload));
         store.put("b", &image(&payload));
@@ -5420,7 +6011,7 @@ mod tests {
         let dir = temp_dir("evict-claim");
         let payload = vec![7u8; 100];
         let file = serialize_entry("a", &image(&payload), &test_entry_key()).len();
-        let budget = entry_charge("a", file, &[]) + 50;
+        let budget = charge_in(&dir, "a", file) + 50;
         let store = Arc::new(DiskStore::open(&dir, budget, test_entry_key()).unwrap());
         store.put("a", &image(&payload));
         let (hook, held, release) = hold_kind(OpKind::Unlink);
@@ -5781,7 +6372,7 @@ mod tests {
         for i in 0..n {
             let key = format!("k{i}");
             let groups = vec![group(i)];
-            let charge = entry_charge(&key, 10, &groups);
+            let charge = entry_charge(&key, 10, &groups, inner.block);
             inner.next_id += 1;
             inner.clock += 1;
             inner.order.insert(inner.clock, key.clone());
@@ -6489,7 +7080,7 @@ mod tests {
         let old: Vec<String> = (0..5).map(|i| format!("old/{i}")).collect();
         left_by_a_previous_run(&dir, &old, &payload);
         let file = serialize_entry(&old[0], &image(&payload), &test_entry_key()).len();
-        let one = entry_charge(&old[0], file, &[]);
+        let one = charge_in(&dir, &old[0], file);
         let budget = 4 * one + one / 2;
         let (store, gate) = started_under_gate(&dir, budget, &[OpKind::Read]);
         let (_, held) = gate.next();
@@ -6529,15 +7120,17 @@ mod tests {
         // must not index the copy it read: it would charge the
         // budget for a file that is gone. The files left are
         // small and the writes large, so every file the scan
-        // read would fit beside the writes.
+        // read would fit beside the writes. A file is charged in
+        // whole blocks (issue #777), so the large ones span
+        // several.
         let dir = temp_dir("scan-evict");
         let small = [7u8; 10];
-        let large = [7u8; 2_000];
+        let large = vec![7u8; 8 * volume_block(&dir)];
         let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
         left_by_a_previous_run(&dir, &old, &small);
         let charge = |payload: &[u8]| {
             let file = serialize_entry(&old[0], &image(payload), &test_entry_key()).len();
-            entry_charge(&old[0], file, &[])
+            charge_in(&dir, &old[0], file)
         };
         let budget = 2 * charge(&large) + 3 * charge(&small) + charge(&small) / 2;
         assert!(3 * charge(&large) > budget);
@@ -6903,7 +7496,7 @@ mod tests {
         let payload = [7u8; 200];
         let old: Vec<String> = (0..3).map(|i| format!("old/{i}")).collect();
         let file = serialize_entry(&old[0], &image(&payload), &test_entry_key()).len();
-        let one = entry_charge(&old[0], file, &[]);
+        let one = charge_in(&std::env::temp_dir(), &old[0], file);
         // Three entries, a file that does not verify, and a copy
         // of the newest under another key's name, in a budget
         // that holds two entries.
@@ -7042,6 +7635,9 @@ mod tests {
         #[derive(Default)]
         pub struct Index {
             max_bytes: usize,
+            /// The block size the store charges files in
+            /// (issue #777).
+            block: usize,
             pub entries: HashMap<String, Entry>,
             stamps: HashMap<String, u64>,
             clock: u64,
@@ -7049,9 +7645,10 @@ mod tests {
         }
 
         impl Index {
-            pub fn new(max_bytes: usize) -> Self {
+            pub fn new(max_bytes: usize, block: usize) -> Self {
                 Index {
                     max_bytes,
+                    block,
                     ..Default::default()
                 }
             }
@@ -7093,7 +7690,7 @@ mod tests {
                 let grew = merged.len() > entry.groups.len();
                 if grew {
                     entry.groups = merged;
-                    let charge = entry_charge(key, entry.file_bytes, &entry.groups);
+                    let charge = entry_charge(key, entry.file_bytes, &entry.groups, self.block);
                     self.total_bytes = self.total_bytes - entry.charge + charge;
                     entry.charge = charge;
                     self.clock += 1;
@@ -7131,7 +7728,7 @@ mod tests {
                     .unwrap_or_default();
                 let groups = with_groups(groups, &held);
                 let file_bytes = file_bytes(&groups);
-                let charge = entry_charge(key, file_bytes, &groups);
+                let charge = entry_charge(key, file_bytes, &groups, self.block);
                 if charge > self.max_bytes {
                     return 0;
                 }
@@ -7214,11 +7811,15 @@ mod tests {
             }
             some
         };
-        let one = entry_charge(
+        let one = charge_in(
+            &std::env::temp_dir(),
             &keys[0],
             serialize_entry(&keys[0], &image(&[7; 900]), &test_entry_key()).len(),
-            &[],
         );
+        // Files of one to five blocks, as each is charged in whole
+        // blocks (issue #777).
+        let block = volume_block(&std::env::temp_dir());
+        let lengths = [10, 900, block, 2 * block + 500, 4 * block];
         let mut steps = 0;
         let mut evictions = 0;
         // A budget of about six entries, one of sixty, one that
@@ -7228,12 +7829,13 @@ mod tests {
                 let dir = temp_dir(&format!("min-scan-{budget}-{seed}"));
                 let mut rng = crate::test_support::Rng::new(seed);
                 let store = DiskStore::open(&dir, budget, test_entry_key()).unwrap();
-                let mut model = min_scan::Index::new(budget);
+                let block = store.inner.lock().unwrap().block;
+                let mut model = min_scan::Index::new(budget, block);
                 for step in 0..300 {
                     let key = rng.pick(&keys).clone();
                     let what = match rng.below(100) {
                         0..35 => {
-                            let len = [10, 300, 900, 2_500, 7_000][rng.below(5)];
+                            let len = lengths[rng.below(5)];
                             let copy = CachedImage {
                                 groups: some_groups(&mut rng),
                                 ..image(&vec![7; len])
