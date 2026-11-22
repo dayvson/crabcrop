@@ -374,7 +374,6 @@ impl PdfRenderer {
     /// through `probe_until` (the shared deadline); this
     /// spelling stays as the entry the test suite
     /// exercises.
-    #[allow(dead_code)]
     pub fn probe(&self, pdf: &[u8], page: u32) -> Result<PdfProbe, PdfError> {
         self.probe_until(pdf, page, Instant::now() + self.timeout)
     }

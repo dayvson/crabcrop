@@ -66,7 +66,7 @@ enum Outcome {
     Error(String),
     /// The panic's message, which only the reports print
     /// (through `Debug`): a panic matches nothing.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "read only through Debug, in the reports")]
     Panicked(String),
 }
 

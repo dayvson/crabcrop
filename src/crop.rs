@@ -17,7 +17,6 @@ use crate::url::Align;
 /// The engine calls [`crop_to_aspect_with`] (it may have a face
 /// provider); this composed form is kept for tests and future
 /// library use.
-#[allow(dead_code)]
 pub fn crop_to_aspect(
     img: DynamicImage,
     target_w: u32,

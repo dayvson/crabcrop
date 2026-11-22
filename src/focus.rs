@@ -38,7 +38,6 @@ const MAX_DIM: u32 = 128;
 /// The composed form is kept for tests and callers that do
 /// not need the trace; the engine consumes
 /// [`focal_point_traced`].
-#[allow(dead_code)]
 pub fn focal_point_with(
     img: &DynamicImage,
     faces: Option<&dyn crate::ai::FaceProvider>,

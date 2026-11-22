@@ -946,7 +946,6 @@ impl S3Store {
     /// existence check goes through [`S3Store::exists_raw`],
     /// a HEAD (issue #192), and serving reads of uploaded
     /// objects go through the loader.
-    #[allow(dead_code)]
     pub async fn get_raw(&self, name: &str) -> Option<Vec<u8>> {
         let object = format!("{}{name}", self.prefix);
         let started = Instant::now();
@@ -1382,7 +1381,6 @@ impl S3Store {
     /// for the tests and any caller that wants the whole
     /// walk in one call. The same applies to the
     /// unbounded `purge_group` and `purge_source` below.
-    #[allow(dead_code)]
     pub async fn purge_matching(&self, base: &str, epoch_base: &str) -> usize {
         let target = PurgeTarget::Key(base.to_string());
         self.purge_whole(&target, Some(epoch_base), PurgeCutoff::EVERYTHING)
@@ -1518,7 +1516,6 @@ impl S3Store {
 
     /// Remove every entry belonging to `group`. Returns
     /// how many entries were removed.
-    #[allow(dead_code)]
     pub async fn purge_group(&self, group: &str) -> usize {
         let target = PurgeTarget::Group(group.to_string());
         self.purge_whole(&target, None, PurgeCutoff::EVERYTHING)
@@ -1531,7 +1528,6 @@ impl S3Store {
     /// R2-07): an upload overwrite calls this so the
     /// replaced original's derivatives stop serving.
     /// Returns how many entries were removed.
-    #[allow(dead_code)]
     pub async fn purge_source(&self, source: &str) -> usize {
         let target = PurgeTarget::Source(source.to_string());
         self.purge_whole(&target, None, PurgeCutoff::EVERYTHING)

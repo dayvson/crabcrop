@@ -7018,7 +7018,7 @@ mod tests {
         use std::collections::HashMap;
 
         /// The record as it was, for its size.
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "kept for its size; no field is read")]
         pub struct Record {
             stem: String,
             file_bytes: usize,

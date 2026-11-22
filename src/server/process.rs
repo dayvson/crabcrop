@@ -422,7 +422,7 @@ impl MissProgress {
 pub(in crate::server) struct WatermarkSources {
     pub(in crate::server) images: Vec<(String, Vec<u8>)>,
     /// Held only to be dropped after `images`.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "held for its Drop, which returns the charge")]
     pub(in crate::server) share: Option<crate::loader::SourceCharge>,
 }
 
