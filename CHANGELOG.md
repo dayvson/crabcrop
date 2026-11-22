@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Security
+
+- Reading a source's C2PA manifest store, for meta's `provenance` and for a signed output's parent ingredient, is now bounded work. A store is read only when its boxes nest exactly and it holds at most 64 manifests and at most 8 compressed ones, and the reader inflates a compressed manifest to at most 1 MiB. The counts come from the store's box headers, before anything is parsed or inflated. Meta's read is now held to the 1 MiB store size that signing's already was (issue #610), and it validates the store it measured, found through the format the server sniffed, as signing does. An ISO BMFF source (HEIC, HEIF, AVIF, MP4) whose store is kept as an original and an update is not read, since c2pa-rs merges the two before they can be checked. A store past any bound reads as one that does not parse: meta reports `source` as `null`, and a signed output's ingredient names the source's format and records no status. A store within the bounds reads as before, and renders are unchanged.
+
 ## [0.15.0] - 2026-11-22
 
 - Boot now refuses a `CRABCROP_METRICS_TOKEN` under 16 bytes, and the Helm chart a secret given as a plain value: fix both before upgrading (issue #632).

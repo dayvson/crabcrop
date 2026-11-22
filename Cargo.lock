@@ -1008,6 +1008,7 @@ dependencies = [
  "ab_glyph",
  "axum",
  "base64",
+ "brotli",
  "bytes",
  "c2pa",
  "crabcrop-url",
