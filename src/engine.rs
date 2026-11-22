@@ -355,7 +355,6 @@ impl Engine {
     /// The server calls [`Engine::process_preferred`] instead,
     /// because it negotiates format from `Accept`; this composed
     /// form is kept for tests and future library use.
-    #[allow(dead_code)]
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
         self.process_preferred(bytes, ops, ProcessContext::default())
     }

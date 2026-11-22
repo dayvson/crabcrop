@@ -1181,7 +1181,6 @@ pub enum Operation {
 /// works with [`parse_signature`] and [`parse_operations`]
 /// separately. This type and [`parse_request`] are the convenient
 /// whole-path form, kept for tests and future library use.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request<'a> {
     pub operations: Vec<Operation>,
@@ -2913,7 +2912,6 @@ impl RequestDirectives {
     /// the server's AI gate uses `uses_ai_beyond_smart_crop`
     /// plus that provider check (issue #379). Only the tests
     /// call this, to pin the directive classification.
-    #[allow(dead_code)]
     pub fn uses_ai(&self) -> bool {
         self.uses_ai_beyond_smart_crop() || self.smart_crop
     }
@@ -3207,7 +3205,6 @@ pub fn canonical_key_form(remainder: &str) -> String {
 }
 
 /// Parse a full request path into its signature and [`Request`].
-#[allow(dead_code)]
 pub fn parse_request(path: &str) -> Result<(Signature, Option<String>, Request<'_>), ParseError> {
     let (signature, key_id, rest) = parse_signature(path)?;
     let (operations, source_url) = parse_operations(rest)?;
@@ -3287,7 +3284,6 @@ pub const ENTRY_KEY_LABEL: &str = "crabcrop/entry-key";
 /// to the `crabcrop-url` crate, the one implementation
 /// clients and server share (Q6). The server only
 /// verifies; this mints, for operators and tests.
-#[allow(dead_code)]
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
     crabcrop_url::purge_signature(secret, target)
 }
@@ -3296,7 +3292,6 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
 /// `exp:<expires>/<target>` under the derived purge key.
 /// Delegates to the crate helper; this mints, for operators
 /// and tests.
-#[allow(dead_code)]
 pub fn purge_signature_with_expiry(secret: &[u8], target: &str, expires: u64) -> String {
     crabcrop_url::purge_signature_with_expiry(secret, target, expires)
 }
@@ -3314,7 +3309,6 @@ pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
 /// the group name under the derived purge-group key.
 /// Delegates to the crate helper so nobody
 /// hand-constructs the message.
-#[allow(dead_code)]
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     crabcrop_url::purge_group_signature(secret, group)
 }
@@ -3322,7 +3316,6 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
 /// The expiring purge-group signature for a cache group:
 /// HMAC of `exp:<expires>/<group>` under the derived
 /// purge-group key. Delegates to the crate helper.
-#[allow(dead_code)]
 pub fn purge_group_signature_with_expiry(secret: &[u8], group: &str, expires: u64) -> String {
     crabcrop_url::purge_group_signature_with_expiry(secret, group, expires)
 }
@@ -3416,7 +3409,6 @@ pub fn upload_key(secret: &[u8]) -> Vec<u8> {
 /// of the name alone, under the derived upload key.
 /// Delegates to the `crabcrop-url` crate. The server only
 /// verifies; this mints, for operators and tests.
-#[allow(dead_code)]
 pub fn upload_signature(secret: &[u8], name: &str) -> String {
     crabcrop_url::upload_signature(secret, name)
 }
@@ -3426,7 +3418,6 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
 /// under the derived upload key. Delegates to the
 /// `crabcrop-url` crate; this mints, for operators and
 /// tests.
-#[allow(dead_code)]
 pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
     crabcrop_url::upload_signature_with_expiry(secret, name, expires)
 }

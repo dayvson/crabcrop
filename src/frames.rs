@@ -442,7 +442,6 @@ impl VideoFrameExtractor {
     /// `probe_until` (the shared deadline); this spelling
     /// stays as the single-probe entry the test suite
     /// exercises.
-    #[allow(dead_code)]
     pub fn probe(&self, video: &[u8]) -> Result<VideoProbe, FrameError> {
         let input = stage_input(video)?;
         self.probe_until(&input, Instant::now() + self.timeout)

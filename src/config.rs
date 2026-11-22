@@ -31,7 +31,10 @@ use crate::loader::{SourceConfig, SourcePolicy};
 /// and no message quotes one.
 // Boot only prints the message: the fields are for code
 // that matches on a failure, the tests today.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only the tests match on the fields")
+)]
 #[derive(Debug)]
 pub enum ConfigError {
     /// A variable the server cannot boot without is unset.
