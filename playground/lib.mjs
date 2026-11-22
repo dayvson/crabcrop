@@ -10,7 +10,7 @@
  * to these functions is used only for the HMAC computation.
  */
 
-import { explainUrl } from "./sdk/explain.js";
+import { explainUrl, readsBeforeSource } from "./sdk/explain.js";
 
 const encoder = new TextEncoder();
 
@@ -70,7 +70,9 @@ export async function sign(secret, remainder) {
  * literal `unsafe`. Only a null/undefined secret means unsafe:
  * an empty string is a real (if weak) key and signs, matching
  * every other implementation (audit P-6). Inputs that can
- * never verify throw instead of minting a dead URL (P-4, P-5).
+ * never verify throw instead of minting a dead URL (P-4, P-5),
+ * and so, with an expiry, does text that would decide the URL
+ * in its place (issue #782).
  */
 export async function buildPlaygroundUrl({ base, secret, operations, source, expires }) {
   if (expires !== undefined && expires !== null) {
@@ -80,6 +82,9 @@ export async function buildPlaygroundUrl({ base, secret, operations, source, exp
   }
   assertUrlText(operations, "operations");
   assertUrlText(source, "source");
+  if (expires !== undefined && expires !== null) {
+    assertNoExpiryOverride(operations, source);
+  }
   const trimmedBase = base.replace(/\/+$/, "");
   let remainder = "";
   if (expires !== undefined && expires !== null) {
@@ -95,6 +100,28 @@ export async function buildPlaygroundUrl({ base, secret, operations, source, exp
   const signature =
     secret === null || secret === undefined ? "unsafe" : await sign(secret, remainder);
   return `${trimmedBase}/${signature}/${remainder}`;
+}
+
+// With an expiry, the SDK's buildURL refuses an exp: or maxage:
+// segment among the operations, and a source whose first segment
+// the server reads ahead of the source (issue #782): the server
+// keeps the last exp: of a URL. The same refusal, with the SDK's
+// message; the reading is the SDK explainer's own.
+function assertNoExpiryOverride(operations, source) {
+  const metadata = operations
+    .split("/")
+    .find((segment) => segment.startsWith("exp:") || segment.startsWith("maxage:"));
+  if (metadata !== undefined) {
+    throw new Error(
+      `operations carries the segment "${metadata}": with an expiry, the operations may carry no exp: or maxage: segment, since the server keeps the last of each`,
+    );
+  }
+  const first = source.split("/", 1)[0];
+  if (readsBeforeSource(first)) {
+    throw new Error(
+      `source begins with the segment "${first}", which the server reads ahead of the source: with an expiry, the source may not begin with an operation, exp:, maxage: or preset: segment`,
+    );
+  }
 }
 
 // Characters a browser rewrites in a URL path (issue #472):

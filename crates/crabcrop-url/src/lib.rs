@@ -263,6 +263,16 @@ pub enum BuildError {
     /// no image URL may carry: its signature could be a
     /// derived subkey. Carries the remainder.
     ReservedRemainder(String),
+    /// With an expiry, the named input ("operations" or
+    /// "source") carries a segment that would decide the URL in
+    /// the expiry's place (issue #782): an `exp:` or `maxage:`
+    /// segment among the operations, or a first source segment
+    /// the server reads ahead of the source, as an operation,
+    /// `exp:`, `maxage:` or `preset:`. The server keeps the last
+    /// `exp:` of a remainder, so such text would set the URL's
+    /// lifetime whatever expiry was given, or add operations to
+    /// the signed URL. Carries the input and the segment.
+    ExpiryOverride { what: &'static str, segment: String },
 }
 
 /// The one message for a reserved remainder, shared by
@@ -274,6 +284,30 @@ fn write_reserved_remainder(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
         "remainder begins with the reserved segment \"{RESERVED_SEGMENT}\": \
          it is kept for key derivation, and no image URL may begin with it"
     )
+}
+
+/// The one message for an input that would decide an expiring
+/// URL in its expiry's place, shared by [`BuildError`] and
+/// [`SealError`] and spelled the same way by every first-party
+/// implementation.
+fn write_expiry_override(
+    f: &mut std::fmt::Formatter<'_>,
+    what: &str,
+    segment: &str,
+) -> std::fmt::Result {
+    match what {
+        "operations" => write!(
+            f,
+            "operations carries the segment \"{segment}\": with an expiry, the operations \
+             may carry no exp: or maxage: segment, since the server keeps the last of each"
+        ),
+        _ => write!(
+            f,
+            "{what} begins with the segment \"{segment}\", which the server reads ahead of \
+             the source: with an expiry, the source may not begin with an operation, exp:, \
+             maxage: or preset: segment"
+        ),
+    }
 }
 
 impl std::fmt::Display for BuildError {
@@ -291,6 +325,7 @@ impl std::fmt::Display for BuildError {
                 "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
             ),
             BuildError::ReservedRemainder(_) => write_reserved_remainder(f),
+            BuildError::ExpiryOverride { what, segment } => write_expiry_override(f, what, segment),
         }
     }
 }
@@ -503,6 +538,13 @@ pub enum SealError {
     /// carry: the server refuses a token whose remainder
     /// does. Carries the remainder.
     ReservedRemainder(String),
+    /// With an expiry, the named input ("operations" or
+    /// "source") carries a segment that would decide the URL in
+    /// the expiry's place, as for
+    /// [`BuildError::ExpiryOverride`]: the server reads a
+    /// token's remainder as it reads a plain one. Carries the
+    /// input and the segment.
+    ExpiryOverride { what: &'static str, segment: String },
     /// The operating system's random number generator could
     /// not draw the nonce [`seal`] needs. Carries its error,
     /// as text. Nothing was sealed; a retry may succeed.
@@ -540,6 +582,7 @@ impl std::fmt::Display for SealError {
                 write!(f, "sealing requires a secret: there is no unsafe token")
             }
             SealError::ReservedRemainder(_) => write_reserved_remainder(f),
+            SealError::ExpiryOverride { what, segment } => write_expiry_override(f, what, segment),
             SealError::RandomnessFailed(cause) => write!(
                 f,
                 "the operating system's random number generator failed, so no nonce \
@@ -774,7 +817,9 @@ impl<'a> SealedUrl<'a> {
     }
 
     /// Expire the URL at this unix second: an `exp:` segment
-    /// leads the sealed remainder.
+    /// leads the sealed remainder, and [`SealedUrl::build`]
+    /// refuses operations and a source that would decide the
+    /// URL in its place, as [`build_url`] does.
     #[must_use = "a setter returns the changed URL and leaves this one as it was"]
     pub fn expires(self, unix_seconds: u64) -> Self {
         SealedUrl {
@@ -809,8 +854,10 @@ impl<'a> SealedUrl<'a> {
     /// Seal the remainder under `secret` and assemble the URL.
     /// It fails with the input that can never be served (a
     /// refused character, a reserved remainder, a remainder over
-    /// [`MAX_SEALED_REMAINDER`], an invalid key ID), or when no
-    /// nonce can be drawn.
+    /// [`MAX_SEALED_REMAINDER`], an invalid key ID), with an
+    /// input that would decide the URL in its expiry's place
+    /// ([`SealError::ExpiryOverride`]), or when no nonce can be
+    /// drawn.
     pub fn build(&self, secret: &[u8]) -> Result<String, SealError> {
         let remainder = assemble_remainder(self.operations, self.source, self.expires)?;
         let base = self.base.trim_end_matches('/');
@@ -919,12 +966,13 @@ fn refused_character(text: &str) -> Option<char> {
     })
 }
 
-/// Why [`assemble_remainder`] refused its inputs: the two
+/// Why [`assemble_remainder`] refused its inputs: the
 /// refusals every builder shares, plain or sealed, which each
 /// builder reports in its own error type.
 enum RemainderError {
     InvalidCharacter { what: &'static str, character: char },
     Reserved(String),
+    ExpiryOverride { what: &'static str, segment: String },
 }
 
 impl From<RemainderError> for BuildError {
@@ -934,6 +982,9 @@ impl From<RemainderError> for BuildError {
                 BuildError::InvalidCharacter { what, character }
             }
             RemainderError::Reserved(remainder) => BuildError::ReservedRemainder(remainder),
+            RemainderError::ExpiryOverride { what, segment } => {
+                BuildError::ExpiryOverride { what, segment }
+            }
         }
     }
 }
@@ -945,8 +996,81 @@ impl From<RemainderError> for SealError {
                 SealError::InvalidCharacter { what, character }
             }
             RemainderError::Reserved(remainder) => SealError::ReservedRemainder(remainder),
+            RemainderError::ExpiryOverride { what, segment } => {
+                SealError::ExpiryOverride { what, segment }
+            }
         }
     }
+}
+
+/// The prefixes of the segments the server reads ahead of the
+/// source (`parse_operations_with_expiry` and `parse_operation`
+/// in the server's `src/url.rs`): the `exp:` and `maxage:`
+/// metadata, a `preset:` reference, and every operation that
+/// opens with a name. A size has none (see [`size_shaped`]).
+const LEADING_PREFIXES: [&str; 13] = [
+    "exp:",
+    "maxage:",
+    "preset:",
+    "debug:",
+    "frame:",
+    "page:",
+    "crop-rect:",
+    "focalpoint:",
+    "focal:",
+    "crop:",
+    "pad:",
+    "fit-in:",
+    "filters:",
+];
+
+/// The server's size shape: an `x` joining two parts, at least
+/// one of them a dimension spelling (digits, `orig`, or
+/// nothing, after an optional `-`), and no `.` or `:` in the
+/// segment. Every size the server parses has it, and the
+/// server reads a segment with it that does not parse as a
+/// malformed size, never as source text.
+fn size_shaped(segment: &str) -> bool {
+    let Some((left, right)) = segment.split_once('x') else {
+        return false;
+    };
+    if segment.contains('.') || segment.contains(':') {
+        return false;
+    }
+    let spelling = |part: &str| {
+        let digits = part.strip_prefix('-').unwrap_or(part);
+        digits == "orig" || digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    spelling(left) || spelling(right)
+}
+
+/// Whether the server reads `segment` ahead of the source:
+/// as metadata, a preset reference or an operation, valid or
+/// not. The first segment that is none of these starts the
+/// source.
+fn read_before_source(segment: &str) -> bool {
+    LEADING_PREFIXES
+        .iter()
+        .any(|prefix| segment.starts_with(prefix))
+        || size_shaped(segment)
+}
+
+/// With an expiry, the input and segment that would decide
+/// the URL in the expiry's place (issue #782): an `exp:` or
+/// `maxage:` segment anywhere in the operations, or a first
+/// source segment the server reads ahead of the source. The
+/// server keeps the last `exp:` of a remainder, so either
+/// would let the text a caller passed outlive the expiry it
+/// gave, and a source read as operations would sign them too.
+fn expiry_override<'a>(operations: &'a str, source: &'a str) -> Option<(&'static str, &'a str)> {
+    if let Some(segment) = operations
+        .split('/')
+        .find(|s| s.starts_with("exp:") || s.starts_with("maxage:"))
+    {
+        return Some(("operations", segment));
+    }
+    let first = source.split('/').next().unwrap_or(source);
+    read_before_source(first).then_some(("source", first))
 }
 
 /// The remainder every builder signs or seals: the expiry
@@ -955,7 +1079,9 @@ impl From<RemainderError> for SealError {
 /// sealed, with a secret or without: a character
 /// [`validate_url_text`] refuses, and a remainder that
 /// begins with [`RESERVED_SEGMENT`], which the server
-/// refuses whatever the signature.
+/// refuses whatever the signature. With an expiry, so is
+/// text that would decide the URL in the expiry's place
+/// (see [`BuildError::ExpiryOverride`]).
 fn assemble_remainder(
     operations: &str,
     source: &str,
@@ -965,6 +1091,12 @@ fn assemble_remainder(
         if let Some(character) = refused_character(text) {
             return Err(RemainderError::InvalidCharacter { what, character });
         }
+    }
+    if let Some((what, segment)) = expires.and_then(|_| expiry_override(operations, source)) {
+        return Err(RemainderError::ExpiryOverride {
+            what,
+            segment: segment.to_string(),
+        });
     }
     let mut remainder = String::new();
     if let Some(exp) = expires {
@@ -986,7 +1118,12 @@ fn assemble_remainder(
 /// `operations` is the operation string verbatim (it may hold
 /// several `/`-separated segments, `preset:` references
 /// included). `expires` is a unix-seconds expiry, emitted as a
-/// leading `exp:` segment. A `None` secret produces the
+/// leading `exp:` segment. With one, the operations may carry
+/// no `exp:` or `maxage:` segment, and the source may not
+/// begin with a segment the server reads as an operation,
+/// `exp:`, `maxage:` or `preset:`: the server keeps the last
+/// `exp:` of a URL, so either is refused, with
+/// [`BuildError::ExpiryOverride`]. A `None` secret produces the
 /// literal `unsafe` signature segment, for servers running
 /// with unsafe or presets-only configurations. A remainder
 /// that begins with [`RESERVED_SEGMENT`] is refused either
@@ -1383,6 +1520,184 @@ mod tests {
             // like characters, the builders police it.
             let token = seal_with_nonce(secret, None, &nonce, remainder).unwrap();
             assert_eq!(unseal(secret, &token).unwrap(), remainder);
+        }
+    }
+
+    /// The message an expiry refusal carries, as every
+    /// first-party implementation spells it.
+    fn expiry_override_message(what: &str, segment: &str) -> String {
+        if what == "operations" {
+            format!(
+                "operations carries the segment \"{segment}\": with an expiry, the operations \
+                 may carry no exp: or maxage: segment, since the server keeps the last of each"
+            )
+        } else {
+            format!(
+                "source begins with the segment \"{segment}\", which the server reads ahead of \
+                 the source: with an expiry, the source may not begin with an operation, exp:, \
+                 maxage: or preset: segment"
+            )
+        }
+    }
+
+    /// The expiry vectors from `spec/test-vectors.json` (issue
+    /// #782). With an expiry, every builder refuses operations
+    /// that carry an `exp:` or `maxage:` segment, and a source
+    /// whose first segment the server reads ahead of the source,
+    /// signed or not, keyed or not, plain or sealed, with the
+    /// one typed error and the one message; without the expiry
+    /// the same inputs build as they always did. The vectors
+    /// that build mark where the refusal stops.
+    #[test]
+    fn expiry_test_vectors() {
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(VECTORS).unwrap();
+        let base = "https://img.example.com";
+        let secret = &b"s3cr3t"[..];
+        let (mut refusals, mut builds) = (0, 0);
+        for v in &vectors {
+            let description = v["description"].as_str().unwrap();
+            if let Some(refusal) = v.get("refuses_with_expiry") {
+                refusals += 1;
+                let operations = v["operations"].as_str().unwrap();
+                let source = v["source"].as_str().unwrap();
+                let expiry = v["expires"].as_u64().unwrap();
+                let expires = Some(expiry);
+                let what = match refusal["input"].as_str().unwrap() {
+                    "operations" => "operations",
+                    "source" => "source",
+                    other => panic!("{description}: no input {other}"),
+                };
+                let segment = refusal["segment"].as_str().unwrap();
+                let refused = BuildError::ExpiryOverride {
+                    what,
+                    segment: segment.to_string(),
+                };
+                assert_eq!(refused.to_string(), expiry_override_message(what, segment));
+                let plain = if operations.is_empty() {
+                    source.to_string()
+                } else {
+                    format!("{operations}/{source}")
+                };
+                for secret in [Some(secret), None] {
+                    assert_eq!(
+                        build_url(base, secret, operations, source, expires),
+                        Err(refused.clone()),
+                        "{description}"
+                    );
+                    let url = build_url(base, secret, operations, source, None).unwrap();
+                    assert!(url.ends_with(&format!("/{plain}")), "{description}: {url}");
+                }
+                assert_eq!(
+                    build_url_with_key_id(base, (secret, "k2"), operations, source, expires),
+                    Err(refused.clone()),
+                    "{description}"
+                );
+                if what == "source" {
+                    assert_eq!(
+                        build_srcset(base, Some(secret), source, &[320], expires),
+                        Err(refused.clone()),
+                        "{description}"
+                    );
+                }
+                let sealed = SealError::ExpiryOverride {
+                    what,
+                    segment: segment.to_string(),
+                };
+                assert_eq!(sealed.to_string(), refused.to_string());
+                let url = SealedUrl::new(base, operations, source).expires(expiry);
+                for url in [url, url.key_id("k2"), url.name("a.jpg")] {
+                    assert_eq!(url.build(secret), Err(sealed.clone()), "{description}");
+                }
+                assert!(
+                    SealedUrl::new(base, operations, source)
+                        .build(secret)
+                        .is_ok()
+                );
+                for secret in [Some(secret), None] {
+                    #[allow(deprecated)]
+                    let shim =
+                        build_sealed_url(base, secret, operations, source, expires, None, None);
+                    assert_eq!(shim, Err(sealed.clone()), "{description}");
+                }
+            }
+            if let Some(remainder) = v.get("builds_with_expiry") {
+                builds += 1;
+                let operations = v["operations"].as_str().unwrap();
+                let source = v["source"].as_str().unwrap();
+                let expiry = v["expires"].as_u64().unwrap();
+                let expires = Some(expiry);
+                let remainder = remainder.as_str().unwrap();
+                assert_eq!(
+                    build_url(base, Some(secret), operations, source, expires).unwrap(),
+                    format!("{base}/{}/{remainder}", sign(secret, remainder).unwrap()),
+                    "{description}"
+                );
+                assert_eq!(
+                    build_url(base, None, operations, source, expires).unwrap(),
+                    format!("{base}/unsafe/{remainder}"),
+                    "{description}"
+                );
+                let url = SealedUrl::new(base, operations, source)
+                    .expires(expiry)
+                    .build(secret)
+                    .unwrap();
+                let token = url.strip_prefix(&format!("{base}/")).unwrap();
+                assert_eq!(unseal(secret, token).unwrap(), remainder, "{description}");
+            }
+        }
+        assert!(refusals >= 11, "the spec carries expiry refusal vectors");
+        assert!(builds >= 5, "the spec carries expiry build vectors");
+    }
+
+    /// The segments the expiry check reads ahead of the source
+    /// (issue #782): each prefix the server's parser reads as
+    /// metadata, a preset reference or an operation, and a size
+    /// in any spelling the parser reads as one, valid or not.
+    /// The server's tests hold the check to its parser over the
+    /// grammar corpora.
+    #[test]
+    fn the_expiry_check_reads_segments_as_the_server_does() {
+        for segment in [
+            "exp:1",
+            "maxage:60",
+            "preset:og-card",
+            "debug:focal",
+            "frame:poster",
+            "page:2",
+            "crop-rect:0x0:10x10",
+            "focalpoint:0.5,0.5,2",
+            "focal:0x0:10x10",
+            "crop:100x100:smart",
+            "pad:100x100",
+            "fit-in:100x100",
+            "filters:grayscale",
+            "300x200",
+            "-300x0",
+            "origx100",
+            "x",
+            "16384x10",
+            "300xabc",
+            "xmas",
+        ] {
+            assert!(read_before_source(segment), "{segment}");
+        }
+        for segment in [
+            "",
+            "https:",
+            "s3:",
+            "gs:",
+            "file:",
+            "root:photos",
+            "example.com",
+            "100x200.jpg",
+            "x.jpg",
+            "photo.jpg",
+            "crabcrop",
+            "trim",
+            "filters",
+            "300",
+        ] {
+            assert!(!read_before_source(segment), "{segment}");
         }
     }
 
