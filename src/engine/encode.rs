@@ -593,14 +593,21 @@ impl Default for AvifTiles {
 
 /// The thread pools AVIF encodes run in, for one tile count:
 /// each of exactly that many threads, which is what holds the
-/// tile count, and one pool for every that many cores
-/// (rounded up), so a host with more cores still runs that
-/// many encodes side by side. A count above the host's core
-/// count is one pool, of more threads than cores. Built at
-/// the first AVIF encode and kept: asking the encoder for a
-/// thread count instead (`with_num_threads`) builds and drops
-/// a pool inside every encode, which measured 9% slower at
-/// 800x533.
+/// tile count, and one pool for every core, which is one for
+/// every permit of the stills lane, so each render the lane
+/// runs at once encodes in a pool of its own (issue #790).
+/// Encodes that share a pool share its threads, and a thread
+/// that waits for a tile of its own encode runs a tile of
+/// another one meanwhile, so an encode ends only once the
+/// tiles it took on have ended too: with four AVIF renders at
+/// once on four cores, a pool each served them at the rate
+/// one shared pool did, with the 90th percentile of their
+/// latency 17% lower and the 99th 43% lower. A count above
+/// the host's core count makes pools of more threads than
+/// cores. Built at the first AVIF encode and kept: asking the
+/// encoder for a thread count instead (`with_num_threads`)
+/// builds and drops a pool inside every encode, which
+/// measured 9% slower at 800x533.
 struct AvifPools {
     pools: Vec<rayon::ThreadPool>,
     /// The encodes running in each pool.
@@ -622,7 +629,7 @@ impl AvifPools {
         // A failure to start the threads fails this encode and
         // is not remembered: the next one tries again.
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let built = Self::build(tiles, cores.div_ceil(tiles.count()))?;
+        let built = Self::build(tiles, cores)?;
         Ok(slot.get_or_init(|| built))
     }
 
@@ -1584,18 +1591,15 @@ mod tests {
 
     #[test]
     fn avif_pools_are_built_for_the_tile_count_and_the_cores() {
-        // A server's pools (issue #688): as many threads each as
-        // the count, one pool for every that many cores, rounded
-        // up, so a count above the cores is one pool. Each count
-        // has its own, built once and kept.
+        // A server's pools (issues #688, #790): as many threads
+        // each as the count, and one pool for every core, which
+        // is one for every permit of the stills lane, whatever
+        // the count. Each count has its own, built once and
+        // kept.
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         for tiles in every_tile_count() {
             let pools = AvifPools::get(tiles).unwrap();
-            assert_eq!(
-                pools.pools.len(),
-                cores.div_ceil(tiles.count()),
-                "{tiles:?}"
-            );
+            assert_eq!(pools.pools.len(), cores, "{tiles:?}");
             for pool in &pools.pools {
                 assert_eq!(pool.current_num_threads(), tiles.count(), "{tiles:?}");
             }
