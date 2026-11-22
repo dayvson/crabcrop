@@ -10732,16 +10732,17 @@ async fn meta_reports_signer_names_as_one_bounded_line() {
 
 #[tokio::test]
 async fn a_source_store_past_the_read_bounds_is_neither_summarized_nor_recorded() {
-    // A source whose store holds more compressed manifests
-    // than a read takes: meta reports no source manifest, as
-    // for a store that does not parse, and the signed output's
-    // parent records no status. With one fewer, both read the
-    // store (its own manifest reads invalid, since the store
-    // moved).
-    let (within, past) =
-        crate::provenance::test_sources_at_the_compressed_bound(&test_png(), "image/png");
+    // A source whose store holds a compressed manifest: meta
+    // reports no source manifest, as for a store that does not
+    // parse, and the signed output's parent records no status.
+    // Without it, both read the store (its own manifest reads
+    // invalid, since the store moved).
+    let (without, with) = crate::provenance::test_sources_without_and_with_a_compressed_manifest(
+        &test_png(),
+        "image/png",
+    );
     let base = spawn_app_with_signer().await;
-    for (name, source, read) in [("within", within, true), ("past", past, false)] {
+    for (name, source, read) in [("without", without, true), ("with", with, false)] {
         let src = spawn_bytes_server(source).await;
         let remainder = format!("40x24/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));

@@ -329,25 +329,24 @@ impl c2pa::http::SyncHttpResolver for NoNetwork {
 /// The context every read of a manifest store runs under:
 /// no network ([`NoNetwork`]), no decoding of CAWG
 /// identity assertions, and no compressed manifest inflated
-/// past [`MAX_INFLATED_MANIFEST_MIB`]. Decoding an identity
-/// assertion evaluates the identity's own credential
-/// against its issuer, which is where the network fetches
-/// come from; with no network an issuer that publishes its
-/// key on the web could only read as unavailable, a failure
-/// of the reader's making that the SDK counts against the
-/// manifest. Undecoded, an identity assertion is still an
-/// assertion the claim hashes, so its bytes are checked
-/// like any other, and a manifest's state is its own
-/// signature and hashes, which is what meta reports and an
-/// output records about its parent. Like [`Context::new`],
-/// it loads no trust anchors.
+/// at all. Decoding an identity assertion evaluates the
+/// identity's own credential against its issuer, which is
+/// where the network fetches come from; with no network an
+/// issuer that publishes its key on the web could only read
+/// as unavailable, a failure of the reader's making that the
+/// SDK counts against the manifest. Undecoded, an identity
+/// assertion is still an assertion the claim hashes, so its
+/// bytes are checked like any other, and a manifest's state
+/// is its own signature and hashes, which is what meta
+/// reports and an output records about its parent. Like
+/// [`Context::new`], it loads no trust anchors.
 fn reading_context() -> Context {
     let mut context = Context::new().with_resolver(NoNetwork);
     let core = &mut context.settings_mut().core;
     core.decode_identity_assertions = false;
-    // Each compressed manifest inflates no further than a whole
-    // store may take (MAX_INFLATED_MANIFEST_MIB).
-    core.max_decompressed_manifest_size_in_mb = MAX_INFLATED_MANIFEST_MIB;
+    // No compressed manifest is inflated: a store that holds one
+    // fails the read, as `read_store` refuses it beforehand.
+    core.max_decompressed_manifest_size_in_mb = 0;
     context
 }
 
@@ -468,22 +467,6 @@ const MAX_SOURCE_STORE_BYTES: usize = 1024 * 1024;
 /// holds 6), and an output this server signs holds one.
 const MAX_STORE_MANIFESTS: usize = 64;
 
-/// The most compressed manifests a store read from an asset
-/// may hold. With each one inflated no further than
-/// [`MAX_INFLATED_MANIFEST_MIB`], this bounds what one read
-/// inflates in all: 8 MiB. Compressed manifests are
-/// rare. C2PA added them in 1.4, a manifest bound to its
-/// asset by a data hash (as c2pa-rs binds JPEG, PNG and WebP
-/// files by default) may not be compressed, and c2pa-rs
-/// writes one only when asked to: none of its own test
-/// fixtures holds one.
-const MAX_COMPRESSED_MANIFESTS: usize = 8;
-
-/// How far the reader may inflate one compressed manifest,
-/// in MiB, the unit of its setting: as far as the largest
-/// store read at all ([`MAX_SOURCE_STORE_BYTES`]).
-const MAX_INFLATED_MANIFEST_MIB: usize = MAX_SOURCE_STORE_BYTES / (1024 * 1024);
-
 /// What a manifest store holds after its description box,
 /// as [`store_shape`] counts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,59 +474,133 @@ struct StoreShape {
     /// Its manifests: every box at its top level.
     manifests: usize,
     /// Those that hold a `brob` box among their own boxes:
-    /// compressed manifests, which the reader inflates.
+    /// compressed manifests. A store holding one is not read.
+    /// Compressed manifests are rare: C2PA added them in 1.4,
+    /// a manifest bound to its asset by a data hash (as
+    /// c2pa-rs binds JPEG, PNG and WebP files by default) may
+    /// not be compressed, c2pa-rs writes one only when asked
+    /// to, and none of its own test fixtures holds one.
     compressed: usize,
 }
 
+/// The deepest a superbox may sit in a store, the store
+/// itself at depth 0: the reader's own nesting limit.
+const MAX_SUPERBOX_DEPTH: usize = 32;
+
 /// The box at the start of `bytes`: its type, its payload
 /// (what follows its 8-byte header), and the bytes after it.
-/// `None` unless its size is written in 32 bits, covers its
-/// header, and fits in `bytes`.
+/// `None` unless its type is not four zero bytes and its
+/// size is written in 32 bits, covers its header, and fits
+/// in `bytes`.
 fn split_box(bytes: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     let size = usize::try_from(u32::from_be_bytes(*bytes.first_chunk::<4>()?)).ok()?;
     if size < 8 || size > bytes.len() {
         return None;
     }
     let (this, rest) = bytes.split_at(size);
-    Some((&this[4..8], &this[8..], rest))
+    let kind = &this[4..8];
+    if kind == [0; 4] {
+        return None;
+    }
+    Some((kind, &this[8..], rest))
 }
 
-/// The shape of a manifest store, from box headers alone:
-/// nothing is inflated, and nothing is parsed past the
-/// headers of the store's boxes and of each manifest's own.
-/// `None` unless the store is a superbox whose description
-/// box comes first, and those boxes tile their parent
-/// exactly, as a writer lays them out. The reader parses a
-/// store whole before it inflates anything, and when it
-/// parses one laid out that way it finds the same boxes
-/// where this walk does, so the counts are the ones it acts
-/// on; a store laid out any other way is not read. Bytes
-/// after the store's own end are left out, as the reader
-/// leaves them.
+/// Whether `payload`, a description box's payload, reads to
+/// exactly its end as the reader reads one: its type, toggles
+/// that make it requestable and labelled, a label of at least
+/// one character ended by a zero byte, then the optional id
+/// (4 bytes) and signature (32 bytes) its toggles announce,
+/// and, when they announce a private box, a `c2sh` box with a
+/// 32-bit size that takes up the rest.
+fn description_reads_exactly(payload: &[u8]) -> bool {
+    let Some((head, rest)) = payload.split_at_checked(17) else {
+        return false;
+    };
+    let toggles = head[16];
+    if toggles & 0x03 != 0x03 {
+        return false;
+    }
+    let Some(end) = rest.iter().position(|&b| b == 0).filter(|&end| end > 0) else {
+        return false;
+    };
+    let mut rest = &rest[end + 1..];
+    for (bit, len) in [(0x04, 4), (0x08, 32)] {
+        if toggles & bit != 0 {
+            let Some(after) = rest.get(len..) else {
+                return false;
+            };
+            rest = after;
+        }
+    }
+    if toggles & 0x10 != 0 {
+        match split_box(rest) {
+            Some((kind, _, after)) if kind == b"c2sh" && after.is_empty() => return true,
+            _ => return false,
+        }
+    }
+    rest.is_empty()
+}
+
+/// Walk the payload of a superbox at `depth` as the reader
+/// reads one: its description box first, read to exactly its
+/// end, then boxes that tile the rest, every superbox among
+/// them walked the same way, no deeper than
+/// [`MAX_SUPERBOX_DEPTH`]. Calls `each` with the depth and
+/// type of every box after a description box, in order, a
+/// superbox before the boxes inside it. `None` when anything
+/// reads otherwise.
+fn walk_superbox<'a>(
+    payload: &'a [u8],
+    depth: usize,
+    each: &mut impl FnMut(usize, &'a [u8]),
+) -> Option<()> {
+    if depth >= MAX_SUPERBOX_DEPTH {
+        return None;
+    }
+    let (kind, description, mut rest) = split_box(payload)?;
+    if kind != b"jumd" || !description_reads_exactly(description) {
+        return None;
+    }
+    while !rest.is_empty() {
+        let (kind, inner, after) = split_box(rest)?;
+        each(depth, kind);
+        if kind == b"jumb" {
+            walk_superbox(inner, depth + 1, each)?;
+        }
+        rest = after;
+    }
+    Some(())
+}
+
+/// The shape of a manifest store, from box headers and
+/// description boxes alone: nothing is inflated, and no
+/// content box is read. `None` unless the store is a
+/// superbox that reads exactly as [`walk_superbox`] walks
+/// it, at every depth: the reader parses a store whole
+/// before it acts on any manifest, and it finds a store laid
+/// out that way where the walk does, so the counts are the
+/// ones it acts on. A store laid out any other way is not
+/// read. Bytes after the store's own end are left out, as
+/// the reader leaves them.
 fn store_shape(store: &[u8]) -> Option<StoreShape> {
     let (kind, payload, _) = split_box(store)?;
-    let (description, _, mut rest) = split_box(payload)?;
-    if kind != b"jumb" || description != b"jumd" {
+    if kind != b"jumb" {
         return None;
     }
     let mut shape = StoreShape {
         manifests: 0,
         compressed: 0,
     };
-    while !rest.is_empty() {
-        let (kind, mut boxes, after) = split_box(rest)?;
-        let mut compressed = false;
-        if kind == b"jumb" {
-            while !boxes.is_empty() {
-                let (kind, _, after) = split_box(boxes)?;
-                compressed |= kind == b"brob";
-                boxes = after;
-            }
+    let mut counted = false;
+    walk_superbox(payload, 0, &mut |depth, kind| {
+        if depth == 0 {
+            shape.manifests += 1;
+            counted = false;
+        } else if depth == 1 && kind == b"brob" && !counted {
+            shape.compressed += 1;
+            counted = true;
         }
-        shape.manifests += 1;
-        shape.compressed += usize::from(compressed);
-        rest = after;
-    }
+    })?;
     Some(shape)
 }
 
@@ -606,13 +663,11 @@ fn bmff_store_pair(asset: &[u8]) -> bool {
 /// a `format` asset, when that store is within the bounds on
 /// a read. The store is copied out of the asset first,
 /// without parsing it, and measured: at most
-/// [`MAX_SOURCE_STORE_BYTES`], at most
-/// [`MAX_STORE_MANIFESTS`] manifests, at most
-/// [`MAX_COMPRESSED_MANIFESTS`] of them compressed
-/// ([`store_shape`]), and not an ISO BMFF pair that copying
-/// it out would parse ([`bmff_store_pair`]). The reader then
-/// inflates no compressed manifest past
-/// [`MAX_INFLATED_MANIFEST_MIB`] ([`reading_context`]). What
+/// [`MAX_SOURCE_STORE_BYTES`], laid out as [`store_shape`]
+/// walks it, at most [`MAX_STORE_MANIFESTS`] manifests and
+/// none of them compressed, and not an ISO BMFF pair that
+/// copying it out would parse ([`bmff_store_pair`]). The
+/// reader inflates nothing either ([`reading_context`]). What
 /// it validates is exactly the store that was measured,
 /// against the asset read as `format`: the reader is handed
 /// those bytes rather than finding the store again, since its
@@ -630,7 +685,7 @@ fn read_store(asset: &[u8], format: &str) -> Option<Reader> {
         return None;
     }
     let shape = store_shape(&store)?;
-    if shape.manifests > MAX_STORE_MANIFESTS || shape.compressed > MAX_COMPRESSED_MANIFESTS {
+    if shape.manifests > MAX_STORE_MANIFESTS || shape.compressed > 0 {
         return None;
     }
     Reader::from_context(reading_context())
@@ -1417,16 +1472,16 @@ mod store_tests;
 
 /// `asset` signed with the test identity as a `format`
 /// asset, twice over, for other modules' suites: once with
-/// as many compressed manifests added to its store as a read
-/// takes, and once with one more, a store that is not read.
-/// Either asset's own manifest reads `invalid`, as its store
-/// has moved.
+/// its store rewritten as it was, and once with a compressed
+/// manifest added to it, a store that is not read. Either
+/// asset's own manifest reads `invalid`, as its store has
+/// moved.
 #[cfg(test)]
-pub(crate) fn test_sources_at_the_compressed_bound(
+pub(crate) fn test_sources_without_and_with_a_compressed_manifest(
     asset: &[u8],
     format: &str,
 ) -> (Vec<u8>, Vec<u8>) {
-    store_tests::at_the_compressed_bound(asset, format)
+    store_tests::without_and_with_a_compressed_manifest(asset, format)
 }
 
 /// The test identity whose common name runs past 64

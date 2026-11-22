@@ -1,10 +1,9 @@
 //! The bounds on reading a manifest store, for meta's
 //! summary of an asset and for the status a signed output
-//! records about its parent: the store's size, how many
-//! manifests it holds, how many of those are compressed, and
-//! how far one compressed manifest may inflate. A store past
-//! any of them is not read, as a store that does not parse is
-//! not.
+//! records about its parent: the store's size, its layout,
+//! how many manifests it holds, and whether any of them is
+//! compressed. A store past any of them is not read, as a
+//! store that does not parse is not.
 
 use super::*;
 
@@ -67,7 +66,7 @@ fn brotli_stream(bytes: &[u8]) -> Vec<u8> {
 
 /// A compressed manifest: a `brob` box whose stream inflates
 /// to exactly `inflated` bytes, a manifest of a type no reader
-/// knows. A reader inflates it, then skips it.
+/// knows.
 fn compressed_manifest(n: usize, inflated: usize) -> Vec<u8> {
     compressed_manifest_behind(n, inflated, &[])
 }
@@ -128,24 +127,33 @@ fn compressed(count: usize) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn a_store_with_more_compressed_manifests_than_the_bound_is_not_read() {
+fn a_store_with_a_compressed_manifest_is_not_read() {
     let asset = signed_png();
-    let within = with_extra_manifests(&asset, "image/png", &compressed(MAX_COMPRESSED_MANIFESTS));
-    let summary = read_manifest(&within, "image/png").expect("a store within the bound is read");
+    // A manifest stored as it is: the store is read (its own
+    // manifest reads `invalid`, since the store moved).
+    let without = with_extra_manifests(&asset, "image/png", &[skipped_manifest(0)]);
+    let summary = read_manifest(&without, "image/png").expect("the store is read");
     assert_eq!(summary.state, "invalid", "the store moved: {summary:?}");
     assert_eq!(
         summary.manifests, 1,
         "a manifest of a type no reader knows is skipped"
     );
-    assert!(source_status(&within, "image/png").is_some());
-    // One more, and neither meta nor signing reads the store.
-    let over = with_extra_manifests(
-        &asset,
+    assert!(source_status(&without, "image/png").is_some());
+    // One small compressed manifest instead, and neither meta
+    // nor signing reads the store.
+    let with = with_extra_manifests(&asset, "image/png", &[compressed_manifest(0, 1024)]);
+    assert_eq!(read_manifest(&with, "image/png"), None);
+    assert_eq!(source_status(&with, "image/png"), None);
+    // The reader fails it as well when it is handed the store
+    // directly: it inflates no compressed manifest.
+    let store = c2pa::jumbf_io::load_jumbf_from_memory("image/png", &with).expect("a store");
+    assert_eq!(store_shape(&store).map(|shape| shape.compressed), Some(1));
+    let read = Reader::from_context(reading_context()).with_manifest_data_and_stream(
+        &store,
         "image/png",
-        &compressed(MAX_COMPRESSED_MANIFESTS + 1),
+        Cursor::new(&with),
     );
-    assert_eq!(read_manifest(&over, "image/png"), None);
-    assert_eq!(source_status(&over, "image/png"), None);
+    assert!(read.is_err(), "the reader read a compressed manifest");
 }
 
 #[test]
@@ -160,23 +168,6 @@ fn a_store_with_more_manifests_than_the_bound_is_not_read() {
     let over = with_extra_manifests(&asset, "image/png", &skipped(MAX_STORE_MANIFESTS));
     assert_eq!(read_manifest(&over, "image/png"), None);
     assert_eq!(source_status(&over, "image/png"), None);
-}
-
-#[test]
-fn a_compressed_manifest_inflates_no_further_than_the_store_bound() {
-    // A compressed manifest may inflate to the size of the
-    // largest store read at all, and no further: one that
-    // would inflate past it fails the store, as a manifest
-    // that does not decompress does.
-    let asset = signed_png();
-    let at = [compressed_manifest(0, MAX_SOURCE_STORE_BYTES)];
-    let at = with_extra_manifests(&asset, "image/png", &at);
-    assert!(read_manifest(&at, "image/png").is_some());
-    assert!(source_status(&at, "image/png").is_some());
-    let past = [compressed_manifest(0, MAX_SOURCE_STORE_BYTES + 1)];
-    let past = with_extra_manifests(&asset, "image/png", &past);
-    assert_eq!(read_manifest(&past, "image/png"), None);
-    assert_eq!(source_status(&past, "image/png"), None);
 }
 
 #[test]
@@ -254,8 +245,11 @@ fn a_bmff_store_that_comes_as_an_update_pair_is_not_read() {
     assert_eq!(source_status(&pair, "image/heic"), None);
 }
 
-/// See [`super::test_sources_at_the_compressed_bound`].
-pub(super) fn at_the_compressed_bound(asset: &[u8], format: &str) -> (Vec<u8>, Vec<u8>) {
+/// See [`super::test_sources_without_and_with_a_compressed_manifest`].
+pub(super) fn without_and_with_a_compressed_manifest(
+    asset: &[u8],
+    format: &str,
+) -> (Vec<u8>, Vec<u8>) {
     let signed = test_signer()
         .sign(
             asset,
@@ -267,8 +261,8 @@ pub(super) fn at_the_compressed_bound(asset: &[u8], format: &str) -> (Vec<u8>, V
         )
         .expect("signing works");
     (
-        with_extra_manifests(&signed, format, &compressed(MAX_COMPRESSED_MANIFESTS)),
-        with_extra_manifests(&signed, format, &compressed(MAX_COMPRESSED_MANIFESTS + 1)),
+        with_extra_manifests(&signed, format, &[skipped_manifest(0)]),
+        with_extra_manifests(&signed, format, &[compressed_manifest(0, 1024)]),
     )
 }
 
@@ -313,20 +307,21 @@ fn the_walk_counts_the_manifests_of_a_store() {
 
 #[test]
 fn a_brob_box_anywhere_in_a_manifest_counts_it_as_compressed() {
-    // The reader inflates a manifest whose first box of a type
-    // it knows is a `brob`, and it skips boxes of other types
-    // before it: a `brob` box behind one is inflated too, so
-    // any `brob` box makes a manifest count.
+    // A `brob` box behind a box of another type counts too, and
+    // the reader, handed such a store directly, fails it.
     let ahead = [bmff_box(b"zzzz", &[0; 16])];
-    let late = |inflated| compressed_manifest_behind(0, inflated, &ahead);
-    let shape = store_shape(&store_of(&[late(4096)])).expect("the store tiles");
+    let late = compressed_manifest_behind(0, 4096, &ahead);
+    let shape = store_shape(&store_of(std::slice::from_ref(&late))).expect("the store tiles");
     assert_eq!(shape.compressed, 1);
-    let asset = signed_png();
-    let small = with_extra_manifests(&asset, "image/png", &[late(4096)]);
-    assert!(read_manifest(&small, "image/png").is_some());
-    // Past the inflate bound, the store fails: it was inflated.
-    let large = with_extra_manifests(&asset, "image/png", &[late(MAX_SOURCE_STORE_BYTES + 1)]);
-    assert_eq!(read_manifest(&large, "image/png"), None);
+    let asset = with_extra_manifests(&signed_png(), "image/png", &[late]);
+    assert_eq!(read_manifest(&asset, "image/png"), None);
+    let store = c2pa::jumbf_io::load_jumbf_from_memory("image/png", &asset).expect("a store");
+    let read = Reader::from_context(reading_context()).with_manifest_data_and_stream(
+        &store,
+        "image/png",
+        Cursor::new(&asset),
+    );
+    assert!(read.is_err(), "the reader read a compressed manifest");
 }
 
 #[test]
@@ -434,4 +429,291 @@ fn the_walks_take_any_truncation_or_flipped_byte() {
         }
     }
     assert!(!bmff_store_pair(&file));
+}
+
+/// A box whose type is four zero bytes.
+fn zero_type_box() -> Vec<u8> {
+    bmff_box(&[0; 4], &[])
+}
+
+/// A box of type `kind` around `payload`, its size written in
+/// 64 bits (a size field of 1).
+fn large_size_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = 1u32.to_be_bytes().to_vec();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(&(16 + payload.len() as u64).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A box of type `kind` around `payload`, its size field 0.
+fn zero_size_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = 0u32.to_be_bytes().to_vec();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A manifest of a type no reader knows, labelled `label`,
+/// holding `boxes` after its description box.
+fn manifest_holding(label: &str, boxes: &[Vec<u8>]) -> Vec<u8> {
+    superbox(UNKNOWN_TYPE, label, boxes)
+}
+
+/// `boxes`, then one manifest more than a read takes.
+fn ahead_of_manifests(boxes: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut all = boxes.to_vec();
+    all.extend((0..=MAX_STORE_MANIFESTS).map(skipped_manifest));
+    all
+}
+
+/// The payload of a store's description box: its type,
+/// `toggles`, its label, and `rest` after the label.
+fn store_description(toggles: u8, rest: &[u8]) -> Vec<u8> {
+    let mut description: Vec<u8> = (0..16)
+        .map(|i| u8::from_str_radix(&STORE_TYPE[2 * i..2 * i + 2], 16).expect("a hex type"))
+        .collect();
+    description.push(toggles);
+    description.extend_from_slice(b"c2pa\0");
+    description.extend_from_slice(rest);
+    description
+}
+
+/// The manifests of the store `asset` carries, as its store
+/// holds them after its description box.
+fn manifests_of(asset: &[u8]) -> Vec<u8> {
+    let store = c2pa::jumbf_io::load_jumbf_from_memory("image/png", asset).expect("a store");
+    let description = u32::from_be_bytes(store[8..12].try_into().expect("a box size"));
+    store[8 + description as usize..].to_vec()
+}
+
+/// A store whose description box holds `description` and
+/// whose boxes after it are `boxes`.
+fn store_with(description: &[u8], boxes: &[u8]) -> Vec<u8> {
+    bmff_box(
+        b"jumb",
+        &[bmff_box(b"jumd", description), boxes.to_vec()].concat(),
+    )
+}
+
+#[test]
+fn a_box_whose_type_is_zero_is_refused_at_any_depth() {
+    // A box whose type is four zero bytes, in a manifest or in
+    // any superbox below one: the walk refuses the store, and
+    // neither meta nor signing reads it.
+    let asset = signed_png();
+    let zero = |count: usize| vec![zero_type_box(); count];
+    for (case, manifest) in [
+        (
+            "in a manifest",
+            manifest_holding("urn:c2pa:outer", &ahead_of_manifests(&zero(1))),
+        ),
+        (
+            "a level below",
+            manifest_holding(
+                "urn:c2pa:outer",
+                &[manifest_holding(
+                    "urn:c2pa:inner",
+                    &ahead_of_manifests(&zero(2)),
+                )],
+            ),
+        ),
+        (
+            "two levels below",
+            manifest_holding(
+                "urn:c2pa:outer",
+                &[manifest_holding(
+                    "urn:c2pa:middle",
+                    &[manifest_holding(
+                        "urn:c2pa:inner",
+                        &ahead_of_manifests(&zero(3)),
+                    )],
+                )],
+            ),
+        ),
+    ] {
+        let source = with_extra_manifests(&asset, "image/png", &[manifest]);
+        let store = c2pa::jumbf_io::load_jumbf_from_memory("image/png", &source).expect("a store");
+        assert!(store.len() <= MAX_SOURCE_STORE_BYTES, "{case}");
+        assert_eq!(store_shape(&store), None, "{case}");
+        assert_eq!(read_manifest(&source, "image/png"), None, "{case}");
+        assert_eq!(source_status(&source, "image/png"), None, "{case}");
+    }
+}
+
+#[test]
+fn a_box_with_a_size_field_of_0_or_1_is_refused_at_any_depth() {
+    // A size field of 0 or 1 (a size written in 64 bits), in a
+    // manifest or in any superbox below one: the walk refuses
+    // the store, and neither meta nor signing reads it.
+    let asset = signed_png();
+    let zeros = [zero_type_box(), zero_type_box()].concat();
+    let below = |boxes: &[Vec<u8>]| {
+        manifest_holding(
+            "urn:c2pa:outer",
+            &[manifest_holding("urn:c2pa:inner", boxes)],
+        )
+    };
+    let after = ahead_of_manifests(&[]).concat();
+    for (case, manifest) in [
+        (
+            "a 64-bit size below a manifest",
+            below(&[large_size_box(
+                b"free",
+                &[zeros.clone(), after.clone()].concat(),
+            )]),
+        ),
+        (
+            "a size of 0 below a manifest",
+            below(&ahead_of_manifests(&[
+                zero_size_box(b"cbor", &[]),
+                zero_type_box(),
+                zero_type_box(),
+            ])),
+        ),
+        (
+            "a 64-bit size in a manifest",
+            manifest_holding("urn:c2pa:outer", &[large_size_box(b"free", &[0; 16])]),
+        ),
+    ] {
+        let source = with_extra_manifests(&asset, "image/png", &[manifest]);
+        let store = c2pa::jumbf_io::load_jumbf_from_memory("image/png", &source).expect("a store");
+        assert_eq!(store_shape(&store), None, "{case}");
+        assert_eq!(read_manifest(&source, "image/png"), None, "{case}");
+        assert_eq!(source_status(&source, "image/png"), None, "{case}");
+    }
+}
+
+#[test]
+fn a_description_box_is_walked_to_its_exact_end() {
+    let asset = signed_png();
+    let manifests = manifests_of(&asset);
+    // A label, then the id, the signature and the private salt
+    // box its toggles announce: walked, and the store is read.
+    let salt = bmff_box(b"c2sh", &[0x5A; 16]);
+    for (case, toggles, rest) in [
+        ("a label", 0x03, Vec::new()),
+        ("an id", 0x07, vec![0; 4]),
+        ("an id and a signature", 0x0F, vec![0; 36]),
+        (
+            "an id, a signature and a salt",
+            0x1F,
+            [&[0; 36][..], &salt].concat(),
+        ),
+    ] {
+        let store = store_with(&store_description(toggles, &rest), &manifests);
+        assert!(store_shape(&store).is_some(), "{case}");
+        let source = c2pa::jumbf_io::save_jumbf_to_memory("image/png", &asset, &store)
+            .expect("the store is written");
+        assert!(read_manifest(&source, "image/png").is_some(), "{case}");
+    }
+    // Anything else is refused.
+    let mut no_end: Vec<u8> = store_description(0x03, &[]);
+    no_end.pop();
+    let mut empty_label = store_description(0x03, &[]);
+    empty_label.truncate(17);
+    empty_label.push(0);
+    for (case, description) in [
+        ("not labelled", store_description(0x01, &[])),
+        ("a label with no end", no_end),
+        ("an empty label", empty_label),
+        ("an id cut short", store_description(0x07, &[0; 2])),
+        ("bytes after the label", store_description(0x03, &[0; 3])),
+        (
+            "a private box that is not a salt",
+            store_description(0x13, &bmff_box(b"zzzz", &[0; 16])),
+        ),
+        (
+            "a salt short of the end",
+            store_description(0x13, &[salt.clone(), vec![0; 4]].concat()),
+        ),
+        (
+            "a salt with a 64-bit size",
+            store_description(0x13, &large_size_box(b"c2sh", &[0x5A; 16])),
+        ),
+    ] {
+        assert_eq!(
+            store_shape(&store_with(&description, &manifests)),
+            None,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_superbox_deeper_than_the_reader_goes_is_refused() {
+    // The store sits at depth 0: a superbox at depth 31 is
+    // walked, one at depth 32 is not.
+    let nested = |depth: usize| {
+        let mut boxes = vec![bmff_box(b"cbor", &[0xA0])];
+        for level in (1..=depth).rev() {
+            boxes = vec![manifest_holding(&format!("urn:c2pa:level-{level}"), &boxes)];
+        }
+        store_of(&boxes)
+    };
+    assert!(store_shape(&nested(MAX_SUPERBOX_DEPTH - 1)).is_some());
+    assert_eq!(store_shape(&nested(MAX_SUPERBOX_DEPTH)), None);
+}
+
+#[test]
+fn a_store_the_walk_refuses_is_not_read_with_any_contents() {
+    // Each refused layout, with compressed manifests or more
+    // manifests than a read takes after it: neither meta nor
+    // signing reads the store.
+    let asset = signed_png();
+    let manifests = manifests_of(&asset);
+    let compressed_after = |boxes: &[Vec<u8>]| {
+        let mut all = boxes.to_vec();
+        all.extend(compressed(2));
+        all
+    };
+    let zeros = [zero_type_box(), zero_type_box()].concat();
+    let below = |boxes: &[Vec<u8>]| {
+        manifest_holding(
+            "urn:c2pa:outer",
+            &[manifest_holding("urn:c2pa:inner", boxes)],
+        )
+    };
+    let extra = |manifest: Vec<u8>| with_extra_manifests(&asset, "image/png", &[manifest]);
+    let salted = {
+        let description = store_description(0x13, &large_size_box(b"c2sh", &[0x5A; 16]));
+        let boxes = [compressed(2).concat(), manifests.clone()].concat();
+        let store = store_with(&description, &bmff_box(b"free", &boxes));
+        c2pa::jumbf_io::save_jumbf_to_memory("image/png", &asset, &store)
+            .expect("the store is written")
+    };
+    for (case, source) in [
+        (
+            "a zero type, then compressed manifests",
+            extra(manifest_holding(
+                "urn:c2pa:outer",
+                &compressed_after(&[zero_type_box()]),
+            )),
+        ),
+        (
+            "a zero type, then manifests",
+            extra(manifest_holding(
+                "urn:c2pa:outer",
+                &ahead_of_manifests(&[zero_type_box()]),
+            )),
+        ),
+        (
+            "zero types a level below, then compressed manifests",
+            extra(below(&compressed_after(&[
+                zero_type_box(),
+                zero_type_box(),
+            ]))),
+        ),
+        (
+            "a 64-bit size a level below, then compressed manifests",
+            extra(below(&[large_size_box(
+                b"free",
+                &[zeros.clone(), compressed(2).concat()].concat(),
+            )])),
+        ),
+        ("a salt with a 64-bit size", salted),
+    ] {
+        assert_eq!(read_manifest(&source, "image/png"), None, "meta: {case}");
+        assert_eq!(source_status(&source, "image/png"), None, "signing: {case}");
+    }
 }
