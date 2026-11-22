@@ -466,12 +466,18 @@ fn jpeg_xl_holds_alpha_to_quality_15_only_under_it_and_up_to_64x64() {
                 };
                 let what = format!("{speed:?} at quality {quality}, {width}x{height}");
                 assert_eq!(
-                    format!("{:?}", jxl_config(quality, speed, width, height, true)),
+                    format!(
+                        "{:?}",
+                        jxl_config(quality, speed, width, height, true, None)
+                    ),
                     format!("{with_alpha:?}"),
                     "{what}, with alpha"
                 );
                 assert_eq!(
-                    format!("{:?}", jxl_config(quality, speed, width, height, false)),
+                    format!(
+                        "{:?}",
+                        jxl_config(quality, speed, width, height, false, None)
+                    ),
                     format!("{plain:?}"),
                     "{what}, without alpha"
                 );
