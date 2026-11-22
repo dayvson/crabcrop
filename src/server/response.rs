@@ -9,6 +9,7 @@
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use super::admission::unix_seconds;
 use super::wants_meta;
 use crate::engine::EngineError;
 use crate::loader::LoadError;
@@ -79,7 +80,11 @@ pub(in crate::server) fn attach_cache_headers(
 /// The cache lifetime is the immutable year unless the request
 /// carried a `maxage:` directive (issue #159), which substitutes
 /// its own value for that response only: the stored entry is
-/// shared, headers are composed per response. `immutable` rides
+/// shared, headers are composed per response. A URL's `exp:`
+/// second (`expires_at`) caps the lifetime too, at the seconds
+/// the URL has left as this response is composed, so a cache
+/// that follows the header stops reusing its copy from the
+/// second the server refuses the URL. `immutable` rides
 /// along at any positive value (during the lifetime the body
 /// will not change, so no revalidation is owed); at `max-age=0`
 /// it is dropped, because a response that is stale on arrival
@@ -90,6 +95,7 @@ pub(in crate::server) fn respond(
     quality: Option<u8>,
     bytes: bytes::Bytes,
     max_age: Option<u32>,
+    expires_at: Option<u64>,
     client_hints: bool,
 ) -> Response {
     use axum::http::HeaderValue;
@@ -103,7 +109,7 @@ pub(in crate::server) fn respond(
         ImageFormat::Mp4 => "video/mp4",
         ImageFormat::WebM => "video/webm",
     };
-    let cache_control = match max_age {
+    let cache_control = match image_max_age(max_age, expires_at) {
         None => HeaderValue::from_static("public, max-age=31536000, immutable"),
         Some(0) => HeaderValue::from_static("public, max-age=0"),
         Some(n) => format!("public, max-age={n}, immutable").parse().unwrap(),
@@ -130,6 +136,26 @@ pub(in crate::server) fn respond(
         );
     }
     (headers, bytes).into_response()
+}
+
+/// The `max-age` of an image response, when it is not the
+/// year: the request's `maxage:`, cut to the seconds left
+/// before its `exp:` second when those are fewer, and 0 from
+/// that second on. The clock is read here, as the response is
+/// composed, not at admission: a render, a gate wait or a slow
+/// tier can take seconds in between, and a cache may count the
+/// lifetime from when it receives the response. An expiry no
+/// sooner than the lifetime the request already has leaves
+/// that lifetime as it is, the year included.
+fn image_max_age(max_age: Option<u32>, expires_at: Option<u64>) -> Option<u32> {
+    let Some(at) = expires_at else {
+        return max_age;
+    };
+    let longest = max_age.unwrap_or(crate::url::MAX_CACHE_AGE);
+    match u32::try_from(at.saturating_sub(unix_seconds())) {
+        Ok(left) if left < longest => Some(left),
+        _ => max_age,
+    }
 }
 
 pub(in crate::server) fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {

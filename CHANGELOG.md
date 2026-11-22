@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Security
+
+- An expiring URL's image responses now carry a `max-age` no longer than the seconds left before its `exp:` second, so a browser or CDN that follows the response headers stops reusing a copy when the server starts refusing the URL. They carried the immutable year, or the `maxage:` lifetime, however close the expiry was. The seconds left are counted as each response is made, so renders, hits from every tier, `304`s and `HEAD`s agree; with `maxage:` as well the shorter lifetime applies, `immutable` stays while the lifetime is positive, and a response made at or past the expiry second answers `max-age=0`. URLs without `exp:`, or with one more than a year away, keep their headers unchanged, and no output bytes change. The CDN recipes no longer suggest a fixed edge TTL for expiring paths, since one would now outlast the lifetime crabcrop sends: remove it if you added one.
+
 ## [0.15.0] - 2026-11-22
 
 - Boot now refuses a `CRABCROP_METRICS_TOKEN` under 16 bytes, and the Helm chart a secret given as a plain value: fix both before upgrading (issue #632).
