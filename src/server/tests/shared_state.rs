@@ -87,6 +87,7 @@ fn an_engine_job_shares_the_states_providers() {
         groups: Vec::new(),
         cache_key: "key".to_string(),
         max_age: None,
+        expires_at: None,
         sealed: false,
         progress: MissProgress::default(),
         disk_handoff: None,

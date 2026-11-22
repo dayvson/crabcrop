@@ -7,7 +7,7 @@ A successful image response carries:
 | Header | Value |
 | --- | --- |
 | `Content-Type` | The output format's media type, e.g. `image/webp`. |
-| `Cache-Control` | `public, max-age=31536000, immutable`, or `private` with the same lifetime when a client hint applies to the response (see [Client hints and shared caches](#client-hints-and-shared-caches)). |
+| `Cache-Control` | `public, max-age=31536000, immutable`, or `private` with the same lifetime when a client hint applies to the response (see [Client hints and shared caches](#client-hints-and-shared-caches)). A `maxage:` segment shortens the lifetime, and an `exp:` segment caps it at the seconds the URL has left before it expires; the shorter of the two applies, and `max-age=0` comes without `immutable` (see [Per-request cache lifetime](url-grammar.md#per-request-cache-lifetime)). |
 | `ETag` | A strong validator: a digest of the response's exact bytes (see [Caching](#caching)). |
 | `Vary` | `Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data`, or `Accept` alone with `CRABCROP_CLIENT_HINTS=0`. Every answer of an image URL carries it, errors and meta included. |
 | `Accept-CH` | `Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width`, the hints a browser may send on later requests. Not sent with `CRABCROP_CLIENT_HINTS=0`. |

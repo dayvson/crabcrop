@@ -19,7 +19,7 @@ Do not enable Token Authentication on this Pull Zone (the zone's Security settin
 
 In the Pull Zone's **Caching > General** settings:
 
-- **Cache Expiration Time: Respect Origin Cache-Control.** This is the setting the whole recipe hangs on. Picking any fixed duration instead replaces crabcrop's per-response TTLs with one number: the year on images, the shorter lifetime a `maxage:` segment pins for its own URL, all flattened. Respecting the origin leaves each response class with the TTL crabcrop chose for it.
+- **Cache Expiration Time: Respect Origin Cache-Control.** This is the setting the whole recipe hangs on. Picking any fixed duration instead replaces crabcrop's per-response TTLs with one number: the year on images, the shorter lifetime a `maxage:` or `exp:` segment sets for its own URL, all flattened. Respecting the origin leaves each response class with the TTL crabcrop chose for it.
 - **Browser Cache Expiration Time: respect the origin** (match the server value; do not pick an Override). This setting rewrites the `Cache-Control` header browsers see. An override here would strip the `immutable` year crabcrop deliberately sends, or stamp a cacheable header onto responses that were never meant for a browser cache.
 - **Smart Cache: off.** Smart Cache decides what may be cached by file extension and MIME type instead of by response headers, and it is on by default for zones accelerated by Bunny DNS. crabcrop decides by header, and its URLs end with the source path, so an extension gate gives the wrong answer in both directions: an extensionless source is never cached at all, and negotiated bytes are gated by the source's name rather than the response's type. With it off, the standard expiration logic above decides, which is the origin's headers.
 - **Cache Error Responses: leave on** (the default). With it on, Bunny does not cache error responses at all; crabcrop's errors carry `no-store` anyway, so the two agree. Turning it off restores a brief (5 second) protective cache of error responses that this origin does not need.
@@ -49,13 +49,9 @@ Leave the other Vary Cache settings off: each one multiplies the stored versions
 
 ## 4. Expiring URLs: the edge does not read them
 
-`exp:` expiry lives inside the signed path, and Bunny never looks inside the URL. A response cached before expiry keeps being served until its TTL runs out or it is purged: with step 1 in place, that can be a year. What expiry still guarantees is that the origin refuses the URL, so nothing new gets rendered or re-cached after it passes.
+`exp:` expiry lives inside the signed path, and Bunny never looks inside the URL. It does not have to: crabcrop caps the `max-age` of an expiring URL's response at the seconds left before its `exp:` second, and with step 1 in place the origin's `Cache-Control` sets the TTL, so a cached copy goes stale when the URL expires. The edge then asks the origin again, the origin refuses the URL with `403` and `no-store`, and nothing new gets rendered or re-cached.
 
-If expiry has to bite at the edge, pick one:
-
-- Cap the edge TTL for expiring paths with an Edge Rule: action **Override Cache Time**, condition **Request URL** matching `*/exp:*/*` (any path carrying an `exp:` segment), value no higher than the shortest signed lifetime you mint, in seconds. The override replaces crabcrop's TTL for those paths only. Cache-time overrides are first-match, so if you add more of them later, order this one deliberately.
-- Purge the URL when it expires, from the same job that tracks the expiry (step 5; one URL purge from the generous Exact budget).
-- Accept it, when expiry is about minting (no new renders) rather than access control. Most signed-URL deployments mean exactly that.
+Keep the expiring paths on Respect Origin Cache-Control. An Override Cache Time Edge Rule on them replaces crabcrop's lifetime with one fixed value, which outlives the expiry of a URL first fetched close to it; an earlier version of this recipe suggested one, so remove it if you added it. Where a copy must not be served after the expiry even as stale content, also purge the URL when it expires, from the same job that tracks the expiry (step 5; one URL purge from the generous Exact budget).
 
 ## 5. Purge mapping
 
@@ -95,4 +91,4 @@ Run against your Pull Zone after setup:
 
 ## Teardown
 
-Delete the Pull Zone and crabcrop is off Bunny entirely. To keep the zone but undo the recipe: set the Cache Expiration Time back to a fixed duration of your choice, remove the step 4 Edge Rule, unlink the middleware script, and turn Origin Shield off. Bunny Optimizer and Token Authentication were never enabled, so there is nothing to switch back there.
+Delete the Pull Zone and crabcrop is off Bunny entirely. To keep the zone but undo the recipe: set the Cache Expiration Time back to a fixed duration of your choice, unlink the middleware script, and turn Origin Shield off. Bunny Optimizer and Token Authentication were never enabled, so there is nothing to switch back there.
