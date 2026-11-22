@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Security
+
+- `/explain`'s source probe is now charged against the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), as a cache miss's source is. The probe reads at most 256 KB of the source's head, and that head was held outside the budget. It is now charged as it arrives, the most the probe reads standing for the body's length, and stays charged until the probe is done with it, its wait for the probe gate included: `crabcrop_source_buffer_bytes` counts it, and a probe that cannot get budget within 5 seconds answers `503 server_busy` with `Retry-After: 1`, as a miss does. The buffer the head is read into grows with what arrives. The report is unchanged.
+
 ## [0.15.0] - 2026-11-22
 
 - Boot now refuses a `CRABCROP_METRICS_TOKEN` under 16 bytes, and the Helm chart a secret given as a plain value: fix both before upgrading (issue #632).

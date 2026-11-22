@@ -9,6 +9,7 @@ mod disk_hang;
 mod disk_scan;
 mod disk_stall;
 mod explain_admission;
+mod explain_budget;
 mod meta_frame;
 mod request_log;
 mod shared_bounds;

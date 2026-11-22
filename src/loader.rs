@@ -200,10 +200,11 @@ impl MediaAdmission {
 /// (issue #403). Cache misses charge their source and
 /// watermark bodies against it as the bytes arrive (see
 /// [`SourceCharge`]) and keep the charge until the render
-/// job that uses the bytes finishes, so peak buffered
-/// source memory is bounded by the budget rather than by
-/// how many requests arrive at once. Clones share one
-/// budget.
+/// job that uses the bytes finishes, and an explain probe
+/// charges the head it reads until it has probed it, so
+/// peak buffered source memory is bounded by the budget
+/// rather than by how many requests arrive at once. Clones
+/// share one budget.
 #[derive(Debug, Clone)]
 pub struct SourceBudget {
     sem: std::sync::Arc<tokio::sync::Semaphore>,
@@ -509,6 +510,28 @@ impl<'a> BodyCharge<'a> {
     /// keeps budget past its received bytes.
     fn window_closes(&self) -> Option<tokio::time::Instant> {
         self.window.map(|w| w.opened + BODY_GRANT)
+    }
+
+    /// The next chunk of `resp`, an origin body that has
+    /// received `received` bytes so far, judging each window
+    /// that closes while the chunk is awaited.
+    async fn next_chunk(
+        &mut self,
+        resp: &mut reqwest::Response,
+        received: usize,
+    ) -> Result<Option<bytes::Bytes>, LoadError> {
+        loop {
+            self.judge(received);
+            let next = match self.window_closes() {
+                Some(closes) => match tokio::time::timeout_at(closes, resp.chunk()).await {
+                    Ok(next) => next,
+                    // The window closed first: judge it.
+                    Err(_) => continue,
+                },
+                None => resp.chunk().await,
+            };
+            return next.map_err(map_request_error);
+        }
     }
 
     /// Judge the window once it has closed, the body having
@@ -1208,6 +1231,25 @@ enum StoreKind {
 /// no more.
 const PROBE_HEAD_BYTES: usize = 256 * 1024;
 
+/// How far a probe's head buffer grows ahead of the bytes in
+/// it at most (see [`extend_head`]).
+const PROBE_HEAD_STEP: usize = 64 * 1024;
+
+/// Append `kept` to a probe's `head`, which comes to hold at
+/// most `most` bytes (the probe head cap, or the declared
+/// length when that is smaller). The buffer grows with what
+/// arrives, at most [`PROBE_HEAD_STEP`] past it at a time and
+/// never past `most`, rather than doubling or reserving the
+/// cap before anything has arrived, so the memory it takes
+/// stays within a step of the bytes the probe charges for it.
+fn extend_head(head: &mut Vec<u8>, kept: &[u8], most: usize) {
+    if head.capacity() - head.len() < kept.len() {
+        let step = PROBE_HEAD_STEP.min(most.saturating_sub(head.len()));
+        head.reserve_exact(kept.len().max(step));
+    }
+    head.extend_from_slice(kept);
+}
+
 /// What a probe load learned about a source: the head of
 /// the body, and the body's total size when it is known
 /// without reading the rest (a declared Content-Length, a
@@ -1222,15 +1264,17 @@ pub struct ProbeLoad {
 
 /// Which body read a load performs: the full body, or a
 /// probe that stops as soon as the caller's predicate
-/// settles on the head (or the head cap is reached).
+/// settles on the head (or the head cap is reached). Either
+/// is charged against the request's source budget share
+/// when there is one (issue #403).
 enum BodyMode<'a> {
-    /// The whole body, charged against the request's
-    /// source budget share when there is one (issue #403).
+    /// The whole body.
     Full(Option<Charged<'a>>),
-    Probe(&'a (dyn Fn(&[u8]) -> bool + Sync)),
+    /// The head, which the predicate judges.
+    Probe(&'a (dyn Fn(&[u8]) -> bool + Sync), Option<Charged<'a>>),
 }
 
-/// A charged full load: the request's share of the source
+/// A charged load: the request's share of the source
 /// budget, and when the load times out, which a body's
 /// arrival is judged against (see [`BODY_GRANT`]).
 #[derive(Clone, Copy)]
@@ -1422,17 +1466,49 @@ impl Loader {
     /// head cap is reached), under the same guards and the
     /// same total timeout as a full load. For a caller
     /// that only reads the source's headers (the explain
-    /// report), so a slow or large origin cannot make the
-    /// probe download a whole body it will never use.
+    /// report, which charges its probes: see
+    /// [`Loader::load_probe_charged`]), so a slow or large
+    /// origin cannot make the probe download a whole body
+    /// it will never use.
     pub async fn load_probe(
         &self,
         url: &str,
         admission: MediaAdmission,
         settled: &(dyn Fn(&[u8]) -> bool + Sync),
     ) -> Result<ProbeLoad, LoadError> {
+        self.load_head(url, admission, settled, None).await
+    }
+
+    /// [`Loader::load_probe`], charging the head against
+    /// `charge` as it arrives (issue #403), as
+    /// [`Loader::load_media_charged`] charges a body: the
+    /// most the probe reads, the probe head cap or the
+    /// declared length when that is smaller, stands for the
+    /// body's length. The charge keeps the head's bytes when
+    /// the probe succeeds and drops them when it fails.
+    /// [`LoadError::Busy`] when the request's wait for budget
+    /// ran out.
+    pub async fn load_probe_charged(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        settled: &(dyn Fn(&[u8]) -> bool + Sync),
+        charge: &SourceCharge,
+    ) -> Result<ProbeLoad, LoadError> {
+        self.load_head(url, admission, settled, Some(charge)).await
+    }
+
+    async fn load_head(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        settled: &(dyn Fn(&[u8]) -> bool + Sync),
+        charge: Option<&SourceCharge>,
+    ) -> Result<ProbeLoad, LoadError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
+        let charged = charge.map(|charge| Charged { charge, deadline });
         match self
-            .load_timed(url, admission, BodyMode::Probe(settled), deadline)
+            .load_timed(url, admission, BodyMode::Probe(settled, charged), deadline)
             .await?
         {
             LoadBody::Probe(probe) => Ok(probe),
@@ -1550,8 +1626,9 @@ impl Loader {
             BodyMode::Full(charged) => Ok(LoadBody::Full(
                 self.read_checked_body(resp, admission, *charged).await?,
             )),
-            BodyMode::Probe(settled) => Ok(LoadBody::Probe(
-                self.read_probe_body(resp, admission, settled).await?,
+            BodyMode::Probe(settled, charged) => Ok(LoadBody::Probe(
+                self.read_probe_body(resp, admission, settled, *charged)
+                    .await?,
             )),
         }
     }
@@ -1629,19 +1706,7 @@ impl Loader {
         )
         .await?;
         let mut body = Vec::new();
-        loop {
-            part.judge(body.len());
-            let next = match part.window_closes() {
-                Some(closes) => match tokio::time::timeout_at(closes, resp.chunk()).await {
-                    Ok(next) => next,
-                    // The window closed first: judge it.
-                    Err(_) => continue,
-                },
-                None => resp.chunk().await,
-            };
-            let Some(bytes) = next.map_err(map_request_error)? else {
-                break;
-            };
+        while let Some(bytes) = part.next_chunk(&mut resp, body.len()).await? {
             let received = body.len() + bytes.len();
             if received as u64 > self.max_bytes {
                 return Err(LoadError::TooLarge {
@@ -1660,12 +1725,17 @@ impl Loader {
     /// probe to settle, under the same size cap. A declared
     /// length past the cap keeps the full load's too-large
     /// answer, so the probe never reports facts about a
-    /// source a real request would refuse for its size.
+    /// source a real request would refuse for its size. A
+    /// charged probe (issue #403) charges its head as a
+    /// charged full read charges its body (see `BodyCharge`),
+    /// the most it reads standing for the body's length, and
+    /// keeps exactly the head it read.
     async fn read_probe_body(
         &self,
         mut resp: reqwest::Response,
         admission: MediaAdmission,
         settled: &(dyn Fn(&[u8]) -> bool + Sync),
+        charged: Option<Charged<'_>>,
     ) -> Result<ProbeLoad, LoadError> {
         let declared = Self::check_response_head(&resp, admission)?;
         if declared.is_some_and(|total| total > self.max_bytes) {
@@ -1673,6 +1743,22 @@ impl Loader {
                 limit: self.max_bytes,
             });
         }
+        let most = declared
+            .and_then(|d| usize::try_from(d).ok())
+            .map_or(PROBE_HEAD_BYTES, |d| d.min(PROBE_HEAD_BYTES));
+        let mut part = match charged {
+            Some(charged) => Some(
+                BodyCharge::stream(
+                    charged.charge,
+                    declared,
+                    PROBE_HEAD_BYTES as u64,
+                    &self.read_ahead_pool,
+                    charged.deadline,
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let mut head = Vec::new();
         let mut received: u64 = 0;
         let mut ended = false;
@@ -1680,7 +1766,10 @@ impl Loader {
             if settled(&head) || head.len() >= PROBE_HEAD_BYTES {
                 break;
             }
-            let chunk = resp.chunk().await.map_err(map_request_error)?;
+            let chunk = match &mut part {
+                Some(part) => part.next_chunk(&mut resp, head.len()).await?,
+                None => resp.chunk().await.map_err(map_request_error)?,
+            };
             let Some(bytes) = chunk else {
                 ended = true;
                 break;
@@ -1691,8 +1780,15 @@ impl Loader {
                     limit: self.max_bytes,
                 });
             }
-            let room = PROBE_HEAD_BYTES - head.len();
-            head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            let kept = &bytes[..bytes.len().min(PROBE_HEAD_BYTES - head.len())];
+            if let Some(part) = &mut part {
+                part.cover(head.len() + kept.len()).await?;
+            }
+            extend_head(&mut head, kept, most);
+        }
+        head.shrink_to_fit();
+        if let Some(part) = part {
+            part.finish(head.len());
         }
         let total_bytes = declared.or_else(|| ended.then_some(received));
         Ok(ProbeLoad { head, total_bytes })
@@ -1906,16 +2002,26 @@ impl Loader {
             .await
             .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))??;
         let mut file = tokio::fs::File::from_std(file);
-        if matches!(mode, BodyMode::Probe(_)) {
+        if let BodyMode::Probe(_, charged) = mode {
             // A probe of a file needs only its head; the
             // total is the file's own size. The size cap
-            // keeps the full load's too-large answer.
+            // keeps the full load's too-large answer. A
+            // charged probe reserves the head it will read
+            // before reading it, as a charged file read
+            // reserves the file.
             let total = meta.len();
             if total > self.max_bytes {
                 return Err(LoadError::TooLarge {
                     limit: self.max_bytes,
                 });
             }
+            let most = usize::try_from(total)
+                .unwrap_or(usize::MAX)
+                .min(PROBE_HEAD_BYTES);
+            let mut part = match charged {
+                Some(charged) => Some(BodyCharge::file(charged.charge, most).await?),
+                None => None,
+            };
             let mut head = Vec::new();
             let mut buf = [0u8; 8192];
             while head.len() < PROBE_HEAD_BYTES {
@@ -1923,8 +2029,15 @@ impl Loader {
                 if n == 0 {
                     break;
                 }
-                let room = PROBE_HEAD_BYTES - head.len();
-                head.extend_from_slice(&buf[..n.min(room)]);
+                let kept = &buf[..n.min(PROBE_HEAD_BYTES - head.len())];
+                if let Some(part) = &mut part {
+                    part.cover(head.len() + kept.len()).await?;
+                }
+                extend_head(&mut head, kept, most);
+            }
+            head.shrink_to_fit();
+            if let Some(part) = part {
+                part.finish(head.len());
             }
             return Ok(LoadBody::Probe(ProbeLoad {
                 head,
@@ -3880,7 +3993,7 @@ mod tests {
                 let mode = if full {
                     BodyMode::Full(None)
                 } else {
-                    BodyMode::Probe(&settled)
+                    BodyMode::Probe(&settled, None)
                 };
                 let answer = loader.load_file_checked(url, mode, swap).await;
                 assert!(
@@ -4878,6 +4991,116 @@ mod tests {
         assert_eq!(err, LoadError::Timeout);
         assert_eq!(budget.in_use(), body.len());
         drop(charge);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_charged_probe_keeps_exactly_its_head_and_a_failed_one_keeps_nothing() {
+        // A probe reads at most the head cap, whatever the
+        // body declares, and keeps exactly the head it read,
+        // charged, in a buffer of that size: from an origin,
+        // with a declared length or without one, and from a
+        // file. A probe that fails gives back what it took.
+        let budget = SourceBudget::new(2 << 20);
+        let dir = crate::test_support::scratch_dir("loader-probe-charge");
+        let root = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(root.join("big.png"), vec![0u8; 300_000]).unwrap();
+        std::fs::write(root.join("small.png"), vec![0u8; 1000]).unwrap();
+        let loader = Loader::with_defaults()
+            .unwrap()
+            .with_sources(SourceConfig {
+                file_root: Some(root),
+                ..Default::default()
+            })
+            .with_source_budget(budget.clone());
+        let never = |_: &[u8]| false;
+        let body = vec![0u8; 300_000];
+        let declared = response(
+            "200 OK",
+            &format!(
+                "Content-Type: image/png\r\nContent-Length: {}\r\n",
+                body.len()
+            ),
+            &body,
+        );
+        let undeclared = response("200 OK", "Content-Type: image/png\r\n", &body);
+        let charge = budget.charge(Duration::from_secs(1));
+        let mut held = 0;
+        for (source, answer) in [("declared", &declared), ("undeclared", &undeclared)] {
+            let base = spawn_server(Respond::Bytes(answer.clone())).await;
+            let url = format!("{base}/a.png");
+            let probe = loader
+                .load_probe_charged(&url, MediaAdmission::default(), &never, &charge)
+                .await
+                .unwrap();
+            let head = (probe.head.len(), probe.head.capacity());
+            assert_eq!(head, (PROBE_HEAD_BYTES, PROBE_HEAD_BYTES), "{source}");
+            held += PROBE_HEAD_BYTES;
+            assert_eq!(charge.bytes(), held, "{source}");
+        }
+        for (url, len) in [
+            ("file:///big.png", PROBE_HEAD_BYTES),
+            ("file:///small.png", 1000),
+        ] {
+            let probe = loader
+                .load_probe_charged(url, MediaAdmission::default(), &never, &charge)
+                .await
+                .unwrap();
+            let head = (probe.head.len(), probe.head.capacity());
+            assert_eq!(head, (len, len), "{url}");
+            held += len;
+            assert_eq!(charge.bytes(), held, "{url}");
+        }
+        // A head that settles early keeps what it read, no
+        // more.
+        let base = spawn_server(Respond::Bytes(declared.clone())).await;
+        let probe = loader
+            .load_probe_charged(
+                &format!("{base}/b.png"),
+                MediaAdmission::default(),
+                &|head: &[u8]| !head.is_empty(),
+                &charge,
+            )
+            .await
+            .unwrap();
+        assert!(probe.head.len() < PROBE_HEAD_BYTES);
+        assert_eq!(probe.head.capacity(), probe.head.len());
+        held += probe.head.len();
+        assert_eq!(charge.bytes(), held);
+        // A probe the loader's timeout cancels while its
+        // origin stalls, and one whose head cannot be charged
+        // within its wait, keep nothing.
+        let quick = Loader::new(DEFAULT_MAX_BYTES, Duration::from_millis(300))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let base = spawn_stalling_server(200_000, 1000).await;
+        let err = quick
+            .load_probe_charged(
+                &format!("{base}/c.png"),
+                MediaAdmission::default(),
+                &never,
+                &charge,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, LoadError::Timeout);
+        assert_eq!(budget.in_use(), held);
+        let hog = budget.charge(Duration::ZERO);
+        hog.grow_to(budget.capacity() - held).await.unwrap();
+        let waiting = budget.charge(Duration::from_millis(300));
+        let base = spawn_server(Respond::Bytes(declared)).await;
+        let err = loader
+            .load_probe_charged(
+                &format!("{base}/d.png"),
+                MediaAdmission::default(),
+                &never,
+                &waiting,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, LoadError::Busy);
+        assert_eq!(waiting.bytes(), 0);
+        drop((hog, charge));
         assert_eq!(budget.in_use(), 0);
     }
 

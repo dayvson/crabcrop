@@ -1,8 +1,8 @@
 //! `/explain` (issue #741): the route's handler and its
 //! stages. It admits through the image path's own stages,
-//! probes the source under the probe gate, and answers with
-//! the report as JSON or HTML; the report itself is built in
-//! `crate::explain`.
+//! probes the source within the source buffer budget and
+//! under the probe gate, and answers with the report as JSON
+//! or HTML; the report itself is built in `crate::explain`.
 //!
 //! server.rs re-exports what the router and the tests use.
 
@@ -20,8 +20,8 @@ use super::response::{
     accept_of, bad_signature_parts, busy_response, error_response, load_busy_response,
     load_error_parts,
 };
-use super::{AppState, PROCESS_GATE_WAIT};
-use crate::loader::LoadError;
+use super::{AppState, PROCESS_GATE_WAIT, SOURCE_BUDGET_WAIT};
+use crate::loader::{LoadError, SourceCharge};
 use crate::observe::RequestRecord;
 
 #[cfg(doc)]
@@ -63,8 +63,16 @@ const PROBE_GATE_WAIT: std::time::Duration = PROCESS_GATE_WAIT;
 /// waits on one; the permit moves into the job, so a probe
 /// whose request went away still counts until it ends.
 /// Every other kind's probe reads headers alone and runs
-/// inline. `None` means the gate stayed full past its wait.
-async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine::SourceProbe> {
+/// inline. `charge` holds the head against the source
+/// buffer budget and goes where the head goes, so the head
+/// stays charged until the probe is done with it, its wait
+/// for a probe slot included. `None` means the gate stayed
+/// full past its wait.
+async fn explain_probe(
+    state: &AppState,
+    head: Vec<u8>,
+    charge: SourceCharge,
+) -> Option<crate::engine::SourceProbe> {
     let kind = crate::engine::probe_kind(&head);
     if !crate::engine::probe_is_heavy(kind) {
         return Some(crate::engine::probe_source(&head));
@@ -75,6 +83,7 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
         .ok()?;
     let probe = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _charge = charge;
         crate::engine::probe_source(&head)
     })
     .await;
@@ -96,10 +105,11 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// the image route admits, and a refusal is the image
 /// path's own status and body (issue #741). Only then is
 /// the source touched, once, through the loader with all
-/// of its guards ([`probe_explained`]), and the facts come
-/// from header probing (`crate::engine::probe_source`): no
-/// decode, no detection, no process, AI, or video gate (an
-/// SVG, AVIF, or HEIC probe takes the probe gate, see
+/// of its guards and within the source buffer budget
+/// ([`probe_explained`]), and the facts come from header
+/// probing (`crate::engine::probe_source`): no decode, no
+/// detection, no process, AI, or video gate (an SVG, AVIF,
+/// or HEIC probe takes the probe gate, see
 /// [`explain_probe`]), and nothing written to any cache
 /// tier. A bad signature, an over-cap operation list, or
 /// an expired URL therefore costs zero source fetches.
@@ -189,12 +199,14 @@ pub(in crate::server) fn admit_explained<'a>(
 
 /// The second stage of [`explain_handle`]: the single
 /// bounded source fetch, through the loader and its
-/// policy, and the probe of the head it read
+/// policy, its head charged against the source buffer
+/// budget, and the probe of the head it read
 /// ([`explain_probe`]). Returns the source's encoded size
-/// when the fetch states it, and the probe; a failed fetch,
-/// or a probe shed for a full gate, is the answer instead,
-/// boxed as [`render_miss`] boxes its own (a bare `Response`
-/// is 128 bytes, too large for an `Err`: clippy's
+/// when the fetch states it, and the probe; a failed fetch
+/// (one shed for budget included), or a probe shed for a
+/// full gate, is the answer instead, boxed as
+/// [`render_miss`] boxes its own (a bare `Response` is 128
+/// bytes, too large for an `Err`: clippy's
 /// `result_large_err`).
 async fn probe_explained(
     state: &AppState,
@@ -226,13 +238,18 @@ async fn probe_explained(
     // whole body (which also keeps this route off the
     // result cache's coalescing path by construction: it
     // never held a whole body to share). A root source is
-    // fetched at its expansion.
+    // fetched at its expansion. The head is charged to the
+    // source buffer budget as it arrives, as a miss charges
+    // its source (issue #403), so a burst of probes waits
+    // for budget and sheds like a burst of misses, and a
+    // probe an origin keeps reading holds what it received.
+    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let crate::loader::ProbeLoad { head, total_bytes } = state
         .loader
-        .load_probe(&resolved.source_url, admission, &probe_settled)
+        .load_probe_charged(&resolved.source_url, admission, &probe_settled, &charge)
         .await
         .map_err(|e| Box::new(explain_load_error(e, accept)))?;
-    let Some(probe) = explain_probe(state, head).await else {
+    let Some(probe) = explain_probe(state, head, charge).await else {
         return Err(Box::new(busy_response(
             "server busy: too many source probes running at once",
             5,
