@@ -1,0 +1,14 @@
+name: Deprecate old MCP package
+on:
+  workflow_dispatch:
+jobs:
+  deprecate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - run: npm deprecate "@crabcrop/mcp@0.1.0" "Early test publish. Use the latest @crabcrop/mcp instead."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
