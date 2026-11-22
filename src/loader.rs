@@ -1231,20 +1231,27 @@ enum StoreKind {
 /// no more.
 const PROBE_HEAD_BYTES: usize = 256 * 1024;
 
-/// How far a probe's head buffer grows ahead of the bytes in
-/// it at most (see [`extend_head`]).
+/// The most a probe's head buffer grows by at once (see
+/// [`extend_head`]).
 const PROBE_HEAD_STEP: usize = 64 * 1024;
 
 /// Append `kept` to a probe's `head`, which comes to hold at
 /// most `most` bytes (the probe head cap, or the declared
-/// length when that is smaller). The buffer grows with what
-/// arrives, at most [`PROBE_HEAD_STEP`] past it at a time and
-/// never past `most`, rather than doubling or reserving the
-/// cap before anything has arrived, so the memory it takes
-/// stays within a step of the bytes the probe charges for it.
+/// length when that is smaller). A full buffer grows by what
+/// arrived or by what it already holds, whichever is more,
+/// but by at most [`PROBE_HEAD_STEP`] and never past `most`,
+/// rather than doubling or reserving the cap before anything
+/// has arrived. Its room past its bytes therefore stays under
+/// the bytes it holds: a probe whose body falls behind, and
+/// is then charged only what it received, holds less than
+/// twice that, and a one-byte head takes one byte. Growing
+/// by at least what it holds, up to the step, keeps the
+/// copies to a handful whatever the chunk sizes.
 fn extend_head(head: &mut Vec<u8>, kept: &[u8], most: usize) {
     if head.capacity() - head.len() < kept.len() {
-        let step = PROBE_HEAD_STEP.min(most.saturating_sub(head.len()));
+        let step = PROBE_HEAD_STEP
+            .min(head.len().max(1))
+            .min(most.saturating_sub(head.len()));
         head.reserve_exact(kept.len().max(step));
     }
     head.extend_from_slice(kept);
@@ -5101,6 +5108,274 @@ mod tests {
         assert_eq!(err, LoadError::Busy);
         assert_eq!(waiting.bytes(), 0);
         drop((hog, charge));
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[test]
+    fn a_probe_head_buffer_grows_with_what_has_arrived() {
+        // The buffer a probe reads its head into, fed as the
+        // probe reads feed it, each chunk clipped to the head
+        // cap. A one-byte head takes one byte; the room past
+        // the bytes stays under the bytes held and within a
+        // step, so a probe charged only what it received holds
+        // less than twice that; the buffer never outgrows the
+        // most the head can hold; and it is reallocated a
+        // handful of times whatever the chunk sizes.
+        let mut one = Vec::new();
+        extend_head(&mut one, &[0], PROBE_HEAD_BYTES);
+        assert_eq!((one.len(), one.capacity()), (1, 1));
+        // Chunk size, bytes sent, the most the head can hold,
+        // and the most allocations the buffer may take.
+        for (chunk, sent, most, allocations) in [
+            (1, PROBE_HEAD_BYTES, PROBE_HEAD_BYTES, 20),
+            (8 * 1024, PROBE_HEAD_BYTES, PROBE_HEAD_BYTES, 7),
+            (2_000, 40_000, 200_000, 6),
+            (7_000, 100_000, 100_000, 5),
+            (300_000, 300_000, PROBE_HEAD_BYTES, 1),
+        ] {
+            let mut head = Vec::new();
+            let (mut fed, mut grown) = (0, 0);
+            while fed < sent && head.len() < PROBE_HEAD_BYTES {
+                let bytes = vec![0u8; chunk.min(sent - fed)];
+                fed += bytes.len();
+                let kept = &bytes[..bytes.len().min(PROBE_HEAD_BYTES - head.len())];
+                let before = head.capacity();
+                extend_head(&mut head, kept, most);
+                grown += usize::from(head.capacity() != before);
+                let (len, room) = (head.len(), head.capacity() - head.len());
+                assert!(
+                    room < len,
+                    "{chunk}-byte chunks at {len}: {room} bytes of room"
+                );
+                assert!(room <= PROBE_HEAD_STEP, "{chunk}-byte chunks at {len}");
+                assert!(head.capacity() <= most, "{chunk}-byte chunks at {len}");
+            }
+            assert!(
+                grown <= allocations,
+                "{chunk}-byte chunks: {grown} allocations"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_probe_is_charged_only_what_it_received_once_it_falls_behind() {
+        // An origin declares 200,000 bytes, sends one and
+        // stalls. The probe reserves its head once the origin
+        // answers; once its first window is judged it has
+        // fallen behind and is charged the one byte it holds,
+        // while it still waits for the rest.
+        let budget = SourceBudget::new(64 << 20);
+        let loader = Loader::with_defaults()
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let base = spawn_stalling_server(200_000, 1).await;
+        let charge = std::sync::Arc::new(budget.charge(Duration::from_secs(5)));
+        let probe = {
+            let charge = charge.clone();
+            tokio::spawn(async move {
+                loader
+                    .load_probe_charged(
+                        &format!("{base}/s.png"),
+                        MediaAdmission::default(),
+                        &|_: &[u8]| false,
+                        &charge,
+                    )
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(charge.bytes(), 200_000, "the grant, while it lasts");
+        sleep(Duration::from_millis(2200)).await;
+        assert_eq!(charge.bytes(), 1, "the byte it received, once behind");
+        assert!(!probe.is_finished(), "the probe still waits for the rest");
+        probe.abort();
+        let _ = probe.await;
+        drop(charge);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// An origin that answers every request with `body`, all
+    /// at once.
+    async fn spawn_body_server(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An origin that answers every request with a declared
+    /// length of `declared` bytes, sends `sent` of them, and
+    /// resets the connection.
+    async fn spawn_cutting_server(declared: usize, sent: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {declared}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![0u8; sent]).await;
+                    let _ = socket.set_zero_linger();
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_and_cancelled_probes_give_back_every_charged_byte() {
+        // 240 charged probes at once, from origins that send
+        // their body at once, stall, arrive in steps, settle at
+        // once or reset, and from files, under a budget of
+        // about twelve heads, so many wait for it; a third are
+        // cancelled at a random moment. A probe that finishes
+        // is charged exactly its head, in a buffer of that
+        // size; one that fails keeps nothing; and once all are
+        // done the budget holds nothing.
+        let dir = crate::test_support::scratch_dir("loader-probe-burst");
+        let root = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(root.join("big.png"), vec![0u8; 300_000]).unwrap();
+        std::fs::write(root.join("small.png"), vec![0u8; 5_000]).unwrap();
+        // A PNG signature and IHDR, so the head settles at
+        // once, padded to 150,000 bytes.
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x64\0\0\0\x3c\x08\x02\0\0\0".to_vec();
+        png.resize(150_000, 0);
+        let origins = [
+            spawn_paced_server(1, 300_000, Duration::ZERO).await,
+            spawn_paced_server(1, 3_000, Duration::ZERO).await,
+            spawn_stalling_server(200_000, 70_000).await,
+            spawn_paced_server(30, 4_000, Duration::from_millis(30)).await,
+            spawn_cutting_server(200_000, 50_000).await,
+            spawn_body_server(png).await,
+        ];
+        let budget = SourceBudget::new(12 * PROBE_HEAD_BYTES);
+        let loader = std::sync::Arc::new(
+            Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(4))
+                .unwrap()
+                .with_sources(SourceConfig {
+                    file_root: Some(root),
+                    ..Default::default()
+                })
+                .with_source_budget(budget.clone()),
+        );
+        // A small deterministic generator for the mix.
+        let mut seed: u64 = 0x5eed;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let mut probes = Vec::new();
+        for i in 0..240 {
+            let url = match next() % 8 {
+                pick @ 0..=5 => format!("{}/s{i}.png", origins[pick as usize]),
+                6 => "file:///big.png".to_string(),
+                _ => "file:///small.png".to_string(),
+            };
+            let cancel = (next() % 3 == 0).then(|| Duration::from_millis(next() % 3000));
+            let (loader, budget) = (loader.clone(), budget.clone());
+            probes.push(tokio::spawn(async move {
+                let charge = budget.charge(Duration::from_secs(2));
+                let settled = |head: &[u8]| head.len() >= 33 && head.starts_with(b"\x89PNG");
+                let load =
+                    loader.load_probe_charged(&url, MediaAdmission::default(), &settled, &charge);
+                let outcome = match cancel {
+                    Some(after) => tokio::time::timeout(after, load).await.ok(),
+                    None => Some(load.await),
+                };
+                match &outcome {
+                    Some(Ok(probe)) => {
+                        assert_eq!(charge.bytes(), probe.head.len(), "{url}");
+                        assert_eq!(probe.head.capacity(), probe.head.len(), "{url}");
+                    }
+                    Some(Err(_)) => assert_eq!(charge.bytes(), 0, "{url}: a failed probe"),
+                    None => {}
+                }
+            }));
+            if i % 20 == 0 {
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        for probe in probes {
+            probe.await.unwrap();
+        }
+        assert_eq!(budget.in_use(), 0, "every charged byte came back");
+    }
+
+    #[tokio::test]
+    async fn a_charged_probe_reads_the_head_an_uncharged_one_reads() {
+        // The charge changes what a probe holds against the
+        // budget, never what it reads: the same head and the
+        // same stated size from each shape of origin, for a
+        // probe that settles at once and one that never does.
+        // Chunk boundaries differ between connections, so a
+        // head that settles part way is not compared.
+        let budget = SourceBudget::new(64 << 20);
+        let charged = Loader::with_defaults()
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let plain = Loader::with_defaults().unwrap();
+        let origins = [
+            spawn_paced_server(1, 0, Duration::ZERO).await,
+            spawn_paced_server(1, 10, Duration::ZERO).await,
+            spawn_paced_server(1, 300_000, Duration::ZERO).await,
+            spawn_paced_server(1, PROBE_HEAD_BYTES, Duration::ZERO).await,
+            spawn_paced_server(1, PROBE_HEAD_BYTES + 1, Duration::ZERO).await,
+            spawn_paced_server(15, 7_000, Duration::from_millis(20)).await,
+        ];
+        // Settled at once, and never.
+        let settles: [fn(&[u8]) -> bool; 2] = [|_| true, |_| false];
+        for origin in &origins {
+            for settled in settles {
+                let charge = budget.charge(Duration::from_secs(5));
+                let a = charged
+                    .load_probe_charged(
+                        &format!("{origin}/a.png"),
+                        MediaAdmission::default(),
+                        &settled,
+                        &charge,
+                    )
+                    .await
+                    .unwrap();
+                let b = plain
+                    .load_probe(
+                        &format!("{origin}/b.png"),
+                        MediaAdmission::default(),
+                        &settled,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(a, b, "{origin}");
+                assert_eq!(charge.bytes(), a.head.len(), "{origin}");
+            }
+        }
         assert_eq!(budget.in_use(), 0);
     }
 
