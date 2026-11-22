@@ -93,6 +93,9 @@ pub(in crate::server) struct MissWork {
     pub(in crate::server) groups: Vec<String>,
     pub(in crate::server) cache_key: String,
     pub(in crate::server) max_age: Option<u32>,
+    /// The URL's `exp:` second, when it carries one: it caps
+    /// the lifetime of the image response (see [`respond`]).
+    pub(in crate::server) expires_at: Option<u64>,
     /// Whether the request arrived in the sealed spelling
     /// (issue #255). Meta for it redacts every operation and
     /// source text, and its image responses carry no
@@ -296,6 +299,7 @@ pub(in crate::server) async fn serve_miss(
         groups,
         cache_key,
         max_age,
+        expires_at,
         sealed,
         disk_handoff,
         ..
@@ -356,6 +360,7 @@ pub(in crate::server) async fn serve_miss(
             processed.quality,
             bytes::Bytes::from(processed.bytes),
             max_age,
+            expires_at,
             state.client_hints,
         )
     };

@@ -52,13 +52,9 @@ None of the three puts the client hint headers in the key, which is why step 1 f
 
 ## 4. Expiring URLs: the edge does not read them
 
-`exp:` expiry lives inside the signed path, and CloudFront never looks inside the URL. A response cached before expiry keeps being served until its TTL runs out or it is invalidated: with the policy above, that can be a year. What expiry still guarantees is that the origin refuses the URL, so nothing new gets rendered or re-cached after it passes.
+`exp:` expiry lives inside the signed path, and CloudFront never looks inside the URL. It does not have to: crabcrop caps the `max-age` of an expiring URL's response at the seconds left before its `exp:` second, and the cache policy of step 1 takes the origin's `max-age` as the TTL, so a cached copy goes stale when the URL expires. The edge then asks the origin again, the origin refuses the URL with `403` and `no-store`, and step 1's custom error responses keep that `403` out of the cache.
 
-If expiry has to bite at the edge, pick one:
-
-- Add a second behavior for the expiring paths with a maximum TTL no longer than the signed lifetime. The cap replaces crabcrop's TTL for those paths only.
-- Invalidate the URL when it expires, from the same job that tracks the expiry (step 5; a path invalidation is one path of quota).
-- Accept it, when expiry is about minting (no new renders) rather than access control. Most signed-URL deployments mean exactly that.
+No separate behavior for expiring paths is needed. One with a lower maximum TTL, as an earlier version of this recipe suggested, only shortens how long the edge keeps the URLs that have longer left. Where a copy must not be served after the expiry even as stale content, also invalidate the URL when it expires, from the same job that tracks the expiry (step 5; a path invalidation is one path of quota).
 
 ## 5. Purge mapping
 

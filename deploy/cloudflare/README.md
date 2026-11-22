@@ -23,7 +23,7 @@ By default Cloudflare only caches a fixed list of file extensions, and a crabcro
 - Edge TTL: **Respect origin**
 - Browser TTL: **Respect origin**
 
-**Never use an Edge TTL override on the crabcrop hostname.** An override that ignores origin cache headers caches even `no-store` responses, so crabcrop's meta JSON (`private, no-store`) and its error responses (`no-store`) would be pinned at the edge. Respect origin also preserves the per-URL `maxage:` directive, which an override would flatten to a single value.
+**Never use an Edge TTL override on the crabcrop hostname.** An override that ignores origin cache headers caches even `no-store` responses, so crabcrop's meta JSON (`private, no-store`) and its error responses (`no-store`) would be pinned at the edge. Respect origin also preserves the lifetime each URL sets for itself, with a `maxage:` directive or the end of its `exp:` expiry (step 4), which an override would flatten to a single value.
 
 ## 2. Turn Polish off for this hostname
 
@@ -45,13 +45,9 @@ Without an explicit `filters:format(...)`, crabcrop negotiates the output format
 
 ## 4. Expiring URLs: the edge does not read them
 
-`exp:` expiry lives inside the signed path, and Cloudflare never looks inside the URL. A response cached before expiry keeps being served until its Edge TTL runs out or it is purged: with the respect-origin rule above, that can be a year. What expiry still guarantees is that the origin refuses the URL, so nothing new gets rendered or re-cached after it passes.
+`exp:` expiry lives inside the signed path, and Cloudflare never looks inside the URL. It does not have to: crabcrop caps the `max-age` of an expiring URL's response at the seconds left before its `exp:` second, so under the respect-origin rule of step 1 a cached copy goes stale when the URL expires. The edge then asks the origin again, the origin refuses the URL with `403` and `no-store`, and nothing new gets rendered or re-cached.
 
-If expiry has to bite at the edge, pick one:
-
-- Add a second Cache Rule for the expiring paths with an Edge TTL override no longer than the signed lifetime. The override replaces crabcrop's TTL for those paths only, including any `maxage:` on them.
-- Purge the URL when it expires, from the same job that tracks the expiry.
-- Accept it, when expiry is about minting (no new renders) rather than access control. Most signed-URL deployments mean exactly that.
+Keep the expiring paths under that rule. An Edge TTL override replaces crabcrop's lifetime with one fixed value, which outlives the expiry of a URL first fetched close to it; an earlier version of this recipe suggested one for expiring paths, so remove it if you added it. Where a copy must not be served after the expiry even as stale content, also purge the URL when it expires, from the same job that tracks the expiry.
 
 Cloudflare can validate its own HMAC tokens per request in the WAF (`is_timed_hmac_valid_v0()`), but those are Cloudflare-format tokens, not crabcrop signatures. Adopting it means a second token layer in front of the first, which this recipe does not recommend.
 

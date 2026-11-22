@@ -6,6 +6,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Security
 
+- An expiring URL's image responses now carry a `max-age` no longer than the seconds left before its `exp:` second, so a browser or CDN that follows the response headers stops reusing a copy when the server starts refusing the URL. They carried the immutable year, or the `maxage:` lifetime, however close the expiry was. The seconds left are counted as each response is made, so renders, hits from every tier, `304`s and `HEAD`s agree; with `maxage:` as well the shorter lifetime applies, `immutable` stays while the lifetime is positive, and a response made at or past the expiry second answers `max-age=0`. URLs without `exp:`, or with one more than a year away, keep their headers unchanged, and no output bytes change. The CDN recipes no longer suggest a fixed edge TTL for expiring paths, since one would now outlast the lifetime crabcrop sends: remove it if you added one.
+
 - `/explain`'s source probe is now charged against the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), as a cache miss's source is. The probe reads at most 256 KB of the source's head, and that head was held outside the budget. It is now charged as it arrives, the most the probe reads standing for the body's length, and stays charged until the probe is done with it, its wait for the probe gate included: `crabcrop_source_buffer_bytes` counts it, and a probe that cannot get budget within 5 seconds answers `503 server_busy` with `Retry-After: 1`, as a miss does. The buffer the head is read into grows with what arrives. The report is unchanged.
 
 ## [0.15.0] - 2026-11-22
