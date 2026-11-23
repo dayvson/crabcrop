@@ -3279,6 +3279,31 @@ pub fn entry_key(secret: &[u8]) -> Vec<u8> {
 /// The label [`entry_key`] is derived from.
 pub const ENTRY_KEY_LABEL: &str = "crabcrop/entry-key";
 
+/// The token a deployment's `CDN-Loop` entry names it by
+/// (see [`crate::loader::LoopMark`]), from the server secret,
+/// so every replica that shares the secret sends the same
+/// one. Every origin a fetch reaches reads the token, so it
+/// is a digest of a derived key, never the key: the key is the
+/// HMAC of [`LOOP_KEY_LABEL`] under the secret, the
+/// derivation of every subkey, and the token the first 16
+/// bytes of its SHA-256, in hex. Neither the secret nor any
+/// key the server signs, seals or authenticates with follows
+/// from it. The label begins with
+/// [`crabcrop_url::RESERVED_SEGMENT`], so no signer ever
+/// computes the key as a signature either.
+pub fn loop_token(secret: &[u8]) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Digest as _;
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(LOOP_KEY_LABEL.as_bytes());
+    let key = zeroize::Zeroizing::new(mac.finalize().into_bytes().to_vec());
+    hex::encode(&sha2::Sha256::digest(key.as_slice())[..16])
+}
+
+/// The label [`loop_token`]'s key is derived from.
+pub const LOOP_KEY_LABEL: &str = "crabcrop/loop-key";
+
 /// The purge signature for a target path: HMAC-SHA256 of
 /// the path alone, under the derived purge key. Delegates
 /// to the `crabcrop-url` crate, the one implementation

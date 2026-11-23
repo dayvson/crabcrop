@@ -425,6 +425,16 @@ pub(in crate::server) fn reserved_remainder_parts() -> ErrorParts {
     )
 }
 
+/// The refusal for a request that carries this server's own
+/// `CDN-Loop` entry (see [`super::admission::refuse_own_fetch`]).
+pub(in crate::server) fn loop_detected_parts() -> ErrorParts {
+    (
+        StatusCode::LOOP_DETECTED,
+        "loop_detected",
+        "loop detected: the request carries this server's CDN-Loop entry".to_string(),
+    )
+}
+
 /// The refusal for a signature that does not verify, and
 /// for a sealed spelling on the explain route.
 pub(in crate::server) fn bad_signature_parts() -> ErrorParts {

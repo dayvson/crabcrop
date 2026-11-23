@@ -63,7 +63,9 @@ kubectl create secret generic crabcrop \
     replace the ConfigMap with a `configMapGenerator` in
     your overlay. For presets-only mode, add
     `CRABCROP_ONLY_PRESETS=1` to the Deployment env from
-    your overlay.
+    your overlay. With `CRABCROP_ALLOW_UNSAFE=1` as well,
+    add `CRABCROP_ALLOWED_SOURCES` set to the hosts your
+    images come from, not crabcrop's own.
   - `result-storage`: the disk result tier (PVC plus
     `CRABCROP_RESULT_STORAGE_DIR` and its budget). One pod's
     disk: do not share the claim across replicas unless it

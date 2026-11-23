@@ -1808,3 +1808,124 @@ fn the_disk_tier_boot_lines_say_what_the_scan_did() {
     assert_eq!(lines.len(), 2);
     assert!(lines[1].starts_with("shutdown: 2 purges sent while the boot scan ran"));
 }
+
+/// The token a deployment's `CDN-Loop` entry carries, derived
+/// here from the documented recipe rather than through the
+/// server's code: the first 16 bytes of the SHA-256 of the
+/// HMAC-SHA256 of `crabcrop/loop-key` under the secret, in hex.
+fn loop_token_of(secret: &str) -> String {
+    use hmac::{KeyInit, Mac};
+    use sha2::Digest as _;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(b"crabcrop/loop-key");
+    hex::encode(&sha2::Sha256::digest(mac.finalize().into_bytes())[..16])
+}
+
+/// An origin that serves a small PNG on every connection and
+/// keeps the head of every request it reads.
+async fn spawn_recording_origin() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut png = Vec::new();
+    image::DynamicImage::new_rgb8(40, 20)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = Arc::clone(&heads);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            kept.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&seen).into_owned());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&png).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), heads)
+}
+
+/// A server booted the way `run` boots one, from an
+/// environment that signs with `CRABCROP_SECRET` (and during a
+/// rotation window `CRABCROP_SECRET_PREVIOUS` too) and serves
+/// unsigned URLs on loopback sources.
+async fn boot_unsafe_server(secret: &str, previous: Option<&str>) -> String {
+    let mut env = vec![
+        ("CRABCROP_SECRET", secret),
+        ("CRABCROP_SECRET_KEY_ID", "k-new"),
+        ("CRABCROP_ALLOW_UNSAFE", "1"),
+        ("CRABCROP_ALLOWED_SOURCES", "127.0.0.1"),
+        ("CRABCROP_LOG_SYNC", "1"),
+    ];
+    if let Some(previous) = previous {
+        env.push(("CRABCROP_SECRET_PREVIOUS", previous));
+        env.push(("CRABCROP_SECRET_PREVIOUS_KEY_ID", "k-old"));
+    }
+    let config = Config::from_env(env_of(&env)).unwrap();
+    let state = build_state(&config, open_stores(&config).unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, server::app(state)).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_rotation_window_refuses_requests_marked_by_either_secret() {
+    // The server marks its fetches with the current secret's
+    // token, and refuses a request marked with the token of
+    // either secret it verifies: while a rotation rolls out,
+    // a replica still on the outgoing secret and one already
+    // on the incoming one refuse each other's fetches. Once
+    // the window closes, the outgoing token is any other
+    // deployment's.
+    const NEW: &str = "the-incoming-signing-secret-0123";
+    const OLD: &str = "the-outgoing-signing-secret-4567";
+    const OTHER: &str = "another-deployments-secret-89ab";
+    let (origin, heads) = spawn_recording_origin().await;
+    let client = reqwest::Client::new();
+    let marked = |base: &str, secret: &str| {
+        client
+            .get(format!("{base}/unsafe/20x0/{origin}/marked.png"))
+            .header(
+                "cdn-loop",
+                format!("crabcrop; id={}", loop_token_of(secret)),
+            )
+    };
+    let window = boot_unsafe_server(NEW, Some(OLD)).await;
+    let resp = client
+        .get(format!("{window}/unsafe/20x0/{origin}/fresh.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let head = heads.lock().unwrap()[0].clone();
+    assert!(
+        head.lines().any(|line| line
+            .eq_ignore_ascii_case(&format!("cdn-loop: crabcrop; id={}", loop_token_of(NEW)))),
+        "{head}"
+    );
+    for (secret, status) in [(NEW, 508), (OLD, 508), (OTHER, 200)] {
+        let resp = marked(&window, secret).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{secret} during the window");
+    }
+    let closed = boot_unsafe_server(NEW, None).await;
+    for (secret, status) in [(NEW, 508), (OLD, 200)] {
+        let resp = marked(&closed, secret).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{secret} after the window");
+    }
+}

@@ -13,7 +13,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
 
-use super::admission::{Credential, Negotiated, authenticate, negotiate, resolve_request};
+use super::admission::{
+    Credential, Negotiated, authenticate, negotiate, refuse_own_fetch, resolve_request,
+};
 use super::flight::run_flight;
 use super::miss::MissWork;
 use super::{AppState, MissProgress, has_directive};
@@ -343,9 +345,10 @@ pub(in crate::server) async fn handle(
 /// which comes back with the answer.
 ///
 /// The request runs in stages (issue #479):
-/// [`authenticate`], [`resolve_request`] and [`negotiate`]
-/// admit it, each returning a [`Refusal`] that is answered
-/// here, the one place that knows the request's spelling;
+/// [`refuse_own_fetch`], [`authenticate`], [`resolve_request`]
+/// and [`negotiate`] admit it, each returning a [`Refusal`]
+/// that is answered here, the one place that knows the
+/// request's spelling;
 /// [`cache_key_for`] keys it; and [`run_flight`] serves it
 /// from the tiers or the miss path.
 pub(in crate::server) async fn serve(
@@ -366,7 +369,8 @@ pub(in crate::server) async fn serve(
     let width = width_hint(headers).filter(|_| hints);
     let save_data = hints && save_data_hint(headers);
     let full = format!("/{path}");
-    let opened = authenticate(state, &full, &mut record);
+    let opened =
+        refuse_own_fetch(state, headers).and_then(|()| authenticate(state, &full, &mut record));
     let sealed = opened
         .as_ref()
         .is_ok_and(|opened| matches!(opened.credential, Credential::Sealed));
@@ -422,6 +426,7 @@ pub(in crate::server) async fn serve(
         sealed,
         progress: MissProgress::default(),
         disk_handoff: None,
+        loop_entries: crate::loader::LoopEntries::of(headers),
     };
     let (mut response, record) = run_flight(state, path, work, if_none_match, record).await;
     if hint_shaped {
@@ -459,7 +464,7 @@ fn keep_from_shared_caches(response: &mut Response) {
         .insert(header::CACHE_CONTROL, private.parse().unwrap());
 }
 
-/// The fourth stage of [`serve`]: the request's cache key.
+/// The fifth stage of [`serve`]: the request's cache key.
 ///
 /// Without an explicit format in the URL, the response depends
 /// on the Accept class as well as the path, so the cache key

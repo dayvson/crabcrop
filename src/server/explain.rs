@@ -13,7 +13,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::admission::{
-    Credential, Opened, Refusal, Resolved, authenticate, resolve_request, unix_seconds,
+    Credential, Opened, Refusal, Resolved, authenticate, refuse_own_fetch, resolve_request,
+    unix_seconds,
 };
 use super::request::dpr_hint;
 use super::response::{
@@ -91,18 +92,19 @@ async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine:
 /// itself is built in [`crate::explain`]).
 ///
 /// The request runs in stages. [`admit_explained`] admits
-/// it through the image path's own [`authenticate`] and
-/// [`resolve_request`], so a URL this route admits is one
-/// the image route admits, and a refusal is the image
-/// path's own status and body (issue #741). Only then is
-/// the source touched, once, through the loader with all
-/// of its guards ([`probe_explained`]), and the facts come
-/// from header probing (`crate::engine::probe_source`): no
-/// decode, no detection, no process, AI, or video gate (an
-/// SVG, AVIF, or HEIC probe takes the probe gate, see
+/// it through the image path's own [`refuse_own_fetch`],
+/// [`authenticate`] and [`resolve_request`], so a URL this
+/// route admits is one the image route admits, and a
+/// refusal is the image path's own status and body (issue
+/// #741). Only then is the source touched, once, through
+/// the loader with all of its guards ([`probe_explained`]),
+/// and the facts come from header probing
+/// (`crate::engine::probe_source`): no decode, no
+/// detection, no process, AI, or video gate (an SVG, AVIF,
+/// or HEIC probe takes the probe gate, see
 /// [`explain_probe`]), and nothing written to any cache
-/// tier. A bad signature, an over-cap operation list, or
-/// an expired URL therefore costs zero source fetches.
+/// tier. A bad signature, an over-cap operation list, or an
+/// expired URL therefore costs zero source fetches.
 /// [`explain_report`] builds the report and
 /// [`explain_response`] answers it.
 pub(in crate::server) async fn explain_handle(
@@ -133,14 +135,15 @@ pub(in crate::server) async fn explain_handle(
         );
     };
     let full = format!("/{tail}");
-    let (credential, resolved) = match admit_explained(&state, &full) {
+    let (credential, resolved) = match admit_explained(&state, &full, &headers) {
         Ok((opened, resolved)) => (opened.credential, resolved),
         // Only plain spellings are admitted here, so every
         // refusal is the plain spelling's own answer, as on
         // the image route.
         Err(refusal) => return refusal.answer(false, accept),
     };
-    let (source_bytes, probe) = match probe_explained(&state, &resolved, accept).await {
+    let entries = crate::loader::LoopEntries::of(&headers);
+    let (source_bytes, probe) = match probe_explained(&state, &resolved, &entries, accept).await {
         Ok(facts) => facts,
         Err(response) => return *response,
     };
@@ -157,12 +160,14 @@ pub(in crate::server) async fn explain_handle(
 }
 
 /// The first stage of [`explain_handle`]: the image path's
-/// admission, [`authenticate`] and [`resolve_request`]
-/// themselves (issue #741), so the two routes cannot
-/// disagree on which plain URLs they admit or on how they
-/// refuse the rest.
+/// admission, [`refuse_own_fetch`], [`authenticate`] and
+/// [`resolve_request`] themselves (issue #741), so the two
+/// routes cannot disagree on which plain URLs they admit or
+/// on how they refuse the rest.
 ///
-/// A sealed spelling is refused before either runs,
+/// One of the server's own fetches come back to it is
+/// refused first, as on the image route. A sealed spelling
+/// is refused before the other two run,
 /// wholesale (issue #255): the server never unseals as a
 /// service, because an endpoint that opens tokens would be
 /// an unsealing oracle for anyone who lifts one off a
@@ -173,7 +178,9 @@ pub(in crate::server) async fn explain_handle(
 pub(in crate::server) fn admit_explained<'a>(
     state: &AppState,
     full: &'a str,
+    headers: &HeaderMap,
 ) -> Result<(Opened<'a>, Resolved), Refusal> {
+    refuse_own_fetch(state, headers)?;
     let nolead = full.strip_prefix('/').unwrap_or(full);
     if crate::url::looks_sealed(nolead.split('/').next().unwrap_or("")) {
         return Err(Refusal::AsIs(bad_signature_parts()));
@@ -188,17 +195,18 @@ pub(in crate::server) fn admit_explained<'a>(
 }
 
 /// The second stage of [`explain_handle`]: the single
-/// bounded source fetch, through the loader and its
-/// policy, and the probe of the head it read
-/// ([`explain_probe`]). Returns the source's encoded size
-/// when the fetch states it, and the probe; a failed fetch,
-/// or a probe shed for a full gate, is the answer instead,
-/// boxed as [`render_miss`] boxes its own (a bare `Response`
-/// is 128 bytes, too large for an `Err`: clippy's
-/// `result_large_err`).
+/// bounded source fetch, through the loader and its policy,
+/// carrying the request's `CDN-Loop` `entries`, and the
+/// probe of the head it read ([`explain_probe`]). Returns
+/// the source's encoded size when the fetch states it, and
+/// the probe; a failed fetch, or a probe shed for a full
+/// gate, is the answer instead, boxed as [`render_miss`]
+/// boxes its own (a bare `Response` is 128 bytes, too large
+/// for an `Err`: clippy's `result_large_err`).
 async fn probe_explained(
     state: &AppState,
     resolved: &Resolved,
+    entries: &crate::loader::LoopEntries,
     accept: Option<&str>,
 ) -> Result<(Option<usize>, crate::engine::SourceProbe), Box<Response>> {
     // Watermark and overlay sources are operations' inputs,
@@ -229,7 +237,7 @@ async fn probe_explained(
     // fetched at its expansion.
     let crate::loader::ProbeLoad { head, total_bytes } = state
         .loader
-        .load_probe(&resolved.source_url, admission, &probe_settled)
+        .load_probe(&resolved.source_url, admission, &probe_settled, entries)
         .await
         .map_err(|e| Box::new(explain_load_error(e, accept)))?;
     let Some(probe) = explain_probe(state, head).await else {

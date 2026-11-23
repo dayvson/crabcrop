@@ -4834,3 +4834,49 @@ fn the_entry_key_is_the_hmac_of_its_label() {
         assert_ne!(entry, other);
     }
 }
+
+/// The `CDN-Loop` token is the first 16 bytes of the SHA-256 of
+/// the HMAC of its label under the secret, in hex. The value is
+/// pinned: replicas on two releases of the server must name
+/// their deployment alike. The token is public, so it is the
+/// digest of a derived key and never a key, nor any key's
+/// leading bytes: not the HMAC of its own label (which is that
+/// label's image signature, refused as reserved), not the
+/// secret's, and not any subkey the server signs, seals or
+/// authenticates with.
+#[test]
+fn the_loop_token_is_a_digest_of_a_derived_key() {
+    assert_eq!(
+        loop_token(b"test-secret"),
+        "0ef091d2dd087ee7c2220ed2d36ae2a6"
+    );
+    assert_eq!(loop_token(b"test-secret"), loop_token(b"test-secret"));
+    assert_ne!(loop_token(b"test-secret"), loop_token(b"other-secret"));
+    assert!(crabcrop_url::is_reserved_remainder(LOOP_KEY_LABEL));
+    assert!(crabcrop_url::sign(b"test-secret", LOOP_KEY_LABEL).is_err());
+    let secret = b"test-secret";
+    let token = loop_token(secret);
+    assert_eq!(token.len(), 32);
+    assert!(
+        token
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    let label_key = {
+        use hmac::{Hmac, KeyInit, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).unwrap();
+        mac.update(LOOP_KEY_LABEL.as_bytes());
+        mac.finalize().into_bytes().to_vec()
+    };
+    for key in [
+        label_key,
+        entry_key(secret),
+        purge_key(secret),
+        purge_group_key(secret),
+        upload_key(secret),
+        crabcrop_url::seal_key(secret),
+        secret.to_vec(),
+    ] {
+        assert!(!hex::encode(&key).starts_with(&token));
+    }
+}

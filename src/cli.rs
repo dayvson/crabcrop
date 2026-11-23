@@ -2505,6 +2505,7 @@ mod tests {
             "crabcrop/upload-key",
             "crabcrop/seal-key",
             "crabcrop/entry-key",
+            "crabcrop/loop-key",
             "crabcrop",
         ] {
             for verb in ["sign", "seal"] {

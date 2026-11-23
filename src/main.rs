@@ -810,7 +810,11 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         .with_sources(config.sources.clone())
         .with_source_budget(crate::loader::SourceBudget::new(
             usize::try_from(config.source_buffer_bytes).unwrap_or(usize::MAX),
-        )),
+        ))
+        // Every replica that shares the secret marks its
+        // fetches alike, and refuses the others' marked
+        // requests (see `LoopMark`).
+        .with_loop_mark(crate::loader::LoopMark::for_keyring(&config.keyring)),
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(config.process_timeout_secs),
         metrics: Arc::new(Metrics::default()),

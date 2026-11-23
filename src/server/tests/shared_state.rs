@@ -91,6 +91,7 @@ fn an_engine_job_shares_the_states_providers() {
         sealed: false,
         progress: MissProgress::default(),
         disk_handoff: None,
+        loop_entries: Default::default(),
     };
     let job = build_job(&state, &work, Default::default());
     assert!(Arc::ptr_eq(&job.providers, &state.providers));
