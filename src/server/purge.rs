@@ -591,13 +591,15 @@ fn purge_key_form(state: &AppState, target: &str) -> (String, String) {
     // Entries are keyed post-merge (issue #145): with
     // defaults configured, the purge target's key form is
     // the canonical form of the merged operations, or the
-    // purge silently removes nothing. The form is bounded
-    // the way `cache_key_for` bounds it, so an over-long
-    // URL's purge names its digest-form key.
+    // purge silently removes nothing. The base is the one
+    // `cache_key_for` builds on, so the purge names the
+    // source in the form the loader fetches (issue #778),
+    // whichever spelling of it the target writes, and an
+    // over-long URL's purge names its digest-form key.
     let key_form = match parse_operations_with_expiry(target) {
         Ok((ops, source, _, _)) => {
             let merged = crate::url::merge_default_ops(&state.default_ops, ops);
-            crate::cache::bounded_key_base(crate::url::canonical_form(&merged, source), source)
+            super::request::cache_key_base(&merged, source)
         }
         Err(_) => crate::cache::bounded_key_base(target.to_string(), ""),
     };
@@ -815,7 +817,11 @@ pub(in crate::server) async fn purge_source_everywhere(
     // completes and is logged even if the caller is
     // dropped mid-purge. The caller waits for the count.
     let task_state = state.clone();
-    let source = source.to_string();
+    // Entries carry their source in the form the loader
+    // fetches (issue #778), so the purge matches on that
+    // form too: it reaches the renders of every spelling of
+    // the replaced object, whichever one it is handed.
+    let source = crate::loader::fetched_form(source).into_owned();
     let task = state.background.spawn(async move {
         // Tombstones first, tiers second (issues #350,
         // #461), as in the per-URL purge.

@@ -2437,6 +2437,100 @@ fn percent_decode(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The form of the source `url` that the loader fetches: the
+/// text the cache keys a render on (issue #778), so that the
+/// spellings the loader fetches as one object share an entry,
+/// and a purge that names any of them reaches it. Each kind
+/// takes the steps its load takes before it fetches:
+///
+/// - An `http://` or `https://` URL is the URL the request
+///   is made for: parsed, which lowercases the scheme and the
+///   host, drops a default port and resolves dot segments,
+///   and without a fragment, which no request carries.
+/// - A `file://` URL is `file:///` and the path below the file
+///   root that [`Loader::load`] opens (see
+///   [`file_source_relative`]), with a `%` or `#` in it
+///   written `%25` or `%23`: each path has one form, and no
+///   form holds the `#` a cache key's variants begin with.
+/// - An `s3://` or `gs://` URL is its text: the loader sends
+///   the key as written.
+///
+/// Text the loader refuses before it fetches anything (a URL
+/// that does not parse, a scheme it does not fetch, a
+/// `file://` host that is not this one, a path that would
+/// leave the root) is its own form, so it never shares an
+/// entry with a source the loader fetches. A source already
+/// in its form is returned as it is.
+pub(crate) fn fetched_form(url: &str) -> std::borrow::Cow<'_, str> {
+    // The scheme dispatch of `Loader::load_dispatch`.
+    let form = if url.starts_with("s3://") || url.starts_with("gs://") {
+        None
+    } else if url.starts_with("file://") {
+        file_source_relative(url)
+            .ok()
+            .map(|relative| file_source_form(&relative))
+    } else {
+        Url::parse(url)
+            .ok()
+            .filter(|parsed| matches!(parsed.scheme(), "http" | "https"))
+            .map(|mut parsed| {
+                parsed.set_fragment(None);
+                String::from(parsed)
+            })
+    };
+    match form {
+        Some(form) if form != url => std::borrow::Cow::Owned(form),
+        _ => std::borrow::Cow::Borrowed(url),
+    }
+}
+
+/// The path below the file root that [`Loader::load`] opens
+/// for the `file://` URL `url`, or the refusal it answers from
+/// the text alone: the steps `Loader::load_file_checked` takes
+/// before it resolves the path, through the same functions,
+/// and with its errors (a test holds the two to the same
+/// answers). URL parsing drops a `localhost` host and resolves
+/// dot segments; the path is then decoded and its leading
+/// slashes trimmed.
+fn file_source_relative(url: &str) -> Result<String, LoadError> {
+    let parsed =
+        Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
+    match parsed.host_str() {
+        None | Some("") | Some("localhost") => {}
+        Some(host) => {
+            return Err(LoadError::Forbidden(format!(
+                "file source host {host} is not local"
+            )));
+        }
+    }
+    let decoded = percent_decode(parsed.path());
+    if decoded.contains('\0') {
+        return Err(LoadError::InvalidSource(
+            "invalid file source path".to_string(),
+        ));
+    }
+    let relative = decoded.trim_start_matches('/');
+    if !file_source_path_stays_in_root(relative) {
+        return Err(LoadError::NotFound);
+    }
+    Ok(relative.to_string())
+}
+
+/// `file:///` and the root-relative path `relative`, with `%`
+/// written `%25` and `#` written `%23` (see [`fetched_form`]).
+fn file_source_form(relative: &str) -> String {
+    let mut form = String::with_capacity("file:///".len() + relative.len());
+    form.push_str("file:///");
+    for c in relative.chars() {
+        match c {
+            '%' => form.push_str("%25"),
+            '#' => form.push_str("%23"),
+            c => form.push(c),
+        }
+    }
+    form
+}
+
 fn map_request_error(e: reqwest::Error) -> LoadError {
     if e.is_timeout() {
         return LoadError::Timeout;
@@ -5870,5 +5964,182 @@ mod tests {
         drop(charge);
         assert_eq!(slow_load.await.unwrap(), Err(LoadError::Timeout));
         assert_eq!(budget.in_use(), 0, "every charge came back");
+    }
+
+    #[test]
+    fn a_source_in_its_fetched_form_keeps_its_text() {
+        // Issue #778: the cache keys a render on the form the
+        // loader fetches, so a source already in that form
+        // keeps the key it had.
+        for url in [
+            "http://example.com/a.jpg",
+            "https://cdn.example.com:8443/images/photo.jpg",
+            "https://example.com/a.jpg?v=2&w=1",
+            "https://example.com/with%20space/caf%C3%A9%2Fx.jpg",
+            "http://[::1]:8080/~user/a.png",
+            "https://xn--bcher-kva.example/a.jpg",
+            "http://127.0.0.1:5341/f/src01.jpg",
+            "file:///photo.png",
+            "file:///heroes/cat-01_v2.jpg",
+            "file:///a b.png",
+            "file:///café.png",
+            "file:///100%25.png",
+            "file:///a%23b.png",
+            "file:///a%2523b.png",
+            "s3://my-bucket/photos/a.jpg",
+            "gs://my-bucket/photos/a%20b.jpg",
+            "s3://my-bucket/a/./b.jpg",
+        ] {
+            assert!(
+                matches!(fetched_form(url), std::borrow::Cow::Borrowed(form) if form == url),
+                "{url}: {}",
+                fetched_form(url)
+            );
+        }
+    }
+
+    #[test]
+    fn the_spellings_of_one_source_have_one_fetched_form() {
+        for (spellings, form) in [
+            (
+                &[
+                    "http://h/f/./a.jpg",
+                    "HTTP://H/f/a.jpg",
+                    "http://h:80/f/a.jpg",
+                    "http://h/f/x/../a.jpg",
+                    "http://h/f/%2E/a.jpg",
+                    "http://h/f/a.jpg#part",
+                    "http:/h/f/a.jpg",
+                ][..],
+                "http://h/f/a.jpg",
+            ),
+            (&["https://h:443/a.jpg"][..], "https://h/a.jpg"),
+            (&["http://h"][..], "http://h/"),
+            (&["http://127.1/a.jpg"][..], "http://127.0.0.1/a.jpg"),
+            (
+                &[
+                    "file://localhost/photo.png",
+                    "file://LOCALHOST/photo.png",
+                    "file:////photo.png",
+                    "file:///./photo.png",
+                    "file:///sub/../photo.png",
+                    "file:///%70hoto.png",
+                    "file:///photo.png?v=2",
+                    "file:///photo.png#x",
+                ][..],
+                "file:///photo.png",
+            ),
+            (&["file:///a%20b.png"][..], "file:///a b.png"),
+            (&["file:///caf%C3%A9.png"][..], "file:///café.png"),
+        ] {
+            for spelling in spellings {
+                assert_eq!(fetched_form(spelling), form, "{spelling}");
+            }
+        }
+    }
+
+    #[test]
+    fn text_the_loader_refuses_is_its_own_fetched_form() {
+        // Refused before anything is fetched, so it shares an
+        // entry with nothing the loader fetches.
+        for url in [
+            "file://example.com/photo.png",
+            "file:///pic%00.jpg",
+            "file:///sub%2f..%2fpic.jpg",
+            "FILE:///photo.png",
+            "ftp://example.com/a.jpg",
+            "example.com/a.png",
+            "root:photos/a.jpg",
+            "http://[::1/a.jpg",
+        ] {
+            assert!(
+                matches!(fetched_form(url), std::borrow::Cow::Borrowed(form) if form == url),
+                "{url}: {}",
+                fetched_form(url)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fetched_form_of_a_file_source_names_the_file_the_loader_opens() {
+        // `file_source_relative` takes the steps of
+        // `load_file_checked` before it resolves the path: each
+        // spelling loads the file its form names, and a spelling
+        // the loader refuses gets the loader's own answer.
+        let (base, root) = make_file_tree();
+        for (name, body) in [
+            ("a#b.jpg", "hash"),
+            ("a%23b.jpg", "escaped"),
+            ("100%.jpg", "percent"),
+            ("a b.jpg", "space"),
+            ("café.jpg", "accent"),
+        ] {
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        let loader = file_loader(&root, 1024);
+        for (spelling, name, form) in [
+            ("file:///pic.jpg", "pic.jpg", "file:///pic.jpg"),
+            ("file://localhost/pic.jpg", "pic.jpg", "file:///pic.jpg"),
+            ("file:////pic.jpg", "pic.jpg", "file:///pic.jpg"),
+            ("file:///./pic.jpg", "pic.jpg", "file:///pic.jpg"),
+            ("file:///%70ic.jpg", "pic.jpg", "file:///pic.jpg"),
+            ("file:///sub/../pic.jpg", "pic.jpg", "file:///pic.jpg"),
+            (
+                "file:///sub%2finner.jpg",
+                "sub/inner.jpg",
+                "file:///sub/inner.jpg",
+            ),
+            ("file:///a%23b.jpg", "a#b.jpg", "file:///a%23b.jpg"),
+            ("file:///a%2523b.jpg", "a%23b.jpg", "file:///a%2523b.jpg"),
+            ("file:///100%25.jpg", "100%.jpg", "file:///100%25.jpg"),
+            ("file:///a%20b.jpg", "a b.jpg", "file:///a b.jpg"),
+            ("file:///caf%C3%A9.jpg", "café.jpg", "file:///café.jpg"),
+        ] {
+            assert_eq!(
+                file_source_relative(spelling).as_deref(),
+                Ok(name),
+                "{spelling}"
+            );
+            assert_eq!(fetched_form(spelling), form, "{spelling}");
+            assert_eq!(
+                loader.load(spelling).await.unwrap(),
+                std::fs::read(root.join(name)).unwrap(),
+                "{spelling}"
+            );
+        }
+        for spelling in [
+            "file://example.com/pic.jpg",
+            "file:///pic%00.jpg",
+            "file:///sub%2f..%2fpic.jpg",
+            "file:///..%2fsecret.jpg",
+        ] {
+            let refused = loader.load(spelling).await.unwrap_err();
+            assert_eq!(file_source_relative(spelling), Err(refused), "{spelling}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn the_fetched_form_of_an_http_source_is_the_request_the_loader_makes() {
+        // The origin is asked for the path and query of the
+        // form, whichever spelling the load was given.
+        let loader = Loader::with_defaults().unwrap();
+        for path in [
+            "/f/a.jpg",
+            "/f/./a.jpg",
+            "/f/x/../a.jpg",
+            "/f/%2E/a.jpg",
+            "/f/a.jpg#part",
+            "/f/a.jpg?v=2",
+        ] {
+            let (base, captured) = spawn_capturing_server().await;
+            let url = format!("{base}{path}");
+            assert_eq!(loader.load(&url).await.unwrap(), b"\xff\xd8\xff\xd9");
+            let head = captured.lock().unwrap().clone();
+            let target = head.split_whitespace().nth(1).unwrap().to_string();
+            assert_eq!(fetched_form(&url), format!("{base}{target}"), "{url}");
+            let upper = url.replace("http://", "HTTP://");
+            assert_eq!(fetched_form(&upper), fetched_form(&url), "{upper}");
+        }
     }
 }
