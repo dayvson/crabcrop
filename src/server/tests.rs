@@ -10,6 +10,7 @@ mod disk_scan;
 mod disk_stall;
 mod expiry_lifetime;
 mod explain_admission;
+mod explain_budget;
 mod loop_mark;
 mod meta_frame;
 mod request_log;
