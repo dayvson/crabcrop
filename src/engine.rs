@@ -1414,5 +1414,10 @@ mod quality_bound_tests;
 #[cfg(test)]
 mod fidelity_tests;
 
+// The byte budget a step's output frame is held to, in the
+// layout the step allocates (issue #784).
+#[cfg(test)]
+mod output_bytes_tests;
+
 #[cfg(test)]
 pub(crate) mod test_formats;

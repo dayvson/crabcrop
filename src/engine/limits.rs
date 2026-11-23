@@ -24,6 +24,14 @@ pub(in crate::engine) const MAX_ANIMATED_FRAMES: usize = 200;
 pub(in crate::engine) const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
+/// The most bytes the frame a step allocates may hold (issue
+/// #784): what an RGBA8 frame at [`MAX_OUTPUT_PIXELS`] holds.
+/// A step allocates its frame in the layout it works in, for a
+/// resize the layout of the frame in hand, so a 16-bit color
+/// or float frame at the pixel limit would hold two to four
+/// times as much.
+pub(crate) const MAX_OUTPUT_BYTES: u64 = MAX_OUTPUT_PIXELS * 4;
+
 /// Reject an output size past the shared pixel budget, before
 /// anything allocates it. u64 math, so DPR-scaled dimensions
 /// cannot wrap past the check.
@@ -31,6 +39,28 @@ pub(in crate::engine) fn check_output_pixels(width: u32, height: u32) -> Result<
     if width as u64 * height as u64 > MAX_OUTPUT_PIXELS {
         return Err(EngineError::Unsupported(format!(
             "requested output {width}x{height} exceeds the {MAX_OUTPUT_PIXELS} pixel limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a `width` x `height` frame in `layout` past
+/// [`MAX_OUTPUT_BYTES`], before anything allocates it (issue
+/// #784). An 8-bit layout holds four bytes a pixel at most, so
+/// a frame within the pixel budget is within this one: it
+/// binds only on 16-bit color and float frames. The refusal
+/// starts `requested output WxH`, as the pixel budget's does,
+/// so a hinted DPR factor steps down from it.
+pub(in crate::engine) fn check_output_bytes(
+    width: u32,
+    height: u32,
+    layout: image::ColorType,
+) -> Result<(), EngineError> {
+    let per_pixel = u64::from(layout.bytes_per_pixel());
+    if (width as u64 * height as u64).saturating_mul(per_pixel) > MAX_OUTPUT_BYTES {
+        return Err(EngineError::Unsupported(format!(
+            "requested output {width}x{height} at {per_pixel} bytes a pixel exceeds the \
+             {MAX_OUTPUT_BYTES} byte limit"
         )));
     }
     Ok(())
@@ -296,8 +326,9 @@ pub(crate) fn dpr_step_below(factor: f32) -> Option<f32> {
 }
 
 /// How every refusal of an output size opens: a step past
-/// the per-axis limit or the pixel budget
-/// ([`check_output_size`], [`check_output_pixels`]), a hinted
+/// the per-axis limit, the pixel budget or the byte budget
+/// ([`check_output_size`], [`check_output_pixels`],
+/// [`check_output_bytes`]), a hinted
 /// output past the per-axis limit ([`check_hinted_output`]),
 /// a scaled overlay past the budget, and an animated output
 /// past the budget across its frames ([`OutputBudget`]). A

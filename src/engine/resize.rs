@@ -9,7 +9,7 @@
 
 use image::DynamicImage;
 
-use super::limits::check_output_size;
+use super::limits::{check_output_bytes, check_output_size};
 use super::{EngineError, Window, jpeg_scaled};
 use crate::url::{Dimension, ImageSize, PadFill};
 
@@ -219,6 +219,9 @@ pub(in crate::engine) fn apply_size_windowed(
     };
     let (w, h) = resize_target(size, dpr, (sw, sh), cap);
     check_output_size(w, h, (sw, sh))?;
+    // Every branch below allocates its result in the frame's
+    // layout, or as RGBA8, which the pixel limit bounds.
+    check_output_bytes(w, h, img.color())?;
     let unchanged = w == sw && h == sh;
     let img = match window {
         // A reduced frame is not the size the target was
@@ -253,6 +256,7 @@ pub(in crate::engine) fn apply_size_lent(
     let dims = (frame.width(), frame.height());
     let (w, h) = resize_target(size, dpr, dims, cap);
     check_output_size(w, h, dims)?;
+    check_output_bytes(w, h, frame.color())?;
     if (w, h) == dims {
         return Ok(None);
     }
@@ -719,6 +723,26 @@ pub(in crate::engine) fn apply_pad(
         return Ok((img, whole));
     }
     check_output_size(target_w, target_h, (img.width(), img.height()))?;
+    let canvas = ImageSize {
+        width: Dimension::Pixels(target_w),
+        height: Dimension::Pixels(target_h),
+        flip_horizontal: false,
+        flip_vertical: false,
+    };
+    // The canvas is RGBA8, which the check above holds to the
+    // byte budget too, and the fit checks the image it fits in
+    // the frame's layout. The blurred bars scale the frame to
+    // cover the canvas, in its layout, before they crop the
+    // canvas out of it: that frame is checked here, before the
+    // pad allocates anything (issue #784). Pad never adapts:
+    // the canvas is the explicit box, so the fit inside it
+    // uses the box as written.
+    let dims = (img.width(), img.height());
+    let fit = fit_in_target(&canvas, false, cap, 1.0, dims, img.color())?.unwrap_or(dims);
+    if fill == PadFill::Blur && fit != (target_w, target_h) {
+        let (cover_w, cover_h) = cover_size(dims, (target_w, target_h));
+        check_output_bytes(cover_w, cover_h, img.color())?;
+    }
     let backdrop = match fill {
         PadFill::Color(c) => Backdrop::Solid(c),
         PadFill::Directive => Backdrop::Solid(directive_fill.unwrap_or([0, 0, 0])),
@@ -726,20 +750,7 @@ pub(in crate::engine) fn apply_pad(
         // the fit, so only it keeps a copy (issue #656).
         PadFill::Blur => Backdrop::Blurred(img.clone()),
     };
-    let fitted = apply_fit_in(
-        img,
-        &ImageSize {
-            width: Dimension::Pixels(target_w),
-            height: Dimension::Pixels(target_h),
-            flip_horizontal: false,
-            flip_vertical: false,
-        },
-        // Pad never adapts: the canvas is the explicit box,
-        // so the fit inside it uses the box as written.
-        false,
-        cap,
-        1.0,
-    )?;
+    let fitted = apply_fit_in(img, &canvas, false, cap, 1.0)?;
     if fitted.width() == target_w && fitted.height() == target_h {
         return Ok((fitted, (0, 0, target_w, target_h)));
     }
@@ -768,6 +779,20 @@ pub(in crate::engine) fn apply_pad(
     let placed = (x, y, fitted.width(), fitted.height());
     place_on(&mut base, fitted, x, y);
     Ok((DynamicImage::ImageRgba8(base), placed))
+}
+
+/// The size `DynamicImage::resize_to_fill` scales a `w` by
+/// `h` image to before it crops a `target` out of the middle:
+/// the smallest scale at which the image covers the target,
+/// each side rounded and at least 1, as the image crate
+/// rounds it. A side past `u32` saturates, which the byte
+/// check refuses.
+fn cover_size((w, h): (u32, u32), (target_w, target_h): (u32, u32)) -> (u32, u32) {
+    let ratio =
+        (f64::from(target_w) / f64::from(w.max(1))).max(f64::from(target_h) / f64::from(h.max(1)));
+    let side =
+        |n: u32| u32::try_from(((f64::from(n) * ratio).round() as u64).max(1)).unwrap_or(u32::MAX);
+    (side(w), side(h))
 }
 
 /// Composite `top` over `base` at (x, y): byte for byte
@@ -858,7 +883,7 @@ pub(in crate::engine) fn apply_fit_in(
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
     let dims = (img.width(), img.height());
-    match fit_in_target(size, adaptive, cap, dpr, dims)? {
+    match fit_in_target(size, adaptive, cap, dpr, dims, img.color())? {
         Some((w, h)) if (w, h) != dims => Ok(resize_lanczos3_owned(img, w, h)),
         _ => Ok(img),
     }
@@ -875,14 +900,17 @@ pub(in crate::engine) fn apply_fit_in_lent(
     dpr: f32,
 ) -> Result<Option<DynamicImage>, EngineError> {
     let dims = (frame.width(), frame.height());
-    Ok(match fit_in_target(size, adaptive, cap, dpr, dims)? {
-        Some((w, h)) if (w, h) != dims => Some(resize_lanczos3_lent(frame, w, h)),
-        _ => None,
-    })
+    Ok(
+        match fit_in_target(size, adaptive, cap, dpr, dims, frame.color())? {
+            Some((w, h)) if (w, h) != dims => Some(resize_lanczos3_lent(frame, w, h)),
+            _ => None,
+        },
+    )
 }
 
-/// The size a fit-in to `size` leaves a `sw` by `sh` image at,
-/// checked against the output bounds; `None` when the box
+/// The size a fit-in to `size` leaves a `sw` by `sh` image in
+/// `layout` at, checked against the output bounds, the bytes
+/// of a frame in that layout included; `None` when the box
 /// bounds neither axis, so the image passes as it is.
 fn fit_in_target(
     size: &ImageSize,
@@ -890,6 +918,7 @@ fn fit_in_target(
     cap: Option<(u32, u32)>,
     dpr: f32,
     (sw, sh): (u32, u32),
+    layout: image::ColorType,
 ) -> Result<Option<(u32, u32)>, EngineError> {
     check_nonzero_size(size)?;
     let scaled = ImageSize {
@@ -920,5 +949,6 @@ fn fit_in_target(
         None => (w, h),
     };
     check_output_size(w, h, (sw, sh))?;
+    check_output_bytes(w, h, layout)?;
     Ok(Some((w, h)))
 }

@@ -15,8 +15,8 @@ use super::detect::{
 };
 use super::focal::{Focal, PendingFocal, capture_from_trace, filter_keeps_focal};
 use super::limits::{
-    check_final_output, check_hinted_output, check_operation_count, check_output_pixels,
-    check_output_size, scales_with_dpr,
+    check_final_output, check_hinted_output, check_operation_count, check_output_bytes,
+    check_output_pixels, check_output_size, scales_with_dpr,
 };
 use super::overlay::{blend_overlay_keeping, overlay_watermark};
 use super::resize::{
@@ -470,9 +470,15 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // hand is still the pre-crop frame: the two-step
         // path checks the window at this point, and the
         // fused crop ran that same check on the window when
-        // it recorded it.
+        // it recorded it. The image stays inside the byte
+        // budget too (issue #784): a step that allocates in
+        // the image's own layout checks before it allocates,
+        // and an image inside the budget keeps what a quarter
+        // turn, a crop's copy or the encoder's conversions
+        // make from it inside the budget as well.
         if self.fused_window.is_none() {
             check_output_pixels(img.width(), img.height())?;
+            check_output_bytes(img.width(), img.height(), img.color())?;
         }
         Ok(img)
     }
@@ -686,6 +692,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     // the window now, so an oversized window
                     // refuses the same way.
                     check_output_pixels(right - left, bottom - top)?;
+                    check_output_bytes(right - left, bottom - top, img.color())?;
                     self.fused_window = Some((*left, *top, right - left, bottom - top));
                 } else {
                     img = img.crop_imm(*left, *top, right - left, bottom - top);
@@ -759,6 +766,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // budget: growth is checked before it compounds
         // across a chain, not just at the size operations.
         check_output_pixels(img.width(), img.height())?;
+        check_output_bytes(img.width(), img.height(), img.color())?;
         Ok(img)
     }
 
@@ -815,6 +823,8 @@ impl<'r, 'a> ChainState<'r, 'a> {
             None => (tw, th),
         };
         check_output_size(target.0, target.1, (img.width(), img.height()))?;
+        // The resize lands in the frame's layout (issue #784).
+        check_output_bytes(target.0, target.1, img.color())?;
         // The crop consumes any pending focal form, mapped
         // onto the image in hand by the steps since its
         // segment (issue #465). Center and smart crops
@@ -1396,7 +1406,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // the canvas: check the canvas it
         // is about to allocate before it
         // allocates (issue #182, R2-12),
-        // per axis too (issue #521).
+        // per axis too (issue #521). It
+        // draws the canvas as RGBA8, which
+        // the pixel check holds to the
+        // byte budget; a quarter turn
+        // keeps the frame's bytes (issue
+        // #784).
         if let PlainFilter::Rotate(degrees) = filter {
             let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
             check_output_size(cw, ch, (img.width(), img.height()))?;
@@ -1456,8 +1471,13 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // image that goes to the encoder is inside the output
         // budget (issue #182, audit R2-12) and the per-axis
         // limit (issue #528). The still, animated and video
-        // paths all end here, once per frame.
+        // paths all end here, once per frame. The frame is
+        // inside the byte budget too (issue #784), which holds
+        // the encoder's conversions inside it: to 8-bit RGB or
+        // RGBA, four bytes a pixel at most at the pixel limit,
+        // and of a float frame to 16 bits, half its bytes.
         check_final_output(img.width(), img.height())?;
+        check_output_bytes(img.width(), img.height(), img.color())?;
         let inpaint_record = if self.inpaint_regions.is_empty() {
             None
         } else {
