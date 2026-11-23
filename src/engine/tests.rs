@@ -8429,6 +8429,54 @@ fn an_animated_webp_is_charged_the_canvases_its_decode_holds() {
     assert_eq!(frames.dimensions(), (64, 48));
 }
 
+/// `bytes`, an animated WebP, with its VP8X chunk's size field
+/// set to `size`.
+fn with_vp8x_size(mut bytes: Vec<u8>, size: u32) -> Vec<u8> {
+    assert_eq!(&bytes[12..16], b"VP8X");
+    bytes[16..20].copy_from_slice(&size.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn an_animated_webp_is_charged_as_its_decoder_reads_the_vp8x_chunk() {
+    // image-webp reads the ten bytes of a VP8X chunk's fields
+    // whatever its size field says, and finds the next chunk by
+    // that size rounded up to an even one, so a chunk that
+    // states 9 bytes is read as one that states 10. The charge
+    // reads the canvas and the frames the same way, before any
+    // frame decodes; the libwebp walk declines such a chunk and
+    // leaves the file to the image crate's iterator.
+    for (width, height) in [(8192, 8192), (16384, 16384)] {
+        let short = with_vp8x_size(with_webp_canvas(small_animated_webp(1), width, height), 9);
+        let err = check_webp_frame_budget(&short).unwrap_err();
+        assert!(
+            err.to_string().contains("decode allocation limit"),
+            "{width}x{height}: {err}"
+        );
+        let started = std::time::Instant::now();
+        let got = decode_webp_frames(&short, None).unwrap_err();
+        assert_eq!(got.to_string(), err.to_string(), "{width}x{height}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{width}x{height}: the refusal took {:?}",
+            started.elapsed()
+        );
+    }
+    // Within the charge such a file decodes, through the image
+    // crate's iterator, to the frames the file with a ten-byte
+    // chunk decodes to.
+    let ten = with_webp_canvas(small_animated_webp(2), 64, 48);
+    let nine = with_vp8x_size(ten.clone(), 9);
+    let (want, got) = (
+        decode_webp_frames(&ten, None).unwrap(),
+        decode_webp_frames(&nine, None).unwrap(),
+    );
+    assert_eq!(got.len(), want.len());
+    for (got, want) in got.iter().zip(want.iter()) {
+        assert!(got.buffer().as_raw() == want.buffer().as_raw());
+    }
+}
+
 /// A GIF with a `width` x `height` logical screen and `frames`
 /// one-pixel frames at its corner, so each frame decodes from one
 /// coded pixel and comes back composited onto the whole screen.

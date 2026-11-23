@@ -1417,7 +1417,7 @@ fn a_progressive_jpeg_is_charged_its_coefficients_before_any_decode() {
     );
 }
 
-/// The coefficients [`progressive_coefficient_bytes`] charges
+/// The coefficients [`jpeg_coefficient_bytes`] charges
 /// `bytes`, from zune-jpeg's reading of its header.
 fn coefficients(bytes: &[u8]) -> u64 {
     let mut zune = zune_jpeg::JpegDecoder::new_with_options(
@@ -1425,7 +1425,7 @@ fn coefficients(bytes: &[u8]) -> u64 {
         zune_jpeg_options(),
     );
     zune.decode_headers().unwrap();
-    progressive_coefficient_bytes(bytes, &zune)
+    jpeg_coefficient_bytes(bytes, &zune)
 }
 
 #[test]
@@ -1530,6 +1530,91 @@ fn the_sampling_factors_are_read_from_the_frame_zune_jpeg_reads() {
             "{what}"
         );
     }
+}
+
+/// A sequential JPEG of `components` components at 1x1, each
+/// coded in a scan of its own, of a flat picture: one Huffman
+/// table of one two-bit code for each class, so every block is
+/// a DC difference of zero and an end of block, four zero bits.
+fn a_component_a_scan_jpeg(width: u16, height: u16, components: u8) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xD8];
+    // A quantization table of ones.
+    out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    out.extend_from_slice(&[1u8; 64]);
+    out.extend_from_slice(&[0xFF, 0xC0]);
+    out.extend_from_slice(&(8 + 3 * u16::from(components)).to_be_bytes());
+    out.push(8);
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.push(components);
+    for component in 1..=components {
+        out.extend_from_slice(&[component, 0x11, 0]);
+    }
+    for class in [0x00, 0x10] {
+        out.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, class]);
+        let mut counts = [0u8; 16];
+        counts[1] = 1;
+        out.extend_from_slice(&counts);
+        out.push(0);
+    }
+    let blocks = usize::from(width).div_ceil(8) * usize::from(height).div_ceil(8);
+    for component in 1..=components {
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 1, component, 0x00, 0, 63, 0]);
+        let mut data = vec![0u8; blocks.div_ceil(2)];
+        if blocks % 2 == 1 {
+            // The last block's four bits, then ones to the byte.
+            *data.last_mut().unwrap() = 0x0F;
+        }
+        out.extend_from_slice(&data);
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+#[test]
+fn a_sequential_jpeg_coded_a_component_a_scan_is_charged_its_coefficients() {
+    // A sequential file whose first scan leaves components to
+    // later scans cannot be decoded a row at a time either:
+    // zune-jpeg keeps every component's coefficients until the
+    // scans that carry the rest have come, as for a progressive
+    // file, so it is charged them the same way. 8192x8192 in
+    // three components at full resolution is a 256 MiB frame and
+    // 384 MiB of coefficients.
+    let small = a_component_a_scan_jpeg(64, 48, 3);
+    let declared = declaring(&small, 8192, 8192);
+    assert_eq!(coefficients(&declared), 3 * 1024 * 1024 * 128);
+    let refused = decode_image(&declared);
+    assert!(
+        matches!(&refused, Err(EngineError::Decode(why))
+            if why.contains("coefficients") && !why.contains("progressive")),
+        "{:?}",
+        refused.map(|img| (img.width(), img.height()))
+    );
+    // A shrinking request is refused the same way: such a file
+    // never takes the scaled decode.
+    assert_eq!(plan_for(&declared, "100x0"), None);
+    let answered = answer(render(&declared, "100x0"));
+    assert!(
+        answered.as_ref().is_err_and(|e| e.contains("coefficients")),
+        "{answered:?}"
+    );
+    // Four components, as a CMYK file has them.
+    let four = declaring(&a_component_a_scan_jpeg(64, 48, 4), 6000, 6000);
+    assert_eq!(coefficients(&four), 4 * 750 * 750 * 128);
+    assert!(decode_image(&four).is_err());
+    // Within the budget such a file decodes as before.
+    assert_eq!(coefficients(&small), 3 * 8 * 6 * 128);
+    let img = decode_image(&small).unwrap();
+    assert_eq!((img.width(), img.height()), (64, 48));
+    // A sequential file whose first scan carries every component
+    // is decoded a row of MCUs at a time and is charged its frame
+    // alone, as is a sequential file of one component.
+    let one_scan = declaring(&jpeg(&picture(64, 48)), 8192, 8192);
+    assert_eq!(coefficients(&one_scan), 0);
+    let gray = jpeg_with(&picture(64, 48), |c| {
+        c.set_subsamp(turbojpeg::Subsamp::Gray).unwrap();
+    });
+    assert_eq!(coefficients(&declaring(&gray, 8192, 8192)), 0);
 }
 
 #[test]

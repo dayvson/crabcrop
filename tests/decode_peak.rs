@@ -196,3 +196,206 @@ fn a_one_frame_animated_webp_holds_one_canvas() {
         "the render held {held} bytes for a canvas of {canvas}"
     );
 }
+
+/// A one-frame animated WebP whose one frame fills its
+/// `width` x `height` canvas: libwebp's lossless stream of a flat
+/// picture, in a container of its own (VP8X with the animation
+/// and alpha flags, ANIM, one ANMF that does not blend).
+fn full_canvas_animation(width: u32, height: u32) -> Vec<u8> {
+    fn chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = fourcc.to_vec();
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+    let u24 = |v: u32| v.to_le_bytes()[..3].to_vec();
+    let rgba = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 200]));
+    let still = webp::Encoder::from_rgba(rgba.as_raw(), width, height).encode_lossless();
+    assert_eq!(&still[12..16], b"VP8L");
+    let size = u32::from_le_bytes(still[16..20].try_into().unwrap()) as usize;
+    let vp8l = &still[20..20 + size];
+    let vp8x = [vec![0x12, 0, 0, 0], u24(width - 1), u24(height - 1)].concat();
+    let anmf = [
+        u24(0),
+        u24(0),
+        u24(width - 1),
+        u24(height - 1),
+        u24(100),
+        vec![0b10],
+        chunk(b"VP8L", vp8l),
+    ]
+    .concat();
+    let body = [
+        chunk(b"VP8X", &vp8x),
+        chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]),
+        chunk(b"ANMF", &anmf),
+    ]
+    .concat();
+    [
+        &b"RIFF"[..],
+        &((4 + body.len()) as u32).to_le_bytes(),
+        b"WEBP",
+        &body,
+    ]
+    .concat()
+}
+
+#[test]
+fn an_animated_webp_decoded_as_a_still_is_charged_its_canvases() {
+    // The still decode, `decode_image` (it decodes watermarks and
+    // the renders meta mode reads back), takes an animated WebP's
+    // first frame, which image-webp composites onto a canvas of
+    // its own beside the frame it decodes and the buffer it hands
+    // back, as its frame iterator does. So it is charged as a
+    // one-frame animation: three canvases. One small frame on a
+    // 4096x5462 canvas passes that by a row, and is refused
+    // before anything is allocated for it.
+    let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+    let image = oxideav_webp::WebpImage::from_rgba8(4, 4, img.into_raw()).unwrap();
+    let frame = oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(100)));
+    let opts = oxideav_webp::EncodeOptions::default()
+        .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+    let one = oxideav_webp::encode_animation(&[frame], &opts).unwrap();
+    let wide = with_canvas(one, 4096, 5462);
+    let (refused, held) = peak(|| crabcrop::engine::decode_image(&wide).map(|img| img.width()));
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("decode allocation limit")),
+        "{refused:?}"
+    );
+    assert!(held < 4096 * 5462, "the refusal held {held} bytes");
+    // Within the charge, a frame that fills a 1024x1024 canvas
+    // holds the three canvases it is charged, and no more.
+    let (width, height) = (1024, 1024);
+    let canvas = (width * height * 4) as usize;
+    let full = full_canvas_animation(width, height);
+    let (decoded, held) =
+        peak(|| crabcrop::engine::decode_image(&full).map(|img| (img.width(), img.height())));
+    // Visible under `--nocapture`; captured in the gate.
+    eprintln!("animated WebP as a still: {held} bytes for a {canvas} byte canvas");
+    assert_eq!(decoded.unwrap(), (width, height));
+    assert!(
+        held <= 3 * canvas + canvas / 8,
+        "the decode held {held} bytes for a canvas of {canvas}"
+    );
+}
+
+/// A JPEG of a noisy `width` x `height` picture from
+/// libjpeg-turbo, at quality 90.
+fn turbo_jpeg(width: u32, height: u32, subsamp: turbojpeg::Subsamp, progressive: bool) -> Vec<u8> {
+    let mut state: u32 = 0x1234_5678;
+    let pixels: Vec<u8> = (0..width * height * 3)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let mut compressor = turbojpeg::Compressor::new().unwrap();
+    compressor.set_quality(90).unwrap();
+    compressor.set_subsamp(subsamp).unwrap();
+    compressor.set_progressive(progressive).unwrap();
+    compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: pixels.as_slice(),
+            width: width as usize,
+            pitch: width as usize * 3,
+            height: height as usize,
+            format: turbojpeg::PixelFormat::RGB,
+        })
+        .unwrap()
+}
+
+/// A sequential JPEG of three components at 1x1, each coded in a
+/// scan of its own, of a flat picture: one Huffman table of one
+/// two-bit code for each class, so every block is four zero bits.
+fn a_component_a_scan_jpeg(width: u16, height: u16) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+    out.extend_from_slice(&[1u8; 64]);
+    out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 8]);
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&[3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+    for class in [0x00, 0x10] {
+        out.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, class]);
+        let mut counts = [0u8; 16];
+        counts[1] = 1;
+        out.extend_from_slice(&counts);
+        out.push(0);
+    }
+    let blocks = usize::from(width).div_ceil(8) * usize::from(height).div_ceil(8);
+    for component in 1..=3 {
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 1, component, 0x00, 0, 63, 0]);
+        let mut data = vec![0u8; blocks.div_ceil(2)];
+        if blocks % 2 == 1 {
+            *data.last_mut().unwrap() = 0x0F;
+        }
+        out.extend_from_slice(&data);
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+#[test]
+fn the_coefficient_charge_covers_what_the_decoders_keep() {
+    // The charge counts a progressive file's coefficients as 64 of
+    // two bytes a block, over the image padded out to whole MCUs.
+    // What a progressive decode holds past the baseline decode of
+    // the same picture, in every layout, is no more than that.
+    let (width, height) = (1000u64, 700u64);
+    let layouts: [(turbojpeg::Subsamp, &[(u64, u64)]); 6] = [
+        (turbojpeg::Subsamp::None, &[(1, 1), (1, 1), (1, 1)]),
+        (turbojpeg::Subsamp::Sub2x1, &[(2, 1), (1, 1), (1, 1)]),
+        (turbojpeg::Subsamp::Sub2x2, &[(2, 2), (1, 1), (1, 1)]),
+        (turbojpeg::Subsamp::Sub1x2, &[(1, 2), (1, 1), (1, 1)]),
+        (turbojpeg::Subsamp::Sub4x1, &[(4, 1), (1, 1), (1, 1)]),
+        (turbojpeg::Subsamp::Gray, &[(1, 1)]),
+    ];
+    let held_decoding = |bytes: &[u8]| {
+        let (decoded, held) = peak(|| crabcrop::engine::decode_image(bytes));
+        decoded.unwrap();
+        held as i64
+    };
+    for (subsamp, factors) in layouts {
+        let most = factors
+            .iter()
+            .fold((1, 1), |(h, v), &(fh, fv)| (h.max(fh), v.max(fv)));
+        let (across, down) = (width.div_ceil(8 * most.0), height.div_ceil(8 * most.1));
+        let charged: u64 = factors
+            .iter()
+            .map(|&(h, v)| across * h * down * v * 128)
+            .sum();
+        let progressive = turbo_jpeg(width as u32, height as u32, subsamp, true);
+        let baseline = turbo_jpeg(width as u32, height as u32, subsamp, false);
+        let beyond = held_decoding(&progressive) - held_decoding(&baseline);
+        // The image crate's own decode, which grayscale takes,
+        // copies the file it reads.
+        let slack = (progressive.len() as i64 - baseline.len() as i64).max(0) + 65_536;
+        // Visible under `--nocapture`; captured in the gate.
+        eprintln!(
+            "{subsamp:?}: the progressive decode held {beyond} bytes more, {charged} charged"
+        );
+        assert!(
+            beyond <= charged as i64 + slack,
+            "{subsamp:?}: {beyond} bytes beyond the baseline decode, {charged} charged"
+        );
+    }
+    // A sequential file coded a component a scan keeps the same
+    // store beside its frame, and is charged it.
+    let multi = a_component_a_scan_jpeg(width as u16, height as u16);
+    let charged = 3 * width.div_ceil(8) * height.div_ceil(8) * 128;
+    let held = held_decoding(&multi);
+    eprintln!(
+        "a component a scan: the decode held {held} bytes, {charged} of coefficients charged"
+    );
+    assert!(held >= charged as i64, "held {held}, charged {charged}");
+    assert!(
+        held <= (width * height * 3 + charged) as i64 + 65_536,
+        "held {held}, charged {charged}"
+    );
+}

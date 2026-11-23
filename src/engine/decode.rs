@@ -14,7 +14,9 @@ use std::sync::Once;
 
 use image::DynamicImage;
 
-use super::animated::{decode_gif_frames, decode_webp_frames, webp_animation_params};
+use super::animated::{
+    check_webp_first_frame_budget, decode_gif_frames, decode_webp_frames, webp_animation_params,
+};
 use super::limits::{MAX_DECODE_ALLOC, MAX_DECODE_DIMENSION};
 use super::resize::{fit_in_box, proportional_side, scale_px};
 use super::{EngineError, jpeg_scaled, state};
@@ -112,6 +114,11 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
             if let Some(img) = decode_webp_direct(bytes) {
                 return Ok(img);
             }
+            // libwebp's still decode refuses an animated file, which
+            // the image crate decodes below to its first frame, onto
+            // a canvas of its own: it is charged as a one-frame
+            // animation.
+            check_webp_first_frame_budget(bytes)?;
         }
         _ => {}
     }
@@ -274,15 +281,14 @@ pub(in crate::engine) fn zune_jpeg_options() -> zune_core::options::DecoderOptio
         .set_max_height(MAX_DECODE_DIMENSION as usize)
 }
 
-/// Refuse a progressive JPEG whose decode would hold more than
-/// the decode allocation budget: its frame, at four bytes a
-/// pixel as the probe in [`decode_image`] charges every still,
-/// and the coefficients it keeps beside the frame until its
-/// last scan ([`progressive_coefficient_bytes`]). Both decodes
-/// that may follow, zune-jpeg's own and the image crate's
-/// around it, read the header as zune-jpeg reads it here. A
-/// header it cannot read is left to them, and they fail on it
-/// before they allocate.
+/// Refuse a JPEG whose decode would hold more than the decode
+/// allocation budget: its frame, at four bytes a pixel as the
+/// probe in [`decode_image`] charges every still, and the
+/// coefficients it keeps beside the frame until its last scan
+/// ([`jpeg_coefficient_bytes`]). Both decodes that may follow,
+/// zune-jpeg's own and the image crate's around it, read the
+/// header as zune-jpeg reads it here. A header it cannot read is
+/// left to them, and they fail on it before they allocate.
 fn check_jpeg_coefficients(bytes: &[u8]) -> Result<(), EngineError> {
     let mut zune = zune_jpeg::JpegDecoder::new_with_options(
         zune_core::bytestream::ZCursor::new(bytes),
@@ -291,38 +297,43 @@ fn check_jpeg_coefficients(bytes: &[u8]) -> Result<(), EngineError> {
     if zune.decode_headers().is_err() {
         return Ok(());
     }
-    let coefficients = progressive_coefficient_bytes(bytes, &zune);
+    let coefficients = jpeg_coefficient_bytes(bytes, &zune);
     let Some((width, height)) = zune.dimensions() else {
         return Ok(());
     };
     let held = (width as u64 * height as u64 * 4).saturating_add(coefficients);
     if coefficients > 0 && held > MAX_DECODE_ALLOC {
         return Err(EngineError::Decode(format!(
-            "progressive JPEG {width}x{height} would hold {held} bytes with its coefficients, \
-             past the {MAX_DECODE_ALLOC} byte decode allocation limit"
+            "JPEG {width}x{height} would hold {held} bytes with the coefficients it keeps until \
+             its last scan, past the {MAX_DECODE_ALLOC} byte decode allocation limit"
         )));
     }
     Ok(())
 }
 
-/// The coefficients a progressive JPEG's decode holds beside
-/// its frame, in bytes, or 0 for any other file. A progressive
-/// file cannot be decoded a row at a time: zune-jpeg keeps
-/// every component's coefficients, 64 of two bytes a block over
-/// the image padded out to whole MCUs, until its last scan, and
-/// libjpeg-turbo's scaled decode ([`jpeg_scaled`]) keeps the
-/// same store. A baseline file is decoded a row of MCUs at a
-/// time.
+/// The coefficients a JPEG's decode holds beside its frame, in
+/// bytes, or 0 for a file decoded a row of MCUs at a time. A
+/// progressive file cannot be decoded a row at a time: zune-jpeg
+/// keeps every component's coefficients, 64 of two bytes a block
+/// over the image padded out to whole MCUs, until its last scan,
+/// and libjpeg-turbo's scaled decode ([`jpeg_scaled`]) keeps the
+/// same store. Nor can a sequential file whose first scan leaves
+/// components to later scans: zune-jpeg keeps the same store for
+/// it until those scans have come. A sequential file whose first
+/// scan carries every component, and one of a single component,
+/// is decoded a row of MCUs at a time.
 ///
 /// `zune` has read the file's headers, and its reading decides
 /// whether the file is progressive, its size and its component
 /// count. The components' sampling factors, which zune-jpeg
-/// does not report, come from [`frame_sampling`], whose walk
-/// reads the frame header zune-jpeg reads. Where the walk
-/// does not read a frame that agrees with zune-jpeg's, each
-/// component is taken at the largest factors, the most such a
-/// frame can hold.
-pub(in crate::engine) fn progressive_coefficient_bytes<T>(
+/// does not report, and the first scan's component count come
+/// from [`frame_sampling`], whose walk reads the frame header and
+/// the first scan header zune-jpeg reads. Where the walk does not
+/// read a frame that agrees with zune-jpeg's, each component is
+/// taken at the largest factors, the most such a frame can hold,
+/// and where it does not reach the first scan, a sequential file
+/// is charged as one whose first scan leaves components out.
+pub(in crate::engine) fn jpeg_coefficient_bytes<T>(
     bytes: &[u8],
     zune: &zune_jpeg::JpegDecoder<T>,
 ) -> u64
@@ -333,7 +344,9 @@ where
     let Some(info) = zune.info() else {
         return 0;
     };
-    if !info.sof.is_progressive() {
+    let progressive = info.sof.is_progressive();
+    let count = usize::from(info.components);
+    if !progressive && count == 1 {
         return 0;
     }
     let most = match info.sample_ratio {
@@ -343,15 +356,17 @@ where
         SampleRatios::HV => (2, 2),
         SampleRatios::Generic(h, v) => (h as u64, v as u64),
     };
-    let across = u64::from(info.width).div_ceil(8 * most.0);
-    let down = u64::from(info.height).div_ceil(8 * most.1);
-    let count = usize::from(info.components);
     let frame = frame_sampling(bytes).filter(|frame| {
         (frame.width, frame.height) == (info.width, info.height)
-            && frame.progressive
+            && frame.progressive == progressive
             && frame.count == count
             && frame.most() == most
     });
+    if !progressive && frame.as_ref().and_then(|frame| frame.first_scan) == Some(count) {
+        return 0;
+    }
+    let across = u64::from(info.width).div_ceil(8 * most.0);
+    let down = u64::from(info.height).div_ceil(8 * most.1);
     let blocks: u64 = (0..count)
         .map(|i| {
             let (h, v) = frame.as_ref().map_or(most, |frame| frame.sampling[i]);
@@ -361,7 +376,8 @@ where
     blocks * 64 * 2
 }
 
-/// A JPEG frame header as [`frame_sampling`] reads it.
+/// A JPEG frame header as [`frame_sampling`] reads it, and the
+/// component count of the scan header after it.
 struct FrameSampling {
     width: u16,
     height: u16,
@@ -371,6 +387,9 @@ struct FrameSampling {
     /// Each component's horizontal and vertical sampling
     /// factors, for the first `count`.
     sampling: [(u64, u64); 4],
+    /// How many components the first scan carries, where the
+    /// walk reaches that scan's header.
+    first_scan: Option<usize>,
 }
 
 impl FrameSampling {
@@ -383,78 +402,101 @@ impl FrameSampling {
 }
 
 /// The frame header of a JPEG, read by a walk over its marker
-/// segments, for [`progressive_coefficient_bytes`]: the first
-/// frame header zune-jpeg decodes (SOF0 to SOF2), as zune-jpeg's
-/// header reader comes to it. The walk steps over each segment
-/// on the way by its length, as that reader does (an APP0
-/// segment of length 6 takes one byte more there), and over the
-/// other frame headers, which that reader skips too. `None` for
-/// anything else on the way: stray bytes between segments,
+/// segments, for [`jpeg_coefficient_bytes`]: the first frame
+/// header zune-jpeg decodes (SOF0 to SOF2), as zune-jpeg's header
+/// reader comes to it, with the component count of the first scan
+/// header after it, where that reader stops. The walk steps over
+/// each segment on the way by its length, as that reader does (an
+/// APP0 segment of length 6 takes one byte more there), and over
+/// the other frame headers, which that reader skips too. It stops
+/// at anything else on the way: stray bytes between segments,
 /// which that reader passes over and the walk does not follow,
-/// and a scan, the end of the image or a header it refuses. The
-/// walk allocates nothing.
+/// and the end of the image or a header it refuses. Stopped ahead
+/// of the frame header it is `None`; stopped between that and the
+/// first scan, it has no first scan. The walk allocates nothing.
 fn frame_sampling(bytes: &[u8]) -> Option<FrameSampling> {
     if bytes.get(..2)? != [0xFF, 0xD8] {
         return None;
     }
+    let mut frame = None;
     let mut at = 2;
-    loop {
-        if *bytes.get(at)? != 0xFF {
-            return None;
-        }
-        // Fill bytes ahead of the marker's code.
-        while *bytes.get(at + 1)? == 0xFF {
-            at += 1;
-        }
-        let code = bytes[at + 1];
-        let length = usize::from(u16::from_be_bytes([
-            *bytes.get(at + 2)?,
-            *bytes.get(at + 3)?,
-        ]));
+    while let Some((code, length, marker)) = marker_at(bytes, at) {
         match code {
-            0xC0..=0xC2 => {
-                let segment = bytes.get(at + 4..(at + 2).checked_add(length)?)?;
-                let (&[8, h0, h1, w0, w1, count], components) = segment.split_first_chunk::<6>()?
-                else {
-                    return None;
-                };
-                let count = usize::from(count);
-                if !(1..=4).contains(&count) || components.len() != 3 * count {
-                    return None;
-                }
-                let mut sampling = [(1, 1); 4];
-                for (slot, &[_, factors, _]) in
-                    sampling.iter_mut().zip(components.as_chunks::<3>().0)
-                {
-                    let (h, v) = (factors >> 4, factors & 15);
-                    if !matches!(h, 1 | 2 | 4) || !matches!(v, 1 | 2 | 4) {
-                        return None;
-                    }
-                    *slot = (u64::from(h), u64::from(v));
-                }
-                return Some(FrameSampling {
-                    width: u16::from_be_bytes([w0, w1]),
-                    height: u16::from_be_bytes([h0, h1]),
-                    progressive: code == 0xC2,
-                    count,
-                    sampling,
-                });
+            0xC0..=0xC2 if frame.is_none() => {
+                let segment = bytes.get(marker + 4..(marker + 2).checked_add(length)?)?;
+                frame = Some(frame_header(code, segment)?);
             }
-            // A stuffed zero is no marker, and a scan, the end of
-            // the image and the two headers zune-jpeg refuses
-            // (DAC, DNL) end its header reading without a frame.
-            0x00 | 0xCC | 0xD9 | 0xDA | 0xDC => return None,
+            // A second frame header, which zune-jpeg refuses.
+            0xC0..=0xC2 => return frame,
+            0xDA => {
+                if let Some(frame) = frame.as_mut() {
+                    frame.first_scan = bytes.get(marker + 4).map(|&n| usize::from(n));
+                }
+                return frame;
+            }
+            // A stuffed zero is no marker, and the end of the image
+            // and the two headers zune-jpeg refuses (DAC, DNL) end
+            // its header reading.
+            0x00 | 0xCC | 0xD9 | 0xDC => return frame,
             _ => {}
         }
         if length < 2 {
-            return None;
+            return frame;
         }
         // zune-jpeg reads five bytes of an APP0 segment longer
         // than five before it skips the rest, and one of length 6
         // has four.
         let extra = usize::from(code == 0xE0 && length == 6);
-        at = at.checked_add(2 + length + extra)?;
+        let Some(next) = marker.checked_add(2 + length + extra) else {
+            return frame;
+        };
+        at = next;
     }
+    frame
+}
+
+/// The marker at `at`: its code, the length its segment states,
+/// and where the 0xFF before its code is, past any fill bytes.
+/// `None` where no marker starts.
+fn marker_at(bytes: &[u8], mut at: usize) -> Option<(u8, usize, usize)> {
+    if *bytes.get(at)? != 0xFF {
+        return None;
+    }
+    while *bytes.get(at + 1)? == 0xFF {
+        at += 1;
+    }
+    let length = u16::from_be_bytes([*bytes.get(at + 2)?, *bytes.get(at + 3)?]);
+    Some((bytes[at + 1], usize::from(length), at))
+}
+
+/// The frame header segment `segment` of a frame of type `code`
+/// (SOF0 to SOF2), as zune-jpeg reads it: 8-bit samples, one to
+/// four components, sampling factors of 1, 2 or 4. `None` for one
+/// zune-jpeg refuses.
+fn frame_header(code: u8, segment: &[u8]) -> Option<FrameSampling> {
+    let (&[8, h0, h1, w0, w1, count], components) = segment.split_first_chunk::<6>()? else {
+        return None;
+    };
+    let count = usize::from(count);
+    if !(1..=4).contains(&count) || components.len() != 3 * count {
+        return None;
+    }
+    let mut sampling = [(1, 1); 4];
+    for (slot, &[_, factors, _]) in sampling.iter_mut().zip(components.as_chunks::<3>().0) {
+        let (h, v) = (factors >> 4, factors & 15);
+        if !matches!(h, 1 | 2 | 4) || !matches!(v, 1 | 2 | 4) {
+            return None;
+        }
+        *slot = (u64::from(h), u64::from(v));
+    }
+    Some(FrameSampling {
+        width: u16::from_be_bytes([w0, w1]),
+        height: u16::from_be_bytes([h0, h1]),
+        progressive: code == 0xC2,
+        count,
+        sampling,
+        first_scan: None,
+    })
 }
 
 /// The scaled JPEG decode on its own (issue #653): `bytes`
@@ -1293,3 +1335,6 @@ fn is_video_container(bytes: &[u8]) -> bool {
     }
     bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && !is_heic(bytes)
 }
+
+#[cfg(test)]
+mod tests;

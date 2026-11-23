@@ -589,20 +589,47 @@ pub(in crate::engine) fn check_webp_frame_budget(bytes: &[u8]) -> Result<(), Eng
     // holds two canvas-sized buffers beyond the frames it hands
     // back: its canvas and the frame it decodes, beside the
     // buffer it copies the canvas into for that frame. The walk
-    // holds one fewer, since its last frame takes its canvas (see
-    // `webp_anim`). The decode is charged the iterator's, which
-    // takes any file the walk declines: two canvases more than
-    // the frames it keeps. A file with no frames allocates no
-    // canvas, and its decode refuses it.
-    let held = u64::from(header.frames)
+    // holds as much at most: its canvas, the frame libwebp
+    // decodes, and libwebp's own buffer of a lossless frame's
+    // size while it decodes one; its last frame takes its canvas
+    // (see `webp_anim`). So the decode is charged two canvases
+    // more than the frames it keeps.
+    check_webp_held(&header, header.frames)
+}
+
+/// [`check_webp_frame_budget`] for a decode that keeps the first
+/// frame of an animated WebP alone: the image crate's still
+/// decode, which `decode_image` runs for a watermark or overlay
+/// image and for a render meta mode reads back. It composites
+/// that frame onto a canvas of its own, as its frame iterator
+/// does, beside the frame it decodes and the buffer it hands
+/// back, so it is charged as a one-frame animation. The canvas
+/// is held to the dimension and allocation limits by the probe
+/// ahead of that decode.
+pub(in crate::engine) fn check_webp_first_frame_budget(bytes: &[u8]) -> Result<(), EngineError> {
+    let Some(header) = webp_anim::header(bytes) else {
+        return Ok(());
+    };
+    check_webp_held(&header, header.frames.min(1))
+}
+
+/// Refuse a decode that keeps `frames` frames of the animated
+/// WebP `header` describes when, with the two canvas-sized
+/// buffers a decoder holds beside them (see
+/// [`check_webp_frame_budget`]), it would hold more than
+/// [`MAX_DECODE_ALLOC`]. A file with no frames allocates no
+/// canvas, and its decode refuses it.
+fn check_webp_held(header: &webp_anim::Header, frames: u32) -> Result<(), EngineError> {
+    let canvas = u64::from(header.width) * u64::from(header.height);
+    let held = u64::from(frames)
         .saturating_add(2)
         .saturating_mul(canvas)
         .saturating_mul(4);
-    if header.frames > 0 && held > MAX_DECODE_ALLOC {
+    if frames > 0 && held > MAX_DECODE_ALLOC {
         return Err(EngineError::Decode(format!(
-            "WebP decode of {} frames on a {}x{} canvas would hold {held} bytes, past the \
+            "WebP decode of {frames} frames on a {}x{} canvas would hold {held} bytes, past the \
              {MAX_DECODE_ALLOC} byte decode allocation limit",
-            header.frames, header.width, header.height
+            header.width, header.height
         )));
     }
     Ok(())

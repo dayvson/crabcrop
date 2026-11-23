@@ -78,7 +78,7 @@ use image::DynamicImage;
 
 use super::{
     EngineError, ImageSize, MAX_DECODE_ALLOC, Operation, ProcessContext, SizeCap,
-    check_decoded_dimensions, exif_orientation, has_zero_side, progressive_coefficient_bytes,
+    check_decoded_dimensions, exif_orientation, has_zero_side, jpeg_coefficient_bytes,
     resize_target, zune_jpeg_options,
 };
 
@@ -470,7 +470,7 @@ fn tiff_orientation(tiff: &[u8]) -> Option<u32> {
 /// The declared size is held to the decode limits here, ahead
 /// of any decode, and so is a progressive file's frame with the
 /// coefficients both decoders keep beside it
-/// ([`progressive_coefficient_bytes`]): a file past them is not
+/// ([`jpeg_coefficient_bytes`]): a file past them is not
 /// eligible, and the full-size path refuses it by the same
 /// checks before it decodes anything.
 ///
@@ -498,7 +498,7 @@ fn eligible_size(bytes: &[u8], glance: &Glance) -> Option<(u32, u32)> {
     if (width, height) != glance.size
         || check_decoded_dimensions(width.into(), height.into()).is_err()
         || (u64::from(width) * u64::from(height) * 4)
-            .saturating_add(progressive_coefficient_bytes(bytes, &zune))
+            .saturating_add(jpeg_coefficient_bytes(bytes, &zune))
             > MAX_DECODE_ALLOC
     {
         return None;
