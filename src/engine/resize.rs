@@ -231,7 +231,7 @@ pub(in crate::engine) fn apply_size_windowed(
         SourceWindow::Fused((x, y, ww, wh)) if unchanged => img.crop_imm(x, y, ww, wh),
         SourceWindow::Cut(window) if unchanged => crate::crop::cut(&img, window),
         SourceWindow::Whole if unchanged => img,
-        SourceWindow::Fused((x, y, ww, wh)) => resize_lanczos3_cropped(&img, x, y, ww, wh, w, h),
+        SourceWindow::Fused(window) => resize_lanczos3_cropped_owned(img, window, w, h),
         SourceWindow::Cut(window) => resize_lanczos3_cut(img, window, w, h),
         SourceWindow::Whole => resize_lanczos3_owned(img, w, h),
     };
@@ -353,7 +353,10 @@ pub(in crate::engine) fn resize_lanczos3_owned(
 /// full alpha and a black one as they are, so the rows to copy
 /// are those holding any other pixel: none for an opaque frame,
 /// and none for a GIF frame, whose pixels are opaque or
-/// transparent black. Any other layout, and a size that needs
+/// transparent black. A frame with no such row is not
+/// premultiplied at all (issue #807), since that would change
+/// none of its bytes: the backend convolves it as it is and
+/// divides the result. Any other layout, and a size that needs
 /// no resample, take [`resize_lanczos3`].
 pub(in crate::engine) fn resize_lanczos3_lent(
     img: &mut DynamicImage,
@@ -367,7 +370,11 @@ pub(in crate::engine) fn resize_lanczos3_lent(
         _ => return resize_lanczos3(img, w, h),
     };
     let mut dst = DynamicImage::new_rgba8(w, h);
-    let done = resample_premultiplying(img, &mut dst);
+    let done = if changing.rows.is_empty() {
+        convolve_and_divide(&*img, &mut dst)
+    } else {
+        resample_premultiplying(img, &mut dst)
+    };
     if let DynamicImage::ImageRgba8(rgba) = img {
         changing.put_back(rgba);
     }
@@ -455,17 +462,35 @@ where
     if mul_div.multiply_alpha_inplace(src).is_err() {
         return false;
     }
-    if convolve_lanczos3(src, dst) && mul_div.divide_alpha_inplace(dst).is_ok() {
+    #[cfg(test)]
+    PREMULTIPLIED.set(PREMULTIPLIED.get() + u64::from(src.width()) * u64::from(src.height()));
+    if convolve_and_divide(src, dst) {
         return true;
     }
     let _ = mul_div.divide_alpha_inplace(src);
     false
 }
 
+/// The last two of the backend's three alpha steps, on a frame
+/// premultiplied already or one its premultiply would leave as
+/// it is: its convolution with the alpha step off, and its own
+/// divide of the result. `false` when either refuses.
+fn convolve_and_divide<S, D>(src: &S, dst: &mut D) -> bool
+where
+    S: fast_image_resize::IntoImageView,
+    D: fast_image_resize::IntoImageViewMut,
+{
+    convolve_lanczos3(src, dst, None)
+        && fast_image_resize::MulDiv::new()
+            .divide_alpha_inplace(dst)
+            .is_ok()
+}
+
 /// The backend's Lanczos3 convolution alone, its alpha step
-/// off: what it runs between its own premultiply and divide.
-/// `false` when it refuses.
-fn convolve_lanczos3<S, D>(src: &S, dst: &mut D) -> bool
+/// off: what it runs between its own premultiply and divide,
+/// through its crop box `crop` when there is one. `false`
+/// when it refuses.
+fn convolve_lanczos3<S, D>(src: &S, dst: &mut D, crop: Option<Window>) -> bool
 where
     S: fast_image_resize::IntoImageView,
     D: fast_image_resize::IntoImageViewMut,
@@ -474,8 +499,12 @@ where
     if CONVOLVE_REFUSES.get() {
         return false;
     }
+    let mut options = lanczos3_options().use_alpha(false);
+    if let Some((x, y, w, h)) = crop {
+        options = options.crop(f64::from(x), f64::from(y), f64::from(w), f64::from(h));
+    }
     fast_image_resize::Resizer::new()
-        .resize(src, dst, &lanczos3_options().use_alpha(false))
+        .resize(src, dst, &options)
         .is_ok()
 }
 
@@ -485,6 +514,10 @@ thread_local! {
     /// a test can walk the path behind a backend refusal,
     /// which no input reaches.
     pub(in crate::engine) static CONVOLVE_REFUSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many pixels the resizes here have premultiplied
+    /// where they sit on this thread, so a test can see which
+    /// premultiplies run and how much of a frame each covers.
+    pub(in crate::engine) static PREMULTIPLIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A blank destination image of `img`'s own variant at
@@ -573,7 +606,7 @@ fn resample_window(
         DynamicImage::ImageRgb8(rgb) if view_holds_no_more(frame_bytes, 3, (ww, wh), (w, h)) => {
             let mut resized = image::RgbImage::new(w, h);
             let done = fast_image_resize::images::CroppedImage::new(&rgb, x, y, ww, wh)
-                .is_ok_and(|view| convolve_lanczos3(&view, &mut resized));
+                .is_ok_and(|view| convolve_lanczos3(&view, &mut resized, None));
             if done {
                 Ok(DynamicImage::ImageRgb8(resized))
             } else {
@@ -661,6 +694,90 @@ pub(crate) fn resize_lanczos3_cropped(
         Ok(()) => dst,
         Err(_) => two_step(),
     }
+}
+
+/// [`resize_lanczos3_cropped`] of a frame the caller is done
+/// with (issue #807), as [`resize_lanczos3_owned`] is of a
+/// whole resize. Through a crop box, the backend premultiplies
+/// a borrowed frame with alpha into a copy of the whole frame,
+/// whatever the box, though its kernel reads only the box and
+/// the filter's support around it (see [`kernel_span`]). An
+/// RGBA8 frame has that part premultiplied where it sits, by
+/// the backend's own routine, and the whole frame is resampled
+/// through the same crop box with the alpha step off, then
+/// divided by the backend's own routine. The kernel reads the
+/// same premultiplied values at the same places, weighted by
+/// the coefficients the backend computes for that box and that
+/// frame, so the bytes are the same. Any other layout, and a
+/// box that needs no resample, take [`resize_lanczos3_cropped`];
+/// so does a backend refusal, which no input reaches, once the
+/// part is divided back.
+pub(in crate::engine) fn resize_lanczos3_cropped_owned(
+    img: DynamicImage,
+    (x, y, ww, wh): Window,
+    w: u32,
+    h: u32,
+) -> DynamicImage {
+    let DynamicImage::ImageRgba8(mut rgba) = img else {
+        return resize_lanczos3_cropped(&img, x, y, ww, wh, w, h);
+    };
+    let (fw, fh) = rgba.dimensions();
+    let inside = x as u64 + ww as u64 <= fw as u64 && y as u64 + wh as u64 <= fh as u64;
+    if inside && ww > 0 && wh > 0 && w > 0 && h > 0 && (ww, wh) != (w, h) {
+        let (left, right) = kernel_span(x, ww, w, fw);
+        let (top, bottom) = kernel_span(y, wh, h, fh);
+        let read = (left, top, right - left, bottom - top);
+        let mut dst = image::RgbaImage::new(w, h);
+        if resample_part_premultiplying(&mut rgba, read, (x, y, ww, wh), &mut dst) {
+            return DynamicImage::ImageRgba8(dst);
+        }
+    }
+    resize_lanczos3_cropped(&DynamicImage::ImageRgba8(rgba), x, y, ww, wh, w, h)
+}
+
+/// The samples of a frame axis `size` long that the backend's
+/// Lanczos3 kernel reads when it resamples the `len` samples
+/// from `start` to `out`, as (first, one past the last): the
+/// box and the filter's radius past each of its ends, which is
+/// three samples times the reduction (and three where the box
+/// is enlarged), rounded up, with two samples more for the
+/// floor and the ceiling the backend's bounds take, within the
+/// frame.
+pub(in crate::engine) fn kernel_span(start: u32, len: u32, out: u32, size: u32) -> (u32, u32) {
+    let radius = 3.0 * (f64::from(len) / f64::from(out)).max(1.0);
+    let reach = (radius.ceil() as u32).saturating_add(2);
+    let end = start.saturating_add(len).saturating_add(reach);
+    (start.saturating_sub(reach), end.min(size))
+}
+
+/// [`resample_premultiplying`] through the backend's crop box
+/// `crop`, with only the part `read` of `frame` premultiplied,
+/// where it sits: the part the kernel reads for that box (see
+/// [`resize_lanczos3_cropped_owned`]). `true` when `dst` holds
+/// the result. On `false` the part is straight alpha again,
+/// as [`resample_premultiplying`] leaves its frame.
+fn resample_part_premultiplying(
+    frame: &mut image::RgbaImage,
+    (px, py, pw, ph): Window,
+    crop: Window,
+    dst: &mut image::RgbaImage,
+) -> bool {
+    use fast_image_resize::images::CroppedImageMut;
+    let mul_div = fast_image_resize::MulDiv::new();
+    let premultiplied = CroppedImageMut::new(frame, px, py, pw, ph)
+        .is_ok_and(|mut part| mul_div.multiply_alpha_inplace(&mut part).is_ok());
+    if !premultiplied {
+        return false;
+    }
+    #[cfg(test)]
+    PREMULTIPLIED.set(PREMULTIPLIED.get() + u64::from(pw) * u64::from(ph));
+    if convolve_lanczos3(&*frame, dst, Some(crop)) && mul_div.divide_alpha_inplace(dst).is_ok() {
+        return true;
+    }
+    if let Ok(mut part) = CroppedImageMut::new(frame, px, py, pw, ph) {
+        let _ = mul_div.divide_alpha_inplace(&mut part);
+    }
+    false
 }
 
 /// [`resize_lanczos3`] of a frame the JPEG decoder reduced
@@ -753,14 +870,18 @@ pub(in crate::engine) fn apply_pad(
         Backdrop::Blurred(source) => {
             // Ambient bars: the image scaled to cover the whole
             // canvas, then blurred hard enough that only its
-            // broad colors survive.
+            // broad colors survive. The cover is the image
+            // crate's Triangle `resize_to_fill`, of which an
+            // RGB8 or RGBA8 frame has only the part the canvas
+            // keeps computed, over rows (issue #806).
             let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
-            crate::filters::blur_fast_within(
-                &source.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
-                sigma,
-                deadline,
-            )?
-            .into_rgba8()
+            let cover = crate::ai::resample::resize_to_fill(
+                &source,
+                target_w,
+                target_h,
+                crate::ai::resample::Kernel::Triangle,
+            );
+            crate::filters::blur_fast_within(&cover, sigma, deadline)?.into_rgba8()
         }
     };
     let x = (target_w - fitted.width()) / 2;

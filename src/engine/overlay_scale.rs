@@ -21,6 +21,9 @@
 //! horizontal taps read, and nothing else. The identity
 //! proofs (`identity_proofs.rs`) pin it to the crate's resize
 //! in every layout.
+//!
+//! The ThumbHash of a meta response's placeholder scales its
+//! input with it too, whole (issue #811).
 
 use image::{DynamicImage, ImageBuffer, Pixel, RgbaImage};
 
@@ -71,7 +74,7 @@ pub(super) fn scaled_size((w, h): (u32, u32), width: u32) -> (u32, u32) {
 /// and within a row every [`CHECK_EVERY`] source samples its
 /// vertical pass reads, where the caller checks the deadline;
 /// its error stops the scale.
-pub(super) fn scaled_part<E>(
+pub(crate) fn scaled_part<E>(
     image: &DynamicImage,
     size: (u32, u32),
     part: crate::filters::Rect,
