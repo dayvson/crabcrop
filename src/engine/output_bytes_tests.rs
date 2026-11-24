@@ -8,7 +8,7 @@
 
 use super::*;
 
-/// A 2x2 frame in `layout`, one color.
+/// A `width` x `height` frame in `layout`, one color.
 fn frame(layout: image::ColorType, width: u32, height: u32) -> DynamicImage {
     let rgba = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         width,
@@ -16,6 +16,10 @@ fn frame(layout: image::ColorType, width: u32, height: u32) -> DynamicImage {
         image::Rgba([40, 120, 200, 255]),
     ));
     match layout {
+        image::ColorType::Rgba8 => rgba,
+        image::ColorType::Rgb8 => DynamicImage::ImageRgb8(rgba.to_rgb8()),
+        image::ColorType::L8 => DynamicImage::ImageLuma8(rgba.to_luma8()),
+        image::ColorType::La16 => DynamicImage::ImageLumaA16(rgba.to_luma_alpha16()),
         image::ColorType::Rgba16 => DynamicImage::ImageRgba16(rgba.to_rgba16()),
         image::ColorType::Rgb16 => DynamicImage::ImageRgb16(rgba.to_rgb16()),
         image::ColorType::Rgba32F => DynamicImage::ImageRgba32F(rgba.to_rgba32f()),
@@ -58,8 +62,9 @@ fn refusal(img: DynamicImage, remainder: &str) -> String {
 /// The refusal of a `width` x `height` frame at `bytes` a
 /// pixel.
 fn past_budget(width: u32, height: u32, bytes: u32) -> String {
+    let unit = if bytes == 1 { "byte" } else { "bytes" };
     format!(
-        "unsupported operation: requested output {width}x{height} at {bytes} bytes a pixel \
+        "unsupported operation: requested output {width}x{height} at {bytes} {unit} a pixel \
          exceeds the 400000000 byte limit"
     )
 }
@@ -231,35 +236,71 @@ fn a_scaled_overlay_part_past_the_byte_limit_is_refused() {
     assert_eq!(err.to_string(), past_budget(5001, 5001, 16));
 }
 
-/// A 5x1000 RGBA8 strip, as wide as it is tall times 1/200.
-fn strip() -> DynamicImage {
-    DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-        5,
-        1000,
-        image::Rgba([40, 120, 200, 255]),
-    ))
+/// A 5x`height` strip in `layout`.
+fn strip(layout: image::ColorType, height: u32) -> DynamicImage {
+    frame(layout, 5, height)
 }
 
 #[test]
-fn a_blurred_pad_whose_cover_passes_the_byte_limit_is_refused_at_any_depth() {
-    // The image a blurred pad scales to cover its canvas follows
+fn a_blurred_pad_of_an_eight_bit_color_image_renders_whatever_its_cover() {
+    // A blurred pad scales the image to cover its canvas and
+    // keeps the canvas's part of the cover. The cover follows
     // the ratio of the canvas's aspect to the image's, not the
-    // size of the output: a 1000x1000 canvas over a 1:200 strip
-    // needs a 1000x200000 cover, 800 MB as RGBA8, for a
-    // one-megapixel output. It is refused at 8 bits as at 16.
-    assert_eq!(
-        refusal(strip(), "pad:1000x1000:blur"),
-        past_budget(1000, 200_000, 4)
-    );
+    // output's size: over a 5x1000 strip, a 1000x1000 canvas
+    // needs a 1000x200000 cover, 800 MB as RGBA8. An RGB8 or
+    // RGBA8 image has only the canvas's part of it computed
+    // (issue #806), so it renders, as it always did.
+    for layout in [image::ColorType::Rgb8, image::ColorType::Rgba8] {
+        let out = chain(strip(layout, 1000), "pad:1000x1000:blur")
+            .unwrap_or_else(|err| panic!("{layout:?}: {err}"));
+        assert_eq!(
+            (out.width(), out.height(), out.color()),
+            (1000, 1000, image::ColorType::Rgba8),
+            "{layout:?}"
+        );
+    }
 }
 
 #[test]
-fn an_eight_bit_blurred_pad_whose_cover_fits_renders() {
-    // The same strip on a 100x100 canvas: a 100x20000 cover, 8
-    // MB, within the budget, renders as it always did.
-    let out = chain(strip(), "pad:100x100:blur").unwrap();
-    assert_eq!(
-        (out.width(), out.height(), out.color()),
-        (100, 100, image::ColorType::Rgba8)
-    );
+fn a_blurred_pad_whose_whole_cover_passes_the_byte_limit_is_refused() {
+    // An image in any other layout is scaled to the whole
+    // cover, in its own layout, before the canvas is cut out of
+    // it. That cover is held to the budget before the pad
+    // allocates anything: at 8 bytes a pixel for RGBA16, 16 for
+    // RGBA float and 4 for 16-bit gray with alpha, and at 1 for
+    // 8-bit gray once the strip is a little more than twice as
+    // long.
+    for (layout, height, cover, bytes) in [
+        (image::ColorType::Rgba16, 1000, (1000, 200_000), 8),
+        (image::ColorType::Rgba32F, 1000, (1000, 200_000), 16),
+        (image::ColorType::La16, 1000, (1000, 200_000), 4),
+        (image::ColorType::L8, 2001, (1000, 400_200), 1),
+    ] {
+        assert_eq!(
+            refusal(strip(layout, height), "pad:1000x1000:blur"),
+            past_budget(cover.0, cover.1, bytes),
+            "{layout:?}"
+        );
+    }
+}
+
+#[test]
+fn a_blurred_pad_whose_whole_cover_fits_renders() {
+    // The strip on a 100x100 canvas: a 100x20000 cover, within
+    // the budget in every layout, renders as it always did,
+    // whether the cover is built whole (8-bit gray, RGBA16) or
+    // only the canvas's part of it (RGBA8).
+    for layout in [
+        image::ColorType::L8,
+        image::ColorType::Rgba16,
+        image::ColorType::Rgba8,
+    ] {
+        let out = chain(strip(layout, 1000), "pad:100x100:blur")
+            .unwrap_or_else(|err| panic!("{layout:?}: {err}"));
+        assert_eq!(
+            (out.width(), out.height(), out.color()),
+            (100, 100, image::ColorType::Rgba8),
+            "{layout:?}"
+        );
+    }
 }

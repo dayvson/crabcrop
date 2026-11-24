@@ -365,5 +365,18 @@ pub(crate) fn resize_to_fill(
         .unwrap_or_else(|| img.resize_to_fill(nwidth, nheight, kernel.filter()))
 }
 
+/// Whether [`resize_to_fill`] computes only the box it keeps
+/// of an image in `layout`, rather than the crate's whole
+/// cover: RGB8 and RGBA8, the layouts `image_window`
+/// computes. It leaves one of those to the crate only for a
+/// cover side past `u32`, which no image and box within the
+/// engine's 16384 px a side make, or for weights past
+/// `WEIGHT_LIMIT`, which these kernels never make. A blurred
+/// pad holds the whole cover of every other layout to the
+/// engine's byte budget before it builds it (issue #784).
+pub(crate) fn fills_by_window(layout: image::ColorType) -> bool {
+    matches!(layout, image::ColorType::Rgb8 | image::ColorType::Rgba8)
+}
+
 #[cfg(test)]
 mod tests;

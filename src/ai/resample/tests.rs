@@ -376,6 +376,31 @@ fn resize_to_fill_matches_the_crate_byte_for_byte() {
 }
 
 #[test]
+fn the_layouts_filled_by_window_are_the_ones_computed_over_rows() {
+    // A blurred pad holds the cover of an image to the byte
+    // budget only where `resize_to_fill` builds it whole (issue
+    // #784), and asks `fills_by_window` which covers those are:
+    // every layout `image_window` does not compute.
+    use image::ColorType;
+    for layout in [
+        ColorType::L8,
+        ColorType::La8,
+        ColorType::Rgb8,
+        ColorType::Rgba8,
+        ColorType::L16,
+        ColorType::La16,
+        ColorType::Rgb16,
+        ColorType::Rgba16,
+        ColorType::Rgb32F,
+        ColorType::Rgba32F,
+    ] {
+        let img = DynamicImage::new(3, 2, layout);
+        let computed = image_window(&img, (6, 4), Kernel::Triangle, (0, 1, 6, 2)).is_some();
+        assert_eq!(fills_by_window(layout), computed, "{layout:?}");
+    }
+}
+
+#[test]
 fn resize_dimensions_are_the_crate_s() {
     // The size `DynamicImage::resize` fits a box at, as its
     // output shows it. `resize_to_fill` takes the larger ratio

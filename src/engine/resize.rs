@@ -849,15 +849,21 @@ pub(in crate::engine) fn apply_pad(
     // The canvas is RGBA8, which the check above holds to the
     // byte budget too, and the fit checks the image it fits in
     // the frame's layout. The blurred bars scale the frame to
-    // cover the canvas, in its layout, before they crop the
-    // canvas out of it: that frame is checked here, before the
-    // pad allocates anything (issue #784). Pad never adapts:
-    // the canvas is the explicit box, so the fit inside it
-    // uses the box as written.
+    // cover the canvas and keep the canvas's part of the cover.
+    // An RGB8 or RGBA8 frame has only that part computed (issue
+    // #806). A frame in any other layout is scaled to the whole
+    // cover first, in its layout, so that cover is checked
+    // here, before the pad allocates anything (issue #784). Pad
+    // never adapts: the canvas is the explicit box, so the fit
+    // inside it uses the box as written.
     let dims = (img.width(), img.height());
     let fit = fit_in_target(&canvas, false, cap, 1.0, dims, img.color())?.unwrap_or(dims);
-    if fill == PadFill::Blur && fit != (target_w, target_h) {
-        let (cover_w, cover_h) = cover_size(dims, (target_w, target_h));
+    if fill == PadFill::Blur
+        && fit != (target_w, target_h)
+        && !crate::ai::resample::fills_by_window(img.color())
+    {
+        let (cover_w, cover_h) =
+            crate::ai::resample::resize_dimensions(dims.0, dims.1, target_w, target_h, true);
         check_output_bytes(cover_w, cover_h, img.color())?;
     }
     let backdrop = match fill {
@@ -900,20 +906,6 @@ pub(in crate::engine) fn apply_pad(
     let placed = (x, y, fitted.width(), fitted.height());
     place_on(&mut base, fitted, x, y);
     Ok((DynamicImage::ImageRgba8(base), placed))
-}
-
-/// The size `DynamicImage::resize_to_fill` scales a `w` by
-/// `h` image to before it crops a `target` out of the middle:
-/// the smallest scale at which the image covers the target,
-/// each side rounded and at least 1, as the image crate
-/// rounds it. A side past `u32` saturates, which the byte
-/// check refuses.
-fn cover_size((w, h): (u32, u32), (target_w, target_h): (u32, u32)) -> (u32, u32) {
-    let ratio =
-        (f64::from(target_w) / f64::from(w.max(1))).max(f64::from(target_h) / f64::from(h.max(1)));
-    let side =
-        |n: u32| u32::try_from(((f64::from(n) * ratio).round() as u64).max(1)).unwrap_or(u32::MAX);
-    (side(w), side(h))
 }
 
 /// Composite `top` over `base` at (x, y): byte for byte

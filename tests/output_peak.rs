@@ -207,6 +207,44 @@ fn every_step_past_the_byte_limit_is_refused_before_it_allocates() {
 }
 
 #[test]
+fn a_blurred_pad_builds_its_whole_cover_only_within_the_budget() {
+    // `pad:1000x1000:blur` over a 5x1000 strip scales it to a
+    // 1000x200000 cover and keeps the canvas's part of it. An
+    // RGBA8 strip has only that part computed (issue #806): it
+    // renders, holding a small part of the 800 MB the whole
+    // cover would. A 16-bit strip is scaled to the whole cover,
+    // in its own layout, 1.6 GB: it is refused before anything
+    // of it is allocated.
+    let strip = |layout: image::ColorType| {
+        let rgba = image::RgbaImage::from_fn(5, 1000, |x, y| {
+            image::Rgba([(x * 50) as u8, (y % 256) as u8, 90, 255])
+        });
+        let img = DynamicImage::ImageRgba8(rgba);
+        let img = match layout {
+            image::ColorType::Rgba8 => img,
+            image::ColorType::Rgba16 => DynamicImage::ImageRgba16(img.to_rgba16()),
+            other => panic!("no strip for {other:?}"),
+        };
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    };
+    let remainder = "pad:1000x1000:blur/filters:format(jpeg)";
+    let (outcome, held) = render(&strip(image::ColorType::Rgba8), "strip.png", remainder);
+    eprintln!("the RGBA8 strip: held {held} bytes at most, {outcome:?}");
+    outcome.unwrap_or_else(|e| panic!("the RGBA8 strip: {e}"));
+    assert!(held < 100 << 20, "the RGBA8 strip held {held} bytes");
+    let (outcome, held) = render(&strip(image::ColorType::Rgba16), "strip.png", remainder);
+    eprintln!("the RGBA16 strip: held {held} bytes at most, {outcome:?}");
+    assert!(refused_for_bytes(&outcome), "the RGBA16 strip: {outcome:?}");
+    assert!(
+        held < REFUSED_PEAK,
+        "the RGBA16 strip was refused after holding {held} bytes"
+    );
+}
+
+#[test]
 fn a_deep_overlay_is_held_like_an_eight_bit_one_or_refused() {
     // `overlay(...,width)` scales the part of the overlay that
     // lands on the image in the overlay's own layout, before it

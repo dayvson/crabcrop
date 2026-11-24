@@ -48,9 +48,11 @@ pub(in crate::engine) fn check_output_pixels(width: u32, height: u32) -> Result<
 /// [`MAX_OUTPUT_BYTES`], before anything allocates it (issue
 /// #784). An 8-bit layout holds four bytes a pixel at most, so
 /// a frame within the pixel budget is within this one: it
-/// binds only on 16-bit color and float frames. The refusal
-/// starts `requested output WxH`, as the pixel budget's does,
-/// so a hinted DPR factor steps down from it.
+/// binds on 16-bit color and float frames, and on a frame no
+/// pixel check holds, the whole cover a blurred pad scales a
+/// gray, 16-bit or float image to. The refusal starts
+/// `requested output WxH`, as the pixel budget's does, so a
+/// hinted DPR factor steps down from it.
 pub(in crate::engine) fn check_output_bytes(
     width: u32,
     height: u32,
@@ -58,8 +60,9 @@ pub(in crate::engine) fn check_output_bytes(
 ) -> Result<(), EngineError> {
     let per_pixel = u64::from(layout.bytes_per_pixel());
     if (width as u64 * height as u64).saturating_mul(per_pixel) > MAX_OUTPUT_BYTES {
+        let unit = if per_pixel == 1 { "byte" } else { "bytes" };
         return Err(EngineError::Unsupported(format!(
-            "requested output {width}x{height} at {per_pixel} bytes a pixel exceeds the \
+            "requested output {width}x{height} at {per_pixel} {unit} a pixel exceeds the \
              {MAX_OUTPUT_BYTES} byte limit"
         )));
     }
