@@ -636,6 +636,25 @@ impl From<&Vec<u8>> for JobSource {
     }
 }
 
+/// The most threads a render's JPEG XL encode may use (issue
+/// #791): the stills lane's permits, one for every core,
+/// shared among the renders that hold them when the render
+/// starts, and never fewer than one. jixel writes the same
+/// file at any count, so the count decides only how the
+/// encodes share the cores. A render alone spreads its encode
+/// over every core, as every encode did before. With the lane
+/// full each encode runs on one thread, and four JPEG XL
+/// renders at once on four cores served about 11% more
+/// requests a second than with every encode spread over every
+/// core. The division rounds down, so renders that start
+/// together ask for no more threads than the lane has
+/// permits. A slow-lane render holds no stills permit and
+/// takes the share of the still renders in flight, every core
+/// when there are none.
+pub(in crate::server) fn jxl_threads_for(stills: &Gate) -> usize {
+    (stills.capacity() / stills.in_use().max(1)).max(1)
+}
+
 /// Run the engine under its lane's gate (issue #324) on
 /// a blocking thread, so CPU-bound work neither stalls
 /// the async workers nor multiplies unboundedly under a
@@ -670,6 +689,9 @@ pub(in crate::server) async fn run_process(
     if !job.progress.may_start_render() {
         return Err(ProcessFailure::ClientGone);
     }
+    // Read once the permit is held, so a still render counts
+    // itself among the renders in flight.
+    let jxl_threads = jxl_threads_for(&state.process_gate);
     // No await between here and the spawn below: the
     // render is marked started exactly when it is.
     job.progress.mark_started();
@@ -752,6 +774,7 @@ pub(in crate::server) async fn run_process(
                 avif_speed: job.avif_speed,
                 avif_tiles: job.avif_tiles,
                 jxl_speed: job.jxl_speed,
+                jxl_threads: Some(jxl_threads),
                 deadline: Some(deadline),
             };
             let mut processed = engine.process_preferred(&bytes, &job.ops, ctx)?;

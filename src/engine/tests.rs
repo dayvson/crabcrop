@@ -4691,6 +4691,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(now, legacy, "jpeg default encode changed");
@@ -4731,6 +4732,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(now, legacy, "webp default encode changed");
@@ -4750,6 +4752,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(now, legacy, "png default encode changed");
@@ -4770,6 +4773,7 @@ fn jpeg_options_change_the_encode() {
             DEFAULT_AVIF_SPEED,
             AvifTiles::default(),
             DEFAULT_JXL_SPEED,
+            None,
         )
         .unwrap()
     };
@@ -4829,6 +4833,7 @@ fn jpeg_bytes(
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap()
 }
@@ -5319,6 +5324,7 @@ fn jpeg_refuses_the_sizes_the_format_and_libjpeg_do_not_take() {
             DEFAULT_AVIF_SPEED,
             AvifTiles::default(),
             DEFAULT_JXL_SPEED,
+            None,
         )
     };
     let refusal = |width: u32, height: u32| match encode_sized(width, height) {
@@ -5418,6 +5424,7 @@ fn jpeg_takes_every_pixel_layout_as_8_bit_rgb() {
             DEFAULT_AVIF_SPEED,
             AvifTiles::default(),
             DEFAULT_JXL_SPEED,
+            None,
         )
         .unwrap()
     };
@@ -5561,6 +5568,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     // IHDR: 8 signature + 4 length + 4 type + 4 width +
@@ -5579,6 +5587,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(interlaced[28], 1, "IHDR interlace byte must be Adam7");
@@ -5618,6 +5627,7 @@ fn png_interlace_writes_16_bit_samples_big_endian() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(interlaced[28], 1, "IHDR interlace byte must be Adam7");
@@ -5798,6 +5808,7 @@ fn webp_options_change_the_encode() {
             DEFAULT_AVIF_SPEED,
             AvifTiles::default(),
             DEFAULT_JXL_SPEED,
+            None,
         )
         .unwrap()
     };
@@ -5837,6 +5848,7 @@ fn webp_options_change_the_encode() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     let decoded = image::load_from_memory(&lossless).unwrap();
@@ -5864,6 +5876,7 @@ fn format_options_do_not_leak_across_formats() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     let jpeg_default = encode(
@@ -5876,6 +5889,7 @@ fn format_options_do_not_leak_across_formats() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(jpeg, jpeg_default);
@@ -5894,6 +5908,7 @@ fn format_options_do_not_leak_across_formats() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     let png_default = encode(
@@ -5906,6 +5921,7 @@ fn format_options_do_not_leak_across_formats() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert_eq!(png, png_default);
@@ -6154,6 +6170,7 @@ fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
         DEFAULT_AVIF_SPEED,
         AvifTiles::default(),
         DEFAULT_JXL_SPEED,
+        None,
     )
     .unwrap();
     assert!(check_jxl_dimensions(&bytes).is_ok());
