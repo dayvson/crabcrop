@@ -328,8 +328,9 @@ impl c2pa::http::SyncHttpResolver for NoNetwork {
 
 /// The context every read of a manifest store runs under:
 /// no network ([`NoNetwork`]), no decoding of CAWG
-/// identity assertions, and no compressed manifest inflated
-/// at all. Decoding an identity assertion evaluates the
+/// identity assertions, and a zero inflate limit, a backstop
+/// to the box walk's refusal of any store that holds a
+/// compressed manifest. Decoding an identity assertion evaluates the
 /// identity's own credential against its issuer, which is
 /// where the network fetches come from; with no network an
 /// issuer that publishes its key on the web could only read
@@ -344,8 +345,11 @@ fn reading_context() -> Context {
     let mut context = Context::new().with_resolver(NoNetwork);
     let core = &mut context.settings_mut().core;
     core.decode_identity_assertions = false;
-    // No compressed manifest is inflated: a store that holds one
-    // fails the read, as `read_store` refuses it beforehand.
+    // The box walk in `read_store` refuses any store that holds a
+    // compressed manifest before the reader opens it, so one never
+    // reaches here. This zero limit is a backstop: were one to
+    // reach the reader, the read fails, though only after the
+    // decompressor has expanded at most one window.
     core.max_decompressed_manifest_size_in_mb = 0;
     context
 }
@@ -667,7 +671,8 @@ fn bmff_store_pair(asset: &[u8]) -> bool {
 /// walks it, at most [`MAX_STORE_MANIFESTS`] manifests and
 /// none of them compressed, and not an ISO BMFF pair that
 /// copying it out would parse ([`bmff_store_pair`]). The
-/// reader inflates nothing either ([`reading_context`]). What
+/// reader's inflate limit is zero, a backstop to that walk
+/// ([`reading_context`]). What
 /// it validates is exactly the store that was measured,
 /// against the asset read as `format`: the reader is handed
 /// those bytes rather than finding the store again, since its
