@@ -2449,9 +2449,10 @@ fn percent_decode(path: &str) -> String {
 ///   and without a fragment, which no request carries.
 /// - A `file://` URL is `file:///` and the path below the file
 ///   root that [`Loader::load`] opens (see
-///   [`file_source_relative`]), with a `%` or `#` in it
-///   written `%25` or `%23`: each path has one form, and no
-///   form holds the `#` a cache key's variants begin with.
+///   [`file_source_relative`]), written so that the loader
+///   reads it back as that path (see [`file_source_form`]):
+///   each path has one form, and no form holds the `#` a
+///   cache key's variants begin with.
 /// - An `s3://` or `gs://` URL is its text: the loader sends
 ///   the key as written.
 ///
@@ -2516,16 +2517,54 @@ fn file_source_relative(url: &str) -> Result<String, LoadError> {
     Ok(relative.to_string())
 }
 
-/// `file:///` and the root-relative path `relative`, with `%`
-/// written `%25` and `#` written `%23` (see [`fetched_form`]).
+/// `file:///` and the root-relative path `relative`, written so
+/// that [`file_source_relative`] reads it back as `relative`,
+/// which makes the form its own [`fetched_form`]. URL parsing
+/// reads `%` as an escape, `#` and `?` as the start of a
+/// fragment and a query, `\` as a separator, a `.` or `..`
+/// segment as a move along the path, a drive letter's `|` as
+/// `:`, a tab or a line break as nothing, and a space or
+/// control character at the end of the text as nothing. So
+/// each of those is written escaped: for a dot segment, the
+/// slashes beside it, a leading one included; for the rest,
+/// the character itself. The parser escapes a space elsewhere
+/// and non-ASCII text on its own, and the loader decodes them
+/// back, so those are written as they are.
 fn file_source_form(relative: &str) -> String {
+    use std::fmt::Write as _;
+    let kept = relative
+        .trim_end_matches(|c: char| c == ' ' || c.is_ascii_control())
+        .len();
+    let segments: Vec<&str> = relative.split('/').collect();
+    let is_dot = |segment: &str| matches!(segment, "." | "..");
     let mut form = String::with_capacity("file:///".len() + relative.len());
     form.push_str("file:///");
-    for c in relative.chars() {
-        match c {
-            '%' => form.push_str("%25"),
-            '#' => form.push_str("%23"),
-            c => form.push(c),
+    let mut at = 0;
+    for (i, &segment) in segments.iter().enumerate() {
+        if i > 0 {
+            let beside_dot = is_dot(segment) || is_dot(segments[i - 1]);
+            form.push_str(if beside_dot { "%2F" } else { "/" });
+            at += 1;
+        } else if is_dot(segment) {
+            // A leading escaped slash, which the loader trims
+            // as it trims every leading slash.
+            form.push_str("%2F");
+        }
+        let drive =
+            i == 0 && matches!(segment.as_bytes(), [letter, b'|'] if letter.is_ascii_alphabetic());
+        for c in segment.chars() {
+            let escaped = match c {
+                '%' | '#' | '?' | '\\' => true,
+                '|' => drive,
+                ' ' => at >= kept,
+                c => c.is_ascii_control(),
+            };
+            if escaped {
+                let _ = write!(form, "%{:02X}", u32::from(c));
+            } else {
+                form.push(c);
+            }
+            at += c.len_utf8();
         }
     }
     form
@@ -6143,3 +6182,8 @@ mod tests {
         }
     }
 }
+
+// The fetched form over awkward spellings (issue #778): one form,
+// one object, and each form its own form.
+#[cfg(test)]
+mod form_tests;
