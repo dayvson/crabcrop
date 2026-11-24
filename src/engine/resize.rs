@@ -753,14 +753,18 @@ pub(in crate::engine) fn apply_pad(
         Backdrop::Blurred(source) => {
             // Ambient bars: the image scaled to cover the whole
             // canvas, then blurred hard enough that only its
-            // broad colors survive.
+            // broad colors survive. The cover is the image
+            // crate's Triangle `resize_to_fill`, of which an
+            // RGB8 or RGBA8 frame has only the part the canvas
+            // keeps computed, over rows (issue #806).
             let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
-            crate::filters::blur_fast_within(
-                &source.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
-                sigma,
-                deadline,
-            )?
-            .into_rgba8()
+            let cover = crate::ai::resample::resize_to_fill(
+                &source,
+                target_w,
+                target_h,
+                crate::ai::resample::Kernel::Triangle,
+            );
+            crate::filters::blur_fast_within(&cover, sigma, deadline)?.into_rgba8()
         }
     };
     let x = (target_w - fitted.width()) / 2;

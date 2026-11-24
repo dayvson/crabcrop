@@ -2,19 +2,21 @@
 //! byte, over rows (issue #673).
 //!
 //! A few frames are still resampled with the image crate's
-//! own resize: the 224-crop of the CLIP and ViT preprocessing
-//! and the studio composite's subject (issue #674). What they
-//! produce feeds a model or is the response, so the kernel
-//! cannot change without changing bytes. The crate reads one
-//! pixel at a time through `get_pixel`, column by column,
-//! into a four-channel float image. This module does the
-//! same arithmetic on rows: the same weights from the same
-//! expressions, the same accumulation order for every
-//! sample, the same clamp and rounding. The tests compare it
-//! with the crate.
+//! own resize: the 224-crop of the CLIP and ViT preprocessing,
+//! the studio composite's subject (issue #674) and the blurred
+//! backdrop of a pad (issue #806). What they produce feeds a
+//! model or is the response, so the kernel cannot change
+//! without changing bytes. The crate reads one pixel at a time
+//! through `get_pixel`, column by column, into a four-channel
+//! float image. This module does the same arithmetic on rows:
+//! the same weights from the same expressions, the same
+//! accumulation order for every sample, the same clamp and
+//! rounding. The tests compare it with the crate.
 //!
 //! It can compute a window of the output alone, for a
 //! caller that crops right after it resizes.
+
+use image::DynamicImage;
 
 /// The sampling filters the callers use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,14 @@ pub(crate) enum Kernel {
 }
 
 impl Kernel {
+    /// The crate's filter of the same name.
+    fn filter(self) -> image::imageops::FilterType {
+        match self {
+            Kernel::Triangle => image::imageops::FilterType::Triangle,
+            Kernel::CatmullRom => image::imageops::FilterType::CatmullRom,
+        }
+    }
+
     /// The filter's support, as the crate's `resize` sets it.
     fn support(self) -> f32 {
         match self {
@@ -234,6 +244,94 @@ pub(crate) fn resize<const CH: usize>(
     kernel: Kernel,
 ) -> Option<Vec<u8>> {
     resize_window::<CH>(src, src_dims, (dw, dh), kernel, (0, 0, dw, dh))
+}
+
+/// The image crate's `resize_dimensions`, which it does not
+/// export, verbatim: the size `DynamicImage::resize` (`fill`
+/// false) and `DynamicImage::resize_to_fill` (`fill` true)
+/// scale a `width` by `height` image to, its aspect kept, to
+/// fit inside a box of `nwidth` by `nheight` or to cover it.
+pub(crate) fn resize_dimensions(
+    width: u32,
+    height: u32,
+    nwidth: u32,
+    nheight: u32,
+    fill: bool,
+) -> (u32, u32) {
+    let wratio = f64::from(nwidth) / f64::from(width);
+    let hratio = f64::from(nheight) / f64::from(height);
+    let ratio = if fill {
+        f64::max(wratio, hratio)
+    } else {
+        f64::min(wratio, hratio)
+    };
+    let nw = ((f64::from(width) * ratio).round() as u64).max(1);
+    let nh = ((f64::from(height) * ratio).round() as u64).max(1);
+    if nw > u64::from(u32::MAX) {
+        let ratio = f64::from(u32::MAX) / f64::from(width);
+        (
+            u32::MAX,
+            ((f64::from(height) * ratio).round() as u32).max(1),
+        )
+    } else if nh > u64::from(u32::MAX) {
+        let ratio = f64::from(u32::MAX) / f64::from(height);
+        (((f64::from(width) * ratio).round() as u32).max(1), u32::MAX)
+    } else {
+        (nw as u32, nh as u32)
+    }
+}
+
+/// [`resize_window`] of an RGB8 or RGBA8 image, in its own
+/// layout: the window `(x, y, w, h)` of `img.resize_exact(dw,
+/// dh, kernel)`. `None` for any other layout, and where
+/// [`resize_window`] answers `None`.
+fn image_window(
+    img: &DynamicImage,
+    (dw, dh): (u32, u32),
+    kernel: Kernel,
+    window: (u32, u32, u32, u32),
+) -> Option<DynamicImage> {
+    let src_dims = (img.width(), img.height());
+    let (_, _, w, h) = window;
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            resize_window::<3>(rgb.as_raw(), src_dims, (dw, dh), kernel, window)
+                .and_then(|raw| image::RgbImage::from_raw(w, h, raw))
+                .map(DynamicImage::ImageRgb8)
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            resize_window::<4>(rgba.as_raw(), src_dims, (dw, dh), kernel, window)
+                .and_then(|raw| image::RgbaImage::from_raw(w, h, raw))
+                .map(DynamicImage::ImageRgba8)
+        }
+        _ => None,
+    }
+}
+
+/// `img.resize_to_fill(nwidth, nheight, kernel)` (issue #806):
+/// the image scaled to cover the box, at the crate's size (see
+/// [`resize_dimensions`]), and the box cut from the middle of
+/// the axis that overflows it, where the crate cuts it. The
+/// crate scales the whole image and then cuts; an RGB8 or
+/// RGBA8 image has only the window that is kept computed, over
+/// rows. Any other layout takes the crate's own call.
+pub(crate) fn resize_to_fill(
+    img: &DynamicImage,
+    nwidth: u32,
+    nheight: u32,
+    kernel: Kernel,
+) -> DynamicImage {
+    let (w, h) = resize_dimensions(img.width(), img.height(), nwidth, nheight, true);
+    let window = if u64::from(nwidth) * u64::from(h) > u64::from(w) * u64::from(nheight) {
+        h.checked_sub(nheight)
+            .map(|spare| (0, spare / 2, nwidth, nheight))
+    } else {
+        w.checked_sub(nwidth)
+            .map(|spare| (spare / 2, 0, nwidth, nheight))
+    };
+    window
+        .and_then(|window| image_window(img, (w, h), kernel, window))
+        .unwrap_or_else(|| img.resize_to_fill(nwidth, nheight, kernel.filter()))
 }
 
 #[cfg(test)]
