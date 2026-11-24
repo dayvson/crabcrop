@@ -35,6 +35,7 @@ URLs, so no secret ever lives in WordPress. Run the instance with:
 CRABCROP_ONLY_PRESETS=1
 CRABCROP_ALLOW_UNSAFE=1
 CRABCROP_PRESETS_FILE=/etc/crabcrop/presets.txt
+CRABCROP_ALLOWED_SOURCES=blog.example.com
 ```
 
 `CRABCROP_ONLY_PRESETS=1` is what makes this safe rather than merely
@@ -43,6 +44,15 @@ public URLs can only ever name a preset, and there is no way to
 invent a transform. The transform policy (crop, format, quality)
 lives in the presets file on the server, next to the instance, and
 rotating it never touches WordPress.
+
+`CRABCROP_ALLOWED_SOURCES` names the host the site's media is
+served from: the WordPress site's own host, as in the worked
+example below, or the host an offload plugin or a CDN serves the
+uploads from. The URLs still name their source, so the list keeps
+the instance to the site's own media. Keep the instance's own host
+names off it: a listed suffix covers every name under it, so list
+`blog.example.com`, not `example.com`, when the instance answers on
+`images.example.com`.
 
 **Signed.** Sizes map to operation strings, signed with the
 instance's `CRABCROP_SECRET` held in the plugin settings. Choose

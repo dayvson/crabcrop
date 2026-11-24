@@ -35,18 +35,21 @@ use super::tiers::populate_tiers;
 /// document, the placeholder fields, and the Accept
 /// opt-ins), each computed by the same helpers the miss
 /// path branches on, so the key can never disagree with
-/// the document a flight shares.
+/// the document a flight shares. The `CDN-Loop` entries the
+/// request's fetches forward join the key too: they can
+/// change the fetch's answer (see [`FlightIdentity`]).
 fn meta_flight_key(work: &MissWork) -> String {
     let cache_key = &work.cache_key;
     let accept = work.accept.as_deref();
     format!(
-        "{cache_key}\u{1}meta\u{1}{}{}{}{}{}{}",
+        "{cache_key}\u{1}meta\u{1}{}{}{}{}{}{}\u{1}{:?}",
         work.sealed as u8,
         work.placeholders as u8,
         wants_detections(accept) as u8,
         wants_moderation(accept) as u8,
         wants_embeddings(accept) as u8,
         wants_ocr(accept) as u8,
+        work.loop_entries,
     )
 }
 
@@ -203,22 +206,34 @@ fn stored_results_may_answer(state: &AppState, work: &MissWork) -> bool {
 /// width, not the raw hint, and whether Save-Data applies,
 /// not the raw header, so browsers that phrase the same
 /// request differently still share one flight.
+///
+/// The `CDN-Loop` entries the request's fetches forward, as
+/// the miss path bounds them ([`crate::loader::LoopEntries`]),
+/// count too: the next hop may answer a fetch by them, and
+/// refuse one whose entries name it, so a waiter with other
+/// entries would not have got the leader's error, or its
+/// fallback image. Requests without entries, nearly all of
+/// them, still share one flight. A render a tier stored
+/// serves a waiter whatever its entries, from the tier: it
+/// is the URL's render, whatever fetched it.
 struct FlightIdentity<'a> {
     path: &'a str,
     preferred: Option<ImageFormat>,
     dpr_hint: Option<f32>,
     hinted_width: Option<u32>,
     save_data: bool,
+    loop_entries: &'a crate::loader::LoopEntries,
 }
 
 impl<'a> FlightIdentity<'a> {
-    fn of(path: &'a str, work: &MissWork) -> Self {
+    fn of(path: &'a str, work: &'a MissWork) -> Self {
         Self {
             path,
             preferred: work.preferred,
             dpr_hint: work.dpr_hint,
             hinted_width: work.hinted_width,
             save_data: work.save_data,
+            loop_entries: &work.loop_entries,
         }
     }
 
@@ -240,8 +255,9 @@ impl<'a> FlightIdentity<'a> {
             dpr_hint,
             hinted_width,
             save_data,
+            loop_entries,
         } = self;
-        format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}")
+        format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}{loop_entries:?}")
     }
 }
 

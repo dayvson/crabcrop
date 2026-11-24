@@ -51,6 +51,14 @@
 //! A host name that resolves to a non-public address fails the
 //! way a name that does not resolve fails, so the answer never
 //! says which names resolve inside the server's network.
+//!
+//! Every HTTP request the loader sends, on every redirect hop
+//! and to the object stores too, carries a `CDN-Loop` entry
+//! (RFC 8586) that names this deployment (see [`LoopMark`]),
+//! after the entries of the request the fetch is made for (see
+//! [`LoopEntries`]). The server refuses a request that carries
+//! its own entry, so a source that leads back to the server
+//! ends at its first nested hop.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -675,6 +683,180 @@ impl SourcePolicy {
     }
 }
 
+/// The `CDN-Loop` request header field (RFC 8586).
+pub const CDN_LOOP: &str = "cdn-loop";
+
+/// The pseudonym a crabcrop deployment's `CDN-Loop` entry
+/// opens with. Its `id` parameter tells deployments apart.
+const LOOP_PSEUDONYM: &str = "crabcrop";
+
+/// The most bytes of a request's own `CDN-Loop` entries the
+/// fetches made for it carry on (see [`LoopEntries`]).
+pub const MAX_FORWARDED_LOOP_BYTES: usize = 2048;
+
+/// This deployment's mark in the `CDN-Loop` field (RFC 8586):
+/// the entry every request the loader sends carries,
+/// `crabcrop; id=<token>`, and the tokens the deployment knows
+/// itself by. A request that arrives carrying one of them is
+/// one of the deployment's own fetches come back to it, and the
+/// server refuses it before it fetches anything (`508
+/// loop_detected`): a source, watermark, overlay or fallback
+/// URL that leads back to the server, directly or through a
+/// CDN or proxy that keeps the field, ends at its first nested
+/// hop.
+#[derive(Debug, Clone)]
+pub struct LoopMark {
+    /// The entry the loader's requests carry: the first
+    /// token's.
+    entry: header::HeaderValue,
+    /// The tokens a request names this deployment by.
+    tokens: Vec<String>,
+}
+
+impl LoopMark {
+    /// The mark of the deployment that verifies with
+    /// `keyring`: its entry names the current secret's token
+    /// ([`crate::url::loop_token`]), which every replica that
+    /// shares the secret sends. During a rotation window the
+    /// previous secret's token names the deployment too, so a
+    /// replica already on the incoming secret refuses the
+    /// fetches of one still on the outgoing secret. That one
+    /// does not know the incoming token, but its own fetch
+    /// forwards the incoming entry ahead of its own (see
+    /// [`LoopEntries`]), and the next hop refuses it.
+    pub fn for_keyring(keyring: &crate::url::Keyring) -> Self {
+        let mut tokens = vec![crate::url::loop_token(&keyring.current)];
+        if let Some((_, previous)) = &keyring.previous {
+            tokens.push(crate::url::loop_token(previous));
+        }
+        Self::of_tokens(tokens)
+    }
+
+    /// The mark of a loader no keyring's mark was installed on
+    /// (see [`Loader::with_loop_mark`]): a token drawn at random
+    /// once per process, so a process still refuses its own
+    /// fetches. The server always installs its secret's mark,
+    /// and it does not start without a secret.
+    fn per_process() -> Self {
+        static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let token = TOKEN.get_or_init(|| {
+            use std::hash::{BuildHasher, Hasher};
+            // A `RandomState` keys its hasher from the operating
+            // system's randomness.
+            (0..2u64)
+                .map(|half| {
+                    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                    hasher.write_u64(half);
+                    format!("{:016x}", hasher.finish())
+                })
+                .collect()
+        });
+        Self::of_tokens(vec![token.clone()])
+    }
+
+    fn of_tokens(tokens: Vec<String>) -> Self {
+        let entry = header::HeaderValue::from_str(&format!("{LOOP_PSEUDONYM}; id={}", tokens[0]))
+            .expect("a hex token makes a header value");
+        Self { entry, tokens }
+    }
+
+    /// The entry this deployment's requests carry.
+    pub fn entry(&self) -> &header::HeaderValue {
+        &self.entry
+    }
+
+    /// Whether `headers` carry an entry that names this
+    /// deployment, in any `CDN-Loop` line, however long the
+    /// field. Entries are split at every comma and parameters
+    /// at every semicolon, inside quotes too: the field's
+    /// grammar would let an unclosed quote in an entry the
+    /// request forwarded run over the entry its fetch appended,
+    /// and this split cannot be led past that entry.
+    pub fn is_carried_by(&self, headers: &header::HeaderMap) -> bool {
+        headers.get_all(CDN_LOOP).iter().any(|line| {
+            line.as_bytes()
+                .split(|&b| b == b',')
+                .any(|entry| self.names(entry))
+        })
+    }
+
+    /// Whether one entry names this deployment: the pseudonym,
+    /// with an `id` parameter that is one of its tokens.
+    fn names(&self, entry: &[u8]) -> bool {
+        let mut parts = entry.split(|&b| b == b';');
+        let cdn_id = parts.next().unwrap_or_default().trim_ascii();
+        cdn_id.eq_ignore_ascii_case(LOOP_PSEUDONYM.as_bytes())
+            && parts.any(|parameter| {
+                let Some(eq) = parameter.iter().position(|&b| b == b'=') else {
+                    return false;
+                };
+                let (name, value) = (
+                    parameter[..eq].trim_ascii(),
+                    parameter[eq + 1..].trim_ascii(),
+                );
+                let value = value
+                    .strip_prefix(b"\"")
+                    .and_then(|v| v.strip_suffix(b"\""))
+                    .unwrap_or(value);
+                name.eq_ignore_ascii_case(b"id")
+                    && self.tokens.iter().any(|token| token.as_bytes() == value)
+            })
+    }
+}
+
+/// The `CDN-Loop` entries (RFC 8586) a request arrived with.
+/// Every fetch made for the request carries them, as they came
+/// and in their order, ahead of this deployment's own entry, as
+/// a CDN keeps the field on the requests it forwards: a loop
+/// that passes through another deployment, which marks its own
+/// fetches the same way, then comes back carrying the mark of
+/// the deployment it left, and that deployment ends it. Entries
+/// that come to more than [`MAX_FORWARDED_LOOP_BYTES`] are not
+/// carried on, so no request makes its fetches send a field of
+/// any length: those fetches carry this deployment's entry
+/// alone, which still ends a loop through it.
+#[derive(Debug, Clone, Default)]
+pub struct LoopEntries(Option<header::HeaderValue>);
+
+impl LoopEntries {
+    /// The entries `headers` carry: every `CDN-Loop` line, in
+    /// order, joined into one field.
+    pub fn of(headers: &header::HeaderMap) -> Self {
+        let mut joined = Vec::new();
+        for line in headers.get_all(CDN_LOOP) {
+            let line = line.as_bytes().trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            if !joined.is_empty() {
+                joined.extend_from_slice(b", ");
+            }
+            joined.extend_from_slice(line);
+            if joined.len() > MAX_FORWARDED_LOOP_BYTES {
+                return Self::default();
+            }
+        }
+        if joined.is_empty() {
+            return Self::default();
+        }
+        Self(header::HeaderValue::from_bytes(&joined).ok())
+    }
+
+    /// The `CDN-Loop` field a fetch made for the request
+    /// carries: these entries, then `mark`'s.
+    fn followed_by(&self, mark: &LoopMark) -> header::HeaderValue {
+        let Some(entries) = &self.0 else {
+            return mark.entry.clone();
+        };
+        let mut field = Vec::with_capacity(entries.len() + 2 + mark.entry.len());
+        field.extend_from_slice(entries.as_bytes());
+        field.extend_from_slice(b", ");
+        field.extend_from_slice(mark.entry.as_bytes());
+        // Two header values and a comma make a header value.
+        header::HeaderValue::from_bytes(&field).unwrap_or_else(|_| mark.entry.clone())
+    }
+}
+
 /// Fetches source image bytes over HTTP(S).
 #[derive(Debug, Clone)]
 pub struct Loader {
@@ -726,6 +908,9 @@ pub struct Loader {
     /// [`HostLookups`]); shared by loader clones and by the
     /// HTTP clients' resolver.
     lookups: HostLookups,
+    /// The `CDN-Loop` mark every request the loader sends
+    /// carries (see [`LoopMark`]).
+    loop_mark: LoopMark,
     /// Tests only: the private-address check takes loopback
     /// addresses for public ones (see
     /// [`Loader::with_loopback_public`]).
@@ -1352,6 +1537,7 @@ impl Loader {
             source_budget: SourceBudget::unlimited(),
             read_ahead_pool: read_ahead_pool(tokio::sync::Semaphore::MAX_PERMITS, max_bytes),
             lookups,
+            loop_mark: LoopMark::per_process(),
             #[cfg(test)]
             loopback_public: false,
         })
@@ -1431,6 +1617,20 @@ impl Loader {
         &self.source_budget
     }
 
+    /// Set the `CDN-Loop` mark the loader's requests carry
+    /// (see [`LoopMark`]). Until one is set, the mark is a
+    /// token drawn at random for the process.
+    pub fn with_loop_mark(mut self, mark: LoopMark) -> Self {
+        self.loop_mark = mark;
+        self
+    }
+
+    /// The `CDN-Loop` mark the loader's requests carry, which
+    /// the server refuses on a request it receives.
+    pub fn loop_mark(&self) -> &LoopMark {
+        &self.loop_mark
+    }
+
     /// The source host lookup slots (see [`LOOKUP_SLOTS`]):
     /// how many are taken right now, and how many there are.
     pub fn lookup_slots(&self) -> (usize, usize) {
@@ -1459,7 +1659,8 @@ impl Loader {
         url: &str,
         admission: MediaAdmission,
     ) -> Result<Vec<u8>, LoadError> {
-        self.load_full(url, admission, None).await
+        self.load_full(url, admission, None, &LoopEntries::default())
+            .await
     }
 
     /// [`Loader::load_media`], charging the body against
@@ -1470,14 +1671,17 @@ impl Loader {
     /// [`BODY_READ_AHEAD`]). The charge keeps the body's
     /// bytes when the load succeeds and drops them when it
     /// fails. [`LoadError::Busy`] when the request's wait
-    /// for budget ran out.
+    /// for budget ran out. The fetch carries `entries`, the
+    /// `CDN-Loop` entries of the request it is made for, ahead
+    /// of the loader's own (see [`LoopEntries`]).
     pub async fn load_media_charged(
         &self,
         url: &str,
         admission: MediaAdmission,
         charge: &SourceCharge,
+        entries: &LoopEntries,
     ) -> Result<Vec<u8>, LoadError> {
-        self.load_full(url, admission, Some(charge)).await
+        self.load_full(url, admission, Some(charge), entries).await
     }
 
     async fn load_full(
@@ -1485,11 +1689,12 @@ impl Loader {
         url: &str,
         admission: MediaAdmission,
         charge: Option<&SourceCharge>,
+        entries: &LoopEntries,
     ) -> Result<Vec<u8>, LoadError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let charged = charge.map(|charge| Charged { charge, deadline });
         match self
-            .load_timed(url, admission, BodyMode::Full(charged), deadline)
+            .load_timed(url, admission, BodyMode::Full(charged), deadline, entries)
             .await?
         {
             LoadBody::Full(bytes) => Ok(bytes),
@@ -1515,7 +1720,8 @@ impl Loader {
         admission: MediaAdmission,
         settled: &(dyn Fn(&[u8]) -> bool + Sync),
     ) -> Result<ProbeLoad, LoadError> {
-        self.load_head(url, admission, settled, None).await
+        self.load_head(url, admission, settled, None, &LoopEntries::default())
+            .await
     }
 
     /// [`Loader::load_probe`], charging the head against
@@ -1526,15 +1732,18 @@ impl Loader {
     /// body's length. The charge keeps the head's bytes when
     /// the probe succeeds and drops them when it fails.
     /// [`LoadError::Busy`] when the request's wait for budget
-    /// ran out.
+    /// ran out. The fetch carries `entries` as a charged full
+    /// load does.
     pub async fn load_probe_charged(
         &self,
         url: &str,
         admission: MediaAdmission,
         settled: &(dyn Fn(&[u8]) -> bool + Sync),
         charge: &SourceCharge,
+        entries: &LoopEntries,
     ) -> Result<ProbeLoad, LoadError> {
-        self.load_head(url, admission, settled, Some(charge)).await
+        self.load_head(url, admission, settled, Some(charge), entries)
+            .await
     }
 
     async fn load_head(
@@ -1543,11 +1752,18 @@ impl Loader {
         admission: MediaAdmission,
         settled: &(dyn Fn(&[u8]) -> bool + Sync),
         charge: Option<&SourceCharge>,
+        entries: &LoopEntries,
     ) -> Result<ProbeLoad, LoadError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let charged = charge.map(|charge| Charged { charge, deadline });
         match self
-            .load_timed(url, admission, BodyMode::Probe(settled, charged), deadline)
+            .load_timed(
+                url,
+                admission,
+                BodyMode::Probe(settled, charged),
+                deadline,
+                entries,
+            )
             .await?
         {
             LoadBody::Probe(probe) => Ok(probe),
@@ -1591,8 +1807,10 @@ impl Loader {
         admission: MediaAdmission,
         mode: BodyMode<'_>,
         deadline: tokio::time::Instant,
+        entries: &LoopEntries,
     ) -> Result<LoadBody, LoadError> {
-        match tokio::time::timeout_at(deadline, self.load_dispatch(url, admission, mode)).await {
+        let load = self.load_dispatch(url, admission, mode, entries);
+        match tokio::time::timeout_at(deadline, load).await {
             Ok(result) => result,
             Err(_) => Err(LoadError::Timeout),
         }
@@ -1605,13 +1823,15 @@ impl Loader {
         url: &str,
         admission: MediaAdmission,
         mode: BodyMode<'_>,
+        entries: &LoopEntries,
     ) -> Result<LoadBody, LoadError> {
         match SourceKind::of(url)? {
             SourceKind::Object(kind, bucket, key) => {
-                self.load_object(kind, bucket, key, admission, mode).await
+                self.load_object(kind, bucket, key, admission, mode, entries)
+                    .await
             }
             SourceKind::File => self.load_file(url, mode).await,
-            SourceKind::Http => self.load_http(url, admission, mode).await,
+            SourceKind::Http => self.load_http(url, admission, mode, entries).await,
         }
     }
 
@@ -1620,6 +1840,7 @@ impl Loader {
         url: &str,
         admission: MediaAdmission,
         mode: BodyMode<'_>,
+        entries: &LoopEntries,
     ) -> Result<LoadBody, LoadError> {
         let mut parsed = parse_source(url)?;
         // Every lookup this fetch starts of another host, on
@@ -1628,6 +1849,9 @@ impl Loader {
         // host has no lookup to count: the policy refuses it
         // first.
         let origin = parsed.host_str().unwrap_or_default().to_owned();
+        // Every hop carries the mark: a redirect back to the
+        // server is a fetch of the server too.
+        let cdn_loop = entries.followed_by(&self.loop_mark);
         let mut hops = 0;
         loop {
             check_hop_scheme(&parsed, hops)?;
@@ -1636,8 +1860,11 @@ impl Loader {
                 Some(pin) => self.pinned_client(pin)?,
                 None => self.client.clone(),
             };
+            let request = client
+                .get(parsed.clone())
+                .header(CDN_LOOP, cdn_loop.clone());
             let resp = FETCH_ORIGIN
-                .scope(origin.clone(), client.get(parsed.clone()).send())
+                .scope(origin.clone(), request.send())
                 .await
                 .map_err(map_request_error)?;
             let status = resp.status();
@@ -1885,6 +2112,7 @@ impl Loader {
         key: &str,
         admission: MediaAdmission,
         mode: BodyMode<'_>,
+        entries: &LoopEntries,
     ) -> Result<LoadBody, LoadError> {
         self.check_object(bucket, key)?;
         let encoded_key = sigv4::encode_path(key);
@@ -1914,7 +2142,12 @@ impl Loader {
         };
         let url = Url::parse(&url_string)
             .map_err(|e| LoadError::Network(format!("invalid store url: {e}")))?;
-        let mut request = self.store_client.get(url.clone());
+        // The mark is not signed: SigV4 covers the headers it
+        // lists, and S3 and GCS take others unsigned.
+        let mut request = self
+            .store_client
+            .get(url.clone())
+            .header(CDN_LOOP, entries.followed_by(&self.loop_mark));
         if let Some(creds) = creds {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3591,6 +3824,266 @@ mod tests {
         assert!(first.starts_with("GET /media/pic.jpg "), "{first}");
     }
 
+    /// A server that answers `/hop` with a redirect to `/img`
+    /// and every other path with the ok image, keeping the head
+    /// of every request it reads. Returns its port.
+    async fn spawn_recording_server() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = heads.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&seen).into_owned();
+                let reply = if head.starts_with("GET /hop ") {
+                    response("302 Found", "Location: /img\r\nContent-Length: 0\r\n", b"")
+                } else {
+                    ok_image_response()
+                };
+                kept.lock().unwrap().push(head);
+                let _ = socket.write_all(&reply).await;
+            }
+        });
+        (port, heads)
+    }
+
+    /// The `CDN-Loop` lines of one request head.
+    fn cdn_loop_lines(head: &str) -> Vec<String> {
+        head.lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("cdn-loop")
+                    .then(|| value.trim().to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_kind_of_fetch_carries_the_loaders_cdn_loop_entry() {
+        // One loader, every client it fetches with: an IP
+        // literal on the unpinned client, through a redirect
+        // hop; a name the private-address check pins; and
+        // both bucket schemes on the store client. Each
+        // request carries one entry, the same one.
+        let (port, heads) = spawn_recording_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_secs(5))
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec![], true))
+            .with_host_lookup(
+                |_| Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                4,
+                Duration::from_secs(1),
+            )
+            .with_loopback_public()
+            .with_sources(SourceConfig {
+                s3_endpoint: Some(base.clone()),
+                gcs_endpoint: base.clone(),
+                allowed_buckets: vec!["photos".to_string()],
+                ..Default::default()
+            });
+        for url in [
+            format!("{base}/hop"),
+            format!("http://pinned.test:{port}/named.jpg"),
+            "s3://photos/s3.jpg".to_string(),
+            "gs://photos/gs.jpg".to_string(),
+        ] {
+            assert_eq!(
+                loader.load(&url).await,
+                Ok(b"\xff\xd8\xff\xd9".to_vec()),
+                "{url}"
+            );
+        }
+        let heads = heads.lock().unwrap().clone();
+        let paths: Vec<&str> = heads
+            .iter()
+            .map(|head| head.split(' ').nth(1).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/hop",
+                "/img",
+                "/named.jpg",
+                "/photos/s3.jpg",
+                "/photos/gs.jpg"
+            ]
+        );
+        let first = cdn_loop_lines(&heads[0]);
+        assert_eq!(first.len(), 1, "{}", heads[0]);
+        let token = first[0].strip_prefix("crabcrop; id=").unwrap_or_default();
+        assert!(
+            token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{first:?}"
+        );
+        for head in &heads {
+            assert_eq!(cdn_loop_lines(head), first, "{head}");
+        }
+    }
+
+    /// The mark of a rotation window's keyring.
+    fn rotating_mark() -> LoopMark {
+        LoopMark::for_keyring(&crate::url::Keyring {
+            current_id: "k-new".to_string(),
+            current: b"the-incoming-test-secret".to_vec(),
+            previous: Some(("k-old".to_string(), b"the-outgoing-test-secret".to_vec())),
+        })
+    }
+
+    /// Request headers with these `CDN-Loop` lines.
+    fn cdn_loop(lines: &[&str]) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        for line in lines {
+            headers.append(CDN_LOOP, header::HeaderValue::from_str(line).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn a_mark_names_the_current_secret_and_knows_the_previous_one() {
+        let mark = rotating_mark();
+        let new = crate::url::loop_token(b"the-incoming-test-secret");
+        let old = crate::url::loop_token(b"the-outgoing-test-secret");
+        assert_eq!(
+            mark.entry().to_str().unwrap(),
+            format!("crabcrop; id={new}")
+        );
+        let other = crate::url::loop_token(b"another-deployments-secret");
+        for (lines, carried) in [
+            (vec![format!("crabcrop; id={new}")], true),
+            (vec![format!("crabcrop; id={old}")], true),
+            (vec![format!("CrabCrop ;  ID=\"{new}\"")], true),
+            (
+                vec![format!("cloudflare, crabcrop;v=2;id={new} , fastly")],
+                true,
+            ),
+            (
+                vec![
+                    "cloudflare".to_string(),
+                    format!("akamai;v=1.0, crabcrop; id={old}"),
+                ],
+                true,
+            ),
+            // An unclosed quote in an entry before it cannot
+            // hide the entry a fetch appended.
+            (vec![format!("other; x=\"a, crabcrop; id={new}")], true),
+            (vec![format!("crabcrop; id={other}")], false),
+            (vec!["crabcrop".to_string()], false),
+            (vec![format!("crabcrop; id={new}0")], false),
+            (vec![format!("crabcrop; ids={new}")], false),
+            (vec![format!("crabcrop-x; id={new}")], false),
+            (vec![format!("other; id={new}")], false),
+            (vec![], false),
+        ] {
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            assert_eq!(mark.is_carried_by(&cdn_loop(&lines)), carried, "{lines:?}");
+        }
+        // Once the window closes, the outgoing token is any
+        // other deployment's.
+        let closed = LoopMark::for_keyring(&crate::url::Keyring::single(
+            b"the-incoming-test-secret".to_vec(),
+        ));
+        assert!(closed.is_carried_by(&cdn_loop(&[&format!("crabcrop; id={new}")])));
+        assert!(!closed.is_carried_by(&cdn_loop(&[&format!("crabcrop; id={old}")])));
+        // A loader with no mark installed draws one token for
+        // the process, which its own requests carry.
+        let drawn = Loader::with_defaults().unwrap();
+        let again = Loader::with_defaults().unwrap();
+        assert_eq!(drawn.loop_mark().entry(), again.loop_mark().entry());
+        let mut own = header::HeaderMap::new();
+        own.insert(CDN_LOOP, drawn.loop_mark().entry().clone());
+        assert!(again.loop_mark().is_carried_by(&own));
+        assert!(!mark.is_carried_by(&own));
+    }
+
+    #[test]
+    fn a_requests_entries_go_ahead_of_the_mark_up_to_the_bound() {
+        let mark = rotating_mark();
+        let own = mark.entry().to_str().unwrap().to_string();
+        let field = |lines: &[&str]| {
+            LoopEntries::of(&cdn_loop(lines))
+                .followed_by(&mark)
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(LoopEntries::default().followed_by(&mark), mark.entry());
+        assert_eq!(field(&[]), own);
+        assert_eq!(field(&[""]), own);
+        assert_eq!(
+            field(&["cloudflare", " akamai;v=1.0 "]),
+            format!("cloudflare, akamai;v=1.0, {own}")
+        );
+        // A field at the bound is carried; one past it is
+        // not, counted as joined, separators included.
+        let at = "x".repeat(MAX_FORWARDED_LOOP_BYTES);
+        assert_eq!(field(&[&at]), format!("{at}, {own}"));
+        let past = "x".repeat(MAX_FORWARDED_LOOP_BYTES + 1);
+        assert_eq!(field(&[&past]), own);
+        let half = "x".repeat(MAX_FORWARDED_LOOP_BYTES / 2);
+        assert_eq!(field(&[&half, &half]), own);
+    }
+
+    #[tokio::test]
+    async fn a_charged_load_and_a_probe_carry_the_requests_entries_then_the_mark() {
+        // The two loads the server makes for a request carry
+        // its entries ahead of the mark: a render's (its
+        // source, watermarks, overlays and fallback) and the
+        // explain report's probe. The loads made for no
+        // request carry the mark alone.
+        let (port, heads) = spawn_recording_server().await;
+        let mark = rotating_mark();
+        let loader = Loader::with_defaults()
+            .unwrap()
+            .with_loop_mark(mark.clone());
+        let entries = LoopEntries::of(&cdn_loop(&["cloudflare"]));
+        let charge = SourceBudget::unlimited().charge(Duration::from_secs(1));
+        let url = |name: &str| format!("http://127.0.0.1:{port}/{name}");
+        loader
+            .load_media_charged(
+                &url("charged.jpg"),
+                MediaAdmission::default(),
+                &charge,
+                &entries,
+            )
+            .await
+            .unwrap();
+        loader
+            .load_probe_charged(
+                &url("probe.jpg"),
+                MediaAdmission::default(),
+                &|_: &[u8]| true,
+                &charge,
+                &entries,
+            )
+            .await
+            .unwrap();
+        loader.load(&url("plain.jpg")).await.unwrap();
+        loader
+            .load_probe(
+                &url("plain-probe.jpg"),
+                MediaAdmission::default(),
+                &|_: &[u8]| true,
+            )
+            .await
+            .unwrap();
+        let own = mark.entry().to_str().unwrap().to_string();
+        let forwarded = format!("cloudflare, {own}");
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 4);
+        for (head, want) in heads.iter().zip([&forwarded, &forwarded, &own, &own]) {
+            assert_eq!(cdn_loop_lines(head), [want.as_str()], "{head}");
+        }
+    }
+
     #[tokio::test]
     async fn bucket_allowlist_gates_both_schemes() {
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
@@ -5131,7 +5624,12 @@ mod tests {
         let charge = budget.charge(Duration::from_secs(1));
         let base = spawn_server(Respond::Bytes(ok)).await;
         let got = loader
-            .load_media_charged(&format!("{base}/a.png"), MediaAdmission::default(), &charge)
+            .load_media_charged(
+                &format!("{base}/a.png"),
+                MediaAdmission::default(),
+                &charge,
+                &LoopEntries::default(),
+            )
             .await
             .unwrap();
         assert_eq!(got.len(), body.len());
@@ -5144,7 +5642,12 @@ mod tests {
         let undeclared = response("200 OK", "Content-Type: image/png\r\n", &body);
         let base = spawn_server(Respond::Bytes(undeclared)).await;
         let err = small
-            .load_media_charged(&format!("{base}/b.png"), MediaAdmission::default(), &charge)
+            .load_media_charged(
+                &format!("{base}/b.png"),
+                MediaAdmission::default(),
+                &charge,
+                &LoopEntries::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err, LoadError::TooLarge { limit: 1000 });
@@ -5157,7 +5660,12 @@ mod tests {
             .with_source_budget(budget.clone());
         let base = spawn_stalling_server(1 << 19, 1000).await;
         let err = quick
-            .load_media_charged(&format!("{base}/c.png"), MediaAdmission::default(), &charge)
+            .load_media_charged(
+                &format!("{base}/c.png"),
+                MediaAdmission::default(),
+                &charge,
+                &LoopEntries::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err, LoadError::Timeout);
@@ -5202,7 +5710,13 @@ mod tests {
             let base = spawn_server(Respond::Bytes(answer.clone())).await;
             let url = format!("{base}/a.png");
             let probe = loader
-                .load_probe_charged(&url, MediaAdmission::default(), &never, &charge)
+                .load_probe_charged(
+                    &url,
+                    MediaAdmission::default(),
+                    &never,
+                    &charge,
+                    &LoopEntries::default(),
+                )
                 .await
                 .unwrap();
             let head = (probe.head.len(), probe.head.capacity());
@@ -5215,7 +5729,13 @@ mod tests {
             ("file:///small.png", 1000),
         ] {
             let probe = loader
-                .load_probe_charged(url, MediaAdmission::default(), &never, &charge)
+                .load_probe_charged(
+                    url,
+                    MediaAdmission::default(),
+                    &never,
+                    &charge,
+                    &LoopEntries::default(),
+                )
                 .await
                 .unwrap();
             let head = (probe.head.len(), probe.head.capacity());
@@ -5232,6 +5752,7 @@ mod tests {
                 MediaAdmission::default(),
                 &|head: &[u8]| !head.is_empty(),
                 &charge,
+                &LoopEntries::default(),
             )
             .await
             .unwrap();
@@ -5252,6 +5773,7 @@ mod tests {
                 MediaAdmission::default(),
                 &never,
                 &charge,
+                &LoopEntries::default(),
             )
             .await
             .unwrap_err();
@@ -5267,6 +5789,7 @@ mod tests {
                 MediaAdmission::default(),
                 &never,
                 &waiting,
+                &LoopEntries::default(),
             )
             .await
             .unwrap_err();
@@ -5344,6 +5867,7 @@ mod tests {
                         MediaAdmission::default(),
                         &|_: &[u8]| false,
                         &charge,
+                        &LoopEntries::default(),
                     )
                     .await
             })
@@ -5469,8 +5993,14 @@ mod tests {
             probes.push(tokio::spawn(async move {
                 let charge = budget.charge(Duration::from_secs(2));
                 let settled = |head: &[u8]| head.len() >= 33 && head.starts_with(b"\x89PNG");
-                let load =
-                    loader.load_probe_charged(&url, MediaAdmission::default(), &settled, &charge);
+                let entries = LoopEntries::default();
+                let load = loader.load_probe_charged(
+                    &url,
+                    MediaAdmission::default(),
+                    &settled,
+                    &charge,
+                    &entries,
+                );
                 let outcome = match cancel {
                     Some(after) => tokio::time::timeout(after, load).await.ok(),
                     None => Some(load.await),
@@ -5526,6 +6056,7 @@ mod tests {
                         MediaAdmission::default(),
                         &settled,
                         &charge,
+                        &LoopEntries::default(),
                     )
                     .await
                     .unwrap();
@@ -5596,6 +6127,7 @@ mod tests {
                         &format!("{stalled}/s.png"),
                         MediaAdmission::default(),
                         &charge,
+                        &LoopEntries::default(),
                     )
                     .await;
                 (result.map(|b| b.len()), charge.bytes())
@@ -5623,6 +6155,7 @@ mod tests {
                 &format!("{healthy}/h.png"),
                 MediaAdmission::default(),
                 &charge,
+                &LoopEntries::default(),
             )
             .await
             .unwrap();
@@ -5682,6 +6215,7 @@ mod tests {
                         &format!("http://{addr}/s{i}.png"),
                         MediaAdmission::default(),
                         &charge,
+                        &LoopEntries::default(),
                     )
                     .await
                     .expect("every load fits within the wait");
@@ -5782,6 +6316,7 @@ mod tests {
                             &format!("{base}/s{i}.png"),
                             MediaAdmission::default(),
                             &charge,
+                            &LoopEntries::default(),
                         )
                         .await?;
                     // Held a moment, as a render would.
@@ -5822,6 +6357,7 @@ mod tests {
                             &format!("{base}/b{i}.png"),
                             MediaAdmission::default(),
                             &charge,
+                            &LoopEntries::default(),
                         )
                         .await?;
                     sleep(Duration::from_millis(50)).await;
@@ -5917,6 +6453,7 @@ mod tests {
                             &format!("{base}/t{i}.png"),
                             MediaAdmission::default(),
                             &charge,
+                            &LoopEntries::default(),
                         )
                         .await;
                 })
@@ -5948,7 +6485,12 @@ mod tests {
             let charge = budget.charge(Duration::from_secs(2));
             let start = std::time::Instant::now();
             let got = loader
-                .load_media_charged(&format!("{fast}/f.png"), MediaAdmission::default(), &charge)
+                .load_media_charged(
+                    &format!("{fast}/f.png"),
+                    MediaAdmission::default(),
+                    &charge,
+                    &LoopEntries::default(),
+                )
                 .await;
             let waited = start.elapsed();
             assert_eq!(got.map(|b| b.len()), Ok(len), "after {waited:?}");
@@ -5999,6 +6541,7 @@ mod tests {
                         &format!("{slow}/s.png"),
                         MediaAdmission::default(),
                         &charge,
+                        &LoopEntries::default(),
                     )
                     .await
                     .map(|b| b.len())
@@ -6029,7 +6572,12 @@ mod tests {
         let fast = spawn_server(Respond::Bytes(ok)).await;
         let charge = budget.charge(Duration::from_secs(1));
         let got = loader
-            .load_media_charged(&format!("{fast}/f.png"), MediaAdmission::default(), &charge)
+            .load_media_charged(
+                &format!("{fast}/f.png"),
+                MediaAdmission::default(),
+                &charge,
+                &LoopEntries::default(),
+            )
             .await;
         assert_eq!(got.map(|b| b.len()), Ok(4000));
         drop(charge);

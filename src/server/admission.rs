@@ -1,8 +1,10 @@
 //! Admission (issue #741): the stages that admit a request
-//! before its cache lookup. `authenticate` verifies the
-//! signature or opens the sealed token, `resolve_request`
-//! expands and parses the remainder and checks it, and
-//! `negotiate` settles the output; each returns a `Refusal`.
+//! before its cache lookup. `refuse_own_fetch` refuses one of
+//! the server's own fetches come back to it, `authenticate`
+//! verifies the signature or opens the sealed token,
+//! `resolve_request` expands and parses the remainder and
+//! checks it, and `negotiate` settles the output; each returns
+//! a `Refusal`.
 //! The image route and `/explain` admit through the same
 //! stages since #762.
 //!
@@ -10,13 +12,13 @@
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 
 use super::request::quantize_width;
 use super::response::{
-    ErrorParts, bad_signature_parts, error_response, parse_failure_parts, reserved_remainder_parts,
-    sealed_refusal_response,
+    ErrorParts, bad_signature_parts, error_response, loop_detected_parts, parse_failure_parts,
+    reserved_remainder_parts, sealed_refusal_response,
 };
 use super::{AppState, meta_cache_headers, wants_meta, wants_placeholders};
 use crate::observe::RequestRecord;
@@ -50,9 +52,11 @@ pub(in crate::server) enum Refusal {
     MetaDisabled(ErrorParts),
     /// An answer both spellings give as is: the plain
     /// spelling's own signature failures, which a sealed
-    /// request never reaches, and an expired URL, which an
+    /// request never reaches, an expired URL, which an
     /// opened token answers exactly as the plain form does
-    /// (`signature_expired`).
+    /// (`signature_expired`), and one of the server's own
+    /// fetches come back to it, refused before any token is
+    /// opened (`loop_detected`).
     AsIs(ErrorParts),
 }
 
@@ -95,7 +99,28 @@ pub(in crate::server) enum Credential {
     Unsafe,
 }
 
-/// The first stage of [`serve`]: verify the signature over
+/// The first stage of [`serve`], and of the explain route's
+/// admission ([`admit_explained`]): refuse a request that
+/// carries this server's own `CDN-Loop` entry
+/// ([`crate::loader::LoopMark`]). Such a request is one of the
+/// server's own fetches come back to it, from a source,
+/// watermark, overlay or fallback URL that leads back to the
+/// server, and the server answers it `508 loop_detected`
+/// before anything else, its signature included: a URL that
+/// nests the server's own URLs costs the request it names and
+/// one nested request, which looks up no cache and fetches
+/// nothing.
+pub(in crate::server) fn refuse_own_fetch(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), Refusal> {
+    if state.loader.loop_mark().is_carried_by(headers) {
+        return Err(Refusal::AsIs(loop_detected_parts()));
+    }
+    Ok(())
+}
+
+/// The second stage of [`serve`]: verify the signature over
 /// the remainder, or open the sealed token in its slot,
 /// timing either into `record.verify`.
 ///
@@ -231,15 +256,15 @@ pub(in crate::server) fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// The second stage of [`serve`]: expand and parse the
+/// The third stage of [`serve`]: expand and parse the
 /// remainder, recording its operation summary, and refuse
 /// what it may not ask for: a reserved segment, a preset
 /// or grammar failure, too many operations, an unknown
 /// source root, or an expired URL, in that order.
 ///
-/// It and [`authenticate`] are the explain route's
-/// admission too ([`admit_explained`]), so a refusal added
-/// to either holds on both routes.
+/// It, [`refuse_own_fetch`] and [`authenticate`] are the
+/// explain route's admission too ([`admit_explained`]), so a
+/// refusal added to any of them holds on both routes.
 pub(in crate::server) fn resolve_request(
     state: &AppState,
     rest: &str,
@@ -402,7 +427,7 @@ impl Negotiated {
     }
 }
 
-/// The third stage of [`serve`]: settle the directives,
+/// The fourth stage of [`serve`]: settle the directives,
 /// the client hints, and the negotiated format, and refuse
 /// a meta request this server or this output cannot
 /// answer.

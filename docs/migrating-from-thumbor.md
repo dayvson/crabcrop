@@ -76,7 +76,7 @@ Filters with no equivalent are dropped and named in the warnings: `frame(...)`, 
 
 ## A cutover recipe
 
-1. Run crabcrop next to Thumbor, pointed at the same origins, with `CRABCROP_ALLOW_UNSAFE=1` (or presets-only) while you convert.
+1. Run crabcrop next to Thumbor, pointed at the same origins, with `CRABCROP_ALLOW_UNSAFE=1` (or presets-only) while you convert, and with `CRABCROP_ALLOWED_SOURCES` set to those origins' hosts, not crabcrop's own.
 2. Convert your URL *templates* with `convert-thumbor`, one per layout, and read every warning. Signed output needs the target secret; the converter validates each result against the server grammar before printing it.
 3. Compare outputs on a sample of real images. Expect pixel differences in `brightness` and `rgb`; those are the documented approximations.
 4. Flip traffic, then set `CRABCROP_SECRET` enforcement by removing the unsafe allowance once every template is signed.

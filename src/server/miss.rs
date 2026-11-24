@@ -53,9 +53,11 @@ pub enum Fallback {
 /// the caller answers with the original source error. The copy
 /// is charged to the request's source budget share like a
 /// source (issue #403); no budget within the wait is `None` too.
+/// Its fetch carries the request's `CDN-Loop` `entries`.
 async fn fallback_source_bytes(
     state: &AppState,
     charge: &crate::loader::SourceCharge,
+    entries: &crate::loader::LoopEntries,
 ) -> Option<Vec<u8>> {
     match &state.fallback {
         Some(Fallback::Bytes(bytes)) => {
@@ -64,7 +66,12 @@ async fn fallback_source_bytes(
         }
         Some(Fallback::Url(url)) => state
             .loader
-            .load_media_charged(url, crate::loader::MediaAdmission::default(), charge)
+            .load_media_charged(
+                url,
+                crate::loader::MediaAdmission::default(),
+                charge,
+                entries,
+            )
             .await
             .ok(),
         None => None,
@@ -112,6 +119,14 @@ pub(in crate::server) struct MissWork {
     /// to finish once its followers are woken (issue #572).
     /// `None` everywhere else.
     pub(in crate::server) disk_handoff: Option<DiskHandoff>,
+    /// The `CDN-Loop` entries the request arrived with, which
+    /// every fetch the miss makes carries ahead of the
+    /// server's own (see [`crate::loader::LoopEntries`]). A
+    /// flight's fetches are its leader's, and carry its
+    /// leader's entries, so the flights' sharing keys on
+    /// them as well: a waiter takes the leader's unstored
+    /// answer only when its own entries are the same.
+    pub(in crate::server) loop_entries: crate::loader::LoopEntries,
 }
 
 /// Whether a request runs inference and so takes an AI
@@ -436,10 +451,26 @@ pub(in crate::server) async fn render_miss(
         video: wants_frame,
         pdf: wants_page,
     };
-    let (bytes, used_fallback) =
-        load_source(state, &work.source_url, admission, &charge, accept, record).await?;
-    let watermark_sources =
-        load_watermarks(state, &directives.watermark_urls, &charge, accept, record).await?;
+    let entries = &work.loop_entries;
+    let (bytes, used_fallback) = load_source(
+        state,
+        &work.source_url,
+        admission,
+        &charge,
+        entries,
+        accept,
+        record,
+    )
+    .await?;
+    let watermark_sources = load_watermarks(
+        state,
+        &directives.watermark_urls,
+        &charge,
+        entries,
+        accept,
+        record,
+    )
+    .await?;
 
     record.process_ran = true;
     let process_start = Instant::now();
@@ -479,7 +510,7 @@ pub(in crate::server) async fn render_miss(
         share: Some(charge),
     };
     let rendered =
-        render_with_fallback(state, &job, source, used_fallback, plan, accept, record).await;
+        render_with_fallback(state, &job, source, used_fallback, plan, work, record).await;
     // The source's budget share drained with its run; the
     // watermarks go now with theirs (issue #403), not after
     // the population writes and meta annotations.
@@ -490,19 +521,21 @@ pub(in crate::server) async fn render_miss(
 /// Load the miss's source, charged to `charge` (issue
 /// #403), timing the load into the record. Returns the
 /// bytes and whether they are the configured fallback's,
-/// which stands in for a source that failed to load.
+/// which stands in for a source that failed to load. The
+/// fetch carries the request's `CDN-Loop` `entries`.
 async fn load_source(
     state: &AppState,
     source_url: &str,
     admission: crate::loader::MediaAdmission,
     charge: &crate::loader::SourceCharge,
+    entries: &crate::loader::LoopEntries,
     accept: Option<&str>,
     record: &mut RequestRecord,
 ) -> Result<(Vec<u8>, bool), Box<Response>> {
     let load_start = Instant::now();
     let loaded = match state
         .loader
-        .load_media_charged(source_url, admission, charge)
+        .load_media_charged(source_url, admission, charge, entries)
         .await
     {
         Ok(b) => (b, false),
@@ -522,7 +555,7 @@ async fn load_source(
             {
                 None
             } else {
-                fallback_source_bytes(state, charge).await
+                fallback_source_bytes(state, charge, entries).await
             };
             match fb {
                 Some(b) => (b, true),
@@ -555,11 +588,13 @@ async fn load_source(
 /// there with the same engine error (audit R2-16).
 /// Watermark loads charge the same budget, against the
 /// request's one wait (issue #403); their share is split
-/// off to travel with the watermark bytes.
+/// off to travel with the watermark bytes. Each fetch
+/// carries the request's `CDN-Loop` `entries`.
 async fn load_watermarks(
     state: &AppState,
     urls: &[String],
     charge: &crate::loader::SourceCharge,
+    entries: &crate::loader::LoopEntries,
     accept: Option<&str>,
     record: &mut RequestRecord,
 ) -> Result<Arc<WatermarkSources>, Box<Response>> {
@@ -568,7 +603,12 @@ async fn load_watermarks(
         record.load_ran = true;
         let wm_bytes = match state
             .loader
-            .load_media_charged(wm_url, crate::loader::MediaAdmission::default(), charge)
+            .load_media_charged(
+                wm_url,
+                crate::loader::MediaAdmission::default(),
+                charge,
+                entries,
+            )
             .await
         {
             Ok(b) => b,
@@ -649,9 +689,10 @@ async fn render_with_fallback(
     source: JobSource,
     mut used_fallback: bool,
     plan: RunPlan,
-    accept: Option<&str>,
+    work: &MissWork,
     record: &mut RequestRecord,
 ) -> Result<Rendered, Box<Response>> {
+    let accept = work.accept.as_deref();
     // The request's one process deadline starts with the
     // process phase, so the gate waits and the run itself
     // share a single budget (run_process takes it as a
@@ -702,7 +743,7 @@ async fn render_with_fallback(
             // properties of the request or the configuration,
             // not of the source, and stay honest.
             let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
-                retry_on_fallback(state, job, plan, deadline).await
+                retry_on_fallback(state, job, plan, deadline, &work.loop_entries).await
             } else {
                 None
             };
@@ -738,6 +779,7 @@ async fn retry_on_fallback(
     job: &ProcessJob,
     plan: RunPlan,
     deadline: Instant,
+    entries: &crate::loader::LoopEntries,
 ) -> Option<crate::engine::ProcessedImage> {
     // A fallback is never stored, so for a client that has
     // gone it would be work nobody receives: it is not
@@ -751,7 +793,7 @@ async fn retry_on_fallback(
     // keep the share they travel with. No budget leaves the
     // original engine error standing, like a full gate.
     let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
-    let bytes = fallback_source_bytes(state, &charge).await?;
+    let bytes = fallback_source_bytes(state, &charge, entries).await?;
     // The fallback run draws on the same gates as the first:
     // each kind of work re-acquires its permit (the first
     // run's permits drained with its job), and a full gate

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Duration;
 
-use crabcrop::loader::{Loader, MediaAdmission, SourceBudget};
+use crabcrop::loader::{Loader, LoopEntries, MediaAdmission, SourceBudget};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -136,7 +136,13 @@ async fn held(origin: &str, budget: Option<&SourceBudget>) -> (isize, usize) {
                     Some(budget) => {
                         let charge = budget.charge(Duration::from_secs(5));
                         loader
-                            .load_probe_charged(&url, MediaAdmission::default(), &never, &charge)
+                            .load_probe_charged(
+                                &url,
+                                MediaAdmission::default(),
+                                &never,
+                                &charge,
+                                &LoopEntries::default(),
+                            )
                             .await
                     }
                     None => {
