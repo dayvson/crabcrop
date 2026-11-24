@@ -50,9 +50,10 @@ pub(in crate::engine) use decode::{
 mod resize;
 #[cfg(test)]
 pub(in crate::engine) use resize::{
-    CONVOLVE_REFUSES, ChangingRows, SourceWindow, apply_fit_in, apply_pad, apply_size,
-    apply_size_windowed, fit_in_box, place_on, resize_lanczos3, resize_lanczos3_cropped,
-    resize_lanczos3_cut, resize_lanczos3_lent, resize_lanczos3_owned, view_holds_no_more,
+    CONVOLVE_REFUSES, ChangingRows, PREMULTIPLIED, SourceWindow, apply_fit_in, apply_pad,
+    apply_size, apply_size_windowed, fit_in_box, kernel_span, place_on, resize_lanczos3,
+    resize_lanczos3_cropped, resize_lanczos3_cropped_owned, resize_lanczos3_cut,
+    resize_lanczos3_lent, resize_lanczos3_owned, view_holds_no_more,
 };
 pub(in crate::engine) use resize::{SizeCap, resize_target};
 pub(crate) use resize::{cap_dimensions, has_zero_side};
