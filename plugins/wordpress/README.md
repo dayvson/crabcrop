@@ -144,4 +144,11 @@ drift from the server's. It skips the sealed and purge entries: the
 plugin neither seals URLs nor mints purge signatures. The refusal
 vectors hold it to the same character rules: a source with a
 character a browser rewrites in a path (such as `{` or `\`) keeps
-its original URL.
+its original URL. The expiry vectors hold `CrabcropUrl::build` to
+the rule every builder follows when it is given an expiry, its
+fifth argument: it throws `InvalidArgumentException` for
+operations that carry an `exp:` or `maxage:` segment, and for a
+source whose first segment the server reads as an operation,
+`exp:`, `maxage:` or `preset:`, because the server keeps the last
+`exp:` of a URL. The plugin's own URLs carry no expiry, so they
+are unchanged.

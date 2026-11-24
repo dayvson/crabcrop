@@ -252,7 +252,8 @@ pub(in crate::engine) fn gif_frame_quantized(
 /// an alpha channel (only JPEG needs it here). `palette` is
 /// the indexed-color budget for PNG output (issue #313); the
 /// other formats ignore it. `avif_speed` and `avif_tiles`
-/// apply to AVIF only, and `jxl_speed` to JPEG XL only.
+/// apply to AVIF only, and `jxl_speed` and `jxl_threads` to
+/// JPEG XL only.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn encode(
     src: &EncodeBuffers<'_>,
@@ -264,6 +265,7 @@ pub(in crate::engine) fn encode(
     avif_speed: u8,
     avif_tiles: AvifTiles,
     jxl_speed: jixel::Speed,
+    jxl_threads: Option<usize>,
 ) -> Result<Vec<u8>, EngineError> {
     let img = src.img;
     let (w, h) = (img.width(), img.height());
@@ -337,7 +339,7 @@ pub(in crate::engine) fn encode(
             // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
             // 0-100 scale, matching the quality filter's semantics.
             let alpha = img.color().has_alpha();
-            let config = jxl_config(quality.unwrap_or(80), jxl_speed, w, h, alpha);
+            let config = jxl_config(quality.unwrap_or(80), jxl_speed, w, h, alpha, jxl_threads);
             let encoded = if alpha {
                 jixel::encode_image_with_alpha(src.rgba().as_raw(), w as usize, h as usize, &config)
             } else {
@@ -381,17 +383,23 @@ const JXL_ALPHA_FLOOR_PIXELS: u64 = 64 * 64;
 /// `alpha` is set: the quality's distance, and in a frame of
 /// up to [`JXL_ALPHA_FLOOR_PIXELS`] with alpha, under
 /// [`JXL_ALPHA_FLOOR_QUALITY`], that quality's distance for
-/// the alpha.
+/// the alpha. `threads` is the most threads the encode may
+/// use (issue #791), and `None` leaves jixel's own count, one
+/// for every core. jixel writes the same file at any count.
 pub(in crate::engine) fn jxl_config(
     quality: u8,
     speed: jixel::Speed,
     width: u32,
     height: u32,
     alpha: bool,
+    threads: Option<usize>,
 ) -> jixel::EncodeConfig {
-    let config = jixel::EncodeConfig::default()
+    let mut config = jixel::EncodeConfig::default()
         .with_quality(f32::from(quality))
         .with_speed(speed);
+    if let Some(threads) = threads {
+        config = config.with_num_threads(threads);
+    }
     let small = u64::from(width) * u64::from(height) <= JXL_ALPHA_FLOOR_PIXELS;
     if alpha && small && quality < JXL_ALPHA_FLOOR_QUALITY {
         let floor = jixel::distance_from_quality(f32::from(JXL_ALPHA_FLOOR_QUALITY));
@@ -1251,6 +1259,7 @@ mod tests {
                 DEFAULT_AVIF_SPEED,
                 AvifTiles::default(),
                 DEFAULT_JXL_SPEED,
+                None,
             )
             .unwrap()
         };
@@ -1406,6 +1415,7 @@ mod tests {
             speed,
             tiles,
             DEFAULT_JXL_SPEED,
+            None,
         )
     }
 
@@ -1714,6 +1724,84 @@ mod tests {
             direct.to_string(),
             message(image_crate_avif(&wide, DEFAULT_AVIF_SPEED, 80).unwrap_err())
         );
+    }
+
+    #[test]
+    fn jxl_config_asks_for_the_threads_it_is_given() {
+        // Issue #791: the count reaches the encoder, and without
+        // one jixel keeps its own, one for every core.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        for alpha in [false, true] {
+            for threads in [1, 2, 3, 4, 8] {
+                let config = jxl_config(80, DEFAULT_JXL_SPEED, 800, 533, alpha, Some(threads));
+                assert_eq!(config.num_threads, threads, "alpha {alpha}");
+            }
+            let config = jxl_config(80, DEFAULT_JXL_SPEED, 800, 533, alpha, None);
+            assert_eq!(config.num_threads, cores, "alpha {alpha}");
+        }
+        // The alpha floor of a small frame (issue #696) holds at
+        // any count.
+        let floored = jxl_config(5, DEFAULT_JXL_SPEED, 16, 16, true, Some(1));
+        assert_eq!(
+            floored.alpha_distance,
+            jxl_config(5, DEFAULT_JXL_SPEED, 16, 16, true, None).alpha_distance
+        );
+        assert!(floored.alpha_distance.is_some());
+    }
+
+    #[test]
+    fn jpeg_xl_bytes_do_not_follow_the_thread_count() {
+        // Issue #791: the server gives a JPEG XL encode as many
+        // threads as the stills lane's load leaves it, so the
+        // file must be the same at every count. At the default
+        // speed jixel gives a thread to each 64K pixels at most,
+        // so the large frame has room for eight threads and the
+        // one with alpha for three; the slower tiers take every
+        // thread they are given, at any size. One digest for
+        // every count, jixel's own count (one for every core)
+        // included.
+        use sha2::Digest;
+        let large = DynamicImage::ImageRgb8(test_field(1024, 480));
+        let field = test_field(512, 384);
+        let with_alpha = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(512, 384, |x, y| {
+            let [r, g, b] = field.get_pixel(x, y).0;
+            image::Rgba([r, g, b, ((x + y) / 4) as u8])
+        }));
+        let small = DynamicImage::ImageRgb8(test_field(128, 96));
+        let cases: [(&DynamicImage, jixel::Speed, &[usize]); 3] = [
+            (&large, DEFAULT_JXL_SPEED, &[1, 2, 3, 8]),
+            (&with_alpha, DEFAULT_JXL_SPEED, &[1, 3]),
+            (&small, jixel::Speed::Fast, &[1, 2, 8]),
+        ];
+        for (img, speed, counts) in cases {
+            let src = EncodeBuffers::new(img);
+            let digests: Vec<(Option<usize>, String)> = std::iter::once(None)
+                .chain(counts.iter().copied().map(Some))
+                .map(|threads| {
+                    let bytes = encode(
+                        &src,
+                        StillFormat::Jxl,
+                        Some(80),
+                        None,
+                        None,
+                        FormatOptions::default(),
+                        DEFAULT_AVIF_SPEED,
+                        AvifTiles::default(),
+                        speed,
+                        threads,
+                    )
+                    .unwrap();
+                    (threads, hex::encode(sha2::Sha256::digest(&bytes)))
+                })
+                .collect();
+            assert!(
+                digests.iter().all(|(_, digest)| *digest == digests[0].1),
+                "{speed:?}, {:?} {}x{}: {digests:?}",
+                img.color(),
+                img.width(),
+                img.height()
+            );
+        }
     }
 
     /// The table [`png_crc32_by_table`] reads: the CRC this

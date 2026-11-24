@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from crabcrop_url import (  # noqa: E402
+    ExpiryOverrideError,
     SealError,
     build_sealed_url,
     build_srcset,
@@ -38,11 +39,28 @@ SIGNED_VECTORS = [v for v in VECTORS if "signature" in v]
 SEALED_VECTORS = [v for v in VECTORS if v.get("sealed")]
 REFUSAL_VECTORS = [v for v in VECTORS if "refuses" in v]
 RESERVED_VECTORS = [v for v in VECTORS if v.get("reserved")]
+EXPIRY_REFUSAL_VECTORS = [v for v in VECTORS if "refuses_with_expiry" in v]
+EXPIRY_BUILD_VECTORS = [v for v in VECTORS if "builds_with_expiry" in v]
 PURGE_VECTORS = [v for v in VECTORS if "purge_signature" in v]
 RESERVED_MESSAGE = (
     'remainder begins with the reserved segment "crabcrop": '
     "it is kept for key derivation, and no image URL may begin with it"
 )
+
+
+def expiry_override_message(what, segment):
+    """The message an expiry refusal carries, as every first-party
+    implementation spells it (issue #782)."""
+    if what == "operations":
+        return (
+            f'operations carries the segment "{segment}": with an expiry, the operations '
+            "may carry no exp: or maxage: segment, since the server keeps the last of each"
+        )
+    return (
+        f'source begins with the segment "{segment}", which the server reads ahead of '
+        "the source: with an expiry, the source may not begin with an operation, exp:, "
+        "maxage: or preset: segment"
+    )
 BROWSER_REWRITTEN = '"<>\\^`{|}'
 HAS_CRYPTOGRAPHY = __import__("importlib").util.find_spec("cryptography") is not None
 
@@ -122,6 +140,64 @@ class TestVectors(unittest.TestCase):
                     with self.assertRaises(ValueError) as caught:
                         call()
                     self.assertEqual(str(caught.exception), RESERVED_MESSAGE)
+
+    def test_expiry_refusal_vectors(self):
+        # Issue #782: with an expiry, every builder refuses
+        # operations that carry an exp: or maxage: segment, and a
+        # source whose first segment the server reads ahead of the
+        # source, signed or not, keyed or not, plain or sealed, with
+        # ExpiryOverrideError and the one message. The refusal
+        # comes before any sealing, so it needs no cryptography
+        # extra. Without the expiry the same inputs build as they
+        # always did.
+        self.assertGreaterEqual(len(EXPIRY_REFUSAL_VECTORS), 11)
+        base = "https://img.example.com"
+        for v in EXPIRY_REFUSAL_VECTORS:
+            ops, src, exp = v["operations"], v["source"], v["expires"]
+            what, segment = v["refuses_with_expiry"]["input"], v["refuses_with_expiry"]["segment"]
+            calls = [
+                lambda: build_url(base, "s3cr3t", ops, src, exp),
+                lambda: build_url(base, None, ops, src, exp),
+                lambda: build_url(base, "s3cr3t", ops, src, exp, key_id="k2"),
+                lambda: build_sealed_url(base, "s3cr3t", ops, src, exp),
+                lambda: build_sealed_url(base, None, ops, src, exp),
+                lambda: build_sealed_url(base, "s3cr3t", ops, src, exp, key_id="k2"),
+            ]
+            if what == "source":
+                calls.append(lambda: build_srcset(base, "s3cr3t", src, [320], exp))
+            for call in calls:
+                with self.subTest(description=v["description"]):
+                    with self.assertRaises(ExpiryOverrideError) as caught:
+                        call()
+                    self.assertEqual(
+                        (caught.exception.input, caught.exception.segment), (what, segment)
+                    )
+                    self.assertEqual(str(caught.exception), expiry_override_message(what, segment))
+            plain = f"{ops}/{src}" if ops else src
+            with self.subTest(description=v["description"]):
+                self.assertEqual(build_url(base, None, ops, src), f"{base}/unsafe/{plain}")
+                self.assertEqual(
+                    build_url(base, "s3cr3t", ops, src),
+                    f"{base}/{sign('s3cr3t', plain)}/{plain}",
+                )
+
+    def test_expiry_build_vectors(self):
+        # Issue #782: what the expiry refusal leaves alone builds
+        # as before: an exp: inside the source path, operations and
+        # preset references, and sources whose first segment is not
+        # one the server reads ahead of the source.
+        self.assertGreaterEqual(len(EXPIRY_BUILD_VECTORS), 5)
+        base = "https://img.example.com"
+        for v in EXPIRY_BUILD_VECTORS:
+            ops, src, exp, rem = v["operations"], v["source"], v["expires"], v["builds_with_expiry"]
+            with self.subTest(description=v["description"]):
+                self.assertEqual(build_url(base, None, ops, src, exp), f"{base}/unsafe/{rem}")
+                self.assertEqual(
+                    build_url(base, "s3cr3t", ops, src, exp), f"{base}/{sign('s3cr3t', rem)}/{rem}"
+                )
+                if HAS_CRYPTOGRAPHY:
+                    url = build_sealed_url(base, "s3cr3t", ops, src, exp)
+                    self.assertEqual(unseal("s3cr3t", url[len(base) + 1 :]), rem)
 
     def test_no_signer_returns_a_derived_subkey(self):
         # Each subkey is HMAC(secret, label), the same function

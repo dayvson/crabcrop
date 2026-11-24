@@ -59,6 +59,45 @@ for (const v of vectors) {
     });
     continue;
   }
+  if (v.refuses_with_expiry !== undefined) {
+    // Issue #782: with an expiry, the playground refuses what
+    // every builder refuses, with the SDK's message, signed or
+    // not, and builds the same inputs without one as before.
+    test(`expiry refusal vector: ${v.description}`, async () => {
+      const base = "https://img.example.com";
+      let expected;
+      try {
+        sdk.buildURL(base, "s3cr3t", v.operations, v.source, { expires: v.expires });
+      } catch (e) {
+        expected = e.message;
+      }
+      assert.ok(expected?.startsWith(`${v.refuses_with_expiry.input} `), expected);
+      assert.ok(expected.includes(`"${v.refuses_with_expiry.segment}"`), expected);
+      for (const secret of ["s3cr3t", null]) {
+        const call = { base, secret, operations: v.operations, source: v.source };
+        await assert.rejects(buildPlaygroundUrl({ ...call, expires: v.expires }), {
+          message: expected,
+        });
+        assert.equal(
+          await buildPlaygroundUrl(call),
+          sdk.buildURL(base, secret, v.operations, v.source),
+        );
+      }
+    });
+    continue;
+  }
+  if (v.builds_with_expiry !== undefined) {
+    test(`expiry build vector: ${v.description}`, async () => {
+      const base = "https://img.example.com";
+      for (const secret of ["s3cr3t", null]) {
+        const call = { base, secret, operations: v.operations, source: v.source, expires: v.expires };
+        const url = await buildPlaygroundUrl(call);
+        assert.equal(url, sdk.buildURL(base, secret, v.operations, v.source, { expires: v.expires }));
+        assert.ok(url.endsWith(`/${v.builds_with_expiry}`), url);
+      }
+    });
+    continue;
+  }
   if (v.signature === undefined) {
     // Sealed entries carry a token, and purge entries a
     // purge signature, not an image signature: the

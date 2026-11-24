@@ -6,6 +6,7 @@ import {
   buildSealedURL,
   buildSrcSet,
   buildURL,
+  ExpiryOverrideError,
   isReservedRemainder,
   purgeGroupSignature,
   purgeSignature,
@@ -35,6 +36,8 @@ const vectors = JSON.parse(
   source?: string;
   refuses?: { input: string; character: string };
   reserved?: boolean;
+  refuses_with_expiry?: { input: "operations" | "source"; segment: string };
+  builds_with_expiry?: string;
   endpoint?: string;
   target?: string;
   expires?: number;
@@ -139,6 +142,68 @@ for (const v of vectors) {
 }
 test("the spec carries the reserved vectors", () => {
   assert.ok(reserved >= 9, `${reserved} reserved vectors`);
+});
+
+// The expiry vectors (issue #782): with an expiry, every
+// builder refuses operations that carry an exp: or maxage:
+// segment, and a source whose first segment the server reads
+// ahead of the source, signed or not, keyed or not, plain or
+// sealed, with ExpiryOverrideError and the one message every
+// implementation spells alike. Without the expiry the same
+// inputs build as they always did, and the vectors that build
+// mark where the refusal stops.
+function expiryOverrideMessage(input: string, segment: string): string {
+  return input === "operations"
+    ? `operations carries the segment "${segment}": with an expiry, the operations may carry no exp: or maxage: segment, since the server keeps the last of each`
+    : `source begins with the segment "${segment}", which the server reads ahead of the source: with an expiry, the source may not begin with an operation, exp:, maxage: or preset: segment`;
+}
+let expiryRefusals = 0;
+let expiryBuilds = 0;
+for (const v of vectors) {
+  const operations = v.operations as string;
+  const source = v.source as string;
+  const expires = v.expires as number;
+  const base = "https://img.example.com";
+  if (v.refuses_with_expiry !== undefined) {
+    expiryRefusals++;
+    const { input, segment } = v.refuses_with_expiry;
+    test(`expiry refusal vector: ${v.description}`, () => {
+      const refused = (e: unknown): boolean =>
+        e instanceof ExpiryOverrideError &&
+        e.input === input &&
+        e.segment === segment &&
+        e.message === expiryOverrideMessage(input, segment);
+      assert.throws(() => buildURL(base, "s3cr3t", operations, source, { expires }), refused);
+      assert.throws(() => buildURL(base, null, operations, source, { expires }), refused);
+      assert.throws(() => buildURL(base, "s3cr3t", operations, source, { expires, keyId: "k2" }), refused);
+      assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source, { expires }), refused);
+      assert.throws(() => buildSealedURL(base, null as unknown as string, operations, source, { expires }), refused);
+      assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source, { expires, keyId: "k2" }), refused);
+      if (input === "source") {
+        assert.throws(() => buildSrcSet(base, "s3cr3t", source, [320], { expires }), refused);
+      }
+      const plain = operations ? `${operations}/${source}` : source;
+      assert.equal(buildURL(base, null, operations, source), `${base}/unsafe/${plain}`);
+      assert.equal(buildURL(base, "s3cr3t", operations, source), `${base}/${sign("s3cr3t", plain)}/${plain}`);
+    });
+  }
+  const remainder = v.builds_with_expiry;
+  if (remainder !== undefined) {
+    expiryBuilds++;
+    test(`expiry build vector: ${v.description}`, () => {
+      assert.equal(buildURL(base, null, operations, source, { expires }), `${base}/unsafe/${remainder}`);
+      assert.equal(
+        buildURL(base, "s3cr3t", operations, source, { expires }),
+        `${base}/${sign("s3cr3t", remainder)}/${remainder}`,
+      );
+      const url = buildSealedURL(base, "s3cr3t", operations, source, { expires });
+      assert.equal(unseal("s3cr3t", url.slice(base.length + 1)), remainder);
+    });
+  }
+}
+test("the spec carries the expiry vectors", () => {
+  assert.ok(expiryRefusals >= 11, `${expiryRefusals} expiry refusal vectors`);
+  assert.ok(expiryBuilds >= 5, `${expiryBuilds} expiry build vectors`);
 });
 
 test("no signer returns a derived subkey", () => {

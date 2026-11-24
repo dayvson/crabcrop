@@ -86,7 +86,7 @@ pub(in crate::server) use process::{
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
-pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
+pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance, jxl_threads_for};
 
 mod response;
 #[cfg(test)]

@@ -138,6 +138,8 @@ Pass `None` as the secret to produce the literal `unsafe` signature segment, for
 
 The builders raise `ValueError` on operations or a source that can never verify: `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded). Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
 
+With `expires`, `build_url`, `build_srcset` and `build_sealed_url` also raise `ExpiryOverrideError`, a `ValueError`, for operations that carry an `exp:` or `maxage:` segment, and for a source whose first segment the server reads as an operation, `exp:`, `maxage:` or `preset:`, such as `300x200/https://example.com/a.jpg` passed as the source. The server keeps the last `exp:` of a URL and reads everything before the source as operations, so such text, from page content say, would set the URL's lifetime whatever `expires` says, or sign operations nobody passed as operations. The error's `input` names the input and `segment` the segment. Without `expires` these inputs build as before.
+
 ## Tests
 
 ```bash

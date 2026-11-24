@@ -305,6 +305,12 @@ pub struct ProcessContext<'a> {
     /// jixel speed tier for JPEG XL encodes, from
     /// `CRABCROP_JXL_SPEED`.
     pub jxl_speed: jixel::Speed,
+    /// The most threads a JPEG XL encode may use (issue
+    /// #791). The server sets it from the stills lane's load
+    /// when the render starts; `None` leaves jixel's own
+    /// count, one for every core. jixel writes the same file
+    /// at any count.
+    pub jxl_threads: Option<usize>,
     /// Processing deadline for this request (issue #260),
     /// from `CRABCROP_PROCESS_TIMEOUT_SECS`: pipeline
     /// stages check it between operations and frames and

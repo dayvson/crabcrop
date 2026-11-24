@@ -1436,6 +1436,15 @@ def _explain_segment(seg: str, now_seconds: int) -> Optional[ExplainedSegment]:
     return None
 
 
+def reads_before_source(seg: str) -> bool:
+    """Whether the server reads ``seg`` ahead of the source (issue
+    #782): as ``exp:`` or ``maxage:`` metadata, a ``preset:``
+    reference, or an operation, valid or not. The first segment that is
+    none of these starts the source. The builders refuse a source that
+    begins with one when they are given an expiry."""
+    return seg != "" and _explain_segment(seg, 0) is not None
+
+
 # ---------------------------------------------------------------------------
 # The URL
 # ---------------------------------------------------------------------------

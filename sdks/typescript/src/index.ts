@@ -13,6 +13,7 @@ import {
   timingSafeEqual,
 } from "#crypto";
 import { fromBase64Url, toBase64Url, toHex, utf8, utf8Strict } from "./bytes.ts";
+import { readsBeforeSource } from "./explain.ts";
 import { isReservedRemainder, MAX_DIMENSION, RESERVED_SEGMENT } from "./limits.ts";
 
 // Declared beside MAX_DIMENSION, where the explainer reads them
@@ -141,7 +142,12 @@ export function uploadSignature(secret: string, name: string, expires?: number):
 }
 
 export interface BuildOptions {
-  /** Unix-seconds expiry, emitted as a leading `exp:` segment. */
+  /**
+   * Unix-seconds expiry, emitted as a leading `exp:` segment.
+   * With it, the builder refuses operations and a source that
+   * would decide the URL in its place (see
+   * {@link ExpiryOverrideError}).
+   */
   expires?: number;
   /**
    * Key ID to stamp on the signature segment (`<key-id>:<tag>`),
@@ -286,7 +292,11 @@ export function unseal(secret: string, segment: string): string {
 
 /** Options for {@link buildSealedURL}. */
 export interface SealOptions {
-  /** Unix-seconds expiry, sealed inside the token as a leading `exp:` segment. */
+  /**
+   * Unix-seconds expiry, sealed inside the token as a leading
+   * `exp:` segment, with the refusals {@link BuildOptions.expires}
+   * names.
+   */
   expires?: number;
   /** Key ID to stamp on the token segment (`<key-id>:s1.…`), for rotation. */
   keyId?: string;
@@ -307,7 +317,10 @@ export interface SealOptions {
  * operations, source) and then sealed whole, pre-expansion,
  * so the sealed and plain forms of one render are one cache
  * entry and one purge target on the server. A secret is
- * required: there is no `unsafe` spelling of a token.
+ * required: there is no `unsafe` spelling of a token. With
+ * `expires`, operations and a source that would decide the
+ * URL in its place throw {@link ExpiryOverrideError}, as in
+ * {@link buildURL}.
  */
 export function buildSealedURL(
   base: string,
@@ -321,6 +334,9 @@ export function buildSealedURL(
   }
   assertUrlText(operations, "operations");
   assertUrlText(source, "source");
+  if (options.expires !== undefined) {
+    assertNoExpiryOverride(operations, source);
+  }
   const trimmedBase = base.replace(/\/+$/, "");
   let remainder = "";
   if (options.expires !== undefined) {
@@ -382,6 +398,51 @@ function assertExpires(expires: number): void {
 }
 
 /**
+ * What a builder given an expiry throws for text that would
+ * decide the URL in the expiry's place (issue #782): an `exp:`
+ * or `maxage:` segment among the operations, or a source whose
+ * first segment the server reads ahead of the source, as an
+ * operation, `exp:`, `maxage:` or `preset:`. The server keeps
+ * the last `exp:` of a URL, so such text would set the URL's
+ * lifetime whatever expiry was given, or add operations to the
+ * signed URL. `input` names the input and `segment` the
+ * segment.
+ */
+export class ExpiryOverrideError extends Error {
+  readonly input: "operations" | "source";
+  readonly segment: string;
+
+  constructor(input: "operations" | "source", segment: string) {
+    super(
+      input === "operations"
+        ? `operations carries the segment "${segment}": with an expiry, the operations may carry no exp: or maxage: segment, since the server keeps the last of each`
+        : `source begins with the segment "${segment}", which the server reads ahead of the source: with an expiry, the source may not begin with an operation, exp:, maxage: or preset: segment`,
+    );
+    this.name = "ExpiryOverrideError";
+    this.input = input;
+    this.segment = segment;
+  }
+}
+
+/**
+ * With an expiry, refuse the operations or the source that
+ * would decide the URL in its place (see
+ * {@link ExpiryOverrideError}).
+ */
+function assertNoExpiryOverride(operations: string, source: string): void {
+  const metadata = operations
+    .split("/")
+    .find((segment) => segment.startsWith("exp:") || segment.startsWith("maxage:"));
+  if (metadata !== undefined) {
+    throw new ExpiryOverrideError("operations", metadata);
+  }
+  const first = source.split("/", 1)[0];
+  if (readsBeforeSource(first)) {
+    throw new ExpiryOverrideError("source", first);
+  }
+}
+
+/**
  * A srcset width becomes a `{width}x0` size segment, so it
  * must satisfy the grammar's dimension rules: a positive
  * integer within the server cap. Anything else mints a
@@ -399,7 +460,12 @@ function assertWidth(width: number): void {
 /**
  * Assemble a signed (or `unsafe`) crabcrop URL. `operations`
  * is the operation string verbatim (several `/`-separated
- * segments and `preset:` references included). A null secret
+ * segments and `preset:` references included). With
+ * `expires`, the operations may carry no `exp:` or `maxage:`
+ * segment, and the source may not begin with a segment the
+ * server reads as an operation, `exp:`, `maxage:` or
+ * `preset:`: the server keeps the last `exp:` of a URL, so
+ * either throws {@link ExpiryOverrideError}. A null secret
  * produces the literal `unsafe` signature segment, for servers
  * running with unsafe or presets-only configurations.
  */
@@ -415,6 +481,9 @@ export function buildURL(
   }
   assertUrlText(operations, "operations");
   assertUrlText(source, "source");
+  if (options.expires !== undefined) {
+    assertNoExpiryOverride(operations, source);
+  }
   const trimmedBase = base.replace(/\/+$/, "");
   let remainder = "";
   if (options.expires !== undefined) {
