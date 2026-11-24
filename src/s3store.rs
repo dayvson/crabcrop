@@ -7101,4 +7101,72 @@ mod tests {
         assert_eq!(seen[0].as_deref(), Some("first-token"));
         assert_eq!(seen[1].as_deref(), Some("rotated-token"));
     }
+
+    #[tokio::test]
+    async fn the_documented_lifecycle_rules_match_every_entry_and_no_tombstone() {
+        // Issue #779, docs/deployment.md ("Bounding the shared
+        // tier"): `<prefix>` is `CRABCROP_RESULT_PREFIX` without
+        // its leading and trailing `/`, then one `/`, and empty
+        // when that leaves nothing. Each entry is the object
+        // `<prefix><64 hex digits>.bin`, the tombstones are under
+        // `<prefix>purges/`, and 16 lifecycle rules, on
+        // `<prefix>0` to `<prefix>9` and `<prefix>a` to
+        // `<prefix>f`, match every entry and no tombstone. A rule
+        // written without that `/` matches no entry.
+        let mut misses = Vec::new();
+        for (configured, prefix) in [
+            ("cache/", "cache/"),
+            ("cache", "cache/"),
+            ("/cache/", "cache/"),
+            ("img/prod/", "img/prod/"),
+            ("img/prod", "img/prod/"),
+            ("", ""),
+        ] {
+            let fake = start_fake().await;
+            let s = store_with_prefix(&fake.endpoint, configured);
+            for key in ["one", "two", "three", "four", "five", "six"] {
+                s.put(key, &image(key.as_bytes(), &[])).await;
+            }
+            let cutoff = PurgeCutoff {
+                start_ms: crate::cache::now_ms(),
+                writer: 0xa,
+            };
+            s.put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+                .await
+                .expect("tombstone stored");
+            let rules_under = |lead: &str| -> Vec<String> {
+                "0123456789abcdef"
+                    .chars()
+                    .map(|c| format!("{lead}{c}"))
+                    .collect()
+            };
+            let rules = rules_under(prefix);
+            let unslashed = rules_under(prefix.trim_end_matches('/'));
+            let objects: Vec<String> = fake.objects.lock().unwrap().keys().cloned().collect();
+            let tombstone_dir = format!("{prefix}purges/");
+            for object in &objects {
+                let matches =
+                    |rules: &[String]| rules.iter().any(|rule| object.starts_with(rule.as_str()));
+                let is_entry = s.is_entry_object(object);
+                if is_entry && !matches(&rules) {
+                    misses.push(format!("{configured:?}: no rule matches entry {object}"));
+                }
+                if !is_entry && matches(&rules) {
+                    misses.push(format!("{configured:?}: a rule matches non-entry {object}"));
+                }
+                if !is_entry && !object.starts_with(&tombstone_dir) {
+                    misses.push(format!(
+                        "{configured:?}: tombstone {object} is not under {tombstone_dir}"
+                    ));
+                }
+                if !prefix.is_empty() && matches(&unslashed) {
+                    misses.push(format!(
+                        "{configured:?}: a rule without the slash matches {object}"
+                    ));
+                }
+            }
+            assert_eq!(objects.len(), 7, "{configured:?}: {objects:?}");
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
 }
