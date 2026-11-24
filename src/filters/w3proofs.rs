@@ -336,6 +336,39 @@ fn w3_perms_match_crate() {
     }
 }
 
+/// [`fliph_in_place`] writes what the crate's `fliph` writes, in
+/// every layout: the 8-bit ones reverse each row's pixels
+/// themselves, in one pass or in bands over threads, the others
+/// take the crate's own in-place flip. The sizes run from one
+/// pixel to frames past the size the bands start at, and to
+/// frames with fewer rows than there are bands.
+#[test]
+fn fliph_in_place_writes_what_fliph_writes() {
+    let mut checked = 0;
+    for (w, h) in [
+        (1u32, 1u32),
+        (1, 9),
+        (9, 1),
+        (7, 5),
+        (333, 257),
+        (1999, 1501),
+        (1_000_003, 3),
+    ] {
+        let base = photo(w, h);
+        let mut images = variants(&base);
+        if u64::from(w) * u64::from(h) <= 100_000 {
+            images.extend(deep_variants(&base));
+        }
+        for img in images {
+            let mut got = img.clone();
+            fliph_in_place(&mut got);
+            assert_eq!(raw(&got), raw(&img.fliph()), "{w}x{h} {:?}", img.color());
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 5 * 10 + 2 * 4);
+}
+
 /// The block rotation of issue #648 is the crate's `rotate90`
 /// for every pixel layout the fast path takes, at any size:
 /// under one block of output rows, on both sides of a block

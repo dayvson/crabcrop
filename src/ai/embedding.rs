@@ -78,14 +78,35 @@ impl AestheticHead {
     /// Load and validate a head file: unreadable,
     /// unparseable, or wrongly shaped files are load
     /// errors naming the file.
+    ///
+    /// A file over [`HEAD_BUDGET`] is refused from its size
+    /// before any of it is read (issue #783): reading it
+    /// first buffered a model file whole at boot to refuse
+    /// it. The read itself stops one byte past the budget,
+    /// for a file that grows after the check or one whose
+    /// size the file system does not report, such as a
+    /// device.
     pub fn load(path: &str) -> Result<Self, AiError> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| AiError::Load(format!("cannot read the aesthetic head {path}: {e}")))?;
+        use std::io::Read as _;
+        let unreadable = |e: std::io::Error| {
+            AiError::Load(format!("cannot read the aesthetic head {path}: {e}"))
+        };
+        let too_large = |size: &str| {
+            AiError::Load(format!(
+                "the aesthetic head {path} is {size} bytes: a linear head is a few kilobytes, not a model file"
+            ))
+        };
+        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let declared = file.metadata().map_err(unreadable)?.len();
+        if declared > HEAD_BUDGET as u64 {
+            return Err(too_large(&declared.to_string()));
+        }
+        let mut bytes = Vec::with_capacity(declared as usize);
+        file.take(HEAD_BUDGET as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(unreadable)?;
         if bytes.len() > HEAD_BUDGET {
-            return Err(AiError::Load(format!(
-                "the aesthetic head {path} is {} bytes: a linear head is a few kilobytes, not a model file",
-                bytes.len()
-            )));
+            return Err(too_large(&format!("over {HEAD_BUDGET}")));
         }
         let (weights, bias) = parse_aesthetic_head(&bytes)
             .map_err(|e| AiError::Load(format!("the aesthetic head {path} is not usable: {e}")))?;
