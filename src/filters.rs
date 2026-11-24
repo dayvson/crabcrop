@@ -400,7 +400,9 @@ pub fn apply_filters_filled(
 /// answers [`DeadlinePassed`]; the image is dropped. Every
 /// arm of its match applies a filter or records a
 /// directive: a filter the engine applies itself is not a
-/// [`PlainFilter`], so none reaches it (issue #741).
+/// [`PlainFilter`], so none reaches it (issue #741). A
+/// filter whose arguments would hand the image on as it
+/// came is skipped (see `leaves_unchanged`).
 pub fn apply_filters_within(
     img: DynamicImage,
     filters: &[PlainFilter],
@@ -410,6 +412,9 @@ pub fn apply_filters_within(
     let mut img = img;
     let mut options = EncodeOptions::default();
     for filter in filters {
+        if skips(filter, &img) {
+            continue;
+        }
         match filter {
             PlainFilter::Grayscale => {
                 img = map_rgb_lanes(img, |r, g, b| {
@@ -516,6 +521,78 @@ pub fn apply_filters_within(
         }
     }
     Ok((img, options))
+}
+
+/// Whether `filter` would hand `img` on as it came, byte for
+/// byte and in its own layout, so running it would change
+/// nothing (issue #810). A directive never does: it records
+/// something for the encoder.
+///
+/// - `brighten`, `gamma`, `exposure` and `contrast` map each
+///   channel through a 256-entry table, and a table that maps
+///   every value to itself changes no pixel. `brighten`
+///   applies its table to an 8-bit frame in the frame's own
+///   layout, so it skips on all four 8-bit layouts.
+/// - `saturation(1)`, `huerotate` by a whole number of turns
+///   and `rgb(0,0,0)` leave every pixel as it was: the first
+///   by its own arithmetic over the whole RGB cube, which the
+///   tests walk; the second because its matrix is then the
+///   identity exactly; the third because it adds zero.
+/// - `gamma`, `exposure`, `contrast`, `saturation` and `rgb`
+///   turn any other layout into RGB8 or RGBA8 as they run, so
+///   they skip only on those two, which they keep. `huerotate`
+///   skips only on those two as well.
+///
+/// `contrast(0)` still runs: its table drops some values a
+/// level (issue #815).
+fn leaves_unchanged(filter: &PlainFilter, img: &DynamicImage) -> bool {
+    let rgb = matches!(
+        img,
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_)
+    );
+    match *filter {
+        PlainFilter::Brighten(value) => {
+            let eight_bit = matches!(
+                img,
+                DynamicImage::ImageLuma8(_)
+                    | DynamicImage::ImageLumaA8(_)
+                    | DynamicImage::ImageRgb8(_)
+                    | DynamicImage::ImageRgba8(_)
+            );
+            eight_bit && is_identity(&brighten_lut(value))
+        }
+        PlainFilter::Gamma(gamma) => rgb && is_identity(&gamma_lut(gamma)),
+        PlainFilter::Exposure(stops) => rgb && is_identity(&exposure_lut(stops)),
+        PlainFilter::Contrast(amount) => rgb && is_identity(&contrast_lut(amount)),
+        PlainFilter::Saturation(amount) => rgb && amount == 1.0,
+        PlainFilter::HueRotate(degrees) => rgb && hue_degrees(degrees) == 0,
+        PlainFilter::Rgb(r, g, b) => rgb && (r, g, b) == (0, 0, 0),
+        _ => false,
+    }
+}
+
+/// Whether a channel table maps every value to itself.
+fn is_identity(lut: &[u8; 256]) -> bool {
+    lut.iter().enumerate().all(|(i, &v)| usize::from(v) == i)
+}
+
+/// Whether [`apply_filters_within`] skips `filter` on `img`:
+/// where it [`leaves_unchanged`] the image, unless a test has
+/// turned the skip off on this thread.
+fn skips(filter: &PlainFilter, img: &DynamicImage) -> bool {
+    #[cfg(test)]
+    if RUNS_SKIPPED.get() {
+        return false;
+    }
+    leaves_unchanged(filter, img)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`apply_filters_within`] run on this thread the
+    /// filters it would skip, so a test can see them change
+    /// nothing.
+    static RUNS_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The processing deadline passed while a filter ran (issues
@@ -1911,8 +1988,14 @@ pub(crate) fn huerotate_fast(img: DynamicImage, value: i32) -> DynamicImage {
 
 // ---------------- brighten ----------------
 
+/// The table `brighten` maps each channel through: the value
+/// added, clamped to 0 to 255.
+fn brighten_lut(value: i32) -> [u8; 256] {
+    std::array::from_fn(|b| (b as i32 + value).clamp(0, 255) as u8)
+}
+
 pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
-    let lut: [u8; 256] = std::array::from_fn(|b| (b as i32 + value).clamp(0, 255) as u8);
+    let lut = brighten_lut(value);
     fn apply<const CH: usize, const ALPHA: bool>(buf: &mut [u8], width: usize, lut: &[u8; 256]) {
         map_pixels_bands::<CH>(buf, width, &|p: &mut [u8; CH]| {
             let n = if ALPHA { CH - 1 } else { CH };
@@ -2060,13 +2143,12 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
     out
 }
 
-/// Contrast through a 256-entry lookup table: the image
-/// crate's per-channel formula (scale about the midpoint by
-/// `((100 + amount) / 100)^2`, clamp, truncate) depends only
-/// on the input byte, so evaluating it once per byte value
-/// with the identical f32 arithmetic and then mapping bytes
-/// is byte-identical to evaluating it per pixel.
-fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
+/// The image crate's contrast formula for each byte value:
+/// scale about the midpoint by `((100 + amount) / 100)^2`,
+/// clamp, truncate. It depends only on the input byte, so a
+/// table of it, computed with the identical f32 arithmetic,
+/// maps bytes as the formula would one at a time.
+fn contrast_lut(amount: f32) -> [u8; 256] {
     let percent = ((100.0 + amount) / 100.0).powi(2);
     let mut lut = [0u8; 256];
     for (i, e) in lut.iter_mut().enumerate() {
@@ -2074,6 +2156,13 @@ fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
         let d = ((c / 255.0 - 0.5) * percent + 0.5) * 255.0;
         *e = d.clamp(0.0, 255.0) as u8;
     }
+    lut
+}
+
+/// Contrast through [`contrast_lut`]: byte-identical to the
+/// crate's formula evaluated per pixel.
+fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
+    let lut = contrast_lut(amount);
     let w = img.width() as usize;
     map_rgb_bands::<3>(img.as_mut(), w, &|r, g, b| {
         [lut[r as usize], lut[g as usize], lut[b as usize]]
