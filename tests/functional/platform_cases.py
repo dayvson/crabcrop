@@ -1174,10 +1174,19 @@ def parity_cases():
     ]
     vectors = json.load(open(os.path.join(REPO, "spec", "test-vectors.json")))
     for i, v in enumerate(vectors):
-        if "refuses" in v or v.get("reserved"):
-            # Builder refusals (issue #472) and reserved
+        if "refuses" in v or v.get("reserved") or "refuses_with_expiry" in v:
+            # Builder refusals (issues #472 and #782) and reserved
             # remainders have no output to compare; each SDK's
             # own vector suite runs them.
+            continue
+        if "builds_with_expiry" in v:
+            # Where the expiry refusal stops (issue #782): every
+            # SDK builds the entry, and the remainder after the
+            # signature is the one the spec gives.
+            cases.append({"id": f"vec-build-{i}", "kind": "build_url", "base": PARITY_BASE,
+                          "secret": S, "operations": v["operations"],
+                          "source": v["source"], "expires": v["expires"],
+                          "expect_remainder": v["builds_with_expiry"]})
             continue
         if v.get("sealed"):
             cases.append({"id": f"vec-seal-{i}", "kind": "seal",
@@ -1230,11 +1239,19 @@ def parity_build_url_and_srcset():
         if len(vals) != 1:
             diffs.append(f"{c['id']}: py={py.get(c['id'])!r} ts={ts.get(c['id'])!r} "
                          f"rs={rs.get(c['id'])!r}")
+        elif "expect_remainder" in c:
+            # The URL is the base, the signature, then the remainder.
+            built = py.get(c["id"]) or ""
+            rest = built[len(c["base"]) + 1:].split("/", 1)
+            if not built.startswith(c["base"] + "/") or rest[1:] != [c["expect_remainder"]]:
+                diffs.append(f"{c['id']}: got {built!r}, the spec gives the remainder "
+                             f"{c['expect_remainder']!r}")
     ok = not diffs
     rec("parity-build-url-and-srcset", "parity",
         f"{len(cases)} build_url/srcset cases x TS/Py/Rust", "-",
         "PASS" if ok else "FAIL", None,
-        "byte-identical across all three SDKs" if ok else " | ".join(diffs)[:600])
+        "byte-identical across all three SDKs, and the expiry build vectors' remainders "
+        "as spec/test-vectors.json gives them" if ok else " | ".join(diffs)[:600])
 
 
 @cell

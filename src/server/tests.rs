@@ -12,6 +12,7 @@ mod expiry_lifetime;
 mod explain_admission;
 mod explain_budget;
 mod meta_frame;
+mod probe_gate;
 mod request_log;
 mod shared_bounds;
 mod shared_state;
@@ -10732,6 +10733,53 @@ async fn meta_reports_signer_names_as_one_bounded_line() {
 }
 
 #[tokio::test]
+async fn a_source_store_past_the_read_bounds_is_neither_summarized_nor_recorded() {
+    // A source whose store holds a compressed manifest: meta
+    // reports no source manifest, as for a store that does not
+    // parse, and the signed output's parent records no status.
+    // Without it, both read the store (its own manifest reads
+    // invalid, since the store moved).
+    let (without, with) = crate::provenance::test_sources_without_and_with_a_compressed_manifest(
+        &test_png(),
+        "image/png",
+    );
+    let base = spawn_app_with_signer().await;
+    for (name, source, read) in [("without", without, true), ("with", with, false)] {
+        let src = spawn_bytes_server(source).await;
+        let remainder = format!("40x24/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{name}");
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let prov = &meta["provenance"];
+        assert_eq!(prov["output"]["state"], "valid", "{name}: {prov}");
+        if read {
+            assert_eq!(prov["source"]["state"], "invalid", "{name}: {prov}");
+        } else {
+            assert!(prov["source"].is_null(), "{name}: {prov}");
+        }
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{name}");
+        let png = resp.bytes().await.unwrap();
+        let store: serde_json::Value =
+            serde_json::from_str(&crate::provenance::manifest_json(&png, "image/png")).unwrap();
+        let active = store["active_manifest"].as_str().unwrap();
+        let parent = &store["manifests"][active]["ingredients"][0];
+        assert_eq!(parent["relationship"], "parentOf", "{name}: {parent}");
+        assert_eq!(
+            parent.get("validation_results").is_some(),
+            read,
+            "{name}: {parent}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn signing_server_signs_image_responses() {
     let base = spawn_app_with_signer().await;
     let src = spawn_image_server().await;
@@ -17570,6 +17618,87 @@ async fn avif_is_written_in_the_servers_tile_count() {
     );
 }
 
+#[tokio::test]
+async fn a_jpeg_xl_encode_shares_the_cores_with_the_renders_in_flight() {
+    // Issue #791: the stills lane's permits, one for every
+    // core, shared among the renders that hold them, rounded
+    // down and at least one: every core for a render alone,
+    // one thread each with the lane full, and every core for
+    // a slow-lane render while no still is rendering.
+    let cases: [(usize, &[usize]); 3] = [
+        (4, &[4, 2, 1, 1]),
+        (16, &[16, 8, 5, 4, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]),
+        (1, &[1]),
+    ];
+    for (permits, threads) in cases {
+        let stills = Arc::new(Gate::new(permits));
+        assert_eq!(jxl_threads_for(&stills), permits, "{permits} permits");
+        let mut held = Vec::new();
+        for &want in threads {
+            held.push(stills.clone().acquire_owned().await.unwrap());
+            assert_eq!(
+                jxl_threads_for(&stills),
+                want,
+                "{permits} permits, {} held",
+                held.len()
+            );
+        }
+        drop(held);
+        assert_eq!(jxl_threads_for(&stills), permits, "{permits} permits");
+    }
+}
+
+/// A JPEG XL render's file does not follow the stills lane's
+/// load (issue #791): with three of the lane's four permits
+/// held, the encode gets one thread where alone it gets four,
+/// and the bytes are the same.
+#[tokio::test]
+async fn jpeg_xl_renders_the_same_bytes_with_the_stills_lane_full() {
+    // Room for four threads at the default speed, which gives
+    // a thread to each 64K pixels at most.
+    let frame = DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 480, |x, y| {
+        let n = (x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77)) >> 24;
+        image::Rgb([(x / 3) as u8, (y / 2) as u8, n as u8])
+    }));
+    let mut png = std::io::Cursor::new(Vec::new());
+    frame.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let src = spawn_bytes_server(png.into_inner()).await;
+    let stills = Arc::new(Gate::new(4));
+    let base = spawn_state(AppState {
+        process_gate: stills.clone(),
+        ..test_state()
+    })
+    .await;
+    // Two spellings of the source, so the second render is not
+    // the first one's cache entry: the bytes server answers
+    // every path with the same image.
+    let render = |name: &'static str| {
+        let remainder = format!(
+            "filters:format(jxl):quality(80)/{}",
+            src.replace("src.png", name)
+        );
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        async move {
+            let resp = client().get(url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            resp.bytes().await.unwrap()
+        }
+    };
+    let alone = render("alone.png").await;
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(stills.clone().acquire_owned().await.unwrap());
+    }
+    let busy = render("busy.png").await;
+    drop(held);
+    assert!(
+        busy == alone,
+        "{} bytes with the lane full, {} alone",
+        busy.len(),
+        alone.len()
+    );
+}
+
 /// A float TIFF source (Rgb32F samples) renders to PNG, plain
 /// and interlaced, and to AVIF, named or negotiated from a
 /// browser's `Accept` (issue #464). Each of these was a 500
@@ -19130,7 +19259,7 @@ async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
 }
 
 /// A minimal, valid SVG that sizes instantly but carries
-/// [`crate::engine::decode::SVG_PROBE_SLOW_MARKER`], so the
+/// [`crate::engine::decode::SLOW_PROBE_MARKER`], so the
 /// probe's test hook sleeps while sizing it: a stand-in for an
 /// SVG whose parse is slow, without crafting a slow document.
 const SLOW_PROBE_SVG: &[u8] = b"<!--crabcrop-slow-probe--><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
@@ -19194,11 +19323,11 @@ fn blocking_get(url: &str) -> (u16, std::time::Duration) {
 }
 
 /// Fire several concurrent /explain requests for a
-/// slow-to-size SVG (the `urls` are distinct, so the loader
+/// slow-to-size source (the `urls` are distinct, so the loader
 /// does not coalesce them into one probe) and, from off the
 /// runtime, time /health while they run. The probes run off
 /// the request threads (issue #447), so /health answers
-/// promptly; on a server that sizes SVG on the request
+/// promptly; on a server that sizes such a source on the request
 /// threads, the probes hold every request thread and /health
 /// waits for one to finish. More requests than the two
 /// request threads keeps them held for the whole window.
@@ -19225,7 +19354,7 @@ async fn health_stays_responsive_during_slow_explains(urls: Vec<String>, base: &
     assert_eq!(status, 200, "/health did not answer 200");
     assert!(
         elapsed < std::time::Duration::from_secs(1),
-        "/health took {elapsed:?} while slow SVG explains ran: the probes held the request threads"
+        "/health took {elapsed:?} while slow explains ran: the probes held the request threads"
     );
     for task in tasks {
         let _ = within(

@@ -1214,6 +1214,16 @@ function explainSegment(seg, nowSeconds) {
     return null; // Not an operation: the source starts here.
 }
 /**
+ * Whether the server reads `seg` ahead of the source (issue
+ * #782): as `exp:` or `maxage:` metadata, a `preset:`
+ * reference, or an operation, valid or not. The first segment
+ * that is none of these starts the source. The builders refuse
+ * a source that begins with one when they are given an expiry.
+ */
+export function readsBeforeSource(seg) {
+    return seg !== "" && explainSegment(seg, 0) !== null;
+}
+/**
  * The server's size-shape test (url.rs size_shaped), ported:
  * an `x` joining two parts, at least one of them a dimension
  * spelling (digits, `orig`, or empty, with an optional flip

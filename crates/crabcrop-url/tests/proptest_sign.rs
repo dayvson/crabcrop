@@ -106,6 +106,108 @@ fn url_text(min: usize, max: usize) -> impl Strategy<Value = String> {
     proptest::string::string_regex(&format!("{URL_SAFE}{{{min},{max}}}")).expect("a valid regex")
 }
 
+/// One builder segment of `min` to `max` [`URL_SAFE`]
+/// characters other than `/`.
+fn segment_text(min: usize, max: usize) -> impl Strategy<Value = String> {
+    proptest::string::string_regex(&format!("[A-Za-z0-9._~!$&'()*+,;=:@%-]{{{min},{max}}}"))
+        .expect("a valid regex")
+}
+
+/// The prefixes of the segments the server reads ahead of the
+/// source, the metadata and the operations spec/url-signing.md
+/// names: a source that opens with one is refused by a builder
+/// given an expiry (issue #782).
+const READ_AHEAD_PREFIXES: [&str; 13] = [
+    "exp:",
+    "maxage:",
+    "preset:",
+    "debug:",
+    "frame:",
+    "page:",
+    "crop-rect:",
+    "focalpoint:",
+    "focal:",
+    "crop:",
+    "pad:",
+    "fit-in:",
+    "filters:",
+];
+
+/// The size shape as spec/url-signing.md states it: an `x`
+/// joins two parts, at least one of them a dimension spelling
+/// (digits, `orig`, or empty, with an optional `-`), and the
+/// segment carries no `.` or `:`. The server reads such a
+/// segment as a size, valid or not.
+fn size_shaped(segment: &str) -> bool {
+    let spelling = |part: &str| {
+        let digits = part.strip_prefix('-').unwrap_or(part);
+        digits == "orig" || digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    match segment.split_once('x') {
+        Some((left, right)) if !segment.contains(['.', ':']) => spelling(left) || spelling(right),
+        _ => false,
+    }
+}
+
+/// What a builder given an expiry refuses (issue #782), as the
+/// input and the segment its error names: the first `exp:` or
+/// `maxage:` segment among the operations, or else a source's
+/// first segment that the server reads ahead of the source.
+fn expiry_override(operations: &str, source: &str) -> Option<(&'static str, String)> {
+    if let Some(segment) = operations
+        .split('/')
+        .find(|s| s.starts_with("exp:") || s.starts_with("maxage:"))
+    {
+        return Some(("operations", segment.to_string()));
+    }
+    let head = source.split('/').next().unwrap_or_default();
+    (READ_AHEAD_PREFIXES.iter().any(|p| head.starts_with(p)) || size_shaped(head))
+        .then(|| ("source", head.to_string()))
+}
+
+/// Builder operations: any [`URL_SAFE`] text, or text around an
+/// `exp:` or `maxage:` segment, a quarter of the time, so the
+/// expiry refusal runs on every pass.
+fn operations_text() -> impl Strategy<Value = String> {
+    prop_oneof![
+        3 => url_text(0, 40),
+        1 => (
+            prop::option::of(segment_text(0, 16)),
+            prop_oneof![Just("exp:"), Just("maxage:")],
+            segment_text(0, 12),
+            prop::option::of(segment_text(0, 16)),
+        )
+            .prop_map(|(before, prefix, value, after)| {
+                let mut segments: Vec<String> = before.into_iter().collect();
+                segments.push(format!("{prefix}{value}"));
+                segments.extend(after);
+                segments.join("/")
+            }),
+    ]
+}
+
+/// Builder sources: any [`URL_SAFE`] text, or text whose first
+/// segment opens with one of [`READ_AHEAD_PREFIXES`] or is
+/// size-shaped, a quarter of the time.
+fn source_text() -> impl Strategy<Value = String> {
+    let head = prop_oneof![
+        (
+            prop::sample::select(READ_AHEAD_PREFIXES.to_vec()),
+            segment_text(0, 12)
+        )
+            .prop_map(|(prefix, rest)| format!("{prefix}{rest}")),
+        proptest::string::string_regex("-?([0-9]{0,5}|orig)x[A-Za-z0-9_~!$&'()*+,;=@%-]{0,12}")
+            .expect("a valid regex"),
+    ];
+    prop_oneof![
+        3 => url_text(1, 60),
+        1 => (head, prop::option::of(url_text(0, 40))).prop_map(|(head, tail)| match tail {
+            Some(tail) => format!("{head}/{tail}"),
+            None => head,
+        }),
+    ]
+}
+
 /// Change the byte at `at` to a different printable ASCII
 /// byte: `delta` in 1..95 steps around the 95 printable
 /// characters, so the result is never the original.
@@ -128,6 +230,30 @@ fn token_from(bytes: &[u8]) -> String {
         "{SEALED_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
+}
+
+/// The case `built_urls_verify_and_open` shrank to before it
+/// expected the expiry refusal (issue #782): a source that is a
+/// lone `x`, which the server reads as a size, built with an
+/// expiry, and the segment it shrank from, a malformed size to
+/// the server. Both are refused with the expiry and build
+/// without it. The saved seed replays a drawn case, which the
+/// strategies may no longer draw this way, so the case is
+/// pinned here as well.
+#[test]
+fn an_expiring_source_that_opens_with_a_size_is_refused() {
+    let base = "https://img.example.com";
+    for source in ["x", "x(_U=&d~1QC%"] {
+        let refused = BuildError::ExpiryOverride {
+            what: "source",
+            segment: source.to_string(),
+        };
+        assert_eq!(
+            build_url(base, Some(&b""[..]), "", source, Some(0)),
+            Err(refused)
+        );
+        assert!(build_url(base, Some(&b""[..]), "", source, None).is_ok());
+    }
 }
 
 proptest! {
@@ -302,16 +428,42 @@ proptest! {
     /// the same remainder. The inputs use only characters
     /// both the current builders and the issue #472 builders
     /// accept, so the property holds across that change.
+    ///
+    /// With an expiry, operations that carry an `exp:` or
+    /// `maxage:` segment, and a source whose first segment the
+    /// server reads ahead of the source, are refused instead
+    /// (issue #782): every builder answers `ExpiryOverride`
+    /// with the input and the segment. The strategies draw such
+    /// inputs a quarter of the time, so both outcomes run on
+    /// every pass, and without an expiry the same inputs build.
     #[test]
     fn built_urls_verify_and_open(
         secret in secret(),
-        operations in url_text(0, 40),
-        source in url_text(1, 60),
+        operations in operations_text(),
+        source in source_text(),
         expires in proptest::option::of(any::<u64>()),
         kid in key_id(),
         slashes in 0usize..3,
     ) {
         let base = format!("https://img.example.com{}", "/".repeat(slashes));
+        let refusal = expires.zip(expiry_override(&operations, &source));
+        if let Some((exp, (what, segment))) = refusal {
+            let refused = BuildError::ExpiryOverride { what, segment: segment.clone() };
+            prop_assert_eq!(
+                build_url(&base, Some(&secret), &operations, &source, expires),
+                Err(refused.clone())
+            );
+            prop_assert_eq!(build_url(&base, None, &operations, &source, expires), Err(refused.clone()));
+            prop_assert_eq!(
+                build_url_with_key_id(&base, (&secret, &kid), &operations, &source, expires),
+                Err(refused)
+            );
+            prop_assert_eq!(
+                SealedUrl::new(&base, &operations, &source).key_id(&kid).expires(exp).build(&secret),
+                Err(SealError::ExpiryOverride { what, segment })
+            );
+            return Ok(());
+        }
         let mut remainder = String::new();
         if let Some(exp) = expires {
             remainder.push_str(&format!("exp:{exp}/"));
