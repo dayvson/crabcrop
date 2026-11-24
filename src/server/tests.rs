@@ -12,6 +12,7 @@ mod expiry_lifetime;
 mod explain_admission;
 mod explain_budget;
 mod meta_frame;
+mod probe_gate;
 mod request_log;
 mod shared_bounds;
 mod shared_state;
@@ -19258,7 +19259,7 @@ async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
 }
 
 /// A minimal, valid SVG that sizes instantly but carries
-/// [`crate::engine::decode::SVG_PROBE_SLOW_MARKER`], so the
+/// [`crate::engine::decode::SLOW_PROBE_MARKER`], so the
 /// probe's test hook sleeps while sizing it: a stand-in for an
 /// SVG whose parse is slow, without crafting a slow document.
 const SLOW_PROBE_SVG: &[u8] = b"<!--crabcrop-slow-probe--><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
@@ -19322,11 +19323,11 @@ fn blocking_get(url: &str) -> (u16, std::time::Duration) {
 }
 
 /// Fire several concurrent /explain requests for a
-/// slow-to-size SVG (the `urls` are distinct, so the loader
+/// slow-to-size source (the `urls` are distinct, so the loader
 /// does not coalesce them into one probe) and, from off the
 /// runtime, time /health while they run. The probes run off
 /// the request threads (issue #447), so /health answers
-/// promptly; on a server that sizes SVG on the request
+/// promptly; on a server that sizes such a source on the request
 /// threads, the probes hold every request thread and /health
 /// waits for one to finish. More requests than the two
 /// request threads keeps them held for the whole window.
@@ -19353,7 +19354,7 @@ async fn health_stays_responsive_during_slow_explains(urls: Vec<String>, base: &
     assert_eq!(status, 200, "/health did not answer 200");
     assert!(
         elapsed < std::time::Duration::from_secs(1),
-        "/health took {elapsed:?} while slow SVG explains ran: the probes held the request threads"
+        "/health took {elapsed:?} while slow explains ran: the probes held the request threads"
     );
     for task in tasks {
         let _ = within(
