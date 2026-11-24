@@ -123,7 +123,9 @@ pub(in crate::server) struct MissWork {
     /// every fetch the miss makes carries ahead of the
     /// server's own (see [`crate::loader::LoopEntries`]). A
     /// flight's fetches are its leader's, and carry its
-    /// leader's entries.
+    /// leader's entries, so the flights' sharing keys on
+    /// them as well: a waiter takes the leader's unstored
+    /// answer only when its own entries are the same.
     pub(in crate::server) loop_entries: crate::loader::LoopEntries,
 }
 

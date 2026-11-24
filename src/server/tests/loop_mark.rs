@@ -437,3 +437,182 @@ async fn entries_past_the_forwarding_bound_are_not_carried_but_still_read() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
 }
+
+/// Another deployment's entry, which the origin below
+/// refuses a fetch for.
+const NEXT_HOP_ENTRY: &str = "crabcrop; id=00112233445566778899aabbccddeeff";
+
+/// An origin that waits `delay`, then answers `508` to a
+/// request whose head carries [`NEXT_HOP_ENTRY`] and the test
+/// PNG to any other, keeping every head it reads: the next
+/// hop of a fetch, which refuses a fetch its own entry names
+/// and serves the rest. The delay keeps a fetch in flight
+/// while a second request joins its flight.
+async fn spawn_refusing_origin(
+    delay: std::time::Duration,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let kept = heads.clone();
+    let png = Arc::new(test_png());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (kept, png) = (kept.clone(), png.clone());
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.len() < 64 * 1024 {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&seen).into_owned();
+                let refused = head.contains(NEXT_HOP_ENTRY);
+                kept.lock().unwrap().push(head);
+                tokio::time::sleep(delay).await;
+                if refused {
+                    let head = "HTTP/1.1 508 Loop Detected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(head.as_bytes()).await;
+                } else {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        png.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&png).await;
+                }
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), heads)
+}
+
+/// Wait until `heads` holds `count` request heads.
+async fn fetched(heads: &std::sync::Mutex<Vec<String>>, count: usize) {
+    for _ in 0..300 {
+        if heads.lock().unwrap().len() >= count {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the origin never saw {count} fetches");
+}
+
+/// A request for `url` with `accept`, carrying `entries` as
+/// its `CDN-Loop` field when there are any, on a task of its
+/// own: its status and `Cache-Status`.
+fn send(
+    url: &str,
+    accept: Option<&'static str>,
+    entries: Option<&'static str>,
+) -> tokio::task::JoinHandle<(StatusCode, String)> {
+    let mut request = client().get(url);
+    if let Some(accept) = accept {
+        request = request.header("accept", accept);
+    }
+    if let Some(entries) = entries {
+        request = request.header("cdn-loop", entries);
+    }
+    tokio::spawn(async move {
+        let resp = request.send().await.unwrap();
+        (resp.status(), header(&resp, "cache-status"))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flight_waiter_with_other_loop_entries_fetches_for_itself() {
+    // The entries a request forwards steer its fetch: the
+    // next hop may refuse a fetch whose entries name it. A
+    // waiter whose entries differ from its flight leader's
+    // therefore does not take the leader's unstored answer.
+    // It fetches for itself and ends as it would alone, on
+    // the image route and on the meta route.
+    let (origin, heads) = spawn_refusing_origin(std::time::Duration::from_millis(700)).await;
+    let (base, _state) = serve_shared(AppState {
+        allow_unsafe: true,
+        ..test_state()
+    })
+    .await;
+    for (what, accept, path) in [
+        ("image", None, "image.png"),
+        ("meta", Some("application/json"), "meta.png"),
+    ] {
+        let url = format!("{base}/unsafe/20x0/{origin}/{path}");
+        let before = heads.lock().unwrap().len();
+        let leader = send(&url, accept, Some(NEXT_HOP_ENTRY));
+        // Sent while the leader's fetch is under way, so it
+        // joins the leader's flight.
+        fetched(&heads, before + 1).await;
+        let waiter = send(&url, accept, None).await.unwrap();
+        let leader = leader.await.unwrap();
+        assert_eq!(leader.0, StatusCode::BAD_GATEWAY, "{what}: the leader");
+        assert_eq!(waiter.0, StatusCode::OK, "{what}: the waiter");
+        let heads = heads.lock().unwrap()[before..].to_vec();
+        assert_eq!(heads.len(), 2, "{what}: the waiter fetched for itself");
+        assert!(heads[0].contains(NEXT_HOP_ENTRY), "{what}: {}", heads[0]);
+        assert!(!heads[1].contains(NEXT_HOP_ENTRY), "{what}: {}", heads[1]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flight_waiters_with_the_leaders_loop_entries_share_its_fetch() {
+    // Equal entries steer equal fetches, so a waiter whose
+    // entries are the leader's still takes the leader's
+    // unstored answer, whether a render (every tier is off
+    // here) or an error: two requests, one fetch.
+    let (origin, heads) = spawn_refusing_origin(std::time::Duration::from_millis(700)).await;
+    let (base, _state) = serve_shared(AppState {
+        allow_unsafe: true,
+        cache: Arc::new(Cache::new(0)),
+        ..test_state()
+    })
+    .await;
+    for (what, entries, status) in [
+        ("no entries", None, StatusCode::OK),
+        (
+            "the same entries",
+            Some(NEXT_HOP_ENTRY),
+            StatusCode::BAD_GATEWAY,
+        ),
+    ] {
+        let url = format!("{base}/unsafe/20x0/{origin}/{}.png", status.as_u16());
+        let before = heads.lock().unwrap().len();
+        let leader = send(&url, None, entries);
+        fetched(&heads, before + 1).await;
+        let waiter = send(&url, None, entries).await.unwrap();
+        assert_eq!(leader.await.unwrap().0, status, "{what}: the leader");
+        assert_eq!(waiter.0, status, "{what}: the waiter");
+        assert_eq!(
+            heads.lock().unwrap().len(),
+            before + 1,
+            "{what}: the waiter took the leader's answer"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flight_waiter_with_other_loop_entries_takes_a_stored_render() {
+    // A render the leader stores is the URL's, whatever
+    // entries fetched it, so a waiter with other entries
+    // reads it from the tier the leader filled: one fetch.
+    let (origin, heads) = spawn_refusing_origin(std::time::Duration::from_millis(700)).await;
+    let (base, _state) = serve_shared(AppState {
+        allow_unsafe: true,
+        ..test_state()
+    })
+    .await;
+    let url = format!("{base}/unsafe/20x0/{origin}/stored.png");
+    let leader = send(&url, None, Some("cloudflare"));
+    fetched(&heads, 1).await;
+    let waiter = send(&url, None, None).await.unwrap();
+    let leader = leader.await.unwrap();
+    assert_eq!(
+        leader,
+        (StatusCode::OK, "crabcrop; fwd=uri-miss".to_string())
+    );
+    assert_eq!(waiter, (StatusCode::OK, "crabcrop; hit".to_string()));
+    assert_eq!(heads.lock().unwrap().len(), 1);
+}
