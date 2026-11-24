@@ -47,7 +47,7 @@ impl ScratchDir {
     /// sits under the name, left by a run that was killed
     /// before its drops ran, is removed first: the test
     /// sees only what it writes itself.
-    pub(super) fn fresh(path: PathBuf) -> Self {
+    pub(crate) fn fresh(path: PathBuf) -> Self {
         if let Err(e) = std::fs::remove_dir_all(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {

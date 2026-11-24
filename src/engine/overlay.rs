@@ -302,13 +302,75 @@ pub(in crate::engine) fn flattened_for(
 }
 
 /// Composite an image over a solid background color, dropping the
-/// alpha channel.
+/// alpha channel: byte for byte the image crate's overlay of the
+/// image, as RGBA8, on an opaque canvas of the color, converted to
+/// RGB8. That took a canvas, a copy of the image, a blend one
+/// pixel at a time through the crate's pixel accessors and a
+/// conversion; each pixel is now blended over the color in one
+/// pass, by the crate's own arithmetic (see [`blend_over`]),
+/// straight into the RGB8 result (issue #808). An RGBA8 image is
+/// read where it lies; any other layout is converted to RGBA8
+/// first, as the overlay read it.
 pub(in crate::engine) fn flatten(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
-    let mut base = image::RgbaImage::from_pixel(
-        img.width(),
-        img.height(),
-        image::Rgba([bg[0], bg[1], bg[2], 255]),
+    let converted;
+    let rgba = match img {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        other => {
+            converted = other.to_rgba8();
+            &converted
+        }
+    };
+    let (w, h) = rgba.dimensions();
+    let pixels = w as usize * h as usize;
+    let fill = [bg[0], bg[1], bg[2], u8::MAX];
+    let mut out = Vec::with_capacity(pixels * 3);
+    for &top in &rgba.as_raw().as_chunks::<4>().0[..pixels] {
+        let [r, g, b, _] = blend_over(fill, top);
+        out.extend_from_slice(&[r, g, b]);
+    }
+    image::RgbImage::from_raw(w, h, out).expect("three samples a pixel")
+}
+
+/// `bg.blend(&fg)` for `Rgba<u8>`, the image crate's source-over
+/// blend, with its operations in its order: a transparent `fg`
+/// leaves `bg`, an opaque one replaces it, and any other is
+/// blended in `f32` on the 0 to 1 scale, premultiplied, divided
+/// by the alpha that results and cast back. The crate's cast
+/// (`NumCast`) truncates, and refuses a value outside -1 to 256,
+/// which this blend never makes: each premultiplied channel is
+/// at most the alpha it is divided by, to within the rounding of
+/// that alpha, so a channel comes out under 256.
+#[inline(always)]
+pub(in crate::engine) fn blend_over(bg: [u8; 4], fg: [u8; 4]) -> [u8; 4] {
+    if fg[3] == 0 {
+        return bg;
+    }
+    if fg[3] == u8::MAX {
+        return fg;
+    }
+    let max_t = f32::from(u8::MAX);
+    let [bg_r, bg_g, bg_b, bg_a] = bg.map(|c| f32::from(c) / max_t);
+    let [fg_r, fg_g, fg_b, fg_a] = fg.map(|c| f32::from(c) / max_t);
+    let alpha_final = bg_a + fg_a - bg_a * fg_a;
+    if alpha_final == 0.0 {
+        return bg;
+    }
+    let (bg_r_a, bg_g_a, bg_b_a) = (bg_r * bg_a, bg_g * bg_a, bg_b * bg_a);
+    let (fg_r_a, fg_g_a, fg_b_a) = (fg_r * fg_a, fg_g * fg_a, fg_b * fg_a);
+    let (out_r_a, out_g_a, out_b_a) = (
+        fg_r_a + bg_r_a * (1.0 - fg_a),
+        fg_g_a + bg_g_a * (1.0 - fg_a),
+        fg_b_a + bg_b_a * (1.0 - fg_a),
     );
-    image::imageops::overlay(&mut base, &img.to_rgba8(), 0, 0);
-    DynamicImage::ImageRgba8(base).to_rgb8()
+    let (out_r, out_g, out_b) = (
+        out_r_a / alpha_final,
+        out_g_a / alpha_final,
+        out_b_a / alpha_final,
+    );
+    [
+        (max_t * out_r) as u8,
+        (max_t * out_g) as u8,
+        (max_t * out_b) as u8,
+        (max_t * alpha_final) as u8,
+    ]
 }

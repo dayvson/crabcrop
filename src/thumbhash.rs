@@ -16,24 +16,34 @@
 //! that client libraries decode into a blurred preview with
 //! the image's approximate aspect ratio and average color.
 
-use image::{DynamicImage, imageops::FilterType};
+use image::DynamicImage;
 
 /// The largest input the encoder accepts, per axis.
 const MAX_INPUT: u32 = 100;
 
 /// The ThumbHash of a processed image, base64-encoded: the
 /// image is downscaled to fit within 100x100 first (the
-/// encoder's input contract), with the pipeline's usual
-/// high-quality resampler.
+/// encoder's input contract), with the image crate's Lanczos3
+/// resize. That resize is computed over rows, as the
+/// `overlay(...,width)` scale computes it (issue #811): the
+/// crate's `resize` to the box, converted to RGBA8, byte for
+/// byte.
 pub fn thumbhash_base64(img: &DynamicImage) -> String {
-    let resized;
-    let img = if img.width() > MAX_INPUT || img.height() > MAX_INPUT {
-        resized = img.resize(MAX_INPUT, MAX_INPUT, FilterType::Lanczos3);
-        &resized
+    let rgba = if img.width() > MAX_INPUT || img.height() > MAX_INPUT {
+        let size = crate::ai::resample::resize_dimensions(
+            img.width(),
+            img.height(),
+            MAX_INPUT,
+            MAX_INPUT,
+            false,
+        );
+        let whole = (0, 0, size.0, size.1);
+        let Ok(rgba) =
+            crate::engine::scaled_part(img, size, whole, || Ok::<(), std::convert::Infallible>(()));
+        rgba
     } else {
-        img
+        img.to_rgba8()
     };
-    let rgba = img.to_rgba8();
     let hash = encode_rgba(rgba.width(), rgba.height(), rgba.as_raw());
     crate::placeholder::base64_encode(&hash)
 }
@@ -346,6 +356,50 @@ mod tests {
         // Half the blocks are at alpha 128: mean alpha ~0.75.
         let avg = average_rgba(&hash);
         assert!((avg[3] - 0.75).abs() < 0.1, "alpha {}", avg[3]);
+    }
+
+    #[test]
+    fn the_input_is_the_image_crate_s_resize() {
+        // Issue #811: an image past 100 pixels on a side is
+        // scaled to fit inside 100x100 by the row-based Lanczos3
+        // scale of `overlay(...,width)`. In each layout, and at
+        // sizes just past the box, a render's, long and thin:
+        // the crate's resize to the box as RGBA8, byte for byte,
+        // and so the hash it gave.
+        let mut rng = crate::test_support::Rng::new(60);
+        for (w, h) in [(101, 100), (100, 101), (333, 1001), (800, 533), (1000, 3)] {
+            let rgb = image::RgbImage::from_raw(w, h, rng.bytes((w * h * 3) as usize)).unwrap();
+            let rgba = image::RgbaImage::from_raw(w, h, rng.bytes((w * h * 4) as usize)).unwrap();
+            let (rgb, rgba) = (DynamicImage::ImageRgb8(rgb), DynamicImage::ImageRgba8(rgba));
+            for img in [
+                DynamicImage::ImageLuma8(rgb.to_luma8()),
+                DynamicImage::ImageRgba16(rgba.to_rgba16()),
+                DynamicImage::ImageRgb32F(rgb.to_rgb32f()),
+                rgb,
+                rgba,
+            ] {
+                let theirs = img
+                    .resize(MAX_INPUT, MAX_INPUT, image::imageops::FilterType::Lanczos3)
+                    .to_rgba8();
+                let size = (theirs.width(), theirs.height());
+                let whole = (0, 0, size.0, size.1);
+                let Ok(ours) = crate::engine::scaled_part(&img, size, whole, || {
+                    Ok::<(), std::convert::Infallible>(())
+                });
+                assert_eq!(
+                    crate::ai::resample::resize_dimensions(w, h, MAX_INPUT, MAX_INPUT, false),
+                    size
+                );
+                assert!(ours == theirs, "{:?} {w}x{h}", img.color());
+                let hash = encode_rgba(size.0, size.1, theirs.as_raw());
+                assert_eq!(
+                    thumbhash_base64(&img),
+                    crate::placeholder::base64_encode(&hash),
+                    "{:?} {w}x{h}",
+                    img.color()
+                );
+            }
+        }
     }
 
     #[test]

@@ -662,6 +662,165 @@ fn image_bytes_mut(img: &mut DynamicImage) -> &mut [u8] {
 }
 
 #[test]
+fn the_owned_crop_rect_resize_matches_the_borrowed_one() {
+    // Issue #807: a fused crop-rect premultiplies, where it
+    // sits, only the part of an RGBA8 frame its kernel reads.
+    // RGBA8 under every alpha plane a frame carries, on every
+    // window and target the crop tests use (inside the frame,
+    // against each edge, reduced, enlarged, on one axis, and
+    // at its own size), and two of each for the other layouts,
+    // which take the borrowed path: the bytes of the borrowed
+    // resize, which premultiplies a copy of the whole frame.
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (9, 17), (64, 48), (101, 53)] {
+        for (name, img) in rgba8_planes(w, h) {
+            for window @ (x, y, ww, wh) in windows(w, h) {
+                for (tw, th) in targets(ww, wh) {
+                    let borrowed = resize_lanczos3_cropped(&img, x, y, ww, wh, tw, th);
+                    let owned = resize_lanczos3_cropped_owned(img.clone(), window, tw, th);
+                    assert!(same(&borrowed, &owned), "{name} {window:?} to {tw}x{th}");
+                    cases += 1;
+                }
+            }
+        }
+        for (name, img) in frames_at(w, h) {
+            let window @ (x, y, ww, wh) = (w / 3, h / 3, (w / 3).max(1), (h / 3).max(1));
+            for (tw, th) in [(ww * 2, wh + 1), (1, 1)] {
+                let borrowed = resize_lanczos3_cropped(&img, x, y, ww, wh, tw, th);
+                let owned = resize_lanczos3_cropped_owned(img.clone(), window, tw, th);
+                assert!(same(&borrowed, &owned), "{name} {window:?} to {tw}x{th}");
+                cases += 1;
+            }
+        }
+    }
+    assert!(cases > 2000, "{cases}");
+}
+
+#[test]
+fn the_crop_box_reads_nothing_past_the_part_premultiplied() {
+    // Issue #807 premultiplies the part of the frame that
+    // `kernel_span` gives, which must hold every pixel the
+    // backend's kernel reads through the crop box. A frame
+    // that differs from another only outside that part
+    // resamples through the box to the same bytes, borrowed
+    // or owned. Windows inside the frame and against its
+    // edges, reduced hard and a little, enlarged, on one axis
+    // and to one pixel.
+    let (w, h) = (96, 80);
+    let img = layouts(w, h, harsh, mixed_alpha(harsh)).swap_remove(1).1;
+    assert!(matches!(img, DynamicImage::ImageRgba8(_)));
+    let mut narrower = 0;
+    for window @ (x, y, ww, wh) in [
+        (30u32, 20u32, 40u32, 30u32),
+        (0, 0, 50, 40),
+        (60, 50, 36, 30),
+        (10, 30, 70, 9),
+        (45, 35, 3, 4),
+    ] {
+        for (tw, th) in [
+            (1, 1),
+            (5, 4),
+            (13, 9),
+            (ww - 1, wh),
+            (ww, wh.div_ceil(2)),
+            (80, 60),
+        ] {
+            let (left, right) = kernel_span(x, ww, tw, w);
+            let (top, bottom) = kernel_span(y, wh, th, h);
+            let mut elsewhere = img.clone();
+            let stride = w as usize * 4;
+            for (i, v) in image_bytes_mut(&mut elsewhere).iter_mut().enumerate() {
+                let (px, py) = ((i % stride / 4) as u32, (i / stride) as u32);
+                if !((left..right).contains(&px) && (top..bottom).contains(&py)) {
+                    *v = !*v;
+                }
+            }
+            narrower += usize::from(!same(&img, &elsewhere));
+            let borrowed = resize_lanczos3_cropped(&img, x, y, ww, wh, tw, th);
+            let label = format!("{window:?} to {tw}x{th}");
+            assert!(
+                same(
+                    &borrowed,
+                    &resize_lanczos3_cropped(&elsewhere, x, y, ww, wh, tw, th)
+                ),
+                "{label}: the kernel read past the part"
+            );
+            let owned = resize_lanczos3_cropped_owned(elsewhere, window, tw, th);
+            assert!(same(&borrowed, &owned), "{label}");
+        }
+    }
+    // Most parts leave some of the frame out, or this would
+    // prove nothing.
+    assert!(narrower >= 20, "{narrower}");
+}
+
+#[test]
+fn a_refused_owned_crop_rect_resize_divides_its_part_back() {
+    // Issue #807: no input makes the backend refuse, so the
+    // refusal is forced. The part premultiplied where it sits
+    // is divided back before the borrowed resize takes the
+    // frame, or that resize would premultiply it a second
+    // time.
+    let mut cases = 0;
+    for (w, h) in [(9, 17), (64, 48)] {
+        for (name, img) in exactly_divisible_frames(w, h) {
+            let window @ (x, y, ww, wh) = (w / 4, h / 4, w / 2, h / 2);
+            for (tw, th) in [(ww.div_ceil(2), wh.div_ceil(2)), (ww * 2, wh + 3)] {
+                let plain = resize_lanczos3_cropped(&img, x, y, ww, wh, tw, th);
+                let refused = {
+                    let _refusal = RefusedConvolve::new();
+                    resize_lanczos3_cropped_owned(img.clone(), window, tw, th)
+                };
+                assert!(same(&plain, &refused), "{name} {w}x{h} to {tw}x{th}");
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 2 * 5 * 2);
+}
+
+#[test]
+fn crop_rect_and_lent_resizes_premultiply_only_what_they_must() {
+    // Issue #807. A crop-rect reducing an interior window to
+    // a third premultiplies the window and its kernel's reach
+    // around it, less than the frame. A lent frame with no row
+    // the premultiply changes, opaque or a GIF frame's, is not
+    // premultiplied at all; one with such a row is, whole.
+    let (w, h) = (64, 48);
+    let premultiplied = |run: &mut dyn FnMut()| {
+        let before = PREMULTIPLIED.get();
+        run();
+        PREMULTIPLIED.get() - before
+    };
+    for (name, img) in rgba8_planes(w, h) {
+        let window @ (x, y, ww, wh) = (20, 16, 24, 16);
+        let (left, right) = kernel_span(x, ww, 8, w);
+        let (top, bottom) = kernel_span(y, wh, 6, h);
+        let part = u64::from(right - left) * u64::from(bottom - top);
+        assert!(part < u64::from(w * h), "{part}");
+        let cropped = premultiplied(&mut || {
+            resize_lanczos3_cropped_owned(img.clone(), window, 8, 6);
+        });
+        assert_eq!(cropped, part, "{name}");
+        let mut lent = img.clone();
+        let lending = premultiplied(&mut || {
+            resize_lanczos3_lent(&mut lent, 30, 20);
+        });
+        let changes = !ChangingRows::of(&img.to_rgba8()).rows.is_empty();
+        assert_eq!(
+            changes,
+            !(name.contains("opaque") || name.contains("gif")),
+            "{name}"
+        );
+        assert_eq!(
+            lending,
+            if changes { u64::from(w * h) } else { 0 },
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn an_rgb_window_resamples_as_rgb_at_any_reduction() {
     // Issue #713: an RGB8 window is resampled as RGB8 and
     // stays RGB8. The RGBA8 resample it used to stand for
@@ -1336,6 +1495,88 @@ fn placing_falls_back_to_the_blend_wherever_a_row_copy_is_not_it() {
         }
     }
     assert_eq!(cases, 60);
+}
+
+/// `flatten` as it stood before issue #808: an opaque canvas of
+/// the fill, the image copied to RGBA8 and laid over it by the
+/// crate's overlay, one pixel at a time, and the canvas
+/// converted to RGB8.
+fn flatten_as_it_was(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
+    let mut base = image::RgbaImage::from_pixel(
+        img.width(),
+        img.height(),
+        image::Rgba([bg[0], bg[1], bg[2], 255]),
+    );
+    image::imageops::overlay(&mut base, &img.to_rgba8(), 0, 0);
+    DynamicImage::ImageRgba8(base).to_rgb8()
+}
+
+#[test]
+fn the_blend_is_the_crate_s_at_every_alpha_over_every_fill() {
+    // Issue #808. Over an opaque fill each channel of the blend
+    // depends on its own two samples and the top alpha alone,
+    // so every top sample at every alpha over every fill sample
+    // is every case there is: 16.7 million, each the crate's
+    // `Rgba::blend` to the byte, the alpha it computes included.
+    // Then translucent and transparent bases, which the flatten
+    // never has, on a coarser grid.
+    use image::Pixel;
+    let check = |bg: [u8; 4], fg: [u8; 4]| {
+        let mut theirs = image::Rgba(bg);
+        theirs.blend(&image::Rgba(fg));
+        assert_eq!(blend_over(bg, fg), theirs.0, "{fg:?} over {bg:?}");
+    };
+    for fill in 0..=255u8 {
+        let bg = [fill, fill.wrapping_add(85), fill.wrapping_add(170), 255];
+        for alpha in 0..=255u8 {
+            for top in 0..=255u8 {
+                check(bg, [top, !top, top ^ 0x5a, alpha]);
+            }
+        }
+    }
+    for bg_alpha in [0u8, 1, 77, 128, 254] {
+        for fill in (0..=255u8).step_by(5) {
+            for alpha in (0..=255u8).step_by(3) {
+                for top in (0..=255u8).step_by(7) {
+                    check(
+                        [fill, !fill, fill ^ 0x33, bg_alpha],
+                        [top, !top, top ^ 0x5a, alpha],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn flatten_matches_the_overlay_it_replaced() {
+    // Issue #808: every layout, with alpha and without, from an
+    // empty image and one pixel up, over fills at both ends of
+    // the range and between them: the old composition's bytes.
+    let mut cases = 0;
+    for (w, h) in [(0, 3), (1, 1), (3, 2), (37, 20), (101, 53)] {
+        let mut frames = frames_at(w, h);
+        frames.extend(rgba8_planes(w, h));
+        for (name, img) in frames {
+            for fill in [
+                [255, 255, 255],
+                [0, 0, 0],
+                [12, 200, 99],
+                [255, 0, 128],
+                [1, 2, 3],
+            ] {
+                let ours = flatten(&img, fill);
+                assert_eq!((ours.width(), ours.height()), (w, h), "{name}");
+                assert_eq!(
+                    ours.as_raw(),
+                    flatten_as_it_was(&img, fill).as_raw(),
+                    "{name} over {fill:?}"
+                );
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 5 * (20 + 8) * 5);
 }
 
 /// The part of an overlay scaled to `target` px wide as it was

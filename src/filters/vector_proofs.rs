@@ -1,3 +1,4 @@
+use super::identity_proofs::filter3x3_rgb;
 use super::*;
 
 /// Smooth content with a little noise on top.
@@ -382,8 +383,8 @@ fn grayscale_and_saturation_lanes_match_the_per_pixel_maps() {
         f32::NAN,
     ] {
         assert_eq!(
-            old_saturate(colors.clone(), amount).as_raw(),
-            saturate(colors.clone(), amount).as_raw(),
+            old_saturate(colors.clone(), amount).as_raw().as_slice(),
+            saturate(DynamicImage::ImageRgb8(colors.clone()), amount).as_bytes(),
             "saturation {amount}"
         );
     }
@@ -414,8 +415,8 @@ fn grayscale_and_saturation_lanes_match_the_per_pixel_maps() {
         let raw = rgb.to_rgb8();
         for amount in [0.3f32, 1.2] {
             assert_eq!(
-                old_saturate(raw.clone(), amount).as_raw(),
-                saturate(raw.clone(), amount).as_raw(),
+                old_saturate(raw.clone(), amount).as_raw().as_slice(),
+                saturate(DynamicImage::ImageRgb8(raw.clone()), amount).as_bytes(),
                 "saturation {amount} {w}x{h}"
             );
         }
@@ -446,8 +447,8 @@ fn lanes_split_into_bands_where_the_per_pixel_maps_do() {
         new_grayscale(dynamic).as_bytes()
     );
     assert_eq!(
-        old_saturate(big.clone(), 1.2).as_raw(),
-        saturate(big, 1.2).as_raw()
+        old_saturate(big.clone(), 1.2).as_raw().as_slice(),
+        saturate(DynamicImage::ImageRgb8(big), 1.2).as_bytes()
     );
     let mut rgba = DynamicImage::ImageRgb8(rgb(867, 869, smooth)).to_rgba8();
     for (x, y, p) in rgba.enumerate_pixels_mut() {

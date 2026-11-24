@@ -311,3 +311,118 @@ fn the_weights_are_the_bounded_ones_the_module_computes_with() {
         assert!(largest <= 3.0, "{largest} with {kernel:?}");
     }
 }
+
+/// An image in each layout the stand-ins compute over rows,
+/// RGBA8 with every alpha the noise gives, and in two layouts
+/// they leave to the crate, with whether its rows are this
+/// module's.
+fn images((w, h): (u32, u32), seed: u32) -> Vec<(DynamicImage, bool)> {
+    let rgb = image::RgbImage::from_raw(w, h, noise((w * h * 3) as usize, seed)).unwrap();
+    let rgba = image::RgbaImage::from_raw(w, h, noise((w * h * 4) as usize, seed + 1)).unwrap();
+    let rgb = DynamicImage::ImageRgb8(rgb);
+    vec![
+        (DynamicImage::ImageLuma8(rgb.to_luma8()), false),
+        (DynamicImage::ImageRgb16(rgb.to_rgb16()), false),
+        (rgb, true),
+        (DynamicImage::ImageRgba8(rgba), true),
+    ]
+}
+
+/// The layout, the size and every byte.
+fn same(a: &DynamicImage, b: &DynamicImage) -> bool {
+    a.color() == b.color()
+        && (a.width(), a.height()) == (b.width(), b.height())
+        && a.as_bytes() == b.as_bytes()
+}
+
+#[test]
+fn resize_to_fill_matches_the_crate_byte_for_byte() {
+    // Issue #806, the backdrop of `pad:WxH:blur`: a pixel, wide,
+    // tall and odd-sized sources, into boxes that cut the sides,
+    // cut the top and bottom, shrink the source, enlarge it past
+    // its own size, miss square by a pixel, and match it. The
+    // crate's layouts run with the pad's kernel only: their
+    // bytes are the crate's own call.
+    let mut cases = 0;
+    for (sw, sh) in [(1, 1), (3, 2), (97, 61), (240, 160), (161, 241)] {
+        for (tw, th) in [
+            (1, 1),
+            (80, 80),
+            (120, 30),
+            (30, 120),
+            (64, 64),
+            (79, 81),
+            (300, 300),
+            (240, 160),
+        ] {
+            for (img, rows) in images((sw, sh), sw * 13 + sh) {
+                for kernel in KERNELS {
+                    if !rows && kernel != Kernel::Triangle {
+                        continue;
+                    }
+                    let ours = resize_to_fill(&img, tw, th, kernel);
+                    let theirs = img.resize_to_fill(tw, th, crate_filter(kernel));
+                    assert!(
+                        same(&ours, &theirs),
+                        "{:?} {sw}x{sh} to {tw}x{th} with {kernel:?}",
+                        img.color()
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 5 * 8 * (2 * 2 + 2));
+}
+
+#[test]
+fn resize_dimensions_are_the_crate_s() {
+    // The size `DynamicImage::resize` fits a box at, as its
+    // output shows it. `resize_to_fill` takes the larger ratio
+    // where this takes the smaller, which the bytes of its cut
+    // check above. Shapes from a pixel to a long strip, into
+    // boxes on either side of them.
+    let mut cases = 0;
+    for (w, h) in [
+        (1, 1),
+        (1, 7),
+        (7, 1),
+        (3, 2),
+        (97, 61),
+        (800, 533),
+        (533, 800),
+        (16_383, 1),
+    ] {
+        for (nw, nh) in [
+            (1, 1),
+            (100, 100),
+            (16, 9),
+            (9, 16),
+            (2, 1000),
+            (1000, 2),
+            (w, h),
+            (w + 1, h),
+        ] {
+            let fit = DynamicImage::new_luma8(w, h).resize(nw, nh, FilterType::Nearest);
+            assert_eq!(
+                resize_dimensions(w, h, nw, nh, false),
+                (fit.width(), fit.height()),
+                "{w}x{h} into {nw}x{nh}"
+            );
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 8 * 8);
+    // A strip turned across its box covers it at its length
+    // squared; past `u32` that axis is held at it, and the
+    // other follows at the ratio that reaches it, as the crate
+    // holds them.
+    assert_eq!(
+        resize_dimensions(16_383, 1, 1, 16_383, true),
+        (268_402_689, 16_383)
+    );
+    assert_eq!(
+        resize_dimensions(1, 65_536, 65_536, 1, true),
+        (65_536, u32::MAX)
+    );
+}
