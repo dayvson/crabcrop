@@ -1380,6 +1380,7 @@ type Window = (u32, u32, u32, u32);
 mod encode;
 mod jpeg_scaled;
 mod overlay_scale;
+pub(crate) use overlay_scale::scaled_part;
 mod webp_anim;
 pub use encode::AvifTiles;
 pub(in crate::engine) use encode::{

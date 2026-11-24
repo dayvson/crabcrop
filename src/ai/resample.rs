@@ -3,15 +3,17 @@
 //!
 //! A few frames are still resampled with the image crate's
 //! own resize: the 224-crop of the CLIP and ViT preprocessing,
-//! the studio composite's subject (issue #674) and the blurred
-//! backdrop of a pad (issue #806). What they produce feeds a
-//! model or is the response, so the kernel cannot change
-//! without changing bytes. The crate reads one pixel at a time
-//! through `get_pixel`, column by column, into a four-channel
-//! float image. This module does the same arithmetic on rows:
-//! the same weights from the same expressions, the same
-//! accumulation order for every sample, the same clamp and
-//! rounding. The tests compare it with the crate.
+//! the studio composite's subject (issue #674), the blurred
+//! backdrop of a pad (issue #806) and the previews a meta
+//! response's placeholder is computed from (issue #811). What
+//! they produce feeds a model or is the response, so the
+//! kernel cannot change without changing bytes. The crate
+//! reads one pixel at a time through `get_pixel`, column by
+//! column, into a four-channel float image. This module does
+//! the same arithmetic on rows: the same weights from the
+//! same expressions, the same accumulation order for every
+//! sample, the same clamp and rounding. The tests compare it
+//! with the crate.
 //!
 //! It can compute a window of the output alone, for a
 //! caller that crops right after it resizes.
@@ -306,6 +308,35 @@ fn image_window(
         }
         _ => None,
     }
+}
+
+/// `img.resize_exact(nwidth, nheight, kernel)` (issue #811),
+/// computed over rows for an RGB8 or RGBA8 image; any other
+/// layout takes the crate's own call.
+pub(crate) fn resize_exact(
+    img: &DynamicImage,
+    nwidth: u32,
+    nheight: u32,
+    kernel: Kernel,
+) -> DynamicImage {
+    image_window(img, (nwidth, nheight), kernel, (0, 0, nwidth, nheight))
+        .unwrap_or_else(|| img.resize_exact(nwidth, nheight, kernel.filter()))
+}
+
+/// `img.resize(nwidth, nheight, kernel)` (issue #811): the
+/// image scaled to fit inside the box, at the crate's size
+/// (see [`resize_dimensions`]), computed over rows for an RGB8
+/// or RGBA8 image; any other layout takes the crate's own
+/// call.
+pub(crate) fn resize_to_fit(
+    img: &DynamicImage,
+    nwidth: u32,
+    nheight: u32,
+    kernel: Kernel,
+) -> DynamicImage {
+    let (w, h) = resize_dimensions(img.width(), img.height(), nwidth, nheight, false);
+    image_window(img, (w, h), kernel, (0, 0, w, h))
+        .unwrap_or_else(|| img.resize(nwidth, nheight, kernel.filter()))
 }
 
 /// `img.resize_to_fill(nwidth, nheight, kernel)` (issue #806):
