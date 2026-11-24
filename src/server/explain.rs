@@ -319,13 +319,15 @@ fn explain_report(
     // config fingerprint suffix is operator state and stays
     // unreported. A form past the key-length bound is shown
     // in full, though the key carries its digest
-    // (`cache::bounded_key_base`). For a root source the
-    // form is built from the source as written: the key
-    // itself is keyed on the expansion, but printing that
-    // here would publish the root's base URL into the
-    // report.
+    // (`cache::bounded_key_base`). Its source is in the form
+    // the loader fetches, as the key's is (issue #778). For a
+    // root source the form is built from the source as
+    // written: the key itself is keyed on the expansion, but
+    // printing that here would publish the root's base URL
+    // into the report.
     let source_url = resolved.written_source();
-    let canonical = crate::url::canonical_form(&resolved.ops, &source_url);
+    let canonical =
+        crate::url::canonical_form(&resolved.ops, &crate::loader::fetched_form(&source_url));
     let (signed, key_id) = match credential {
         Credential::Signature(key_id) => (true, key_id),
         Credential::Unsafe => (false, None),

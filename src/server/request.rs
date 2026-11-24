@@ -472,16 +472,9 @@ fn keep_from_shared_caches(response: &mut Response) {
 /// Without an explicit format in the URL, the response depends
 /// on the Accept class as well as the path, so the cache key
 /// carries the class. Explicit-format URLs key on the path alone.
-/// The key is the request's canonical form (Q1): the
-/// parsed operations re-serialized in their one
-/// spelling, so equivalent requests share an entry.
-/// Expiry and the cache lifetime are not operations,
-/// so neither ever enters it. A form past
-/// [`crate::cache::MAX_KEY_BASE_BYTES`] is carried as its
-/// digest ([`crate::cache::bounded_key_base`]), so a padded
-/// source cannot make one entry's key, which every tier
-/// stores and the cache maps hold twice, tens of kilobytes
-/// long.
+/// The key is built on [`cache_key_base`], so equivalent
+/// requests share an entry. Expiry and the cache lifetime
+/// are not operations, so neither ever enters it.
 pub(in crate::server) fn cache_key_for(
     config_fingerprint: &str,
     ops: &[crate::url::Operation],
@@ -489,8 +482,7 @@ pub(in crate::server) fn cache_key_for(
     negotiated: &Negotiated,
 ) -> String {
     use std::fmt::Write as _;
-    let key_base =
-        crate::cache::bounded_key_base(crate::url::canonical_form(ops, source_url), source_url);
+    let key_base = cache_key_base(ops, source_url);
     // The key also carries the configuration fingerprint
     // (audit R2-08): entries in the persistent tiers are
     // keyed under the configuration that produced them, so
@@ -525,4 +517,20 @@ pub(in crate::server) fn cache_key_for(
         let _ = write!(cache_key, "#dpr{effective_dpr}");
     }
     cache_key
+}
+
+/// The base of the cache key of `ops` on `source_url`, ahead of
+/// its `#` suffixes, and the key form a purge removes by: the
+/// canonical form (Q1), the parsed operations re-serialized in
+/// their one spelling, of the source in the form the loader
+/// fetches it (issue #778, [`crate::loader::fetched_form`]), so
+/// that the spellings of one request and of one source share
+/// an entry. A form past [`crate::cache::MAX_KEY_BASE_BYTES`]
+/// is carried as its digest ([`crate::cache::bounded_key_base`]),
+/// so a padded source cannot make one entry's key, which every
+/// tier stores and the cache maps hold twice, tens of kilobytes
+/// long.
+pub(in crate::server) fn cache_key_base(ops: &[crate::url::Operation], source_url: &str) -> String {
+    let source = crate::loader::fetched_form(source_url);
+    crate::cache::bounded_key_base(crate::url::canonical_form(ops, &source), &source)
 }

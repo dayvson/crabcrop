@@ -10,7 +10,7 @@
 use image::DynamicImage;
 
 use super::animated::ScaledOverlays;
-use super::limits::MAX_OUTPUT_PIXELS;
+use super::limits::{MAX_OUTPUT_PIXELS, check_output_bytes};
 use super::{EngineError, ProcessContext, StillFormat, overlay_scale};
 
 /// One channel of a blend mode: the CSS formulas on the
@@ -108,6 +108,12 @@ pub(in crate::engine) fn blend_overlay_keeping(
         // Scaled to its own size, the overlay is itself.
         ov.rgba_part(part.0)
     } else {
+        // The part is scaled in the overlay's own layout before
+        // it becomes RGBA8, so it is held to the byte budget in
+        // that layout before it is scaled, on a still and on
+        // every frame of an animation alike (issue #784).
+        let (_, _, part_w, part_h) = part.0;
+        check_output_bytes(part_w, part_h, ov.image().color())?;
         let scale =
             || overlay_scale::scaled_part(ov.image(), top_size, part.0, || ctx.check_deadline());
         let origin = (part.0.0, part.0.1);
