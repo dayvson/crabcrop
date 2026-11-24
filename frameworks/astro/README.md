@@ -46,7 +46,7 @@ Service config (under `image.service.config`):
 | `preset` | A preset name defined on the server. Recommended (see below). |
 | `origin` | Origin prepended to root-relative sources such as `/_astro/hero.jpg` (local imports) or `/uploads/a.jpg`. |
 | `secret` | Signs the URLs. Safe here in a way a client loader cannot offer: the service runs only on the server (build and SSR), so the secret never enters client code. Read it from the environment in `astro.config` (`process.env.CRABCROP_SECRET`), never hardcode it. |
-| `expires` | A unix-seconds expiry applied to every generated URL. |
+| `expires` | A unix-seconds expiry applied to every generated URL. A source whose first segment crabcrop reads as an operation, `exp:`, `maxage:` or `preset:` then throws, as `buildURL` throws for it with an expiry: the server keeps the last `exp:` of a URL. |
 
 ## Sign in the service, keep the policy in a preset
 

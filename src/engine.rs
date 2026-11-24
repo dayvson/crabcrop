@@ -242,6 +242,7 @@ impl Default for ProcessContext<'_> {
             avif_speed: DEFAULT_AVIF_SPEED,
             avif_tiles: AvifTiles::default(),
             jxl_speed: DEFAULT_JXL_SPEED,
+            jxl_threads: None,
             deadline: None,
         }
     }
@@ -1132,6 +1133,7 @@ impl Engine {
                 ctx.avif_speed,
                 ctx.avif_tiles,
                 ctx.jxl_speed,
+                ctx.jxl_threads,
             )
         };
         let mut encode_budget = MAX_REQUEST_ENCODES;

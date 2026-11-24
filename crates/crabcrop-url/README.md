@@ -24,7 +24,7 @@ let url = build_url(
 // https://images.example.com/<signature>/crop:1200x630:smart/filters:format(webp)/https://example.com/photo.jpg
 ```
 
-Pass `Some(unix_seconds)` as the last argument to mint an expiring URL. The expiry becomes a leading `exp:` segment inside the signed remainder, so it cannot be stripped or extended without the secret, and the server refuses the URL once the expiry second is reached.
+Pass `Some(unix_seconds)` as the last argument to mint an expiring URL. The expiry becomes a leading `exp:` segment inside the signed remainder, so it cannot be stripped or extended without the secret, and the server refuses the URL once the expiry second is reached. The server keeps the last `exp:` of a URL, so with an expiry the builders refuse operations that carry an `exp:` or `maxage:` segment, and a source whose first segment the server reads as an operation, `exp:`, `maxage:` or `preset:`, with `BuildError::ExpiryOverride` (`SealError::ExpiryOverride` for a sealed URL): such text, from page content say, would set the URL's lifetime in place of the expiry, or sign operations nobody passed as operations. Without an expiry those inputs build as before.
 
 ```rust
 let expiring = build_url(
@@ -184,7 +184,7 @@ A `None` secret produces the literal `unsafe` signature segment, for servers run
 
 ## Errors
 
-Builders fail loudly at build time rather than minting a URL that would be refused at fetch time. Failures are typed: `BuildError` for signed URL construction (a character that cannot travel in a URL path, an out-of-range srcset width, an invalid key ID, a reserved remainder) and `SealError` for sealing and opening (remainder too long, invalid key ID, a refused character, a reserved remainder, no secret for the deprecated `build_sealed_url`, a random number generator that could not draw a nonce, an encryption failure, and the uniform `OpenFailed`, which only opening returns). Both enums are `#[non_exhaustive]`: a later release may add a variant, so a `match` on one needs a wildcard arm.
+Builders fail loudly at build time rather than minting a URL that would be refused at fetch time. Failures are typed: `BuildError` for signed URL construction (a character that cannot travel in a URL path, an out-of-range srcset width, an invalid key ID, a reserved remainder, an input that would override the expiry) and `SealError` for sealing and opening (remainder too long, invalid key ID, a refused character, a reserved remainder, an input that would override the expiry, no secret for the deprecated `build_sealed_url`, a random number generator that could not draw a nonce, an encryption failure, and the uniform `OpenFailed`, which only opening returns). Both enums are `#[non_exhaustive]`: a later release may add a variant, so a `match` on one needs a wildcard arm.
 
 The refused characters are `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded), so a URL signed over them answers 403 from a page. Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error message names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
 

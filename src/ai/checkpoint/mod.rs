@@ -12,7 +12,8 @@ use zip::read_zip_entries;
 /// everything its zip entries inflate to. A linear head
 /// is a few kilobytes; the budget keeps a wrong file (a
 /// full model save, say) from being buffered and parsed
-/// as one.
+/// as one. The loader refuses a file over it from its
+/// size, before reading any of it (issue #783).
 pub(super) const HEAD_BUDGET: usize = 16 * 1024 * 1024;
 
 /// Extract the (weights, bias) pair from a head

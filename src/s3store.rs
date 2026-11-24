@@ -54,7 +54,9 @@
 //! /metrics by request and in the tier's errors, and are
 //! logged at most one line every 10 seconds. A purge walk that
 //! meets a refusal has not judged that object, so its purge's
-//! tombstone stays in force.
+//! tombstone stays in force. A redirect is one of those answers
+//! (issue #781): no request follows a `3xx`, so nothing the
+//! store is sent goes to the host a redirect names.
 //!
 //! Walks list the bucket a page at a time (issue #709): one
 //! page of at most [`LIST_PAGE_KEYS`] names, judged before the
@@ -463,13 +465,20 @@ impl S3Store {
         Ok(Self {
             // No client-wide total (issue #550): every request
             // gets its own bound, sized to what it moves (see
-            // `send`).
+            // `send`). Neither client follows a redirect (issue
+            // #781), as the loader's store client and the
+            // container credentials client do not: a followed
+            // `3xx` carried the session token, the date and a
+            // write's body to whatever host it named. A `3xx`
+            // is the store's answer, refused like a `403`.
             client: reqwest::Client::builder()
                 .connect_timeout(STORE_CONNECT_TIMEOUT)
                 .read_timeout(STORE_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             put_client: reqwest::Client::builder()
                 .connect_timeout(STORE_CONNECT_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             bucket,
             prefix,
@@ -2905,6 +2914,13 @@ pub(crate) mod test_support {
         /// the next page the one it was asked for: a store
         /// whose listing never ends (issue #709).
         pub stuck_token: bool,
+        /// Answer every request for an object (a GET, ranged
+        /// or not, a HEAD, a PUT, a DELETE) with S3's `307
+        /// TemporaryRedirect` to the same path and query
+        /// under this base (issue #781).
+        pub redirect_objects: Option<String>,
+        /// Answer every listing page the same way.
+        pub redirect_listings: Option<String>,
     }
 
     /// The credentials the fake accepts until a test sets
@@ -3683,6 +3699,24 @@ pub(crate) mod test_support {
                 "content-type: application/xml\r\n".to_string(),
             )
         };
+        let listing = method == "GET" && query.contains("list-type=2");
+        let redirect = if listing {
+            &fail.redirect_listings
+        } else {
+            &fail.redirect_objects
+        };
+        if let Some(base) = redirect {
+            let redirect = Refusal::new(
+                "307 Temporary Redirect",
+                "TemporaryRedirect",
+                "Please re-send this request to the specified temporary endpoint.",
+            );
+            return (
+                redirect.status.to_string(),
+                redirect.document(),
+                format!("location: {base}{target}\r\ncontent-type: application/xml\r\n"),
+            );
+        }
         match (method, query.contains("list-type=2")) {
             ("PUT", _) if fail.put => error,
             ("PUT", _)
@@ -6619,6 +6653,128 @@ mod tests {
             let read = HeaderRead::of_error(answer(status, "<Error/>"), Instant::now()).await;
             assert!(matches!(read, HeaderRead::Failed), "{status}");
         }
+    }
+
+    /// Where the redirect test's store points: a listener that
+    /// records the request line of each connection it accepts
+    /// and answers `200` with nothing (issue #781).
+    async fn start_elsewhere() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/elsewhere", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = [0u8; 4096];
+                let n = socket.read(&mut head).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&head[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("a connection with no request")
+                    .to_string();
+                recorded.lock().unwrap().push(line);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn a_store_redirect_is_refused_and_never_followed() {
+        // Issue #781: both clients followed a store's 3xx to
+        // the host it named, with the session token, the date
+        // and a write's body. A redirect is now the store's
+        // answer: a refused lookup, a dropped write, a purge
+        // walk left incomplete, an upload's failed check and
+        // write, counted as the store's other refusals are,
+        // and nothing reaches the host it names.
+        let fake = start_fake().await;
+        let (elsewhere, reached) = start_elsewhere().await;
+        let mut creds = super::test_support::test_credentials();
+        creds.session_token = Some("redirect-test-session-token".to_string());
+        *fake.credentials.lock().unwrap() = Some(creds.clone());
+        let s = S3Store::new(
+            "results".into(),
+            "cache/".into(),
+            Some(fake.endpoint.clone()),
+            "us-east-1".into(),
+            Some(creds.into()),
+            test_entry_key(),
+        )
+        .unwrap();
+        let cutoff = PurgeCutoff {
+            start_ms: now_ms(),
+            writer: 0xb,
+        };
+        s.put("k", &image(b"x", &["hero"])).await;
+        assert!(s.put_raw("photo.png", b"x".to_vec()).await);
+        assert!(
+            s.put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+                .await
+                .is_some()
+        );
+        assert_eq!(s.errors(), 0);
+        let nowhere_else = |after: &str| {
+            let reached = reached.lock().unwrap();
+            assert!(
+                reached.is_empty(),
+                "{after} followed the store's redirect: {reached:?}"
+            );
+        };
+        // The store redirects every request for an object.
+        fake.fail.lock().unwrap().redirect_objects = Some(elsewhere.clone());
+        assert!(s.get("k").await.is_none());
+        nowhere_else("a lookup");
+        assert_eq!((s.refused(Refused::Lookup), s.errors()), (1, 1));
+        s.put("k2", &image(b"y", &[])).await;
+        nowhere_else("a write");
+        assert_eq!(s.errors(), 2);
+        let hero = PurgeTarget::Group("hero".into());
+        let swept = s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING).await;
+        nowhere_else("a purge walk's read");
+        assert!(!swept.complete, "the walk could not read the entry");
+        assert_eq!((s.refused(Refused::Purge), s.errors()), (1, 3));
+        assert!(
+            s.put_tombstone(&tombstone_for("hero", cutoff, None), 2)
+                .await
+                .is_none()
+        );
+        nowhere_else("a tombstone write");
+        assert_eq!(s.errors(), 4);
+        let guard = PurgeGuard::new();
+        assert!(!s.refresh_tombstones(&guard).await, "the tombstone read");
+        nowhere_else("a tombstone read");
+        assert_eq!(s.errors(), 5);
+        // The upload bucket's store is this store too.
+        assert!(!s.exists_raw("photo.png").await);
+        nowhere_else("an existence check");
+        assert_eq!((s.exists_checks_failed(), s.errors()), (1, 6));
+        assert!(!s.put_raw("other.png", b"x".to_vec()).await);
+        assert_eq!(
+            s.put_raw_if_absent("new.png", b"x".to_vec()).await,
+            RawPut::Failed
+        );
+        nowhere_else("an upload");
+        // And every listing page: neither a walk nor a
+        // tombstone refresh can list.
+        fake.fail.lock().unwrap().redirect_listings = Some(elsewhere.clone());
+        let swept = s.purge_whole(&hero, None, PurgeCutoff::EVERYTHING).await;
+        assert!(!swept.complete, "the walk could not list");
+        assert_eq!(s.errors(), 7);
+        assert!(!s.refresh_tombstones(&guard).await, "the tombstone listing");
+        assert_eq!(s.errors(), 8);
+        nowhere_else("a listing");
+        assert!(
+            fake.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("PUT cache/new.png")),
+            "the store was asked"
+        );
     }
 
     /// What [`start_hashless_store`] hands back: its endpoint,

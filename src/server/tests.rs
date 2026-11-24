@@ -17617,6 +17617,87 @@ async fn avif_is_written_in_the_servers_tile_count() {
     );
 }
 
+#[tokio::test]
+async fn a_jpeg_xl_encode_shares_the_cores_with_the_renders_in_flight() {
+    // Issue #791: the stills lane's permits, one for every
+    // core, shared among the renders that hold them, rounded
+    // down and at least one: every core for a render alone,
+    // one thread each with the lane full, and every core for
+    // a slow-lane render while no still is rendering.
+    let cases: [(usize, &[usize]); 3] = [
+        (4, &[4, 2, 1, 1]),
+        (16, &[16, 8, 5, 4, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]),
+        (1, &[1]),
+    ];
+    for (permits, threads) in cases {
+        let stills = Arc::new(Gate::new(permits));
+        assert_eq!(jxl_threads_for(&stills), permits, "{permits} permits");
+        let mut held = Vec::new();
+        for &want in threads {
+            held.push(stills.clone().acquire_owned().await.unwrap());
+            assert_eq!(
+                jxl_threads_for(&stills),
+                want,
+                "{permits} permits, {} held",
+                held.len()
+            );
+        }
+        drop(held);
+        assert_eq!(jxl_threads_for(&stills), permits, "{permits} permits");
+    }
+}
+
+/// A JPEG XL render's file does not follow the stills lane's
+/// load (issue #791): with three of the lane's four permits
+/// held, the encode gets one thread where alone it gets four,
+/// and the bytes are the same.
+#[tokio::test]
+async fn jpeg_xl_renders_the_same_bytes_with_the_stills_lane_full() {
+    // Room for four threads at the default speed, which gives
+    // a thread to each 64K pixels at most.
+    let frame = DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 480, |x, y| {
+        let n = (x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77)) >> 24;
+        image::Rgb([(x / 3) as u8, (y / 2) as u8, n as u8])
+    }));
+    let mut png = std::io::Cursor::new(Vec::new());
+    frame.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let src = spawn_bytes_server(png.into_inner()).await;
+    let stills = Arc::new(Gate::new(4));
+    let base = spawn_state(AppState {
+        process_gate: stills.clone(),
+        ..test_state()
+    })
+    .await;
+    // Two spellings of the source, so the second render is not
+    // the first one's cache entry: the bytes server answers
+    // every path with the same image.
+    let render = |name: &'static str| {
+        let remainder = format!(
+            "filters:format(jxl):quality(80)/{}",
+            src.replace("src.png", name)
+        );
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        async move {
+            let resp = client().get(url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            resp.bytes().await.unwrap()
+        }
+    };
+    let alone = render("alone.png").await;
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(stills.clone().acquire_owned().await.unwrap());
+    }
+    let busy = render("busy.png").await;
+    drop(held);
+    assert!(
+        busy == alone,
+        "{} bytes with the lane full, {} alone",
+        busy.len(),
+        alone.len()
+    );
+}
+
 /// A float TIFF source (Rgb32F samples) renders to PNG, plain
 /// and interlaced, and to AVIF, named or negotiated from a
 /// browser's `Accept` (issue #464). Each of these was a 500

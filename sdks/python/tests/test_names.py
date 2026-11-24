@@ -32,6 +32,7 @@ PYTHON_NAMES = {
     "seal": "seal",
     "unseal": "unseal",
     "buildSealedURL": "build_sealed_url",
+    "ExpiryOverrideError": "ExpiryOverrideError",
     "buildURL": "build_url",
     "buildSrcSet": "build_srcset",
     "MAX_DIMENSION": "MAX_DIMENSION",
@@ -65,7 +66,7 @@ KEYWORD_ARGUMENTS = {"BuildOptions", "SealOptions"}
 
 def typescript_exports():
     text = TYPESCRIPT_INDEX.read_text(encoding="utf-8")
-    names = set(re.findall(r"^export (?:const|function|interface|type) (\w+)", text, re.M))
+    names = set(re.findall(r"^export (?:class|const|function|interface|type) (\w+)", text, re.M))
     for group in re.findall(r"^export (?:type )?\{([^}]*)\} from", text, re.M):
         names.update(name.strip() for name in group.split(",") if name.strip())
     return names
