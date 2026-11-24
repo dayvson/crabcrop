@@ -409,6 +409,151 @@
     "remainder": "crabcrop/300x200/https://example.com/photo.jpg"
   },
   {
+    "description": "refused with an expiry: an exp: segment opening the operations (the server keeps the last exp:, so it would outlive the builder's)",
+    "operations": "exp:4102444800/300x200",
+    "source": "https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "operations",
+      "segment": "exp:4102444800"
+    }
+  },
+  {
+    "description": "refused with an expiry: an exp: segment anywhere among the operations",
+    "operations": "300x200/exp:4102444800/filters:grayscale",
+    "source": "https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "operations",
+      "segment": "exp:4102444800"
+    }
+  },
+  {
+    "description": "refused with an expiry: a malformed exp: segment in the operations: the prefix is what counts",
+    "operations": "exp:soon/300x200",
+    "source": "https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "operations",
+      "segment": "exp:soon"
+    }
+  },
+  {
+    "description": "refused with an expiry: a maxage: segment in the operations",
+    "operations": "300x200/maxage:60",
+    "source": "https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "operations",
+      "segment": "maxage:60"
+    }
+  },
+  {
+    "description": "refused with an expiry: an exp: segment opening the source, which the server reads as the URL's expiry",
+    "operations": "300x200",
+    "source": "exp:4102444800/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "exp:4102444800"
+    }
+  },
+  {
+    "description": "refused with an expiry: a maxage: segment opening the source",
+    "operations": "300x200",
+    "source": "maxage:60/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "maxage:60"
+    }
+  },
+  {
+    "description": "refused with an expiry: a filters: segment opening the source, which the server reads as an operation",
+    "operations": "300x200",
+    "source": "filters:blur(20)/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "filters:blur(20)"
+    }
+  },
+  {
+    "description": "refused with an expiry: a crop: segment opening the source",
+    "operations": "",
+    "source": "crop:100x100:smart/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "crop:100x100:smart"
+    }
+  },
+  {
+    "description": "refused with an expiry: a size opening the source, with no operations: pass operations as operations",
+    "operations": "",
+    "source": "100x50/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "100x50"
+    }
+  },
+  {
+    "description": "refused with an expiry: a malformed size opening the source: the server reads it as a size, valid or not",
+    "operations": "300x200",
+    "source": "16384x10/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "16384x10"
+    }
+  },
+  {
+    "description": "refused with an expiry: a preset: reference opening the source",
+    "operations": "300x200",
+    "source": "preset:og-card/https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "refuses_with_expiry": {
+      "input": "source",
+      "segment": "preset:og-card"
+    }
+  },
+  {
+    "description": "built with an expiry: an exp: segment inside the source path is source text, not metadata",
+    "operations": "300x200",
+    "source": "https://example.com/exp:4102444800/photo.jpg",
+    "expires": 1893456000,
+    "builds_with_expiry": "exp:1893456000/300x200/https://example.com/exp:4102444800/photo.jpg"
+  },
+  {
+    "description": "built with an expiry: operations, preset references and filters build as before",
+    "operations": "preset:og-card/crop:1200x630:smart/filters:grayscale",
+    "source": "https://example.com/photo.jpg",
+    "expires": 1893456000,
+    "builds_with_expiry": "exp:1893456000/preset:og-card/crop:1200x630:smart/filters:grayscale/https://example.com/photo.jpg"
+  },
+  {
+    "description": "built with an expiry: a source-root source",
+    "operations": "300x200",
+    "source": "root:photos/cat.jpg",
+    "expires": 1893456000,
+    "builds_with_expiry": "exp:1893456000/300x200/root:photos/cat.jpg"
+  },
+  {
+    "description": "built with an expiry: a bucket locator whose key holds a size",
+    "operations": "",
+    "source": "s3://media/300x200/photo.jpg",
+    "expires": 1893456000,
+    "builds_with_expiry": "exp:1893456000/s3://media/300x200/photo.jpg"
+  },
+  {
+    "description": "built with an expiry: a source with no scheme: its first segment holds an x and a dot, so it is not a size",
+    "operations": "300x200",
+    "source": "example.com/photo.jpg",
+    "expires": 1893456000,
+    "builds_with_expiry": "exp:1893456000/300x200/example.com/photo.jpg"
+  },
+  {
     "description": "purge: a per-URL purge signature, the purge subkey's HMAC over the path alone",
     "endpoint": "purge",
     "secret": "test-secret",

@@ -21,6 +21,30 @@ if (!class_exists('CrabcropUrl')) {
         const RESERVED_SEGMENT = 'crabcrop';
 
         /**
+         * The prefixes of the segments the server reads ahead of the
+         * source (issue #782): the exp: and maxage: metadata, a
+         * preset: reference, and every operation that opens with a
+         * name. A size has none (see size_shaped). The list is the
+         * crabcrop-url crate's, which the server's tests hold to its
+         * parser.
+         */
+        const LEADING_PREFIXES = array(
+            'exp:',
+            'maxage:',
+            'preset:',
+            'debug:',
+            'frame:',
+            'page:',
+            'crop-rect:',
+            'focalpoint:',
+            'focal:',
+            'crop:',
+            'pad:',
+            'fit-in:',
+            'filters:',
+        );
+
+        /**
          * Whether $remainder is the reserved segment or starts with
          * crabcrop/.
          */
@@ -74,7 +98,12 @@ if (!class_exists('CrabcropUrl')) {
          * of " < > \ ^ ` { | }, which a browser rewrites before the
          * request leaves the page (a URL signed over them answers 403),
          * and a remainder that begins with the reserved segment, signed
-         * or not (the server refuses it whatever the signature).
+         * or not (the server refuses it whatever the signature). With an
+         * expiry, it also throws for operations that carry an exp: or
+         * maxage: segment, and for a source whose first segment the
+         * server reads as an operation, exp:, maxage: or preset: (issue
+         * #782): the server keeps the last exp: of a URL, so either
+         * would decide the URL in the expiry's place.
          */
         public static function build($base, $secret, $operations, $source, $expiry = null, $key_id = null)
         {
@@ -92,6 +121,7 @@ if (!class_exists('CrabcropUrl')) {
                 if (!is_int($expiry) || $expiry < 0) {
                     throw new InvalidArgumentException('expiry must be a non-negative integer');
                 }
+                self::check_no_expiry_override($operations, $source);
                 $parts[] = 'exp:' . $expiry;
             }
             if ($operations !== '') {
@@ -111,6 +141,69 @@ if (!class_exists('CrabcropUrl')) {
             }
 
             return rtrim($base, '/') . '/' . $signature . '/' . $remainder;
+        }
+
+        /**
+         * With an expiry, refuse the text that would decide the URL in
+         * its place (issue #782): an exp: or maxage: segment anywhere
+         * among the operations, or a first source segment the server
+         * reads ahead of the source. The messages are the ones every
+         * other builder gives.
+         */
+        private static function check_no_expiry_override($operations, $source)
+        {
+            foreach (explode('/', $operations) as $segment) {
+                if (strpos($segment, 'exp:') === 0 || strpos($segment, 'maxage:') === 0) {
+                    throw new InvalidArgumentException(
+                        'operations carries the segment "' . $segment . '": with an expiry, the operations'
+                            . ' may carry no exp: or maxage: segment, since the server keeps the last of each'
+                    );
+                }
+            }
+            $head = explode('/', $source, 2);
+            if (self::read_before_source($head[0])) {
+                throw new InvalidArgumentException(
+                    'source begins with the segment "' . $head[0] . '", which the server reads ahead of'
+                        . ' the source: with an expiry, the source may not begin with an operation, exp:,'
+                        . ' maxage: or preset: segment'
+                );
+            }
+        }
+
+        /**
+         * Whether the server reads $segment ahead of the source: as
+         * metadata, a preset reference or an operation, valid or not.
+         * The first segment that is none of these starts the source.
+         */
+        private static function read_before_source($segment)
+        {
+            foreach (self::LEADING_PREFIXES as $prefix) {
+                if (strpos($segment, $prefix) === 0) {
+                    return true;
+                }
+            }
+            return self::size_shaped($segment);
+        }
+
+        /**
+         * The server's size shape: an x joining two parts, at least one
+         * of them a dimension spelling (digits, orig, or nothing, after
+         * an optional -), and no . or : in the segment. Every size the
+         * server parses has it, and the server reads a segment with it
+         * that does not parse as a malformed size, never as source text.
+         */
+        private static function size_shaped($segment)
+        {
+            $x = strpos($segment, 'x');
+            if ($x === false || strpbrk($segment, '.:') !== false) {
+                return false;
+            }
+            foreach (array(substr($segment, 0, $x), (string) substr($segment, $x + 1)) as $side) {
+                if (preg_match('/^-?(orig|[0-9]*)$/D', $side)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private static function check_remainder_part($part, $what)

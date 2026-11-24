@@ -28,6 +28,7 @@ from ._explain import (
     SignatureKind,
     explain_url,
 )
+from ._explain import reads_before_source as _reads_before_source
 from ._grammar import (
     MAX_DIMENSION,
     RESERVED_SEGMENT,
@@ -60,6 +61,7 @@ __all__ = [
     "CropAlign",
     "CurveChannel",
     "Dimension",
+    "ExpiryOverrideError",
     "ExplainedSegment",
     "ExplainedSignature",
     "Explanation",
@@ -531,11 +533,15 @@ def build_sealed_url(
     friendly name: the server never parses, validates, or
     authenticates it; omit it and the URL ends at the
     token. A ``None`` secret raises: there is no ``unsafe``
-    spelling of a token."""
+    spelling of a token. With ``expires``, operations and a
+    source that would decide the URL in its place raise
+    `ExpiryOverrideError`, as in `build_url`."""
     if expires is not None:
         _validate_expires(expires)
     _validate_url_text(operations, "operations")
     _validate_url_text(source, "source")
+    if expires is not None:
+        _refuse_expiry_override(operations, source)
     remainder = ""
     if expires is not None:
         remainder += f"exp:{expires}/"
@@ -581,6 +587,45 @@ def _validate_url_text(text: str, what: str) -> None:
             )
 
 
+class ExpiryOverrideError(ValueError):
+    """A builder given an expiry refused text that would decide the
+    URL in the expiry's place (issue #782): an ``exp:`` or ``maxage:``
+    segment among the operations, or a source whose first segment the
+    server reads ahead of the source, as an operation, ``exp:``,
+    ``maxage:`` or ``preset:``. The server keeps the last ``exp:`` of a
+    URL, so such text would set the URL's lifetime whatever expiry was
+    given, or add operations to the signed URL. ``input`` names the
+    input (``"operations"`` or ``"source"``) and ``segment`` the
+    segment. A ``ValueError``, as every other refused input is."""
+
+    def __init__(self, input: str, segment: str) -> None:
+        self.input = input
+        self.segment = segment
+        if input == "operations":
+            message = (
+                f'operations carries the segment "{segment}": with an expiry, the operations '
+                "may carry no exp: or maxage: segment, since the server keeps the last of each"
+            )
+        else:
+            message = (
+                f'source begins with the segment "{segment}", which the server reads ahead of '
+                "the source: with an expiry, the source may not begin with an operation, exp:, "
+                "maxage: or preset: segment"
+            )
+        super().__init__(message)
+
+
+def _refuse_expiry_override(operations: str, source: str) -> None:
+    """With an expiry, refuse the operations or the source that would
+    decide the URL in its place (see `ExpiryOverrideError`)."""
+    for segment in operations.split("/"):
+        if segment.startswith(("exp:", "maxage:")):
+            raise ExpiryOverrideError("operations", segment)
+    first = source.split("/", 1)[0]
+    if _reads_before_source(first):
+        raise ExpiryOverrideError("source", first)
+
+
 def _validate_expires(expires: int) -> None:
     """The server accepts only an unsigned 64-bit integer
     (audit P-5)."""
@@ -607,15 +652,21 @@ def build_url(
     ``operations`` is the operation string verbatim (several
     ``/``-separated segments and ``preset:`` references
     included). ``expires`` is a unix-seconds expiry, emitted as
-    a leading ``exp:`` segment. A ``None`` secret produces the
-    literal ``unsafe`` signature segment, for servers running
-    with unsafe or presets-only configurations."""
+    a leading ``exp:`` segment. With one, the operations may carry
+    no ``exp:`` or ``maxage:`` segment, and the source may not begin
+    with a segment the server reads as an operation, ``exp:``,
+    ``maxage:`` or ``preset:``: the server keeps the last ``exp:``
+    of a URL, so either raises `ExpiryOverrideError`. A ``None``
+    secret produces the literal ``unsafe`` signature segment, for
+    servers running with unsafe or presets-only configurations."""
     remainder = ""
     if expires is not None:
         _validate_expires(expires)
         remainder += f"exp:{expires}/"
     _validate_url_text(operations, "operations")
     _validate_url_text(source, "source")
+    if expires is not None:
+        _refuse_expiry_override(operations, source)
     if operations:
         remainder += f"{operations}/"
     remainder += source
