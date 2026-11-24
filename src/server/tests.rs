@@ -10734,6 +10734,53 @@ async fn meta_reports_signer_names_as_one_bounded_line() {
 }
 
 #[tokio::test]
+async fn a_source_store_past_the_read_bounds_is_neither_summarized_nor_recorded() {
+    // A source whose store holds a compressed manifest: meta
+    // reports no source manifest, as for a store that does not
+    // parse, and the signed output's parent records no status.
+    // Without it, both read the store (its own manifest reads
+    // invalid, since the store moved).
+    let (without, with) = crate::provenance::test_sources_without_and_with_a_compressed_manifest(
+        &test_png(),
+        "image/png",
+    );
+    let base = spawn_app_with_signer().await;
+    for (name, source, read) in [("without", without, true), ("with", with, false)] {
+        let src = spawn_bytes_server(source).await;
+        let remainder = format!("40x24/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{name}");
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let prov = &meta["provenance"];
+        assert_eq!(prov["output"]["state"], "valid", "{name}: {prov}");
+        if read {
+            assert_eq!(prov["source"]["state"], "invalid", "{name}: {prov}");
+        } else {
+            assert!(prov["source"].is_null(), "{name}: {prov}");
+        }
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{name}");
+        let png = resp.bytes().await.unwrap();
+        let store: serde_json::Value =
+            serde_json::from_str(&crate::provenance::manifest_json(&png, "image/png")).unwrap();
+        let active = store["active_manifest"].as_str().unwrap();
+        let parent = &store["manifests"][active]["ingredients"][0];
+        assert_eq!(parent["relationship"], "parentOf", "{name}: {parent}");
+        assert_eq!(
+            parent.get("validation_results").is_some(),
+            read,
+            "{name}: {parent}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn signing_server_signs_image_responses() {
     let base = spawn_app_with_signer().await;
     let src = spawn_image_server().await;
