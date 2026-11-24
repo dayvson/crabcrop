@@ -719,8 +719,11 @@ impl LoopMark {
     /// ([`crate::url::loop_token`]), which every replica that
     /// shares the secret sends. During a rotation window the
     /// previous secret's token names the deployment too, so a
-    /// replica still on the outgoing secret and one already on
-    /// the incoming one refuse each other's fetches.
+    /// replica already on the incoming secret refuses the
+    /// fetches of one still on the outgoing secret. That one
+    /// does not know the incoming token, but its own fetch
+    /// forwards the incoming entry ahead of its own (see
+    /// [`LoopEntries`]), and the next hop refuses it.
     pub fn for_keyring(keyring: &crate::url::Keyring) -> Self {
         let mut tokens = vec![crate::url::loop_token(&keyring.current)];
         if let Some((_, previous)) = &keyring.previous {

@@ -1889,9 +1889,9 @@ async fn a_rotation_window_refuses_requests_marked_by_either_secret() {
     // The server marks its fetches with the current secret's
     // token, and refuses a request marked with the token of
     // either secret it verifies: while a rotation rolls out,
-    // a replica still on the outgoing secret and one already
-    // on the incoming one refuse each other's fetches. Once
-    // the window closes, the outgoing token is any other
+    // a replica already on the incoming secret refuses the
+    // fetches of one still on the outgoing secret. Once the
+    // window closes, the outgoing token is any other
     // deployment's.
     const NEW: &str = "the-incoming-signing-secret-0123";
     const OLD: &str = "the-outgoing-signing-secret-4567";
