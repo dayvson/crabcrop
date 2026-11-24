@@ -202,3 +202,31 @@ fn the_byte_limit_binds_only_past_four_bytes_a_pixel() {
         Some(2.0)
     );
 }
+
+#[test]
+fn a_scaled_overlay_part_past_the_byte_limit_is_refused() {
+    // `overlay(...,width)` scales the part that lands in the
+    // overlay's own layout before it becomes RGBA8: a 1x1 float
+    // overlay at the full width of a 5001x5001 base would scale
+    // a 5001x5001 part at 16 bytes a pixel. It is refused before
+    // the part is scaled, as a step's image is.
+    let base = DynamicImage::ImageLuma8(image::GrayImage::new(5001, 5001));
+    let overlay = crate::filters::WatermarkImage::new(DynamicImage::ImageRgba32F(
+        image::Rgba32FImage::from_pixel(1, 1, image::Rgba([0.8, 0.2, 0.2, 1.0])),
+    ));
+    let ctx = ProcessContext::default();
+    let err = match blend_overlay(
+        &ctx,
+        &base,
+        &overlay,
+        0,
+        0,
+        100,
+        crate::url::BlendMode::Normal,
+        Some(100),
+    ) {
+        Err(err) => err,
+        Ok(out) => panic!("composited {}x{}", out.width(), out.height()),
+    };
+    assert_eq!(err.to_string(), past_budget(5001, 5001, 16));
+}

@@ -205,3 +205,60 @@ fn every_step_past_the_byte_limit_is_refused_before_it_allocates() {
         );
     }
 }
+
+#[test]
+fn a_deep_overlay_is_held_like_an_eight_bit_one_or_refused() {
+    // `overlay(...,width)` scales the part of the overlay that
+    // lands on the image in the overlay's own layout, before it
+    // becomes RGBA8. A 2x1 overlay at the full width of a
+    // 10000x5000 image lands a 10000x5000 part: 200 MB as RGBA8,
+    // 800 MB as float, past the budget. Like a step's image, it
+    // is refused, or holds no more than 1.2 times what the 8-bit
+    // overlay holds.
+    use crabcrop::engine::ProcessContext;
+    use crabcrop::filters::{WatermarkImage, WatermarkImages};
+    let base = source(image::ColorType::Rgba8, image::ImageFormat::Png);
+    let url = "http://wm.example/o.png";
+    let render_with = |layout: image::ColorType, (w, h): (u32, u32)| {
+        let rgba = image::RgbaImage::from_pixel(2, 1, image::Rgba([200, 30, 30, 255]));
+        let img = match layout {
+            image::ColorType::Rgba8 => DynamicImage::ImageRgba8(rgba),
+            _ => DynamicImage::ImageRgba32F(DynamicImage::ImageRgba8(rgba).to_rgba32f()),
+        };
+        let mut overlays = WatermarkImages::new();
+        overlays.insert(url.to_string(), WatermarkImage::new(img));
+        let path = format!(
+            "/unsafe/{w}x{h}/filters:overlay(http%3A%2F%2Fwm.example%2Fo.png,0,0,100,normal,100):format(jpeg)/example.com/a.png"
+        );
+        let (_, _, request) = parse_request(&path).unwrap();
+        let ctx = ProcessContext {
+            watermarks: Some(&overlays),
+            ..Default::default()
+        };
+        peak(|| {
+            Engine
+                .process_preferred(&base, &request.operations, ctx)
+                .map(drop)
+        })
+    };
+    // Inside the budget, both render.
+    for layout in [image::ColorType::Rgba8, image::ColorType::Rgba32F] {
+        let (outcome, held) = render_with(layout, (4000, 2000));
+        eprintln!("4000x2000 with a {layout:?} overlay: held {held} bytes at most, {outcome:?}");
+        outcome.unwrap_or_else(|e| panic!("4000x2000, {layout:?}: {e}"));
+    }
+    // Past it, the 8-bit render is measured only when the float
+    // one is served: one refused needs no yardstick.
+    let (deep, deep_held) = render_with(image::ColorType::Rgba32F, (10000, 5000));
+    eprintln!("10000x5000 with a float overlay: held {deep_held} bytes at most, {deep:?}");
+    if refused_for_bytes(&deep) {
+        return;
+    }
+    deep.unwrap_or_else(|e| panic!("10000x5000, float: {e}"));
+    let (eight, eight_held) = render_with(image::ColorType::Rgba8, (10000, 5000));
+    eight.unwrap_or_else(|e| panic!("10000x5000, 8-bit: {e}"));
+    assert!(
+        deep_held as f64 <= 1.2 * eight_held as f64,
+        "10000x5000: the float overlay held {deep_held} bytes at most, the 8-bit one {eight_held}"
+    );
+}
