@@ -182,10 +182,11 @@ pub(in crate::server) async fn run_flight(
 /// and a copy enters it only once this policy has admitted
 /// the copy's sources (see [`lookup_tiers_within`]). The
 /// sources are part of the cache key, so every request for a
-/// key agrees. The checks resolve no host name: a hit costs
-/// no lookup, and a render stored from a name that now
-/// resolves to a non-public address serves until it is
-/// purged.
+/// key agrees. The checks resolve no host name and replay no
+/// redirect: a hit costs no lookup, and a render whose fetch
+/// went through a host the policy now refuses (a redirect
+/// target, a name that now resolves to a non-public address)
+/// serves until it is purged.
 fn stored_results_may_answer(state: &AppState, work: &MissWork) -> bool {
     std::iter::once(&work.source_url)
         .chain(&work.directives.watermark_urls)

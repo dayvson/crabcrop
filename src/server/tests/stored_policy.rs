@@ -400,3 +400,282 @@ async fn a_hit_on_a_named_source_looks_nothing_up() {
     assert_eq!(lookups.load(Ordering::SeqCst), 3);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
+
+/// A source on 127.0.0.1 whose `/r.png` answers with a redirect
+/// to the same server under the name `hop.test`, which serves
+/// the image at `/img.png`. Returns the source URL and how many
+/// requests the server took.
+async fn spawn_hopping_server() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let png = Arc::new(test_png());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let png = png.clone();
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.len() < 64 * 1024 {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let first = String::from_utf8_lossy(&seen)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if first.contains(" /r.png ") {
+                    let head = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://hop.test:{}/img.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        addr.port()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                } else {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        png.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&png).await;
+                }
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/r.png"), hits)
+}
+
+/// A purge of `remainder` on the server at `base`, which must
+/// remove something.
+async fn purge_render(base: &str, remainder: &str) {
+    let resp = client()
+        .post(format!(
+            "{base}/purge/{}/{remainder}",
+            crate::url::purge_signature(SECRET, remainder)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert_ne!(body, "purged 0\n", "the purge removed nothing");
+}
+
+#[tokio::test]
+async fn a_render_fetched_through_a_redirect_is_judged_by_the_url_it_names() {
+    // The checks a stored render passes read the URLs the
+    // request names: they replay no redirect. Here the source is
+    // on a listed host and redirects to `hop.test`, which the
+    // narrower policy drops. As with a name that now resolves to
+    // a non-public address (`a_hit_on_a_named_source_looks_nothing_up`),
+    // the stored render keeps serving, from the disk tier and from
+    // the bucket, until it is purged, as docs/configuration.md
+    // ("Changing the source policy") says. A render of the source
+    // that no tier holds is refused on its redirect hop.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (src, hits) = spawn_hopping_server().await;
+    let replica = |dir: Option<&std::path::Path>, listed: &[&str]| {
+        let loader = listing(listed).with_host_lookup(
+            |host| match host {
+                "hop.test" => Ok(vec!["127.0.0.1".parse().unwrap()]),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                )),
+            },
+            crate::loader::LOOKUP_SLOTS,
+            crate::loader::LOOKUP_WAIT,
+        );
+        Arc::new(AppState {
+            loader,
+            ..tier_test_state(dir, &fake.endpoint)
+        })
+    };
+    let (stored, unstored) = (format!("40x24/{src}"), format!("41x24/{src}"));
+    let dir = crate::test_support::scratch_dir("srv-policy-hop");
+    let wide = replica(Some(&dir), &["127.0.0.1", "hop.test"]);
+    let resp = get_signed(&serve_state(&wide).await, &stored).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the redirected render failed"
+    );
+    writes_settle(&wide).await;
+    assert_eq!(
+        entry_objects(&fake),
+        1,
+        "the render was not written through"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the source and its redirect"
+    );
+    // Restarted over the disk tier and the bucket with `hop.test`
+    // off the list, and a replica with the bucket alone: both
+    // serve the stored render, with no fetch.
+    let narrow = replica(Some(&dir), &["127.0.0.1"]);
+    let base = serve_state(&narrow).await;
+    let resp = get_signed(&base, &stored).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), DISK_HIT);
+    let bucket_only = replica(None, &["127.0.0.1"]);
+    let resp = get_signed(&serve_state(&bucket_only).await, &stored).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "a hit fetched the source");
+    // An unstored size of the same source is refused on its
+    // redirect hop, and so is the stored one once it is purged.
+    let refused = answer(&base, &unstored).await;
+    assert_eq!(refused.0, StatusCode::FORBIDDEN);
+    assert_eq!(refused.2, b"source refused by policy");
+    purge_render(&base, &stored).await;
+    assert_eq!(answer(&base, &stored).await, refused);
+}
+
+#[tokio::test]
+async fn concurrent_refusals_of_a_stored_render_share_flights_and_promote_nothing() {
+    // A burst of requests for a stored render whose host the
+    // policy dropped: each is refused as an unstored render is,
+    // through the key's flights, and none reads a tier, promotes
+    // the copy, or fetches the source.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (stored, unstored) = (format!("40x24/{src}"), format!("41x24/{src}"));
+    let dir = crate::test_support::scratch_dir("srv-policy-burst");
+    let wide = disk_state(&dir, listing(&["127.0.0.1"]));
+    let resp = get_signed(&serve_state(&wide).await, &stored).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let narrow = disk_state(&dir, listing(&["images.example.com"]));
+    let key = key_of(&stored);
+    let base = serve_state(&narrow).await;
+    let expected = answer(&base, &unstored).await;
+    let answers = futures_util::future::join_all((0..16).map(|_| answer(&base, &stored))).await;
+    for got in answers {
+        assert_eq!(got, expected);
+    }
+    assert!(
+        narrow.cache.get(&key).is_none(),
+        "a refusal promoted the render"
+    );
+    assert!(narrow.store.as_ref().unwrap().contains(&key));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a refusal fetched the source"
+    );
+}
+
+#[tokio::test]
+async fn a_sealed_request_for_a_stored_render_the_policy_refuses_gets_the_uniform_refusal() {
+    // The sealed spelling shares the plain one's entry. Once the
+    // host is dropped, it is answered as a sealed request for an
+    // unstored size is: the one uniform refusal.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let (stored, unstored) = (format!("40x24/{src}"), format!("41x24/{src}"));
+    let dir = crate::test_support::scratch_dir("srv-policy-sealed");
+    let wide = disk_state(&dir, listing(&["127.0.0.1"]));
+    let resp = get_signed(&serve_state(&wide).await, &stored).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let narrow = disk_state(&dir, listing(&["images.example.com"]));
+    let base = serve_state(&narrow).await;
+    let sealed = |remainder: &str| {
+        let url = format!(
+            "{base}/{}",
+            super::sealed_path(remainder, Some("photo.png"))
+        );
+        async move {
+            let resp = client().get(url).send().await.unwrap();
+            let headers =
+                ["content-type", "cache-control", "cache-status"].map(|name| header(&resp, name));
+            (resp.status(), headers, resp.bytes().await.unwrap().to_vec())
+        }
+    };
+    let refused = sealed(&stored).await;
+    assert_eq!(refused.0, StatusCode::FORBIDDEN, "{refused:?}");
+    assert_eq!(refused.2, b"bad signature");
+    assert_eq!(refused, sealed(&unstored).await);
+    assert!(narrow.cache.get(&key_of(&stored)).is_none());
+}
+
+#[tokio::test]
+async fn a_render_from_a_loopback_literal_in_another_spelling_is_refused_once_dropped() {
+    // The URL parser reads `2130706433` and `0x7f.1` as
+    // 127.0.0.1, for the text checks and for the load alike: a
+    // render stored from either spelling under a list naming
+    // 127.0.0.1 is refused once the list drops it.
+    let (src, _) = spawn_counting_server(200, "image/png", test_png()).await;
+    let port = src
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches("/src.png")
+        .to_string();
+    let mut served = Vec::new();
+    for host in ["2130706433", "0x7f.1", "127.000.000.001", "127.0.0.1."] {
+        let source = format!("http://{host}:{port}/src.png");
+        let (stored, unstored) = (format!("40x24/{source}"), format!("41x24/{source}"));
+        let dir = crate::test_support::scratch_dir("srv-policy-spelling");
+        let wide = disk_state(&dir, listing(&["127.0.0.1"]));
+        let resp = get_signed(&serve_state(&wide).await, &stored).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{host}");
+        let narrow = disk_state(&dir, listing(&["images.example.com"]));
+        assert!(narrow.store.as_ref().unwrap().contains(&key_of(&stored)));
+        let base = serve_state(&narrow).await;
+        let (status, headers, _) = answer(&base, &stored).await;
+        if status != StatusCode::FORBIDDEN {
+            served.push(format!("{host}: {status} {headers:?}"));
+            continue;
+        }
+        assert_refused_as_a_render(&base, &stored, &unstored).await;
+    }
+    assert!(served.is_empty(), "{served:#?}");
+}
+
+#[tokio::test]
+async fn a_stored_render_keeps_its_key_when_the_file_root_moves() {
+    // Outside what the checks read: a `file://` URL names a path
+    // under `CRABCROP_FILE_ROOT`, and moving the root re-keys
+    // nothing that is stored, as docs/configuration.md ("Changing
+    // the source policy") says. With the root moved down to a
+    // subdirectory, the stored render of a file the new root
+    // leaves out still serves, while an unstored size of the same
+    // URL reads the path under the new root, where no file is.
+    // Purged, the stored render answers as the unstored one does.
+    let files = crate::test_support::scratch_dir("srv-policy-root");
+    let root = std::fs::canonicalize(&files).unwrap();
+    std::fs::create_dir_all(root.join("private")).unwrap();
+    std::fs::create_dir_all(root.join("public")).unwrap();
+    std::fs::write(root.join("private/src.png"), test_png()).unwrap();
+    let rooted = |root: std::path::PathBuf| {
+        Loader::with_defaults().unwrap().with_sources(SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        })
+    };
+    let (stored, unstored) = (
+        "40x24/file:///private/src.png".to_string(),
+        "41x24/file:///private/src.png".to_string(),
+    );
+    let dir = crate::test_support::scratch_dir("srv-policy-root-tier");
+    let wide = disk_state(&dir, rooted(root.clone()));
+    let resp = get_signed(&serve_state(&wide).await, &stored).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let narrow = disk_state(&dir, rooted(root.join("public")));
+    let base = serve_state(&narrow).await;
+    let resp = get_signed(&base, &stored).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), DISK_HIT);
+    let missing = answer(&base, &unstored).await;
+    assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    purge_render(&base, &stored).await;
+    assert_eq!(answer(&base, &stored).await, missing);
+}

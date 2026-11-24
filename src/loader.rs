@@ -6036,4 +6036,368 @@ mod tests {
         assert_eq!(slow_load.await.unwrap(), Err(LoadError::Timeout));
         assert_eq!(budget.in_use(), 0, "every charge came back");
     }
+
+    /// A persistent origin on 127.0.0.1 that answers every
+    /// request with a small image and counts the connections it
+    /// took. Returns its port and the count.
+    async fn spawn_counting_origin() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(&ok_image_response()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// The source URLs the differential below runs: every kind
+    /// of source the loader dispatches on, in the spellings the
+    /// URL parser normalizes (case, percent-encoding, IDNA,
+    /// trailing dots, odd IPv4 forms, IPv6 embeddings), with
+    /// userinfo, ports, schemes, bucket names and file paths
+    /// the checks judge. `{p}` is the counting origin's port.
+    fn differential_corpus(port: u16) -> Vec<String> {
+        let raw = [
+            // Names, as listed and not.
+            "http://listed.test:{p}/x.png",
+            "https://listed.test:{p}/x.png",
+            "http://sub.listed.test:{p}/x.png",
+            "http://LISTED.TEST:{p}/x.png",
+            "http://Listed.Test:{p}/x.png",
+            "http://listed.test.:{p}/x.png",
+            "http://listed.test..:{p}/x.png",
+            "http://lis%74ed.test:{p}/x.png",
+            "http://listed%2etest:{p}/x.png",
+            "http://l\u{ed}sted.test:{p}/x.png",
+            "http://xn--lsted-8sa.test:{p}/x.png",
+            "http://\u{ff4c}isted.test:{p}/x.png",
+            "http://listed.test\u{3002}:{p}/x.png",
+            "http://other.test:{p}/x.png",
+            "http://unlisted.test:{p}/x.png",
+            "http://listed.test.other.test:{p}/x.png",
+            "http://internal.test:{p}/x.png",
+            "http://nowhere.test:{p}/x.png",
+            "http://listed.test/x.png",
+            // Userinfo.
+            "http://user@listed.test:{p}/x.png",
+            "http://user:pw@listed.test:{p}/x.png",
+            "http://:pw@listed.test:{p}/x.png",
+            "http://@listed.test:{p}/x.png",
+            "http://:@listed.test:{p}/x.png",
+            "http://us%40er@listed.test:{p}/x.png",
+            "http://listed.test:{p}@other.test:{p}/x.png",
+            "http://other.test:{p}#@listed.test/x.png",
+            "http://other.test:{p}?@listed.test/x.png",
+            "http://other.test:{p}\\@listed.test/x.png",
+            // Loopback, in the spellings that parse to it.
+            "http://127.0.0.1:{p}/x.png",
+            "http://127.1:{p}/x.png",
+            "http://127.0.1:{p}/x.png",
+            "http://2130706433:{p}/x.png",
+            "http://0x7f000001:{p}/x.png",
+            "http://0x7F.0.0.1:{p}/x.png",
+            "http://0177.0.0.1:{p}/x.png",
+            "http://0177.1:{p}/x.png",
+            "http://127.000.000.001:{p}/x.png",
+            "http://127.0.0.1.:{p}/x.png",
+            "http://127.0.0.2:{p}/x.png",
+            "http://[::1]:{p}/x.png",
+            "http://[0:0:0:0:0:0:0:1]:{p}/x.png",
+            "http://[::ffff:127.0.0.1]:{p}/x.png",
+            "http://[::ffff:7f00:1]:{p}/x.png",
+            "http://[::127.0.0.1]:{p}/x.png",
+            "http://0.0.0.0:{p}/x.png",
+            "http://0:{p}/x.png",
+            // Private and special literals, in odd spellings too.
+            "http://10.0.0.8:{p}/x.png",
+            "http://10.8:{p}/x.png",
+            "http://012.0.0.8:{p}/x.png",
+            "http://0xa000008:{p}/x.png",
+            "http://167772168:{p}/x.png",
+            "http://10.0.0.9:{p}/x.png",
+            "http://192.168.1.1:{p}/x.png",
+            "http://169.254.169.254:{p}/x.png",
+            "http://100.64.0.1:{p}/x.png",
+            "http://198.18.0.1:{p}/x.png",
+            "http://224.0.0.1:{p}/x.png",
+            "http://240.0.0.1:{p}/x.png",
+            "http://255.255.255.255:{p}/x.png",
+            "http://192.0.2.1:{p}/x.png",
+            "http://[::ffff:10.0.0.8]:{p}/x.png",
+            "http://[::ffff:a00:8]:{p}/x.png",
+            "http://[64:ff9b::a00:8]:{p}/x.png",
+            "http://[64:ff9b:1::1]:{p}/x.png",
+            "http://[2002:a00:8::1]:{p}/x.png",
+            "http://[2001:0:a00:8::1]:{p}/x.png",
+            "http://[2001:db8::1]:{p}/x.png",
+            "http://[fe80::1]:{p}/x.png",
+            "http://[fe80::1%25eth0]:{p}/x.png",
+            "http://[fc00::1]:{p}/x.png",
+            "http://[fec0::1]:{p}/x.png",
+            "http://[::]:{p}/x.png",
+            "http://[100::1]:{p}/x.png",
+            "http://1.2.3.4.5:{p}/x.png",
+            "http://256.0.0.1:{p}/x.png",
+            // Ports.
+            "http://listed.test:0/x.png",
+            "http://listed.test:65536/x.png",
+            "http://listed.test:-1/x.png",
+            "http://listed.test:05800/x.png",
+            // Schemes and shapes.
+            "HTTP://listed.test:{p}/x.png",
+            "HtTpS://listed.test:{p}/x.png",
+            "ftp://listed.test:{p}/x.png",
+            "ws://listed.test:{p}/x.png",
+            "data:image/png;base64,AAAA",
+            "javascript:alert(1)",
+            "blob:http://listed.test/x",
+            "http:/listed.test:{p}/x.png",
+            "http:listed.test:{p}/x.png",
+            "http:\\\\listed.test:{p}/x.png",
+            "//listed.test:{p}/x.png",
+            "listed.test:{p}/x.png",
+            " http://listed.test:{p}/x.png ",
+            "http://listed.test:{p}/x\u{0}.png",
+            "http://list\ted.test:{p}/x.png",
+            "http://listed.test:{p}/x.png#frag",
+            "http://[::1/x.png",
+            "http://",
+            "",
+            "not a url",
+            // Buckets.
+            "s3://bkt/x.png",
+            "s3://bkt/a/b/x.png",
+            "s3://bkt/a/../x.png",
+            "s3://bkt/./x.png",
+            "s3://bkt/..",
+            "s3://bkt/a/.",
+            "s3://bkt/%2e%2e/x.png",
+            "s3://bkt/a%2F..%2Fx.png",
+            "s3://bkt//x.png",
+            "s3://bkt/x.png?y=1",
+            "s3://bkt/x.png#y",
+            "s3://bkt",
+            "s3://bkt/",
+            "s3:///x.png",
+            "s3://Bkt/x.png",
+            "s3://BKT/x.png",
+            "S3://bkt/x.png",
+            "s3://my.bucket/x.png",
+            "s3://my..bucket/x.png",
+            "s3://my.-bucket/x.png",
+            "s3://-bkt/x.png",
+            "s3://bkt-/x.png",
+            "s3://ab/x.png",
+            "s3://1.2.3.4/x.png",
+            "s3://1.2.3.256/x.png",
+            "s3://bkt?x/y.png",
+            "s3://bkt#x/y.png",
+            "s3://bkt%2fx/y.png",
+            "s3://xn--bkt/x.png",
+            "s3://other/x.png",
+            "s3://user@bkt/x.png",
+            "gs://bkt/x.png",
+            "gs://other/x.png",
+            "gs://bkt/../x.png",
+            "GS://bkt/x.png",
+            // Files.
+            "file:///pic.jpg",
+            "file:///sub/inner.jpg",
+            "file:///nope.jpg",
+            "file:///sub/",
+            "file://localhost/pic.jpg",
+            "file://LOCALHOST/pic.jpg",
+            "file://127.0.0.1/pic.jpg",
+            "file://remote/pic.jpg",
+            "file://user@localhost/pic.jpg",
+            "file:///../secret.jpg",
+            "file:///sub/../pic.jpg",
+            "file:///sub/../../secret.jpg",
+            "file:///sub/..%2fpic.jpg",
+            "file:///sub/..%2F..%2Fsecret.jpg",
+            "file:///sub/%2e%2e/pic.jpg",
+            "file:///sub/%2E%2E%2F%2E%2E%2Fsecret.jpg",
+            "file:///%2e%2e%2fsecret.jpg",
+            "file:///sub\\..\\..\\secret.jpg",
+            "file:///sub%5c..%5c..%5csecret.jpg",
+            "file:///pic%00.jpg",
+            "file:///pic.jpg%00",
+            "file:///pic%2ejpg",
+            "file:////pic.jpg",
+            "file:///C:/pic.jpg",
+            "file:///out.jpg",
+            "file:pic.jpg",
+            "file:/pic.jpg",
+            "FILE:///pic.jpg",
+            "File:///pic.jpg",
+            "file:///pic.jpg?x",
+            "file:///pic.jpg#x",
+        ];
+        raw.iter()
+            .map(|u| u.replace("{p}", &port.to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_checks_and_loads_agree_over_a_corpus() {
+        // Issue #780: a stored render serves only when
+        // `check_source_text` admits its URLs. For each URL of
+        // the corpus, under each policy: when the text checks
+        // refuse it, a load refuses it with the same error and
+        // looks nothing up and connects nowhere; when they admit
+        // it, a load never refuses it with a policy refusal or an
+        // invalid source before it has looked a name up or
+        // connected (the only errors the text decides).
+        use std::sync::atomic::Ordering::SeqCst;
+        let (port, hits) = spawn_counting_origin().await;
+        let (base, root) = make_file_tree();
+        std::os::unix::fs::symlink(base.join("secret.jpg"), root.join("out.jpg")).unwrap();
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stores = |buckets: &[&str], files: bool| SourceConfig {
+            s3_endpoint: Some(format!("http://127.0.0.1:{port}")),
+            gcs_endpoint: format!("http://127.0.0.1:{port}"),
+            allowed_buckets: buckets.iter().map(|b| b.to_string()).collect(),
+            file_root: files.then(|| root.clone()),
+            ..Default::default()
+        };
+        let listed = || {
+            vec![
+                "listed.test".to_string(),
+                "127.0.0.1".to_string(),
+                "10.0.0.8".to_string(),
+                "[::1]".to_string(),
+            ]
+        };
+        let policies = [
+            (
+                "allowlist, listed hosts exempt",
+                SourcePolicy::new(listed(), true),
+                stores(&["bkt", "my.bucket"], true),
+                true,
+            ),
+            (
+                "allowlist, listed hosts checked",
+                SourcePolicy::new(listed(), true).with_allowlisted_checked(true),
+                stores(&["bkt"], true),
+                true,
+            ),
+            (
+                "allowlist, loopback private",
+                SourcePolicy::new(listed(), true).with_allowlisted_checked(true),
+                stores(&["bkt"], true),
+                false,
+            ),
+            (
+                "no allowlist, private check on",
+                SourcePolicy::new(Vec::new(), true),
+                stores(&["*"], true),
+                true,
+            ),
+            (
+                "no allowlist, private check on, loopback private",
+                SourcePolicy::new(Vec::new(), true),
+                stores(&["*"], false),
+                false,
+            ),
+            (
+                "no allowlist, private check off",
+                SourcePolicy::new(Vec::new(), false),
+                stores(&[], false),
+                true,
+            ),
+        ];
+        let corpus = differential_corpus(port);
+        let mut disagreements = Vec::new();
+        let mut judged = 0;
+        for (name, policy, sources, loopback_public) in policies {
+            let counter = lookups.clone();
+            let loader = Loader::new(DEFAULT_MAX_BYTES, Duration::from_millis(400))
+                .unwrap()
+                .with_policy(policy)
+                .with_sources(sources)
+                .with_host_lookup(
+                    move |host| {
+                        counter.fetch_add(1, SeqCst);
+                        let addrs: &[&str] = match host {
+                            "listed.test"
+                            | "sub.listed.test"
+                            | "other.test"
+                            | "unlisted.test"
+                            | "listed.test.other.test" => &["127.0.0.1"],
+                            "internal.test" => &["10.0.0.8"],
+                            _ => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "no such host",
+                                ));
+                            }
+                        };
+                        Ok(addrs.iter().map(|a| a.parse().unwrap()).collect())
+                    },
+                    LOOKUP_SLOTS,
+                    LOOKUP_WAIT,
+                );
+            let loader = if loopback_public {
+                loader.with_loopback_public()
+            } else {
+                loader
+            };
+            for url in &corpus {
+                judged += 1;
+                let text = loader.check_source_text(url);
+                let (looked, connected) = (lookups.load(SeqCst), hits.load(SeqCst));
+                let load = loader.load(url).await;
+                // A connection the origin took is counted by the
+                // time the load has its answer, unless the load
+                // failed first; give a late accept a moment.
+                tokio::task::yield_now().await;
+                let io = lookups.load(SeqCst) != looked || hits.load(SeqCst) != connected;
+                // One line per case, for the record of the run.
+                eprintln!(
+                    "differential\t{name}\t{url:?}\ttext={text:?}\tload={:?}\tio={io}",
+                    load.as_ref().map(|b| b.len())
+                );
+                match &text {
+                    Err(refused) => {
+                        if load.as_ref() != Err(refused) || io {
+                            disagreements.push(format!(
+                                "{name}: {url:?}: text {text:?}, load {load:?}, io {io}"
+                            ));
+                        }
+                    }
+                    Ok(()) => {
+                        if let Err(e) = &load
+                            && !io
+                            && matches!(e, LoadError::Forbidden(_) | LoadError::InvalidSource(_))
+                        {
+                            disagreements.push(format!(
+                                "{name}: {url:?}: text admits, load {load:?} with no lookup or connection"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(judged > 900, "{judged}");
+        assert!(
+            disagreements.is_empty(),
+            "{} disagreements:\n{}",
+            disagreements.len(),
+            disagreements.join("\n")
+        );
+    }
 }
