@@ -4556,6 +4556,16 @@ fn the_builders_expiry_check_reads_segments_as_this_parser_does() {
             || seg.starts_with("preset:")
             || parse_operation(seg).is_some()
     };
+    // A lone `x` is a size (0x0), and a segment that opens with `x`
+    // and has no `.` or `:` is a malformed size: both are read ahead
+    // of the source, so a source the builders refuse for opening
+    // with one (`x(_U=&d~1QC%` is the one a property test drew) is
+    // refused by the parser's own reading.
+    assert!(matches!(parse_operation("x"), Some(Ok(Operation::Size(_)))));
+    assert!(matches!(
+        parse_operation("x(_U=&d~1QC%"),
+        Some(Err(ParseError::InvalidSize(_)))
+    ));
     let mut segments: std::collections::BTreeSet<String> = one_walk_corpus()
         .iter()
         .flat_map(|rest| rest.split('/').map(str::to_string).collect::<Vec<_>>())
@@ -4563,6 +4573,7 @@ fn the_builders_expiry_check_reads_segments_as_this_parser_does() {
     segments.extend(
         [
             "x",
+            "x(_U=&d~1QC%",
             "xmas",
             "x.jpg",
             "-x",
