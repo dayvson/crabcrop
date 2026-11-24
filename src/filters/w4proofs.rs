@@ -99,8 +99,8 @@ fn w4_auto_levels_banded_matches_sequential() {
     for (w, h) in [(64u32, 48u32), (333, 257), (1200, 900)] {
         let rgb = photo(w, h).to_rgb8();
         assert_eq!(
-            auto_levels(rgb.clone()).as_raw(),
-            seq_auto_levels_reference(rgb).as_raw(),
+            map_rgb_frame(DynamicImage::ImageRgb8(rgb.clone()), FrameFilter::Enhance).as_bytes(),
+            seq_auto_levels_reference(rgb).as_raw().as_slice(),
             "auto_levels photo {w}x{h}"
         );
         let mut flat = image::RgbImage::new(w, h);
@@ -108,8 +108,8 @@ fn w4_auto_levels_banded_matches_sequential() {
             *p = image::Rgb([100, 110, 120]);
         }
         assert_eq!(
-            auto_levels(flat.clone()).as_raw(),
-            seq_auto_levels_reference(flat).as_raw(),
+            map_rgb_frame(DynamicImage::ImageRgb8(flat.clone()), FrameFilter::Enhance).as_bytes(),
+            seq_auto_levels_reference(flat).as_raw().as_slice(),
             "auto_levels flat {w}x{h}"
         );
     }

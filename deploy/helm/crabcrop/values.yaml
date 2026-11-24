@@ -134,6 +134,11 @@ resultStorage:
   sizeLimitMb: 512
   pvc:
     existingClaim: ""
+    # Each entry takes at least one block and one inode. A
+    # 1Gi ext4 volume has 65,536 inodes, which renders under
+    # 4 KiB, a block each, run out of before the budget
+    # fills; the tier then keeps to what the volume holds.
+    # Claim about three times the budget to keep all of it.
     size: 1Gi
     storageClass: ""
     accessMode: ReadWriteOnce

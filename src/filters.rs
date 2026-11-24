@@ -400,7 +400,9 @@ pub fn apply_filters_filled(
 /// answers [`DeadlinePassed`]; the image is dropped. Every
 /// arm of its match applies a filter or records a
 /// directive: a filter the engine applies itself is not a
-/// [`PlainFilter`], so none reaches it (issue #741).
+/// [`PlainFilter`], so none reaches it (issue #741). A
+/// filter whose arguments would hand the image on as it
+/// came is skipped (see `leaves_unchanged`).
 pub fn apply_filters_within(
     img: DynamicImage,
     filters: &[PlainFilter],
@@ -410,6 +412,9 @@ pub fn apply_filters_within(
     let mut img = img;
     let mut options = EncodeOptions::default();
     for filter in filters {
+        if skips(filter, &img) {
+            continue;
+        }
         match filter {
             PlainFilter::Grayscale => {
                 img = map_rgb_lanes(img, |r, g, b| {
@@ -425,7 +430,7 @@ pub fn apply_filters_within(
             PlainFilter::Blur(sigma) => img = blur_fast_within(&img, blur_sigma(*sigma), deadline)?,
             PlainFilter::Brighten(amount) => img = brighten_fast(img, *amount),
             PlainFilter::Contrast(amount) => {
-                img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
+                img = contrast(img, *amount);
             }
             PlainFilter::Gamma(gamma) => {
                 img = gamma_correct(img, *gamma);
@@ -442,13 +447,13 @@ pub fn apply_filters_within(
                 // boosted, the cross neighbors subtracted.
                 let a = sharpen_amount(*amount);
                 let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
-                img = map_rgb_image(img, |rgb| filter3x3_rgb(&rgb, &kernel));
+                img = map_rgb_frame(img, FrameFilter::Convolve(kernel));
             }
             PlainFilter::Saturation(amount) => {
-                img = map_rgb_image(img, |rgb| saturate(rgb, *amount));
+                img = saturate(img, *amount);
             }
             PlainFilter::Vibrance(amount) => {
-                img = map_rgb_image(img, |rgb| vibrance(rgb, *amount));
+                img = vibrance(img, *amount);
             }
             PlainFilter::Rgb(r, g, b) => {
                 img = map_rgb(img, |pr, pg, pb| {
@@ -469,10 +474,10 @@ pub fn apply_filters_within(
                 img = add_noise(&img, *amount);
             }
             PlainFilter::Equalize => {
-                img = map_rgb_image(img, equalize);
+                img = map_rgb_frame(img, FrameFilter::Equalize);
             }
             PlainFilter::Enhance => {
-                img = map_rgb_image(img, auto_levels);
+                img = map_rgb_frame(img, FrameFilter::Enhance);
             }
             PlainFilter::Rotate(degrees) => {
                 let normalized = fold_degrees(*degrees);
@@ -516,6 +521,78 @@ pub fn apply_filters_within(
         }
     }
     Ok((img, options))
+}
+
+/// Whether `filter` would hand `img` on as it came, byte for
+/// byte and in its own layout, so running it would change
+/// nothing (issue #810). A directive never does: it records
+/// something for the encoder.
+///
+/// - `brighten`, `gamma`, `exposure` and `contrast` map each
+///   channel through a 256-entry table, and a table that maps
+///   every value to itself changes no pixel. `brighten`
+///   applies its table to an 8-bit frame in the frame's own
+///   layout, so it skips on all four 8-bit layouts.
+/// - `saturation(1)`, `huerotate` by a whole number of turns
+///   and `rgb(0,0,0)` leave every pixel as it was: the first
+///   by its own arithmetic over the whole RGB cube, which the
+///   tests walk; the second because its matrix is then the
+///   identity exactly; the third because it adds zero.
+/// - `gamma`, `exposure`, `contrast`, `saturation` and `rgb`
+///   turn any other layout into RGB8 or RGBA8 as they run, so
+///   they skip only on those two, which they keep. `huerotate`
+///   skips only on those two as well.
+///
+/// `contrast(0)` still runs: its table drops some values a
+/// level (issue #815).
+fn leaves_unchanged(filter: &PlainFilter, img: &DynamicImage) -> bool {
+    let rgb = matches!(
+        img,
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_)
+    );
+    match *filter {
+        PlainFilter::Brighten(value) => {
+            let eight_bit = matches!(
+                img,
+                DynamicImage::ImageLuma8(_)
+                    | DynamicImage::ImageLumaA8(_)
+                    | DynamicImage::ImageRgb8(_)
+                    | DynamicImage::ImageRgba8(_)
+            );
+            eight_bit && is_identity(&brighten_lut(value))
+        }
+        PlainFilter::Gamma(gamma) => rgb && is_identity(&gamma_lut(gamma)),
+        PlainFilter::Exposure(stops) => rgb && is_identity(&exposure_lut(stops)),
+        PlainFilter::Contrast(amount) => rgb && is_identity(&contrast_lut(amount)),
+        PlainFilter::Saturation(amount) => rgb && amount == 1.0,
+        PlainFilter::HueRotate(degrees) => rgb && hue_degrees(degrees) == 0,
+        PlainFilter::Rgb(r, g, b) => rgb && (r, g, b) == (0, 0, 0),
+        _ => false,
+    }
+}
+
+/// Whether a channel table maps every value to itself.
+fn is_identity(lut: &[u8; 256]) -> bool {
+    lut.iter().enumerate().all(|(i, &v)| usize::from(v) == i)
+}
+
+/// Whether [`apply_filters_within`] skips `filter` on `img`:
+/// where it [`leaves_unchanged`] the image, unless a test has
+/// turned the skip off on this thread.
+fn skips(filter: &PlainFilter, img: &DynamicImage) -> bool {
+    #[cfg(test)]
+    if RUNS_SKIPPED.get() {
+        return false;
+    }
+    leaves_unchanged(filter, img)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`apply_filters_within`] run on this thread the
+    /// filters it would skip, so a test can see them change
+    /// nothing.
+    static RUNS_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The processing deadline passed while a filter ran (issues
@@ -861,21 +938,52 @@ fn lanes_block<const CH: usize>(
     }
 }
 
-fn map_rgb_image(
-    img: DynamicImage,
-    f: impl FnOnce(image::RgbImage) -> image::RgbImage,
-) -> DynamicImage {
-    if img.color().has_alpha() {
-        let mapped = f(img.to_rgb8());
-        let mut out = img.into_rgba8();
-        for (o, m) in out.pixels_mut().zip(mapped.pixels()) {
-            o[0] = m[0];
-            o[1] = m[1];
-            o[2] = m[2];
+/// A filter over the color channels of a frame that reads more
+/// of the frame than the pixel it writes: a 3x3 neighborhood,
+/// or the histogram of the whole frame.
+#[derive(Clone, Copy)]
+enum FrameFilter {
+    /// [`filter3x3`] with this kernel.
+    Convolve([f32; 9]),
+    /// [`equalize`].
+    Equalize,
+    /// [`auto_levels`].
+    Enhance,
+}
+
+impl FrameFilter {
+    /// The filter over the pixels of a `w` by `h` frame, `CH`
+    /// interleaved 8-bit channels each: RGB, or RGBA, whose alpha
+    /// comes back as it was.
+    fn run<const CH: usize>(self, pixels: Vec<u8>, (w, h): (usize, usize)) -> Vec<u8> {
+        match self {
+            FrameFilter::Convolve(kernel) => filter3x3::<CH>(&pixels, (w, h), &kernel),
+            FrameFilter::Equalize => equalize::<CH>(pixels, w * h),
+            FrameFilter::Enhance => auto_levels::<CH>(pixels, (w, h)),
         }
-        DynamicImage::ImageRgba8(out)
+    }
+}
+
+/// Run `filter` over the color channels of `img`, laid out as
+/// [`map_rgb`] lays them out: an image with alpha as RGBA8,
+/// filtered where its pixels lie with the alpha left as it is
+/// (issue #812), any other as RGB8. An image with alpha used to
+/// be filtered as an RGB8 copy, whose colors were then copied
+/// back into its RGBA8 form: the same colors, since both forms
+/// take each color channel from the image the same way.
+fn map_rgb_frame(img: DynamicImage, filter: FrameFilter) -> DynamicImage {
+    if img.color().has_alpha() {
+        let rgba = img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        let pixels = filter.run::<4>(rgba.into_raw(), (w as usize, h as usize));
+        DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(w, h, pixels).expect("the frame's size"),
+        )
     } else {
-        DynamicImage::ImageRgb8(f(img.into_rgb8()))
+        let rgb = img.into_rgb8();
+        let (w, h) = rgb.dimensions();
+        let pixels = filter.run::<3>(rgb.into_raw(), (w as usize, h as usize));
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, pixels).expect("the frame's size"))
     }
 }
 
@@ -1942,8 +2050,14 @@ pub(crate) fn huerotate_fast(img: DynamicImage, value: i32) -> DynamicImage {
 
 // ---------------- brighten ----------------
 
+/// The table `brighten` maps each channel through: the value
+/// added, clamped to 0 to 255.
+fn brighten_lut(value: i32) -> [u8; 256] {
+    std::array::from_fn(|b| (b as i32 + value).clamp(0, 255) as u8)
+}
+
 pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
-    let lut: [u8; 256] = std::array::from_fn(|b| (b as i32 + value).clamp(0, 255) as u8);
+    let lut = brighten_lut(value);
     fn apply<const CH: usize, const ALPHA: bool>(buf: &mut [u8], width: usize, lut: &[u8; 256]) {
         map_pixels_bands::<CH>(buf, width, &|p: &mut [u8; CH]| {
             let n = if ALPHA { CH - 1 } else { CH };
@@ -1977,15 +2091,16 @@ pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
     }
 }
 
-/// 3x3 convolution of an RGB image with the exact arithmetic
-/// of the image crate's `filter3x3` (same tap order, same
-/// inverse-sum scaling, same clamp and truncation), but over
-/// raw row slices instead of per-pixel trait calls, and with
-/// one deliberate divergence: the crate writes only interior
-/// pixels and leaves a zeroed border, so sharpening framed
-/// every output in black and turned an image under 3px on
-/// an axis entirely black (issue #378). Here the border
-/// pixels are computed with their taps clamped to the
+/// 3x3 convolution of the color channels of a `w` by `h`
+/// frame of `CH` interleaved 8-bit channels, RGB or RGBA, with
+/// the exact arithmetic of the image crate's `filter3x3` (same
+/// tap order, same inverse-sum scaling, same clamp and
+/// truncation), but over raw row slices instead of per-pixel
+/// trait calls, and with one deliberate divergence: the crate
+/// writes only interior pixels and leaves a zeroed border, so
+/// sharpening framed every output in black and turned an image
+/// under 3px on an axis entirely black (issue #378). Here the
+/// border pixels are computed with their taps clamped to the
 /// nearest edge pixel (edge replication, the same rule the
 /// `convolve` filter documents), and small images are
 /// computed whole. Zero-weight taps are skipped: every
@@ -1994,20 +2109,30 @@ pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
 ///
 /// The interior is summed a tap at a time over a whole row
 /// (issue #658), which hands every sample its taps in the
-/// order it always had them; see the comment there.
-fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let mut out = image::RgbImage::new(w as u32, h as u32);
+/// order it always had them; see the comment there. An RGBA
+/// frame is convolved where its pixels lie (issue #812), its
+/// alpha copied as it is: its rows are widened to their color
+/// samples alone, which are the rows of the RGB frame with
+/// the same colors, so every sum is the one that frame's is.
+fn filter3x3<const CH: usize>(src: &[u8], (w, h): (usize, usize), kernel: &[f32; 9]) -> Vec<u8> {
+    let src = &src[..w * h * CH];
+    // Every color sample is written below, so only an RGBA
+    // frame's output starts as its source, for the alpha.
+    let mut out = if CH == 4 {
+        src.to_vec()
+    } else {
+        vec![0u8; src.len()]
+    };
     if w == 0 || h == 0 {
         return out;
     }
-    let src = img.as_raw();
-    let dst: &mut [u8] = out.as_mut();
-    let stride = w * 3;
+    let dst: &mut [u8] = &mut out;
+    let stride = w * CH;
     let sum: f32 = kernel.iter().sum();
     let inverse_sum = if sum == 0.0 { 1.0 } else { 1.0 / sum };
-    // (row delta, byte offset of the tap column within its
-    // row relative to the pixel's own first byte, weight)
+    // (row delta, offset of the tap column's first color
+    // sample from the pixel's own in a row of color samples,
+    // weight)
     let taps: Vec<(usize, usize, f32)> = kernel
         .iter()
         .enumerate()
@@ -2025,14 +2150,22 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
         // `f32` multiplies and adds, so it is the same value;
         // and each pass is a loop over two slices, which the
         // compiler turns into vector code. The three source
-        // rows an output row reads are kept as `f32`, each
-        // converted once.
-        let span = stride - 6;
+        // rows an output row reads are kept as `f32` color
+        // samples, each converted once.
+        let colors = w * 3;
+        let span = colors - 6;
         let widen = |y: usize, row: &mut Vec<f32>| {
             row.clear();
-            row.extend(src[y * stride..(y + 1) * stride].iter().map(|&v| v as f32));
+            let line = &src[y * stride..(y + 1) * stride];
+            if CH == 3 {
+                row.extend(line.iter().map(|&v| v as f32));
+            } else {
+                for p in line.as_chunks::<CH>().0 {
+                    row.extend([p[0] as f32, p[1] as f32, p[2] as f32]);
+                }
+            }
         };
-        let mut rows: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(stride));
+        let mut rows: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(colors));
         for (y, row) in rows.iter_mut().enumerate() {
             widen(y, row);
         }
@@ -2048,9 +2181,18 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
                     *total += sample * k;
                 }
             }
-            let out_row = &mut dst[y * stride + 3..(y + 1) * stride - 3];
-            for (d, &total) in out_row.iter_mut().zip(&totals) {
-                *d = (total * inverse_sum).clamp(0.0, 255.0) as u8;
+            let out_row = &mut dst[y * stride + CH..(y + 1) * stride - CH];
+            if CH == 3 {
+                for (d, &total) in out_row.iter_mut().zip(&totals) {
+                    *d = (total * inverse_sum).clamp(0.0, 255.0) as u8;
+                }
+            } else {
+                let pixels = out_row.as_chunks_mut::<CH>().0;
+                for (p, t) in pixels.iter_mut().zip(totals.as_chunks::<3>().0) {
+                    for (sample, &total) in p.iter_mut().zip(t) {
+                        *sample = (total * inverse_sum).clamp(0.0, 255.0) as u8;
+                    }
+                }
             }
         }
     }
@@ -2062,12 +2204,12 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
         for &(rd, coff, k) in &taps {
             let sy = (y + rd).saturating_sub(1).min(h - 1);
             let sx = (x + coff / 3).saturating_sub(1).min(w - 1);
-            let b = sy * stride + sx * 3;
+            let b = sy * stride + sx * CH;
             t[0] += src[b] as f32 * k;
             t[1] += src[b + 1] as f32 * k;
             t[2] += src[b + 2] as f32 * k;
         }
-        let base = y * stride + x * 3;
+        let base = y * stride + x * CH;
         for c in 0..3 {
             dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
         }
@@ -2091,13 +2233,12 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
     out
 }
 
-/// Contrast through a 256-entry lookup table: the image
-/// crate's per-channel formula (scale about the midpoint by
-/// `((100 + amount) / 100)^2`, clamp, truncate) depends only
-/// on the input byte, so evaluating it once per byte value
-/// with the identical f32 arithmetic and then mapping bytes
-/// is byte-identical to evaluating it per pixel.
-fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
+/// The image crate's contrast formula for each byte value:
+/// scale about the midpoint by `((100 + amount) / 100)^2`,
+/// clamp, truncate. It depends only on the input byte, so a
+/// table of it, computed with the identical f32 arithmetic,
+/// maps bytes as the formula would one at a time.
+fn contrast_lut(amount: f32) -> [u8; 256] {
     let percent = ((100.0 + amount) / 100.0).powi(2);
     let mut lut = [0u8; 256];
     for (i, e) in lut.iter_mut().enumerate() {
@@ -2105,11 +2246,17 @@ fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
         let d = ((c / 255.0 - 0.5) * percent + 0.5) * 255.0;
         *e = d.clamp(0.0, 255.0) as u8;
     }
-    let w = img.width() as usize;
-    map_rgb_bands::<3>(img.as_mut(), w, &|r, g, b| {
+    lut
+}
+
+/// Contrast through [`contrast_lut`]: byte-identical to the
+/// crate's formula evaluated per pixel. An image with alpha is
+/// mapped where its pixels lie (issue #812).
+fn contrast(img: DynamicImage, amount: f32) -> DynamicImage {
+    let lut = contrast_lut(amount);
+    map_rgb(img, |r, g, b| {
         [lut[r as usize], lut[g as usize], lut[b as usize]]
-    });
-    img
+    })
 }
 
 /// The 256-entry lookup table for one gamma divisor: entry
@@ -3593,18 +3740,17 @@ pub(crate) fn trim_to(
 }
 
 /// Scale each pixel's distance from its luma by `amount`:
-/// 0 collapses to gray, 1 is the identity.
-fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
-    let w = out.width() as usize;
-    lanes_bands::<3>(out.as_mut(), w, &|r, g, b| {
+/// 0 collapses to gray, 1 is the identity. An image with alpha
+/// is mapped where its pixels lie (issue #812).
+fn saturate(img: DynamicImage, amount: f32) -> DynamicImage {
+    map_rgb_lanes(img, |r, g, b| {
         for i in 0..LANES {
             let luma = luma_of(r[i], g[i], b[i]);
             r[i] = (luma + (r[i] - luma) * amount).clamp(0.0, 255.0);
             g[i] = (luma + (g[i] - luma) * amount).clamp(0.0, 255.0);
             b[i] = (luma + (b[i] - luma) * amount).clamp(0.0, 255.0);
         }
-    });
-    out
+    })
 }
 
 /// Vibrance (issue #317): like [`saturate`], but the
@@ -3617,11 +3763,11 @@ fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
 /// scale. Negative percents run the same weighting in
 /// reverse, draining the muted colors first. The finish
 /// matches `saturate`: scale the distance from luma,
-/// clamp, truncate.
-fn vibrance(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
+/// clamp, truncate. An image with alpha is mapped where its
+/// pixels lie (issue #812).
+fn vibrance(img: DynamicImage, amount: f32) -> DynamicImage {
     let amount = percent_sanitized(amount);
-    let w = out.width() as usize;
-    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
+    map_rgb(img, |r, g, b| {
         let max = r.max(g).max(b) as f32;
         let min = r.min(g).min(b) as f32;
         let s = if max > 0.0 { (max - min) / max } else { 0.0 };
@@ -3632,8 +3778,7 @@ fn vibrance(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
             (luma + (g as f32 - luma) * factor).clamp(0.0, 255.0) as u8,
             (luma + (b as f32 - luma) * factor).clamp(0.0, 255.0) as u8,
         ]
-    });
-    out
+    })
 }
 
 /// The smallest percentile span [`auto_levels`] will
@@ -3671,23 +3816,24 @@ fn channel_percentile(hist: &[u64; 256], total: u64, num: u64, den: u64) -> u8 {
 /// which is what keeps the filter gentle next to
 /// [`equalize`] and its full redistribution. A channel
 /// whose percentile span is under
-/// [`AUTO_LEVELS_MIN_SPAN`] is left unmapped.
-fn auto_levels(img: image::RgbImage) -> image::RgbImage {
-    let total = (img.width() * img.height()) as u64;
+/// [`AUTO_LEVELS_MIN_SPAN`] is left unmapped. The pixels are a
+/// `w` by `h` frame's, `CH` interleaved channels each: RGB, or
+/// RGBA, whose alpha is left as it is.
+fn auto_levels<const CH: usize>(mut pixels: Vec<u8>, (w, h): (usize, usize)) -> Vec<u8> {
+    let total = (w * h) as u64;
     // Banded histogram: per-band local counts merged by integer
     // addition, which is order-independent, so the merged counts
     // are exactly the sequential pass's counts. Small frames count
     // sequentially over the raw buffer.
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let raw = img.as_raw();
-    let row = w * 3;
+    let row = w * CH;
+    let raw = &pixels[..row * h];
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .min(4);
     let hists: [[u64; 256]; 3] = if threads < 2 || h < 256 || raw.len() < 3_000_000 {
         let mut hists = [[0u64; 256]; 3];
-        for p in raw.as_chunks::<3>().0 {
+        for p in raw.as_chunks::<CH>().0 {
             hists[0][p[0] as usize] += 1;
             hists[1][p[1] as usize] += 1;
             hists[2][p[2] as usize] += 1;
@@ -3701,7 +3847,7 @@ fn auto_levels(img: image::RgbImage) -> image::RgbImage {
                 .map(|band| {
                     s.spawn(move || {
                         let mut hists = [[0u64; 256]; 3];
-                        for p in band.as_chunks::<3>().0 {
+                        for p in band.as_chunks::<CH>().0 {
                             hists[0][p[0] as usize] += 1;
                             hists[1][p[1] as usize] += 1;
                             hists[2][p[2] as usize] += 1;
@@ -3741,26 +3887,26 @@ fn auto_levels(img: image::RgbImage) -> image::RgbImage {
             } as u8;
         }
     }
-    let mut out = img;
-    let w = out.width() as usize;
-    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
+    map_rgb_bands::<CH>(&mut pixels[..row * h], w, &|r, g, b| {
         [
             maps[0][usize::from(r)],
             maps[1][usize::from(g)],
             maps[2][usize::from(b)],
         ]
     });
-    out
+    pixels
 }
 
-/// Histogram equalization, independently per channel.
-fn equalize(img: image::RgbImage) -> image::RgbImage {
-    let total = (img.width() * img.height()) as u64;
+/// Histogram equalization, independently per channel, of the
+/// first `count` pixels in `pixels`, `CH` interleaved channels
+/// each: RGB, or RGBA, whose alpha is left as it is.
+fn equalize<const CH: usize>(mut pixels: Vec<u8>, count: usize) -> Vec<u8> {
+    let total = count as u64;
     let mut maps: [[u8; 256]; 3] = [[0; 256]; 3];
     // One pass for all three channel histograms (the counts
     // are the same three passes would produce).
     let mut hists = [[0u64; 256]; 3];
-    for p in img.pixels() {
+    for p in pixels[..count * CH].as_chunks::<CH>().0 {
         hists[0][p[0] as usize] += 1;
         hists[1][p[1] as usize] += 1;
         hists[2][p[2] as usize] += 1;
@@ -3785,13 +3931,12 @@ fn equalize(img: image::RgbImage) -> image::RgbImage {
             };
         }
     }
-    let mut out = img;
-    for p in out.pixels_mut() {
-        for c in 0..3 {
-            p[c] = maps[c][p[c] as usize];
+    for p in pixels[..count * CH].as_chunks_mut::<CH>().0 {
+        for (sample, map) in p.iter_mut().zip(&maps) {
+            *sample = map[*sample as usize];
         }
     }
-    out
+    pixels
 }
 
 #[cfg(test)]

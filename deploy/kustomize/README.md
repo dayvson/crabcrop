@@ -74,6 +74,14 @@ kubectl create secret generic crabcrop \
     fresh claim mounts root-owned: the base's `fsGroup`
     is what makes it writable, so keep it if you replace
     the base's pod `securityContext`.
+    Each entry takes at least one block and one inode, and
+    the 1Gi claim, ext4 by default on most storage classes,
+    has 65,536 inodes: renders under 4 KiB, a block each,
+    run out of them before the 512 MB budget fills, and the
+    tier then keeps to what the volume holds (see
+    [the cache tiers](../../docs/deployment.md#the-cache-tiers-and-what-replicas-change)).
+    For small renders, patch the claim to about three times
+    the budget.
   - `ai`: the AI variant image (`Dockerfile.ai`) and a
     models volume referencing a claim named
     `crabcrop-models` that you provide, holding the ONNX

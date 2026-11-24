@@ -50,16 +50,17 @@ pub(in crate::engine) use decode::{
 mod resize;
 #[cfg(test)]
 pub(in crate::engine) use resize::{
-    CONVOLVE_REFUSES, ChangingRows, SourceWindow, apply_fit_in, apply_pad, apply_size,
-    apply_size_windowed, fit_in_box, place_on, resize_lanczos3, resize_lanczos3_cropped,
-    resize_lanczos3_cut, resize_lanczos3_lent, resize_lanczos3_owned, view_holds_no_more,
+    CONVOLVE_REFUSES, ChangingRows, PREMULTIPLIED, SourceWindow, apply_fit_in, apply_pad,
+    apply_size, apply_size_windowed, fit_in_box, kernel_span, place_on, resize_lanczos3,
+    resize_lanczos3_cropped, resize_lanczos3_cropped_owned, resize_lanczos3_cut,
+    resize_lanczos3_lent, resize_lanczos3_owned, view_holds_no_more,
 };
 pub(in crate::engine) use resize::{SizeCap, resize_target};
 pub(crate) use resize::{cap_dimensions, has_zero_side};
 mod overlay;
 #[cfg(test)]
 pub(in crate::engine) use overlay::{
-    blend_channel, blend_overlay, composite, landing, lands_on, overlay_watermark,
+    blend_channel, blend_over, blend_overlay, composite, landing, lands_on, overlay_watermark,
 };
 pub(in crate::engine) use overlay::{flatten, flattened_for};
 mod detect;
@@ -1381,6 +1382,7 @@ type Window = (u32, u32, u32, u32);
 mod encode;
 mod jpeg_scaled;
 mod overlay_scale;
+pub(crate) use overlay_scale::scaled_part;
 mod webp_anim;
 pub use encode::AvifTiles;
 pub(in crate::engine) use encode::{

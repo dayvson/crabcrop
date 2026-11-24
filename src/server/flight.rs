@@ -87,14 +87,17 @@ fn meta_flight_key(work: &MissWork) -> String {
 /// it.
 ///
 /// Each pass of the loop reads the tiers ([`answer_hit`]),
-/// takes what the flight it followed left for it
-/// ([`Following::take_shared`], [`answer_shared`]), and
-/// then leads the key's flight ([`lead_flight`]) or follows
-/// it ([`Following::wait`]). The loop stays in this function
-/// and the misses are awaited here: an async function holds
-/// its arguments for as long as it runs, so a stage of its
-/// own that takes the work would hold a second copy of it
-/// in every request's future.
+/// the disk and shared ones only while the source policy
+/// admits the request's sources (see
+/// [`stored_results_may_answer`]), takes what the flight it
+/// followed left for it ([`Following::take_shared`],
+/// [`answer_shared`]), and then leads the key's flight
+/// ([`lead_flight`]) or follows it ([`Following::wait`]).
+/// The loop stays in this function and the misses are
+/// awaited here: an async function holds its arguments for
+/// as long as it runs, so a stage of its own that takes the
+/// work would hold a second copy of it in every request's
+/// future.
 pub(in crate::server) async fn run_flight(
     state: &Arc<AppState>,
     path: &str,
@@ -126,12 +129,17 @@ pub(in crate::server) async fn run_flight(
     // One disk budget for every tier check this request makes
     // (issue #572).
     let mut budget = DiskBudget::new();
+    // The policy's verdict on the request's sources, taken the
+    // first time a lookup misses memory (issue #780).
+    let mut admitted = None;
     loop {
         // The key and the groups are read where they are
         // until the miss path takes the work.
         let (cache_key, groups) = (work.cache_key.as_str(), work.groups.as_slice());
+        let slower_tiers_admitted =
+            || *admitted.get_or_insert_with(|| stored_results_may_answer(state, &work));
         if let Some((hit, cache_status)) =
-            lookup_tiers_within(state, cache_key, groups, &mut budget).await
+            lookup_tiers_within(state, cache_key, groups, &mut budget, slower_tiers_admitted).await
         {
             return answer_hit(state, &work, hit, cache_status, if_none_match, record);
         }
@@ -155,6 +163,37 @@ pub(in crate::server) async fn run_flight(
             }
         }
     }
+}
+
+/// Whether a copy in the disk or the shared tier may answer
+/// `work` (issue #780): whether the source policy admits its
+/// source and every watermark it names, by the checks their
+/// text decides on its own
+/// ([`crate::loader::Loader::check_source_text`]).
+///
+/// A render is stored under the policy it was made under,
+/// and the policy is part of no cache key, so a narrowed
+/// policy (a host or a bucket dropped from its list, the
+/// private-address check applied to listed hosts, file
+/// sources turned off) would leave every render those tiers
+/// hold of a source it now refuses serving, from the bucket
+/// on every replica, until it was purged or evicted. A
+/// request it refuses reads neither, so it learns no group
+/// and promotes no copy, and takes the miss path, whose
+/// loads refuse it with the answer they always gave. Memory
+/// holds no copy of such a source: it is this server's own,
+/// and a copy enters it only once this policy has admitted
+/// the copy's sources (see [`lookup_tiers_within`]). The
+/// sources are part of the cache key, so every request for a
+/// key agrees. The checks resolve no host name and replay no
+/// redirect: a hit costs no lookup, and a render whose fetch
+/// went through a host the policy now refuses (a redirect
+/// target, a name that now resolves to a non-public address)
+/// serves until it is purged.
+fn stored_results_may_answer(state: &AppState, work: &MissWork) -> bool {
+    std::iter::once(&work.source_url)
+        .chain(&work.directives.watermark_urls)
+        .all(|url| state.loader.check_source_text(url).is_ok())
 }
 
 /// What makes two image requests for one key identical for

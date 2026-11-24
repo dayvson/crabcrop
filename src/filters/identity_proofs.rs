@@ -55,6 +55,14 @@ pub(crate) fn old_convolve(img: &DynamicImage, kernel: &[f64], normalize: bool) 
     }
 }
 
+/// [`filter3x3`] over an RGB8 image: the form these proofs and
+/// the vector proofs compare.
+pub(crate) fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
+    let (w, h) = img.dimensions();
+    let out = filter3x3::<3>(img.as_raw(), (w as usize, h as usize), kernel);
+    image::RgbImage::from_raw(w, h, out).expect("the image's size")
+}
+
 #[test]
 fn filter3x3_rgb_matches_image_crate_in_the_interior_and_replicates_edges() {
     // Interior pixels match the image crate byte for
@@ -158,8 +166,304 @@ fn convolve_matches_old_implementation() {
 fn contrast_lut_matches_image_crate() {
     for amount in [-100.0f32, -25.0, 0.0, 10.0, 25.0, 100.0] {
         let rgb = rand_rgb(64, 48, 7);
-        let mine = contrast_in_place(rgb.clone(), amount);
+        let mine = contrast(DynamicImage::ImageRgb8(rgb.clone()), amount);
         let theirs = image::imageops::contrast(&rgb, amount);
-        assert_eq!(mine.as_raw(), theirs.as_raw(), "amount {amount}");
+        assert_eq!(
+            mine.as_bytes(),
+            theirs.as_raw().as_slice(),
+            "amount {amount}"
+        );
+    }
+}
+
+/// Every color an 8-bit RGB pixel holds, once each: a 4096 by
+/// 4096 frame.
+fn rgb_cube() -> image::RgbImage {
+    image::RgbImage::from_fn(4096, 4096, |x, y| {
+        let i = y * 4096 + x;
+        image::Rgb([(i >> 16) as u8, (i >> 8) as u8, i as u8])
+    })
+}
+
+/// Makes the filters run on this thread where they would be
+/// skipped, until dropped.
+struct RunsSkipped;
+
+impl RunsSkipped {
+    fn new() -> Self {
+        RUNS_SKIPPED.set(true);
+        RunsSkipped
+    }
+}
+
+impl Drop for RunsSkipped {
+    fn drop(&mut self) {
+        RUNS_SKIPPED.set(false);
+    }
+}
+
+#[test]
+fn the_arguments_skipped_change_no_pixel() {
+    // Issue #810: each filter skipped for its arguments, run
+    // anyway, hands every color back as it was: 16.7 million,
+    // the whole RGB cube.
+    use PlainFilter as F;
+    let cube = DynamicImage::ImageRgb8(rgb_cube());
+    let _runs = RunsSkipped::new();
+    for filter in [
+        F::Saturation(1.0),
+        F::HueRotate(0),
+        F::HueRotate(720),
+        F::Rgb(0, 0, 0),
+        F::Brighten(0),
+        F::Gamma(1.0),
+        F::Exposure(0.0),
+    ] {
+        assert!(leaves_unchanged(&filter, &cube), "{filter:?}");
+        let (out, _) = apply_filters(cube.clone(), std::slice::from_ref(&filter));
+        assert!(
+            out.as_bytes() == cube.as_bytes(),
+            "{filter:?} moved a color"
+        );
+    }
+    // A whole number of turns reduces to no angle, whose matrix
+    // is the identity exactly; the tables map every value, the
+    // whole of what a table holds, to itself.
+    for turns in (i32::MIN / 360)..=(i32::MAX / 360) {
+        assert_eq!(hue_degrees(turns * 360), 0, "{turns} turns");
+    }
+    assert_eq!(hue_matrix(0), [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    assert!(is_identity(&brighten_lut(0)));
+    assert!(is_identity(&gamma_lut(1.0)));
+    assert!(is_identity(&exposure_lut(0.0)));
+    assert!(is_identity(&exposure_lut(-0.0)));
+    // Any other brightness moves an end of the range.
+    for value in (-255..=255).filter(|&v| v != 0) {
+        assert!(!is_identity(&brighten_lut(value)), "brighten({value})");
+    }
+}
+
+/// Small frames in the layouts a filter can receive, the ones
+/// with alpha under every alpha level.
+fn filter_layouts() -> Vec<(&'static str, DynamicImage)> {
+    let rgb = DynamicImage::ImageRgb8(rand_rgb(31, 9, 810));
+    let mut rgba = rgb.to_rgba8();
+    for (i, p) in rgba.pixels_mut().enumerate() {
+        p[3] = (i * 37 % 256) as u8;
+    }
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    vec![
+        ("luma8", DynamicImage::ImageLuma8(rgb.to_luma8())),
+        ("lumaa8", DynamicImage::ImageLumaA8(rgba.to_luma_alpha8())),
+        ("rgb16", DynamicImage::ImageRgb16(rgb.to_rgb16())),
+        ("rgba16", DynamicImage::ImageRgba16(rgba.to_rgba16())),
+        ("rgb32f", DynamicImage::ImageRgb32F(rgb.to_rgb32f())),
+        ("rgb8", rgb),
+        ("rgba8", rgba),
+    ]
+}
+
+#[test]
+fn identity_arguments_skip_only_on_the_layouts_they_keep() {
+    // Issue #810: which filters `leaves_unchanged` skips, and on
+    // which layouts. Where one is skipped, running it anyway
+    // hands the frame back as it came, layout and bytes, alpha
+    // included. At any other argument, and on a layout the
+    // filter turns into RGB8 or RGBA8 as it runs, it runs.
+    use PlainFilter as F;
+    let eight_bit = ["luma8", "lumaa8", "rgb8", "rgba8"].as_slice();
+    let rgb = ["rgb8", "rgba8"].as_slice();
+    let cases: [(PlainFilter, &[&str]); 17] = [
+        (F::Brighten(0), eight_bit),
+        (F::Gamma(1.0), rgb),
+        (F::Exposure(0.0), rgb),
+        (F::Saturation(1.0), rgb),
+        (F::HueRotate(0), rgb),
+        (F::HueRotate(-720), rgb),
+        (F::Rgb(0, 0, 0), rgb),
+        (F::Brighten(1), &[]),
+        (F::Gamma(1.5), &[]),
+        (F::Exposure(0.5), &[]),
+        (F::Saturation(1.5), &[]),
+        (F::HueRotate(90), &[]),
+        (F::Rgb(0, 0, 1), &[]),
+        (F::Contrast(0.0), &[]),
+        (F::Contrast(25.0), &[]),
+        (F::Fill([1, 2, 3]), &[]),
+        (F::NoUpscale, &[]),
+    ];
+    let mut skipped = 0;
+    for (filter, skips_on) in &cases {
+        for (name, img) in filter_layouts() {
+            let skips = leaves_unchanged(filter, &img);
+            assert_eq!(skips, skips_on.contains(&name), "{filter:?} on {name}");
+            if skips {
+                let _runs = RunsSkipped::new();
+                let (out, _) = apply_filters(img.clone(), std::slice::from_ref(filter));
+                assert_eq!(out.color(), img.color(), "{filter:?} on {name}");
+                assert!(out.as_bytes() == img.as_bytes(), "{filter:?} on {name}");
+                skipped += 1;
+            }
+        }
+    }
+    assert_eq!(skipped, 4 + 6 * 2);
+    // On another layout the skip would not be exact: gray comes
+    // back from `gamma(1)` and the others as RGB8.
+    let gray = DynamicImage::ImageLuma8(DynamicImage::ImageRgb8(rand_rgb(9, 7, 815)).to_luma8());
+    for filter in [
+        F::Gamma(1.0),
+        F::Exposure(0.0),
+        F::Saturation(1.0),
+        F::Rgb(0, 0, 0),
+    ] {
+        let (out, _) = apply_filters(gray.clone(), std::slice::from_ref(&filter));
+        assert_eq!(out.color(), image::ColorType::Rgb8, "{filter:?}");
+    }
+}
+
+#[test]
+fn contrast_zero_still_runs_since_its_table_drops_levels() {
+    // Issue #815: `contrast(0)`'s table maps 1 to 63 one level
+    // down and every other value to itself, so `contrast(0)`
+    // changes pixels and is not skipped. Skipping it, or making
+    // its table the identity, would move rendered bytes.
+    let lut = contrast_lut(0.0);
+    let moved: Vec<usize> = (0..256).filter(|&i| usize::from(lut[i]) != i).collect();
+    assert_eq!(moved, (1..=63).collect::<Vec<_>>());
+    assert!(moved.iter().all(|&i| usize::from(lut[i]) == i - 1));
+    let ramp = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 1, |x, _| {
+        image::Rgb([x as u8; 3])
+    }));
+    assert!(!leaves_unchanged(&PlainFilter::Contrast(0.0), &ramp));
+    let (out, _) = apply_filters(ramp.clone(), &[PlainFilter::Contrast(0.0)]);
+    assert_ne!(out.as_bytes(), ramp.as_bytes());
+    assert_eq!(out.as_bytes()[3 * 63], 62);
+}
+
+/// What a filter over RGB8 made of an image before issue #812:
+/// `map_rgb_image` ran it on an RGB8 copy of an image with alpha
+/// and copied the colors into the image's RGBA8 form, one pixel
+/// at a time; an image without alpha it ran on as RGB8.
+fn map_rgb_image_as_it_was(
+    img: DynamicImage,
+    f: impl FnOnce(image::RgbImage) -> image::RgbImage,
+) -> DynamicImage {
+    if img.color().has_alpha() {
+        let mapped = f(img.to_rgb8());
+        let mut out = img.into_rgba8();
+        for (o, m) in out.pixels_mut().zip(mapped.pixels()) {
+            o[0] = m[0];
+            o[1] = m[1];
+            o[2] = m[2];
+        }
+        DynamicImage::ImageRgba8(out)
+    } else {
+        DynamicImage::ImageRgb8(f(img.into_rgb8()))
+    }
+}
+
+/// The layouts an RGB filter can be handed, at `w` by `h`:
+/// RGBA8 opaque, translucent at every level, clear over colors,
+/// and a GIF frame's opaque or clear black pixels; the other
+/// layouts with alpha, translucent, their samples off the 8-bit
+/// grid; and two layouts without alpha.
+fn alpha_layouts(w: u32, h: u32) -> Vec<(&'static str, DynamicImage)> {
+    let rgb = DynamicImage::ImageRgb8(rand_rgb(w, h, 812 + u64::from(w)));
+    let plane = |alpha: &dyn Fn(usize) -> u8, gif: bool| {
+        let mut rgba = rgb.to_rgba8();
+        for (i, p) in rgba.pixels_mut().enumerate() {
+            p[3] = alpha(i);
+            if gif && p[3] == 0 {
+                p.0 = [0, 0, 0, 0];
+            }
+        }
+        DynamicImage::ImageRgba8(rgba)
+    };
+    let translucent = plane(&|i| (i * 37 % 256) as u8, false);
+    let mut rgba16 = translucent.to_rgba16();
+    for (i, s) in rgba16.iter_mut().enumerate() {
+        *s = s.saturating_add((i * 29 % 200) as u16);
+    }
+    let mut rgba32f = translucent.to_rgba32f();
+    for (i, s) in rgba32f.iter_mut().enumerate() {
+        *s = (*s + (i % 7) as f32 / 1000.0).min(1.0);
+    }
+    vec![
+        ("rgba8 opaque", plane(&|_| 255, false)),
+        ("rgba8 clear", plane(&|_| 0, false)),
+        (
+            "rgba8 gif",
+            plane(&|i| if i % 3 == 0 { 0 } else { 255 }, true),
+        ),
+        (
+            "lumaa8",
+            DynamicImage::ImageLumaA8(translucent.to_luma_alpha8()),
+        ),
+        (
+            "lumaa16",
+            DynamicImage::ImageLumaA16(translucent.to_luma_alpha16()),
+        ),
+        ("rgba16", DynamicImage::ImageRgba16(rgba16)),
+        ("rgba32f", DynamicImage::ImageRgba32F(rgba32f)),
+        ("luma8", DynamicImage::ImageLuma8(rgb.to_luma8())),
+        ("rgba8 translucent", translucent),
+        ("rgb8", rgb),
+    ]
+}
+
+#[test]
+fn the_rgb_filters_keep_the_bytes_of_the_rgb_copy_they_ran_on() {
+    // Issue #812: contrast, sharpen, saturation, vibrance,
+    // equalize and enhance filter an image with alpha where its
+    // pixels lie, as RGBA8, with no RGB8 copy out and back.
+    // Every layout, RGBA8 under each alpha plane, at sizes with
+    // no interior for sharpen and odd ones, and a frame past the
+    // banding thresholds: the bytes the RGB copy gave, alpha as
+    // the RGBA8 form had it.
+    use PlainFilter as F;
+    let filters = [
+        F::Contrast(20.0),
+        F::Contrast(-50.0),
+        F::Sharpen(1.5),
+        F::Saturation(0.5),
+        F::Saturation(1.7),
+        F::Vibrance(40.0),
+        F::Vibrance(-60.0),
+        F::Equalize,
+        F::Enhance,
+    ];
+    let check = |name: &str, img: &DynamicImage, filter: &PlainFilter| {
+        let (ours, _) = apply_filters(img.clone(), std::slice::from_ref(filter));
+        let theirs = map_rgb_image_as_it_was(img.clone(), |rgb| {
+            let (rgb, _) =
+                apply_filters(DynamicImage::ImageRgb8(rgb), std::slice::from_ref(filter));
+            rgb.into_rgb8()
+        });
+        assert_eq!(ours.color(), theirs.color(), "{filter:?} on {name}");
+        assert_eq!(
+            (ours.width(), ours.height()),
+            (theirs.width(), theirs.height())
+        );
+        assert!(ours.as_bytes() == theirs.as_bytes(), "{filter:?} on {name}");
+    };
+    let mut cases = 0;
+    for (w, h) in [(1, 1), (2, 5), (3, 3), (17, 9), (64, 48)] {
+        for (name, img) in alpha_layouts(w, h) {
+            for filter in &filters {
+                check(&format!("{name} {w}x{h}"), &img, filter);
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 5 * 10 * 9);
+    // Past 3,000,000 samples and 256 rows the maps and the
+    // histogram run in bands, on the RGBA8 frame as on its copy.
+    let big = alpha_layouts(1003, 1001)
+        .into_iter()
+        .find(|(name, _)| *name == "rgba8 translucent")
+        .unwrap()
+        .1;
+    for filter in [F::Contrast(20.0), F::Saturation(1.7), F::Enhance] {
+        check("rgba8 translucent 1003x1001", &big, &filter);
     }
 }

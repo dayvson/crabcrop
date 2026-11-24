@@ -2,7 +2,9 @@
 //! dominant color and a tiny blurred preview, computed from the
 //! final pixels so both match the requested operations exactly.
 
-use image::{DynamicImage, codecs::jpeg::JpegEncoder, imageops::FilterType};
+use image::{DynamicImage, codecs::jpeg::JpegEncoder};
+
+use crate::ai::resample::{self, Kernel};
 
 /// Placeholder data attached to a processed image when the
 /// request asked for it.
@@ -21,7 +23,10 @@ pub struct Placeholder {
     pub thumbhash: String,
 }
 
-/// Compute the placeholder for a processed image.
+/// Compute the placeholder for a processed image. Its three
+/// resizes are the image crate's Triangle resizes, computed
+/// over rows (issue #811, see `crate::ai::resample`): the
+/// same bytes.
 pub fn compute(img: &DynamicImage) -> Placeholder {
     Placeholder {
         dominant_color: dominant_color(img),
@@ -39,7 +44,7 @@ pub fn compute(img: &DynamicImage) -> Placeholder {
 /// transparent image has no prominent colors and reports
 /// just its (RGB) dominant color.
 fn palette(img: &DynamicImage) -> Vec<String> {
-    let small = img.resize(100, 100, FilterType::Triangle).to_rgba8();
+    let small = resample::resize_to_fit(img, 100, 100, Kernel::Triangle).to_rgba8();
     let mut sums = vec![[0.0f64; 3]; 4096];
     let mut weights = vec![0.0f64; 4096];
     for px in small.pixels() {
@@ -84,7 +89,12 @@ fn palette(img: &DynamicImage) -> Vec<String> {
 /// The average color: a 1x1 triangle resample is a true mean,
 /// so a solid image reports its exact color.
 fn dominant_color(img: &DynamicImage) -> String {
-    let one = DynamicImage::ImageRgb8(img.to_rgb8()).resize_exact(1, 1, FilterType::Triangle);
+    let one = resample::resize_exact(
+        &DynamicImage::ImageRgb8(img.to_rgb8()),
+        1,
+        1,
+        Kernel::Triangle,
+    );
     let px = one.to_rgb8().get_pixel(0, 0).0;
     format!("#{:02x}{:02x}{:02x}", px[0], px[1], px[2])
 }
@@ -95,9 +105,13 @@ fn dominant_color(img: &DynamicImage) -> String {
 fn data_uri(img: &DynamicImage) -> String {
     let (w, h) = (img.width().max(1), img.height().max(1));
     let tiny_h = ((16.0 * h as f32 / w as f32).round() as u32).max(1);
-    let tiny = DynamicImage::ImageRgb8(img.to_rgb8())
-        .resize_exact(16, tiny_h, FilterType::Triangle)
-        .blur(1.0);
+    let tiny = resample::resize_exact(
+        &DynamicImage::ImageRgb8(img.to_rgb8()),
+        16,
+        tiny_h,
+        Kernel::Triangle,
+    )
+    .blur(1.0);
     let mut bytes = Vec::new();
     // A 16px-wide in-memory JPEG encode does not fail in
     // practice; if it ever did, an empty preview beats an error.
@@ -264,6 +278,64 @@ mod tests {
             "{:?}",
             p.palette
         );
+    }
+
+    /// A render in each layout the placeholder can be handed,
+    /// with every alpha level where it has alpha.
+    fn renders(w: u32, h: u32) -> Vec<DynamicImage> {
+        let mut rng = crate::test_support::Rng::new(811);
+        let rgb = image::RgbImage::from_raw(w, h, rng.bytes((w * h * 3) as usize)).unwrap();
+        let rgba = image::RgbaImage::from_raw(w, h, rng.bytes((w * h * 4) as usize)).unwrap();
+        let (rgb, rgba) = (DynamicImage::ImageRgb8(rgb), DynamicImage::ImageRgba8(rgba));
+        vec![
+            DynamicImage::ImageLuma8(rgb.to_luma8()),
+            DynamicImage::ImageRgba16(rgba.to_rgba16()),
+            rgb,
+            rgba,
+        ]
+    }
+
+    #[test]
+    fn the_resizes_are_the_image_crate_s() {
+        // Issue #811: the three resizes `compute` makes, in each
+        // layout, at a render's size and at odd, small, long and
+        // already fitting ones: the crate's calls they stand for,
+        // layout and bytes.
+        use image::imageops::FilterType;
+        let same = |a: &DynamicImage, b: &DynamicImage| {
+            a.color() == b.color()
+                && (a.width(), a.height()) == (b.width(), b.height())
+                && a.as_bytes() == b.as_bytes()
+        };
+        for (w, h) in [
+            (1, 1),
+            (90, 40),
+            (100, 100),
+            (101, 100),
+            (333, 1001),
+            (800, 533),
+        ] {
+            for img in renders(w, h) {
+                let rgb = DynamicImage::ImageRgb8(img.to_rgb8());
+                let tiny_h = ((16.0 * h as f32 / w as f32).round() as u32).max(1);
+                for (nw, nh) in [(1, 1), (16, tiny_h)] {
+                    let ours = resample::resize_exact(&rgb, nw, nh, Kernel::Triangle);
+                    let theirs = rgb.resize_exact(nw, nh, FilterType::Triangle);
+                    assert!(
+                        same(&ours, &theirs),
+                        "{:?} {w}x{h} to {nw}x{nh}",
+                        img.color()
+                    );
+                }
+                let ours = resample::resize_to_fit(&img, 100, 100, Kernel::Triangle);
+                let theirs = img.resize(100, 100, FilterType::Triangle);
+                assert!(
+                    same(&ours, &theirs),
+                    "{:?} {w}x{h} into 100x100",
+                    img.color()
+                );
+            }
+        }
     }
 
     #[test]

@@ -104,7 +104,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 - **Sealed URLs.** For links that stay public but unreadable: the whole recipe, operations and source, encrypted into one opaque token in the signature slot. Only the server opens it. The readable form stays the default.
 - **Presets and purge.** Server-side preset names keep templates short. Purge one result, or a whole preset group, with signatures from their own subkey, which can carry an expiry.
 - **URLs that explain themselves.** Put `explain/` in front of any signed URL and the server reports on it instead of serving the image.
-- **Sources on your terms.** The loader fetches only what your policy allows: host allowlists, private address blocking, the source policy re-checked on every redirect hop, and fixed fetch and decode bounds, so a small file cannot expand into gigabytes.
+- **Sources on your terms.** The loader fetches only what your policy allows: host allowlists, private address blocking, the source policy re-checked on every redirect hop, and fixed fetch and decode bounds, so a small file cannot expand into gigabytes. A cached result serves only while the policy admits the URLs it names.
 
 ## Documentation
 

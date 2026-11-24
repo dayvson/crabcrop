@@ -17,6 +17,7 @@ mod probe_gate;
 mod request_log;
 mod shared_bounds;
 mod shared_state;
+mod stored_policy;
 mod upload_pace;
 
 const SECRET: &[u8] = b"test-secret";
