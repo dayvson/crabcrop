@@ -21,8 +21,10 @@
 //! the index's memory. On a volume that runs out of room first,
 //! as one of small renders runs out of inodes, a write that
 //! finds no room evicts the oldest entries until it fits, so the
-//! store holds what the volume holds, and a boot on a full volume
-//! deletes the oldest entries until it can write.
+//! store holds what the volume holds, unless the deletes free
+//! nothing it can use, when writes stop evicting after three
+//! such writes. A boot on a full volume deletes the oldest
+//! entries until it can write.
 //!
 //! The index is the authority on an entry's cache groups
 //! (issue #572). A group learned on a hit goes into the index
@@ -44,7 +46,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -417,12 +419,18 @@ fn entry_charge(key: &str, file_bytes: usize, groups: &[String], block: usize) -
         .iter()
         .map(|group| group.len() + size_of::<String>() + ALLOCATION_OVERHEAD)
         .sum();
-    file_bytes.next_multiple_of(block)
+    in_blocks(file_bytes, block)
         + FILE_OVERHEAD
         + 2 * key.len()
         + STEM_LEN
         + groups
         + RECORD_OVERHEAD
+}
+
+/// What a file of `file_bytes` takes on a volume of `block`-byte
+/// blocks (issue #777): its length in whole blocks.
+fn in_blocks(file_bytes: usize, block: usize) -> usize {
+    file_bytes.next_multiple_of(block)
 }
 
 /// Whether a write failed for want of room on the volume, or
@@ -441,6 +449,24 @@ fn no_room(e: &std::io::Error) -> bool {
 /// alone proves little: a file that another process holds open
 /// keeps its room until it is closed.
 const FRUITLESS_DELETES: usize = 3;
+
+/// How many times a write that finds no room on the volume makes
+/// room and runs again (issue #777). The room one write makes can
+/// go to another written at the same moment: at the capacity of a
+/// volume of 100 files, eight writers lost 380 of 1,600 writes
+/// with one try, 95 with two and 35 with three.
+const ROOM_TRIES: usize = 2;
+
+/// How many writes in a row may make room on a full volume and
+/// still find none, with no write landing meanwhile, before writes
+/// stop making room (issue #777). The deletes then free nothing the
+/// store can use: a snapshot keeps the blocks, a quota counts
+/// another owner's files, or another program takes the room first.
+/// From then on a write that finds no room evicts nothing and is
+/// dropped, as before writes made room, until a write lands. A
+/// write that loses its room to another of the store's writes
+/// does not count, as that one lands.
+const FRUITLESS_WRITES: usize = 3;
 
 /// The room a volume has left, as `statvfs` reports it to a
 /// process without privileges (issue #777).
@@ -504,6 +530,10 @@ struct Inner {
     clock: u64,
     /// The sum of the indexed entries' charges.
     total_bytes: usize,
+    /// What the indexed entries' files take on the volume, in whole
+    /// blocks (issue #777): the most that evicting every entry
+    /// frees.
+    block_bytes: usize,
     /// The block size of the directory's volume, read once when
     /// the directory is checked (issue #777): every entry's file
     /// is charged in whole blocks of it.
@@ -815,6 +845,18 @@ pub struct DiskStore {
     /// on the volume and made it (issue #777): at a volume's
     /// capacity, every write over it does.
     room_log: StallLog,
+    /// Writes that landed so far (issue #777): a write that makes
+    /// room on a full volume reads it to tell whether any write
+    /// landed while it did.
+    landings: AtomicU64,
+    /// Writes in a row that made room on a full volume and still
+    /// found none while no write landed (issue #777). At
+    /// [`FRUITLESS_WRITES`], writes stop making room until one
+    /// lands.
+    fruitless_writes: AtomicUsize,
+    /// Rate-limits the log lines for writes that stopped making
+    /// room (issue #777).
+    stop_log: StallLog,
     /// Rate-limits the log lines for background jobs that
     /// failed: a disk that refuses them fails each one again
     /// at every retry.
@@ -1261,6 +1303,9 @@ impl DiskStore {
             stall_log: StallLog::new("disk waits ran out"),
             write_log: StallLog::new("cache entry writes failed"),
             room_log: StallLog::new("writes made room on the full volume"),
+            landings: AtomicU64::new(0),
+            fruitless_writes: AtomicUsize::new(0),
+            stop_log: StallLog::new("times writes stopped making room"),
             job_log: StallLog::new("background disk jobs failed"),
             boot: BootScan {
                 started: std::time::Instant::now(),
@@ -1476,9 +1521,12 @@ impl DiskStore {
     /// #777) is full, whatever the budget says, as a volume of
     /// small renders runs out of inodes first: the partial file
     /// goes, the least recently used entries make room for it
-    /// (see [`DiskStore::make_room`]), and the write runs once
-    /// more. At capacity the store then holds what the volume
-    /// holds, and nothing stays shrunk once the volume has room.
+    /// (see [`DiskStore::make_room`]), and the write runs again, up
+    /// to [`ROOM_TRIES`] times, as another write can take the room
+    /// first. At capacity the store then holds what the volume
+    /// holds, and nothing stays shrunk once the volume has room. A
+    /// write that made room and still found none while no write
+    /// landed counts toward [`FRUITLESS_WRITES`].
     /// `Err` holds which step failed, and how.
     fn write_into_place(
         &self,
@@ -1500,21 +1548,65 @@ impl DiskStore {
             }
             written
         };
-        match attempt() {
-            Err((what, e)) if no_room(&e) => {
-                if !self.make_room(data.len()) {
-                    return Err((what, e));
+        let first = match attempt() {
+            Err((what, e)) if no_room(&e) => (what, e),
+            written => {
+                if written.is_ok() {
+                    self.landed();
                 }
-                attempt()?;
-                let what = format!(
-                    "the volume had no room for a cache entry ({e}), so the oldest entries made room for it"
-                );
-                if let Some(line) = self.room_log.note(monotonic_ms(), &what) {
-                    stderr_line!("{line}");
-                }
-                Ok(())
+                return written;
             }
-            written => written,
+        };
+        let landings = self.landings.load(Ordering::Relaxed);
+        let mut last = first;
+        let mut made_room = false;
+        for _ in 0..ROOM_TRIES {
+            if !self.make_room(data.len()) {
+                break;
+            }
+            made_room = true;
+            match attempt() {
+                Ok(()) => {
+                    self.landed();
+                    let what = format!(
+                        "the volume had no room for a cache entry ({}), so the oldest entries made room for it",
+                        last.1
+                    );
+                    if let Some(line) = self.room_log.note(monotonic_ms(), &what) {
+                        stderr_line!("{line}");
+                    }
+                    return Ok(());
+                }
+                Err((what, e)) if no_room(&e) => last = (what, e),
+                Err(failed) => return Err(failed),
+            }
+        }
+        // No write of the store's took the room this one made.
+        if made_room && self.landings.load(Ordering::Relaxed) == landings {
+            self.made_room_for_nothing();
+        }
+        Err(last)
+    }
+
+    /// Note a write that landed (issue #777): writes may make room
+    /// again.
+    fn landed(&self) {
+        self.landings.fetch_add(1, Ordering::Relaxed);
+        self.fruitless_writes.store(0, Ordering::Relaxed);
+    }
+
+    /// Note a write that made room on a full volume and still found
+    /// none while no write landed (issue #777). The
+    /// [`FRUITLESS_WRITES`]th in a row stops writes making room
+    /// until one lands, and says so.
+    fn made_room_for_nothing(&self) {
+        if self.fruitless_writes.fetch_add(1, Ordering::Relaxed) + 1 == FRUITLESS_WRITES {
+            let what = format!(
+                "{FRUITLESS_WRITES} writes in a row made room on the full volume and still found none, so writes evict nothing until one lands"
+            );
+            if let Some(line) = self.stop_log.note(monotonic_ms(), &what) {
+                stderr_line!("{line}");
+            }
         }
     }
 
@@ -1527,23 +1619,37 @@ impl DiskStore {
     /// nothing yet, so it counts for nothing here. It stops early
     /// once [`FRUITLESS_DELETES`] deletes in a row fail, so a
     /// volume that refuses deletes does not have one write evict
-    /// the whole tier. Returns whether a file was deleted. None is
-    /// while the boot scan runs: the files it has not indexed are
-    /// what fills the volume, and it trims them to the budget once
-    /// it indexes them.
+    /// the whole tier. Returns whether a file was deleted.
+    ///
+    /// It evicts nothing, and the write goes as it did before
+    /// writes made room, in three cases. While the boot scan runs:
+    /// the files it has not indexed are what fills the volume, and
+    /// it trims them to the budget once it indexes them. When the
+    /// tier's files take fewer blocks than the write, as on a
+    /// volume mostly full of other data: evicting them all would
+    /// not make room. And once [`FRUITLESS_WRITES`] writes in a row
+    /// made room for nothing, until a write lands.
     fn make_room(&self, bytes: usize) -> bool {
+        if self.fruitless_writes.load(Ordering::Relaxed) >= FRUITLESS_WRITES {
+            return false;
+        }
         let mut freed = 0;
         let mut deleted = false;
         // Deletes in a row that failed.
         let mut fruitless = 0;
+        let mut first = true;
         loop {
             let (next, block) = {
                 let mut guard = self.inner.lock().unwrap();
                 let inner = &mut *guard;
                 let block = inner.block;
+                let needed = in_blocks(bytes, block).max(block);
+                let too_large = first && inner.block_bytes < needed;
+                first = false;
                 if inner.scan.is_some()
+                    || too_large
                     || fruitless >= FRUITLESS_DELETES
-                    || freed >= bytes.next_multiple_of(block).max(block)
+                    || freed >= needed
                 {
                     return deleted;
                 }
@@ -1566,7 +1672,7 @@ impl DiskStore {
             if self.unlink(&self.file_for(&stem)) {
                 deleted = true;
                 fruitless = 0;
-                freed += file_bytes.next_multiple_of(block).max(block);
+                freed += in_blocks(file_bytes, block).max(block);
             } else {
                 fruitless += 1;
             }
@@ -2006,6 +2112,7 @@ impl DiskStore {
         for (n, scanned) in kept.into_iter().enumerate() {
             let stamp = n as u64 + 1;
             inner.total_bytes += scanned.charge;
+            inner.block_bytes += in_blocks(scanned.file_bytes, inner.block);
             inner.next_id += 1;
             let id = inner.next_id;
             inner.order.insert(stamp, scanned.key.clone());
@@ -2459,6 +2566,7 @@ impl DiskStore {
                     inner.next_id += 1;
                     let id = inner.next_id;
                     inner.total_bytes += charge;
+                    inner.block_bytes += in_blocks(data.len(), inner.block);
                     inner.clock += 1;
                     let stamp = inner.clock;
                     inner.order.insert(stamp, key.to_string());
@@ -2623,6 +2731,7 @@ impl DiskStore {
             .collect();
         for (key, record) in &removed {
             inner.total_bytes -= record.charge;
+            inner.block_bytes -= in_blocks(record.file_bytes, inner.block);
             inner.order.remove(&record.stamp);
             if inner
                 .rewrites
@@ -2879,6 +2988,8 @@ impl DiskStore {
         let inner = &mut *guard;
         match inner.entries.get_mut(key).filter(|record| record.id == id) {
             Some(record) => {
+                inner.block_bytes = inner.block_bytes - in_blocks(record.file_bytes, inner.block)
+                    + in_blocks(data.len(), inner.block);
                 record.file_bytes = data.len();
                 let charge = entry_charge(key, record.file_bytes, &record.groups, inner.block);
                 inner.total_bytes = inner.total_bytes - record.charge + charge;
@@ -3153,6 +3264,7 @@ fn touch(inner: &mut Inner, key: &str) {
 fn evict_entry(inner: &mut Inner, key: &str) -> Option<Record> {
     let record = inner.entries.remove(key)?;
     inner.total_bytes -= record.charge;
+    inner.block_bytes -= in_blocks(record.file_bytes, inner.block);
     inner.order.remove(&record.stamp);
     if inner
         .rewrites
@@ -5060,6 +5172,7 @@ mod tests {
         assert!(!store.contains(&keys[0]), "the oldest entry made room");
         assert_eq!(store.errors(), 0);
         assert!(!store.run_one_job(), "nothing is left to retry");
+        assert!(block_bytes_add_up(&store));
     }
 
     #[cfg(unix)]
@@ -5079,6 +5192,102 @@ mod tests {
         store.put("a", &image(b"small"));
         assert!(store.get("a").is_some());
         assert_eq!(store.errors(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_larger_than_the_tier_on_a_full_volume_evicts_nothing_and_is_dropped() {
+        // Issue #777 third review: a write evicted entries until
+        // their files freed the blocks it takes, or none was left,
+        // and ran again. When the whole tier's files take fewer
+        // blocks than the write, as on a volume mostly full of
+        // another program's data, it evicted every entry and was
+        // dropped anyway. It now evicts nothing and is dropped, as
+        // before writes made room.
+        let dir = temp_dir("larger-than-tier");
+        let store = DiskStore::open(&dir, 100_000_000, test_entry_key()).unwrap();
+        for i in 0..4 {
+            store.put(&format!("small/{i}"), &image(&[7u8; 100]));
+        }
+        stand_in_volume(&store, &dir, 0, rustix::io::Errno::NOSPC);
+        store.put("large", &image(&vec![7u8; 64 * 1024]));
+        assert!(!store.contains("large"));
+        assert_eq!((store.stats().0, files_in(&dir)), (4, 4));
+        assert_eq!(store.errors(), 1);
+    }
+
+    /// Whether the store's count of what its entries' files take on
+    /// the volume is what they take (issue #777).
+    #[cfg(unix)]
+    fn block_bytes_add_up(store: &DiskStore) -> bool {
+        let inner = store.inner.lock().unwrap();
+        let held: usize = inner
+            .entries
+            .values()
+            .map(|record| in_blocks(record.file_bytes, inner.block))
+            .sum();
+        held == inner.block_bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_from_eight_threads_at_a_full_volume_keep_the_index_and_the_files_in_step() {
+        // Issue #777 third review: at the volume's capacity, writes
+        // on several threads take the room the others make, and a
+        // write makes room and runs again up to twice. Whatever
+        // lands or is dropped, every indexed entry keeps its file,
+        // every file is indexed, no claim is left, reads return
+        // what was written, and the writes that lose their room to
+        // the others' do not stop writes making room.
+        let dir = temp_dir("eight-writers");
+        let store = DiskStore::open(&dir, 100_000_000, test_entry_key()).unwrap();
+        let payload = |k: &str| k.as_bytes().repeat(4);
+        stand_in_volume(&store, &dir, 40, rustix::io::Errno::NOSPC);
+        for i in 0..40 {
+            let k = format!("fill/{i}");
+            store.put(&k, &image(&payload(&k)));
+        }
+        let (wrong, done) = (AtomicU64::new(0), AtomicBool::new(false));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    for w in 0..8 {
+                        for n in 0..50 {
+                            let k = format!("w{w}/{n}");
+                            if let Some(image) = store.get(&k)
+                                && image.bytes[..] != payload(&k)[..]
+                            {
+                                wrong.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            });
+            let writers: Vec<_> = (0..8)
+                .map(|w| {
+                    let store = &store;
+                    s.spawn(move || {
+                        for n in 0..50 {
+                            let k = format!("w{w}/{n}");
+                            store.put(&k, &image(&payload(&k)));
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        let order = lru_order(&store);
+        for k in &order {
+            assert!(store.file_for(&key_stem(k)).exists(), "{k}");
+        }
+        assert_eq!(files_in(&dir), order.len());
+        assert!(store.inner.lock().unwrap().claims.is_empty());
+        assert_eq!(wrong.load(Ordering::Relaxed), 0);
+        assert!(block_bytes_add_up(&store));
+        assert!(store.fruitless_writes.load(Ordering::Relaxed) < FRUITLESS_WRITES);
     }
 
     #[cfg(unix)]
@@ -5250,34 +5459,72 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_volume_another_program_keeps_filling_drops_writes_and_the_tier_grows_back_once_it_has_room()
-     {
-        // Issue #777 review: each write that found the volume full
-        // lowered the budget by one entry, so a volume another
-        // program kept filling drove the tier to no budget, for
-        // good. No budget is lowered now: each write that finds no
-        // room gives up the tier's oldest entry for it, and is
-        // dropped and counted when the other program takes that
-        // room first. Once the other files go, the tier grows back
-        // past what it held.
+    fn a_volume_whose_deletes_free_no_room_stops_evicting_after_three_writes_and_serves_the_rest() {
+        // Issue #777 third review: on a volume where deletes free
+        // nothing the store can use (a snapshot keeps the blocks, a
+        // quota counts another owner's files, another program takes
+        // the room first), each write evicted entries and was still
+        // dropped, so the tier drained while every write failed.
+        // Once three writes in a row make room for nothing, writes
+        // evict nothing and are dropped, as before writes made
+        // room, and the entries left serve. Once a write lands,
+        // the tier grows back.
         let dir = temp_dir("volume-kept-full");
         let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
         let key = |i: usize| format!("{i:02}/http://127.0.0.1/a.png");
-        for i in 0..8 {
+        for i in 0..12 {
             store.put(&key(i), &image(&[7u8; 100]));
         }
         let volume = stand_in_volume(&store, &dir, 0, rustix::io::Errno::NOSPC);
-        for i in 10..20 {
+        for i in 20..30 {
             store.put(&key(i), &image(&[7u8; 100]));
         }
         assert_eq!(store.errors(), 10);
-        assert_eq!(store.stats().0, 0);
+        // Each of the first three writes evicted one entry a try.
+        let evicted = FRUITLESS_WRITES * ROOM_TRIES;
+        let mut left = store.keys();
+        left.sort();
+        assert_eq!(left, (evicted..12).map(key).collect::<Vec<_>>());
+        for k in &left {
+            assert!(store.get(k).is_some(), "{k}");
+        }
         volume.store(usize::MAX, Ordering::Relaxed);
-        for i in 20..40 {
+        for i in 30..50 {
             store.put(&key(i), &image(&[7u8; 100]));
         }
-        assert_eq!(store.stats().0, 20);
+        assert_eq!(store.stats().0, 12 - evicted + 20);
         assert_eq!(store.errors(), 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_lands_lets_writes_make_room_again() {
+        // Issue #777 third review: once writes stop making room, a
+        // write that lands shows the volume has room again, and the
+        // next write that finds none makes room and lands.
+        let dir = temp_dir("stop-then-land");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        let key = |i: usize| format!("{i:02}/http://127.0.0.1/a.png");
+        for i in 0..12 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        let volume = stand_in_volume(&store, &dir, 0, rustix::io::Errno::NOSPC);
+        for i in 20..20 + FRUITLESS_WRITES {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        // Writes have stopped making room.
+        let held = store.stats().0;
+        store.put(&key(30), &image(&[7u8; 100]));
+        assert_eq!(store.stats().0, held, "a write evicted after the stop");
+        // The volume has room for one more file: a write lands.
+        volume.store(files_in(&dir) + 1, Ordering::Relaxed);
+        store.put(&key(31), &image(&[7u8; 100]));
+        assert!(store.contains(&key(31)));
+        // The volume is full again: the next write makes room and
+        // lands.
+        store.put(&key(32), &image(&[7u8; 100]));
+        assert!(store.contains(&key(32)));
+        assert_eq!(store.stats().0, held + 1);
     }
 
     #[cfg(unix)]
@@ -5342,6 +5589,7 @@ mod tests {
         }
         assert_eq!(store.stats().0, held);
         assert_eq!(store.errors(), 0);
+        assert!(block_bytes_add_up(&store));
     }
 
     #[cfg(unix)]
@@ -5415,6 +5663,7 @@ mod tests {
         }
         assert_eq!(files_in(&dir), 6);
         assert_eq!(store.errors(), 0);
+        assert!(block_bytes_add_up(&store));
     }
 
     #[cfg(unix)]
@@ -5867,6 +6116,201 @@ mod tests {
         drop(held);
         assert_eq!(report.phase, ScanPhase::Done);
         assert_eq!((report.entries, report.deleted), (old.len() - 2, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a small tmpfs at CRABCROP_TEST_TMPFS (env-configured)"]
+    fn on_a_full_tmpfs_a_write_larger_than_the_tier_evicts_nothing_and_is_dropped() {
+        let Some(root) = tmpfs_dir("larger") else {
+            return;
+        };
+        let dir = root.join("results");
+        let store = DiskStore::open(&dir, 100_000_000, test_entry_key()).unwrap();
+        for i in 0..40 {
+            store.put(&format!("small/{i:02}"), &image(&[7u8; 100]));
+        }
+        // Another program's file fills the rest of the volume.
+        let mut other = std::fs::File::create(root.join("other.bin")).unwrap();
+        while std::io::Write::write_all(&mut other, &[0u8; 4096]).is_ok() {}
+        drop(other);
+        // A 512 KiB render: the whole tier, 40 one-block entries,
+        // cannot make room for it.
+        store.put("large", &image(&vec![7u8; 512 * 1024]));
+        eprintln!(
+            "live: a 512 KiB write on a volume full of another file: {} of 40 entries left, landed {}, errors {}",
+            store.stats().0,
+            store.contains("large"),
+            store.errors()
+        );
+        assert!(!store.contains("large"));
+        assert_eq!((store.stats().0, store.errors()), (40, 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a small tmpfs at CRABCROP_TEST_TMPFS (env-configured)"]
+    fn on_a_full_tmpfs_whose_deletes_free_nothing_writes_stop_evicting_after_three() {
+        let Some(root) = tmpfs_dir("frees-nothing") else {
+            return;
+        };
+        let dir = root.join("results");
+        let store = DiskStore::open(&dir, 100_000_000, test_entry_key()).unwrap();
+        let key = |i: usize| format!("{i:02}/http://127.0.0.1/a.png");
+        for i in 0..20 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        assert!(fill_volume(&root.join("other")) > 0);
+        // Every entry file stays open, as a snapshot keeps the
+        // blocks: deleting one frees nothing.
+        let open: Vec<std::fs::File> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| std::fs::File::open(entry.unwrap().path()).unwrap())
+            .collect();
+        for i in 20..30 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        let evicted = FRUITLESS_WRITES * ROOM_TRIES;
+        eprintln!(
+            "live: 10 writes on a full volume whose deletes free nothing: {} of 20 entries left, errors {}",
+            store.stats().0,
+            store.errors()
+        );
+        assert_eq!((store.stats().0, store.errors()), (20 - evicted, 10));
+        for i in evicted..20 {
+            assert!(store.get(&key(i)).is_some(), "{i}");
+        }
+        // The files close, and the room of those deleted comes
+        // back: writes land again, and make room once it is used.
+        drop(open);
+        for i in 30..40 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        assert_eq!((store.stats().0, store.errors()), (20, 10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a small tmpfs at CRABCROP_TEST_TMPFS (env-configured)"]
+    fn on_a_full_tmpfs_another_program_takes_the_room_and_writes_stop_evicting_after_three() {
+        let Some(root) = tmpfs_dir("taken") else {
+            return;
+        };
+        let dir = root.join("results");
+        let store = DiskStore::open(&dir, 100_000_000, test_entry_key()).unwrap();
+        let key = |i: usize| format!("{i:02}/http://127.0.0.1/a.png");
+        for i in 0..20 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        let other = root.join("other");
+        assert!(fill_volume(&other) > 0);
+        // Another program takes whatever room there is before each
+        // of the store's writes.
+        let (taker, taken) = (other.clone(), Arc::new(AtomicU64::new(0)));
+        store.set_hold(Some(Arc::new(move |kind, _| {
+            if kind == OpKind::Write {
+                let n = taken.fetch_add(1, Ordering::Relaxed);
+                let _ = std::fs::write(taker.join(format!("taken{n}")), b"x");
+            }
+            Ok(())
+        })));
+        for i in 20..30 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        let evicted = FRUITLESS_WRITES * ROOM_TRIES;
+        eprintln!(
+            "live: 10 writes on a full volume another program keeps filling: {} of 20 entries left, errors {}",
+            store.stats().0,
+            store.errors()
+        );
+        assert_eq!((store.stats().0, store.errors()), (20 - evicted, 10));
+        for i in evicted..20 {
+            assert!(store.get(&key(i)).is_some(), "{i}");
+        }
+        // The other program's files go: writes land again.
+        store.set_hold(None);
+        std::fs::remove_dir_all(&other).unwrap();
+        for i in 30..40 {
+            store.put(&key(i), &image(&[7u8; 100]));
+        }
+        assert_eq!((store.stats().0, store.errors()), (20 - evicted + 10, 10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a small tmpfs at CRABCROP_TEST_TMPFS (env-configured)"]
+    fn on_a_tmpfs_at_its_inode_limit_eight_writers_keep_the_index_and_the_files_in_step() {
+        let Some(root) = tmpfs_dir("eight") else {
+            return;
+        };
+        let dir = root.join("results");
+        let payload = |k: &str| k.as_bytes().repeat(4);
+        let store = DiskStore::open(&dir, 100_000_000, test_entry_key()).unwrap();
+        let mut filled = 0;
+        while rustix::fs::statvfs(&dir).unwrap().f_favail > 0 {
+            let k = format!("fill/{filled}");
+            store.put(&k, &image(&payload(&k)));
+            filled += 1;
+        }
+        let start = store.errors();
+        let (landed, hits, wrong) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        for w in 0..8 {
+                            for n in 0..200 {
+                                let k = format!("w{w}/{n}");
+                                if let Some(image) = store.get(&k) {
+                                    hits.fetch_add(1, Ordering::Relaxed);
+                                    if image.bytes[..] != payload(&k)[..] {
+                                        wrong.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            let writers: Vec<_> = (0..8)
+                .map(|w| {
+                    let (store, landed) = (&store, &landed);
+                    s.spawn(move || {
+                        for n in 0..200 {
+                            let k = format!("w{w}/{n}");
+                            store.put(&k, &image(&payload(&k)));
+                            if store.contains(&k) {
+                                landed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        let order = lru_order(&store);
+        let missing = order
+            .iter()
+            .filter(|k| !store.file_for(&key_stem(k)).exists())
+            .count();
+        let claims = store.inner.lock().unwrap().claims.len();
+        eprintln!(
+            "live: 1,600 writes by 8 writers at the capacity of {filled} entries, {ROOM_TRIES} tries: {} dropped, {} landed; {} indexed, {} files, {missing} indexed without a file, {claims} claims left; readers: {} hits, {} wrong",
+            store.errors() - start,
+            landed.load(Ordering::Relaxed),
+            order.len(),
+            files_in(&dir),
+            hits.load(Ordering::Relaxed),
+            wrong.load(Ordering::Relaxed)
+        );
+        assert_eq!((missing, claims, wrong.load(Ordering::Relaxed)), (0, 0, 0));
+        assert_eq!(files_in(&dir), order.len());
+        assert!(block_bytes_add_up(&store));
+        assert!(store.fruitless_writes.load(Ordering::Relaxed) < FRUITLESS_WRITES);
     }
 
     #[test]
@@ -7220,6 +7664,7 @@ mod tests {
             inner.clock += 1;
             inner.order.insert(inner.clock, key.clone());
             inner.total_bytes += charge;
+            inner.block_bytes += in_blocks(10, inner.block);
             let record = Record {
                 stem: key_stem(&key),
                 file_bytes: 10,
@@ -8741,6 +9186,12 @@ mod tests {
                     }
                     assert_eq!(inner.total_bytes, model.total_bytes, "{at}");
                     assert!(inner.total_bytes <= budget, "{at}");
+                    let block_bytes: usize = inner
+                        .entries
+                        .values()
+                        .map(|record| in_blocks(record.file_bytes, inner.block))
+                        .sum();
+                    assert_eq!(inner.block_bytes, block_bytes, "{at}");
                     drop(inner);
                     steps += 1;
                 }
