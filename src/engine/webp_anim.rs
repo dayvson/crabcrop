@@ -52,7 +52,13 @@
 //! one canvas, refused past the decode allocation budget, and
 //! one decoded frame no larger than it: a stream that codes
 //! another size than its frame is refused on its header, before
-//! libwebp decodes any of it.
+//! libwebp decodes any of it. While libwebp decodes a lossless
+//! frame it also keeps a buffer of that frame's size of its own
+//! beside the frame it hands back. The decoded frame is freed
+//! once it is on the canvas, before the canvas is copied out
+//! for the frame, and the last frame takes the canvas itself,
+//! so the walk holds at most two canvases more than the
+//! animation has frames, as the charge allows for.
 
 /// Why [`Animation::next_frame`] produced no frame.
 pub(super) enum Stop {
@@ -132,12 +138,19 @@ fn chunk_header(bytes: &[u8], at: usize) -> Option<([u8; 4], usize, usize)> {
 /// read the canvas and the frame count through here, so the
 /// pixels charged before a decode are the pixels the decoder
 /// allocates.
+///
+/// image-webp reads the ten bytes of the VP8X chunk's fields
+/// whatever the chunk's size field states, and finds the next
+/// chunk by that size, so this reads them the same way; a chunk
+/// that states fewer than ten bytes is marked (`short_vp8x`),
+/// and the walk leaves such a file to the image crate.
 pub(super) struct Header {
     pub(super) width: u32,
     pub(super) height: u32,
     has_alpha: bool,
     pub(super) frames: u32,
     first_anmf: Option<usize>,
+    short_vp8x: bool,
 }
 
 pub(super) fn header(bytes: &[u8]) -> Option<Header> {
@@ -146,7 +159,7 @@ pub(super) fn header(bytes: &[u8]) -> Option<Header> {
     }
     let riff_size = usize::try_from(u32le(bytes, 4)?).ok()?;
     let (first, size, rounded) = chunk_header(bytes, 12)?;
-    if &first != b"VP8X" || size < 10 {
+    if &first != b"VP8X" {
         return None;
     }
     let flags = *bytes.get(20)?;
@@ -179,6 +192,7 @@ pub(super) fn header(bytes: &[u8]) -> Option<Header> {
         has_alpha,
         frames,
         first_anmf,
+        short_vp8x: size < 10,
     })
 }
 
@@ -189,7 +203,8 @@ impl<'a> Animation<'a> {
     /// set on that decoder. The canvas size, the alpha flag, the
     /// first frame and the frame count are read by [`header`],
     /// the way image-webp reads them. `None` when the file is not
-    /// a plain animated one.
+    /// a plain animated one, which a VP8X chunk that states fewer
+    /// than its ten bytes is not.
     pub(super) fn open(bytes: &'a [u8], background: Option<[u8; 4]>) -> Option<Self> {
         let Header {
             width,
@@ -197,7 +212,11 @@ impl<'a> Animation<'a> {
             has_alpha,
             frames,
             first_anmf,
+            short_vp8x,
         } = header(bytes)?;
+        if short_vp8x {
+            return None;
+        }
         // The canvas must fit the allocation budget the frame
         // collector charges each frame to. The engine charges
         // this from the header before any frame decodes
@@ -319,11 +338,20 @@ impl<'a> Animation<'a> {
             frame_has_alpha,
             self.previous,
         );
+        // The frame is on the canvas: its decoded pixels go before
+        // the canvas is copied out.
+        drop(pixels);
         self.previous = (frame.x, frame.y, frame.width, frame.height);
         self.dispose_next = frame.dispose;
         self.next = after;
         self.produced += 1;
-        let mut out = canvas.clone();
+        // Nothing composites onto the canvas after the last frame,
+        // so that frame takes the canvas itself.
+        let mut out = if self.produced == self.frames {
+            std::mem::take(canvas)
+        } else {
+            canvas.clone()
+        };
         if !self.has_alpha {
             // The image crate reads such a file as RGB and widens
             // it: the canvas's own alpha never shows.

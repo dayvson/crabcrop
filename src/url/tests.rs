@@ -4542,6 +4542,99 @@ fn the_one_walk_parse_agrees_with_the_three_walks() {
 }
 
 #[test]
+fn the_builders_expiry_check_reads_segments_as_this_parser_does() {
+    // Issue #782: with an expiry, the crabcrop-url builders
+    // refuse a source whose first segment this parser reads
+    // ahead of the source (`exp:` or `maxage:` metadata, a
+    // `preset:` reference, an operation, valid or not), and
+    // no other. The crate has no parser of its own, so its
+    // copy of the dispatch is held to this one on every
+    // segment of the grammar corpora.
+    let reads_before_source = |seg: &str| {
+        seg.starts_with("exp:")
+            || seg.starts_with("maxage:")
+            || seg.starts_with("preset:")
+            || parse_operation(seg).is_some()
+    };
+    // A lone `x` is a size (0x0), and a segment that opens with `x`
+    // and has no `.` or `:` is a malformed size: both are read ahead
+    // of the source, so a source the builders refuse for opening
+    // with one (`x(_U=&d~1QC%` is the one a property test drew) is
+    // refused by the parser's own reading.
+    assert!(matches!(parse_operation("x"), Some(Ok(Operation::Size(_)))));
+    assert!(matches!(
+        parse_operation("x(_U=&d~1QC%"),
+        Some(Err(ParseError::InvalidSize(_)))
+    ));
+    let mut segments: std::collections::BTreeSet<String> = one_walk_corpus()
+        .iter()
+        .flat_map(|rest| rest.split('/').map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    segments.extend(
+        [
+            "x",
+            "x(_U=&d~1QC%",
+            "xmas",
+            "x.jpg",
+            "-x",
+            "origxorig",
+            "300x",
+            "x300",
+            "300xabc",
+            "300",
+            "trim",
+            "focal",
+            "focalpoint",
+            "crop-rect",
+            "preset:",
+            "exp:",
+            "maxage:",
+            "root:photos",
+        ]
+        .map(str::to_string),
+    );
+    let (mut read_ahead, mut sources, mut bad) = (0, 0, Vec::new());
+    for seg in segments.iter().filter(|seg| !seg.is_empty()) {
+        let source = format!("{seg}/https://example.com/a.jpg");
+        let built = crabcrop_url::build_url(
+            "https://img.example.com",
+            None,
+            "300x200",
+            &source,
+            Some(1_893_456_000),
+        );
+        let refused = match built {
+            Ok(_) => false,
+            Err(crabcrop_url::BuildError::ExpiryOverride { what, segment }) => {
+                assert_eq!((what, segment.as_str()), ("source", seg.as_str()));
+                true
+            }
+            // A character no URL may carry: no reading to compare.
+            Err(crabcrop_url::BuildError::InvalidCharacter { .. }) => continue,
+            Err(other) => panic!("{seg}: {other}"),
+        };
+        if refused != reads_before_source(seg) {
+            bad.push(format!("{seg}: the builder refused it: {refused}"));
+        }
+        if refused {
+            read_ahead += 1;
+        } else {
+            sources += 1;
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} disagreements:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+    assert!(
+        read_ahead > 600 && sources > 30,
+        "{read_ahead} read ahead of the source, {sources} sources"
+    );
+}
+
+#[test]
 fn the_one_walk_parse_declines_at_the_caps_the_expansion_enforces() {
     // The operation cap: the hundredth operation is the
     // last one the expansion accepts, so it is the last one
