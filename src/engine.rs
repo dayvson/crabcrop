@@ -60,7 +60,7 @@ pub(crate) use resize::{cap_dimensions, has_zero_side};
 mod overlay;
 #[cfg(test)]
 pub(in crate::engine) use overlay::{
-    blend_channel, blend_overlay, composite, landing, lands_on, overlay_watermark,
+    blend_channel, blend_over, blend_overlay, composite, landing, lands_on, overlay_watermark,
 };
 pub(in crate::engine) use overlay::{flatten, flattened_for};
 mod detect;

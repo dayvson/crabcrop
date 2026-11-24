@@ -1497,6 +1497,88 @@ fn placing_falls_back_to_the_blend_wherever_a_row_copy_is_not_it() {
     assert_eq!(cases, 60);
 }
 
+/// `flatten` as it stood before issue #808: an opaque canvas of
+/// the fill, the image copied to RGBA8 and laid over it by the
+/// crate's overlay, one pixel at a time, and the canvas
+/// converted to RGB8.
+fn flatten_as_it_was(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
+    let mut base = image::RgbaImage::from_pixel(
+        img.width(),
+        img.height(),
+        image::Rgba([bg[0], bg[1], bg[2], 255]),
+    );
+    image::imageops::overlay(&mut base, &img.to_rgba8(), 0, 0);
+    DynamicImage::ImageRgba8(base).to_rgb8()
+}
+
+#[test]
+fn the_blend_is_the_crate_s_at_every_alpha_over_every_fill() {
+    // Issue #808. Over an opaque fill each channel of the blend
+    // depends on its own two samples and the top alpha alone,
+    // so every top sample at every alpha over every fill sample
+    // is every case there is: 16.7 million, each the crate's
+    // `Rgba::blend` to the byte, the alpha it computes included.
+    // Then translucent and transparent bases, which the flatten
+    // never has, on a coarser grid.
+    use image::Pixel;
+    let check = |bg: [u8; 4], fg: [u8; 4]| {
+        let mut theirs = image::Rgba(bg);
+        theirs.blend(&image::Rgba(fg));
+        assert_eq!(blend_over(bg, fg), theirs.0, "{fg:?} over {bg:?}");
+    };
+    for fill in 0..=255u8 {
+        let bg = [fill, fill.wrapping_add(85), fill.wrapping_add(170), 255];
+        for alpha in 0..=255u8 {
+            for top in 0..=255u8 {
+                check(bg, [top, !top, top ^ 0x5a, alpha]);
+            }
+        }
+    }
+    for bg_alpha in [0u8, 1, 77, 128, 254] {
+        for fill in (0..=255u8).step_by(5) {
+            for alpha in (0..=255u8).step_by(3) {
+                for top in (0..=255u8).step_by(7) {
+                    check(
+                        [fill, !fill, fill ^ 0x33, bg_alpha],
+                        [top, !top, top ^ 0x5a, alpha],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn flatten_matches_the_overlay_it_replaced() {
+    // Issue #808: every layout, with alpha and without, from an
+    // empty image and one pixel up, over fills at both ends of
+    // the range and between them: the old composition's bytes.
+    let mut cases = 0;
+    for (w, h) in [(0, 3), (1, 1), (3, 2), (37, 20), (101, 53)] {
+        let mut frames = frames_at(w, h);
+        frames.extend(rgba8_planes(w, h));
+        for (name, img) in frames {
+            for fill in [
+                [255, 255, 255],
+                [0, 0, 0],
+                [12, 200, 99],
+                [255, 0, 128],
+                [1, 2, 3],
+            ] {
+                let ours = flatten(&img, fill);
+                assert_eq!((ours.width(), ours.height()), (w, h), "{name}");
+                assert_eq!(
+                    ours.as_raw(),
+                    flatten_as_it_was(&img, fill).as_raw(),
+                    "{name} over {fill:?}"
+                );
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 5 * (20 + 8) * 5);
+}
+
 /// The part of an overlay scaled to `target` px wide as it was
 /// read: the whole overlay through the image crate's resize,
 /// then the part cut from it.
