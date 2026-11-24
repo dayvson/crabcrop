@@ -146,7 +146,7 @@ async fn a_follower_after_a_long_render_still_reads_a_healthy_disk() {
     state.store.as_ref().unwrap().put(KEY, &tier_test_entry());
     let mut budget = DiskBudget::with(std::time::Duration::from_millis(200));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let (_, status) = lookup_tiers_within(&state, KEY, &[], &mut budget)
+    let (_, status) = lookup_tiers_within(&state, KEY, &[], &mut budget, || true)
         .await
         .unwrap();
     assert_eq!(status, DISK_HIT);
@@ -794,6 +794,7 @@ async fn a_bucket_hit_keeps_its_group_when_a_purge_of_a_known_group_begins_durin
                 KEY,
                 &group_list(&["c"]),
                 &mut DiskBudget::with(std::time::Duration::ZERO),
+                || true,
             )
             .await
         })
@@ -847,6 +848,7 @@ async fn a_bucket_hit_keeps_the_known_groups_no_purge_covers() {
                 KEY,
                 &group_list(&["c"]),
                 &mut DiskBudget::with(std::time::Duration::ZERO),
+                || true,
             )
             .await
         })
@@ -903,6 +905,7 @@ async fn a_bucket_hit_keeps_its_group_under_a_running_purge_of_a_known_group() {
         KEY,
         &group_list(&["c"]),
         &mut DiskBudget::with(std::time::Duration::ZERO),
+        || true,
     )
     .await
     .unwrap();
