@@ -327,31 +327,39 @@ impl c2pa::http::SyncHttpResolver for NoNetwork {
 }
 
 /// The context every read of a manifest store runs under:
-/// no network ([`NoNetwork`]) and no decoding of CAWG
-/// identity assertions. Decoding one evaluates the
+/// no network ([`NoNetwork`]), no decoding of CAWG
+/// identity assertions, and a zero inflate limit, a backstop
+/// to the box walk's refusal of any store that holds a
+/// compressed manifest. Decoding an identity assertion evaluates the
 /// identity's own credential against its issuer, which is
 /// where the network fetches come from; with no network an
 /// issuer that publishes its key on the web could only read
-/// as unavailable, a failure of the reader's making that
-/// the SDK counts against the manifest. Undecoded, an
-/// identity assertion is still an assertion the claim
-/// hashes, so its bytes are checked like any other, and a
-/// manifest's state is its own signature and hashes, which
-/// is what meta reports and an output records about its
-/// parent. Like [`Context::new`], it loads no trust
-/// anchors.
+/// as unavailable, a failure of the reader's making that the
+/// SDK counts against the manifest. Undecoded, an identity
+/// assertion is still an assertion the claim hashes, so its
+/// bytes are checked like any other, and a manifest's state
+/// is its own signature and hashes, which is what meta
+/// reports and an output records about its parent. Like
+/// [`Context::new`], it loads no trust anchors.
 fn reading_context() -> Context {
     let mut context = Context::new().with_resolver(NoNetwork);
-    context.settings_mut().core.decode_identity_assertions = false;
+    let core = &mut context.settings_mut().core;
+    core.decode_identity_assertions = false;
+    // The box walk in `read_store` refuses any store that holds a
+    // compressed manifest before the reader opens it, so one never
+    // reaches here. This zero limit is a backstop: were one to
+    // reach the reader, the read fails, though only after the
+    // decompressor has expanded at most one window.
+    core.max_decompressed_manifest_size_in_mb = 0;
     context
 }
 
 /// Read and validate the manifest store embedded in an
-/// asset. `None` when the asset carries no manifest (or no
-/// parseable one); a present-but-failing manifest reads
-/// back with state `invalid`, never as absent. `format` is
-/// a MIME type hint: the reader detects the container from
-/// the bytes first and uses the hint only as a fallback.
+/// asset of media type `format`. `None` when the asset
+/// carries no manifest, no parseable one, or a store past
+/// the bounds on a read ([`read_store`]); a
+/// present-but-failing manifest reads back with state
+/// `invalid`, never as absent.
 ///
 /// The reader checks signatures and hashes, not trust
 /// lists: its context loads no trust anchors (the SDK's
@@ -360,11 +368,7 @@ fn reading_context() -> Context {
 /// certificate. It makes no network request
 /// ([`reading_context`]).
 pub fn read_manifest(bytes: &[u8], format: &str) -> Option<ManifestSummary> {
-    let mut cursor = Cursor::new(bytes);
-    let reader = Reader::from_context(reading_context())
-        .with_stream(format, &mut cursor)
-        .ok()?;
-    Some(summarize(&reader))
+    read_store(bytes, format).map(|reader| summarize(&reader))
 }
 
 /// The summary of the store `reader` read.
@@ -446,15 +450,253 @@ fn display_signer(name: &str) -> Option<String> {
     (!shown.is_empty()).then_some(shown)
 }
 
-/// The largest manifest store signing reads from a source
-/// (issue #610): 1 MiB, room for a chain of several edits,
-/// each with a full-size claim thumbnail. Reading a store
-/// means parsing and validating it, which holds several
-/// times its size in memory, so a larger store is not
-/// parsed or validated: its ingredient names the source's
+/// The largest manifest store read from an asset (issue
+/// #610), for meta's summary and for the status an output
+/// records about its parent: 1 MiB, room for a chain of
+/// several edits, each with a full-size claim thumbnail.
+/// Reading a store means parsing and validating it, which
+/// holds several times its size in memory, so a larger store
+/// is not parsed or validated: it reads as a store that does
+/// not parse, and an output's ingredient names the source's
 /// format and records no validation status, like a source
 /// with no store.
 const MAX_SOURCE_STORE_BYTES: usize = 1024 * 1024;
+
+/// The most manifests a store read from an asset may hold.
+/// A store holds one manifest for each signed step in the
+/// asset's history, its ingredients' included, and the
+/// reader parses each one and checks the signature of each
+/// one its active manifest reaches. A chain of edits holds a
+/// few (the largest store among c2pa-rs's own test fixtures
+/// holds 6), and an output this server signs holds one.
+const MAX_STORE_MANIFESTS: usize = 64;
+
+/// What a manifest store holds after its description box,
+/// as [`store_shape`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoreShape {
+    /// Its manifests: every box at its top level.
+    manifests: usize,
+    /// Those that hold a `brob` box among their own boxes:
+    /// compressed manifests. A store holding one is not read.
+    /// Compressed manifests are rare: C2PA added them in 1.4,
+    /// a manifest bound to its asset by a data hash (as
+    /// c2pa-rs binds JPEG, PNG and WebP files by default) may
+    /// not be compressed, c2pa-rs writes one only when asked
+    /// to, and none of its own test fixtures holds one.
+    compressed: usize,
+}
+
+/// The deepest a superbox may sit in a store, the store
+/// itself at depth 0: the reader's own nesting limit.
+const MAX_SUPERBOX_DEPTH: usize = 32;
+
+/// The box at the start of `bytes`: its type, its payload
+/// (what follows its 8-byte header), and the bytes after it.
+/// `None` unless its type is not four zero bytes and its
+/// size is written in 32 bits, covers its header, and fits
+/// in `bytes`.
+fn split_box(bytes: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let size = usize::try_from(u32::from_be_bytes(*bytes.first_chunk::<4>()?)).ok()?;
+    if size < 8 || size > bytes.len() {
+        return None;
+    }
+    let (this, rest) = bytes.split_at(size);
+    let kind = &this[4..8];
+    if kind == [0; 4] {
+        return None;
+    }
+    Some((kind, &this[8..], rest))
+}
+
+/// Whether `payload`, a description box's payload, reads to
+/// exactly its end as the reader reads one: its type, toggles
+/// that make it requestable and labelled, a label of at least
+/// one character ended by a zero byte, then the optional id
+/// (4 bytes) and signature (32 bytes) its toggles announce,
+/// and, when they announce a private box, a `c2sh` box with a
+/// 32-bit size that takes up the rest.
+fn description_reads_exactly(payload: &[u8]) -> bool {
+    let Some((head, rest)) = payload.split_at_checked(17) else {
+        return false;
+    };
+    let toggles = head[16];
+    if toggles & 0x03 != 0x03 {
+        return false;
+    }
+    let Some(end) = rest.iter().position(|&b| b == 0).filter(|&end| end > 0) else {
+        return false;
+    };
+    let mut rest = &rest[end + 1..];
+    for (bit, len) in [(0x04, 4), (0x08, 32)] {
+        if toggles & bit != 0 {
+            let Some(after) = rest.get(len..) else {
+                return false;
+            };
+            rest = after;
+        }
+    }
+    if toggles & 0x10 != 0 {
+        match split_box(rest) {
+            Some((kind, _, after)) if kind == b"c2sh" && after.is_empty() => return true,
+            _ => return false,
+        }
+    }
+    rest.is_empty()
+}
+
+/// Walk the payload of a superbox at `depth` as the reader
+/// reads one: its description box first, read to exactly its
+/// end, then boxes that tile the rest, every superbox among
+/// them walked the same way, no deeper than
+/// [`MAX_SUPERBOX_DEPTH`]. Calls `each` with the depth and
+/// type of every box after a description box, in order, a
+/// superbox before the boxes inside it. `None` when anything
+/// reads otherwise.
+fn walk_superbox<'a>(
+    payload: &'a [u8],
+    depth: usize,
+    each: &mut impl FnMut(usize, &'a [u8]),
+) -> Option<()> {
+    if depth >= MAX_SUPERBOX_DEPTH {
+        return None;
+    }
+    let (kind, description, mut rest) = split_box(payload)?;
+    if kind != b"jumd" || !description_reads_exactly(description) {
+        return None;
+    }
+    while !rest.is_empty() {
+        let (kind, inner, after) = split_box(rest)?;
+        each(depth, kind);
+        if kind == b"jumb" {
+            walk_superbox(inner, depth + 1, each)?;
+        }
+        rest = after;
+    }
+    Some(())
+}
+
+/// The shape of a manifest store, from box headers and
+/// description boxes alone: nothing is inflated, and no
+/// content box is read. `None` unless the store is a
+/// superbox that reads exactly as [`walk_superbox`] walks
+/// it, at every depth: the reader parses a store whole
+/// before it acts on any manifest, and it finds a store laid
+/// out that way where the walk does, so the counts are the
+/// ones it acts on. A store laid out any other way is not
+/// read. Bytes after the store's own end are left out, as
+/// the reader leaves them.
+fn store_shape(store: &[u8]) -> Option<StoreShape> {
+    let (kind, payload, _) = split_box(store)?;
+    if kind != b"jumb" {
+        return None;
+    }
+    let mut shape = StoreShape {
+        manifests: 0,
+        compressed: 0,
+    };
+    let mut counted = false;
+    walk_superbox(payload, 0, &mut |depth, kind| {
+        if depth == 0 {
+            shape.manifests += 1;
+            counted = false;
+        } else if depth == 1 && kind == b"brob" && !counted {
+            shape.compressed += 1;
+            counted = true;
+        }
+    })?;
+    Some(shape)
+}
+
+/// The `uuid` box type an ISO BMFF file (HEIC, HEIF, AVIF,
+/// MP4) carries its manifest store in.
+const C2PA_BMFF_BOX: [u8; 16] = [
+    0xD8, 0xFE, 0xC3, 0xD6, 0x1B, 0x0E, 0x48, 0x3C, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7E, 0xC4, 0x81,
+];
+
+/// Whether `asset`, read as ISO BMFF boxes, may keep its
+/// store as an original and an update: a top-level C2PA box
+/// whose purpose is `original` or `update`. The SDK merges
+/// such a pair while it copies the store out of the file,
+/// parsing both stores with its own default bounds, before
+/// anything here can measure them. A top-level box whose
+/// size does not cover its own header counts too, since the
+/// SDK reads on from inside such a box and this walk cannot
+/// follow it there. Only box headers and each C2PA box's
+/// purpose are read; bytes that are not ISO BMFF stop the
+/// walk at their first header.
+fn bmff_store_pair(asset: &[u8]) -> bool {
+    let mut rest = asset;
+    while let Some(&[s0, s1, s2, s3, ..]) = rest.first_chunk::<8>() {
+        let (header_len, size) = match u32::from_be_bytes([s0, s1, s2, s3]) {
+            // A size of 0 runs to the end of the file.
+            0 => (8, rest.len() as u64),
+            1 => match rest.get(8..16) {
+                Some(large) => (
+                    16,
+                    u64::from_be_bytes(large.try_into().expect("an 8-byte slice")),
+                ),
+                None => return false,
+            },
+            small => (8, u64::from(small)),
+        };
+        if size < header_len as u64 {
+            return true;
+        }
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        if size > rest.len() {
+            // The SDK refuses a box past the end of the file,
+            // or, for `mdat`, stops at the end with it.
+            return false;
+        }
+        let (this, after) = rest.split_at(size);
+        if &this[4..8] == b"uuid" && this.get(header_len..header_len + 16) == Some(&C2PA_BMFF_BOX) {
+            // The purpose follows the box's version and flags.
+            let purpose = this.get(header_len + 20..).unwrap_or_default();
+            let purpose = purpose.split(|&b| b == 0).next().unwrap_or_default();
+            if purpose == b"original" || purpose == b"update" {
+                return true;
+            }
+        }
+        rest = after;
+    }
+    false
+}
+
+/// The reader over the manifest store `asset` embeds, read as
+/// a `format` asset, when that store is within the bounds on
+/// a read. The store is copied out of the asset first,
+/// without parsing it, and measured: at most
+/// [`MAX_SOURCE_STORE_BYTES`], laid out as [`store_shape`]
+/// walks it, at most [`MAX_STORE_MANIFESTS`] manifests and
+/// none of them compressed, and not an ISO BMFF pair that
+/// copying it out would parse ([`bmff_store_pair`]). The
+/// reader's inflate limit is zero, a backstop to that walk
+/// ([`reading_context`]). What
+/// it validates is exactly the store that was measured,
+/// against the asset read as `format`: the reader is handed
+/// those bytes rather than finding the store again, since its
+/// own container detection can pick a different handler than
+/// the hint (a text SVG whose first bytes also look like
+/// another container). `None` when the asset carries no
+/// store, when its store is past a bound, or when the store
+/// does not parse. The read makes no network request.
+fn read_store(asset: &[u8], format: &str) -> Option<Reader> {
+    if bmff_store_pair(asset) {
+        return None;
+    }
+    let store = c2pa::jumbf_io::load_jumbf_from_stream(format, &mut Cursor::new(asset)).ok()?;
+    if store.len() > MAX_SOURCE_STORE_BYTES {
+        return None;
+    }
+    let shape = store_shape(&store)?;
+    if shape.manifests > MAX_STORE_MANIFESTS || shape.compressed > 0 {
+        return None;
+    }
+    Reader::from_context(reading_context())
+        .with_manifest_data_and_stream(&store, format, Cursor::new(asset))
+        .ok()
+}
 
 /// How many distinct status codes an output records per
 /// category (success, informational, failure) for its
@@ -470,27 +712,11 @@ const MAX_STATUS_CODE_LEN: usize = 64;
 /// the status codes the SDK's validation of the source's
 /// manifest store produced, as [`status_codes`] reduces
 /// them. `None` when the source carries no embedded store,
-/// when its store is over [`MAX_SOURCE_STORE_BYTES`], or
-/// when the store does not parse; the ingredient then names
-/// the source's format only. The store's bytes are copied
-/// out of the container first, without parsing them, so an
-/// oversized store is never parsed or validated, and the
-/// reader runs only on a source that embeds a store. What
-/// it validates is exactly the store that was measured,
-/// against the source read as `format`: the reader is
-/// handed those bytes rather than finding the store again,
-/// since its own container detection can pick a different
-/// handler than the hint (a text SVG whose first bytes also
-/// look like another container). The read makes no network
-/// request ([`reading_context`]).
+/// when its store is past the bounds on a read, or when the
+/// store does not parse ([`read_store`]); the ingredient
+/// then names the source's format only.
 fn source_status(source: &[u8], format: &str) -> Option<serde_json::Value> {
-    let store = c2pa::jumbf_io::load_jumbf_from_stream(format, &mut Cursor::new(source)).ok()?;
-    if store.len() > MAX_SOURCE_STORE_BYTES {
-        return None;
-    }
-    let reader = Reader::from_context(reading_context())
-        .with_manifest_data_and_stream(&store, format, Cursor::new(source))
-        .ok()?;
+    let reader = read_store(source, format)?;
     let results = serde_json::to_value(reader.validation_results()?).ok()?;
     Some(status_codes(&results))
 }
@@ -1245,6 +1471,23 @@ mod identity_tests;
 
 #[cfg(test)]
 mod shape_tests;
+
+#[cfg(test)]
+mod store_tests;
+
+/// `asset` signed with the test identity as a `format`
+/// asset, twice over, for other modules' suites: once with
+/// its store rewritten as it was, and once with a compressed
+/// manifest added to it, a store that is not read. Either
+/// asset's own manifest reads `invalid`, as its store has
+/// moved.
+#[cfg(test)]
+pub(crate) fn test_sources_without_and_with_a_compressed_manifest(
+    asset: &[u8],
+    format: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    store_tests::without_and_with_a_compressed_manifest(asset, format)
+}
 
 /// The test identity whose common name runs past 64
 /// characters over two lines, for other modules' suites
