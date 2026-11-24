@@ -34,7 +34,7 @@ This setup builds unsigned URLs; read [Signing and server modes](#signing-and-se
 - `base` (required): the crabcrop origin.
 - `preset`: a server-side preset name. Recommended: the transform policy stays on the server. See [Signing and server modes](#signing-and-server-modes) for the server configuration it pairs with.
 - `secret`: signs the URLs. Only pass it from server-side code.
-- `expires`: a unix-seconds expiry applied to every URL.
+- `expires`: a unix-seconds expiry applied to every URL. A `src` whose first segment crabcrop reads as an operation, `exp:`, `maxage:` or `preset:` then throws, as `buildURL` throws for it with an expiry: the server keeps the last `exp:` of a URL.
 
 The loader maps Hydrogen's `{src, width, height, scale}` calls onto the grammar: width and height together become `{w}x{h}` (with `scale` multiplied in, for device-pixel-ratio variants), width alone becomes `{w}x0`, height alone `0x{h}`. With a preset, `preset:<name>` leads and the sizing appends.
 

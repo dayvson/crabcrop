@@ -118,8 +118,22 @@ if ($GROUP === 'vectors') {
     $refused = 0;
     $reserved = 0;
     $purges = 0;
+    $expiry_refused = 0;
+    $expiry_built = 0;
     $reserved_message = 'remainder begins with the reserved segment "crabcrop": '
         . 'it is kept for key derivation, and no image URL may begin with it';
+    // The message an expiry refusal carries, as every builder
+    // spells it (issue #782).
+    $expiry_message = function ($input, $segment) {
+        if ($input === 'operations') {
+            return 'operations carries the segment "' . $segment . '": with an expiry, the operations'
+                . ' may carry no exp: or maxage: segment, since the server keeps the last of each';
+        }
+        return 'source begins with the segment "' . $segment . '", which the server reads ahead of'
+            . ' the source: with an expiry, the source may not begin with an operation, exp:,'
+            . ' maxage: or preset: segment';
+    };
+    $base = 'https://images.example.com';
     foreach ($vectors as $vector) {
         if (!empty($vector['sealed'])) {
             continue; // Sealing is out of scope for a URL builder.
@@ -191,6 +205,62 @@ if ($GROUP === 'vectors') {
             $refused++;
             continue;
         }
+        if (isset($vector['refuses_with_expiry'])) {
+            // With an expiry, signed, unsafe and keyed builds refuse
+            // operations that carry exp: or maxage: and a source that
+            // begins with a segment the server reads ahead of it, naming
+            // the input and the segment (issue #782). Without the expiry
+            // the same inputs build as they always did.
+            $ops = $vector['operations'];
+            $src = $vector['source'];
+            $expected = $expiry_message($vector['refuses_with_expiry']['input'], $vector['refuses_with_expiry']['segment']);
+            foreach (array(array('s3cr3t', null), array(null, null), array('s3cr3t', 'k2')) as $call) {
+                $message = null;
+                try {
+                    CrabcropUrl::build($base, $call[0], $ops, $src, $vector['expires'], $call[1]);
+                } catch (InvalidArgumentException $e) {
+                    $message = $e->getMessage();
+                }
+                $how = $call[0] === null ? ' (unsafe)' : ($call[1] !== null ? ' (keyed)' : '');
+                eq($expected, $message, 'vector: ' . $vector['description'] . $how);
+            }
+            $plain = $ops !== '' ? $ops . '/' . $src : $src;
+            eq(
+                $base . '/' . hash_hmac('sha256', $plain, 's3cr3t') . '/' . $plain,
+                CrabcropUrl::build($base, 's3cr3t', $ops, $src),
+                'vector: ' . $vector['description'] . ' (no expiry: builds as before)'
+            );
+            eq(
+                $base . '/unsafe/' . $plain,
+                CrabcropUrl::build($base, null, $ops, $src),
+                'vector: ' . $vector['description'] . ' (no expiry, unsafe: builds as before)'
+            );
+            $expiry_refused++;
+            continue;
+        }
+        if (isset($vector['builds_with_expiry'])) {
+            // Where the expiry refusal stops: these build, with the
+            // expiry leading the remainder (issue #782).
+            $remainder = $vector['builds_with_expiry'];
+            $args = array($vector['operations'], $vector['source'], $vector['expires']);
+            eq(
+                $base . '/' . hash_hmac('sha256', $remainder, 's3cr3t') . '/' . $remainder,
+                CrabcropUrl::build($base, 's3cr3t', $args[0], $args[1], $args[2]),
+                'vector: ' . $vector['description']
+            );
+            eq(
+                $base . '/unsafe/' . $remainder,
+                CrabcropUrl::build($base, null, $args[0], $args[1], $args[2]),
+                'vector: ' . $vector['description'] . ' (unsafe)'
+            );
+            eq(
+                $base . '/k2:' . hash_hmac('sha256', $remainder, 's3cr3t') . '/' . $remainder,
+                CrabcropUrl::build($base, 's3cr3t', $args[0], $args[1], $args[2], 'k2'),
+                'vector: ' . $vector['description'] . ' (keyed)'
+            );
+            $expiry_built++;
+            continue;
+        }
         $signed++;
         eq(
             $vector['signature'],
@@ -202,6 +272,8 @@ if ($GROUP === 'vectors') {
     check($refused >= 17, "refusal vectors covered ($refused)");
     check($reserved >= 9, "reserved vectors covered ($reserved)");
     check($purges >= 6, "purge vectors recognized and skipped ($purges)");
+    check($expiry_refused >= 11, "expiry refusal vectors covered ($expiry_refused)");
+    check($expiry_built >= 5, "expiry build vectors covered ($expiry_built)");
     // A key label's signature would be its subkey: refused, and a
     // source that only names a label further in still signs.
     foreach (array('crabcrop/purge-key', 'crabcrop/upload-key', 'crabcrop/seal-key') as $label) {
@@ -309,6 +381,40 @@ if ($GROUP === 'builder') {
     throws_invalid(function () {
         CrabcropUrl::build('https://images.example.com', 's', '300x200', 'https://example.com/a.jpg', null, str_repeat('k', 33));
     }, 'rejects a key id past 32 characters');
+
+    // The expiry check's reading of a source's first segment (issue
+    // #782), the crate's own list: each prefix the server's parser
+    // reads as metadata, a preset reference or an operation, and a
+    // size in any spelling it reads as one, valid or not, is refused
+    // there with an expiry; source text is not.
+    foreach (array(
+        'exp:1', 'maxage:60', 'preset:og-card', 'debug:focal', 'frame:poster', 'page:2',
+        'crop-rect:0x0:10x10', 'focalpoint:0.5,0.5,2', 'focal:0x0:10x10', 'crop:100x100:smart',
+        'pad:100x100', 'fit-in:100x100', 'filters:grayscale', '300x200', '-300x0', 'origx100',
+        'x', '16384x10', '300xabc', 'xmas',
+    ) as $segment) {
+        $message = null;
+        try {
+            CrabcropUrl::build('https://images.example.com', null, '300x200', $segment . '/https://example.com/a.jpg', 1893456000);
+        } catch (InvalidArgumentException $e) {
+            $message = $e->getMessage();
+        }
+        check(
+            $message !== null && strpos($message, 'source begins with the segment "' . $segment . '"') === 0,
+            'with an expiry, a source opening with ' . $segment . ' is refused'
+        );
+    }
+    foreach (array(
+        'https:', 's3:', 'gs:', 'file:', 'root:photos', 'example.com', '100x200.jpg', 'x.jpg',
+        'photo.jpg', 'crabcrop', 'trim', 'filters', '300',
+    ) as $segment) {
+        $source = $segment . '/a.jpg';
+        eq(
+            'https://images.example.com/unsafe/exp:1893456000/300x200/' . $source,
+            CrabcropUrl::build('https://images.example.com', null, '300x200', $source, 1893456000),
+            'with an expiry, a source opening with ' . $segment . ' builds'
+        );
+    }
 }
 
 if ($GROUP === 'config_options') {

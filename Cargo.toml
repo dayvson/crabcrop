@@ -235,6 +235,11 @@ rustix = { version = "1", features = ["process", "fs", "pipe", "net"] }
 turbojpeg = { version = "1.5", default-features = false, features = ["require-simd"] }
 
 [dev-dependencies]
+# Brotli streams for the C2PA store tests in src/provenance,
+# which build compressed manifests. A test-only dependency on
+# the version c2pa already builds: it adds no crate and never
+# enters a normal build.
+brotli = "7.0.0"
 # Property tests (issue #478): tests/proptest_url.rs and
 # tests/proptest_crop.rs. Default features off: `fork` and
 # `timeout` pull in rusty-fork and tempfile, which the suites

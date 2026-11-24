@@ -38,7 +38,7 @@ This setup builds unsigned URLs; read [Signing and server modes](#signing-and-se
 - `base` (required): the crabcrop origin.
 - `preset`: a server-side preset name. Recommended: the transform policy stays on the server and the URLs carry only what varies per image. See [Signing and server modes](#signing-and-server-modes) for the server configuration it pairs with.
 - `secret`: signs the URLs. Create the loader with it only in server-side code (a `$lib/server` module or a load function reading `$env/static/private`); the loader additionally forces the secret to null in a browser context, so a factory created with one still cannot sign client-side.
-- `expires`: a unix-seconds expiry applied to every URL.
+- `expires`: a unix-seconds expiry applied to every URL. A `src` whose first segment crabcrop reads as an operation, `exp:`, `maxage:` or `preset:` then throws, as `buildURL` throws for it with an expiry: the server keeps the last `exp:` of a URL.
 - `origin`: origin prepended to root-relative `src` values such as `/uploads/a.jpg`, which crabcrop cannot fetch on their own.
 
 ## URL mapping

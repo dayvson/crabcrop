@@ -1,3 +1,4 @@
+use super::HEAD_BUDGET;
 use crate::ai::{AestheticHead, AiError};
 use crate::test_support::{ScratchDir, head_archive, scratch_dir};
 
@@ -158,6 +159,52 @@ fn aesthetic_head_load_rejects_garbage_and_missing_files() {
     assert!(err.contains("not usable"), "{err}");
     let err = expect_load(AestheticHead::load(&missing_path("head")));
     assert!(err.contains("cannot read the aesthetic head"), "{err}");
+}
+
+#[test]
+fn aesthetic_head_over_the_budget_is_refused_before_it_is_read() {
+    // Issue #783: the loader read the whole file and only then
+    // compared its length with the budget, so a head path
+    // pointed at a model file buffered all of it at boot. The
+    // size is checked first now. The file is sparse and far
+    // larger than memory: a load that read it could not
+    // allocate for it, and would fail naming the read.
+    let dir = scratch_dir("embedding-head-sparse");
+    let path = dir.join("model.pth");
+    let size: u64 = 1 << 40;
+    std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+    let err = expect_load(AestheticHead::load(path.to_str().unwrap()));
+    assert!(
+        err.contains(&format!(
+            "is {size} bytes: a linear head is a few kilobytes"
+        )),
+        "{err}"
+    );
+    // One byte past the budget is refused the same way; the
+    // budget itself is read and parsed.
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(HEAD_BUDGET as u64 + 1).unwrap();
+    let err = expect_load(AestheticHead::load(path.to_str().unwrap()));
+    assert!(
+        err.contains(&format!("is {} bytes", HEAD_BUDGET + 1)),
+        "{err}"
+    );
+    file.set_len(HEAD_BUDGET as u64).unwrap();
+    let err = expect_load(AestheticHead::load(path.to_str().unwrap()));
+    assert!(err.contains("not usable"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn aesthetic_head_read_stops_past_the_budget_when_no_size_is_reported() {
+    // Issue #783: a device reports no size, so the size check
+    // passes it; the read then stops one byte past the budget
+    // instead of reading on for as long as the device answers.
+    let err = expect_load(AestheticHead::load("/dev/zero"));
+    assert!(
+        err.contains(&format!("is over {HEAD_BUDGET} bytes")),
+        "{err}"
+    );
 }
 
 #[test]
