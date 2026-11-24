@@ -230,3 +230,36 @@ fn a_scaled_overlay_part_past_the_byte_limit_is_refused() {
     };
     assert_eq!(err.to_string(), past_budget(5001, 5001, 16));
 }
+
+/// A 5x1000 RGBA8 strip, as wide as it is tall times 1/200.
+fn strip() -> DynamicImage {
+    DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        5,
+        1000,
+        image::Rgba([40, 120, 200, 255]),
+    ))
+}
+
+#[test]
+fn a_blurred_pad_whose_cover_passes_the_byte_limit_is_refused_at_any_depth() {
+    // The image a blurred pad scales to cover its canvas follows
+    // the ratio of the canvas's aspect to the image's, not the
+    // size of the output: a 1000x1000 canvas over a 1:200 strip
+    // needs a 1000x200000 cover, 800 MB as RGBA8, for a
+    // one-megapixel output. It is refused at 8 bits as at 16.
+    assert_eq!(
+        refusal(strip(), "pad:1000x1000:blur"),
+        past_budget(1000, 200_000, 4)
+    );
+}
+
+#[test]
+fn an_eight_bit_blurred_pad_whose_cover_fits_renders() {
+    // The same strip on a 100x100 canvas: a 100x20000 cover, 8
+    // MB, within the budget, renders as it always did.
+    let out = chain(strip(), "pad:100x100:blur").unwrap();
+    assert_eq!(
+        (out.width(), out.height(), out.color()),
+        (100, 100, image::ColorType::Rgba8)
+    );
+}
