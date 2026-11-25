@@ -825,6 +825,30 @@ impl<'r, 'a> ChainState<'r, 'a> {
         check_output_size(target.0, target.1, (img.width(), img.height()))?;
         // The resize lands in the frame's layout (issue #784).
         check_output_bytes(target.0, target.1, img.color())?;
+        // A reduced JPEG decode whose first operation is this
+        // fixed-alignment crop (issue #785): the window is decided
+        // on the full image the frame stands for, since the frame
+        // in hand is only its reduced picture, then resampled from
+        // the part of the frame that image fills. `jpeg_scaled::plan`
+        // offers the scaled decode only for the fixed alignments and
+        // only as a first operation, so a pending focal form, and a
+        // smart, face or object crop, never find `reduced` set here.
+        if let Some(reduced) = self.reduced.take() {
+            let (full_w, full_h) = reduced.full;
+            let window = crate::crop::fill_window_aligned(full_w, full_h, tw, th, align);
+            return apply_size_windowed(
+                img,
+                &ImageSize {
+                    width: Dimension::Pixels(tw),
+                    height: Dimension::Pixels(th),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                self.cap.map(|(cw, ch)| SizeCap::Fit(cw, ch)),
+                1.0,
+                SourceWindow::ReducedCrop { reduced, window },
+            );
+        }
         // The crop consumes any pending focal form, mapped
         // onto the image in hand by the steps since its
         // segment (issue #465). Center and smart crops

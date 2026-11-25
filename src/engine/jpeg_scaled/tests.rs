@@ -589,7 +589,7 @@ fn source() -> Vec<u8> {
 }
 
 #[test]
-fn only_a_plain_resize_first_makes_a_request_eligible() {
+fn a_resize_or_a_fixed_crop_first_makes_a_request_eligible() {
     let source = source();
     // The benchmark's request at a tenth of its size, and the
     // quarter and the eighth below it.
@@ -597,6 +597,22 @@ fn only_a_plain_resize_first_makes_a_request_eligible() {
     assert_eq!(scale_for(&source, "81x0"), None);
     assert_eq!(scale_for(&source, "40x0"), Some(4));
     assert_eq!(scale_for(&source, "20x0"), Some(8));
+    // A crop to a fixed alignment is eligible too (issue #785),
+    // at the scale its window leaves room for, whatever the
+    // alignment. The 240x160 source cropped to 20x20 keeps a
+    // 160x160 window, a quarter of which still covers 20x20;
+    // to 40x40 only a half does.
+    for remainder in [
+        "crop:20x20",
+        "crop:20x20:top",
+        "crop:20x20:bottom-right",
+        "crop:30x20",
+    ] {
+        assert_eq!(scale_for(&source, remainder), Some(4), "{remainder}");
+    }
+    for remainder in ["crop:40x40", "crop:40x40:left"] {
+        assert_eq!(scale_for(&source, remainder), Some(2), "{remainder}");
+    }
     // Whatever follows the resize, the first operation
     // decides, flips included.
     for remainder in [
@@ -619,12 +635,14 @@ fn only_a_plain_resize_first_makes_a_request_eligible() {
         assert_eq!(scale_for(&source, remainder), Some(2), "{remainder}");
     }
     // Any other first operation, and no operation at all,
-    // decodes at full size, however small its own target.
+    // decodes at full size, however small its own target. A
+    // smart, face or object crop reads the pixels to place its
+    // window, so it is not a fixed fill crop and decodes whole.
     for remainder in [
         "",
-        "crop:20x20",
         "crop:20x20:smart",
-        "crop:20x20:top",
+        "crop:20x20:face",
+        "crop:20x20:objects(person)",
         "fit-in:20x20",
         "fit-in:20x0",
         "fit-in:0x20",
@@ -641,7 +659,8 @@ fn only_a_plain_resize_first_makes_a_request_eligible() {
     ] {
         assert_eq!(scale_for(&source, remainder), None, "{remainder:?}");
     }
-    // A resize that shrinks nothing, or not enough.
+    // A resize or a fixed crop that shrinks nothing, or not
+    // enough to leave a one-and-a-half-times resample.
     for remainder in [
         "0x0",
         "origxorig",
@@ -649,6 +668,9 @@ fn only_a_plain_resize_first_makes_a_request_eligible() {
         "20xorig",
         "240x160",
         "120x80",
+        "crop:80x80",
+        "crop:120x80",
+        "crop:240x160:top",
     ] {
         assert_eq!(scale_for(&source, remainder), None, "{remainder}");
     }
@@ -831,11 +853,17 @@ fn the_decode_stage_hands_on_the_reduced_frame_and_the_declared_size() {
         );
     }
     // A full-size decode says nothing: the frame is the image.
-    for remainder in ["81x0", "crop:20x20", ""] {
+    for remainder in ["81x0", "crop:120x80", ""] {
         let (img, reduced) = stage(&source, remainder);
         assert_eq!((img.width(), img.height()), (240, 160), "{remainder:?}");
         assert_eq!(reduced, None, "{remainder:?}");
     }
+    // A fixed-alignment crop reduces too (issue #785): crop:20x20
+    // on the 240x160 source decodes at a quarter, and the frame
+    // stands for the full 240x160 image.
+    let (img, reduced) = stage(&source, "crop:20x20");
+    assert_eq!((img.width(), img.height()), (60, 40));
+    assert_eq!(reduced.map(|r| r.full), Some((240, 160)));
     // Every orientation: the frame comes upright, and the
     // size it stands for is the upright one.
     for orientation in 1..=8u16 {
@@ -1222,6 +1250,176 @@ fn a_scaled_render_is_the_full_size_render_s_picture() {
     assert!(
         worst < 60.0,
         "the scaled renders are {worst:.1} dB apart at worst"
+    );
+}
+
+#[test]
+fn a_scaled_crop_is_the_full_size_crop_s_picture() {
+    // Issue #785: a fixed-alignment crop decoded at reduced scale
+    // is the same picture as the full-size crop, to well within
+    // what the eye sees, at every alignment and orientation,
+    // baseline and progressive, for a size the scale divides and
+    // for one a pixel past it. A window cut in the wrong place,
+    // turned the wrong way, or resampled out of place would be
+    // many decibels away.
+    use crate::url::Align;
+    let aligns = [
+        Align::Center,
+        Align::Top,
+        Align::Bottom,
+        Align::Left,
+        Align::Right,
+        Align::TopLeft,
+        Align::TopRight,
+        Align::BottomLeft,
+        Align::BottomRight,
+    ];
+    let mut worst = f64::INFINITY;
+    for (width, height) in [(240, 160), (241, 161)] {
+        let img = picture(width, height);
+        for bytes in [jpeg(&img), progressive_jpeg(&img)] {
+            for orientation in 1..=8u16 {
+                let bytes = with_orientation(&bytes, orientation);
+                for align in &aligns {
+                    let remainder = format!("crop:40x40:{}", align_slug(align));
+                    assert_eq!(
+                        scale_for(&bytes, &remainder),
+                        Some(2),
+                        "{width}x{height} orientation {orientation} {remainder}"
+                    );
+                    let (ours, theirs) = both_pixels(&bytes, &remainder);
+                    assert_eq!((ours.width(), ours.height()), (40, 40));
+                    assert_eq!(
+                        (ours.width(), ours.height()),
+                        (theirs.width(), theirs.height())
+                    );
+                    let apart = psnr(&ours, &theirs);
+                    assert!(
+                        apart > 40.0,
+                        "{width}x{height} orientation {orientation} {remainder}: {apart:.1} dB"
+                    );
+                    worst = worst.min(apart);
+                }
+            }
+        }
+    }
+    // The pixels did change: the scaled crop is not byte-identical
+    // to the full-size crop.
+    assert!(
+        worst < 70.0,
+        "scaled crops are {worst:.1} dB apart at worst"
+    );
+}
+
+/// The URL alignment token for a fixed alignment.
+fn align_slug(align: &crate::url::Align) -> &'static str {
+    use crate::url::Align;
+    match align {
+        Align::Center => "center",
+        Align::Top => "top",
+        Align::Bottom => "bottom",
+        Align::Left => "left",
+        Align::Right => "right",
+        Align::TopLeft => "top-left",
+        Align::TopRight => "top-right",
+        Align::BottomLeft => "bottom-left",
+        Align::BottomRight => "bottom-right",
+        _ => unreachable!("only fixed alignments are slugged here"),
+    }
+}
+
+#[test]
+fn a_scaled_crop_resolves_the_sizes_the_full_size_crop_does() {
+    // Issue #785: every size a crop works out — the output size,
+    // the source size it reports, under DPR, no_upscale, odd
+    // sizes and every orientation — is the one the full-size
+    // crop works out. Only the pixels differ.
+    for (width, height) in [(240, 160), (241, 161)] {
+        let plain = picture(width, height);
+        for base in [jpeg(&plain), progressive_jpeg(&plain)] {
+            for orientation in 1..=8u16 {
+                let src = Source::new(with_orientation(&base, orientation));
+                for remainder in [
+                    "crop:40x40",
+                    "crop:40x40:top",
+                    "crop:50x30:bottom-right",
+                    "crop:40x40/filters:dpr(2)",
+                    "crop:40x40/filters:no_upscale",
+                    "crop:30x40:left/filters:dpr(2):no_upscale",
+                ] {
+                    let [ours, theirs] = src.sizes(&ops_of(remainder));
+                    assert_eq!(
+                        ours, theirs,
+                        "{width}x{height} orientation {orientation} {remainder}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_crop_of_a_file_the_scaled_decode_does_not_take_falls_back_to_full_size() {
+    // Issue #785: the scaled crop stands down for any file the
+    // scaled decode does not take — a four-component JPEG, CMYK or
+    // YCCK, is not the 8-bit YCbCr frame `eligible_size` requires —
+    // exactly as a scaled resize does, and the full-size crop
+    // answers with the pixels or the error it always gave.
+    for colorspace in [turbojpeg::Colorspace::CMYK, turbojpeg::Colorspace::YCCK] {
+        let bytes = four_component_jpeg(240, 160, colorspace);
+        assert_eq!(scale_for(&bytes, "crop:40x40"), None, "{colorspace:?}");
+        assert_eq!(
+            answer(render(&bytes, "crop:40x40")),
+            answer(at_full_size(|| render(&bytes, "crop:40x40"))),
+            "{colorspace:?}"
+        );
+    }
+}
+
+/// Issue #785 measurement: the crop-fill scaled decode against
+/// the full-size crop on the 25 benchmark sources (2400x1600).
+/// Run with `--ignored --nocapture`. Reports, per crop, the
+/// SSIMULACRA2 of the scaled crop against the full-size crop and
+/// the PSNR between them, and the aggregate floor the keep
+/// decision is made on.
+#[test]
+#[ignore = "measurement for issue #785; run with --ignored --nocapture"]
+fn measure_crop_fill_scaled_vs_full() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/benchmark/fixtures");
+    let mut worst_psnr = f64::INFINITY;
+    let mut worst_ssim = f64::INFINITY;
+    let mut psnrs = Vec::new();
+    for crop in [
+        "crop:400x300",
+        "crop:400x300:top",
+        "crop:300x400:bottom-right",
+    ] {
+        for i in 0..25 {
+            let path = format!("{dir}/src{i:02}.jpg");
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("skip {path}: unreadable");
+                continue;
+            };
+            let scale = scale_for(&bytes, crop);
+            let (scaled, full) = both_pixels(&bytes, crop);
+            let p = psnr(&scaled, &full);
+            let ss = crate::quality::ssimulacra2(&full, &scaled).unwrap_or(f64::NAN);
+            worst_psnr = worst_psnr.min(p);
+            if ss.is_finite() {
+                worst_ssim = worst_ssim.min(ss);
+            }
+            psnrs.push(p);
+            eprintln!("{crop} src{i:02} scale={scale:?} psnr={p:.2}dB ssimulacra2={ss:.2}");
+        }
+    }
+    psnrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = psnrs[psnrs.len() / 2];
+    eprintln!(
+        "crop-fill: {} crops, PSNR floor {:.2} dB, median {:.2} dB, SSIMULACRA2 floor {:.2}",
+        psnrs.len(),
+        worst_psnr,
+        median,
+        worst_ssim
     );
 }
 

@@ -97,7 +97,7 @@ fn default_configuration_keeps_its_fingerprint() {
     );
     assert_eq!(
         (RENDERING_VERSION, fingerprint.as_str()),
-        (8, "6e5d7c480309546a")
+        (9, "299a5181207d5547")
     );
 }
 

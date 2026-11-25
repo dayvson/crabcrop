@@ -1090,7 +1090,24 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// scan the full-size decoder refuses, whose first operation
 /// is a resize to a third of its size or less, which
 /// decodes at full size again, #713).
-const RENDERING_VERSION: u32 = 8;
+///
+/// 9: a batch of output-changing performance improvements
+/// (baseline JPEG output now carries optimized Huffman tables
+/// built from the image instead of libjpeg's standard ones, so
+/// every baseline JPEG's bytes shrink by about 9% for the same
+/// decoded pixels #793; `contrast(0)` is now the exact identity
+/// where its table dropped the values 1 to 63 one level, so a
+/// render that applies `contrast(0)` changes #815; a JPEG source
+/// whose first operation is a crop to a fixed alignment (the
+/// center, an edge or a corner) is decoded at reduced scale
+/// before the crop, the smallest frame that still leaves the
+/// crop window at least one and a half times its target on both
+/// axes, so those renders' pixels change #785; and a 16-bit
+/// source bound for an output this pipeline writes only at 8
+/// bits is narrowed to 8 bits before it is resampled, so a
+/// resized render of such a source moves by at most one level a
+/// sample on about a tenth of the frame #814).
+const RENDERING_VERSION: u32 = 9;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
