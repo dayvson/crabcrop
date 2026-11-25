@@ -441,6 +441,17 @@ impl Engine {
             // record stay PNG, the contract from when every
             // renderer wrote PNG. The decode below still sniffs
             // the real bytes, so the TIFF decodes as a TIFF.
+            //
+            // The frame is byte-identical to the PNG's because
+            // the stock pdftocairo attaches no ICC profile or
+            // metadata to either raster, and
+            // `color::extract_source_meta` reads ICC/EXIF/XMP
+            // only from JPEG and PNG, so a TIFF page gets no
+            // source metadata and its pixels are taken as sRGB.
+            // Were a future renderer to attach an ICC profile to
+            // the PNG, the PNG path would color-convert while
+            // the TIFF path (no ICC read) would not; see the
+            // note on `crate::pdf::render_format_for`.
             source.detected = ImageFormat::Png;
         }
         let detected = source.detected;

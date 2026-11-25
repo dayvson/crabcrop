@@ -612,13 +612,23 @@ impl PdfRenderer {
             ));
         }
         // The raster re-enters the pipeline, which decodes it by
-        // content: accept either raster the contract allows, so
-        // a renderer that writes to a file instead of stdout (as
-        // pdftoppm does) is still caught as not an image.
-        if !looks_like_raster(&run.stdout) {
-            return Err(PdfError::Failed(
-                "the PDF renderer's output is not a PNG or TIFF image".to_string(),
-            ));
+        // content; this check catches a renderer that writes to
+        // a file instead of stdout (as pdftoppm does). Each
+        // contract is held to the format it asked for: the stock
+        // TIFF path accepts a PNG or a TIFF (a pdftocairo build
+        // without TIFF support falls back to a PNG that still
+        // decodes), while the PNG path a custom renderer runs
+        // under keeps the original PNG-only check, so a renderer
+        // asked for `-png` that returns anything else is refused
+        // exactly as before this change (issue #786).
+        let (valid, expected): (bool, &str) = match self.render_format {
+            RenderFormat::Tiff => (looks_like_raster(&run.stdout), "a PNG or TIFF image"),
+            RenderFormat::Png => (run.stdout.starts_with(b"\x89PNG\r\n\x1a\n"), "a PNG"),
+        };
+        if !valid {
+            return Err(PdfError::Failed(format!(
+                "the PDF renderer's output is not {expected}"
+            )));
         }
         Ok(RenderedPage {
             raster: run.stdout,
@@ -683,6 +693,19 @@ impl PdfRenderer {
 /// name keeps the PNG contract it was built to, and a wrapper
 /// named `pdftocairo` that passes its arguments through to the
 /// real program honors the TIFF arguments too.
+///
+/// Why the TIFF renders the same output as the PNG did: the
+/// raster re-enters the pipeline, where `extract_source_meta`
+/// reads an ICC profile (and EXIF/XMP) only from a JPEG or a
+/// PNG, so a TIFF page carries none and its pixels are taken
+/// as sRGB. The stock `pdftocairo` (Poppler 24.02) attaches no
+/// ICC or metadata to its PNG either, so the two decode to the
+/// same frame and no color conversion runs on either. This
+/// equivalence depends on that: were a future Poppler to
+/// attach an `iCCP` chunk to the PNG, the PNG path would
+/// convert to sRGB while the TIFF path (no ICC read) would
+/// not, and the outputs would diverge. Reading a TIFF's ICC is
+/// the follow-up that would close that gap.
 fn render_format_for(program: &Path) -> RenderFormat {
     if is_stock_pdftocairo(program) {
         RenderFormat::Tiff
@@ -698,11 +721,14 @@ fn is_stock_pdftocairo(program: &Path) -> bool {
     program.file_stem().and_then(|stem| stem.to_str()) == Some("pdftocairo")
 }
 
-/// Whether bytes open as one of the rasters a renderer may
-/// return: a PNG, or a little- or big-endian TIFF. The check
-/// catches a renderer that writes no image (an empty stdout,
-/// or junk), whichever raster the contract asked it for; the
-/// pipeline decodes either by content.
+/// Whether bytes open as a raster the stock TIFF path accepts:
+/// a PNG, or a little- or big-endian TIFF. The pipeline decodes
+/// either by content, so a pdftocairo build that wrote a PNG
+/// instead of a TIFF still renders; the check catches a program
+/// that writes no image (an empty stdout, or junk). The PNG
+/// path a custom renderer runs under does not use this: it
+/// keeps the strict PNG-only check, so a custom renderer asked
+/// for `-png` that returns a TIFF is refused, not decoded.
 fn looks_like_raster(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         || bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00])
@@ -1436,6 +1462,33 @@ exit 0\n";
                 "-",
                 "-"
             ]
+        );
+    }
+
+    #[test]
+    fn a_custom_renderer_returning_a_tiff_is_rejected() {
+        // The PNG path a custom renderer runs under keeps the
+        // strict PNG-only check (issue #786): a renderer asked
+        // for `-png` that returns a TIFF is refused, exactly as
+        // it was before the stock renderer moved to TIFF, not
+        // decoded. Only the stock pdftocairo's TIFF path accepts
+        // a TIFF.
+        let dir = temp_dir("custom-tiff");
+        let tiff_path = dir.join("page.tiff");
+        std::fs::write(&tiff_path, encode_tiff(&image::RgbImage::new(4, 3))).unwrap();
+        write_tool(&dir, "pdfinfo", INFO_OK);
+        let render = format!(
+            "#!/bin/sh\ncat > /dev/null\ncat '{}'\nexit 0\n",
+            tiff_path.display()
+        );
+        let program = write_tool(&dir, "pdf-wrapper", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+        assert!(matches!(err, PdfError::Failed(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "the PDF renderer's output is not a PNG",
+            "the custom path keeps the strict PNG-only refusal"
         );
     }
 
