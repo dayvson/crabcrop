@@ -212,6 +212,15 @@ const MALLOC_THRESHOLD_BLOCK: usize = 32 * 1024 * 1024 - 64 * 1024;
 /// Other allocators (musl, macOS) have no such thresholds:
 /// there this allocates and frees a block and changes
 /// nothing. A failed allocation is ignored.
+///
+/// Since issue #801 the binary sets jemalloc as its global
+/// allocator, so on glibc too this now allocates and frees a
+/// block through jemalloc and does nothing: jemalloc holds
+/// freed frame buffers on its own decay timer, which
+/// supersedes these thresholds (and keeps the steady-state
+/// footprint lower than the glibc arenas did). The step is
+/// kept, inert, for a build that falls back to the system
+/// allocator (the `msvc` target sets no global allocator).
 fn raise_malloc_thresholds() {
     let mut block: Vec<u8> = Vec::new();
     if block.try_reserve_exact(MALLOC_THRESHOLD_BLOCK).is_ok() {
