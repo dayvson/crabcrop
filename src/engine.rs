@@ -431,7 +431,18 @@ impl Engine {
         // a higher factor) may have used the whole budget:
         // nothing here starts past the deadline.
         ctx.check_deadline()?;
-        let source = Self::sniff_source(bytes)?;
+        let mut source = Self::sniff_source(bytes)?;
+        if pdf.is_some() {
+            // A rendered PDF page re-enters the pipeline as a
+            // raster whose source format is PNG, whatever
+            // container the renderer wrote (issue #786): the
+            // stock renderer writes TIFF now, but the page's
+            // default output format and its source-format
+            // record stay PNG, the contract from when every
+            // renderer wrote PNG. The decode below still sniffs
+            // the real bytes, so the TIFF decodes as a TIFF.
+            source.detected = ImageFormat::Png;
+        }
         let detected = source.detected;
         // keep_profile is convert-or-tag (issue #374): the
         // kept profile is embedded at encode time, which
@@ -629,9 +640,10 @@ impl Engine {
     /// a decoder); the engine sniffs before the renderer
     /// spawns anything, so image bytes and non-PDF bytes
     /// are refused as a bad source here and never reach
-    /// the tool; and the rendered PNG replaces the bytes,
-    /// so the format detection, the validation preflights,
-    /// and the decode chain all see the page. `None` when
+    /// the tool; and the rendered raster replaces the bytes,
+    /// so the validation preflights and the decode chain all
+    /// see the page (its source format is pinned to PNG in
+    /// [`Self::process_selected`], issue #786). `None` when
     /// the request selects no page.
     fn select_page(
         bytes: &[u8],
@@ -668,7 +680,7 @@ impl Engine {
             page_width: rendered.page_width,
             page_height: rendered.page_height,
         };
-        Ok(Some((rendered.png, pdf_meta)))
+        Ok(Some((rendered.raster, pdf_meta)))
     }
 
     /// Sniff the source bytes by content: the format they

@@ -59,7 +59,7 @@
 //! SECURITY.md records this.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -89,6 +89,24 @@ pub(crate) enum ToolInput<'a> {
 /// The feeder behind [`ToolInput::Writer`].
 pub(crate) type Feed = Box<dyn FnOnce(&mut ChildStdin) -> std::io::Result<()> + Send>;
 
+/// Where a tool's stdout goes (issue #786).
+pub(crate) enum StdoutSink {
+    /// A pipe drained on a reader thread and capped at
+    /// `max_stdout` bytes: one byte more kills the process
+    /// group and fails the run. The default for every tool
+    /// whose output is a byte stream.
+    Pipe,
+    /// A seekable in-memory file (a memfd on Linux, a private
+    /// temporary file elsewhere), read back once the tool has
+    /// exited. A tool whose writer seeks its own output cannot
+    /// use a pipe: libtiff seeks back to patch the TIFF header,
+    /// and on a pipe that seek fails. The sink's size is
+    /// bounded by `RLIMIT_FSIZE` at `max_stdout` where that
+    /// limit exists (the same places the other kernel caps do),
+    /// and by the read-back cap everywhere.
+    Seekable,
+}
+
 /// One run of an external tool: the program, its argv, its
 /// input, and the bounds the run obeys.
 pub(crate) struct ToolCommand<'a> {
@@ -98,8 +116,12 @@ pub(crate) struct ToolCommand<'a> {
     pub(crate) args: &'a [&'a str],
     /// What the tool reads on stdin.
     pub(crate) input: ToolInput<'a>,
+    /// Where the tool's stdout goes: a pipe, or a seekable
+    /// in-memory file for a tool that seeks its own output.
+    pub(crate) stdout: StdoutSink,
     /// The most stdout the run accepts: one byte more kills
-    /// the process group and fails the run.
+    /// the process group and fails the run (a piped stdout), or
+    /// fails the run when the seekable sink is read back.
     pub(crate) max_stdout: usize,
     /// How much of stderr the run keeps for the caller to
     /// read. The rest is drained, so the tool never blocks
@@ -258,6 +280,7 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         program,
         args,
         input,
+        stdout: stdout_sink,
         max_stdout,
         max_stderr,
         deadline,
@@ -273,12 +296,24 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         }
         ToolInput::Writer(feed) => (Stdio::piped(), Some(feed)),
     };
+    // A seekable stdout is set up before the spawn: the tool
+    // writes it directly (no reader thread), and it is read
+    // back once the tool exits.
+    let seekable = matches!(stdout_sink, StdoutSink::Seekable);
+    let mut read_back: Option<File> = None;
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(stdin)
-        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
+    if seekable {
+        let sink = seekable_stdout().map_err(ToolError::Spawn)?;
+        let child_sink = sink.try_clone().map_err(ToolError::Spawn)?;
+        cmd.stdout(Stdio::from(child_sink));
+        read_back = Some(sink);
+    } else {
+        cmd.stdout(Stdio::piped());
+    }
     // The temporary directory as the working directory gives
     // a tool that writes under a relative path a scratch
     // place, not the server's own directory. It is hygiene,
@@ -295,7 +330,15 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().map_err(ToolError::Spawn)?;
-    limit_child(child.id(), cpu_limit, max_address_space);
+    // A seekable sink is capped with RLIMIT_FSIZE, beside the
+    // other kernel caps, so a runaway writer meets a hard stop
+    // there as a piped stdout meets the reader's cap.
+    limit_child(
+        child.id(),
+        cpu_limit,
+        max_address_space,
+        seekable.then_some(max_stdout as u64),
+    );
 
     let writer = feed.map(|feed| {
         let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
@@ -311,26 +354,33 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     #[cfg(test)]
     let (stdout_hold, stderr_hold) = READER_HOLD.with(std::cell::Cell::get);
 
-    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 64 * 1024];
-        let result = loop {
-            match stdout_pipe.read(&mut chunk) {
-                Ok(0) => break Ok(buf),
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.len() > max_stdout {
-                        break Err(ToolError::OutputCap(max_stdout));
+    let stdout_thread = if seekable {
+        // The seekable sink is read back after the exit; there
+        // is no pipe to drain and no stdout sender.
+        drop(out_tx);
+        None
+    } else {
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        Some(std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            let result = loop {
+                match stdout_pipe.read(&mut chunk) {
+                    Ok(0) => break Ok(buf),
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() > max_stdout {
+                            break Err(ToolError::OutputCap(max_stdout));
+                        }
                     }
+                    Err(e) => break Err(ToolError::Read(e)),
                 }
-                Err(e) => break Err(ToolError::Read(e)),
-            }
-        };
-        #[cfg(test)]
-        std::thread::sleep(stdout_hold);
-        let _ = out_tx.send(Output::Stdout(result));
-    });
+            };
+            #[cfg(test)]
+            std::thread::sleep(stdout_hold);
+            let _ = out_tx.send(Output::Stdout(result));
+        }))
+    };
 
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
     let stderr_thread = std::thread::spawn(move || {
@@ -374,10 +424,10 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     // ID, which is also its group's, so the group kill at
     // the deadline reaches a child that holds a pipe after
     // the tool has exited.
-    let (mut stdout, mut stderr) = (None, None);
-    while stdout.is_none() || stderr.is_none() {
+    let (mut stdout_from_pipe, mut stderr) = (None, None);
+    while stderr.is_none() || (!seekable && stdout_from_pipe.is_none()) {
         match out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Output::Stdout(Ok(bytes))) => stdout = Some(bytes),
+            Ok(Output::Stdout(Ok(bytes))) => stdout_from_pipe = Some(bytes),
             Ok(Output::Stdout(Err(e))) => {
                 kill_tool(&mut child);
                 return Err(e);
@@ -423,7 +473,13 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     // above, which the deadline bounds.
     drop(stdout_thread);
     drop(stderr_thread);
-    let stdout = stdout.unwrap_or_default();
+    // A seekable sink is read back now the tool has exited and
+    // its writes are whole; a piped stdout came through the
+    // channel above.
+    let stdout = match read_back {
+        Some(sink) => read_seekable(sink, max_stdout)?,
+        None => stdout_from_pipe.unwrap_or_default(),
+    };
     let stderr = stderr.unwrap_or_default();
     Ok(ToolRun {
         status,
@@ -501,7 +557,12 @@ pub(crate) fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
 /// the one call that sets another process's limits, and
 /// it exists nowhere else. Elsewhere this is a no-op, as
 /// before.
-pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64) {
+pub(crate) fn limit_child(
+    pid: u32,
+    cpu_limit: Duration,
+    max_address_space: u64,
+    max_file_size: Option<u64>,
+) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let Ok(raw) = i32::try_from(pid) else {
@@ -535,6 +596,21 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
                 maximum: Some(0),
             },
         );
+        // A seekable stdout is bounded here, so a tool that
+        // seeks and writes without end (or a file it writes
+        // under its working directory) meets a hard stop as a
+        // piped stdout meets the reader's cap. Unset for a
+        // piped stdout, which the reader caps instead.
+        if let Some(bytes) = max_file_size {
+            let _ = rustix::process::prlimit(
+                Some(pid),
+                rustix::process::Resource::Fsize,
+                rustix::process::Rlimit {
+                    current: Some(bytes),
+                    maximum: Some(bytes),
+                },
+            );
+        }
         // `spawn` can return a moment before the child's exec makes
         // it dumpable again (issue #605). Until then its `/proc`
         // files belong to root, and a non-root server's write is
@@ -551,8 +627,62 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = (pid, cpu_limit, max_address_space);
+        let _ = (pid, cpu_limit, max_address_space, max_file_size);
     }
+}
+
+/// A seekable stdout for a tool whose writer seeks its own
+/// output ([`StdoutSink::Seekable`]): a memfd on Linux, which
+/// holds the bytes in memory and never touches the disk, read
+/// back after the tool exits. A tool's writer that seeks back
+/// (libtiff patches the TIFF header) needs a real file under
+/// it, not a pipe.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn seekable_stdout() -> std::io::Result<File> {
+    let fd = rustix::fs::memfd_create("crabcrop-tool-stdout", rustix::fs::MemfdFlags::CLOEXEC)?;
+    Ok(File::from(fd))
+}
+
+/// [`seekable_stdout`] where memfd is unavailable: a private
+/// temporary file, unlinked at once on Unix so only the open
+/// descriptor holds it. `RLIMIT_FSIZE` is applied only where
+/// `prlimit` exists, so here the read-back cap is the bound.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn seekable_stdout() -> std::io::Result<File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut path = std::env::temp_dir();
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.push(format!(
+        "crabcrop-tool-stdout-{}-{unique}",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+    Ok(file)
+}
+
+/// Read a seekable stdout sink back from its start, bounded by
+/// `max_stdout`: a sink that passed the cap (where no
+/// `RLIMIT_FSIZE` held it) fails the run as a piped stdout past
+/// the cap does.
+fn read_seekable(mut sink: File, max_stdout: usize) -> Result<Vec<u8>, ToolError> {
+    sink.seek(SeekFrom::Start(0)).map_err(ToolError::Read)?;
+    let mut buf = Vec::new();
+    // One byte past the cap tells a sink filled to the brim
+    // from one that passed it.
+    sink.take(max_stdout as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(ToolError::Read)?;
+    if buf.len() > max_stdout {
+        return Err(ToolError::OutputCap(max_stdout));
+    }
+    Ok(buf)
 }
 
 /// Apply the resource limits to the calling process
@@ -630,7 +760,12 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        limit_child(child.id(), Duration::from_secs(1), GENEROUS_ADDRESS_SPACE);
+        limit_child(
+            child.id(),
+            Duration::from_secs(1),
+            GENEROUS_ADDRESS_SPACE,
+            None,
+        );
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -717,7 +852,12 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        limit_child(child.id(), tool_cpu_limit(timeout), GENEROUS_ADDRESS_SPACE);
+        limit_child(
+            child.id(),
+            tool_cpu_limit(timeout),
+            GENEROUS_ADDRESS_SPACE,
+            None,
+        );
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -850,9 +990,62 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        limit_child(child.id(), Duration::from_secs(30), 1 << 30);
+        limit_child(child.id(), Duration::from_secs(30), 1 << 30, None);
         let out = child.wait_with_output().unwrap();
         assert!(!out.status.success(), "{}", out.status);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_seekable_stdout_keeps_output_a_writer_seeks_back_into() {
+        // Issue #786: a tool whose writer seeks its stdout
+        // (libtiff patches the TIFF header) cannot use a pipe,
+        // where the seek fails. The seekable sink is a real
+        // file, so the seek lands and the whole output, patched,
+        // is read back. python3 is the suites' helper
+        // interpreter; skip when it is absent.
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        // Write a header and a body, seek to the start, and
+        // overwrite the header: 'NEWHEADER' replaces 'OLDHEADER'
+        // in place, leaving 'NEWHEADER-body-'.
+        let script = "import os\n\
+             os.write(1, b'OLDHEADER')\n\
+             os.write(1, b'-body-')\n\
+             os.lseek(1, 0, os.SEEK_SET)\n\
+             os.write(1, b'NEWHEADER')\n";
+        let argv = ["-c", script];
+        // The seekable sink carries the patched output whole.
+        let run = run_tool(python_tool(&argv, StdoutSink::Seekable)).unwrap();
+        assert!(run.status.success(), "{}: {}", run.status, run.stderr);
+        assert_eq!(run.stdout, b"NEWHEADER-body-");
+        // A pipe cannot be seeked: the lseek raises and the tool
+        // exits nonzero, so a pipe could not carry a TIFF.
+        let run = run_tool(python_tool(&argv, StdoutSink::Pipe)).unwrap();
+        assert!(
+            !run.status.success(),
+            "a pipe stdout cannot be seeked: {:?}",
+            run.stdout
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_seekable_stdout_is_capped_by_its_file_size_limit() {
+        // Issue #786: RLIMIT_FSIZE bounds the seekable sink, so a
+        // tool that writes past the cap is stopped by the kernel
+        // and the run fails, rather than the sink growing without
+        // bound. dd writes 8 KiB under a 1 KiB cap.
+        let argv = ["-c", "dd if=/dev/zero bs=1024 count=8 2>/dev/null"];
+        match run_tool(shell_seekable(&argv, 1024)) {
+            Ok(run) => assert!(
+                !run.status.success(),
+                "the cap must stop the writer: {run:?}"
+            ),
+            Err(ToolError::OutputCap(_)) => {}
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -900,6 +1093,32 @@ mod tests {
             program: Path::new("/bin/sh"),
             args: script,
             input,
+            stdout: StdoutSink::Pipe,
+            max_stdout: 64 * 1024,
+            max_stderr: 64 * 1024,
+            deadline: std::time::Instant::now() + Duration::from_secs(20),
+            cpu_limit: Duration::from_secs(20),
+            max_address_space: GENEROUS_ADDRESS_SPACE,
+        }
+    }
+
+    /// A shell one-liner whose stdout is the seekable sink, for
+    /// the TIFF-render path's mechanism (issue #786).
+    fn shell_seekable<'a>(script: &'a [&'a str; 2], max_stdout: usize) -> ToolCommand<'a> {
+        ToolCommand {
+            stdout: StdoutSink::Seekable,
+            max_stdout,
+            ..shell(script, ToolInput::Bytes(b""))
+        }
+    }
+
+    /// A `python3` one-liner under generous bounds, to `stdout`.
+    fn python_tool<'a>(script: &'a [&'a str; 2], stdout: StdoutSink) -> ToolCommand<'a> {
+        ToolCommand {
+            program: Path::new("python3"),
+            args: script,
+            input: ToolInput::Bytes(b""),
+            stdout,
             max_stdout: 64 * 1024,
             max_stderr: 64 * 1024,
             deadline: std::time::Instant::now() + Duration::from_secs(20),
