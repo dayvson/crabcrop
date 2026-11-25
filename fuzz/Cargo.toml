@@ -16,7 +16,12 @@ cargo-fuzz = true
 # parser, the decoders, the metadata code, and the filters
 # the server runs, not copies of them. Cargo.lock in this
 # directory pins the same versions as the root lockfile.
-crabcrop = { path = ".." }
+# default-features off drops the crate's default `jemalloc`
+# feature (issue #801): the fuzz harness exercises the library,
+# not the binary's global allocator, so it links neither
+# jemalloc nor its C sources, and fuzz/Cargo.lock carries no
+# jemalloc entries.
+crabcrop = { path = "..", default-features = false }
 crabcrop-url = { path = "../crates/crabcrop-url" }
 libfuzzer-sys = "0.4"
 # The harness builds images and probes dimensions itself;

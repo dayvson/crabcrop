@@ -25,7 +25,11 @@
 // on free, which lowers allocator cost on the hit and render paths.
 // The unsafe `GlobalAlloc` implementation lives in the crate, so this
 // binary keeps `#![forbid(unsafe_code)]`.
-#[cfg(not(target_env = "msvc"))]
+//
+// It is the default `jemalloc` feature: `--no-default-features` builds
+// without it and falls back to the system allocator (glibc on the
+// shipped Linux images), where issue #690 below applies.
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -213,14 +217,15 @@ const MALLOC_THRESHOLD_BLOCK: usize = 32 * 1024 * 1024 - 64 * 1024;
 /// there this allocates and frees a block and changes
 /// nothing. A failed allocation is ignored.
 ///
-/// Since issue #801 the binary sets jemalloc as its global
-/// allocator, so on glibc too this now allocates and frees a
-/// block through jemalloc and does nothing: jemalloc holds
-/// freed frame buffers on its own decay timer, which
-/// supersedes these thresholds (and keeps the steady-state
-/// footprint lower than the glibc arenas did). The step is
-/// kept, inert, for a build that falls back to the system
-/// allocator (the `msvc` target sets no global allocator).
+/// Since issue #801 the default `jemalloc` feature sets
+/// jemalloc as the global allocator, and jemalloc holds freed
+/// frame buffers on its own decay timer, which supersedes
+/// these thresholds (and keeps the steady-state footprint
+/// lower than the glibc arenas did): under that feature this
+/// allocates and frees a block through jemalloc and does
+/// nothing. It is live only in a `--no-default-features` build
+/// that falls back to the system allocator (and on the `msvc`
+/// target, which sets no global allocator either way).
 fn raise_malloc_thresholds() {
     let mut block: Vec<u8> = Vec::new();
     if block.try_reserve_exact(MALLOC_THRESHOLD_BLOCK).is_ok() {

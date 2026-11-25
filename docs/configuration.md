@@ -199,3 +199,7 @@ An unknown key ID is indistinguishable from a bad signature, by design: `403`, n
 ### Diagnostics
 
 `CRABCROP_STUDIO_TIMING`, set to any value, prints the elapsed time of each `studio(...)` pipeline stage to stderr, one `[studio-timing] <stage>: <ms> ms` line per stage. It is a profiling aid, read once per process: responses, cache keys, and the configuration fingerprint are unchanged. Leave it unset in production.
+
+### Allocator
+
+The server links jemalloc as its global allocator (issue #801). This is where its cache-hit throughput comes from: under many concurrent hits, jemalloc's per-thread caches avoid the contention on glibc's malloc arenas, and it returns freed render buffers to the OS for a leaner resident footprint. It is a build-time choice — the default `jemalloc` feature — not a runtime setting, and it changes no output byte. The shipped Docker images, release binaries and Homebrew install all carry it. Build with `--no-default-features` (plus the features you need, for example `--features avif-decode`) to drop jemalloc and use the system allocator instead; on glibc that restores the `raise_malloc_thresholds` startup step (issue #690).

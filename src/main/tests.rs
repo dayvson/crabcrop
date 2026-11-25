@@ -1571,7 +1571,9 @@ fn build_state_names_a_component_that_does_not_build() {
 }
 
 /// The minor page faults this thread has taken (Linux).
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// Used only by the #690 fault test, so it follows the same
+/// cfg: compiled out under the default jemalloc feature (#801).
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
 fn minor_faults() -> u64 {
     let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
     // The fields after the command name, which is in
@@ -1587,7 +1589,9 @@ fn minor_faults() -> u64 {
 /// this binary move them. Prints the page faults of one
 /// round of a render's blocks, once the first round is
 /// over.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+// The helper for the #690 test above; compiled out under the default
+// jemalloc feature with it (issue #801).
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
 #[test]
 #[ignore = "run in a process of its own by raised_malloc_thresholds_keep_a_renders_blocks"]
 fn malloc_churn_helper() {
@@ -1617,19 +1621,16 @@ fn malloc_churn_helper() {
     println!("faults_per_round={}", later[later.len() / 2]);
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+// Checks the glibc #690 path, so it is compiled out when the default
+// `jemalloc` feature is on (issue #801): jemalloc governs retention on its
+// own decay timer, which makes raise_malloc_thresholds a no-op (raise=0 and
+// raise=1 both measured about 4,700 faults a round), so the assertion below
+// cannot hold under it. jemalloc returns the freed blocks deliberately for a
+// leaner footprint, and the per-render faults that returns are immaterial to
+// the CPU-bound render throughput (#801 measured renders at the glibc rate).
+// Without the feature (the system allocator) #690 applies and this runs.
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
 #[test]
-// Ignored on the shipped binary: this checks the glibc #690 path, but
-// since issue #801 the binary sets jemalloc as its global allocator, and
-// jemalloc governs retention on its own decay timer, which makes
-// raise_malloc_thresholds a no-op (raise=0 and raise=1 both measured about
-// 4,700 faults a round). jemalloc returns the freed blocks deliberately for
-// a leaner steady-state footprint; the per-render faults that returns are
-// immaterial to the CPU-bound render throughput (#801 measured renders at
-// the glibc rate). There is no cfg for which allocator is linked in, so the
-// test is kept and run with `--ignored` on a build that uses the system
-// allocator, where #690 still applies.
-#[ignore = "glibc-only: jemalloc (#801) supersedes #690; run with --ignored on a system-allocator build"]
 fn raised_malloc_thresholds_keep_a_renders_blocks() {
     // Issue #690. A fresh process hands a render's blocks
     // back to the kernel when they total more than twice
