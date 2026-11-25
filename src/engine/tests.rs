@@ -7532,6 +7532,84 @@ fn pdf_test_renderer(
     (dir, renderer)
 }
 
+/// A fake PDF renderer whose render step writes `raster`
+/// verbatim, under the program name `program_name`: a name of
+/// `pdftocairo` takes the stock TIFF path, any other the PNG
+/// fallback (issue #786). The probe reports one 612x792 page.
+fn pdf_renderer_emitting(
+    name: &str,
+    program_name: &str,
+    raster: &[u8],
+) -> (crate::test_support::ScratchDir, crate::pdf::PdfRenderer) {
+    let dir = crate::test_support::scratch_dir(&format!("engine-pdf-{name}"));
+    std::fs::write(dir.join("raster"), raster).unwrap();
+    let raster_path = dir.join("raster").display().to_string();
+    crate::test_support::write_script(
+        &dir.join("pdfinfo"),
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page size:       612 x 792 pts (letter)'\nexit 0\n",
+    );
+    crate::test_support::write_script(
+        &dir.join(program_name),
+        &format!("#!/bin/sh\ncat > /dev/null\ncat \"{raster_path}\"\nexit 0\n"),
+    );
+    let renderer =
+        crate::pdf::PdfRenderer::new(dir.join(program_name), std::time::Duration::from_secs(30))
+            .unwrap();
+    (dir, renderer)
+}
+
+#[test]
+fn a_tiff_rendered_page_matches_the_png_path_byte_for_byte() {
+    // Issue #786: the stock renderer writes a TIFF and any
+    // other renderer a PNG, both decode to the same frame, so a
+    // page: request renders byte-for-byte the same output and
+    // its default output format stays PNG. The same image,
+    // encoded as an uncompressed TIFF and as a PNG, stands in
+    // for the two renderers' output.
+    let engine = Engine;
+    let mut raw = image::RgbImage::new(8, 6);
+    for (x, y, pixel) in raw.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x * 30) as u8, (y * 40) as u8, 60]);
+    }
+    let img = DynamicImage::ImageRgb8(raw);
+    let encode = |format| {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, format).unwrap();
+        buf.into_inner()
+    };
+    let (_stock_dir, stock) = pdf_renderer_emitting(
+        "stock-tiff",
+        "pdftocairo",
+        &encode(image::ImageFormat::Tiff),
+    );
+    let (_custom_dir, custom) = pdf_renderer_emitting(
+        "custom-png",
+        "pdf-wrapper",
+        &encode(image::ImageFormat::Png),
+    );
+    let render = |renderer: &crate::pdf::PdfRenderer| {
+        engine
+            .process_preferred(
+                FAKE_PDF_BYTES,
+                &[Operation::Page(1)],
+                ProcessContext {
+                    pdf_renderer: Some(renderer),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    let from_tiff = render(&stock);
+    let from_png = render(&custom);
+    // The page's default output format stays PNG whichever
+    // raster the renderer wrote.
+    assert_eq!(from_tiff.format, ImageFormat::Png);
+    assert_eq!(from_png.format, ImageFormat::Png);
+    assert_eq!((from_tiff.width, from_tiff.height), (8, 6));
+    // The TIFF path renders the PNG path's exact output bytes.
+    assert_eq!(from_tiff.bytes, from_png.bytes);
+}
+
 /// Bytes that carry the PDF header and sniff as no
 /// image (the tools are fake; the document is never
 /// really parsed in these tests).

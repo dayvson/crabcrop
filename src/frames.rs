@@ -717,6 +717,7 @@ impl VideoFrameExtractor {
             program: &self.program,
             args,
             input: ToolInput::File(stdin),
+            stdout: crate::toolrun::StdoutSink::Pipe,
             max_stdout,
             max_stderr: PROBE_REPORT_CAP,
             deadline,

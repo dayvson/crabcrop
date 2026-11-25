@@ -28,17 +28,29 @@
 //!   Facts the design needs before rendering are probe
 //!   facts, so the probe runs first, every time.
 //! - Render: the configured program (Poppler's
-//!   `pdftocairo` is the reference), run as
-//!   `-png -singlefile -cropbox -f <n> -l <n> -r <dpi> - -`:
-//!   the PDF on stdin, one PNG on stdout, at a fixed
-//!   scale of 2.0 (144 DPI) clamped so neither raster
-//!   axis exceeds the 16383 px output limit, and the
-//!   raster area stays within 64 Mpx, at the probed page
-//!   size. `-cropbox` makes the renderer draw the crop
-//!   box, the box the probe measured, so the clamp is
-//!   computed from the box that is drawn. Without it the
-//!   renderer draws the media box, which a page may
-//!   declare far larger than its crop box.
+//!   `pdftocairo` is the reference). The stock `pdftocairo`
+//!   is run as
+//!   `-tiff -tiffcompression none -singlefile -cropbox -f <n> -l <n> -r <dpi> - -`:
+//!   the PDF on stdin, one uncompressed TIFF on stdout, which
+//!   the pipeline decodes to the same frame as the PNG but
+//!   writes far faster (its PNG writer dominated a
+//!   photographic page's render, issue #786). A TIFF writer
+//!   seeks its output to patch the header, which a pipe
+//!   cannot do, so the render's stdout is a seekable memfd
+//!   capped with `RLIMIT_FSIZE` ([`crate::toolrun`]). Any
+//!   other renderer keeps the original contract,
+//!   `-png -singlefile -cropbox -f <n> -l <n> -r <dpi> - -`
+//!   on a pipe, so a custom `CRABCROP_PDF_RENDERER` wrapper
+//!   built to the PNG interface goes on working
+//!   ([`is_stock_pdftocairo`]). Either way the page renders at
+//!   a fixed scale of 2.0 (144 DPI) clamped so neither raster
+//!   axis exceeds the 16383 px output limit, and the raster
+//!   area stays within 64 Mpx, at the probed page size.
+//!   `-cropbox` makes the renderer draw the crop box, the box
+//!   the probe measured, so the clamp is computed from the box
+//!   that is drawn. Without it the renderer draws the media
+//!   box, which a page may declare far larger than its crop
+//!   box.
 //!
 //! The raster clamp bounds the surface the renderer draws,
 //! not the images a page draws on it: Poppler decodes an
@@ -56,15 +68,19 @@
 //! one whose decode alone cannot fit the cap is refused
 //! before any tool runs (see `oversized_jpx`).
 //!
-//! The rendered PNG re-enters the image pipeline as
+//! The rendered raster re-enters the image pipeline as
 //! the source, so every downstream budget (decode
 //! dimensions and allocation, output pixels) applies to
-//! it unchanged.
+//! it unchanged. Its source format is pinned to PNG there
+//! (issue #786), so the page's default output format stays
+//! PNG whether the raster was a PNG or a TIFF.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::toolrun::{ToolCommand, ToolError, ToolInput, ToolRun, run_tool, tool_cpu_limit};
+use crate::toolrun::{
+    StdoutSink, ToolCommand, ToolError, ToolInput, ToolRun, run_tool, tool_cpu_limit,
+};
 
 /// The most pages a document may have before the
 /// pipeline refuses it (issue #215). The cap bounds
@@ -74,13 +90,14 @@ use crate::toolrun::{ToolCommand, ToolError, ToolInput, ToolRun, run_tool, tool_
 /// so the count multiplies no work.
 pub const MAX_PDF_PAGES: u32 = 1000;
 
-/// Cap on the rendered page's PNG bytes. Tied to the
-/// engine's decode allocation budget (256 MiB), the
-/// frames rationale verbatim: a page whose PNG passes
-/// this can never survive the decode budgets, so
-/// anything larger is a broken or hostile tool, not a
-/// page.
-pub const MAX_PAGE_PNG_BYTES: usize = 256 * 1024 * 1024;
+/// Cap on the rendered page's raster bytes, PNG or TIFF.
+/// Tied to the engine's decode allocation budget (256 MiB),
+/// the frames rationale verbatim: a page whose raster passes
+/// this can never survive the decode budgets, so anything
+/// larger is a broken or hostile tool, not a page. An
+/// uncompressed TIFF of the largest raster the clamp allows
+/// (64 Mpx RGB) is 192 MiB, within the cap.
+pub const MAX_PAGE_RASTER_BYTES: usize = 256 * 1024 * 1024;
 
 /// The fixed render scale: pages render at twice their
 /// nominal size (144 DPI), the frames precedent of
@@ -226,12 +243,29 @@ pub struct PdfProbe {
     pub page_height: f64,
 }
 
+/// The raster the renderer writes, which the pipeline
+/// decodes as the page's source image (issue #786). The
+/// stock `pdftocairo` writes a TIFF through a seekable
+/// stdout, whose PNG writer dominated a photographic page's
+/// render; any other renderer keeps the PNG contract, so a
+/// custom program built to the documented PNG interface goes
+/// on working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderFormat {
+    /// `pdftocairo -tiff -tiffcompression none ...` to a
+    /// seekable stdout.
+    Tiff,
+    /// `pdftocairo -png ...` to a piped stdout: the original
+    /// contract, kept for a custom renderer.
+    Png,
+}
+
 /// One rendered page and the facts meta reports.
 #[derive(Debug)]
 pub struct RenderedPage {
-    /// The page as PNG bytes, ready to decode as the
-    /// source image.
-    pub png: Vec<u8>,
+    /// The page as raster bytes (PNG, or TIFF from the stock
+    /// renderer), ready to decode as the source image.
+    pub raster: Vec<u8>,
     /// The document's total page count, for meta.
     pub pages: u32,
     /// The selected page (1-based, after the grammar's
@@ -260,7 +294,7 @@ pub enum PdfError {
     Unsupported(String),
     /// The tool itself failed: it could not be spawned,
     /// timed out, exited nonzero, produced no page, or
-    /// produced output past the cap or not a PNG.
+    /// produced output past the cap or not a raster.
     Failed(String),
 }
 
@@ -296,6 +330,9 @@ pub struct PdfRenderer {
     /// [`DEFAULT_RENDERER_ADDRESS_SPACE`] unless
     /// [`Self::with_address_space`] set another.
     max_address_space: u64,
+    /// The raster the render step asks for: TIFF for the stock
+    /// `pdftocairo`, PNG for any other renderer.
+    render_format: RenderFormat,
 }
 
 impl PdfRenderer {
@@ -315,11 +352,13 @@ impl PdfRenderer {
             )),
             other => other,
         })?;
+        let render_format = render_format_for(&program);
         Ok(Self {
             program,
             probe_program,
             timeout,
             max_address_space: DEFAULT_RENDERER_ADDRESS_SPACE,
+            render_format,
         })
     }
 
@@ -339,16 +378,16 @@ impl PdfRenderer {
     /// The boot check (issue #715): render the page of a
     /// one-page test document as a `page:` request renders
     /// one, the probe and then the renderer, and decode the
-    /// PNG. Two programs that exist and run can still fail
+    /// raster. Two programs that exist and run can still fail
     /// every page: Poppler's `pdftoppm`, for one, takes the
-    /// renderer's arguments but writes its PNG to a file, so
+    /// renderer's arguments but writes its image to a file, so
     /// it prints nothing, and every `page:` request would
     /// answer `502`. Such a pair fails here instead, at boot.
     pub fn self_test(&self) -> Result<(), PdfError> {
         let failed = |why: String| {
             PdfError::Failed(format!(
                 "a one-page test document did not render: {why}. The renderer must take the \
-                 arguments pdftocairo takes and write the page to standard output as one PNG"
+                 arguments pdftocairo takes and write the page to standard output as one image"
             ))
         };
         let page = self
@@ -360,8 +399,8 @@ impl PdfRenderer {
                 page.pages
             )));
         }
-        image::load_from_memory_with_format(&page.png, image::ImageFormat::Png)
-            .map_err(|e| failed(format!("the PNG the renderer wrote does not decode: {e}")))?;
+        image::load_from_memory(&page.raster)
+            .map_err(|e| failed(format!("the image the renderer wrote does not decode: {e}")))?;
         Ok(())
     }
 
@@ -439,6 +478,7 @@ impl PdfRenderer {
                     pdf,
                     PROBE_REPORT_CAP,
                     deadline,
+                    StdoutSink::Pipe,
                 )
             }
             None => self.run(
@@ -448,6 +488,7 @@ impl PdfRenderer {
                 pdf,
                 PROBE_REPORT_CAP,
                 deadline,
+                StdoutSink::Pipe,
             ),
         }
     }
@@ -512,28 +553,41 @@ impl PdfRenderer {
         let dpi = (scale * 72.0).floor().max(MIN_RENDER_DPI);
         let dpi_arg = format!("{dpi}");
         let page_arg = page.to_string();
-        // `-cropbox`: draw the crop box, the size the probe
-        // reported and the scale was clamped for, not the
-        // media box, which can be larger.
+        // The stock pdftocairo renders a TIFF through a seekable
+        // stdout (issue #786): its PNG writer dominated a
+        // photographic page's render, while the TIFF decodes to
+        // the same frame. `-tiffcompression none` leaves the
+        // raster uncompressed, which is what makes the writer
+        // cheap. Any other renderer keeps the PNG contract on a
+        // pipe, so a custom program built to it goes on working.
+        // `-cropbox` draws the crop box, the size the probe
+        // reported and the scale was clamped for, not the media
+        // box, which can be larger.
+        let (format_args, sink): (&[&str], StdoutSink) = match self.render_format {
+            RenderFormat::Tiff => (&["-tiff", "-tiffcompression", "none"], StdoutSink::Seekable),
+            RenderFormat::Png => (&["-png"], StdoutSink::Pipe),
+        };
+        let mut args: Vec<&str> = format_args.to_vec();
+        args.extend_from_slice(&[
+            "-singlefile",
+            "-cropbox",
+            "-f",
+            &page_arg,
+            "-l",
+            &page_arg,
+            "-r",
+            &dpi_arg,
+            "-",
+            "-",
+        ]);
         let run = self.run(
             &self.program,
             "renderer",
-            &[
-                "-png",
-                "-singlefile",
-                "-cropbox",
-                "-f",
-                &page_arg,
-                "-l",
-                &page_arg,
-                "-r",
-                &dpi_arg,
-                "-",
-                "-",
-            ],
+            &args,
             pdf,
-            MAX_PAGE_PNG_BYTES,
+            MAX_PAGE_RASTER_BYTES,
             deadline,
+            sink,
         )?;
         if !run.status.success() {
             if run.stderr.contains("Incorrect password") {
@@ -557,13 +611,27 @@ impl PdfRenderer {
                 "the PDF renderer produced no output".to_string(),
             ));
         }
-        if !run.stdout.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err(PdfError::Failed(
-                "the PDF renderer's output is not a PNG".to_string(),
-            ));
+        // The raster re-enters the pipeline, which decodes it by
+        // content; this check catches a renderer that writes to
+        // a file instead of stdout (as pdftoppm does). Each
+        // contract is held to the format it asked for: the stock
+        // TIFF path accepts a PNG or a TIFF (a pdftocairo build
+        // without TIFF support falls back to a PNG that still
+        // decodes), while the PNG path a custom renderer runs
+        // under keeps the original PNG-only check, so a renderer
+        // asked for `-png` that returns anything else is refused
+        // exactly as before this change (issue #786).
+        let (valid, expected): (bool, &str) = match self.render_format {
+            RenderFormat::Tiff => (looks_like_raster(&run.stdout), "a PNG or TIFF image"),
+            RenderFormat::Png => (run.stdout.starts_with(b"\x89PNG\r\n\x1a\n"), "a PNG"),
+        };
+        if !valid {
+            return Err(PdfError::Failed(format!(
+                "the PDF renderer's output is not {expected}"
+            )));
         }
         Ok(RenderedPage {
-            png: run.stdout,
+            raster: run.stdout,
             pages: probe.pages,
             page,
             page_width: probe.page_width,
@@ -573,8 +641,11 @@ impl PdfRenderer {
 
     /// Run one of the tools once through the shared runner
     /// ([`crate::toolrun::run_tool`]): the source bytes on
-    /// stdin, stdout capped at `max_stdout`, and stderr kept
-    /// up to the report cap.
+    /// stdin, stdout to `stdout` (a pipe for the probe and the
+    /// PNG renderer, a seekable sink for the TIFF renderer)
+    /// capped at `max_stdout`, and stderr kept up to the report
+    /// cap.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         program: &Path,
@@ -583,11 +654,13 @@ impl PdfRenderer {
         stdin_bytes: &[u8],
         max_stdout: usize,
         deadline: Instant,
+        stdout: StdoutSink,
     ) -> Result<ToolRun, PdfError> {
         run_tool(ToolCommand {
             program,
             args,
             input: ToolInput::Bytes(stdin_bytes),
+            stdout,
             max_stdout,
             max_stderr: PROBE_REPORT_CAP,
             deadline,
@@ -610,6 +683,56 @@ impl PdfRenderer {
             })
         })
     }
+}
+
+/// The render format for a configured renderer (issue
+/// #786): the stock Poppler `pdftocairo` renders a TIFF, any
+/// other program a PNG. The stock program is the one whose
+/// file name, without any platform extension, is
+/// `pdftocairo`: a custom renderer or a wrapper under another
+/// name keeps the PNG contract it was built to, and a wrapper
+/// named `pdftocairo` that passes its arguments through to the
+/// real program honors the TIFF arguments too.
+///
+/// Why the TIFF renders the same output as the PNG did: the
+/// raster re-enters the pipeline, where `extract_source_meta`
+/// reads an ICC profile (and EXIF/XMP) only from a JPEG or a
+/// PNG, so a TIFF page carries none and its pixels are taken
+/// as sRGB. The stock `pdftocairo` (Poppler 24.02) attaches no
+/// ICC or metadata to its PNG either, so the two decode to the
+/// same frame and no color conversion runs on either. This
+/// equivalence depends on that: were a future Poppler to
+/// attach an `iCCP` chunk to the PNG, the PNG path would
+/// convert to sRGB while the TIFF path (no ICC read) would
+/// not, and the outputs would diverge. Reading a TIFF's ICC is
+/// the follow-up that would close that gap.
+fn render_format_for(program: &Path) -> RenderFormat {
+    if is_stock_pdftocairo(program) {
+        RenderFormat::Tiff
+    } else {
+        RenderFormat::Png
+    }
+}
+
+/// Whether a renderer path is the stock `pdftocairo`: its
+/// file stem is exactly `pdftocairo` (so `pdftocairo` and
+/// `pdftocairo.exe` match, `pdftocairo-wrapper` does not).
+fn is_stock_pdftocairo(program: &Path) -> bool {
+    program.file_stem().and_then(|stem| stem.to_str()) == Some("pdftocairo")
+}
+
+/// Whether bytes open as a raster the stock TIFF path accepts:
+/// a PNG, or a little- or big-endian TIFF. The pipeline decodes
+/// either by content, so a pdftocairo build that wrote a PNG
+/// instead of a TIFF still renders; the check catches a program
+/// that writes no image (an empty stdout, or junk). The PNG
+/// path a custom renderer runs under does not use this: it
+/// keeps the strict PNG-only check, so a custom renderer asked
+/// for `-png` that returns a TIFF is refused, not decoded.
+fn looks_like_raster(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+        || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
 }
 
 /// The probe program for a renderer path: the `pdfinfo`
@@ -1183,10 +1306,33 @@ Page size:       792 x 612 pts (letter)
         info_script: &str,
         render_script: &str,
     ) -> (crate::test_support::ScratchDir, PathBuf) {
+        fake_pair_named(name, "pdftocairo", info_script, render_script)
+    }
+
+    /// A fake tool pair whose renderer carries `renderer_name`:
+    /// `pdftocairo` takes the stock TIFF contract, any other
+    /// name the PNG fallback (issue #786). The probe is always
+    /// `pdfinfo`, the sibling the renderer derives.
+    fn fake_pair_named(
+        name: &str,
+        renderer_name: &str,
+        info_script: &str,
+        render_script: &str,
+    ) -> (crate::test_support::ScratchDir, PathBuf) {
         let dir = temp_dir(name);
         write_tool(&dir, "pdfinfo", info_script);
-        let renderer = write_tool(&dir, "pdftocairo", render_script);
+        let renderer = write_tool(&dir, renderer_name, render_script);
         (dir, renderer)
+    }
+
+    /// An uncompressed TIFF of `img`, as `-tiffcompression none`
+    /// writes; the encoder seeks its output, which is why the
+    /// render path needs a seekable stdout.
+    fn encode_tiff(img: &image::RgbImage) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Tiff)
+            .expect("the TIFF encodes");
+        buf.into_inner()
     }
 
     const INFO_OK: &str = "#!/bin/sh\n\
@@ -1239,7 +1385,7 @@ exit 0\n";
             program.parent().unwrap().join("pdfinfo")
         );
         let rendered = renderer.render_page(b"%PDF- fake", 2).unwrap();
-        assert!(rendered.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(rendered.raster.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(rendered.pages, 3);
         assert_eq!(rendered.page, 2);
         assert_eq!((rendered.page_width, rendered.page_height), (612.0, 792.0));
@@ -1266,6 +1412,44 @@ exit 0\n";
         assert_eq!(
             recorded.lines().collect::<Vec<_>>(),
             [
+                "-tiff",
+                "-tiffcompression",
+                "none",
+                "-singlefile",
+                "-cropbox",
+                "-f",
+                "2",
+                "-l",
+                "2",
+                "-r",
+                "144",
+                "-",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_custom_renderer_keeps_the_png_contract() {
+        // A renderer whose name is not pdftocairo gets the
+        // original PNG argv on a piped stdout (issue #786), so a
+        // custom CRABCROP_PDF_RENDERER wrapper built to the PNG
+        // interface goes on working.
+        let dir = temp_dir("custom-argv");
+        let argv = dir.join("argv");
+        write_tool(&dir, "pdfinfo", INFO_OK);
+        let render = format!(
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' \"$@\" > '{}'\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+            argv.display()
+        );
+        let program = write_tool(&dir, "pdf-wrapper", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let rendered = renderer.render_page(b"%PDF- fake", 2).unwrap();
+        assert!(rendered.raster.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            [
                 "-png",
                 "-singlefile",
                 "-cropbox",
@@ -1279,6 +1463,61 @@ exit 0\n";
                 "-"
             ]
         );
+    }
+
+    #[test]
+    fn a_custom_renderer_returning_a_tiff_is_rejected() {
+        // The PNG path a custom renderer runs under keeps the
+        // strict PNG-only check (issue #786): a renderer asked
+        // for `-png` that returns a TIFF is refused, exactly as
+        // it was before the stock renderer moved to TIFF, not
+        // decoded. Only the stock pdftocairo's TIFF path accepts
+        // a TIFF.
+        let dir = temp_dir("custom-tiff");
+        let tiff_path = dir.join("page.tiff");
+        std::fs::write(&tiff_path, encode_tiff(&image::RgbImage::new(4, 3))).unwrap();
+        write_tool(&dir, "pdfinfo", INFO_OK);
+        let render = format!(
+            "#!/bin/sh\ncat > /dev/null\ncat '{}'\nexit 0\n",
+            tiff_path.display()
+        );
+        let program = write_tool(&dir, "pdf-wrapper", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+        assert!(matches!(err, PdfError::Failed(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "the PDF renderer's output is not a PNG",
+            "the custom path keeps the strict PNG-only refusal"
+        );
+    }
+
+    #[test]
+    fn the_stock_renderer_renders_a_tiff_through_the_seekable_stdout() {
+        // The stock pdftocairo renders a TIFF; the fake writes a
+        // real one through the seekable stdout, and render_page
+        // hands it back whole, decoding to the drawn pixels
+        // (issue #786).
+        let dir = temp_dir("stock-tiff");
+        let tiff_path = dir.join("page.tiff");
+        let mut img = image::RgbImage::new(4, 3);
+        img.put_pixel(0, 0, image::Rgb([10, 20, 30]));
+        img.put_pixel(3, 2, image::Rgb([200, 100, 50]));
+        let tiff = encode_tiff(&img);
+        std::fs::write(&tiff_path, &tiff).unwrap();
+        write_tool(&dir, "pdfinfo", INFO_OK);
+        let render = format!(
+            "#!/bin/sh\ncat > /dev/null\ncat '{}'\nexit 0\n",
+            tiff_path.display()
+        );
+        let program = write_tool(&dir, "pdftocairo", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let rendered = renderer.render_page(b"%PDF- fake", 1).unwrap();
+        assert_eq!(rendered.raster, tiff, "the TIFF is read back whole");
+        let decoded = image::load_from_memory(&rendered.raster).unwrap().to_rgb8();
+        assert_eq!((decoded.width(), decoded.height()), (4, 3));
+        assert_eq!(decoded.get_pixel(0, 0), &image::Rgb([10, 20, 30]));
+        assert_eq!(decoded.get_pixel(3, 2), &image::Rgb([200, 100, 50]));
     }
 
     #[test]
@@ -1517,6 +1756,7 @@ exit 0\n";
                 b"input",
                 1024,
                 Instant::now() + Duration::from_secs(10),
+                StdoutSink::Pipe,
             )
             .unwrap_err();
         assert!(matches!(err, PdfError::Failed(_)), "{err}");
@@ -1594,12 +1834,13 @@ exit 0\n";
         out
     }
 
-    /// A PNG's width and height from its header, without
-    /// decoding the raster.
-    fn png_size(png: &[u8]) -> (u32, u32) {
-        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n") && png.len() >= 24);
-        let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
-        (be(16), be(20))
+    /// A rendered raster's width and height, by decoding it:
+    /// the format is sniffed, so it reads a PNG or a TIFF.
+    fn raster_size(raster: &[u8]) -> (u32, u32) {
+        let img = image::load_from_memory(raster)
+            .expect("the rendered raster decodes")
+            .to_rgb8();
+        (img.width(), img.height())
     }
 
     /// The reference tools' directory, resolved from
@@ -1635,7 +1876,7 @@ exit 0\n";
         assert_eq!((probe.page_width, probe.page_height), (612.0, 792.0));
 
         let center = |page: &RenderedPage| {
-            let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
+            let img = image::load_from_memory(&page.raster).unwrap().to_rgb8();
             assert_eq!((img.width(), img.height()), (1224, 1584));
             let p = img.get_pixel(612, 792);
             (p[0], p[1], p[2])
@@ -1664,6 +1905,65 @@ exit 0\n";
         assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
     }
 
+    /// End to end against the real Poppler: the stock render
+    /// path's TIFF decodes to the same frame as the PNG the
+    /// renderer wrote before (issue #786), so no rendered
+    /// output changes. The two pages are a solid red and a
+    /// solid blue page, but the frames are compared whole, not
+    /// by a sample.
+    #[test]
+    fn real_tools_render_tiff_and_png_to_the_same_frame() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program.clone(), Duration::from_secs(30)).unwrap();
+        let bytes = two_page_pdf();
+        for page in 1..=2u32 {
+            // The stock render path now writes a TIFF.
+            let tiff = renderer.render_page(&bytes, page).unwrap();
+            assert!(
+                tiff.raster.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+                    || tiff.raster.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]),
+                "the stock render path writes a TIFF"
+            );
+            // The PNG the renderer wrote before: the same
+            // arguments but -png on a pipe.
+            let page_arg = page.to_string();
+            let png = renderer
+                .run(
+                    &program,
+                    "renderer",
+                    &[
+                        "-png",
+                        "-singlefile",
+                        "-cropbox",
+                        "-f",
+                        &page_arg,
+                        "-l",
+                        &page_arg,
+                        "-r",
+                        "144",
+                        "-",
+                        "-",
+                    ],
+                    &bytes,
+                    MAX_PAGE_RASTER_BYTES,
+                    Instant::now() + Duration::from_secs(30),
+                    StdoutSink::Pipe,
+                )
+                .unwrap();
+            assert!(png.status.success(), "{}", png.stderr_excerpt());
+            assert!(png.stdout.starts_with(b"\x89PNG\r\n\x1a\n"));
+            // Both decode to the same frame, byte for byte.
+            let from_tiff = image::load_from_memory(&tiff.raster).unwrap().to_rgba8();
+            let from_png = image::load_from_memory(&png.stdout).unwrap().to_rgba8();
+            assert_eq!(
+                from_tiff, from_png,
+                "page {page}: the TIFF decodes to the PNG's frame"
+            );
+        }
+    }
+
     /// End to end against the real Poppler: a page whose
     /// media box is ten times its crop box on each side.
     /// The probe reports the crop box, the clamp is sized
@@ -1689,7 +1989,7 @@ exit 0\n";
         assert_eq!(render_scale(410.0, 410.0), RENDER_SCALE);
 
         let page = renderer.render_page(&bytes, 1).unwrap();
-        let (width, height) = png_size(&page.png);
+        let (width, height) = raster_size(&page.raster);
         assert_eq!(
             (width, height),
             (820, 820),
@@ -1697,7 +1997,7 @@ exit 0\n";
         );
         assert!(f64::from(width) * f64::from(height) <= MAX_RASTER_PIXELS);
         assert_eq!((page.page_width, page.page_height), (410.0, 410.0));
-        let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
+        let img = image::load_from_memory(&page.raster).unwrap().to_rgb8();
         for (x, y) in [(0, 0), (819, 0), (0, 819), (819, 819), (410, 410)] {
             let p = img.get_pixel(x, y);
             assert!(
@@ -1730,9 +2030,11 @@ exit 0\n";
 
     /// End to end against the real Poppler: a page whose
     /// crop box is its media box, stated or by default, and
-    /// a rotated one, render the same bytes as the renderer
-    /// run without `-cropbox`, the invocation before the
-    /// renderer was asked for the crop box.
+    /// a rotated one, render the same bytes with `-cropbox`
+    /// as the renderer run without it, so asking for the crop
+    /// box changes no bytes when the boxes already match. The
+    /// comparison is in the stock TIFF the render path now
+    /// produces (issue #786), through the same seekable sink.
     #[test]
     fn real_tools_render_pages_with_matching_boxes_as_before() {
         let Some(program) = poppler_renderer() else {
@@ -1759,7 +2061,9 @@ exit 0\n";
                         &program,
                         "renderer",
                         &[
-                            "-png",
+                            "-tiff",
+                            "-tiffcompression",
+                            "none",
                             "-singlefile",
                             "-f",
                             &page_arg,
@@ -1771,14 +2075,15 @@ exit 0\n";
                             "-",
                         ],
                         &bytes,
-                        MAX_PAGE_PNG_BYTES,
+                        MAX_PAGE_RASTER_BYTES,
                         Instant::now() + Duration::from_secs(30),
+                        StdoutSink::Seekable,
                     )
                     .unwrap();
                 assert!(before.status.success(), "{}", before.stderr_excerpt());
                 assert!(
-                    rendered.png == before.stdout,
-                    "page {page} renders the bytes it rendered before"
+                    rendered.raster == before.stdout,
+                    "page {page} renders the bytes it rendered without -cropbox"
                 );
             }
         }
@@ -2250,7 +2555,7 @@ exit 0\n";
             ));
         }
         let page = renderer.render_page(&assemble_pdf(&objects), 1).unwrap();
-        let img = image::load_from_memory(&page.png).unwrap();
+        let img = image::load_from_memory(&page.raster).unwrap();
         assert_eq!((img.width(), img.height()), (8000, 8000));
     }
 
@@ -2275,7 +2580,7 @@ exit 0\n";
         hex.push(b'>');
         let bytes = image_pdf("[/ASCIIHexDecode /JPXDecode]", &hex);
         let page = renderer.render_page(&bytes, 1).unwrap();
-        let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
+        let img = image::load_from_memory(&page.raster).unwrap().to_rgb8();
         assert_eq!((img.width(), img.height()), (400, 400));
         let p = img.get_pixel(200, 200);
         assert_eq!((p[0], p[1], p[2]), (255, 255, 255), "the image was drawn");
@@ -2343,12 +2648,12 @@ exit 0\n";
             (
                 INFO_SELF_TEST,
                 "#!/bin/sh\ncat > /dev/null\nprintf 'P6 16 16 255 '\n",
-                "the PDF renderer's output is not a PNG",
+                "the PDF renderer's output is not a PNG or TIFF image",
             ),
             (
                 INFO_SELF_TEST,
                 RENDER_OK,
-                "the PNG the renderer wrote does not decode",
+                "the image the renderer wrote does not decode",
             ),
             (
                 INFO_SELF_TEST,
@@ -2378,7 +2683,7 @@ exit 0\n";
             );
             assert!(text.contains(why), "{why}: {text}");
             assert!(
-                text.ends_with("write the page to standard output as one PNG"),
+                text.ends_with("write the page to standard output as one image"),
                 "{text}"
             );
         }
@@ -2394,6 +2699,6 @@ exit 0\n";
         let renderer = PdfRenderer::new(program, Duration::from_secs(30)).unwrap();
         renderer.self_test().unwrap();
         let page = renderer.render_page(SELF_TEST_PDF, 1).unwrap();
-        assert_eq!(png_size(&page.png), (16, 16));
+        assert_eq!(raster_size(&page.raster), (16, 16));
     }
 }
