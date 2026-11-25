@@ -19,6 +19,16 @@
 
 #![forbid(unsafe_code)]
 
+// Global allocator: jemalloc, via tikv-jemallocator (issue #801).
+// jemalloc keeps freed pages in per-arena caches and purges them on
+// a decay timer rather than returning each allocation to the system
+// on free, which lowers allocator cost on the hit and render paths.
+// The unsafe `GlobalAlloc` implementation lives in the crate, so this
+// binary keeps `#![forbid(unsafe_code)]`.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // The modules live in the library target (`src/lib.rs`);
 // importing them at the crate root lets every `crate::`
 // path in this file and in `config.rs` resolve to them.

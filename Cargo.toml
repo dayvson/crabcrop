@@ -234,6 +234,13 @@ rustix = { version = "1", features = ["process", "fs", "pipe", "net"] }
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 turbojpeg = { version = "1.5", default-features = false, features = ["require-simd"] }
 
+# Global allocator (issue #801): jemalloc via tikv-jemallocator.
+# jemalloc is a C library the crate builds from vendored sources, so
+# no system package is involved; the msvc guard matches the crate,
+# which does not build there (the service targets Linux and macOS).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 # Brotli streams for the C2PA store tests in src/provenance,
 # which build compressed manifests. A test-only dependency on
