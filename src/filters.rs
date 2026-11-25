@@ -543,8 +543,9 @@ pub fn apply_filters_within(
 ///   they skip only on those two, which they keep. `huerotate`
 ///   skips only on those two as well.
 ///
-/// `contrast(0)` still runs: its table drops some values a
-/// level (issue #815).
+/// `contrast(0)` is the identity (issue #815): its table maps
+/// every value to itself, so it skips on the two RGB layouts
+/// like the others at their no-op argument.
 fn leaves_unchanged(filter: &PlainFilter, img: &DynamicImage) -> bool {
     let rgb = matches!(
         img,
@@ -2237,8 +2238,22 @@ fn filter3x3<const CH: usize>(src: &[u8], (w, h): (usize, usize), kernel: &[f32;
 /// scale about the midpoint by `((100 + amount) / 100)^2`,
 /// clamp, truncate. It depends only on the input byte, so a
 /// table of it, computed with the identical f32 arithmetic,
-/// maps bytes as the formula would one at a time.
+/// maps bytes as the formula would one at a time. For every
+/// amount but zero the table is the crate's byte for byte.
+///
+/// `contrast(0)` scales by one, which is the identity, but the
+/// formula computes that in f32 and truncates: `1/255` becomes
+/// `0.99998`, so each of the values 1 to 63 lands one level low
+/// (issue #815). That dropped a level from `contrast(0)`
+/// renders where it should have changed nothing, so the amount
+/// is special-cased to the identity table, and `contrast(0)` is
+/// then skipped on an 8-bit RGB image like the other filters at
+/// their no-op argument ([`leaves_unchanged`]). Every other
+/// amount keeps the crate's formula, rounding and all.
 fn contrast_lut(amount: f32) -> [u8; 256] {
+    if amount == 0.0 {
+        return std::array::from_fn(|i| i as u8);
+    }
     let percent = ((100.0 + amount) / 100.0).powi(2);
     let mut lut = [0u8; 256];
     for (i, e) in lut.iter_mut().enumerate() {
@@ -2250,7 +2265,8 @@ fn contrast_lut(amount: f32) -> [u8; 256] {
 }
 
 /// Contrast through [`contrast_lut`]: byte-identical to the
-/// crate's formula evaluated per pixel. An image with alpha is
+/// crate's formula evaluated per pixel, except `contrast(0)`,
+/// which is the identity (issue #815). An image with alpha is
 /// mapped where its pixels lie (issue #812).
 fn contrast(img: DynamicImage, amount: f32) -> DynamicImage {
     let lut = contrast_lut(amount);

@@ -34,6 +34,201 @@ fn decode_dims(bytes: &[u8]) -> (u32, u32) {
     (img.width(), img.height())
 }
 
+/// A 16-bit RGB horizontal gradient `width` by `height`: column
+/// `x` holds `x * 65535 / (width - 1)` in every channel, a
+/// smooth ramp that narrows to a 0..255 ramp. Issue #814.
+fn gradient_rgb16(width: u32, height: u32) -> DynamicImage {
+    let mut img: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> =
+        image::ImageBuffer::new(width, height);
+    for (x, _y, p) in img.enumerate_pixels_mut() {
+        let v = (u64::from(x) * 65535 / u64::from(width.max(2) - 1)) as u16;
+        *p = image::Rgb([v, v, v]);
+    }
+    DynamicImage::ImageRgb16(img)
+}
+
+#[test]
+fn output_is_eight_bit_classifies_the_output_formats() {
+    // Issue #814: PNG keeps 16-bit samples; every other still
+    // output is 8-bit, and a video format is not narrowed for.
+    for f in [
+        ImageFormat::Jpeg,
+        ImageFormat::WebP,
+        ImageFormat::Gif,
+        ImageFormat::Avif,
+        ImageFormat::Jxl,
+    ] {
+        assert!(output_is_eight_bit(f), "{f:?} should be 8-bit");
+    }
+    assert!(!output_is_eight_bit(ImageFormat::Png));
+    assert!(!output_is_eight_bit(ImageFormat::Mp4));
+}
+
+#[test]
+fn narrow_for_eight_bit_output_narrows_only_for_eight_bit_outputs() {
+    // Issue #814: a 16-bit frame is narrowed to 8 bits for an
+    // 8-bit output, keeping its channels; it is left as it is for
+    // a 16-bit output, and an 8-bit or float frame is never
+    // touched.
+    let rgb16 = gradient_rgb16(8, 4);
+    let rgba16 = DynamicImage::ImageRgba16(rgb16.to_rgba16());
+    let luma16 = DynamicImage::ImageLuma16(rgb16.to_luma16());
+    let lumaa16 = DynamicImage::ImageLumaA16(rgba16.to_luma_alpha16());
+    // Narrowed for an 8-bit output, channels kept.
+    assert_eq!(
+        narrow_for_eight_bit_output(rgb16.clone(), ImageFormat::Jpeg).color(),
+        image::ColorType::Rgb8
+    );
+    assert_eq!(
+        narrow_for_eight_bit_output(rgba16.clone(), ImageFormat::WebP).color(),
+        image::ColorType::Rgba8
+    );
+    assert_eq!(
+        narrow_for_eight_bit_output(luma16.clone(), ImageFormat::Gif).color(),
+        image::ColorType::L8
+    );
+    assert_eq!(
+        narrow_for_eight_bit_output(lumaa16, ImageFormat::Avif).color(),
+        image::ColorType::La8
+    );
+    // The narrowed samples are the high byte, as the encoder's own
+    // narrowing is.
+    let narrowed = narrow_for_eight_bit_output(rgb16.clone(), ImageFormat::Jpeg);
+    assert_eq!(narrowed.to_rgb8().as_raw(), rgb16.to_rgb8().as_raw());
+    // Left alone for a 16-bit output.
+    assert_eq!(
+        narrow_for_eight_bit_output(rgb16.clone(), ImageFormat::Png).color(),
+        image::ColorType::Rgb16
+    );
+    // An 8-bit frame and a float frame are returned as they are.
+    let rgb8 = DynamicImage::ImageRgb8(rgb16.to_rgb8());
+    assert_eq!(
+        narrow_for_eight_bit_output(rgb8, ImageFormat::Jpeg).color(),
+        image::ColorType::Rgb8
+    );
+    let float = DynamicImage::ImageRgb32F(rgb16.to_rgb32f());
+    assert_eq!(
+        narrow_for_eight_bit_output(float, ImageFormat::Jpeg).color(),
+        image::ColorType::Rgb32F
+    );
+}
+
+#[test]
+fn narrowing_before_resize_leaves_no_banding() {
+    // Issue #814: narrowing a 16-bit source to 8 bits before the
+    // resize (the new path) instead of resampling at 16 bits and
+    // narrowing after (the current path) keeps every resized
+    // sample within one level of the current render. A render
+    // within one level of another cannot step several levels where
+    // the other is flat, so it introduces no contour the current
+    // render lacks — no banding. The orderings do differ, so the
+    // change is real. (A steep ramp steps by more than one between
+    // neighbors on both paths; that is the gradient, not banding,
+    // which is why the test holds the two renders against each
+    // other rather than bounding a single render's steps.)
+    let grad = gradient_rgb16(1200, 8);
+    let mut any_moved = false;
+    for (w, h) in [(800u32, 8u32), (533, 8), (300, 8)] {
+        let at_sixteen = resize_lanczos3_owned(grad.clone(), w, h).to_rgb8();
+        let at_eight =
+            resize_lanczos3_owned(DynamicImage::ImageRgb8(grad.to_rgb8()), w, h).to_rgb8();
+        let mut max_diff = 0u8;
+        for (a, b) in at_sixteen.as_raw().iter().zip(at_eight.as_raw()) {
+            let d = a.abs_diff(*b);
+            max_diff = max_diff.max(d);
+            any_moved |= d != 0;
+        }
+        assert!(
+            max_diff <= 1,
+            "{w}x{h}: a sample moved by {max_diff}, not within one level of the 16-bit path"
+        );
+    }
+    assert!(
+        any_moved,
+        "the two orderings never differed; the change does nothing"
+    );
+}
+
+#[test]
+fn a_sixteen_bit_source_is_full_depth_for_png_and_narrowed_for_jpeg() {
+    // Issue #814: a 16-bit PNG resized and served as PNG keeps its
+    // 16 bits; served as JPEG (an 8-bit output) it renders from an
+    // 8-bit frame. The PNG path's depth is the observable the
+    // narrowing must not touch.
+    let png = png_bytes(&gradient_rgb16(600, 16));
+    let as_png = Engine
+        .process(&png, &ops_of_str("400x0/filters:format(png)"))
+        .unwrap();
+    assert_eq!(as_png.format, ImageFormat::Png);
+    assert_eq!(png_bit_depth(&as_png.bytes), 16, "PNG output kept 16 bits");
+    let as_jpeg = Engine
+        .process(&png, &ops_of_str("400x0/filters:format(jpeg)"))
+        .unwrap();
+    assert_eq!(as_jpeg.format, ImageFormat::Jpeg);
+}
+
+/// The ops of a request remainder, for the engine tests.
+fn ops_of_str(remainder: &str) -> Vec<Operation> {
+    crate::url::parse_operations(&format!("{remainder}/https://example.com/a.png"))
+        .unwrap()
+        .0
+}
+
+/// The bit depth byte of a PNG's IHDR (offset 24).
+fn png_bit_depth(bytes: &[u8]) -> u8 {
+    assert_eq!(&bytes[1..4], b"PNG", "not a PNG");
+    bytes[24]
+}
+
+/// Issue #814 measurement: narrow-then-resample (the new path)
+/// against resample-at-16-then-narrow (the current path), on
+/// 16-bit content, for banding. Run with `--ignored --nocapture`.
+/// Reports the fraction of samples that moved, the largest move,
+/// and the PSNR between the two 8-bit results. A render within a
+/// level or two of the current one carries no contour the current
+/// one lacks.
+#[test]
+#[ignore = "measurement for issue #814; run with --ignored --nocapture"]
+fn measure_sixteen_bit_narrowing_banding() {
+    // A smooth 16-bit gray gradient plus a fine 16-bit dither the
+    // 8-bit layout cannot hold, so the two orderings genuinely
+    // differ where a plain ramp would narrow to the same bytes.
+    let (sw, sh) = (2400u32, 1600u32);
+    let mut img: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> = image::ImageBuffer::new(sw, sh);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let base = (u64::from(x) + u64::from(y)) * 65535 / u64::from(sw + sh - 2);
+        let dither = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40503)) % 200;
+        let v = (base as u32 + dither).min(65535) as u16;
+        *p = image::Rgb([v, v, v]);
+    }
+    let grad = DynamicImage::ImageRgb16(img);
+    for (w, h) in [(800u32, 533u32), (533, 355), (300, 200)] {
+        let at_sixteen = resize_lanczos3_owned(grad.clone(), w, h).to_rgb8();
+        let at_eight =
+            resize_lanczos3_owned(DynamicImage::ImageRgb8(grad.to_rgb8()), w, h).to_rgb8();
+        let n = at_sixteen.as_raw().len();
+        let mut moved = 0usize;
+        let mut max_diff = 0u8;
+        let mut sq = 0f64;
+        for (a, b) in at_sixteen.as_raw().iter().zip(at_eight.as_raw()) {
+            let d = a.abs_diff(*b);
+            moved += usize::from(d != 0);
+            max_diff = max_diff.max(d);
+            sq += f64::from(d).powi(2);
+        }
+        let psnr = if sq == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0f64 * 255.0 * n as f64 / sq).log10()
+        };
+        eprintln!(
+            "{sw}x{sh}->{w}x{h}: narrow-first vs 16-bit path: moved {:.1}% (max {max_diff}), \
+             PSNR {psnr:.1} dB",
+            100.0 * moved as f64 / n as f64
+        );
+    }
+}
+
 #[test]
 fn validate_source_image_accepts_the_servable_set() {
     // The upload acceptance test (issue #168) walks the
@@ -4714,12 +4909,13 @@ fn default_format_options_reproduce_the_standing_encoders() {
     let img = gradient_image();
     let src = EncodeBuffers::new(&img);
 
-    // JPEG: libjpeg-turbo at quality 80, 4:2:0, baseline
-    // (issue #668).
+    // JPEG: libjpeg-turbo at quality 80, 4:2:0, baseline with
+    // optimized Huffman tables (issues #668, #793).
     let rgb = img.to_rgb8();
     let mut compressor = turbojpeg::Compressor::new().unwrap();
     compressor.set_quality(80).unwrap();
     compressor.set_subsamp(turbojpeg::Subsamp::Sub2x2).unwrap();
+    compressor.set_optimize(true).unwrap();
     let legacy = compressor
         .compress_to_vec(turbojpeg::Image {
             pixels: rgb.as_raw().as_slice(),
@@ -4755,8 +4951,8 @@ fn default_format_options_reproduce_the_standing_encoders() {
     assert_eq!(
         (now.len(), sha256_hex(&now).as_str()),
         (
-            1446,
-            "8c110b76daf71afec271dda3a5f6a9e80484899b8d34fbd061f81c515eede21c"
+            1135,
+            "d6e07eee65f20bc7b111d73cbc93a2531a664190a9f0de136bea75d77076e1a9"
         ),
         "jpeg default encode changed"
     );
@@ -5017,9 +5213,9 @@ fn jpeg_layout_is_jfif_then_tables_frame_and_scans() {
             .collect()
     };
     // Baseline: SOI, the JFIF header, two quantization
-    // tables, the frame, the four standard Huffman
-    // tables, one scan, EOI. No Adobe marker, no comment,
-    // no restart interval.
+    // tables, the frame, the four Huffman tables (now
+    // optimized, issue #793), one scan, EOI. No Adobe
+    // marker, no comment, no restart interval.
     let baseline = jpeg_bytes(&img, 80, None, false);
     assert_eq!(
         markers(&baseline),
@@ -5037,19 +5233,32 @@ fn jpeg_layout_is_jfif_then_tables_frame_and_scans() {
         segments[4].1,
         [8, 0, 32, 0, 48, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]
     );
-    // The Huffman tables are the standard's own (Annex K),
-    // the same in every baseline file: DC then AC for
-    // luminance, DC then AC for chrominance.
+    // The Huffman tables are optimized, built from the image
+    // (issue #793): the four slots in the standard order — DC
+    // then AC for luminance, DC then AC for chrominance — each
+    // no larger than the standard table (Annex K) it replaced
+    // (29, 179, 29, 179 bytes of payload), since an optimized
+    // table lists only the symbols the image uses.
     let tables: Vec<(u8, usize)> = segments[5..9]
         .iter()
         .map(|(_, payload)| (payload[0], payload.len()))
         .collect();
-    assert_eq!(tables, [(0x00, 29), (0x10, 179), (0x01, 29), (0x11, 179)]);
+    let slots: Vec<u8> = tables.iter().map(|&(id, _)| id).collect();
+    assert_eq!(slots, [0x00, 0x10, 0x01, 0x11]);
+    for (&(_, len), standard) in tables.iter().zip([29usize, 179, 29, 179]) {
+        assert!(
+            len <= standard,
+            "optimized table {len} is larger than standard {standard}"
+        );
+    }
+    // They follow the image: a different picture builds
+    // different tables, where the standard tables were the same
+    // in every baseline file.
     let other = jpeg_bytes(&speckled_image(48, 32), 80, None, false);
-    assert_eq!(
+    assert_ne!(
         jpeg_segments(&other)[5..9],
         segments[5..9],
-        "baseline Huffman tables follow the image"
+        "optimized Huffman tables follow the image"
     );
     // The scan covers all three components, interleaved.
     assert_eq!(segments[9].1, [3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
@@ -5349,7 +5558,7 @@ fn jpeg_bytes_are_the_same_with_and_without_vector_code() {
     }
     assert_eq!(
         sha256_hex(here.as_bytes()),
-        "95da092e75c2bc5eb60233af4dd427e35bb3643785797f54c89e2d4fd51a4889",
+        "831c9147038f3a369e1c54b54b8e335ea95bdf8504163b5f6a6184a6afa2763a",
         "the JPEG encoder's bytes changed:\n{here}"
     );
 }

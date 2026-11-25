@@ -55,7 +55,7 @@ pub(in crate::engine) use resize::{
     resize_lanczos3_cropped, resize_lanczos3_cropped_owned, resize_lanczos3_cut,
     resize_lanczos3_lent, resize_lanczos3_owned, view_holds_no_more,
 };
-pub(in crate::engine) use resize::{SizeCap, resize_target};
+pub(in crate::engine) use resize::{SizeCap, resize_target, scale_px};
 pub(crate) use resize::{cap_dimensions, has_zero_side};
 mod overlay;
 #[cfg(test)]
@@ -477,6 +477,15 @@ impl Engine {
                 Decoded::Still(img, source_meta, reduced) => (img, source_meta, reduced),
                 Decoded::Rendered(processed) => return Ok(*processed),
             };
+        // A 16-bit source resampled at 16 bits costs four to five
+        // times an 8-bit resample (issue #814). When every output
+        // this request can produce is 8-bit, the extra bits never
+        // reach the response, so the frame is narrowed to 8 bits
+        // before the chain resamples it. A resized render's pixels
+        // then round at 8 bits instead of 16; a 16-bit output
+        // (PNG) keeps its bits, and a JPEG reduced decode, already
+        // 8-bit, is untouched.
+        let img = narrow_for_eight_bit_output(img, resolved_output);
         let mut format = detected;
         ctx.check_deadline()?;
         let (outcome, (source_width, source_height)) =
@@ -1397,6 +1406,50 @@ impl Engine {
             placeholder,
         ))
     }
+}
+
+/// Narrow a 16-bit frame to 8 bits before the chain resamples
+/// it, when `output` is a format this pipeline only ever writes
+/// at 8 bits (issue #814). The frame keeps its channels: a
+/// 16-bit gray frame narrows to 8-bit gray, a 16-bit frame with
+/// alpha keeps its alpha. A float frame is left as it is (it is
+/// not the 16-bit integer case the slow kernels cost most on),
+/// and so is a frame for a 16-bit output. The narrowing is the
+/// same high-byte conversion the encoder would run on the
+/// resampled frame, so the only change is that the resample now
+/// rounds at 8 bits: a resized render's pixels move by at most
+/// one level, and a render that resamples nothing is byte for
+/// byte as it was.
+fn narrow_for_eight_bit_output(img: DynamicImage, output: ImageFormat) -> DynamicImage {
+    if !output_is_eight_bit(output) {
+        return img;
+    }
+    match img {
+        DynamicImage::ImageLuma16(_) => DynamicImage::ImageLuma8(img.to_luma8()),
+        DynamicImage::ImageLumaA16(_) => DynamicImage::ImageLumaA8(img.to_luma_alpha8()),
+        DynamicImage::ImageRgb16(_) => DynamicImage::ImageRgb8(img.to_rgb8()),
+        DynamicImage::ImageRgba16(_) => DynamicImage::ImageRgba8(img.to_rgba8()),
+        other => other,
+    }
+}
+
+/// Whether `output` is a format this pipeline writes only at 8
+/// bits per channel, so narrowing a 16-bit source to 8 bits
+/// before resampling loses no bit the response would carry
+/// (issue #814). PNG is the one still output that keeps 16-bit
+/// samples (see `encode::png_color_params`); JPEG, WebP, GIF,
+/// AVIF and JPEG XL are 8-bit here. Any other format (a video
+/// format, say) is treated as not 8-bit, so nothing is narrowed
+/// for it.
+fn output_is_eight_bit(output: ImageFormat) -> bool {
+    matches!(
+        output,
+        ImageFormat::Jpeg
+            | ImageFormat::WebP
+            | ImageFormat::Gif
+            | ImageFormat::Avif
+            | ImageFormat::Jxl
+    )
 }
 
 /// A rectangle of an image as (left, top, width, height).

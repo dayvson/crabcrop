@@ -210,11 +210,15 @@ fn every_step_past_the_byte_limit_is_refused_before_it_allocates() {
 fn a_blurred_pad_builds_its_whole_cover_only_within_the_budget() {
     // `pad:1000x1000:blur` over a 5x1000 strip scales it to a
     // 1000x200000 cover and keeps the canvas's part of it. An
-    // RGBA8 strip has only that part computed (issue #806): it
-    // renders, holding a small part of the 800 MB the whole
-    // cover would. A 16-bit strip is scaled to the whole cover,
-    // in its own layout, 1.6 GB: it is refused before anything
-    // of it is allocated.
+    // 8-bit RGBA strip has only that part computed (issue #806):
+    // it renders, holding a small part of the 800 MB the whole
+    // cover would. A 16-bit strip kept at 16 bits is scaled to
+    // the whole cover, in its own layout, 1.6 GB: it is refused
+    // before anything of it is allocated. A 16-bit strip bound
+    // for an 8-bit output is narrowed to 8 bits before the chain
+    // resamples it (issue #814), so it takes the 8-bit path and
+    // renders; only a 16-bit output (PNG) keeps it at 16 bits and
+    // meets the refusal.
     let strip = |layout: image::ColorType| {
         let rgba = image::RgbaImage::from_fn(5, 1000, |x, y| {
             image::Rgba([(x * 50) as u8, (y % 256) as u8, 90, 255])
@@ -230,17 +234,37 @@ fn a_blurred_pad_builds_its_whole_cover_only_within_the_budget() {
             .unwrap();
         out
     };
-    let remainder = "pad:1000x1000:blur/filters:format(jpeg)";
-    let (outcome, held) = render(&strip(image::ColorType::Rgba8), "strip.png", remainder);
-    eprintln!("the RGBA8 strip: held {held} bytes at most, {outcome:?}");
-    outcome.unwrap_or_else(|e| panic!("the RGBA8 strip: {e}"));
-    assert!(held < 100 << 20, "the RGBA8 strip held {held} bytes");
-    let (outcome, held) = render(&strip(image::ColorType::Rgba16), "strip.png", remainder);
-    eprintln!("the RGBA16 strip: held {held} bytes at most, {outcome:?}");
-    assert!(refused_for_bytes(&outcome), "the RGBA16 strip: {outcome:?}");
+    let to_jpeg = "pad:1000x1000:blur/filters:format(jpeg)";
+    // An 8-bit strip renders, holding only the canvas's part.
+    let (outcome, held) = render(&strip(image::ColorType::Rgba8), "strip.png", to_jpeg);
+    eprintln!("the RGBA8 strip to JPEG: held {held} bytes at most, {outcome:?}");
+    outcome.unwrap_or_else(|e| panic!("the RGBA8 strip to JPEG: {e}"));
+    assert!(
+        held < 100 << 20,
+        "the RGBA8 strip to JPEG held {held} bytes"
+    );
+    // A 16-bit strip bound for JPEG is narrowed to 8 bits first
+    // (issue #814), so it renders like the 8-bit strip.
+    let (outcome, held) = render(&strip(image::ColorType::Rgba16), "strip.png", to_jpeg);
+    eprintln!("the RGBA16 strip to JPEG: held {held} bytes at most, {outcome:?}");
+    outcome.unwrap_or_else(|e| panic!("the RGBA16 strip to JPEG: {e}"));
+    assert!(
+        held < 100 << 20,
+        "the RGBA16 strip to JPEG held {held} bytes"
+    );
+    // A 16-bit strip bound for a 16-bit output (PNG) stays 16-bit,
+    // so it is scaled to the whole 1.6 GB cover and refused before
+    // anything of it is allocated.
+    let to_png = "pad:1000x1000:blur/filters:format(png)";
+    let (outcome, held) = render(&strip(image::ColorType::Rgba16), "strip.png", to_png);
+    eprintln!("the RGBA16 strip to PNG: held {held} bytes at most, {outcome:?}");
+    assert!(
+        refused_for_bytes(&outcome),
+        "the RGBA16 strip to PNG: {outcome:?}"
+    );
     assert!(
         held < REFUSED_PEAK,
-        "the RGBA16 strip was refused after holding {held} bytes"
+        "the RGBA16 strip to PNG was refused after holding {held} bytes"
     );
 }
 
