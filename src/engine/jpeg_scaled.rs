@@ -8,18 +8,20 @@
 //! such mode. libjpeg-turbo, which already writes the JPEG
 //! output (issue #668), has one, with vector code for it. So
 //! where the first operation of a request is a plain resize
-//! that shrinks a JPEG far enough, the source is decoded
-//! through libjpeg-turbo at reduced scale and the resize
+//! that shrinks a JPEG far enough (issue #653), or a crop to a
+//! fixed alignment that does (issue #785), the source is decoded
+//! through libjpeg-turbo at reduced scale and the operation
 //! finishes from the reduced frame.
 //!
 //! The pixels of such a render differ from the ones a
-//! full-size decode and the same resize give, so the rule is
-//! narrow ([`plan`]): the frame must still be at least one and
-//! a half times the resize's target on both axes. A real
-//! resample always follows the scaled decode, and a scaled
-//! decode never lands on the target itself, which is where the
-//! two renders sit furthest apart. Every other request decodes
-//! as it did.
+//! full-size decode and the same operation give, so the rule is
+//! narrow ([`plan`]): the part of the frame the resample reads
+//! must still be at least one and a half times its target on
+//! both axes, the whole image for a resize and the crop's window
+//! for a crop. A real resample always follows the scaled decode,
+//! and a scaled decode never lands on the target itself, which
+//! is where the two renders sit furthest apart. Every other
+//! request decodes as it did.
 //!
 //! The reduced frame stands for the image the header declares
 //! ([`Reduced`]). That image's size is the source size the
@@ -77,10 +79,11 @@
 use image::DynamicImage;
 
 use super::{
-    EngineError, ImageSize, MAX_DECODE_ALLOC, Operation, ProcessContext, SizeCap,
+    EngineError, ImageSize, MAX_DECODE_ALLOC, Operation, ProcessContext, SizeCap, cap_dimensions,
     check_decoded_dimensions, exif_orientation, has_zero_side, jpeg_coefficient_bytes,
-    resize_target, zune_jpeg_options,
+    resize_target, scale_px, zune_jpeg_options,
 };
+use crate::url::{Align, Dimension};
 
 mod first_scan;
 
@@ -200,24 +203,28 @@ fn turn((width, height): (u32, u32), orientation: Option<u32>) -> (u32, u32) {
 /// `None` for the full-size decode every other request gets.
 ///
 /// Eligible is: the source is a YCbCr JPEG ([`eligible_size`]),
-/// the first operation is a plain resize, and one of a half, a
-/// quarter and an eighth leaves a frame at least one and a half
-/// times the resize's target on both axes. The smallest such
-/// frame is taken.
+/// the first operation is a plain resize (issue #653) or a crop
+/// to a fixed alignment (issue #785), and one of a half, a
+/// quarter and an eighth leaves the part of the frame the
+/// resample reads at least one and a half times its target on
+/// both axes. The smallest such frame is taken. For a resize
+/// that part is the whole image; for a crop it is the window the
+/// crop decides on, which the resize then resamples.
 ///
-/// The target is the one the resize itself will resolve, with
-/// the same function ([`resize_target`]): against the declared
-/// size turned upright by the file's EXIF orientation, a pixel
-/// side scaled by `dpr`, and held to the declared size under
-/// `no_upscale`. For orientations 5 to 8 the stored frame lies
-/// on its side, so the target's width is held against the
-/// frame's height. The plan carries the orientation it read,
-/// which the decode stage then applies to the frame.
+/// The target is the one the operation itself will resolve:
+/// against the declared size turned upright by the file's EXIF
+/// orientation, a pixel side scaled by `dpr`, and held to the
+/// declared size under `no_upscale`. For orientations 5 to 8 the
+/// stored frame lies on its side, so the target's width is held
+/// against the frame's height. The plan carries the orientation
+/// it read, which the decode stage then applies to the frame.
 ///
 /// A request that selects a video frame or a PDF page decodes
 /// the PNG its tool wrote, never a JPEG; it is turned away by
-/// name all the same. A box with a zero pixel side is refused
-/// by the resize, so nothing is gained by decoding for it.
+/// name all the same. A box with a zero pixel side is refused by
+/// the resize, so nothing is gained by decoding for it, and a
+/// smart, face or object crop reads the pixels to place its
+/// window, so it decodes at full size.
 pub(super) fn plan(
     bytes: &[u8],
     ops: &[Operation],
@@ -228,32 +235,156 @@ pub(super) fn plan(
     if FULL_SIZE_ONLY.get() {
         return None;
     }
-    let Some(Operation::Size(size)) = ops.first() else {
-        return None;
-    };
-    if directives.frame.is_some() || directives.page.is_some() || has_zero_side(size) {
+    if directives.frame.is_some() || directives.page.is_some() {
         return None;
     }
+    let request = FirstOp::of(ops.first()?)?;
     // A first look, which allocates nothing, turns most
     // requests down (see [`Glance`]); the two decoders'
     // reading of the header and the orientation as the decode
     // stage reads it then decide.
     let glance = glance(bytes)?;
-    denominator_for(
+    denominator_for_request(
         glance.size,
         glance.orientation,
-        size,
+        &request,
         dpr,
         directives.no_upscale,
     )?;
     let stored = eligible_size(bytes, &glance)?;
     let orientation = exif_orientation(bytes);
-    let denominator = denominator_for(stored, orientation, size, dpr, directives.no_upscale)?;
+    let denominator =
+        denominator_for_request(stored, orientation, &request, dpr, directives.no_upscale)?;
     Some(ScaledDecode {
         denominator,
         stored,
         orientation,
     })
+}
+
+/// The first operation of a request, where it is one the scaled
+/// decode plans for: a plain resize (issue #653), or a crop to a
+/// fixed alignment (issue #785). Every other first operation, a
+/// size or crop with a zero side, and a crop with a non-pixel
+/// side, decode at full size.
+enum FirstOp<'a> {
+    Resize(&'a ImageSize),
+    CropFill {
+        size: &'a ImageSize,
+        align: &'a Align,
+    },
+}
+
+impl<'a> FirstOp<'a> {
+    fn of(op: &'a Operation) -> Option<Self> {
+        match op {
+            Operation::Size(size) if !has_zero_side(size) => Some(FirstOp::Resize(size)),
+            Operation::Crop { size, align }
+                if is_fixed_fill_align(align) && !has_zero_side(size) =>
+            {
+                Some(FirstOp::CropFill { size, align })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether `align` is a fixed fill alignment the scaled crop
+/// decode plans for (issue #785): the center, the four edges and
+/// the four corners, which place the crop window by rule from
+/// the image dimensions alone. The smart, face and object
+/// alignments read the pixels to place the window, so they
+/// decode at full size and run the crop on the full frame.
+fn is_fixed_fill_align(align: &Align) -> bool {
+    matches!(
+        align,
+        Align::Center
+            | Align::Top
+            | Align::Bottom
+            | Align::Left
+            | Align::Right
+            | Align::TopLeft
+            | Align::TopRight
+            | Align::BottomLeft
+            | Align::BottomRight
+    )
+}
+
+/// The denominator the first operation `request` makes `stored`
+/// eligible for (the rule of [`plan`], without the file), or
+/// `None` for the full-size decode.
+fn denominator_for_request(
+    stored: (u32, u32),
+    orientation: Option<u32>,
+    request: &FirstOp<'_>,
+    dpr: f32,
+    no_upscale: bool,
+) -> Option<u32> {
+    match request {
+        FirstOp::Resize(size) => denominator_for(stored, orientation, size, dpr, no_upscale),
+        FirstOp::CropFill { size, align } => {
+            crop_denominator(stored, orientation, size, align, dpr, no_upscale)
+        }
+    }
+}
+
+/// The scale a crop to `size` with a fixed `align` leaves room
+/// for on a `stored` image with this EXIF orientation (issue
+/// #785), the crop's counterpart to [`denominator_for`].
+///
+/// The crop decides a window of the image's own aspect wherever
+/// the target's aspect differs, then resamples that window to
+/// the target; where the aspect already matches, the whole image
+/// is resampled, as a plain resize does. The smallest frame
+/// whose mapped crop window is still at least one and a half
+/// times the target on both axes is taken, so a real resample
+/// always follows and never lands on the target. The window and
+/// the target are the ones the crop itself decides (its
+/// `dpr`-scaled target, held to the source under `no_upscale`,
+/// and [`crate::crop::fill_window_aligned`] for the window), so
+/// the plan and the crop cannot disagree.
+fn crop_denominator(
+    stored: (u32, u32),
+    orientation: Option<u32>,
+    size: &ImageSize,
+    align: &Align,
+    dpr: f32,
+    no_upscale: bool,
+) -> Option<u32> {
+    let (Dimension::Pixels(tw), Dimension::Pixels(th)) = (size.width, size.height) else {
+        return None;
+    };
+    let (full_w, full_h) = turn(stored, orientation);
+    let (mut tw, mut th) = (scale_px(tw, dpr), scale_px(th, dpr));
+    if no_upscale {
+        (tw, th) = cap_dimensions(tw, th, (full_w, full_h));
+    }
+    if tw == 0 || th == 0 {
+        return None;
+    }
+    let (_, _, window_w, window_h) =
+        crate::crop::fill_window_aligned(full_w, full_h, tw, th, align);
+    DENOMINATORS.into_iter().find(|&denominator| {
+        let (fw, fh) = turn(
+            (
+                scaled_side(stored.0, denominator),
+                scaled_side(stored.1, denominator),
+            ),
+            orientation,
+        );
+        crop_leaves_a_resample(fw, window_w, full_w, tw)
+            && crop_leaves_a_resample(fh, window_h, full_h, th)
+    })
+}
+
+/// Whether the part of a `frame`-wide reduced frame that a crop
+/// `window` (of a `full`-wide image) maps to is at least one and
+/// a half times the `target` width, in whole numbers: the
+/// frame's crop window is `frame * window / full` wide, so the
+/// test is `2 * frame * window >= 3 * target * full`. It is
+/// [`leaves_a_resample`] when the window is the whole axis.
+fn crop_leaves_a_resample(frame: u32, window: u32, full: u32, target: u32) -> bool {
+    u64::from(frame) * u64::from(window) * 2 >= u64::from(target) * u64::from(full) * 3
 }
 
 /// The scale a resize to `size` leaves room for on a `stored`

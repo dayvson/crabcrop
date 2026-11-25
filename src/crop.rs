@@ -273,6 +273,58 @@ fn crop_to_aspect_impl(
     )
 }
 
+/// The crop-fill window for a directional or center alignment:
+/// the (left, top, width, height) rectangle a `target_w`:`target_h`
+/// crop keeps of a `w` by `h` image, by the same geometry as
+/// [`crop_to_aspect_impl`]'s non-detection arms. The scaled JPEG
+/// crop decode (issue #785) decides the window on the full image
+/// the reduced frame stands for, so it cannot run
+/// [`crop_to_aspect_impl`] on the frame itself; this computes the
+/// window from the dimensions alone. An aspect that already
+/// matches (or a zero target) returns the whole frame, as the
+/// crop does. Smart, face and object alignments are not fill
+/// crops of this kind and fall to the centered window here; the
+/// scaled decode never offers them one ([`crate::engine`]'s
+/// `jpeg_scaled::plan` takes only the fixed alignments).
+///
+/// A test pins this against [`crop_to_aspect_uncut`]'s window for
+/// every fixed alignment, so the two cannot drift.
+pub(crate) fn fill_window_aligned(
+    w: u32,
+    h: u32,
+    target_w: u32,
+    target_h: u32,
+    align: &Align,
+) -> (u32, u32, u32, u32) {
+    if target_w == 0 || target_h == 0 {
+        return (0, 0, w, h);
+    }
+    let src_ratio = w as u64 * target_h as u64;
+    let dst_ratio = target_w as u64 * h as u64;
+    if src_ratio == dst_ratio {
+        return (0, 0, w, h);
+    }
+    if src_ratio > dst_ratio {
+        // Source is wider: crop the width.
+        let cw = ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32;
+        let x = match align {
+            Align::Left | Align::TopLeft | Align::BottomLeft => 0,
+            Align::Right | Align::TopRight | Align::BottomRight => w.saturating_sub(cw),
+            _ => (w.saturating_sub(cw)) / 2,
+        };
+        (x, 0, cw, h)
+    } else {
+        // Source is taller: crop the height.
+        let ch = ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32;
+        let y = match align {
+            Align::Top | Align::TopLeft | Align::TopRight => 0,
+            Align::Bottom | Align::BottomLeft | Align::BottomRight => h.saturating_sub(ch),
+            _ => (h.saturating_sub(ch)) / 2,
+        };
+        (0, y, w, ch)
+    }
+}
+
 /// The window start for smart alignment: the focal-point
 /// start, adjusted by face-safe placement (issue #199)
 /// when faces fed the decision. With no faces the focal
@@ -850,6 +902,57 @@ mod tests {
         assert_eq!((out.width(), out.height()), (100, 60));
         assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
         assert_eq!(rgb(&out, 99, 0), [0, 0, 255]);
+    }
+
+    #[test]
+    fn fill_window_aligned_matches_the_crop_window() {
+        // Issue #785: the scaled crop decode decides its window
+        // with `fill_window_aligned`, so it must land on the same
+        // rectangle `crop_to_aspect_uncut` cuts for every fixed
+        // alignment and shape. A match that reports no window (the
+        // aspect already fits) is the whole frame.
+        let aligns = [
+            Align::Center,
+            Align::Top,
+            Align::Bottom,
+            Align::Left,
+            Align::Right,
+            Align::TopLeft,
+            Align::TopRight,
+            Align::BottomLeft,
+            Align::BottomRight,
+        ];
+        let shapes = [
+            (200u32, 100u32),
+            (100, 200),
+            (2400, 1600),
+            (1600, 2400),
+            (1000, 667),
+            (667, 1000),
+            (300, 300),
+            (123, 457),
+        ];
+        let targets = [(1u32, 1u32), (4, 3), (3, 4), (16, 9), (300, 200), (7, 13)];
+        for &(w, h) in &shapes {
+            for &(tw, th) in &targets {
+                for align in &aligns {
+                    let uncut = crop_to_aspect_uncut(
+                        DynamicImage::new_rgb8(w, h),
+                        tw,
+                        th,
+                        align.clone(),
+                        None,
+                        None,
+                    );
+                    let expected = uncut.window.unwrap_or((0, 0, w, h));
+                    assert_eq!(
+                        fill_window_aligned(w, h, tw, th, align),
+                        expected,
+                        "{w}x{h} -> {tw}x{th} {align:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// 200x100 mid-gray, with a noisy red block at the far right

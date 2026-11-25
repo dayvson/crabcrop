@@ -1132,6 +1132,27 @@ fn encode_jpeg(
     compressor
         .set_progressive(format_options.jpeg_progressive)
         .map_err(failed)?;
+    if !format_options.jpeg_progressive {
+        // Baseline output: compute optimized Huffman tables for
+        // the image instead of writing libjpeg's standard ones
+        // (issue #793). The optimized tables are a header libjpeg
+        // builds from the image's own symbol counts, so the
+        // entropy-coded data is shorter for the same pixels:
+        // about 9% fewer bytes on the benchmark sources, for one
+        // more pass over the coefficients at encode. The decoded
+        // pixels do not change. Progressive output already builds
+        // optimized tables for every file (the standard ones
+        // cannot code a progressive scan), so the flag is set
+        // only for baseline output, where it is the change. The
+        // pure-Rust encoder before libjpeg-turbo (issue #668)
+        // built its own optimized tables that zune-jpeg, the
+        // decoder this engine reads JPEG with, decoded to the
+        // wrong colors on tiny and flat images (issue #38);
+        // libjpeg's are read back correctly, baseline and
+        // progressive, at every subsampling (the tests decode
+        // them).
+        compressor.set_optimize(true).map_err(failed)?;
+    }
     let (width, height) = (rgb.width() as usize, rgb.height() as usize);
     let image = turbojpeg::Image {
         pixels: rgb.as_raw().as_slice(),
@@ -1170,6 +1191,100 @@ mod tests {
                 image::Rgb([(x * 3) as u8, (y * 5) as u8, (x + y) as u8])
             }
         })
+    }
+
+    /// A flat frame of one color: the kind of tiny image whose
+    /// optimized tables zune-jpeg once decoded wrong (issue #38).
+    fn flat_field(w: u32, h: u32, color: [u8; 3]) -> image::RgbImage {
+        image::RgbImage::from_pixel(w, h, image::Rgb(color))
+    }
+
+    /// `img` as a baseline JPEG with the standard Huffman tables,
+    /// the way baseline output was written before issue #793:
+    /// `encode_jpeg` without `set_optimize`.
+    fn standard_table_jpeg(
+        img: &image::RgbImage,
+        quality: u8,
+        subsamp: turbojpeg::Subsamp,
+    ) -> Vec<u8> {
+        let mut compressor = turbojpeg::Compressor::new().unwrap();
+        compressor.set_quality(i32::from(quality)).unwrap();
+        compressor.set_subsamp(subsamp).unwrap();
+        compressor
+            .compress_to_vec(turbojpeg::Image {
+                pixels: img.as_raw().as_slice(),
+                width: img.width() as usize,
+                pitch: img.width() as usize * 3,
+                height: img.height() as usize,
+                format: turbojpeg::PixelFormat::RGB,
+            })
+            .unwrap()
+    }
+
+    /// The RGB pixels zune-jpeg, the decoder this engine reads
+    /// JPEG with, decodes `bytes` to.
+    fn zune_rgb(bytes: &[u8]) -> Vec<u8> {
+        let mut decoder = zune_jpeg::JpegDecoder::new(zune_core::bytestream::ZCursor::new(bytes));
+        decoder.decode().expect("zune decodes the baseline JPEG")
+    }
+
+    #[test]
+    fn baseline_jpeg_writes_optimized_tables_that_decode_the_same() {
+        // Issue #793: baseline JPEG output now carries optimized
+        // Huffman tables. They decode to exactly the pixels the
+        // standard tables decode to — the tiny and flat images of
+        // issue #38 included, at every subsampling — and they make
+        // a smaller file on real content. Before this change the
+        // engine wrote the standard tables, so "smaller than the
+        // standard tables" is the assertion that fails on the
+        // previous behavior.
+        use crate::url::Subsampling;
+        let subsamplings = [
+            (Subsampling::S444, turbojpeg::Subsamp::None),
+            (Subsampling::S422, turbojpeg::Subsamp::Sub2x1),
+            (Subsampling::S420, turbojpeg::Subsamp::Sub2x2),
+        ];
+        for (w, h) in [(1, 1), (2, 2), (7, 3), (8, 8), (16, 16), (33, 17)] {
+            let fields = [
+                test_field(w, h),
+                flat_field(w, h, [123, 45, 200]),
+                flat_field(w, h, [0, 0, 0]),
+                flat_field(w, h, [255, 255, 255]),
+            ];
+            for img in &fields {
+                for (sub, tj_sub) in subsamplings {
+                    let opts = FormatOptions {
+                        jpeg_subsampling: Some(sub),
+                        ..FormatOptions::default()
+                    };
+                    let optimized = encode_jpeg(img, 80, opts).unwrap();
+                    let standard = standard_table_jpeg(img, 80, tj_sub);
+                    assert_eq!(
+                        zune_rgb(&optimized),
+                        zune_rgb(&standard),
+                        "{w}x{h} {sub:?}: optimized tables decode to other pixels"
+                    );
+                }
+            }
+        }
+        // On real content at 800 wide the optimized tables make a
+        // smaller file at every subsampling, with the same pixels.
+        let photo = test_field(800, 533);
+        for (sub, tj_sub) in subsamplings {
+            let opts = FormatOptions {
+                jpeg_subsampling: Some(sub),
+                ..FormatOptions::default()
+            };
+            let optimized = encode_jpeg(&photo, 80, opts).unwrap();
+            let standard = standard_table_jpeg(&photo, 80, tj_sub);
+            assert!(
+                optimized.len() < standard.len(),
+                "{sub:?}: optimized {} is not smaller than standard {}",
+                optimized.len(),
+                standard.len()
+            );
+            assert_eq!(zune_rgb(&optimized), zune_rgb(&standard), "{sub:?}");
+        }
     }
 
     #[test]

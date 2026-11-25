@@ -579,6 +579,7 @@ impl VideoEncoder {
             program: &self.program,
             args: &args,
             input: ToolInput::Writer(Box::new(feed)),
+            stdout: crate::toolrun::StdoutSink::Pipe,
             max_stdout: self.max_output_bytes,
             // Only the excerpt is read, and it comes from the
             // end of the stream, whatever this keeps.
