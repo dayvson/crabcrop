@@ -234,6 +234,15 @@ rustix = { version = "1", features = ["process", "fs", "pipe", "net"] }
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 turbojpeg = { version = "1.5", default-features = false, features = ["require-simd"] }
 
+# Global allocator (issue #801): jemalloc via tikv-jemallocator,
+# behind the default `jemalloc` feature below. jemalloc is a C library
+# the crate builds from vendored sources, so no system package is
+# involved; the msvc guard matches the crate, which does not build
+# there (the service targets Linux and macOS). Optional so a
+# `--no-default-features` build drops it for the system allocator.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [dev-dependencies]
 # Brotli streams for the C2PA store tests in src/provenance,
 # which build compressed manifests. A test-only dependency on
@@ -256,6 +265,14 @@ proptest = { version = "1.12", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [features]
+# The global allocator is jemalloc by default (issue #801). It is a
+# feature, not unconditional, so a `--no-default-features` build falls
+# back to the system allocator (glibc on the shipped Linux images),
+# where raise_malloc_thresholds (#690) applies; the fuzz crate uses
+# that path. See docs/configuration.md.
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
 # AVIF source decoding, through the image crate's avif-native
 # decoder (mp4parse + dav1d). Off by default (issue #141,
 # option A): dav1d is a C dependency, found through
