@@ -601,14 +601,27 @@ impl Default for AvifTiles {
 
 /// The thread pools AVIF encodes run in, for one tile count:
 /// each of exactly that many threads, which is what holds the
-/// tile count, and one pool for every that many cores
-/// (rounded up), so a host with more cores still runs that
-/// many encodes side by side. A count above the host's core
-/// count is one pool, of more threads than cores. Built at
-/// the first AVIF encode and kept: asking the encoder for a
-/// thread count instead (`with_num_threads`) builds and drops
-/// a pool inside every encode, which measured 9% slower at
-/// 800x533.
+/// tile count, and one pool for every core, which is one for
+/// every permit of the stills lane, so each render the lane
+/// runs at once encodes in a pool of its own (issue #790).
+/// Encodes that share a pool share its threads, and a thread
+/// that waits for a tile of its own encode runs a tile of
+/// another one meanwhile, so an encode ends only once the
+/// tiles it took on have ended too: with four AVIF renders at
+/// once on four cores, a pool each served them at the rate
+/// one shared pool did, with the 90th percentile of their
+/// latency 17% lower and the 99th 43% lower. The count is one
+/// pool per core, capped by `CRABCROP_AVIF_POOLS` (default
+/// [`DEFAULT_AVIF_POOL_CAP`]) so a many-core host does not
+/// run `cores * tiles` encoder threads, and floored at
+/// `cores / tiles` so the cores are never left idle (see
+/// [`avif_pool_count`]); the cap changes no output byte, so
+/// it is not in the configuration fingerprint. A count above
+/// the host's core count makes pools of more threads than
+/// cores. Built at the first AVIF encode and kept: asking the
+/// encoder for a thread count instead (`with_num_threads`)
+/// builds and drops a pool inside every encode, which
+/// measured 9% slower at 800x533.
 struct AvifPools {
     pools: Vec<rayon::ThreadPool>,
     /// The encodes running in each pool.
@@ -621,6 +634,49 @@ struct AvifPools {
 /// set.
 static AVIF_POOLS: [OnceLock<AvifPools>; 5] = [const { OnceLock::new() }; 5];
 
+/// The default cap on the number of AVIF encode pools
+/// (`CRABCROP_AVIF_POOLS`). One pool per core (issue #790)
+/// gives each concurrent render its own `tiles`-thread pool,
+/// which cut tail latency on the measured four-core host but
+/// makes the resident thread count grow as `cores * tiles`
+/// (16 threads on four cores, 256 on a 64-core host). The cap
+/// holds full per-core isolation up to this many cores and
+/// bounds the pool count above it. The default is deliberately
+/// conservative, since the per-core gain is measured only on a
+/// four-core host: it preserves that measured behavior, extends
+/// it to eight cores at the same oversubscription, and bounds
+/// anything larger. Raise it on a larger host that measures a
+/// benefit, or set `CRABCROP_AVIF_POOLS=1` to keep a single
+/// shared pool.
+const DEFAULT_AVIF_POOL_CAP: usize = 8;
+
+/// How many pools of `tiles` threads to build on `cores`
+/// cores, capping the one-pool-per-core design (issue #790) at
+/// `cap`. Floored at `cores / tiles` (rounded up) — the count
+/// that keeps every core busy — so a small cap never leaves
+/// cores idle, and bounded above by `cores`, since more pools
+/// than cores cannot isolate more concurrent encodes than the
+/// stills lane runs. Worker threads are the result times
+/// `tiles`.
+fn avif_pool_count(cores: usize, tiles: AvifTiles, cap: usize) -> usize {
+    cores.min(cap.max(1)).max(cores.div_ceil(tiles.count()))
+}
+
+/// The AVIF pool cap from `CRABCROP_AVIF_POOLS`, or
+/// [`DEFAULT_AVIF_POOL_CAP`]. Read from the environment here,
+/// like the core count, because the pools are a process-global
+/// built once at the first encode. It is validated at boot
+/// (see the config module), so an invalid value cannot reach
+/// here in the server; a test that leaves it unset, or sets it
+/// to something unparseable, gets the default.
+fn avif_pool_cap() -> usize {
+    std::env::var("CRABCROP_AVIF_POOLS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n != 0)
+        .unwrap_or(DEFAULT_AVIF_POOL_CAP)
+}
+
 impl AvifPools {
     fn get(tiles: AvifTiles) -> Result<&'static AvifPools, EngineError> {
         let slot = &AVIF_POOLS[tiles.0.trailing_zeros() as usize];
@@ -630,7 +686,8 @@ impl AvifPools {
         // A failure to start the threads fails this encode and
         // is not remembered: the next one tries again.
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let built = Self::build(tiles, cores.div_ceil(tiles.count()))?;
+        let count = avif_pool_count(cores, tiles, avif_pool_cap());
+        let built = Self::build(tiles, count)?;
         Ok(slot.get_or_init(|| built))
     }
 
@@ -1709,22 +1766,73 @@ mod tests {
 
     #[test]
     fn avif_pools_are_built_for_the_tile_count_and_the_cores() {
-        // A server's pools (issue #688): as many threads each as
-        // the count, one pool for every that many cores, rounded
-        // up, so a count above the cores is one pool. Each count
-        // has its own, built once and kept.
+        // A server's pools (issues #688, #790): as many threads
+        // each as the count, and one pool per core, bounded by
+        // CRABCROP_AVIF_POOLS and the cores/tiles floor
+        // (avif_pool_count), whatever the count. Each count has
+        // its own, built once and kept. (On a host with no more
+        // cores than the cap, this one included, that is one
+        // pool per core.)
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cap = avif_pool_cap();
         for tiles in every_tile_count() {
             let pools = AvifPools::get(tiles).unwrap();
             assert_eq!(
                 pools.pools.len(),
-                cores.div_ceil(tiles.count()),
+                avif_pool_count(cores, tiles, cap),
                 "{tiles:?}"
             );
             for pool in &pools.pools {
                 assert_eq!(pool.current_num_threads(), tiles.count(), "{tiles:?}");
             }
             assert!(std::ptr::eq(pools, AvifPools::get(tiles).unwrap()));
+        }
+    }
+
+    #[test]
+    fn avif_pool_count_caps_large_hosts_without_starving_cores() {
+        // Issue #790, the CRABCROP_AVIF_POOLS cap. One pool per
+        // core up to the cap; above it the pool count holds,
+        // until the floor (cores / tiles, the count that keeps
+        // the cores busy) rises past it. Worker threads are the
+        // count times the tile count.
+        let four = AvifTiles::default();
+        assert_eq!(four.count(), 4);
+        // The measured four-core host: one pool per core; the
+        // default cap does not bind.
+        assert_eq!(avif_pool_count(4, four, DEFAULT_AVIF_POOL_CAP), 4);
+        assert_eq!(avif_pool_count(2, four, DEFAULT_AVIF_POOL_CAP), 2);
+        // Full per-core isolation up to the cap, then held at it.
+        assert_eq!(avif_pool_count(8, four, 8), 8);
+        assert_eq!(avif_pool_count(16, four, 8), 8);
+        assert_eq!(avif_pool_count(24, four, 8), 8);
+        // The floor overrides the cap once cores/tiles exceeds
+        // it, so the cores are never left idle: a 64-core host
+        // gets 16 pools (64 threads = cores), not the uncapped
+        // prototype's 64 pools (256 threads).
+        assert_eq!(avif_pool_count(64, four, 8), 16);
+        assert_eq!(avif_pool_count(64, four, 16), 16);
+        assert!(avif_pool_count(64, four, DEFAULT_AVIF_POOL_CAP) * four.count() <= 64);
+        // CRABCROP_AVIF_POOLS=1 collapses to a single shared pool
+        // where the cores allow it (the pre-#790 behavior), but
+        // never below the floor that keeps the cores busy.
+        assert_eq!(avif_pool_count(4, four, 1), 1);
+        assert_eq!(avif_pool_count(16, four, 1), 4);
+        // Invariants over a range of hosts, tile counts and caps:
+        // at least one pool, never more pools than cores, and
+        // never so few that the cores sit idle.
+        for &cores in &[1usize, 2, 3, 4, 6, 8, 16, 32, 64, 128] {
+            for tiles in every_tile_count() {
+                for &cap in &[1usize, 2, 4, 8, 16, 64, 1024] {
+                    let pools = avif_pool_count(cores, tiles, cap);
+                    assert!(pools >= 1, "cores={cores} tiles={tiles:?} cap={cap}");
+                    assert!(pools <= cores, "cores={cores} tiles={tiles:?} cap={cap}");
+                    assert!(
+                        pools * tiles.count() >= cores,
+                        "cores={cores} tiles={tiles:?} cap={cap}: {pools} pools idle the cores",
+                    );
+                }
+            }
         }
     }
 

@@ -443,6 +443,21 @@ impl Config {
             Some(v) => parse_avif_tiles(&v)?,
             None => crate::engine::AvifTiles::default(),
         };
+        // CRABCROP_AVIF_POOLS caps how many AVIF encode pools the
+        // server builds (issue #790). It is a performance knob
+        // only: it changes no output byte and is not in the
+        // configuration fingerprint, so it is validated here but
+        // read by the engine itself. It must be a whole number of
+        // at least one.
+        if let Some(v) = get("CRABCROP_AVIF_POOLS")
+            && !v.trim().parse::<usize>().is_ok_and(|n| n != 0)
+        {
+            return Err(ConfigError::invalid(
+                "CRABCROP_AVIF_POOLS",
+                &v,
+                format!("CRABCROP_AVIF_POOLS must be a whole number of at least 1, got {v:?}"),
+            ));
+        }
         let jxl_speed = match get("CRABCROP_JXL_SPEED") {
             Some(v) => parse_jxl_speed(&v)?,
             None => crate::engine::DEFAULT_JXL_SPEED,
