@@ -164,7 +164,11 @@ fn convolve_matches_old_implementation() {
 
 #[test]
 fn contrast_lut_matches_image_crate() {
-    for amount in [-100.0f32, -25.0, 0.0, 10.0, 25.0, 100.0] {
+    // Every amount but zero stays byte-identical to the image
+    // crate's contrast; `contrast(0)` is the identity instead
+    // (issue #815), so it is checked on its own below and left
+    // out here, where the crate drops a level at 0.
+    for amount in [-100.0f32, -25.0, 10.0, 25.0, 100.0] {
         let rgb = rand_rgb(64, 48, 7);
         let mine = contrast(DynamicImage::ImageRgb8(rgb.clone()), amount);
         let theirs = image::imageops::contrast(&rgb, amount);
@@ -173,6 +177,24 @@ fn contrast_lut_matches_image_crate() {
             theirs.as_raw().as_slice(),
             "amount {amount}"
         );
+    }
+}
+
+/// Issue #815 acceptance: the tables for the other arguments
+/// follow the documented formula with its rounding. The formula
+/// scales each byte about the midpoint by `((100 + amount)/100)^2`
+/// in f32 and truncates; this recomputes it independently and
+/// pins every entry, so a later change to the rounding would be
+/// caught here, not only through the image crate.
+#[test]
+fn contrast_lut_follows_the_formula_for_nonzero_amounts() {
+    for amount in [-100.0f32, -50.0, -25.0, -1.0, 1.0, 10.0, 25.0, 50.0, 100.0] {
+        let percent = ((100.0 + amount) / 100.0).powi(2);
+        let want: [u8; 256] = std::array::from_fn(|i| {
+            let d = ((i as f32 / 255.0 - 0.5) * percent + 0.5) * 255.0;
+            d.clamp(0.0, 255.0) as u8
+        });
+        assert_eq!(contrast_lut(amount), want, "amount {amount}");
     }
 }
 
@@ -218,6 +240,7 @@ fn the_arguments_skipped_change_no_pixel() {
         F::Brighten(0),
         F::Gamma(1.0),
         F::Exposure(0.0),
+        F::Contrast(0.0),
     ] {
         assert!(leaves_unchanged(&filter, &cube), "{filter:?}");
         let (out, _) = apply_filters(cube.clone(), std::slice::from_ref(&filter));
@@ -287,7 +310,10 @@ fn identity_arguments_skip_only_on_the_layouts_they_keep() {
         (F::Saturation(1.5), &[]),
         (F::HueRotate(90), &[]),
         (F::Rgb(0, 0, 1), &[]),
-        (F::Contrast(0.0), &[]),
+        // contrast(0) is the identity now (issue #815), so it
+        // skips on the two RGB layouts like the others at their
+        // no-op argument; any other amount still runs everywhere.
+        (F::Contrast(0.0), rgb),
         (F::Contrast(25.0), &[]),
         (F::Fill([1, 2, 3]), &[]),
         (F::NoUpscale, &[]),
@@ -306,7 +332,7 @@ fn identity_arguments_skip_only_on_the_layouts_they_keep() {
             }
         }
     }
-    assert_eq!(skipped, 4 + 6 * 2);
+    assert_eq!(skipped, 4 + 7 * 2);
     // On another layout the skip would not be exact: gray comes
     // back from `gamma(1)` and the others as RGB8.
     let gray = DynamicImage::ImageLuma8(DynamicImage::ImageRgb8(rand_rgb(9, 7, 815)).to_luma8());
@@ -322,22 +348,32 @@ fn identity_arguments_skip_only_on_the_layouts_they_keep() {
 }
 
 #[test]
-fn contrast_zero_still_runs_since_its_table_drops_levels() {
-    // Issue #815: `contrast(0)`'s table maps 1 to 63 one level
-    // down and every other value to itself, so `contrast(0)`
-    // changes pixels and is not skipped. Skipping it, or making
-    // its table the identity, would move rendered bytes.
+fn contrast_zero_is_the_identity() {
+    // Issue #815: `contrast(0)` scales about the midpoint by one,
+    // which is the identity, so its table must map every value to
+    // itself. Before the fix the f32 formula truncated 1 to 63 one
+    // level down. This is the exhaustive check the issue asks for.
     let lut = contrast_lut(0.0);
-    let moved: Vec<usize> = (0..256).filter(|&i| usize::from(lut[i]) != i).collect();
-    assert_eq!(moved, (1..=63).collect::<Vec<_>>());
-    assert!(moved.iter().all(|&i| usize::from(lut[i]) == i - 1));
+    let moved: Vec<usize> = lut
+        .iter()
+        .enumerate()
+        .filter(|&(i, &v)| usize::from(v) != i)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(moved, Vec::<usize>::new(), "contrast(0) moves no value");
+    for (i, &v) in lut.iter().enumerate() {
+        assert_eq!(usize::from(v), i, "contrast(0) maps {i}");
+    }
+    // The identity table means `contrast(0)` is skipped on the two
+    // 8-bit RGB layouts, like the other filters at their no-op
+    // argument, and leaves a full ramp untouched when it does run.
     let ramp = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 1, |x, _| {
         image::Rgb([x as u8; 3])
     }));
-    assert!(!leaves_unchanged(&PlainFilter::Contrast(0.0), &ramp));
+    assert!(leaves_unchanged(&PlainFilter::Contrast(0.0), &ramp));
+    let _runs = RunsSkipped::new();
     let (out, _) = apply_filters(ramp.clone(), &[PlainFilter::Contrast(0.0)]);
-    assert_ne!(out.as_bytes(), ramp.as_bytes());
-    assert_eq!(out.as_bytes()[3 * 63], 62);
+    assert_eq!(out.as_bytes(), ramp.as_bytes());
 }
 
 /// What a filter over RGB8 made of an image before issue #812:

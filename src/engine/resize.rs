@@ -102,6 +102,18 @@ pub(in crate::engine) enum SourceWindow {
     /// get, and the part of the frame the image fills is
     /// resampled to it (see [`resize_lanczos3_reduced`]).
     Reduced(jpeg_scaled::Reduced),
+    /// A crop window within a reduced JPEG frame (issue #785):
+    /// `window` is the (left, top, width, height) rectangle the
+    /// crop decided on, in the full image's (upright)
+    /// coordinates, and `reduced` says what part of the frame
+    /// that full image fills. The size resolves and is checked
+    /// against the window's dimensions, as a cut window's is,
+    /// and the part of the frame the window maps to ([`reduced_crop_rect`])
+    /// is resampled to the target (see [`resize_lanczos3_reduced`]).
+    ReducedCrop {
+        reduced: jpeg_scaled::Reduced,
+        window: Window,
+    },
 }
 
 /// [`apply_size`] for the crop+resize fusion (issue #287):
@@ -213,7 +225,12 @@ pub(in crate::engine) fn apply_size_windowed(
         other => other,
     };
     let (sw, sh) = match window {
-        SourceWindow::Fused((_, _, w, h)) | SourceWindow::Cut((_, _, w, h)) => (w, h),
+        SourceWindow::Fused((_, _, w, h))
+        | SourceWindow::Cut((_, _, w, h))
+        | SourceWindow::ReducedCrop {
+            window: (_, _, w, h),
+            ..
+        } => (w, h),
         SourceWindow::Reduced(reduced) => reduced.full,
         SourceWindow::Whole => (img.width(), img.height()),
     };
@@ -228,6 +245,12 @@ pub(in crate::engine) fn apply_size_windowed(
         // resolved against, so it is resampled whatever the
         // target is.
         SourceWindow::Reduced(reduced) => resize_lanczos3_reduced(img, reduced.window, w, h),
+        // A crop window within a reduced frame is likewise
+        // always resampled: the window maps to a part of the
+        // frame smaller than the target it resolved (issue #785).
+        SourceWindow::ReducedCrop { reduced, window } => {
+            resize_lanczos3_reduced(img, reduced_crop_rect(&reduced, window), w, h)
+        }
         // No resample runs: the two-step path returns
         // the materialized window itself, so the fused
         // path materializes it here.
@@ -795,6 +818,30 @@ fn resample_part_premultiplying(
 /// up to a pixel and moves the far edge by as much. A backend
 /// refusal, which no reduced frame meets, resamples the whole
 /// frame.
+/// The part of a reduced frame a crop `window` maps to, as the
+/// backend's fractional crop box (issue #785). The window is in
+/// the full image's upright coordinates; `reduced.window` is the
+/// part of the frame that full image fills, so the window is
+/// mapped into it in proportion. A resize of this box then
+/// resamples the crop straight from the reduced frame, at the
+/// crop's own scale and in its place, exactly as
+/// [`resize_lanczos3_reduced`] does for the whole image.
+fn reduced_crop_rect(
+    reduced: &jpeg_scaled::Reduced,
+    (x, y, cw, ch): Window,
+) -> (f64, f64, f64, f64) {
+    let (full_w, full_h) = reduced.full;
+    let (fx, fy, fw, fh) = reduced.window;
+    let sx = fw / f64::from(full_w.max(1));
+    let sy = fh / f64::from(full_h.max(1));
+    (
+        fx + f64::from(x) * sx,
+        fy + f64::from(y) * sy,
+        f64::from(cw) * sx,
+        f64::from(ch) * sy,
+    )
+}
+
 fn resize_lanczos3_reduced(
     img: DynamicImage,
     (left, top, width, height): (f64, f64, f64, f64),

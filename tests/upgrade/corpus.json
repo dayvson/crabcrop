@@ -25,9 +25,9 @@
    "path": "/622623aeec61c4e64fcaa047340c9da2d2f938cf747d88636906bef5cfd47961/300x200/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 15822,
-   "sha256": "1364089528987577c4e485b675c6fb88331343bdaa9ca85cfbe740e5efb55ca3",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
+   "bytes": 15455,
+   "sha256": "448d9ef6df5a1b8f40f380dccc719643f64e627d79ba22eca479194d43ef4bf4",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "resize-proportional",
@@ -45,9 +45,9 @@
    "path": "/c3ee9f05d79b9ac7018bf5f59c66e4e10583d4e53a54c017a6e6663a085e3912/crop:400x300/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 28728,
-   "sha256": "20f6cca9fcede365d27f0ba7b4e4f0a40fe5e37734b3baa3f6c2261126080716",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 28300,
+   "sha256": "21db11d18d32f6139e323151e4717c113dabd14d55c32a2d14142298b6675667",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "crop-gravity",
@@ -55,9 +55,9 @@
    "path": "/420c70d2666c2bc0b323ec681973540f88a3212f47faba1bf8b944439eec65d7/crop:300x300:bottom-right/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 19897,
-   "sha256": "8f1c825ef076237836afee0f0178715e97601ad32961bed4c98ea3ccd0a46345",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 19499,
+   "sha256": "2c623bb3accae0c1fd0f22b3e3da0f9d9285bb5b87d80c3a7fbe59dfb666cfa9",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "rotate-90",
@@ -135,9 +135,9 @@
    "path": "/92a6abeeb92cc5805c2a8f68afe6e0b0c2a740ab474e2d6d235b2c14a91de5a1/300x0/filters:quality(55)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 10209,
-   "sha256": "19cf7e82d12f46d54e12eede7e0529e3b63bd1f91094d6ef30b25acdce4d7442",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
+   "bytes": 9847,
+   "sha256": "c17fed0407593c344faabd639fcc224fec412d885003f4f4aad1625524443762",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "grayscale",
@@ -145,9 +145,9 @@
    "path": "/6d52f0e7c2d89b10e5c1bd07770294d5cb317621c5b20cb0ca0bf413213ff526/300x0/filters:grayscale/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 14175,
-   "sha256": "e7ccf5b03b65efade9d680525b7d7e909e8df947c1a774dba1b606203f0a8f5b",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
+   "bytes": 13694,
+   "sha256": "a50d689d3a47858d0a99b5e2c0f968088b56fdae808bb88fd4da9d83bb965657",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "chain-multi-filter",
@@ -245,9 +245,9 @@
    "path": "/2dd2bbdbe1f2311e0e7879bfae9b41678b17091be7b4dff7a36de7718db82d65/0x0/filters:format(jpeg)/http://127.0.0.1:8991/exif-orient.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 66682,
-   "sha256": "3842bdd5ea933ef16a77926f5e33a3bfa1d14205faa7e00c0ac3778b1f080a3d",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 64692,
+   "sha256": "66ae5960d2517896e150df2c36064db8332bac99cdbd5a761e0b1a698ed7a44b",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "metadata-preserve",
@@ -255,9 +255,9 @@
    "path": "/2dd2bbdbe1f2311e0e7879bfae9b41678b17091be7b4dff7a36de7718db82d65/0x0/filters:format(jpeg)/http://127.0.0.1:8991/exif-orient.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 66802,
-   "sha256": "45b0167af84a1bbfe47bc8e58d8eeefb993c961103b5771b02d957e53d61073a",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 64812,
+   "sha256": "e1f895935b1dc584292667e4cf7c69b9bd7e14ddfb2907cf9bc6de0ffa118e66",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "watermark-overlay",
@@ -295,9 +295,9 @@
    "path": "/91c46cf9287e54e3f8fa6d8ab019b5f9d85e6125f25fd86d37a8ac2be8623889/preset:card/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 20136,
-   "sha256": "3edc5bcc5b0682785a2bbb2ded0916a31045d2927987ea05fea60f4720165e72",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs."
+   "bytes": 19754,
+   "sha256": "5dc42b2449db72f2b8e244008d3e1d825e5622ceda58e4ff22cab5876fd8465f",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "source-root-short",
@@ -305,9 +305,9 @@
    "path": "/96451c9d9ff0857ecc7af0cc39fa678c5529e82e72d26efd8e1cf73320cb8765/300x200/root:photos/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 15822,
-   "sha256": "1364089528987577c4e485b675c6fb88331343bdaa9ca85cfbe740e5efb55ca3",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
+   "bytes": 15455,
+   "sha256": "448d9ef6df5a1b8f40f380dccc719643f64e627d79ba22eca479194d43ef4bf4",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "sealed-url",
@@ -315,9 +315,9 @@
    "path": "/s1.dXBnMzExbm9uY2Ux5a9pTF9TrjNSr2ihi6NcaPQO-xCpH21yrTJhWhXsPiqLzuEW5JkYG1T-jxEScnTsJXci1iM8reRAH01D/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jpeg",
-   "bytes": 15822,
-   "sha256": "1364089528987577c4e485b675c6fb88331343bdaa9ca85cfbe740e5efb55ca3",
-   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged."
+   "bytes": 15455,
+   "sha256": "448d9ef6df5a1b8f40f380dccc719643f64e627d79ba22eca479194d43ef4bf4",
+   "note": "Re-baselined 2026-11-15 against the current build: JPEG output is written by libjpeg-turbo instead of the jpeg-encoder crate, deliberately (issue #668), so every JPEG render differs from the baseline bytes. The quantization tables for a quality are unchanged; chroma is averaged where it is subsampled instead of one sample kept, and the entropy-coded data differs. Re-baselined again 2026-11-15: a JPEG source whose first operation is a resize to a third of its size or less is now decoded at reduced scale, deliberately (issue #653), so this render, decoded at half size before the resize to 300 wide, differs again. The output size is unchanged. Re-baselined 2026-11-25 against the current build: baseline JPEG output now carries optimized Huffman tables built from the image (issue #793), so the entropy-coded data is shorter for the same decoded pixels, and every baseline JPEG render differs from the baseline bytes."
   },
   {
    "id": "exp-future",
