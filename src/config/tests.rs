@@ -2051,6 +2051,26 @@ fn from_env_reads_the_avif_tile_count() {
 }
 
 #[test]
+fn from_env_validates_the_avif_pool_cap() {
+    // Issue #790: CRABCROP_AVIF_POOLS is a performance knob the
+    // engine reads itself. It is validated at boot (a whole
+    // number of at least 1) but, because it changes no output
+    // byte, it is not in the configuration fingerprint.
+    let unset = config_of(&[]).unwrap().config_fingerprint;
+    for good in ["1", "4", "8", "64", "1024"] {
+        let config = config_of(&[("CRABCROP_AVIF_POOLS", good)]).unwrap();
+        assert_eq!(config.config_fingerprint, unset, "{good}");
+    }
+    for bad in ["0", "-1", "x", "1.5", ""] {
+        let err = refusal(&[("CRABCROP_AVIF_POOLS", bad)]);
+        match &err {
+            ConfigError::Invalid { var, .. } => assert_eq!(*var, "CRABCROP_AVIF_POOLS", "{bad:?}"),
+            other => panic!("{bad:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn from_env_reads_the_tools_address_space_caps() {
     // Issue #738: each tool's cap was a constant. Unset, each
     // is that constant still; set, it is read in megabytes.
