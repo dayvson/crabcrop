@@ -33,7 +33,7 @@
 # Pinned to the current release image. Bump with releases,
 # or set image.digest to pin the exact build.
 image:
-  tag: "0.15.0"
+  tag: "0.16.0"
 
 replicaCount: 1
 

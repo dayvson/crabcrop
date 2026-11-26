@@ -252,7 +252,7 @@ def main():
 
     if "crabcrop" not in skip:
         crab_bin = os.environ.get(
-            "CRABCROP_BIN", os.path.join(WORK, "crabcrop-v0.15.0", "target", "release", "crabcrop")
+            "CRABCROP_BIN", os.path.join(WORK, "crabcrop-v0.16.0", "target", "release", "crabcrop")
         )
 
         def start_crab():
